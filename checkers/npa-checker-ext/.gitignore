@@ -1,0 +1,6 @@
+_build/
+*.annot
+*.cmi
+*.cmo
+*.cmx
+*.o

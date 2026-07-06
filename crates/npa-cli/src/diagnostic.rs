@@ -1,0 +1,642 @@
+//! Structured command diagnostics and deterministic renderers.
+
+use std::fmt::Write as _;
+
+use crate::args::CliUsageError;
+
+/// Stable schema string for package command results.
+pub const PACKAGE_COMMAND_RESULT_SCHEMA: &str = "npa.package.command_result.v0.1";
+/// Stable schema string for optional package timing telemetry.
+pub const PACKAGE_TIMINGS_SCHEMA: &str = "npa.package.timings.v0.1";
+
+/// Process exit class for a command result.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CommandExitCode {
+    /// Command succeeded.
+    Success,
+    /// Package validation, hash, build, or checker failure.
+    PackageFailure,
+    /// CLI usage error or unexpected internal failure.
+    UsageOrInternal,
+}
+
+impl CommandExitCode {
+    /// Numeric process exit code.
+    pub const fn as_u8(self) -> u8 {
+        match self {
+            Self::Success => 0,
+            Self::PackageFailure => 1,
+            Self::UsageOrInternal => 2,
+        }
+    }
+}
+
+/// Aggregate command status.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CommandStatus {
+    /// Command completed successfully.
+    Passed,
+    /// Command failed.
+    Failed,
+}
+
+impl CommandStatus {
+    /// Stable JSON spelling.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Passed => "passed",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+/// Diagnostic category.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DiagnosticKind {
+    /// CLI usage and argument parsing.
+    Usage,
+    /// Package manifest parsing or validation.
+    PackageManifest,
+    /// Package graph validation.
+    PackageGraph,
+    /// Package lock parsing or validation.
+    PackageLock,
+    /// Filesystem access for package artifacts.
+    ArtifactIo,
+    /// Hash mismatch.
+    HashMismatch,
+    /// Certificate build failure.
+    Build,
+    /// Source-free boundary violation.
+    SourceFreeBoundary,
+    /// Fast verifier rejection.
+    FastVerifier,
+    /// Reference verifier rejection.
+    ReferenceVerifier,
+    /// External checker runner rejection.
+    ExternalVerifier,
+    /// Package axiom report generation or checking.
+    AxiomReport,
+    /// Package theorem index generation or checking.
+    TheoremIndex,
+    /// Generated package artifact freshness or filesystem operation.
+    GeneratedArtifact,
+    /// Package artifact policy evaluation.
+    PackagePolicy,
+    /// Unexpected internal command failure.
+    Internal,
+}
+
+impl DiagnosticKind {
+    /// Stable JSON spelling.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Usage => "Usage",
+            Self::PackageManifest => "PackageManifest",
+            Self::PackageGraph => "PackageGraph",
+            Self::PackageLock => "PackageLock",
+            Self::ArtifactIo => "ArtifactIo",
+            Self::HashMismatch => "HashMismatch",
+            Self::Build => "Build",
+            Self::SourceFreeBoundary => "SourceFreeBoundary",
+            Self::FastVerifier => "FastVerifier",
+            Self::ReferenceVerifier => "ReferenceVerifier",
+            Self::ExternalVerifier => "ExternalVerifier",
+            Self::AxiomReport => "AxiomReport",
+            Self::TheoremIndex => "TheoremIndex",
+            Self::GeneratedArtifact => "GeneratedArtifact",
+            Self::PackagePolicy => "PackagePolicy",
+            Self::Internal => "Internal",
+        }
+    }
+
+    fn exit_code(self) -> CommandExitCode {
+        match self {
+            Self::Usage | Self::Internal => CommandExitCode::UsageOrInternal,
+            Self::PackageManifest
+            | Self::PackageGraph
+            | Self::PackageLock
+            | Self::ArtifactIo
+            | Self::HashMismatch
+            | Self::Build
+            | Self::SourceFreeBoundary
+            | Self::FastVerifier
+            | Self::ReferenceVerifier
+            | Self::ExternalVerifier
+            | Self::AxiomReport
+            | Self::TheoremIndex
+            | Self::GeneratedArtifact
+            | Self::PackagePolicy => CommandExitCode::PackageFailure,
+        }
+    }
+}
+
+/// Diagnostic severity.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DiagnosticSeverity {
+    /// Informational diagnostic.
+    Info,
+    /// Error diagnostic.
+    Error,
+}
+
+impl DiagnosticSeverity {
+    /// Stable JSON spelling.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Info => "info",
+            Self::Error => "error",
+        }
+    }
+}
+
+/// A single deterministic command diagnostic.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CommandDiagnostic {
+    /// Diagnostic category.
+    pub kind: DiagnosticKind,
+    /// Stable machine-readable reason code.
+    pub reason_code: String,
+    /// Diagnostic severity.
+    pub severity: DiagnosticSeverity,
+    /// Module name, when applicable.
+    pub module: Option<String>,
+    /// Package-relative path or manifest path, when applicable.
+    pub path: Option<String>,
+    /// Field name, when applicable.
+    pub field: Option<String>,
+    /// Expected hash, when applicable.
+    pub expected_hash: Option<String>,
+    /// Actual hash, when applicable.
+    pub actual_hash: Option<String>,
+    /// Expected value, when applicable.
+    pub expected_value: Option<String>,
+    /// Actual value, when applicable.
+    pub actual_value: Option<String>,
+    /// Checker name, when applicable.
+    pub checker: Option<String>,
+}
+
+impl CommandDiagnostic {
+    /// Build an error diagnostic with the given category and reason code.
+    pub fn error(kind: DiagnosticKind, reason_code: impl Into<String>) -> Self {
+        Self {
+            kind,
+            reason_code: reason_code.into(),
+            severity: DiagnosticSeverity::Error,
+            module: None,
+            path: None,
+            field: None,
+            expected_hash: None,
+            actual_hash: None,
+            expected_value: None,
+            actual_value: None,
+            checker: None,
+        }
+    }
+
+    /// Build an informational diagnostic with the given category and reason code.
+    pub fn info(kind: DiagnosticKind, reason_code: impl Into<String>) -> Self {
+        Self {
+            kind,
+            reason_code: reason_code.into(),
+            severity: DiagnosticSeverity::Info,
+            module: None,
+            path: None,
+            field: None,
+            expected_hash: None,
+            actual_hash: None,
+            expected_value: None,
+            actual_value: None,
+            checker: None,
+        }
+    }
+
+    /// Attach a package-relative path or manifest path.
+    pub fn with_path(mut self, path: impl Into<String>) -> Self {
+        self.path = Some(path.into());
+        self
+    }
+
+    /// Attach a module name.
+    pub fn with_module(mut self, module: impl Into<String>) -> Self {
+        self.module = Some(module.into());
+        self
+    }
+
+    /// Attach a field name.
+    pub fn with_field(mut self, field: impl Into<String>) -> Self {
+        self.field = Some(field.into());
+        self
+    }
+
+    /// Attach an expected value.
+    pub fn with_expected_value(mut self, expected_value: impl Into<String>) -> Self {
+        self.expected_value = Some(expected_value.into());
+        self
+    }
+
+    /// Attach an actual value.
+    pub fn with_actual_value(mut self, actual_value: impl Into<String>) -> Self {
+        self.actual_value = Some(actual_value.into());
+        self
+    }
+
+    /// Attach the checker implementation that produced or owns the result.
+    pub fn with_checker(mut self, checker: impl Into<String>) -> Self {
+        self.checker = Some(checker.into());
+        self
+    }
+
+    /// Attach expected and actual hash values.
+    pub fn with_hashes(
+        mut self,
+        expected_hash: impl Into<String>,
+        actual_hash: impl Into<String>,
+    ) -> Self {
+        self.expected_hash = Some(expected_hash.into());
+        self.actual_hash = Some(actual_hash.into());
+        self
+    }
+
+    /// Convert a CLI usage parser error into a command diagnostic.
+    pub fn from_usage_error(error: &CliUsageError) -> Self {
+        let mut diagnostic = Self::error(DiagnosticKind::Usage, error.reason.reason_code());
+        diagnostic.field = error.flag.clone();
+        diagnostic.actual_value = error.value.clone();
+        diagnostic
+    }
+
+    /// Convert an `npa-package` manifest error into a command diagnostic.
+    pub fn from_package_manifest_error(error: &npa_package::PackageManifestError) -> Self {
+        let kind = match error.kind {
+            npa_package::PackageManifestErrorKind::Graph => DiagnosticKind::PackageGraph,
+            _ => DiagnosticKind::PackageManifest,
+        };
+        Self {
+            kind,
+            reason_code: error.reason_code.as_str().to_owned(),
+            severity: DiagnosticSeverity::Error,
+            module: None,
+            path: Some(error.path.clone()),
+            field: error.field.clone(),
+            expected_hash: None,
+            actual_hash: None,
+            expected_value: error.expected_value.clone(),
+            actual_value: error.actual_value.clone(),
+            checker: None,
+        }
+    }
+
+    /// Convert an `npa-package` lock error into a command diagnostic.
+    pub fn from_package_lock_error(error: &npa_package::PackageLockError) -> Self {
+        let kind = match error.kind {
+            _ if is_lock_hash_mismatch(error.reason_code) => DiagnosticKind::HashMismatch,
+            npa_package::PackageLockErrorKind::ArtifactIo => DiagnosticKind::ArtifactIo,
+            npa_package::PackageLockErrorKind::Graph => DiagnosticKind::PackageGraph,
+            _ => DiagnosticKind::PackageLock,
+        };
+        let mut diagnostic = Self {
+            kind,
+            reason_code: error.reason_code.as_str().to_owned(),
+            severity: DiagnosticSeverity::Error,
+            module: error.module.as_ref().map(|module| module.to_string()),
+            path: Some(error.path.clone()),
+            field: error.field.clone(),
+            expected_hash: None,
+            actual_hash: None,
+            expected_value: error.expected_value.clone(),
+            actual_value: error.actual_value.clone(),
+            checker: None,
+        };
+        if kind == DiagnosticKind::HashMismatch {
+            diagnostic.expected_hash = error.expected_value.clone();
+            diagnostic.actual_hash = error.actual_value.clone();
+            diagnostic.expected_value = None;
+            diagnostic.actual_value = None;
+        }
+        diagnostic
+    }
+
+    fn render_human(&self) -> String {
+        let mut message = format!(
+            "{} {} {}",
+            self.severity.as_str(),
+            self.kind.as_str(),
+            self.reason_code
+        );
+        if let Some(path) = &self.path {
+            message.push_str(&format!(" path={path}"));
+        }
+        if let Some(module) = &self.module {
+            message.push_str(&format!(" module={module}"));
+        }
+        if let Some(field) = &self.field {
+            message.push_str(&format!(" field={field}"));
+        }
+        if let Some(expected) = &self.expected_value {
+            message.push_str(&format!(" expected={expected}"));
+        }
+        if let Some(actual) = &self.actual_value {
+            message.push_str(&format!(" actual={actual}"));
+        }
+        if let Some(expected) = &self.expected_hash {
+            message.push_str(&format!(" expected_hash={expected}"));
+        }
+        if let Some(actual) = &self.actual_hash {
+            message.push_str(&format!(" actual_hash={actual}"));
+        }
+        message
+    }
+}
+
+fn is_lock_hash_mismatch(reason: npa_package::PackageLockErrorReason) -> bool {
+    matches!(
+        reason,
+        npa_package::PackageLockErrorReason::CertificateFileHashMismatch
+            | npa_package::PackageLockErrorReason::ExportHashMismatch
+            | npa_package::PackageLockErrorReason::AxiomReportHashMismatch
+            | npa_package::PackageLockErrorReason::CertificateHashMismatch
+            | npa_package::PackageLockErrorReason::LockImportExportHashMismatch
+            | npa_package::PackageLockErrorReason::LockImportCertificateHashMismatch
+    )
+}
+
+/// A command-owned artifact entry for command results.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CommandArtifact {
+    /// Artifact category.
+    pub kind: String,
+    /// Package-relative artifact path.
+    pub path: String,
+}
+
+/// A single command timing metric in milliseconds.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CommandTimingMetric {
+    /// Stable JSON field name, including the `_ms` unit suffix.
+    pub field: String,
+    /// Elapsed milliseconds for this phase.
+    pub milliseconds: u128,
+}
+
+/// Optional package command timing telemetry.
+///
+/// Timing telemetry is informational only: it is neither proof evidence nor
+/// build evidence, and it must not influence command pass/fail behavior.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CommandTimings {
+    /// Requested timing mode label.
+    pub mode: String,
+    /// Stable timing metrics in render order.
+    pub metrics: Vec<CommandTimingMetric>,
+}
+
+/// Deterministic command result.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CommandResult {
+    /// Command name.
+    pub command: String,
+    /// Sanitized root display string.
+    pub root: String,
+    /// Aggregate status.
+    pub status: CommandStatus,
+    /// Structured diagnostics.
+    pub diagnostics: Vec<CommandDiagnostic>,
+    /// Command-owned artifacts.
+    pub artifacts: Vec<CommandArtifact>,
+    /// Optional informational timing telemetry.
+    pub timings: Option<Box<CommandTimings>>,
+}
+
+impl CommandResult {
+    /// Build a successful command result.
+    pub fn passed(command: impl Into<String>, root: impl Into<String>) -> Self {
+        Self {
+            command: command.into(),
+            root: root.into(),
+            status: CommandStatus::Passed,
+            diagnostics: Vec::new(),
+            artifacts: Vec::new(),
+            timings: None,
+        }
+    }
+
+    /// Build a failed command result.
+    pub fn failed(
+        command: impl Into<String>,
+        root: impl Into<String>,
+        diagnostics: Vec<CommandDiagnostic>,
+    ) -> Self {
+        Self {
+            command: command.into(),
+            root: root.into(),
+            status: CommandStatus::Failed,
+            diagnostics,
+            artifacts: Vec::new(),
+            timings: None,
+        }
+    }
+
+    /// Build a failed command result from a usage error.
+    pub fn usage_error(
+        command: impl Into<String>,
+        root: impl Into<String>,
+        error: &CliUsageError,
+    ) -> Self {
+        Self::failed(
+            command,
+            root,
+            vec![CommandDiagnostic::from_usage_error(error)],
+        )
+    }
+
+    /// Return the process exit class for this result.
+    pub fn exit_code(&self) -> CommandExitCode {
+        if self.status == CommandStatus::Passed {
+            return CommandExitCode::Success;
+        }
+        self.diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.kind.exit_code())
+            .max_by_key(|code| code.as_u8())
+            .unwrap_or(CommandExitCode::UsageOrInternal)
+    }
+
+    /// Attach informational timing telemetry to the command result.
+    pub fn with_timings(mut self, timings: CommandTimings) -> Self {
+        self.timings = Some(Box::new(timings));
+        self
+    }
+
+    /// Render deterministic JSON.
+    pub fn render_json(&self) -> String {
+        let mut output = String::new();
+        output.push('{');
+        push_json_pair(
+            &mut output,
+            "schema",
+            &JsonValue::String(PACKAGE_COMMAND_RESULT_SCHEMA),
+            true,
+        );
+        push_json_pair(
+            &mut output,
+            "command",
+            &JsonValue::String(&self.command),
+            false,
+        );
+        push_json_pair(&mut output, "root", &JsonValue::String(&self.root), false);
+        push_json_pair(
+            &mut output,
+            "status",
+            &JsonValue::String(self.status.as_str()),
+            false,
+        );
+        output.push_str(",\"diagnostics\":");
+        push_diagnostics_json(&mut output, &self.diagnostics);
+        output.push_str(",\"artifacts\":");
+        push_artifacts_json(&mut output, &self.artifacts);
+        if let Some(timings) = &self.timings {
+            output.push_str(",\"timings\":");
+            push_timings_json(&mut output, timings);
+        }
+        output.push('}');
+        output
+    }
+
+    /// Render deterministic human text from the structured result.
+    pub fn render_human(&self) -> String {
+        let mut lines = vec![format!("{}: {}", self.command, self.status.as_str())];
+        lines.extend(self.diagnostics.iter().map(CommandDiagnostic::render_human));
+        lines.join("\n")
+    }
+}
+
+enum JsonValue<'a> {
+    String(&'a str),
+    Bool(bool),
+    U128(u128),
+}
+
+fn push_json_pair(output: &mut String, key: &str, value: &JsonValue<'_>, first: bool) {
+    if !first {
+        output.push(',');
+    }
+    push_json_string(output, key);
+    output.push(':');
+    push_json_value(output, value);
+}
+
+fn push_json_value(output: &mut String, value: &JsonValue<'_>) {
+    match value {
+        JsonValue::String(value) => push_json_string(output, value),
+        JsonValue::Bool(value) => output.push_str(if *value { "true" } else { "false" }),
+        JsonValue::U128(value) => write!(output, "{value}").expect("write to String cannot fail"),
+    }
+}
+
+fn push_diagnostics_json(output: &mut String, diagnostics: &[CommandDiagnostic]) {
+    output.push('[');
+    for (index, diagnostic) in diagnostics.iter().enumerate() {
+        if index > 0 {
+            output.push(',');
+        }
+        output.push('{');
+        push_json_pair(
+            output,
+            "kind",
+            &JsonValue::String(diagnostic.kind.as_str()),
+            true,
+        );
+        push_json_pair(
+            output,
+            "reason_code",
+            &JsonValue::String(&diagnostic.reason_code),
+            false,
+        );
+        push_json_pair(
+            output,
+            "severity",
+            &JsonValue::String(diagnostic.severity.as_str()),
+            false,
+        );
+        push_optional_json_pair(output, "module", diagnostic.module.as_deref());
+        push_optional_json_pair(output, "path", diagnostic.path.as_deref());
+        push_optional_json_pair(output, "field", diagnostic.field.as_deref());
+        push_optional_json_pair(output, "expected_hash", diagnostic.expected_hash.as_deref());
+        push_optional_json_pair(output, "actual_hash", diagnostic.actual_hash.as_deref());
+        push_optional_json_pair(
+            output,
+            "expected_value",
+            diagnostic.expected_value.as_deref(),
+        );
+        push_optional_json_pair(output, "actual_value", diagnostic.actual_value.as_deref());
+        push_optional_json_pair(output, "checker", diagnostic.checker.as_deref());
+        output.push('}');
+    }
+    output.push(']');
+}
+
+fn push_artifacts_json(output: &mut String, artifacts: &[CommandArtifact]) {
+    output.push('[');
+    for (index, artifact) in artifacts.iter().enumerate() {
+        if index > 0 {
+            output.push(',');
+        }
+        output.push('{');
+        push_json_pair(output, "kind", &JsonValue::String(&artifact.kind), true);
+        push_json_pair(output, "path", &JsonValue::String(&artifact.path), false);
+        output.push('}');
+    }
+    output.push(']');
+}
+
+fn push_timings_json(output: &mut String, timings: &CommandTimings) {
+    output.push('{');
+    push_json_pair(
+        output,
+        "schema",
+        &JsonValue::String(PACKAGE_TIMINGS_SCHEMA),
+        true,
+    );
+    push_json_pair(output, "mode", &JsonValue::String(&timings.mode), false);
+    push_json_pair(output, "unit", &JsonValue::String("ms"), false);
+    push_json_pair(output, "proof_evidence", &JsonValue::Bool(false), false);
+    push_json_pair(output, "build_evidence", &JsonValue::Bool(false), false);
+    for metric in &timings.metrics {
+        push_json_pair(
+            output,
+            &metric.field,
+            &JsonValue::U128(metric.milliseconds),
+            false,
+        );
+    }
+    output.push('}');
+}
+
+fn push_optional_json_pair(output: &mut String, key: &str, value: Option<&str>) {
+    if let Some(value) = value {
+        output.push(',');
+        push_json_string(output, key);
+        output.push(':');
+        push_json_string(output, value);
+    }
+}
+
+fn push_json_string(output: &mut String, value: &str) {
+    output.push('"');
+    for character in value.chars() {
+        match character {
+            '"' => output.push_str("\\\""),
+            '\\' => output.push_str("\\\\"),
+            '\n' => output.push_str("\\n"),
+            '\r' => output.push_str("\\r"),
+            '\t' => output.push_str("\\t"),
+            character if character.is_control() => {
+                write!(output, "\\u{:04x}", character as u32).expect("write to String cannot fail");
+            }
+            character => output.push(character),
+        }
+    }
+    output.push('"');
+}

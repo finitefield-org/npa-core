@@ -1,0 +1,20 @@
+schema = "npa.package.v0.1"
+package = "fixture-invalid"
+version = "0.1.0"
+core_spec = "npa.core.v0.1"
+kernel_profile = "npa.kernel.v0.1"
+certificate_format = "npa.certificate.canonical.v0.1"
+checker_profile = "npa.checker.reference.v0.1"
+modules = []
+
+[policy]
+allow_custom_axioms = false
+allowed_axioms = []
+
+[[imports]]
+module = "Std.Logic.Eq"
+package = "npa-std"
+version = "0.1.0"
+certificate = "vendor/npa-std/Std/Logic/Eq/certificate.npcert"
+export_hash = "sha256:bad"
+certificate_hash = "sha256:1111111111111111111111111111111111111111111111111111111111111111"

@@ -1,0 +1,35 @@
+schema = "npa.package.v0.1"
+package = "fixture-invalid"
+version = "0.1.0"
+core_spec = "npa.core.v0.1"
+kernel_profile = "npa.kernel.v0.1"
+certificate_format = "npa.certificate.canonical.v0.1"
+checker_profile = "npa.checker.reference.v0.1"
+
+[policy]
+allow_custom_axioms = false
+allowed_axioms = []
+
+[[modules]]
+module = "Fixture.Duplicate"
+source = "Fixture/Duplicate/source.npa"
+certificate = "Fixture/Duplicate/certificate.npcert"
+imports = []
+expected_source_hash = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+expected_certificate_file_hash = "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+expected_export_hash = "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+expected_axiom_report_hash = "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+expected_certificate_hash = "sha256:4444444444444444444444444444444444444444444444444444444444444444"
+axioms = []
+
+[[modules]]
+module = "Fixture.Duplicate"
+source = "Fixture/Duplicate2/source.npa"
+certificate = "Fixture/Duplicate2/certificate.npcert"
+imports = []
+expected_source_hash = "sha256:5555555555555555555555555555555555555555555555555555555555555555"
+expected_certificate_file_hash = "sha256:6666666666666666666666666666666666666666666666666666666666666666"
+expected_export_hash = "sha256:7777777777777777777777777777777777777777777777777777777777777777"
+expected_axiom_report_hash = "sha256:8888888888888888888888888888888888888888888888888888888888888888"
+expected_certificate_hash = "sha256:9999999999999999999999999999999999999999999999999999999999999999"
+axioms = []

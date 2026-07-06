@@ -1,0 +1,4 @@
+# feature	offset	expected_error_kind
+unsupported_feature_a	17	unsupported_core_feature
+unsupported_feature_b	23	unsupported_core_feature
+unsupported_feature_c	31	unsupported_core_feature

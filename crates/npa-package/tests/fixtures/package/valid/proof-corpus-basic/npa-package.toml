@@ -1,0 +1,29 @@
+schema = "npa.package.v0.1"
+package = "npa-proof-corpus"
+version = "0.1.0"
+core_spec = "npa.core.v0.1"
+kernel_profile = "npa.kernel.v0.1"
+certificate_format = "npa.certificate.canonical.v0.1"
+checker_profile = "npa.checker.reference.v0.1"
+description = "Proofs.Ai.Basic shape from proofs/manifest.toml."
+
+[policy]
+allow_custom_axioms = false
+allowed_axioms = ["Eq.rec"]
+
+[[modules]]
+module = "Proofs.Ai.Basic"
+source = "Proofs/Ai/Basic/source.npa"
+certificate = "Proofs/Ai/Basic/certificate.npcert"
+imports = []
+expected_source_hash = "sha256:2176be7570deae66754789868aa373ab01434512b4f50b992089886d2c655387"
+expected_certificate_file_hash = "sha256:448a3de71485d4f38e45ac7bf3b637b0e9e38d7ce215dd4847a2a2188099ee21"
+expected_export_hash = "sha256:6cbf881b56f61d413c2584eb9b1cdd6fb09e504f6ff6c855fa73ee55d763b839"
+expected_axiom_report_hash = "sha256:fed11e73accfbfb0dfc28b4f510e151fa33d8af82d58fdb23b92567e04e59e40"
+expected_certificate_hash = "sha256:7a50b381af353fe15c0b602fad60f4b9d5f70613dfe6f47832da2d8c11b391dd"
+meta = "Proofs/Ai/Basic/meta.json"
+replay = "Proofs/Ai/Basic/replay.json"
+producer_profile = "human-surface-explicit-term"
+definitions = []
+theorems = ["id", "const_left", "const_right", "apply_fn", "compose"]
+axioms = []

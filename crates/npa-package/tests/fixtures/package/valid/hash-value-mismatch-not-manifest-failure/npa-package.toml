@@ -1,0 +1,27 @@
+# The paths are intentionally not real artifacts. Manifest validation checks
+# hash grammar and graph policy only; byte comparison belongs to check-hashes.
+schema = "npa.package.v0.1"
+package = "fixture-hash-mismatch"
+version = "0.1.0"
+core_spec = "npa.core.v0.1"
+kernel_profile = "npa.kernel.v0.1"
+certificate_format = "npa.certificate.canonical.v0.1"
+checker_profile = "npa.checker.reference.v0.1"
+
+[policy]
+allow_custom_axioms = false
+allowed_axioms = []
+
+[[modules]]
+module = "Fixture.HashMismatch"
+source = "Missing/Source/source.npa"
+certificate = "Missing/Source/certificate.npcert"
+imports = []
+expected_source_hash = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+expected_certificate_file_hash = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+expected_export_hash = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+expected_axiom_report_hash = "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+expected_certificate_hash = "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+definitions = []
+theorems = ["hash_mismatch_is_not_manifest_failure"]
+axioms = []

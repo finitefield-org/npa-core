@@ -1,0 +1,56 @@
+schema = "npa.package.v0.1"
+package = "npa-proof-corpus"
+version = "0.1.0"
+core_spec = "npa.core.v0.1"
+kernel_profile = "npa.kernel.v0.1"
+certificate_format = "npa.certificate.canonical.v0.1"
+checker_profile = "npa.checker.reference.v0.1"
+description = "Proof-corpus-shaped fixture with hash-pinned Std imports."
+
+[policy]
+allow_custom_axioms = false
+allowed_axioms = ["Eq.rec"]
+
+[[imports]]
+module = "Std.Logic.Eq"
+package = "npa-std"
+version = "0.1.0"
+certificate = "vendor/npa-std/Std/Logic/Eq/certificate.npcert"
+export_hash = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+certificate_hash = "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+
+[[imports]]
+module = "Std.Nat.Basic"
+package = "npa-std"
+version = "0.1.0"
+certificate = "vendor/npa-std/Std/Nat/Basic/certificate.npcert"
+export_hash = "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+certificate_hash = "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+
+[[modules]]
+module = "Proofs.Ai.Eq"
+source = "Proofs/Ai/Eq/source.npa"
+certificate = "Proofs/Ai/Eq/certificate.npcert"
+imports = ["Std.Logic.Eq", "Std.Nat.Basic"]
+expected_source_hash = "sha256:14e178062e8df0a03db3f53d28f9315b16fe1f9cdc0a83bcdb5b08155c9ad087"
+expected_certificate_file_hash = "sha256:4b7afc156ec23739738393b0237d9a69792b0410fd96b877e6dada217274cd01"
+expected_export_hash = "sha256:80b826d1aa6c9877b2e551521e781fcfdd3777cd8aec6cd27f4000d132eb64ef"
+expected_axiom_report_hash = "sha256:bc3aec4eabbf2c61f399239a21f359b264c36873e750ed25c9059fee86484bea"
+expected_certificate_hash = "sha256:7e350cb254c1051cb59b9268ef85947a6b618f24607ce71d7fe912ab48019b45"
+definitions = []
+theorems = ["eq_refl_self", "eq_refl_fn_app", "eq_self_imp"]
+axioms = []
+
+[[modules]]
+module = "Proofs.Ai.Nat"
+source = "Proofs/Ai/Nat/source.npa"
+certificate = "Proofs/Ai/Nat/certificate.npcert"
+imports = ["Std.Logic.Eq", "Std.Nat.Basic"]
+expected_source_hash = "sha256:a7423d6facef0e0b5ddf3df54c696247561298d0187fcc7c1489bf5d84a0aa21"
+expected_certificate_file_hash = "sha256:fe8970a02c79bdcec02ff02b540d551d749b1b02e2dde2b5a6063a6f06522a6f"
+expected_export_hash = "sha256:15e6dc1cf805917041c5437a3ee62cc2ebcb2fda50bc86f62bd75ab5edc9dd89"
+expected_axiom_report_hash = "sha256:7715c06c634de0020345067c58ecf3bd23c10e71d84f4b97cd4c2e00e82c1a07"
+expected_certificate_hash = "sha256:2b54ef5d31aa8b7723af87184ebd3cc37f0263a36728fe4d4b9bdb09f4af5707"
+definitions = []
+theorems = ["nat_zero_self_eq", "nat_succ_zero_self_eq", "nat_id"]
+axioms = []

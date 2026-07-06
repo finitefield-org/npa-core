@@ -1,0 +1,35 @@
+[workspace]
+members = [
+    "crates/npa-kernel",
+    "crates/npa-cert",
+    "crates/npa-package",
+    "crates/npa-checker-ref",
+    "crates/npa-frontend",
+    "crates/npa-api",
+    "crates/npa-tactic",
+    "crates/npa-cli",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/finitefield-org/npa-core"
+
+[profile.dev.package.npa-kernel]
+opt-level = 3
+
+[profile.dev.package.npa-cert]
+opt-level = 3
+
+[profile.dev.package.npa-checker-ref]
+opt-level = 3
+
+[profile.dev.package.npa-package]
+opt-level = 3
+
+[profile.dev.package.sha2]
+opt-level = 3
+
+[profile.dev.package.npa-frontend]
+opt-level = 3
