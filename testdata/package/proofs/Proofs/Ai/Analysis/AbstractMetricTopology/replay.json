@@ -1,0 +1,117 @@
+{
+  "schema": "npa-ai-proof-replay-v0.1",
+  "module": "Proofs.Ai.Analysis.AbstractMetricTopology",
+  "trusted": false,
+  "profile": "explicit_term_source_certificate_handoff",
+  "steps": [
+    {
+      "declaration": "MetricBall",
+      "source_kind": "explicit_def_value",
+      "term": "fun X => fun R => fun dist => fun lt => fun center => fun radius => fun x => lt (dist center x) radius"
+    },
+    {
+      "declaration": "Neighborhood",
+      "source_kind": "explicit_def_value",
+      "term": "fun X => fun center => fun domain => domain center"
+    },
+    {
+      "declaration": "LocalMem",
+      "source_kind": "explicit_def_value",
+      "term": "fun X => fun domain => fun x => domain x"
+    },
+    {
+      "declaration": "LocalPred",
+      "source_kind": "explicit_def_value",
+      "term": "fun X => fun domain => fun P => forall (x : X), forall (hx : domain x), P x"
+    },
+    {
+      "declaration": "LocalEq",
+      "source_kind": "explicit_def_value",
+      "term": "fun X => fun Y => fun domain => fun f => fun g => forall (x : X), forall (hx : domain x), @Eq.{v} Y (f x) (g x)"
+    },
+    {
+      "declaration": "LocalUnique",
+      "source_kind": "explicit_def_value",
+      "term": "fun X => fun Y => fun domain => fun predicate => fun candidate => forall (other : forall (x : X), Y), forall (other_sol : forall (x : X), forall (hx : domain x), predicate x (other x)), forall (candidate_sol : forall (x : X), forall (hx : domain x), predicate x (candidate x)), @LocalEq.{u,v} X Y domain other candidate"
+    },
+    {
+      "declaration": "metric_ball_intro",
+      "source_kind": "explicit_term",
+      "term": "fun X => fun R => fun dist => fun lt => fun center => fun radius => fun x => fun h => h"
+    },
+    {
+      "declaration": "metric_ball_elim",
+      "source_kind": "explicit_term",
+      "term": "fun X => fun R => fun dist => fun lt => fun center => fun radius => fun x => fun h => h"
+    },
+    {
+      "declaration": "neighborhood_intro",
+      "source_kind": "explicit_term",
+      "term": "fun X => fun center => fun domain => fun h => h"
+    },
+    {
+      "declaration": "neighborhood_center",
+      "source_kind": "explicit_term",
+      "term": "fun X => fun center => fun domain => fun h => h"
+    },
+    {
+      "declaration": "neighborhood_shrink",
+      "source_kind": "explicit_term",
+      "term": "fun X => fun center => fun larger => fun smaller => fun sub => fun h => sub center h"
+    },
+    {
+      "declaration": "local_mem_intro",
+      "source_kind": "explicit_term",
+      "term": "fun X => fun domain => fun x => fun h => h"
+    },
+    {
+      "declaration": "local_mem_elim",
+      "source_kind": "explicit_term",
+      "term": "fun X => fun domain => fun x => fun h => h"
+    },
+    {
+      "declaration": "local_pred_intro",
+      "source_kind": "explicit_term",
+      "term": "fun X => fun domain => fun P => fun h => h"
+    },
+    {
+      "declaration": "local_pred_apply",
+      "source_kind": "explicit_term",
+      "term": "fun X => fun domain => fun P => fun local => fun x => fun hx => local x hx"
+    },
+    {
+      "declaration": "local_pred_shrink",
+      "source_kind": "explicit_term",
+      "term": "fun X => fun larger => fun smaller => fun P => fun sub => fun local => fun (x : X) => fun (hx : smaller x) => local x (sub x hx)"
+    },
+    {
+      "declaration": "metric_ball_mono",
+      "source_kind": "explicit_term",
+      "term": "fun X => fun R => fun dist => fun lt => fun center => fun r1 => fun r2 => fun h_le => fun (x : X) => fun (hx : @MetricBall.{u,v} X R dist lt center r1 x) => h_le x hx"
+    },
+    {
+      "declaration": "local_eq_refl",
+      "source_kind": "explicit_term",
+      "term": "fun X => fun Y => fun domain => fun f => fun (x : X) => fun (hx : domain x) => @Eq.refl.{v} Y (f x)"
+    },
+    {
+      "declaration": "local_eq_symm",
+      "source_kind": "explicit_term",
+      "term": "fun X => fun Y => fun domain => fun f => fun g => fun h => fun (x : X) => fun (hx : domain x) => @eq_symm.{v} Y (f x) (g x) (h x hx)"
+    },
+    {
+      "declaration": "local_eq_trans",
+      "source_kind": "explicit_term",
+      "term": "fun X => fun Y => fun domain => fun f => fun g => fun k => fun hfg => fun hgk => fun (x : X) => fun (hx : domain x) => @eq_trans.{v} Y (f x) (g x) (k x) (hfg x hx) (hgk x hx)"
+    },
+    {
+      "declaration": "local_unique_apply",
+      "source_kind": "explicit_term",
+      "term": "fun X => fun Y => fun domain => fun predicate => fun candidate => fun uniq => fun other => fun other_sol => fun candidate_sol => uniq other other_sol candidate_sol"
+    }
+  ],
+  "acceptance": {
+    "required": ["decode_module_cert", "verify_module_cert"],
+    "accepted_artifact": "Proofs/Ai/Analysis/AbstractMetricTopology/certificate.npcert"
+  }
+}

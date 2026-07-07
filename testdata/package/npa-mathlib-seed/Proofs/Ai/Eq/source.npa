@@ -1,0 +1,46 @@
+import Std.Logic.Eq
+import Std.Nat.Basic
+
+theorem eq_refl_self.{u} :
+  forall (A : Sort u), forall (x : A), @Eq.{u} A x x :=
+  fun A => fun x => @Eq.refl.{u} A x
+
+theorem eq_refl_fn_app.{u,v} :
+  forall (A : Sort u), forall (B : Sort v), forall (f : forall (x : A), B), forall (x : A), @Eq.{v} B (f x) (f x) :=
+  fun A => fun B => fun f => fun x => @Eq.refl.{v} B (f x)
+
+theorem eq_refl_compose.{u,v,w} :
+  forall (A : Sort u), forall (B : Sort v), forall (C : Sort w), forall (f : forall (x : B), C), forall (g : forall (x : A), B), forall (x : A), @Eq.{w} C (f (g x)) (f (g x)) :=
+  fun A => fun B => fun C => fun f => fun g => fun x => @Eq.refl.{w} C (f (g x))
+
+theorem eq_self_imp.{u} :
+  forall (A : Sort u), forall (x : A), forall (h : @Eq.{u} A x x), @Eq.{u} A x x :=
+  fun A => fun x => fun h => h
+
+theorem eq_refl_prop :
+  forall (P : Prop), forall (p : P), @Eq.{0} P p p :=
+  fun P => fun p => @Eq.refl.{0} P p
+
+theorem eq_refl_apply_twice.{u} :
+  forall (A : Sort u), forall (f : forall (x : A), A), forall (x : A), @Eq.{u} A (f (f x)) (f (f x)) :=
+  fun A => fun f => fun x => @Eq.refl.{u} A (f (f x))
+
+theorem eq_refl_higher_apply.{u,v,w} :
+  forall (A : Sort u), forall (B : Sort v), forall (C : Sort w), forall (h : forall (f : forall (x : A), B), C), forall (f : forall (x : A), B), @Eq.{w} C (h f) (h f) :=
+  fun A => fun B => fun C => fun h => fun f => @Eq.refl.{w} C (h f)
+
+theorem eq_refl_nested_compose.{u,v,w,z} :
+  forall (A : Sort u), forall (B : Sort v), forall (C : Sort w), forall (D : Sort z), forall (f : forall (x : C), D), forall (g : forall (x : B), C), forall (h : forall (x : A), B), forall (x : A), @Eq.{z} D (f (g (h x))) (f (g (h x))) :=
+  fun A => fun B => fun C => fun D => fun f => fun g => fun h => fun x => @Eq.refl.{z} D (f (g (h x)))
+
+theorem eq_refl_prop_apply :
+  forall (P : Prop), forall (Q : Prop), forall (h : forall (p : P), Q), forall (p : P), @Eq.{0} Q (h p) (h p) :=
+  fun P => fun Q => fun h => fun p => @Eq.refl.{0} Q (h p)
+
+theorem eq_local_passthrough.{u} :
+  forall (A : Sort u), forall (x : A), forall (h : @Eq.{u} A x x), @Eq.{u} A x x :=
+  fun A => fun x => fun h => h
+
+theorem eq_refl_nat_function :
+  forall (f : forall (n : Nat), Nat), forall (n : Nat), @Eq.{1} Nat (f n) (f n) :=
+  fun f => fun n => @Eq.refl.{1} Nat (f n)

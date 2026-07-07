@@ -1,0 +1,71 @@
+{
+  "schema": "npa-ai-proof-meta-v0.1",
+  "module": "Mathlib.Data.Nat.Basic",
+  "source": "Mathlib/Data/Nat/Basic/source.npa",
+  "certificate": "Mathlib/Data/Nat/Basic/certificate.npcert",
+  "producer_profile": "human-surface-explicit-term",
+  "trusted_status": "verified_by_certificate",
+  "source_sha256": "sha256:f899f8fcded51dfeef0f37960bb6050d50de22e134e076b6f44805d939bea8cd",
+  "certificate_file_sha256": "sha256:d60f3e74b958bcd3896df5226816de079a5673b65f6cdc6489760305bbb982ec",
+  "export_hash": "sha256:9fc6d82aad7043992d726def9add7c2bf1b81c529923ee28143f6127d3ea5f13",
+  "axiom_report_hash": "sha256:7715c06c634de0020345067c58ecf3bd23c10e71d84f4b97cd4c2e00e82c1a07",
+  "certificate_hash": "sha256:e01b724ffa5ccb171b673f8431716ac42f846d6b70cbee0e59c5216775fa5cc4",
+  "imports": [
+    "Std.Logic.Eq",
+    "Std.Nat.Basic"
+  ],
+  "axioms": [
+
+  ],
+  "declarations": [
+    {
+      "name": "nat_zero_self_eq",
+      "kind": "theorem"
+    },
+    {
+      "name": "nat_succ_zero_self_eq",
+      "kind": "theorem"
+    },
+    {
+      "name": "nat_id",
+      "kind": "theorem"
+    },
+    {
+      "name": "nat_const_zero",
+      "kind": "theorem"
+    },
+    {
+      "name": "nat_apply_fn",
+      "kind": "theorem"
+    },
+    {
+      "name": "nat_const_succ_zero",
+      "kind": "theorem"
+    },
+    {
+      "name": "nat_apply_twice",
+      "kind": "theorem"
+    },
+    {
+      "name": "nat_compose",
+      "kind": "theorem"
+    },
+    {
+      "name": "nat_ignore_middle",
+      "kind": "theorem"
+    },
+    {
+      "name": "nat_select_middle",
+      "kind": "theorem"
+    },
+    {
+      "name": "nat_select_last",
+      "kind": "theorem"
+    },
+    {
+      "name": "nat_succ_self_eq",
+      "kind": "theorem"
+    }
+  ],
+  "trust_boundary": "source, replay, and metadata are non-trusted sidecars; only the canonical certificate verified by npa-cert is accepted"
+}

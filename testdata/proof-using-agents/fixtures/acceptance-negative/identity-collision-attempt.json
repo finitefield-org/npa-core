@@ -1,0 +1,6 @@
+{
+  "id": "identity-collision-attempt",
+  "kind": "identity_collision_attempt",
+  "rejection_kind": "identity_collision_rejected",
+  "blocked_target_state": "integrated"
+}

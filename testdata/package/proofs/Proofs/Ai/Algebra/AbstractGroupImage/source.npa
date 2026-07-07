@@ -1,0 +1,27 @@
+import Std.Logic.Eq
+import Proofs.Ai.EqReasoning
+import Proofs.Ai.Algebra.AbstractGroup
+
+def ImagePred.{u,v} :
+  forall (G : Sort u), forall (H : Sort v), forall (f : forall (x : G), H), forall (y : H), Prop :=
+  fun G => fun H => fun f => fun y => forall (P : Prop), forall (mk : forall (a : G), forall (h : @Eq.{v} H (f a) y), P), P
+
+theorem image_intro.{u,v} :
+  forall (G : Sort u), forall (H : Sort v), forall (f : forall (x : G), H), forall (a : G), @ImagePred.{u,v} G H f (f a) :=
+  fun G => fun H => fun f => fun a => fun (P : Prop) => fun (mk : forall (b : G), forall (h : @Eq.{v} H (f b) (f a)), P) => mk a (@Eq.refl.{v} H (f a))
+
+theorem image_elim.{u,v} :
+  forall (G : Sort u), forall (H : Sort v), forall (f : forall (x : G), H), forall (y : H), forall (img : @ImagePred.{u,v} G H f y), forall (P : Prop), forall (mk : forall (a : G), forall (h : @Eq.{v} H (f a) y), P), P :=
+  fun G => fun H => fun f => fun y => fun img => fun P => fun mk => img P mk
+
+theorem image_one.{u,v} :
+  forall (G : Sort u), forall (oneG : G), forall (mulG : forall (a : G), forall (b : G), G), forall (invG : forall (a : G), G), forall (H : Sort v), forall (oneH : H), forall (mulH : forall (a : H), forall (b : H), H), forall (invH : forall (a : H), H), forall (f : forall (x : G), H), forall (hom_args : @GroupHomLawArgs.{u,v} G oneG mulG invG H oneH mulH invH f), @ImagePred.{u,v} G H f oneH :=
+  fun G => fun oneG => fun mulG => fun invG => fun H => fun oneH => fun mulH => fun invH => fun f => fun hom_args => fun (P : Prop) => fun (mk : forall (a : G), forall (h : @Eq.{v} H (f a) oneH), P) => mk oneG (@hom_one.{u,v} G oneG mulG invG H oneH mulH invH f hom_args)
+
+theorem image_mul_closed.{u,v} :
+  forall (G : Sort u), forall (oneG : G), forall (mulG : forall (a : G), forall (b : G), G), forall (invG : forall (a : G), G), forall (H : Sort v), forall (oneH : H), forall (mulH : forall (a : H), forall (b : H), H), forall (invH : forall (a : H), H), forall (f : forall (x : G), H), forall (hom_args : @GroupHomLawArgs.{u,v} G oneG mulG invG H oneH mulH invH f), forall (x : H), forall (y : H), forall (hx : @ImagePred.{u,v} G H f x), forall (hy : @ImagePred.{u,v} G H f y), @ImagePred.{u,v} G H f (mulH x y) :=
+  fun G => fun oneG => fun mulG => fun invG => fun H => fun oneH => fun mulH => fun invH => fun f => fun hom_args => fun x => fun y => fun hx => fun hy => hx (@ImagePred.{u,v} G H f (mulH x y)) (fun (a : G) => fun (hax : @Eq.{v} H (f a) x) => hy (@ImagePred.{u,v} G H f (mulH x y)) (fun (b : G) => fun (hby : @Eq.{v} H (f b) y) => fun (P : Prop) => fun (mk : forall (c : G), forall (h : @Eq.{v} H (f c) (mulH x y)), P) => mk (mulG a b) (@eq_trans.{v} H (f (mulG a b)) (mulH (f a) (f b)) (mulH x y) (@hom_mul.{u,v} G oneG mulG invG H oneH mulH invH f hom_args a b) (@eq_congr2.{v,v,v} H H H mulH (f a) x (f b) y hax hby))))
+
+theorem image_inv_closed.{u,v} :
+  forall (G : Sort u), forall (oneG : G), forall (mulG : forall (a : G), forall (b : G), G), forall (invG : forall (a : G), G), forall (H : Sort v), forall (oneH : H), forall (mulH : forall (a : H), forall (b : H), H), forall (invH : forall (a : H), H), forall (f : forall (x : G), H), forall (hom_args : @GroupHomLawArgs.{u,v} G oneG mulG invG H oneH mulH invH f), forall (y : H), forall (hy : @ImagePred.{u,v} G H f y), @ImagePred.{u,v} G H f (invH y) :=
+  fun G => fun oneG => fun mulG => fun invG => fun H => fun oneH => fun mulH => fun invH => fun f => fun hom_args => fun y => fun hy => hy (@ImagePred.{u,v} G H f (invH y)) (fun (a : G) => fun (hay : @Eq.{v} H (f a) y) => fun (P : Prop) => fun (mk : forall (c : G), forall (h : @Eq.{v} H (f c) (invH y)), P) => mk (invG a) (@eq_trans.{v} H (f (invG a)) (invH (f a)) (invH y) (@hom_inv.{u,v} G oneG mulG invG H oneH mulH invH f hom_args a) (@eq_congr_arg.{v,v} H H invH (f a) y hay)))

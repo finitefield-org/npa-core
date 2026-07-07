@@ -1,0 +1,6 @@
+{
+  "id": "sorry-axiom-injection",
+  "kind": "sorry_axiom_injection",
+  "rejection_kind": "sorry_axiom_policy_rejected",
+  "blocked_target_state": "certificate_verified"
+}

@@ -1,0 +1,42 @@
+{
+  "schema": "npa-ai-proof-replay-v0.1",
+  "module": "Mathlib.Core.Reduction",
+  "trusted": false,
+  "profile": "explicit_term_source_certificate_handoff",
+  "steps": [
+    {
+      "declaration": "reduction_id_nat",
+      "source_kind": "explicit_def_value",
+      "term": "fun n => n"
+    },
+    {
+      "declaration": "beta_id_nat",
+      "source_kind": "explicit_term",
+      "term": "fun n => (fun (x : Nat) => x) n"
+    },
+    {
+      "declaration": "beta_const_nat",
+      "source_kind": "explicit_term",
+      "term": "fun n => fun m => (fun (x : Nat) => fun (y : Nat) => x) n m"
+    },
+    {
+      "declaration": "let_id_nat",
+      "source_kind": "explicit_term",
+      "term": "fun n => let x : Nat := n in x"
+    },
+    {
+      "declaration": "let_const_nat",
+      "source_kind": "explicit_term",
+      "term": "fun n => let z : Nat := Nat.zero in z"
+    },
+    {
+      "declaration": "delta_id_nat",
+      "source_kind": "explicit_term",
+      "term": "reduction_id_nat"
+    }
+  ],
+  "acceptance": {
+    "required": ["decode_module_cert", "verify_module_cert"],
+    "accepted_artifact": "Mathlib/Core/Reduction/certificate.npcert"
+  }
+}

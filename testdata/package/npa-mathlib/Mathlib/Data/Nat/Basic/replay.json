@@ -1,0 +1,72 @@
+{
+  "schema": "npa-ai-proof-replay-v0.1",
+  "module": "Mathlib.Data.Nat.Basic",
+  "trusted": false,
+  "profile": "explicit_term_source_certificate_handoff",
+  "steps": [
+    {
+      "declaration": "nat_zero_self_eq",
+      "source_kind": "explicit_term",
+      "term": "@Eq.refl.{1} Nat Nat.zero"
+    },
+    {
+      "declaration": "nat_succ_zero_self_eq",
+      "source_kind": "explicit_term",
+      "term": "@Eq.refl.{1} Nat (Nat.succ Nat.zero)"
+    },
+    {
+      "declaration": "nat_id",
+      "source_kind": "explicit_term",
+      "term": "fun n => n"
+    },
+    {
+      "declaration": "nat_const_zero",
+      "source_kind": "explicit_term",
+      "term": "fun n => Nat.zero"
+    },
+    {
+      "declaration": "nat_apply_fn",
+      "source_kind": "explicit_term",
+      "term": "fun f => fun n => f n"
+    },
+    {
+      "declaration": "nat_const_succ_zero",
+      "source_kind": "explicit_term",
+      "term": "fun n => Nat.succ Nat.zero"
+    },
+    {
+      "declaration": "nat_apply_twice",
+      "source_kind": "explicit_term",
+      "term": "fun f => fun n => f (f n)"
+    },
+    {
+      "declaration": "nat_compose",
+      "source_kind": "explicit_term",
+      "term": "fun f => fun g => fun n => f (g n)"
+    },
+    {
+      "declaration": "nat_ignore_middle",
+      "source_kind": "explicit_term",
+      "term": "fun x => fun y => fun z => x"
+    },
+    {
+      "declaration": "nat_select_middle",
+      "source_kind": "explicit_term",
+      "term": "fun x => fun y => fun z => y"
+    },
+    {
+      "declaration": "nat_select_last",
+      "source_kind": "explicit_term",
+      "term": "fun x => fun y => fun z => z"
+    },
+    {
+      "declaration": "nat_succ_self_eq",
+      "source_kind": "explicit_term",
+      "term": "fun n => @Eq.refl.{1} Nat (Nat.succ n)"
+    }
+  ],
+  "acceptance": {
+    "required": ["decode_module_cert", "verify_module_cert"],
+    "accepted_artifact": "Mathlib/Data/Nat/Basic/certificate.npcert"
+  }
+}

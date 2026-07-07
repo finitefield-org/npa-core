@@ -1,0 +1,23 @@
+{
+  "schema": "npa-ai-proof-meta-v0.1",
+  "module": "Proofs.Ai.SketchLifecycle",
+  "source": "Proofs/Ai/SketchLifecycle/source.npa",
+  "certificate": "Proofs/Ai/SketchLifecycle/certificate.npcert",
+  "producer_profile": "human-surface-explicit-term",
+  "trusted_status": "verified_by_certificate",
+  "source_sha256": "sha256:c615c805ecc4e82c4da60462628338d1f3dea1488e01c570c387b4ff27e2d5f0",
+  "certificate_file_sha256": "sha256:1f933e9c33fd91f2df27cda227903e9f6c34167e1b5c8486e6fa0df73221efc4",
+  "export_hash": "sha256:8eec02db1932a35c035579da74472ac379b3a0ae84a679b79e17e0e562f19a13",
+  "axiom_report_hash": "sha256:7f16d2b1782fba08d09a6e6d21d98ef9ca2b9c5a9f606eccb33d66a8b479278d",
+  "certificate_hash": "sha256:9317e52856f70c4602bbcd0fbdb3c6fa2d16488c4afcfe23e0e10ee7a9c10ff0",
+  "imports": [],
+  "axioms": [],
+  "declarations": [
+    { "name": "generated_local_lemma_identity", "kind": "theorem" },
+    { "name": "generated_local_lemma_context_generalized", "kind": "theorem" },
+    { "name": "sketch_parent_lemma_a", "kind": "theorem" },
+    { "name": "sketch_parent_lemma_b_depends_on_a", "kind": "theorem" },
+    { "name": "sketch_parent_final_depends_on_a_b", "kind": "theorem" }
+  ],
+  "trust_boundary": "source, replay, and metadata are non-trusted sidecars; only the canonical certificate verified by npa-cert is accepted"
+}

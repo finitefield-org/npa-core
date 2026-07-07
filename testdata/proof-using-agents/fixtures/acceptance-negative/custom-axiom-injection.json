@@ -1,0 +1,6 @@
+{
+  "id": "custom-axiom-injection",
+  "kind": "custom_axiom_injection",
+  "rejection_kind": "custom_axiom_policy_rejected",
+  "blocked_target_state": "certificate_verified"
+}

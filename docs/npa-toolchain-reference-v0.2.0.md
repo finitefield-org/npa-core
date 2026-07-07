@@ -23,39 +23,20 @@ RUST_TOOLCHAIN_VERSION = 1.95.0
 `NPA_GIT_COMMIT` is also supported when a repository wants to pin the full
 40-hex commit SHA instead of a tag. `NPA_BINARY_PATH` remains supported for
 runner-local binary provisioning. `NPA_VERSION` is reserved for a later
-release-download mode and is rejected by the current setup script.
+release-download mode and is not a valid current package-command pin.
 
 ## SRA-02 Compatibility
 
 This ref includes the `std-library-legacy-core-builder` producer profile used
-by the first `npa-std` package fixture. A checkout at this ref can rebuild and
-check the local `fixtures/npa-std` package fixture without registry or network
-package resolution.
+by the first `npa-std` package fixture. The local `npa-core` regression fixture
+is checked in at `testdata/package/npa-std` and can be rebuilt and checked
+without registry or network package resolution.
 
 The previous `v0.1.1` ref remains a historical SRA-02-compatible toolchain
 reference, but it is no longer the current package-author pin.
 
 Do not use `v0.1.1` as the current external package pin for SRA-02-compatible
 package fixtures.
-
-## Setup Contract
-
-Copy these files into external theorem repositories:
-
-```text
-ci-templates/github-actions/npa-package-pr.yml
-ci-templates/github-actions/npa-package-release.yml
-ci-templates/github-actions/setup-pinned-npa.sh
-ci-templates/github-actions/summarize-npa-diagnostics.py
-```
-
-Copy `ci-templates/github-actions/npa-package-high-trust.yml` only when the
-repository also supplies CLR-08 pinned external checker binaries, runner
-policies, checker registry data, and release audit evidence.
-
-The setup script fetches only the pinned `npa` implementation and exact Rust
-toolchain needed to build `npa-cli`. It must not fetch theorem package
-dependencies, package imports, registry metadata, or hidden package caches.
 
 ## Package Commands
 
@@ -70,6 +51,19 @@ npa package axiom-report --root . --check --json
 npa package index --root . --check --json
 ```
 
+For local certificate-only edits after certificates have already been generated,
+`verify-certs --changed` selects changed checked-in certificate paths from Git
+and verifies only those package modules, plus source-free imports required for a
+sound import context:
+
+```sh
+npa package verify-certs --root . --changed --checker reference --json
+```
+
+This path does not invoke `build-certs` and does not read source, replay, meta,
+theorem-index, AI trace, registry, or checker-result sidecars. It requires the
+package lock to remain consistent with checked-in certificate bytes.
+
 The base release gate additionally records:
 
 ```sh
@@ -82,6 +76,30 @@ npa package verify-certs --root . --checker fast --json
 ```sh
 npa package publish-plan --root . --check --json
 ```
+
+For advisory refactor planning, use `refactor-plan` after package metadata has
+been generated:
+
+```sh
+npa package refactor-plan --root . --scope modules --top 20 --json
+npa package refactor-plan --root . --scope theorems --module Proofs.Ai.Basic --json
+```
+
+`refactor-plan` ranks local package-lock modules, and optionally theorem-family
+clusters, using package metadata only. Default mode is source-free: it reads
+`npa-package.toml`, `generated/package-lock.json`, optional
+`generated/theorem-index.json`, and certificate file metadata for byte length.
+It does not read source files, replay files, meta files, tactic traces, AI
+traces, checker-result sidecars, registry data, or network data.
+
+The command is planning metadata only. It emits standard
+`npa.package.command_result.v0.1` diagnostics with `proof_evidence=false`; it
+does not emit command-specific JSON payloads or `CommandArtifact` entries.
+Theorem-family output is based on family and statement-constant signals from
+the theorem index. It does not claim exact theorem proof dependents. Source
+metrics, a certificate-derived dependency index, recommendation filters, score
+thresholds, and markdown issue output are future work, not current CLI
+behavior.
 
 ## Package Theorem Index Annotations
 
@@ -151,7 +169,8 @@ Untrusted helper data remains:
 - replay and meta files
 - theorem indexes
 - publish plans
-- CI status
+- refactor plans
+- command status
 - Git tags and release pages
 - registry seed entries
 - future registry or API responses
@@ -162,18 +181,13 @@ The SRA-02-compatible local gate is:
 
 ```sh
 cargo build -p npa-cli
-cargo run -p npa-cli -- package check --root fixtures/npa-std --json
-cargo run -p npa-cli -- package build-certs --root fixtures/npa-std --check --json
-cargo run -p npa-cli -- package verify-certs --root fixtures/npa-std --checker reference --json
-cargo run -p npa-cli -- package check-hashes --root fixtures/npa-std --json
-cargo run -p npa-cli -- package axiom-report --root fixtures/npa-std --check --json
-cargo run -p npa-cli -- package index --root fixtures/npa-std --check --json
-cargo run -p npa-cli -- package publish-plan --root fixtures/npa-std --check --json
-python3 ci-templates/github-actions/validate-workflows.py
+cargo run -p npa-cli -- package check --root testdata/package/npa-std --json
+cargo run -p npa-cli -- package build-certs --root testdata/package/npa-std --check --json
+cargo run -p npa-cli -- package verify-certs --root testdata/package/npa-std --checker reference --json
+cargo run -p npa-cli -- package check-hashes --root testdata/package/npa-std --json
+cargo run -p npa-cli -- package axiom-report --root testdata/package/npa-std --check --json
+cargo run -p npa-cli -- package index --root testdata/package/npa-std --check --json
+cargo run -p npa-cli -- package publish-plan --root testdata/package/npa-std --check --json
 cargo test -q -p npa-cli package_cli_args
-tmpdir="$(mktemp -d)"
-GITHUB_PATH="$tmpdir/github-path" RUNNER_TEMP="$tmpdir" GITHUB_WORKSPACE="$PWD" \
-  NPA_BINARY_PATH=target/debug/npa \
-  bash ci-templates/github-actions/setup-pinned-npa.sh
 ./scripts/check-fast.sh
 ```

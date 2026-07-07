@@ -1,0 +1,112 @@
+{
+  "schema": "npa-ai-proof-replay-v0.1",
+  "module": "Mathlib.Logic.Basic",
+  "trusted": false,
+  "profile": "explicit_term_source_certificate_handoff",
+  "steps": [
+    {
+      "declaration": "id",
+      "source_kind": "explicit_term",
+      "term": "fun A => fun x => x"
+    },
+    {
+      "declaration": "const_left",
+      "source_kind": "explicit_term",
+      "term": "fun A => fun B => fun x => fun y => x"
+    },
+    {
+      "declaration": "const_right",
+      "source_kind": "explicit_term",
+      "term": "fun A => fun B => fun x => fun y => y"
+    },
+    {
+      "declaration": "apply_fn",
+      "source_kind": "explicit_term",
+      "term": "fun A => fun B => fun f => fun x => f x"
+    },
+    {
+      "declaration": "compose",
+      "source_kind": "explicit_term",
+      "term": "fun A => fun B => fun C => fun f => fun g => fun x => f (g x)"
+    },
+    {
+      "declaration": "flip",
+      "source_kind": "explicit_term",
+      "term": "fun A => fun B => fun C => fun f => fun y => fun x => f x y"
+    },
+    {
+      "declaration": "duplicate",
+      "source_kind": "explicit_term",
+      "term": "fun A => fun B => fun f => fun x => f x x"
+    },
+    {
+      "declaration": "prop_id",
+      "source_kind": "explicit_term",
+      "term": "fun P => fun p => p"
+    },
+    {
+      "declaration": "modus_ponens",
+      "source_kind": "explicit_term",
+      "term": "fun P => fun Q => fun h => fun p => h p"
+    },
+    {
+      "declaration": "imp_trans",
+      "source_kind": "explicit_term",
+      "term": "fun P => fun Q => fun R => fun pq => fun qr => fun p => qr (pq p)"
+    },
+    {
+      "declaration": "compose_assoc",
+      "source_kind": "explicit_term",
+      "term": "fun A => fun B => fun C => fun D => fun h => fun g => fun f => fun x => h (g (f x))"
+    },
+    {
+      "declaration": "apply_twice",
+      "source_kind": "explicit_term",
+      "term": "fun A => fun f => fun x => f (f x)"
+    },
+    {
+      "declaration": "ignore_middle",
+      "source_kind": "explicit_term",
+      "term": "fun A => fun B => fun C => fun x => fun y => fun z => x"
+    },
+    {
+      "declaration": "select_middle",
+      "source_kind": "explicit_term",
+      "term": "fun A => fun B => fun C => fun x => fun y => fun z => y"
+    },
+    {
+      "declaration": "select_last",
+      "source_kind": "explicit_term",
+      "term": "fun A => fun B => fun C => fun x => fun y => fun z => z"
+    },
+    {
+      "declaration": "imp_swap",
+      "source_kind": "explicit_term",
+      "term": "fun P => fun Q => fun R => fun h => fun q => fun p => h p q"
+    },
+    {
+      "declaration": "imp_compose",
+      "source_kind": "explicit_term",
+      "term": "fun P => fun Q => fun R => fun qr => fun pq => fun p => qr (pq p)"
+    },
+    {
+      "declaration": "imp_ignore",
+      "source_kind": "explicit_term",
+      "term": "fun P => fun Q => fun p => fun q => p"
+    },
+    {
+      "declaration": "imp_duplicate",
+      "source_kind": "explicit_term",
+      "term": "fun P => fun Q => fun h => fun p => h p p"
+    },
+    {
+      "declaration": "higher_apply",
+      "source_kind": "explicit_term",
+      "term": "fun A => fun B => fun C => fun h => fun f => h f"
+    }
+  ],
+  "acceptance": {
+    "required": ["decode_module_cert", "verify_module_cert"],
+    "accepted_artifact": "Mathlib/Logic/Basic/certificate.npcert"
+  }
+}

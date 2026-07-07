@@ -1,0 +1,67 @@
+{
+  "schema": "npa-ai-proof-replay-v0.1",
+  "module": "Proofs.Ai.EqReasoning",
+  "trusted": false,
+  "profile": "explicit_term_source_certificate_handoff",
+  "steps": [
+    {
+      "declaration": "eq_symm",
+      "source_kind": "explicit_term",
+      "term": "fun A => fun x => fun y => fun h => @Eq.rec.{u,0} A x (fun (b : A) => fun (hb : @Eq.{u} A x b) => @Eq.{u} A b x) (@Eq.refl.{u} A x) y h"
+    },
+    {
+      "declaration": "eq_trans",
+      "source_kind": "explicit_term",
+      "term": "fun A => fun x => fun y => fun z => fun hxy => fun hyz => @Eq.rec.{u,0} A y (fun (b : A) => fun (hb : @Eq.{u} A y b) => @Eq.{u} A x b) hxy z hyz"
+    },
+    {
+      "declaration": "eq_congr_arg",
+      "source_kind": "explicit_term",
+      "term": "fun A => fun B => fun f => fun x => fun y => fun h => @Eq.rec.{u,0} A x (fun (b : A) => fun (hb : @Eq.{u} A x b) => @Eq.{v} B (f x) (f b)) (@Eq.refl.{v} B (f x)) y h"
+    },
+    {
+      "declaration": "eq_congr_fun",
+      "source_kind": "explicit_term",
+      "term": "fun A => fun B => fun f => fun g => fun h => fun x => @Eq.rec.{imax u v,0} (forall (x : A), B) f (fun (q : forall (x : A), B) => fun (hq : @Eq.{imax u v} (forall (x : A), B) f q) => @Eq.{v} B (f x) (q x)) (@Eq.refl.{v} B (f x)) g h"
+    },
+    {
+      "declaration": "eq_congr2",
+      "source_kind": "explicit_term",
+      "term": "fun A => fun B => fun C => fun f => fun a => fun a2 => fun b => fun b2 => fun ha => fun hb => @Eq.rec.{u,0} A a (fun (a3 : A) => fun (ha3 : @Eq.{u} A a a3) => forall (b3 : B), forall (hb3 : @Eq.{v} B b b3), @Eq.{w} C (f a b) (f a3 b3)) (fun (b3 : B) => fun (hb3 : @Eq.{v} B b b3) => @Eq.rec.{v,0} B b (fun (b4 : B) => fun (hb4 : @Eq.{v} B b b4) => @Eq.{w} C (f a b) (f a b4)) (@Eq.refl.{w} C (f a b)) b3 hb3) a2 ha b2 hb"
+    },
+    {
+      "declaration": "eq_subst",
+      "source_kind": "explicit_term",
+      "term": "fun A => fun P => fun x => fun y => fun h => fun px => @Eq.rec.{u,0} A x (fun (b : A) => fun (hb : @Eq.{u} A x b) => P b) px y h"
+    },
+    {
+      "declaration": "eq_transport_const",
+      "source_kind": "explicit_term",
+      "term": "fun A => fun P => fun x => fun y => fun h => fun p => @Eq.rec.{u,0} A x (fun (b : A) => fun (hb : @Eq.{u} A x b) => P) p y h"
+    },
+    {
+      "declaration": "eq_rewrite_left",
+      "source_kind": "explicit_term",
+      "term": "fun A => fun x => fun y => fun z => fun hxy => fun hyz => @Eq.rec.{u,0} A x (fun (y2 : A) => fun (hy2 : @Eq.{u} A x y2) => forall (z2 : A), forall (hyz2 : @Eq.{u} A y2 z2), @Eq.{u} A x z2) (fun (z2 : A) => fun (hxz2 : @Eq.{u} A x z2) => hxz2) y hxy z hyz"
+    },
+    {
+      "declaration": "eq_rewrite_right",
+      "source_kind": "explicit_term",
+      "term": "fun A => fun x => fun y => fun z => fun hxy => fun hzx => @Eq.rec.{u,0} A x (fun (y2 : A) => fun (hy2 : @Eq.{u} A x y2) => forall (z2 : A), forall (hzx2 : @Eq.{u} A z2 x), @Eq.{u} A z2 y2) (fun (z2 : A) => fun (hzx2 : @Eq.{u} A z2 x) => hzx2) y hxy z hzx"
+    },
+    {
+      "declaration": "eq_cast_trans",
+      "source_kind": "explicit_term",
+      "term": "fun A => fun P => fun x => fun y => fun z => fun hxy => fun hyz => fun px => @Eq.rec.{u,0} A y (fun (z2 : A) => fun (hz2 : @Eq.{u} A y z2) => P z2) (@Eq.rec.{u,0} A x (fun (y2 : A) => fun (hy2 : @Eq.{u} A x y2) => P y2) px y hxy) z hyz"
+    },
+    {
+      "declaration": "eq_calc3",
+      "source_kind": "explicit_term",
+      "term": "fun A => fun w => fun x => fun y => fun z => fun hwx => fun hxy => fun hyz => @eq_trans.{u} A w y z (@eq_trans.{u} A w x y hwx hxy) hyz"
+    }
+  ],
+  "acceptance": {
+    "required": ["decode_module_cert", "verify_module_cert"],
+    "accepted_artifact": "Proofs/Ai/EqReasoning/certificate.npcert"
+  }
+}

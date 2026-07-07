@@ -1,0 +1,45 @@
+import Std.Logic.Eq
+
+theorem eq_symm.{u} :
+  forall (A : Sort u), forall (x : A), forall (y : A), forall (h : @Eq.{u} A x y), @Eq.{u} A y x :=
+  fun A => fun x => fun y => fun h => @Eq.rec.{u,0} A x (fun (b : A) => fun (hb : @Eq.{u} A x b) => @Eq.{u} A b x) (@Eq.refl.{u} A x) y h
+
+theorem eq_trans.{u} :
+  forall (A : Sort u), forall (x : A), forall (y : A), forall (z : A), forall (hxy : @Eq.{u} A x y), forall (hyz : @Eq.{u} A y z), @Eq.{u} A x z :=
+  fun A => fun x => fun y => fun z => fun hxy => fun hyz => @Eq.rec.{u,0} A y (fun (b : A) => fun (hb : @Eq.{u} A y b) => @Eq.{u} A x b) hxy z hyz
+
+theorem eq_congr_arg.{u,v} :
+  forall (A : Sort u), forall (B : Sort v), forall (f : forall (x : A), B), forall (x : A), forall (y : A), forall (h : @Eq.{u} A x y), @Eq.{v} B (f x) (f y) :=
+  fun A => fun B => fun f => fun x => fun y => fun h => @Eq.rec.{u,0} A x (fun (b : A) => fun (hb : @Eq.{u} A x b) => @Eq.{v} B (f x) (f b)) (@Eq.refl.{v} B (f x)) y h
+
+theorem eq_congr_fun.{u,v} :
+  forall (A : Sort u), forall (B : Sort v), forall (f : forall (x : A), B), forall (g : forall (x : A), B), forall (h : @Eq.{imax u v} (forall (x : A), B) f g), forall (x : A), @Eq.{v} B (f x) (g x) :=
+  fun A => fun B => fun f => fun g => fun h => fun x => @Eq.rec.{imax u v,0} (forall (x : A), B) f (fun (q : forall (x : A), B) => fun (hq : @Eq.{imax u v} (forall (x : A), B) f q) => @Eq.{v} B (f x) (q x)) (@Eq.refl.{v} B (f x)) g h
+
+theorem eq_congr2.{u,v,w} :
+  forall (A : Sort u), forall (B : Sort v), forall (C : Sort w), forall (f : forall (a : A), forall (b : B), C), forall (a : A), forall (a2 : A), forall (b : B), forall (b2 : B), forall (ha : @Eq.{u} A a a2), forall (hb : @Eq.{v} B b b2), @Eq.{w} C (f a b) (f a2 b2) :=
+  fun A => fun B => fun C => fun f => fun a => fun a2 => fun b => fun b2 => fun ha => fun hb => @Eq.rec.{u,0} A a (fun (a3 : A) => fun (ha3 : @Eq.{u} A a a3) => forall (b3 : B), forall (hb3 : @Eq.{v} B b b3), @Eq.{w} C (f a b) (f a3 b3)) (fun (b3 : B) => fun (hb3 : @Eq.{v} B b b3) => @Eq.rec.{v,0} B b (fun (b4 : B) => fun (hb4 : @Eq.{v} B b b4) => @Eq.{w} C (f a b) (f a b4)) (@Eq.refl.{w} C (f a b)) b3 hb3) a2 ha b2 hb
+
+theorem eq_subst.{u} :
+  forall (A : Sort u), forall (P : forall (x : A), Prop), forall (x : A), forall (y : A), forall (h : @Eq.{u} A x y), forall (px : P x), P y :=
+  fun A => fun P => fun x => fun y => fun h => fun px => @Eq.rec.{u,0} A x (fun (b : A) => fun (hb : @Eq.{u} A x b) => P b) px y h
+
+theorem eq_transport_const.{u} :
+  forall (A : Sort u), forall (P : Prop), forall (x : A), forall (y : A), forall (h : @Eq.{u} A x y), forall (p : P), P :=
+  fun A => fun P => fun x => fun y => fun h => fun p => @Eq.rec.{u,0} A x (fun (b : A) => fun (hb : @Eq.{u} A x b) => P) p y h
+
+theorem eq_rewrite_left.{u} :
+  forall (A : Sort u), forall (x : A), forall (y : A), forall (z : A), forall (hxy : @Eq.{u} A x y), forall (hyz : @Eq.{u} A y z), @Eq.{u} A x z :=
+  fun A => fun x => fun y => fun z => fun hxy => fun hyz => @Eq.rec.{u,0} A x (fun (y2 : A) => fun (hy2 : @Eq.{u} A x y2) => forall (z2 : A), forall (hyz2 : @Eq.{u} A y2 z2), @Eq.{u} A x z2) (fun (z2 : A) => fun (hxz2 : @Eq.{u} A x z2) => hxz2) y hxy z hyz
+
+theorem eq_rewrite_right.{u} :
+  forall (A : Sort u), forall (x : A), forall (y : A), forall (z : A), forall (hxy : @Eq.{u} A x y), forall (hzx : @Eq.{u} A z x), @Eq.{u} A z y :=
+  fun A => fun x => fun y => fun z => fun hxy => fun hzx => @Eq.rec.{u,0} A x (fun (y2 : A) => fun (hy2 : @Eq.{u} A x y2) => forall (z2 : A), forall (hzx2 : @Eq.{u} A z2 x), @Eq.{u} A z2 y2) (fun (z2 : A) => fun (hzx2 : @Eq.{u} A z2 x) => hzx2) y hxy z hzx
+
+theorem eq_cast_trans.{u} :
+  forall (A : Sort u), forall (P : forall (x : A), Prop), forall (x : A), forall (y : A), forall (z : A), forall (hxy : @Eq.{u} A x y), forall (hyz : @Eq.{u} A y z), forall (px : P x), P z :=
+  fun A => fun P => fun x => fun y => fun z => fun hxy => fun hyz => fun px => @Eq.rec.{u,0} A y (fun (z2 : A) => fun (hz2 : @Eq.{u} A y z2) => P z2) (@Eq.rec.{u,0} A x (fun (y2 : A) => fun (hy2 : @Eq.{u} A x y2) => P y2) px y hxy) z hyz
+
+theorem eq_calc3.{u} :
+  forall (A : Sort u), forall (w : A), forall (x : A), forall (y : A), forall (z : A), forall (hwx : @Eq.{u} A w x), forall (hxy : @Eq.{u} A x y), forall (hyz : @Eq.{u} A y z), @Eq.{u} A w z :=
+  fun A => fun w => fun x => fun y => fun z => fun hwx => fun hxy => fun hyz => @eq_trans.{u} A w y z (@eq_trans.{u} A w x y hwx hxy) hyz

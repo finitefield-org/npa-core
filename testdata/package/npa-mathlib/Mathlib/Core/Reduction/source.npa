@@ -1,0 +1,25 @@
+import Std.Nat.Basic
+
+def reduction_id_nat :
+  forall (n : Nat), Nat :=
+  fun n => n
+
+theorem beta_id_nat :
+  forall (n : Nat), Nat :=
+  fun n => (fun (x : Nat) => x) n
+
+theorem beta_const_nat :
+  forall (n : Nat), forall (m : Nat), Nat :=
+  fun n => fun m => (fun (x : Nat) => fun (y : Nat) => x) n m
+
+theorem let_id_nat :
+  forall (n : Nat), Nat :=
+  fun n => let x : Nat := n in x
+
+theorem let_const_nat :
+  forall (n : Nat), Nat :=
+  fun n => let z : Nat := Nat.zero in z
+
+theorem delta_id_nat :
+  forall (n : Nat), Nat :=
+  reduction_id_nat

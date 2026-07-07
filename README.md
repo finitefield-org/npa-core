@@ -12,8 +12,9 @@ kernel and source-free checkers.
 ```text
 untrusted:
   parser / elaborator / tactic / automation / AI / plugin / theorem search
-  source files / replay files / theorem indexes / publish plans / CI status
-  GitHub release pages / registry metadata
+  source files / replay files / theorem indexes / publish plans / refactor plans
+  command status
+  release pages / registry metadata
 
 trusted:
   canonical .npcert bytes
@@ -38,17 +39,14 @@ RUST_TOOLCHAIN_VERSION = 1.95.0
 The earlier `v0.1.0` tag is historical and should not be used as the current
 external package toolchain pin.
 
-The split theorem package repositories are:
+The public package repositories are:
 
 - `npa-std`: <https://github.com/finitefield-org/npa-std>
 - `npa-mathlib`: <https://github.com/finitefield-org/npa-mathlib>
-- `npa-corpus`: <https://github.com/finitefield-org/npa-corpus>
-- `npa-project-iut`: <https://github.com/finitefield-org/npa-project-iut>
 
-IUT theory modules and project documents have moved to `npa-project-iut`; this
-repository now keeps the shared NPA core toolchain and package infrastructure.
-The former in-tree proof corpus moved to `npa-corpus`:
-<https://github.com/finitefield-org/npa-corpus>.
+This repository keeps the shared NPA core toolchain and package
+infrastructure. Building, testing, and developing this repository must not
+require a sibling checkout of any other NPA repository.
 
 ## Build From Source
 
@@ -85,6 +83,16 @@ npa package axiom-report --root . --check --json
 npa package index --root . --check --json
 ```
 
+For local certificate-only edits, use the source-free changed-certificate path:
+
+```sh
+npa package verify-certs --root . --changed --checker reference --json
+```
+
+`--changed` selects package modules whose checked-in `certificate.npcert` files
+are changed in Git, plus certificate imports needed by the verifier. It does not
+run `build-certs` or read source/replay/meta artifacts.
+
 For release-ready packages that check in `generated/publish-plan.json`, also
 run:
 
@@ -92,32 +100,43 @@ run:
 npa package publish-plan --root . --check --json
 ```
 
-For local development against the package fixtures that remain in the sibling
-`../npa` checkout, run the same commands through `cargo` or the built
+For advisory refactor planning from package metadata, use:
+
+```sh
+npa package refactor-plan --root . --scope modules --top 20 --json
+npa package refactor-plan --root . --scope theorems --module Proofs.Ai.Basic --json
+```
+
+`refactor-plan` is source-free by default and emits planning diagnostics only.
+It does not read source, replay, meta, tactic trace, AI trace, checker-result,
+registry, or network data, and it is not proof evidence.
+
+For local development against the compact package fixtures checked into this
+repository, run the same commands through `cargo` or the built
 `target/debug/npa` binary:
 
 ```sh
-cargo run -p npa-cli -- package check --root ../npa/fixtures/npa-std --json
-cargo run -p npa-cli -- package build-certs --root ../npa/fixtures/npa-std --check --json
-cargo run -p npa-cli -- package verify-certs --root ../npa/fixtures/npa-std --checker reference --json
-cargo run -p npa-cli -- package check-hashes --root ../npa/fixtures/npa-std --json
+cargo run -p npa-cli -- package check --root testdata/package/npa-std --json
+cargo run -p npa-cli -- package build-certs --root testdata/package/npa-std --check --json
+cargo run -p npa-cli -- package verify-certs --root testdata/package/npa-std --checker reference --json
+cargo run -p npa-cli -- package check-hashes --root testdata/package/npa-std --json
 ```
 
-To work on the proof corpus package hashes and generated metadata, use the
-sibling `../npa-corpus` repository. From `../npa-corpus`, package commands can
-use this repository's CLI through `--manifest-path`:
+For core package/verifier regression checks against the narrow proof-package
+snapshot, use the local `testdata/package/proofs` fixture:
 
 ```sh
-cargo run -q --manifest-path ../npa-core/Cargo.toml -p npa-cli -- package check --root proofs --json
-cargo run -q --manifest-path ../npa-core/Cargo.toml -p npa-cli -- package check-generated --root proofs --timings summary --json
+cargo run -q -p npa-cli -- package check --root testdata/package/proofs --json
+cargo run -q -p npa-cli -- package check-generated --root testdata/package/proofs --timings summary --json
 ```
 
-Run metadata-regeneration commands without `--check` from `../npa-corpus` only
-when intentionally refreshing checked-in corpus artifacts.
+Run metadata-regeneration commands without `--check` only when intentionally
+refreshing checked-in `npa-core/testdata` artifacts.
 
-Package metadata, theorem indexes, publish plans, and CI output are deterministic
-review and release metadata. They are not proof evidence. Downstream users must
-still verify hash-pinned certificate bytes with a source-free checker.
+Package metadata, theorem indexes, publish plans, refactor plans, and command
+output are deterministic review and release metadata. They are not proof evidence.
+Downstream users must still verify hash-pinned certificate bytes with a
+source-free checker.
 
 ## Repository Layout
 
@@ -138,9 +157,13 @@ still verify hash-pinned certificate bytes with a source-free checker.
 └── scripts/             local verification gates
 ```
 
-The `develop/`, `fixtures/`, `ci-templates/`, and web-tool support directories
-were not part of the listed-path migration and remain in the sibling `../npa`
-checkout until they are migrated separately.
+Compact, test-owned package and proof-agent snapshots needed by `npa-core` tests
+live under `testdata/` so `cargo test -p npa-api` and `cargo test -p npa-cli`
+do not need another NPA repository checkout. The `testdata/package/proofs`
+snapshot is intentionally narrow and contains only the modules and generated
+package metadata covered by core package/verifier tests.
+Other historical support directories were not part of the listed-path
+migration unless explicitly documented in a split repository.
 
 ## Documentation
 
@@ -151,10 +174,9 @@ Start with the user documentation:
 Public package-author and toolchain references:
 
 - [Toolchain Reference v0.2.0](docs/npa-toolchain-reference-v0.2.0.md)
-- [External Theorem Library CI](docs/external-theorem-library-ci.md)
 
-Developer-facing specs, release evidence, internal planning, and Japanese
-development notes remain in `../npa/develop/`.
+Developer-facing package-author docs live under `docs/`. The crate-local
+specification snapshot used by tests lives under `testdata/docs/npa-spec.md`.
 
 The in-repo Phase 6 standard-library design documents the MVP release modules
 `Std.Logic`, `Std.Nat`, `Std.List`, and `Std.Algebra.Basic`. The current SRA-02
@@ -171,21 +193,17 @@ For ordinary development, start with the fast gate:
 ./scripts/check-fast.sh
 ```
 
-The proof corpus now lives in the sibling `../npa-corpus` repository. For
-ordinary theorem authoring, run its lightweight authoring gate there:
+For package, verifier, or checked-fixture changes, add the focused cargo tests
+for the touched subsystem and run the relevant local package checks:
 
 ```sh
-(cd ../npa-corpus && ./scripts/check-corpus-authoring.sh)
+cargo run -q -p npa-cli -- package check-generated --root testdata/package/proofs --json
+cargo run -q -p npa-cli -- package check-hashes --root testdata/package/proofs --json
 ```
 
-Reserve the corpus package/full gates for package verifier changes, canonical
-certificate/checker compatibility, `npa-mathlib` promotion readiness, release
-handoff, or high-trust evidence, and run them from `../npa-corpus`:
-
-```sh
-(cd ../npa-corpus && ./scripts/check-corpus-package.sh)
-(cd ../npa-corpus && ./scripts/check-corpus-full.sh)
-```
+The compact fixtures in `testdata/` are regression data, not a full theorem
+corpus. Do not make `npa-core` local gates depend on sibling NPA repository
+checkouts.
 
 For contribution policy and the full local-gate checklist, see
 [CONTRIBUTING.md](CONTRIBUTING.md).

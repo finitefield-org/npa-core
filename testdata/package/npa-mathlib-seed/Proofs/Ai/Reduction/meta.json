@@ -1,0 +1,24 @@
+{
+  "schema": "npa-ai-proof-meta-v0.1",
+  "module": "Proofs.Ai.Reduction",
+  "source": "Proofs/Ai/Reduction/source.npa",
+  "certificate": "Proofs/Ai/Reduction/certificate.npcert",
+  "producer_profile": "human-surface-explicit-term",
+  "trusted_status": "verified_by_certificate",
+  "source_sha256": "sha256:53f6a264f4626ff04d6c5de4d5537e3788ea03b28c0c507c8137de1c55fbf531",
+  "certificate_file_sha256": "sha256:7216b7928a1f06981c7fa09f084dcaa300067bb450a69521688f7235aa385e58",
+  "export_hash": "sha256:c915b139d719a059b8886b2bd30716dbee54dc1accbe1613a35fb791e7584cb9",
+  "axiom_report_hash": "sha256:70b2d0f35f9ebfff46bdf399b80487f0c76ffd6460ab930f733af1f889d2fc65",
+  "certificate_hash": "sha256:3d4e3627b9d165c2cd61f4bcf7482ba04bbf9acb4e1efcc63f4f679885879005",
+  "imports": ["Std.Nat.Basic"],
+  "axioms": [],
+  "declarations": [
+    { "name": "reduction_id_nat", "kind": "def" },
+    { "name": "beta_id_nat", "kind": "theorem" },
+    { "name": "beta_const_nat", "kind": "theorem" },
+    { "name": "let_id_nat", "kind": "theorem" },
+    { "name": "let_const_nat", "kind": "theorem" },
+    { "name": "delta_id_nat", "kind": "theorem" }
+  ],
+  "trust_boundary": "source, replay, and metadata are non-trusted sidecars; only the canonical certificate verified by npa-cert is accepted"
+}

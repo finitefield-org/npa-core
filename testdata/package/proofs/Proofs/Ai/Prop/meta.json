@@ -1,0 +1,24 @@
+{
+  "schema": "npa-ai-proof-meta-v0.1",
+  "module": "Proofs.Ai.Prop",
+  "source": "Proofs/Ai/Prop/source.npa",
+  "certificate": "Proofs/Ai/Prop/certificate.npcert",
+  "producer_profile": "human-surface-explicit-term",
+  "trusted_status": "verified_by_certificate",
+  "source_sha256": "sha256:466c82f2aa00708bbf9d91d7e59a5f0a629f5f61af979711c325a0f4ce29dec6",
+  "certificate_file_sha256": "sha256:a58734aa78d6dc68228a516f195e3b7cf41dcfe1361ee9d0bed1d4fb6abada15",
+  "export_hash": "sha256:63b1200408966ee2058d38d7d2eabccf025b23943de3a9d05a8fe8671e853ad8",
+  "axiom_report_hash": "sha256:70b2d0f35f9ebfff46bdf399b80487f0c76ffd6460ab930f733af1f889d2fc65",
+  "certificate_hash": "sha256:425566ebc73ce76f85c1c90f64138f12c9c387aa486eb7d93ae2707f0bc007f2",
+  "imports": [],
+  "axioms": [],
+  "declarations": [
+    { "name": "imp_chain4", "kind": "theorem" },
+    { "name": "imp_permute3", "kind": "theorem" },
+    { "name": "imp_apply_twice", "kind": "theorem" },
+    { "name": "imp_const3", "kind": "theorem" },
+    { "name": "imp_flip_chain", "kind": "theorem" },
+    { "name": "imp_higher_apply", "kind": "theorem" }
+  ],
+  "trust_boundary": "source, replay, and metadata are non-trusted sidecars; only the canonical certificate verified by npa-cert is accepted"
+}

@@ -1,0 +1,6 @@
+{
+  "id": "score-tampering",
+  "kind": "score_tampering",
+  "rejection_kind": "untrusted_sidecar_not_evidence",
+  "blocked_target_state": "certificate_verified"
+}

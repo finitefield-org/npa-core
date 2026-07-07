@@ -17,13 +17,14 @@ trusted:
 
 not trusted:
   parser / elaborator / tactic / automation / AI / plugin / theorem search
-  source files / replay files / theorem indexes / publish plans / CI status
-  GitHub release pages / registry metadata
+  source files / replay files / theorem indexes / publish plans / refactor plans
+  command status
+  release pages / registry metadata
 ```
 
 Do not make parser output, elaborator output, tactic traces, AI traces, theorem
-search results, CI status, release metadata, or registry metadata part of proof
-acceptance.
+search results, command status, release metadata, or registry metadata part of
+proof acceptance.
 
 ## Local Gates
 
@@ -35,46 +36,39 @@ For ordinary development, run the fast gate first:
 
 This is the default hot-path check for core changes.
 
-The proof corpus is a separate sibling repository at `../npa-corpus`. For
-ordinary theorem authoring, run its local build/source-free checks and
-lightweight authoring gate there:
+For package, verifier, or checked-fixture changes, add focused tests for the
+touched subsystem and run the relevant local package checks against compact
+fixtures in `testdata/`:
 
 ```sh
-(cd ../npa-corpus && cargo run -p npa-proof-corpus -- --build-module Proofs.Ai.X)
-(cd ../npa-corpus && cargo run -p npa-proof-corpus -- --module Proofs.Ai.X --verified-cache authoring)
-(cd ../npa-corpus && ./scripts/check-corpus-authoring.sh)
+cargo run -q -p npa-cli -- package check-generated --root testdata/package/proofs --json
+cargo run -q -p npa-cli -- package check-hashes --root testdata/package/proofs --json
 ```
 
-Run the package/full corpus gate only when a change affects one of these areas:
+Broaden the local test set when a change affects one of these areas:
 
-- `../npa-corpus/tools/proof-corpus/**` package metadata, promotion, package
-  lock, or artifact generation
-- `../npa-corpus/proofs/npa-package.toml`,
-  `../npa-corpus/proofs/generated/package-lock.json`, axiom-report,
+- package metadata, package lock, or artifact generation
+- `testdata/package/proofs/npa-package.toml`,
+  `testdata/package/proofs/generated/package-lock.json`, axiom-report,
   theorem-index, publish-plan, or other package generated artifacts
 - canonical certificate encode, decode, hash, import, or axiom report behavior
 - kernel core semantics, typecheck, reduction, universe, or inductive behavior
 - independent checker, package verifier, package lock, or artifact validation
 - `.npcert` generation or verification compatibility
-- `npa-mathlib` promotion readiness, release, or high-trust evidence
+- public package fixture release behavior or high-trust evidence
 
-For those changes, choose the explicit package/full gate that matches the change:
+For those changes, choose focused `cargo test` targets plus local package
+commands that match the changed behavior. Typical package checks are:
 
 ```sh
-(cd ../npa-corpus && ./scripts/check-corpus-package.sh)
-(cd ../npa-corpus && ./scripts/check-corpus-full.sh)
+cargo test -p npa-cli --test package_check_hashes
+cargo test -p npa-cli --test package_cli package_cli_full_corpus_examples_pass_on_proof_corpus
+cargo test -p npa-api package_fast_verifier_verifies_proof_package_source_free
 ```
 
-`check-corpus-package.sh` covers package verifier behavior, package CLI
-examples, axiom-report, index, and publish-plan regression. Use
-`check-corpus-full.sh` for promotion readiness, release handoff,
-high-trust-adjacent changes, or broad certificate/package/checker compatibility
-changes.
-
-When adding or editing proof corpus theorems, follow `../npa-corpus` guidance
-for the normal repair loop. Do not run the package/full corpus gate after every
-proof attempt; reserve it for promotion, release handoff, or
-certificate/package/checker compatibility changes.
+`npa-core` local development must not require another NPA repository checkout.
+The compact fixtures under `testdata/` are regression inputs, not a full
+theorem authoring corpus.
 
 ## Certificate Compatibility
 
@@ -129,6 +123,18 @@ run:
 npa package publish-plan --root . --check --json
 ```
 
+For advisory cleanup planning, package authors may run:
+
+```sh
+npa package refactor-plan --root . --scope modules --top 20 --json
+npa package refactor-plan --root . --scope theorems --module Proofs.Ai.Basic --json
+```
+
+This command is source-free by default and reads package metadata only. It does
+not read source, replay, meta, tactic trace, AI trace, checker-result, registry,
+or network data. Treat its scores and recommendations as planning diagnostics,
+not as proof evidence or a package acceptance gate.
+
 These commands produce deterministic diagnostics and release metadata. They do
-not make source files, theorem indexes, publish plans, CI status, or GitHub
-release pages trusted proof evidence.
+not make source files, theorem indexes, publish plans, refactor plans, command
+status, or release pages trusted proof evidence.

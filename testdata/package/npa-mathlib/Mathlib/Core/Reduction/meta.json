@@ -1,0 +1,46 @@
+{
+  "schema": "npa-ai-proof-meta-v0.1",
+  "module": "Mathlib.Core.Reduction",
+  "source": "Mathlib/Core/Reduction/source.npa",
+  "certificate": "Mathlib/Core/Reduction/certificate.npcert",
+  "producer_profile": "human-surface-explicit-term",
+  "trusted_status": "verified_by_certificate",
+  "source_sha256": "sha256:53f6a264f4626ff04d6c5de4d5537e3788ea03b28c0c507c8137de1c55fbf531",
+  "certificate_file_sha256": "sha256:df9ac4f4d242d488d044e5dc51b6c78402e921531d6e8d4b625257873d8d6332",
+  "export_hash": "sha256:2569ced477b19ec5058860d727cf520416e353f6fe8c682a323a605869ae7902",
+  "axiom_report_hash": "sha256:70b2d0f35f9ebfff46bdf399b80487f0c76ffd6460ab930f733af1f889d2fc65",
+  "certificate_hash": "sha256:a30a2ceacf391a9635367aa4f760ccf60431809c27f973035d0ed1dede98fd22",
+  "imports": [
+    "Std.Nat.Basic"
+  ],
+  "axioms": [
+
+  ],
+  "declarations": [
+    {
+      "name": "reduction_id_nat",
+      "kind": "def"
+    },
+    {
+      "name": "beta_id_nat",
+      "kind": "theorem"
+    },
+    {
+      "name": "beta_const_nat",
+      "kind": "theorem"
+    },
+    {
+      "name": "let_id_nat",
+      "kind": "theorem"
+    },
+    {
+      "name": "let_const_nat",
+      "kind": "theorem"
+    },
+    {
+      "name": "delta_id_nat",
+      "kind": "theorem"
+    }
+  ],
+  "trust_boundary": "source, replay, and metadata are non-trusted sidecars; only the canonical certificate verified by npa-cert is accepted"
+}

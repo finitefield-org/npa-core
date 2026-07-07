@@ -1,0 +1,102 @@
+{
+  "schema": "npa-ai-proof-meta-v0.1",
+  "module": "Mathlib.Logic.Basic",
+  "source": "Mathlib/Logic/Basic/source.npa",
+  "certificate": "Mathlib/Logic/Basic/certificate.npcert",
+  "producer_profile": "human-surface-explicit-term",
+  "trusted_status": "verified_by_certificate",
+  "source_sha256": "sha256:2176be7570deae66754789868aa373ab01434512b4f50b992089886d2c655387",
+  "certificate_file_sha256": "sha256:e04584ba3e7b9e5c9206b1a5d82e136c77de980e51ac173b432007f67e3c86bf",
+  "export_hash": "sha256:3341d28e9d1d9dd875138399ab1bd7aa6e2727449cb87fe03c73b220c4b231c0",
+  "axiom_report_hash": "sha256:fed11e73accfbfb0dfc28b4f510e151fa33d8af82d58fdb23b92567e04e59e40",
+  "certificate_hash": "sha256:d64221c5341ec96723fd18aa570e1e995af8fd5d6c4ce0f4a6bb96f0aa7a5569",
+  "imports": [
+
+  ],
+  "axioms": [
+
+  ],
+  "declarations": [
+    {
+      "name": "id",
+      "kind": "theorem"
+    },
+    {
+      "name": "const_left",
+      "kind": "theorem"
+    },
+    {
+      "name": "const_right",
+      "kind": "theorem"
+    },
+    {
+      "name": "apply_fn",
+      "kind": "theorem"
+    },
+    {
+      "name": "compose",
+      "kind": "theorem"
+    },
+    {
+      "name": "flip",
+      "kind": "theorem"
+    },
+    {
+      "name": "duplicate",
+      "kind": "theorem"
+    },
+    {
+      "name": "prop_id",
+      "kind": "theorem"
+    },
+    {
+      "name": "modus_ponens",
+      "kind": "theorem"
+    },
+    {
+      "name": "imp_trans",
+      "kind": "theorem"
+    },
+    {
+      "name": "compose_assoc",
+      "kind": "theorem"
+    },
+    {
+      "name": "apply_twice",
+      "kind": "theorem"
+    },
+    {
+      "name": "ignore_middle",
+      "kind": "theorem"
+    },
+    {
+      "name": "select_middle",
+      "kind": "theorem"
+    },
+    {
+      "name": "select_last",
+      "kind": "theorem"
+    },
+    {
+      "name": "imp_swap",
+      "kind": "theorem"
+    },
+    {
+      "name": "imp_compose",
+      "kind": "theorem"
+    },
+    {
+      "name": "imp_ignore",
+      "kind": "theorem"
+    },
+    {
+      "name": "imp_duplicate",
+      "kind": "theorem"
+    },
+    {
+      "name": "higher_apply",
+      "kind": "theorem"
+    }
+  ],
+  "trust_boundary": "source, replay, and metadata are non-trusted sidecars; only the canonical certificate verified by npa-cert is accepted"
+}

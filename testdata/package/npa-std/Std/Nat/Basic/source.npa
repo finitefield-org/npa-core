@@ -1,0 +1,5 @@
+-- npa-std legacy package fixture v0.1.0
+-- module: Std.Nat.Basic
+-- producer_profile: std-library-legacy-core-builder
+-- declarations: Nat
+-- Source skeleton fixes import intent; certificate contents are built by Rust core-module builder.

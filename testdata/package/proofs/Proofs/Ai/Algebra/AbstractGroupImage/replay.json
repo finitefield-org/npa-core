@@ -1,0 +1,42 @@
+{
+  "schema": "npa-ai-proof-replay-v0.1",
+  "module": "Proofs.Ai.Algebra.AbstractGroupImage",
+  "trusted": false,
+  "profile": "explicit_term_source_certificate_handoff",
+  "steps": [
+    {
+      "declaration": "ImagePred",
+      "source_kind": "explicit_def_value",
+      "term": "fun G => fun H => fun f => fun y => forall (P : Prop), forall (mk : forall (a : G), forall (h : @Eq.{v} H (f a) y), P), P"
+    },
+    {
+      "declaration": "image_intro",
+      "source_kind": "explicit_term",
+      "term": "fun G => fun H => fun f => fun a => fun (P : Prop) => fun (mk : forall (b : G), forall (h : @Eq.{v} H (f b) (f a)), P) => mk a (@Eq.refl.{v} H (f a))"
+    },
+    {
+      "declaration": "image_elim",
+      "source_kind": "explicit_term",
+      "term": "fun G => fun H => fun f => fun y => fun img => fun P => fun mk => img P mk"
+    },
+    {
+      "declaration": "image_one",
+      "source_kind": "explicit_term",
+      "term": "fun G => fun oneG => fun mulG => fun invG => fun H => fun oneH => fun mulH => fun invH => fun f => fun hom_args => fun (P : Prop) => fun (mk : forall (a : G), forall (h : @Eq.{v} H (f a) oneH), P) => mk oneG (@hom_one.{u,v} G oneG mulG invG H oneH mulH invH f hom_args)"
+    },
+    {
+      "declaration": "image_mul_closed",
+      "source_kind": "explicit_term",
+      "term": "fun G => fun oneG => fun mulG => fun invG => fun H => fun oneH => fun mulH => fun invH => fun f => fun hom_args => fun x => fun y => fun hx => fun hy => hx (@ImagePred.{u,v} G H f (mulH x y)) (fun (a : G) => fun (hax : @Eq.{v} H (f a) x) => hy (@ImagePred.{u,v} G H f (mulH x y)) (fun (b : G) => fun (hby : @Eq.{v} H (f b) y) => fun (P : Prop) => fun (mk : forall (c : G), forall (h : @Eq.{v} H (f c) (mulH x y)), P) => mk (mulG a b) (@eq_trans.{v} H (f (mulG a b)) (mulH (f a) (f b)) (mulH x y) (@hom_mul.{u,v} G oneG mulG invG H oneH mulH invH f hom_args a b) (@eq_congr2.{v,v,v} H H H mulH (f a) x (f b) y hax hby))))"
+    },
+    {
+      "declaration": "image_inv_closed",
+      "source_kind": "explicit_term",
+      "term": "fun G => fun oneG => fun mulG => fun invG => fun H => fun oneH => fun mulH => fun invH => fun f => fun hom_args => fun y => fun hy => hy (@ImagePred.{u,v} G H f (invH y)) (fun (a : G) => fun (hay : @Eq.{v} H (f a) y) => fun (P : Prop) => fun (mk : forall (c : G), forall (h : @Eq.{v} H (f c) (invH y)), P) => mk (invG a) (@eq_trans.{v} H (f (invG a)) (invH (f a)) (invH y) (@hom_inv.{u,v} G oneG mulG invG H oneH mulH invH f hom_args a) (@eq_congr_arg.{v,v} H H invH (f a) y hay)))"
+    }
+  ],
+  "acceptance": {
+    "required": ["decode_module_cert", "verify_module_cert"],
+    "accepted_artifact": "Proofs/Ai/Algebra/AbstractGroupImage/certificate.npcert"
+  }
+}

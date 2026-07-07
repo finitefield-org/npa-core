@@ -26,7 +26,7 @@ use npa_package::{
     parse_package_publish_plan_json, parse_package_theorem_index_json, PackageArtifactOrigin,
     PackageCheckerMode, PackageModule, PackagePath, PackagePublishArtifactRole,
     PackageRegistryCheckerStatus, PACKAGE_PUBLISH_PLAN_PATH,
-    PACKAGE_REFERENCE_SUMMARY_CACHE_LAYOUT_DIR,
+    PACKAGE_REFERENCE_SUMMARY_CACHE_LAYOUT_DIR, PACKAGE_VERIFIED_EXPORT_SUMMARY_PATH,
 };
 
 const LOCK_PATH: &str = "generated/package-lock.json";
@@ -122,12 +122,19 @@ fn package_cli_smoke_examples_cover_help_json_args_and_check_mode() {
 fn package_cli_full_corpus_examples_pass_on_proof_corpus() {
     let examples = [
         Example {
-            args: ["package", "check", "--root", "proofs"].as_slice(),
+            args: ["package", "check", "--root", "testdata/package/proofs"].as_slice(),
             success_prefix: "package check: passed\n",
             required_output: &[],
         },
         Example {
-            args: ["package", "build-certs", "--root", "proofs", "--check"].as_slice(),
+            args: [
+                "package",
+                "build-certs",
+                "--root",
+                "testdata/package/proofs",
+                "--check",
+            ]
+            .as_slice(),
             success_prefix: "package build-certs: passed\n",
             required_output: &[],
         },
@@ -136,7 +143,7 @@ fn package_cli_full_corpus_examples_pass_on_proof_corpus() {
                 "package",
                 "verify-certs",
                 "--root",
-                "proofs",
+                "testdata/package/proofs",
                 "--checker",
                 "reference",
                 "--audit-cache",
@@ -147,7 +154,13 @@ fn package_cli_full_corpus_examples_pass_on_proof_corpus() {
             required_output: &["package_verified", "module_verified", "npa-checker-ref"],
         },
         Example {
-            args: ["package", "check-hashes", "--root", "proofs"].as_slice(),
+            args: [
+                "package",
+                "check-hashes",
+                "--root",
+                "testdata/package/proofs",
+            ]
+            .as_slice(),
             success_prefix: "package check-hashes: passed\n",
             required_output: &[],
         },
@@ -200,6 +213,149 @@ fn package_cli_source_free_verify_succeeds_without_source_replay_or_meta() {
     assert!(stdout.contains("\"reason_code\":\"package_verified\""));
     assert!(stdout.contains("\"reason_code\":\"module_verified\""));
     assert!(stdout.contains("\"checker\":\"npa-checker-ref\""));
+    assert_host_path_free(&stdout, &package);
+}
+
+#[test]
+fn package_cli_source_free_refactor_plan_succeeds_without_source_sidecars_or_export_summary() {
+    let package = build_refactor_plan_metadata_package("refactor-plan-missing-sidecars", false);
+    assert!(!package.artifact_path("Proofs/Ai/Basic/source.npa").exists());
+    assert!(!package
+        .artifact_path("Proofs/Ai/Basic/replay.json")
+        .exists());
+    assert!(!package.artifact_path("Proofs/Ai/Basic/meta.json").exists());
+    assert!(!package
+        .artifact_path(PACKAGE_VERIFIED_EXPORT_SUMMARY_PATH)
+        .exists());
+
+    let output = run_refactor_plan_json(&package, &[]);
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stderr.is_empty());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert_json_envelope(&stdout, "package refactor-plan", "passed");
+    assert!(stdout.contains("\"reason_code\":\"refactor_plan_summary\""));
+    assert!(stdout.contains("theorem_index_status=missing"));
+    assert!(stdout.contains("certificate_metadata_unavailable"));
+    assert!(stdout.contains("\"root\":\"<absolute-root>\""));
+    assert_host_path_free(&stdout, &package);
+}
+
+#[test]
+fn package_cli_source_free_refactor_plan_output_ignores_source_only_changes() {
+    let package = build_basic_package("refactor-plan-source-drift", true);
+    let before = run_refactor_plan_success_stdout(&package, &[]);
+
+    fs::write(
+        package.artifact_path("Proofs/Ai/Basic/source.npa"),
+        b"source-only bytes that must not affect refactor-plan",
+    )
+    .unwrap();
+    fs::write(
+        package.artifact_path("Proofs/Ai/Basic/replay.json"),
+        b"{\"source_only\":true}",
+    )
+    .unwrap();
+    fs::write(
+        package.artifact_path("Proofs/Ai/Basic/meta.json"),
+        b"{\"source_only\":true}",
+    )
+    .unwrap();
+    write_file(
+        package.artifact_path("Proofs/Ai/Basic/tactic-trace.json"),
+        "{\"source_only\":true}",
+    );
+    write_file(
+        package.artifact_path("Proofs/Ai/Basic/ai-trace.json"),
+        "{\"source_only\":true}",
+    );
+
+    let after = run_refactor_plan_success_stdout(&package, &[]);
+
+    assert_eq!(after, before);
+}
+
+#[test]
+fn package_cli_source_free_refactor_plan_ignores_forbidden_sidecar_sentinels() {
+    let package = build_basic_package("refactor-plan-sidecar-sentinels", false);
+    write_directory(package.artifact_path("Proofs/Ai/Basic/source.npa"));
+    write_directory(package.artifact_path("Proofs/Ai/Basic/replay.json"));
+    write_directory(package.artifact_path("Proofs/Ai/Basic/meta.json"));
+    write_directory(package.artifact_path("Proofs/Ai/Basic/tactic-trace.json"));
+    write_directory(package.artifact_path("Proofs/Ai/Basic/ai-trace.json"));
+    write_directory(package.artifact_path(PACKAGE_VERIFIED_EXPORT_SUMMARY_PATH));
+
+    let output = run_refactor_plan_json(&package, &[]);
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stderr.is_empty());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert_json_envelope(&stdout, "package refactor-plan", "passed");
+    assert!(stdout.contains("\"reason_code\":\"refactor_plan_summary\""));
+    assert!(!stdout.contains("source.npa"));
+    assert!(!stdout.contains("replay.json"));
+    assert!(!stdout.contains("meta.json"));
+    assert!(!stdout.contains("tactic-trace"));
+    assert!(!stdout.contains("ai-trace"));
+    assert!(!stdout.contains("verified-export-summary"));
+    assert_host_path_free(&stdout, &package);
+}
+
+#[test]
+fn package_cli_source_free_refactor_plan_negative_diagnostics_are_sanitized() {
+    let malformed = build_refactor_plan_metadata_package("refactor-plan-malformed-index", true);
+    let theorem_index_path = malformed.artifact_path(PACKAGE_THEOREM_INDEX_PATH);
+    let mut theorem_index_source = fs::read_to_string(&theorem_index_path).unwrap();
+    theorem_index_source.push('\n');
+    fs::write(theorem_index_path, theorem_index_source).unwrap();
+    let malformed_output = run_refactor_plan_json(&malformed, &[]);
+    assert_eq!(malformed_output.status.code(), Some(1));
+    assert!(malformed_output.stderr.is_empty());
+    let malformed_stdout = String::from_utf8(malformed_output.stdout).unwrap();
+    assert_json_envelope(&malformed_stdout, "package refactor-plan", "failed");
+    assert!(malformed_stdout.contains("\"kind\":\"TheoremIndex\""));
+    assert!(malformed_stdout.contains("\"reason_code\":\"refactor_plan_theorem_index_invalid\""));
+    assert!(malformed_stdout.contains("\"path\":\"generated/theorem-index.json\""));
+    assert!(malformed_stdout.contains("\"actual_value\":\"non_canonical_order\""));
+    assert_host_path_free(&malformed_stdout, &malformed);
+
+    let unknown = build_refactor_plan_metadata_package("refactor-plan-unknown-module", false);
+    let unknown_output = run_refactor_plan_json(&unknown, &["--module", "Proofs.Ai.Missing"]);
+    assert_eq!(unknown_output.status.code(), Some(1));
+    assert!(unknown_output.stderr.is_empty());
+    let unknown_stdout = String::from_utf8(unknown_output.stdout).unwrap();
+    assert_json_envelope(&unknown_stdout, "package refactor-plan", "failed");
+    assert!(unknown_stdout.contains("\"kind\":\"PackageLock\""));
+    assert!(unknown_stdout.contains("\"reason_code\":\"refactor_plan_module_unknown\""));
+    assert!(unknown_stdout.contains("\"module\":\"Proofs.Ai.Missing\""));
+    assert_host_path_free(&unknown_stdout, &unknown);
+
+    let external = build_refactor_plan_metadata_package("refactor-plan-external-module", false);
+    let external_output = run_refactor_plan_json(&external, &["--module", "Std.Logic.Eq"]);
+    assert_eq!(external_output.status.code(), Some(1));
+    assert!(external_output.stderr.is_empty());
+    let external_stdout = String::from_utf8(external_output.stdout).unwrap();
+    assert_json_envelope(&external_stdout, "package refactor-plan", "failed");
+    assert!(external_stdout.contains("\"kind\":\"PackageLock\""));
+    assert!(external_stdout.contains("\"reason_code\":\"refactor_plan_module_not_local\""));
+    assert!(external_stdout.contains("\"module\":\"Std.Logic.Eq\""));
+    assert_host_path_free(&external_stdout, &external);
+}
+
+#[test]
+fn package_cli_source_free_refactor_plan_theorem_family_output_uses_family_signals_only() {
+    let package = build_refactor_plan_metadata_package("refactor-plan-theorem-family", true);
+
+    let stdout = run_refactor_plan_success_stdout(
+        &package,
+        &["--scope", "theorems", "--module", "Proofs.Ai.EqReasoning"],
+    );
+
+    assert!(stdout.contains("\"reason_code\":\"refactor_plan_theorem_family_candidate\""));
+    assert!(stdout
+        .contains("evidence=large_theorem_family,shared_name_prefix,statement_constant_signal"));
+    assert!(!stdout.contains("proof-dependent"));
+    assert!(!stdout.contains("proof_dependent"));
     assert_host_path_free(&stdout, &package);
 }
 
@@ -285,7 +441,7 @@ fn package_publish_inputs_rejects_stale_lock_metadata_certificate_and_checker_su
     let stale_certificate = build_basic_package("publish-stale-certificate", false);
     write_publish_input_metadata(&stale_certificate);
     fs::copy(
-        repo_root().join("proofs/Proofs/Ai/Prop/certificate.npcert"),
+        repo_root().join("testdata/package/proofs/Proofs/Ai/Prop/certificate.npcert"),
         stale_certificate.artifact_path("Proofs/Ai/Basic/certificate.npcert"),
     )
     .unwrap();
@@ -702,14 +858,16 @@ fn package_publish_plan_check_write_and_registry_mismatch_diagnostics() {
 #[test]
 fn package_cli_full_corpus_publish_plan_proof_corpus_check_mode_succeeds_with_checked_in_artifact()
 {
-    let publish_plan_path = repo_root().join("proofs").join(PACKAGE_PUBLISH_PLAN_PATH);
+    let publish_plan_path = repo_root()
+        .join("testdata/package/proofs")
+        .join(PACKAGE_PUBLISH_PLAN_PATH);
     let before = fs::read(&publish_plan_path).unwrap();
 
     let output = run_cli(&[
         "package",
         "publish-plan",
         "--root",
-        "proofs",
+        "testdata/package/proofs",
         "--check",
         "--json",
     ]);
@@ -720,7 +878,7 @@ fn package_cli_full_corpus_publish_plan_proof_corpus_check_mode_succeeds_with_ch
     assert!(stdout.starts_with(&format!(
         "{{\"schema\":\"{PACKAGE_COMMAND_RESULT_SCHEMA}\",\"command\":\"package publish-plan\","
     )));
-    assert!(stdout.contains("\"root\":\"proofs\""));
+    assert!(stdout.contains("\"root\":\"testdata/package/proofs\""));
     assert!(stdout.contains("\"status\":\"passed\""));
     assert!(stdout.contains("\"diagnostics\":[]"));
     assert!(stdout.contains(
@@ -773,7 +931,7 @@ fn package_publish_plan_cli_rejects_stale_inputs_and_checked_plan_metadata() {
     let stale_certificate = build_basic_package("publish-plan-cli-stale-certificate", false);
     write_publish_input_metadata(&stale_certificate);
     fs::copy(
-        repo_root().join("proofs/Proofs/Ai/Prop/certificate.npcert"),
+        repo_root().join("testdata/package/proofs/Proofs/Ai/Prop/certificate.npcert"),
         stale_certificate.artifact_path("Proofs/Ai/Basic/certificate.npcert"),
     )
     .unwrap();
@@ -941,7 +1099,7 @@ fn package_publish_plan_reference_cache_rejects_stale_inputs_before_cache_use() 
         Some(0)
     );
     fs::copy(
-        repo_root().join("proofs/Proofs/Ai/Prop/certificate.npcert"),
+        repo_root().join("testdata/package/proofs/Proofs/Ai/Prop/certificate.npcert"),
         stale_certificate.artifact_path("Proofs/Ai/Basic/certificate.npcert"),
     )
     .unwrap();
@@ -1048,7 +1206,7 @@ fn package_cli_temp_fixture_rejects_stale_source_certificate_and_lock() {
 
     let stale_certificate = build_basic_package("stale-certificate", true);
     fs::copy(
-        repo_root().join("proofs/Proofs/Ai/Prop/certificate.npcert"),
+        repo_root().join("testdata/package/proofs/Proofs/Ai/Prop/certificate.npcert"),
         stale_certificate.artifact_path("Proofs/Ai/Basic/certificate.npcert"),
     )
     .unwrap();
@@ -1132,6 +1290,16 @@ fn build_basic_package(label: &str, include_source_sidecars: bool) -> TestPackag
     package
 }
 
+fn build_refactor_plan_metadata_package(label: &str, include_theorem_index: bool) -> TestPackage {
+    let package = TestPackage::new(label);
+    copy_artifact(&package, PACKAGE_MANIFEST_PATH);
+    copy_artifact(&package, LOCK_PATH);
+    if include_theorem_index {
+        copy_artifact(&package, PACKAGE_THEOREM_INDEX_PATH);
+    }
+    package
+}
+
 fn basic_manifest(module: &PackageModule) -> String {
     let mut source = format!(
         r#"schema = "npa.package.v0.1"
@@ -1184,7 +1352,8 @@ tags = []
 }
 
 fn proof_basic_module() -> PackageModule {
-    let source = fs::read_to_string(repo_root().join("proofs/npa-package.toml")).unwrap();
+    let source =
+        fs::read_to_string(repo_root().join("testdata/package/proofs/npa-package.toml")).unwrap();
     parse_and_validate_manifest_str(&source)
         .unwrap()
         .manifest()
@@ -1267,7 +1436,7 @@ fn write_directory(path: PathBuf) {
 }
 
 fn copy_artifact(package: &TestPackage, relative: &str) {
-    let source = repo_root().join("proofs").join(relative);
+    let source = repo_root().join("testdata/package/proofs").join(relative);
     let target = package.artifact_path(relative);
     fs::create_dir_all(target.parent().unwrap()).unwrap();
     fs::copy(source, target).unwrap();
@@ -1301,6 +1470,23 @@ fn run_publish_plan_write(package: &TestPackage) {
     assert!(output.stderr.is_empty());
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(stdout.starts_with("package publish-plan: passed\n"));
+}
+
+fn run_refactor_plan_json(package: &TestPackage, extra_args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_npa"))
+        .args(["package", "refactor-plan", "--root"])
+        .arg(package.path())
+        .args(extra_args)
+        .arg("--json")
+        .output()
+        .unwrap()
+}
+
+fn run_refactor_plan_success_stdout(package: &TestPackage, extra_args: &[&str]) -> String {
+    let output = run_refactor_plan_json(package, extra_args);
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stderr.is_empty());
+    String::from_utf8(output.stdout).unwrap()
 }
 
 fn clear_reference_summary_cache() {

@@ -108,6 +108,7 @@ fn run_verify_certs(timings: PackageTimingMode) -> npa_cli::diagnostic::CommandR
             json: true,
         },
         checker: PackageChecker::Fast,
+        changed: false,
         audit_cache: PackageAuditCacheMode::Off,
         verifier_memo: PackageVerifierMemoMode::Off,
         jobs: 1,
@@ -162,7 +163,7 @@ fn strip_timings(json: &str) -> String {
 }
 
 fn fixture_root() -> PathBuf {
-    repo_root().join("../npa/fixtures/npa-std")
+    repo_root().join("testdata/package/npa-std")
 }
 
 fn repo_root() -> PathBuf {

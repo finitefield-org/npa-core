@@ -1,0 +1,6 @@
+{
+  "id": "checker-disagreement",
+  "kind": "checker_disagreement",
+  "rejection_kind": "checker_disagreement_non_advancing",
+  "blocked_target_state": "independent_verified"
+}

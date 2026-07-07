@@ -1,0 +1,23 @@
+theorem imp_chain4 :
+  forall (P : Prop), forall (Q : Prop), forall (R : Prop), forall (S : Prop), forall (pq : forall (p : P), Q), forall (qr : forall (q : Q), R), forall (rs : forall (r : R), S), forall (p : P), S :=
+  fun P => fun Q => fun R => fun S => fun pq => fun qr => fun rs => fun p => rs (qr (pq p))
+
+theorem imp_permute3 :
+  forall (P : Prop), forall (Q : Prop), forall (R : Prop), forall (S : Prop), forall (h : forall (p : P), forall (q : Q), forall (r : R), S), forall (r : R), forall (p : P), forall (q : Q), S :=
+  fun P => fun Q => fun R => fun S => fun h => fun r => fun p => fun q => h p q r
+
+theorem imp_apply_twice :
+  forall (P : Prop), forall (h : forall (p : P), P), forall (p : P), P :=
+  fun P => fun h => fun p => h (h p)
+
+theorem imp_const3 :
+  forall (P : Prop), forall (Q : Prop), forall (R : Prop), forall (p : P), forall (q : Q), forall (r : R), P :=
+  fun P => fun Q => fun R => fun p => fun q => fun r => p
+
+theorem imp_flip_chain :
+  forall (P : Prop), forall (Q : Prop), forall (R : Prop), forall (qr : forall (q : Q), R), forall (pq : forall (p : P), Q), forall (p : P), R :=
+  fun P => fun Q => fun R => fun qr => fun pq => fun p => qr (pq p)
+
+theorem imp_higher_apply :
+  forall (P : Prop), forall (Q : Prop), forall (R : Prop), forall (h : forall (f : forall (p : P), Q), R), forall (f : forall (p : P), Q), R :=
+  fun P => fun Q => fun R => fun h => fun f => h f

@@ -215,6 +215,7 @@ fn run_package_verify_certs_on_stack(
     cache_cwd: Option<PathBuf>,
 ) -> CommandResult {
     let checker = options.checker;
+    let changed = options.changed;
     let audit_cache = options.audit_cache;
     let verifier_memo = options.verifier_memo;
     let jobs = options.jobs;
@@ -225,6 +226,42 @@ fn run_package_verify_certs_on_stack(
         Ok(loaded) => loaded,
         Err(result) => return timings.finish_result(result),
     };
+
+    if changed && checker == PackageChecker::External {
+        return timings.finish_result(CommandResult::failed(
+            COMMAND,
+            loaded.root_display,
+            vec![
+                CommandDiagnostic::error(DiagnosticKind::Usage, "unsupported_flag")
+                    .with_field("--changed")
+                    .with_actual_value(checker.as_str()),
+            ],
+        ));
+    }
+
+    if changed && audit_cache.uses_local_store() {
+        return timings.finish_result(CommandResult::failed(
+            COMMAND,
+            loaded.root_display,
+            vec![
+                CommandDiagnostic::error(DiagnosticKind::Usage, "unsupported_flag")
+                    .with_field("--audit-cache")
+                    .with_actual_value(audit_cache.as_str()),
+            ],
+        ));
+    }
+
+    if changed && verifier_memo.uses_local_store() {
+        return timings.finish_result(CommandResult::failed(
+            COMMAND,
+            loaded.root_display,
+            vec![
+                CommandDiagnostic::error(DiagnosticKind::Usage, "unsupported_flag")
+                    .with_field("--verifier-memo")
+                    .with_actual_value(verifier_memo.as_str()),
+            ],
+        ));
+    }
 
     let (lock_source, checked_lock) =
         match timings.time_phase(TIMING_LOAD_LOCK_MS, || read_package_lock(&loaded)) {
@@ -278,6 +315,23 @@ fn run_package_verify_certs_on_stack(
             ],
         ));
     }
+
+    let selected_modules = if changed {
+        match timings.time_phase(TIMING_SELECTION_MS, || {
+            changed_certificate_modules(&loaded, &checked_lock)
+        }) {
+            Ok(modules) => Some(modules),
+            Err(diagnostic) => {
+                return timings.finish_result(CommandResult::failed(
+                    COMMAND,
+                    loaded.root_display,
+                    vec![*diagnostic],
+                ));
+            }
+        }
+    } else {
+        None
+    };
 
     if checker == PackageChecker::External {
         if jobs > 1 {
@@ -519,14 +573,18 @@ fn run_package_verify_certs_on_stack(
 
     let collect_decode_cache_counters = timings.is_enabled();
     let report = match timings.time_phase(TIMING_CHECKER_MS, || {
+        let execution_options = PackageVerificationExecutionOptions {
+            jobs,
+            selected_modules,
+            memoization: PackageVerificationMemoMode::ProcessLocal,
+            collect_decode_cache_counters,
+        };
         verify_package(
             checker,
-            jobs,
-            PackageVerificationMemoMode::ProcessLocal,
             &loaded,
             &checked_lock,
             &artifacts,
-            collect_decode_cache_counters,
+            execution_options,
         )
     }) {
         Ok(report) => report,
@@ -1470,19 +1528,11 @@ fn regenerated_package_lock_json(
 
 fn verify_package(
     checker: PackageChecker,
-    jobs: usize,
-    memoization: PackageVerificationMemoMode,
     loaded: &LoadedPackageRoot,
     lock: &PackageLockManifest,
     artifacts: &[CertificateArtifactBuffer],
-    collect_decode_cache_counters: bool,
+    execution_options: PackageVerificationExecutionOptions,
 ) -> Result<PackageVerificationReport, PackageVerificationError> {
-    let execution_options = PackageVerificationExecutionOptions {
-        jobs,
-        selected_modules: None,
-        memoization,
-        collect_decode_cache_counters,
-    };
     match checker {
         PackageChecker::Reference => verify_package_reference_source_free_with_options(
             &loaded.validated,
@@ -1500,6 +1550,198 @@ fn verify_package(
             unreachable!("external checker is handled before verify_package")
         }
     }
+}
+
+fn changed_certificate_modules(
+    loaded: &LoadedPackageRoot,
+    lock: &PackageLockManifest,
+) -> Result<BTreeSet<Name>, Box<CommandDiagnostic>> {
+    let certificate_modules = lock
+        .entries
+        .iter()
+        .map(|entry| (entry.certificate.as_str().to_owned(), entry.module.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let certificate_paths = certificate_modules.keys().cloned().collect::<BTreeSet<_>>();
+    let changed_paths =
+        changed_package_paths(&loaded.root, &certificate_paths).map_err(|error| {
+            Box::new(
+                CommandDiagnostic::error(DiagnosticKind::Internal, "git_status_failed")
+                    .with_field("--changed")
+                    .with_actual_value(error),
+            )
+        })?;
+    Ok(changed_paths
+        .iter()
+        .filter_map(|path| certificate_modules.get(path.as_str()).cloned())
+        .collect())
+}
+
+fn changed_package_paths(
+    package_root: &Path,
+    certificate_paths: &BTreeSet<String>,
+) -> Result<Vec<String>, String> {
+    let worktree_root = git_worktree_root(package_root)?;
+    let package_prefix = package_status_prefix(package_root, &worktree_root)?;
+    let output = Command::new("git")
+        .args([
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            "--",
+        ])
+        .arg(".")
+        .current_dir(package_root)
+        .output()
+        .map_err(|error| format!("failed to run git status: {error}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        if stderr.is_empty() {
+            return Err(format!("git status exited with status {}", output.status));
+        }
+        return Err(stderr);
+    }
+    Ok(changed_paths_from_git_status_z(
+        &output.stdout,
+        &worktree_root,
+        &package_prefix,
+        certificate_paths,
+    )?
+    .into_iter()
+    .collect())
+}
+
+fn git_worktree_root(package_root: &Path) -> Result<PathBuf, String> {
+    let output = Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(package_root)
+        .output()
+        .map_err(|error| format!("failed to run git rev-parse: {error}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        if stderr.is_empty() {
+            return Err(format!(
+                "git rev-parse exited with status {}",
+                output.status
+            ));
+        }
+        return Err(stderr);
+    }
+    Ok(PathBuf::from(
+        String::from_utf8_lossy(&output.stdout).trim(),
+    ))
+}
+
+fn package_status_prefix(package_root: &Path, worktree_root: &Path) -> Result<String, String> {
+    let package_root = package_root
+        .canonicalize()
+        .map_err(|error| format!("failed to canonicalize package root: {error}"))?;
+    let worktree_root = worktree_root
+        .canonicalize()
+        .map_err(|error| format!("failed to canonicalize git worktree root: {error}"))?;
+    let relative = package_root.strip_prefix(&worktree_root).map_err(|_| {
+        format!(
+            "package root {} is not inside Git worktree {}",
+            package_root.display(),
+            worktree_root.display()
+        )
+    })?;
+    Ok(path_to_git_status_path(relative))
+}
+
+fn path_to_git_status_path(path: &Path) -> String {
+    path.components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(segment) => Some(segment.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn package_relative_changed_path(path: &str, package_prefix: &str) -> Option<String> {
+    let path = path.trim_start_matches("./");
+    if path.is_empty() {
+        return None;
+    }
+    if package_prefix.is_empty() {
+        return Some(path.to_owned());
+    }
+    if let Some(path) = path
+        .strip_prefix(package_prefix)
+        .and_then(|path| path.strip_prefix('/'))
+    {
+        return Some(path.to_owned());
+    }
+    Some(path.to_owned())
+}
+
+fn changed_paths_from_git_status_z(
+    stdout: &[u8],
+    worktree_root: &Path,
+    package_prefix: &str,
+    certificate_paths: &BTreeSet<String>,
+) -> Result<Vec<String>, String> {
+    let mut fields = stdout
+        .split(|byte| *byte == 0)
+        .filter(|field| !field.is_empty());
+    let mut paths = Vec::new();
+    while let Some(entry) = fields.next() {
+        if entry.len() < 4 {
+            continue;
+        }
+        let status = &entry[..2];
+        let path = &entry[3..];
+        if !path.is_empty() {
+            let path = git_status_path_from_bytes(path);
+            let Some(package_path) = package_relative_changed_path(&path, package_prefix) else {
+                if status.iter().any(|byte| matches!(byte, b'R' | b'C')) {
+                    let _ = fields.next();
+                }
+                continue;
+            };
+            if certificate_paths.contains(&package_path)
+                && git_status_selects_worktree_path(status, worktree_root, &path)?
+            {
+                paths.push(package_path);
+            }
+        }
+        if status.iter().any(|byte| matches!(byte, b'R' | b'C')) {
+            let _ = fields.next();
+        }
+    }
+    Ok(paths)
+}
+
+fn git_status_selects_worktree_path(
+    status: &[u8],
+    worktree_root: &Path,
+    path: &str,
+) -> Result<bool, String> {
+    if status == b"??" {
+        return Ok(true);
+    }
+    git_worktree_path_differs_from_head(worktree_root, path)
+}
+
+fn git_worktree_path_differs_from_head(worktree_root: &Path, path: &str) -> Result<bool, String> {
+    let status = Command::new("git")
+        .args(["diff", "--quiet", "HEAD", "--"])
+        .arg(format!(":(top,literal){path}"))
+        .current_dir(worktree_root)
+        .status()
+        .map_err(|error| format!("failed to run git diff: {error}"))?;
+    match status.code() {
+        Some(0) => Ok(false),
+        Some(1) => Ok(true),
+        Some(_) | None => Err(format!("git diff exited with status {status}")),
+    }
+}
+
+fn git_status_path_from_bytes(path: &[u8]) -> String {
+    String::from_utf8_lossy(path)
+        .trim_start_matches("./")
+        .to_owned()
 }
 
 fn verify_package_with_read_through_cache(
@@ -1539,12 +1781,15 @@ fn verify_package_with_read_through_cache(
         .time_phase(TIMING_CHECKER_MS, || {
             verify_package(
                 checker,
-                1,
-                PackageVerificationMemoMode::Disabled,
                 loaded,
                 lock,
                 artifacts,
-                false,
+                PackageVerificationExecutionOptions {
+                    jobs: 1,
+                    selected_modules: None,
+                    memoization: PackageVerificationMemoMode::Disabled,
+                    collect_decode_cache_counters: false,
+                },
             )
         })
         .map_err(PackageAuditVerificationRunError::Verification)?;
@@ -1737,12 +1982,15 @@ fn verify_package_with_read_through_disk_memo(
         .time_phase(TIMING_CHECKER_MS, || {
             verify_package(
                 checker,
-                jobs,
-                PackageVerificationMemoMode::Disabled,
                 loaded,
                 lock,
                 artifacts,
-                false,
+                PackageVerificationExecutionOptions {
+                    jobs,
+                    selected_modules: None,
+                    memoization: PackageVerificationMemoMode::Disabled,
+                    collect_decode_cache_counters: false,
+                },
             )
         })
         .map_err(PackageAuditVerificationRunError::Verification)?;
@@ -2767,4 +3015,25 @@ fn lock_entries_by_module(lock: &PackageLockManifest) -> BTreeMap<Name, &Package
         .iter()
         .map(|entry| (entry.module.clone(), entry))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn changed_paths_from_git_status_z_filters_non_certificates_before_diff() {
+        let mut certificate_paths = BTreeSet::new();
+        certificate_paths.insert("Proofs/Ai/Basic/certificate.npcert".to_owned());
+
+        let changed_paths = changed_paths_from_git_status_z(
+            b" M packages/proofs/Proofs/Ai/Basic/source.npa\0",
+            Path::new("/path/that/does/not/exist"),
+            "packages/proofs",
+            &certificate_paths,
+        )
+        .unwrap();
+
+        assert!(changed_paths.is_empty());
+    }
 }

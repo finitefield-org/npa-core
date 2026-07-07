@@ -15,15 +15,15 @@ use npa_package::{
     PackageCheckerMode, PackageDownstreamImportModule, PackageId, PackageVersion,
 };
 
-const DOWNSTREAM_FIXTURE_ROOT: &str = "../npa/fixtures/npa-mathlib-seed-downstream";
-const SEED_RELEASE_ROOT: &str = "../npa/fixtures/npa-mathlib-seed";
+const DOWNSTREAM_FIXTURE_ROOT: &str = "testdata/package/npa-mathlib-seed-downstream";
+const SEED_RELEASE_ROOT: &str = "testdata/package/npa-mathlib-seed";
 const SEED_PUBLISH_PLAN: &str = "generated/publish-plan.json";
 const SEED_PACKAGE: &str = "npa-mathlib-seed";
 const SEED_VERSION: &str = "0.1.0";
 const SEED_MODULE: &str = "Proofs.Ai.Basic";
 const VENDORED_SEED_ROOT: &str = "vendor/npa-mathlib-seed";
-const MATHLIB_DOWNSTREAM_FIXTURE_ROOT: &str = "../npa/fixtures/npa-mathlib-downstream";
-const MATHLIB_RELEASE_ROOT: &str = "../npa/fixtures/npa-mathlib";
+const MATHLIB_DOWNSTREAM_FIXTURE_ROOT: &str = "testdata/package/npa-mathlib-downstream";
+const MATHLIB_RELEASE_ROOT: &str = "testdata/package/npa-mathlib";
 const MATHLIB_PACKAGE: &str = "npa-mathlib";
 const MATHLIB_MODULE: &str = "Mathlib.Logic.Basic";
 const MATHLIB_DOWNSTREAM_MODULE: &str = "Downstream.MathlibBasic";
@@ -478,6 +478,7 @@ fn run_verify(fixture: &TestFixture) -> npa_cli::diagnostic::CommandResult {
             json: true,
         },
         checker: PackageChecker::Reference,
+        changed: false,
         audit_cache: PackageAuditCacheMode::Off,
         verifier_memo: PackageVerifierMemoMode::Off,
         jobs: 1,

@@ -1,0 +1,19 @@
+theorem generated_local_lemma_identity :
+  forall (A : Type), forall (x : A), A :=
+  fun A => fun x => x
+
+theorem generated_local_lemma_context_generalized :
+  forall (A : Type), forall (B : Type), forall (f : forall (x : A), B), forall (x : A), B :=
+  fun A => fun B => fun f => fun x => f x
+
+theorem sketch_parent_lemma_a :
+  forall (A : Type), forall (x : A), A :=
+  fun A => fun x => x
+
+theorem sketch_parent_lemma_b_depends_on_a :
+  forall (A : Type), forall (x : A), A :=
+  fun A => fun x => sketch_parent_lemma_a A x
+
+theorem sketch_parent_final_depends_on_a_b :
+  forall (A : Type), forall (x : A), A :=
+  fun A => fun x => sketch_parent_lemma_b_depends_on_a A (sketch_parent_lemma_a A x)

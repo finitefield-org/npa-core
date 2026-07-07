@@ -3,6 +3,8 @@
 use std::fmt;
 use std::path::PathBuf;
 
+use npa_cert::Name;
+
 /// Parsed top-level CLI action.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CliAction {
@@ -43,6 +45,8 @@ pub enum PackageCommand {
     Index(PackageIndexOptions),
     /// `npa package export-summary`.
     ExportSummary(PackageExportSummaryOptions),
+    /// `npa package export-candidate-metadata`.
+    ExportCandidateMetadata(PackageCandidateMetadataOptions),
     /// `npa package verify-certs`.
     VerifyCerts(PackageVerifyCertsOptions),
     /// `npa package check-hashes`.
@@ -55,6 +59,8 @@ pub enum PackageCommand {
     HighTrust(Box<PackageHighTrustOptions>),
     /// `npa package gate-plan`.
     GatePlan(PackageGatePlanOptions),
+    /// `npa package refactor-plan`.
+    RefactorPlan(PackageRefactorPlanOptions),
 }
 
 impl PackageCommand {
@@ -66,12 +72,14 @@ impl PackageCommand {
             Self::AxiomReport(_) => "package axiom-report",
             Self::Index(_) => "package index",
             Self::ExportSummary(_) => "package export-summary",
+            Self::ExportCandidateMetadata(_) => "package export-candidate-metadata",
             Self::VerifyCerts(_) => "package verify-certs",
             Self::CheckHashes(_) => "package check-hashes",
             Self::PublishPlan(_) => "package publish-plan",
             Self::CheckGenerated(_) => "package check-generated",
             Self::HighTrust(_) => "package high-trust",
             Self::GatePlan(_) => "package gate-plan",
+            Self::RefactorPlan(_) => "package refactor-plan",
         }
     }
 
@@ -83,11 +91,13 @@ impl PackageCommand {
             Self::AxiomReport(options) => &options.common,
             Self::Index(options) => &options.common,
             Self::ExportSummary(options) => &options.common,
+            Self::ExportCandidateMetadata(options) => &options.common,
             Self::VerifyCerts(options) => &options.common,
             Self::PublishPlan(options) => &options.common,
             Self::CheckGenerated(options) => &options.common,
             Self::HighTrust(options) => &options.common,
             Self::GatePlan(options) => &options.common,
+            Self::RefactorPlan(options) => &options.common,
         }
     }
 }
@@ -108,6 +118,32 @@ impl Default for PackageCommonOptions {
             json: false,
         }
     }
+}
+
+/// Scope selected for `package refactor-plan`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PackageRefactorPlanScope {
+    /// Rank module refactor candidates.
+    Modules,
+    /// Rank theorem-family refactor candidates.
+    Theorems,
+    /// Rank both module and theorem-family refactor candidates.
+    Both,
+}
+
+/// Options for `package refactor-plan`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PackageRefactorPlanOptions {
+    /// Common package command options.
+    pub common: PackageCommonOptions,
+    /// Candidate scope to emit.
+    pub scope: PackageRefactorPlanScope,
+    /// Optional local module filter.
+    pub module: Option<Name>,
+    /// Maximum number of sorted candidates to emit.
+    pub top: usize,
+    /// Reserved source-reading metrics flag. Rejected by the MVP parser.
+    pub include_source_metrics: bool,
 }
 
 /// Options for `package gate-plan`.
@@ -192,6 +228,19 @@ pub struct PackageExportSummaryOptions {
     pub timings: PackageTimingMode,
 }
 
+/// Options for `package export-candidate-metadata`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PackageCandidateMetadataOptions {
+    /// Common package command options.
+    pub common: PackageCommonOptions,
+    /// Module containing the candidate theorem.
+    pub module: String,
+    /// Theorem declaration to export.
+    pub declaration: String,
+    /// Package-relative output path.
+    pub out: PathBuf,
+}
+
 /// Options for `package publish-plan`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PackagePublishPlanOptions {
@@ -244,6 +293,8 @@ pub struct PackageVerifyCertsOptions {
     pub common: PackageCommonOptions,
     /// Checker mode selected for source-free verification.
     pub checker: PackageChecker,
+    /// Verify only package modules whose certificate files are changed in Git.
+    pub changed: bool,
     /// Local package audit cache mode.
     pub audit_cache: PackageAuditCacheMode,
     /// Local verifier memo mode.
@@ -396,6 +447,8 @@ pub enum HelpTopic {
     PackageIndex,
     /// `npa package export-summary --help`.
     PackageExportSummary,
+    /// `npa package export-candidate-metadata --help`.
+    PackageExportCandidateMetadata,
     /// `npa package verify-certs --help`.
     PackageVerifyCerts,
     /// `npa package check-hashes --help`.
@@ -408,6 +461,8 @@ pub enum HelpTopic {
     PackageHighTrust,
     /// `npa package gate-plan --help`.
     PackageGatePlan,
+    /// `npa package refactor-plan --help`.
+    PackageRefactorPlan,
 }
 
 /// Stable usage error produced by the argument parser.
@@ -489,6 +544,8 @@ pub enum UsageReason {
     UnsupportedFlag,
     /// Flag value has the wrong deterministic shape.
     InvalidFlagValue,
+    /// Module name is not a canonical dotted NPA name.
+    InvalidModuleName,
     /// Checker mode is outside CLR-04 scope.
     UnsupportedChecker,
     /// Package audit cache mode is unsupported.
@@ -512,6 +569,7 @@ impl UsageReason {
             Self::MissingRequiredFlag => "missing_required_flag",
             Self::UnsupportedFlag => "unsupported_flag",
             Self::InvalidFlagValue => "invalid_flag_value",
+            Self::InvalidModuleName => "invalid_module_name",
             Self::UnsupportedChecker => "unsupported_checker",
             Self::UnsupportedAuditCacheMode => "unsupported_audit_cache_mode",
             Self::UnsupportedVerifierMemoMode => "unsupported_verifier_memo_mode",
@@ -551,12 +609,14 @@ fn parse_package_args(args: &[String]) -> Result<CliAction, CliUsageError> {
         "axiom-report" => parse_package_axiom_report_args(&args[1..]),
         "index" => parse_package_index_args(&args[1..]),
         "export-summary" => parse_package_export_summary_args(&args[1..]),
+        "export-candidate-metadata" => parse_package_export_candidate_metadata_args(&args[1..]),
         "verify-certs" => parse_package_verify_certs_args(&args[1..]),
         "check-hashes" => parse_package_check_hashes_args(&args[1..]),
         "publish-plan" => parse_package_publish_plan_args(&args[1..]),
         "check-generated" => parse_package_check_generated_args(&args[1..]),
         "high-trust" => parse_package_high_trust_args(&args[1..]),
         "gate-plan" => parse_package_gate_plan_args(&args[1..]),
+        "refactor-plan" => parse_package_refactor_plan_args(&args[1..]),
         command if command.starts_with('-') => {
             Err(flag_error(command, UsageReason::UnknownFlag).with_command("package"))
         }
@@ -582,6 +642,89 @@ fn parse_package_check_hashes_args(args: &[String]) -> Result<CliAction, CliUsag
     let common = parse_common_options(args, "package check-hashes", &[])?;
     Ok(CliAction::Run(CliCommand::Package(
         PackageCommand::CheckHashes(common),
+    )))
+}
+
+fn parse_package_refactor_plan_args(args: &[String]) -> Result<CliAction, CliUsageError> {
+    const COMMAND: &str = "package refactor-plan";
+
+    if contains_help(args) {
+        return Ok(CliAction::Help(HelpTopic::PackageRefactorPlan));
+    }
+
+    let mut common_tokens = Vec::new();
+    let mut scope = None::<String>;
+    let mut module = None::<String>;
+    let mut top = None::<String>;
+    let mut index = 0usize;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--scope" => {
+                parse_string_flag(args, &mut index, "--scope", COMMAND, &mut scope)?;
+            }
+            token if token.starts_with("--scope=") => {
+                parse_string_equals_flag(token, "--scope", COMMAND, &mut scope)?;
+                index += 1;
+            }
+            "--module" => {
+                parse_string_flag(args, &mut index, "--module", COMMAND, &mut module)?;
+            }
+            token if token.starts_with("--module=") => {
+                parse_string_equals_flag(token, "--module", COMMAND, &mut module)?;
+                index += 1;
+            }
+            "--top" => {
+                parse_string_flag(args, &mut index, "--top", COMMAND, &mut top)?;
+            }
+            token if token.starts_with("--top=") => {
+                parse_string_equals_flag(token, "--top", COMMAND, &mut top)?;
+                index += 1;
+            }
+            "--include-source-metrics" => {
+                return Err(
+                    flag_error("--include-source-metrics", UsageReason::UnsupportedFlag)
+                        .with_command(COMMAND),
+                );
+            }
+            token if token.starts_with("--include-source-metrics=") => {
+                return Err(
+                    flag_error("--include-source-metrics", UsageReason::UnsupportedFlag)
+                        .with_command(COMMAND),
+                );
+            }
+            token => {
+                common_tokens.push(token.to_owned());
+                index += 1;
+            }
+        }
+    }
+
+    let common = parse_common_options(
+        &common_tokens,
+        COMMAND,
+        &["--scope", "--module", "--top", "--include-source-metrics"],
+    )?;
+    let scope = match scope {
+        Some(value) => parse_refactor_plan_scope(&value)?,
+        None => PackageRefactorPlanScope::Modules,
+    };
+    let module = match module {
+        Some(value) => Some(parse_refactor_plan_module(&value)?),
+        None => None,
+    };
+    let top = match top {
+        Some(value) => parse_refactor_plan_top(&value)?,
+        None => 20,
+    };
+
+    Ok(CliAction::Run(CliCommand::Package(
+        PackageCommand::RefactorPlan(PackageRefactorPlanOptions {
+            common,
+            scope,
+            module,
+            top,
+            include_source_metrics: false,
+        }),
     )))
 }
 
@@ -916,6 +1059,105 @@ fn parse_package_export_summary_args(args: &[String]) -> Result<CliAction, CliUs
             out,
             check,
             timings,
+        }),
+    )))
+}
+
+fn parse_package_export_candidate_metadata_args(
+    args: &[String],
+) -> Result<CliAction, CliUsageError> {
+    if contains_help(args) {
+        return Ok(CliAction::Help(HelpTopic::PackageExportCandidateMetadata));
+    }
+
+    let mut common_tokens = Vec::new();
+    let mut module = None::<String>;
+    let mut declaration = None::<String>;
+    let mut out = None::<PathBuf>;
+    let mut index = 0usize;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--module" => {
+                parse_string_flag(
+                    args,
+                    &mut index,
+                    "--module",
+                    "package export-candidate-metadata",
+                    &mut module,
+                )?;
+            }
+            token if token.starts_with("--module=") => {
+                parse_string_equals_flag(
+                    token,
+                    "--module",
+                    "package export-candidate-metadata",
+                    &mut module,
+                )?;
+                index += 1;
+            }
+            "--declaration" => {
+                parse_string_flag(
+                    args,
+                    &mut index,
+                    "--declaration",
+                    "package export-candidate-metadata",
+                    &mut declaration,
+                )?;
+            }
+            token if token.starts_with("--declaration=") => {
+                parse_string_equals_flag(
+                    token,
+                    "--declaration",
+                    "package export-candidate-metadata",
+                    &mut declaration,
+                )?;
+                index += 1;
+            }
+            "--out" => {
+                parse_path_flag(
+                    args,
+                    &mut index,
+                    "--out",
+                    "package export-candidate-metadata",
+                    &mut out,
+                )?;
+            }
+            token if token.starts_with("--out=") => {
+                parse_path_equals_flag(
+                    token,
+                    "--out",
+                    "package export-candidate-metadata",
+                    &mut out,
+                )?;
+                index += 1;
+            }
+            token => {
+                common_tokens.push(token.to_owned());
+                index += 1;
+            }
+        }
+    }
+
+    let common = parse_common_options(
+        &common_tokens,
+        "package export-candidate-metadata",
+        &["--module", "--declaration", "--out"],
+    )?;
+    Ok(CliAction::Run(CliCommand::Package(
+        PackageCommand::ExportCandidateMetadata(PackageCandidateMetadataOptions {
+            common,
+            module: module.ok_or_else(|| {
+                flag_error("--module", UsageReason::MissingRequiredFlag)
+                    .with_command("package export-candidate-metadata")
+            })?,
+            declaration: declaration.ok_or_else(|| {
+                flag_error("--declaration", UsageReason::MissingRequiredFlag)
+                    .with_command("package export-candidate-metadata")
+            })?,
+            out: out.ok_or_else(|| {
+                flag_error("--out", UsageReason::MissingRequiredFlag)
+                    .with_command("package export-candidate-metadata")
+            })?,
         }),
     )))
 }
@@ -1260,6 +1502,7 @@ fn parse_package_verify_certs_args(args: &[String]) -> Result<CliAction, CliUsag
 
     let mut common_tokens = Vec::new();
     let mut checker = None::<PackageChecker>;
+    let mut changed = false;
     let mut audit_cache = None::<PackageAuditCacheMode>;
     let mut verifier_memo = None::<PackageVerifierMemoMode>;
     let mut jobs = None::<usize>;
@@ -1270,6 +1513,14 @@ fn parse_package_verify_certs_args(args: &[String]) -> Result<CliAction, CliUsag
     let mut index = 0usize;
     while index < args.len() {
         match args[index].as_str() {
+            "--changed" => {
+                if changed {
+                    return Err(flag_error("--changed", UsageReason::DuplicateFlag)
+                        .with_command("package verify-certs"));
+                }
+                changed = true;
+                index += 1;
+            }
             "--checker" => {
                 if checker.is_some() {
                     return Err(flag_error("--checker", UsageReason::DuplicateFlag)
@@ -1539,6 +1790,7 @@ fn parse_package_verify_certs_args(args: &[String]) -> Result<CliAction, CliUsag
         "package verify-certs",
         &[
             "--checker",
+            "--changed",
             "--runner-policy",
             "--runner-policy-hash",
             "--checker-registry",
@@ -1553,6 +1805,24 @@ fn parse_package_verify_certs_args(args: &[String]) -> Result<CliAction, CliUsag
     let verifier_memo = verifier_memo.unwrap_or(PackageVerifierMemoMode::Off);
     let jobs = jobs.unwrap_or(1);
     let timings = timings.unwrap_or(PackageTimingMode::Off);
+    if changed && checker == PackageChecker::External {
+        return Err(CliUsageError::new(UsageReason::UnsupportedFlag)
+            .with_command("package verify-certs")
+            .with_flag("--changed")
+            .with_value(checker.as_str()));
+    }
+    if changed && audit_cache.uses_local_store() {
+        return Err(CliUsageError::new(UsageReason::UnsupportedFlag)
+            .with_command("package verify-certs")
+            .with_flag("--audit-cache")
+            .with_value(audit_cache.as_str()));
+    }
+    if changed && verifier_memo.uses_local_store() {
+        return Err(CliUsageError::new(UsageReason::UnsupportedFlag)
+            .with_command("package verify-certs")
+            .with_flag("--verifier-memo")
+            .with_value(verifier_memo.as_str()));
+    }
     if checker == PackageChecker::External && audit_cache.uses_local_store() {
         return Err(CliUsageError::new(UsageReason::UnsupportedFlag)
             .with_command("package verify-certs")
@@ -1607,6 +1877,7 @@ fn parse_package_verify_certs_args(args: &[String]) -> Result<CliAction, CliUsag
         PackageCommand::VerifyCerts(PackageVerifyCertsOptions {
             common,
             checker,
+            changed,
             audit_cache,
             verifier_memo,
             jobs,
@@ -1650,6 +1921,46 @@ fn parse_verifier_memo_mode(value: &str) -> Result<PackageVerifierMemoMode, CliU
             .with_flag("--verifier-memo")
             .with_value(other)),
     }
+}
+
+fn parse_refactor_plan_scope(value: &str) -> Result<PackageRefactorPlanScope, CliUsageError> {
+    match value {
+        "modules" => Ok(PackageRefactorPlanScope::Modules),
+        "theorems" => Ok(PackageRefactorPlanScope::Theorems),
+        "both" => Ok(PackageRefactorPlanScope::Both),
+        other => Err(CliUsageError::new(UsageReason::InvalidFlagValue)
+            .with_command("package refactor-plan")
+            .with_flag("--scope")
+            .with_value(other)),
+    }
+}
+
+fn parse_refactor_plan_module(value: &str) -> Result<Name, CliUsageError> {
+    let name = Name::from_dotted(value);
+    if name.is_canonical() {
+        Ok(name)
+    } else {
+        Err(CliUsageError::new(UsageReason::InvalidModuleName)
+            .with_command("package refactor-plan")
+            .with_flag("--module")
+            .with_value(value))
+    }
+}
+
+fn parse_refactor_plan_top(value: &str) -> Result<usize, CliUsageError> {
+    let Ok(top) = value.parse::<usize>() else {
+        return Err(CliUsageError::new(UsageReason::InvalidFlagValue)
+            .with_command("package refactor-plan")
+            .with_flag("--top")
+            .with_value(value));
+    };
+    if !(1..=200).contains(&top) {
+        return Err(CliUsageError::new(UsageReason::InvalidFlagValue)
+            .with_command("package refactor-plan")
+            .with_flag("--top")
+            .with_value(value));
+    }
+    Ok(top)
 }
 
 fn parse_timing_mode(
@@ -1877,6 +2188,11 @@ fn is_unsupported_clr04_flag(flag: &str) -> bool {
             | "--jobs"
             | "--timings"
             | "--base"
+            | "--scope"
+            | "--module"
+            | "--declaration"
+            | "--top"
+            | "--include-source-metrics"
     ) || flag.starts_with("--changed=")
         || flag.starts_with("--all=")
         || flag.starts_with("--registry=")
@@ -1898,6 +2214,11 @@ fn is_unsupported_clr04_flag(flag: &str) -> bool {
         || flag.starts_with("--jobs=")
         || flag.starts_with("--timings=")
         || flag.starts_with("--base=")
+        || flag.starts_with("--scope=")
+        || flag.starts_with("--module=")
+        || flag.starts_with("--declaration=")
+        || flag.starts_with("--top=")
+        || flag.starts_with("--include-source-metrics=")
 }
 
 /// Render deterministic help text.
@@ -1907,7 +2228,7 @@ pub fn render_help(topic: HelpTopic) -> &'static str {
             "Usage: npa <command> [options]\n\nCommands:\n  package    Package manifest and certificate commands\n  version    Print npa CLI version\n\nOptions:\n  --help\n  --version"
         }
         HelpTopic::Package => {
-            "Usage: npa package <command> [options]\n\nCommands:\n  check\n  build-certs\n  axiom-report\n  index\n  export-summary\n  verify-certs\n  check-hashes\n  publish-plan\n  check-generated\n  high-trust\n  gate-plan\n\nCommon options:\n  --root PATH    Package root, default: .\n  --json         Emit deterministic JSON diagnostics\n  --help         Show help"
+            "Usage: npa package <command> [options]\n\nCommands:\n  check\n  build-certs\n  axiom-report\n  index\n  export-summary\n  export-candidate-metadata\n  verify-certs\n  check-hashes\n  publish-plan\n  check-generated\n  high-trust\n  gate-plan\n  refactor-plan\n\nCommon options:\n  --root PATH    Package root, default: .\n  --json         Emit deterministic JSON diagnostics\n  --help         Show help"
         }
         HelpTopic::PackageCheck => {
             "Usage: npa package check [--root PATH] [--json]\n\nValidate npa-package.toml metadata without reading source or certificate artifacts."
@@ -1924,8 +2245,11 @@ pub fn render_help(topic: HelpTopic) -> &'static str {
         HelpTopic::PackageExportSummary => {
             "Usage: npa package export-summary [--root PATH] [--json] [--check] [--out PATH] [--timings off|summary|detailed]\n\nGenerate or check generated/verified-export-summary.json from source-free package certificate artifacts. The summary and timing telemetry are not proof evidence."
         }
+        HelpTopic::PackageExportCandidateMetadata => {
+            "Usage: npa package export-candidate-metadata [--root PATH] [--json] --module MODULE --declaration DECL --out PATH\n\nExport npa.candidate-verification-metadata.v1 for a checked source-free package theorem. The metadata is not proof evidence."
+        }
         HelpTopic::PackageVerifyCerts => {
-            "Usage: npa package verify-certs [--root PATH] [--json] [--checker reference|fast|external] [--audit-cache off|read-through|local-hit] [--verifier-memo off|read-through|disk] [--jobs N] [--timings off|summary|detailed] [--runner-policy PATH --runner-policy-hash HASH --checker-registry PATH]\n\nVerify certificates through the source-free package verifier. The default checker is reference, the default audit cache mode is off, the default verifier memo mode is off, the default jobs value is 1, and timings default to off. read-through audit cache and verifier memo modes still run live verification; local-hit and disk verifier memo hits are local-only acceleration and are not proof evidence; timing telemetry is informational and is not proof evidence; external mode requires explicit runner policy and checker registry inputs and does not support audit-cache or verifier-memo acceleration."
+            "Usage: npa package verify-certs [--root PATH] [--json] [--changed] [--checker reference|fast|external] [--audit-cache off|read-through|local-hit] [--verifier-memo off|read-through|disk] [--jobs N] [--timings off|summary|detailed] [--runner-policy PATH --runner-policy-hash HASH --checker-registry PATH]\n\nVerify certificates through the source-free package verifier. The default checker is reference, the default audit cache mode is off, the default verifier memo mode is off, the default jobs value is 1, and timings default to off. --changed verifies only package modules whose certificate files are changed in Git, plus source-free imports needed by the verifier. read-through audit cache and verifier memo modes still run live verification; local-hit and disk verifier memo hits are local-only acceleration and are not proof evidence; timing telemetry is informational and is not proof evidence; external mode requires explicit runner policy and checker registry inputs and does not support audit-cache, verifier-memo, or changed-certificate acceleration."
         }
         HelpTopic::PackageCheckHashes => {
             "Usage: npa package check-hashes [--root PATH] [--json]\n\nCheck checked-in package artifact hashes."
@@ -1941,6 +2265,9 @@ pub fn render_help(topic: HelpTopic) -> &'static str {
         }
         HelpTopic::PackageGatePlan => {
             "Usage: npa package gate-plan [--root PATH] [--json] --base REF\n\nRecommend the cheapest sufficient package gate commands from git diff --name-only REF...HEAD. The planner runs no gates and is not proof evidence."
+        }
+        HelpTopic::PackageRefactorPlan => {
+            "Usage: npa package refactor-plan [--root PATH] [--json] [--scope modules|theorems|both] [--module NAME] [--top N]\n\nRank advisory module and theorem-family refactor candidates from package metadata. The plan is not proof evidence and does not read source files."
         }
     }
 }

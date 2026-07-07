@@ -1,0 +1,6 @@
+{
+  "id": "sidecar-substitution",
+  "kind": "sidecar_substitution",
+  "rejection_kind": "untrusted_sidecar_not_evidence",
+  "blocked_target_state": "certificate_verified"
+}

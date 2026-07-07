@@ -1,0 +1,6 @@
+{
+  "id": "stale-replay",
+  "kind": "stale_replay",
+  "rejection_kind": "stale_input_hash",
+  "blocked_target_state": "replay_verified"
+}

@@ -1,0 +1,115 @@
+schema = "npa.package.v0.1"
+package = "npa-mathlib-seed"
+version = "0.1.0"
+license = "Apache-2.0"
+description = "Small external theorem-library seed package for CLR-09 dogfood."
+
+core_spec = "npa.core.v0.1"
+kernel_profile = "npa.kernel.v0.1"
+certificate_format = "npa.certificate.canonical.v0.1"
+checker_profile = "npa.checker.reference.v0.1"
+
+[policy]
+allow_custom_axioms = false
+allowed_axioms = []
+
+[[imports]]
+module = "Std.Logic.Eq"
+package = "npa-std"
+version = "0.1.0"
+certificate = "vendor/npa-std/Std/Logic/Eq/certificate.npcert"
+export_hash = "sha256:b78b442d5f593458cc12f079b59e3c70259c0bec4967511e1a01d262d2f0e874"
+certificate_hash = "sha256:5a5b68a51b3e90223f1e0cca730f8b155c79f881b9dca70d67e6bf10058054aa"
+
+[[imports]]
+module = "Std.Nat.Basic"
+package = "npa-std"
+version = "0.1.0"
+certificate = "vendor/npa-std/Std/Nat/Basic/certificate.npcert"
+export_hash = "sha256:30c432b4f2fc69e1e2414f556096e9d067d8e3d8e44f98bee1326169cccb5e4d"
+certificate_hash = "sha256:8a477f8d2becb4cfcb6a6baa1c79bc0112840cfe658302f47c9cf3dfd084d84e"
+
+[[modules]]
+module = "Proofs.Ai.Basic"
+source = "Proofs/Ai/Basic/source.npa"
+certificate = "Proofs/Ai/Basic/certificate.npcert"
+meta = "Proofs/Ai/Basic/meta.json"
+replay = "Proofs/Ai/Basic/replay.json"
+producer_profile = "human-surface-explicit-term"
+expected_source_hash = "sha256:2176be7570deae66754789868aa373ab01434512b4f50b992089886d2c655387"
+expected_certificate_file_hash = "sha256:464a0d224b8667e4870888522454782231cd2cdd9049e6fa930cbefa62c18ffc"
+expected_export_hash = "sha256:3341d28e9d1d9dd875138399ab1bd7aa6e2727449cb87fe03c73b220c4b231c0"
+expected_axiom_report_hash = "sha256:fed11e73accfbfb0dfc28b4f510e151fa33d8af82d58fdb23b92567e04e59e40"
+expected_certificate_hash = "sha256:69cb8c64c6ce722209e27820cd790af6d325c98478b3599ae796ee03df528b13"
+imports = []
+definitions = []
+theorems = ["id", "const_left", "const_right", "apply_fn", "compose", "flip", "duplicate", "prop_id", "modus_ponens", "imp_trans", "compose_assoc", "apply_twice", "ignore_middle", "select_middle", "select_last", "imp_swap", "imp_compose", "imp_ignore", "imp_duplicate", "higher_apply"]
+axioms = []
+
+[[modules]]
+module = "Proofs.Ai.Prop"
+source = "Proofs/Ai/Prop/source.npa"
+certificate = "Proofs/Ai/Prop/certificate.npcert"
+meta = "Proofs/Ai/Prop/meta.json"
+replay = "Proofs/Ai/Prop/replay.json"
+producer_profile = "human-surface-explicit-term"
+expected_source_hash = "sha256:466c82f2aa00708bbf9d91d7e59a5f0a629f5f61af979711c325a0f4ce29dec6"
+expected_certificate_file_hash = "sha256:2329dde6bd60cfa6b42abfdf776cd5d876582f8e26332c7f2fdf8b1395e96e6e"
+expected_export_hash = "sha256:2be3062e9adb565d319e67b416e96dd6c5f5ec6bb4fa9fd1902c256bf06c8613"
+expected_axiom_report_hash = "sha256:70b2d0f35f9ebfff46bdf399b80487f0c76ffd6460ab930f733af1f889d2fc65"
+expected_certificate_hash = "sha256:8f6914e6d85bd0113fba91ac8fb67824f7fd0a770424a41044686428252fe442"
+imports = []
+definitions = []
+theorems = ["imp_chain4", "imp_permute3", "imp_apply_twice", "imp_const3", "imp_flip_chain", "imp_higher_apply"]
+axioms = []
+
+[[modules]]
+module = "Proofs.Ai.Eq"
+source = "Proofs/Ai/Eq/source.npa"
+certificate = "Proofs/Ai/Eq/certificate.npcert"
+meta = "Proofs/Ai/Eq/meta.json"
+replay = "Proofs/Ai/Eq/replay.json"
+producer_profile = "human-surface-explicit-term"
+expected_source_hash = "sha256:840d68cb64b2b75fe048cf8f47b5908b05d72c488a6c4168777980d88052a954"
+expected_certificate_file_hash = "sha256:4b7afc156ec23739738393b0237d9a69792b0410fd96b877e6dada217274cd01"
+expected_export_hash = "sha256:80b826d1aa6c9877b2e551521e781fcfdd3777cd8aec6cd27f4000d132eb64ef"
+expected_axiom_report_hash = "sha256:bc3aec4eabbf2c61f399239a21f359b264c36873e750ed25c9059fee86484bea"
+expected_certificate_hash = "sha256:7e350cb254c1051cb59b9268ef85947a6b618f24607ce71d7fe912ab48019b45"
+imports = ["Std.Logic.Eq", "Std.Nat.Basic"]
+definitions = []
+theorems = ["eq_refl_self", "eq_refl_fn_app", "eq_refl_compose", "eq_self_imp", "eq_refl_prop", "eq_refl_apply_twice", "eq_refl_higher_apply", "eq_refl_nested_compose", "eq_refl_prop_apply", "eq_local_passthrough", "eq_refl_nat_function"]
+axioms = []
+
+[[modules]]
+module = "Proofs.Ai.Nat"
+source = "Proofs/Ai/Nat/source.npa"
+certificate = "Proofs/Ai/Nat/certificate.npcert"
+meta = "Proofs/Ai/Nat/meta.json"
+replay = "Proofs/Ai/Nat/replay.json"
+producer_profile = "human-surface-explicit-term"
+expected_source_hash = "sha256:f899f8fcded51dfeef0f37960bb6050d50de22e134e076b6f44805d939bea8cd"
+expected_certificate_file_hash = "sha256:fe8970a02c79bdcec02ff02b540d551d749b1b02e2dde2b5a6063a6f06522a6f"
+expected_export_hash = "sha256:15e6dc1cf805917041c5437a3ee62cc2ebcb2fda50bc86f62bd75ab5edc9dd89"
+expected_axiom_report_hash = "sha256:7715c06c634de0020345067c58ecf3bd23c10e71d84f4b97cd4c2e00e82c1a07"
+expected_certificate_hash = "sha256:2b54ef5d31aa8b7723af87184ebd3cc37f0263a36728fe4d4b9bdb09f4af5707"
+imports = ["Std.Logic.Eq", "Std.Nat.Basic"]
+definitions = []
+theorems = ["nat_zero_self_eq", "nat_succ_zero_self_eq", "nat_id", "nat_const_zero", "nat_apply_fn", "nat_const_succ_zero", "nat_apply_twice", "nat_compose", "nat_ignore_middle", "nat_select_middle", "nat_select_last", "nat_succ_self_eq"]
+axioms = []
+
+[[modules]]
+module = "Proofs.Ai.Reduction"
+source = "Proofs/Ai/Reduction/source.npa"
+certificate = "Proofs/Ai/Reduction/certificate.npcert"
+meta = "Proofs/Ai/Reduction/meta.json"
+replay = "Proofs/Ai/Reduction/replay.json"
+producer_profile = "human-surface-explicit-term"
+expected_source_hash = "sha256:53f6a264f4626ff04d6c5de4d5537e3788ea03b28c0c507c8137de1c55fbf531"
+expected_certificate_file_hash = "sha256:7216b7928a1f06981c7fa09f084dcaa300067bb450a69521688f7235aa385e58"
+expected_export_hash = "sha256:c915b139d719a059b8886b2bd30716dbee54dc1accbe1613a35fb791e7584cb9"
+expected_axiom_report_hash = "sha256:70b2d0f35f9ebfff46bdf399b80487f0c76ffd6460ab930f733af1f889d2fc65"
+expected_certificate_hash = "sha256:3d4e3627b9d165c2cd61f4bcf7482ba04bbf9acb4e1efcc63f4f679885879005"
+imports = ["Std.Nat.Basic"]
+definitions = ["reduction_id_nat"]
+theorems = ["beta_id_nat", "beta_const_nat", "let_id_nat", "let_const_nat", "delta_id_nat"]
+axioms = []

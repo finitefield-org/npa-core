@@ -1,0 +1,37 @@
+{
+  "schema": "npa-ai-proof-replay-v0.1",
+  "module": "Proofs.Ai.SketchLifecycle",
+  "trusted": false,
+  "profile": "explicit_term_source_certificate_handoff",
+  "steps": [
+    {
+      "declaration": "generated_local_lemma_identity",
+      "source_kind": "explicit_term",
+      "term": "fun A => fun x => x"
+    },
+    {
+      "declaration": "generated_local_lemma_context_generalized",
+      "source_kind": "explicit_term",
+      "term": "fun A => fun B => fun f => fun x => f x"
+    },
+    {
+      "declaration": "sketch_parent_lemma_a",
+      "source_kind": "explicit_term",
+      "term": "fun A => fun x => x"
+    },
+    {
+      "declaration": "sketch_parent_lemma_b_depends_on_a",
+      "source_kind": "explicit_term",
+      "term": "fun A => fun x => sketch_parent_lemma_a A x"
+    },
+    {
+      "declaration": "sketch_parent_final_depends_on_a_b",
+      "source_kind": "explicit_term",
+      "term": "fun A => fun x => sketch_parent_lemma_b_depends_on_a A (sketch_parent_lemma_a A x)"
+    }
+  ],
+  "acceptance": {
+    "required": ["decode_module_cert", "verify_module_cert"],
+    "accepted_artifact": "Proofs/Ai/SketchLifecycle/certificate.npcert"
+  }
+}

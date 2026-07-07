@@ -1,0 +1,147 @@
+{
+  "schema": "npa-ai-proof-replay-v0.1",
+  "module": "Proofs.Ai.Algebra.AbstractGroup",
+  "trusted": false,
+  "profile": "explicit_term_source_certificate_handoff",
+  "steps": [
+    {
+      "declaration": "GroupLawArgs",
+      "source_kind": "explicit_def_value",
+      "term": "fun G => fun one => fun mul => fun inv => forall (P : Prop), forall (mk : forall (mul_assoc_law : forall (a : G), forall (b : G), forall (c : G), @Eq.{u} G (mul (mul a b) c) (mul a (mul b c))), forall (one_mul_law : forall (a : G), @Eq.{u} G (mul one a) a), forall (mul_one_law : forall (a : G), @Eq.{u} G (mul a one) a), forall (inv_mul_law : forall (a : G), @Eq.{u} G (mul (inv a) a) one), forall (mul_inv_law : forall (a : G), @Eq.{u} G (mul a (inv a)) one), P), P"
+    },
+    {
+      "declaration": "GroupHomLawArgs",
+      "source_kind": "explicit_def_value",
+      "term": "fun G => fun oneG => fun mulG => fun invG => fun H => fun oneH => fun mulH => fun invH => fun f => forall (P : Prop), forall (mk : forall (hom_mul_law : forall (a : G), forall (b : G), @Eq.{v} H (f (mulG a b)) (mulH (f a) (f b))), forall (hom_one_law : @Eq.{v} H (f oneG) oneH), forall (hom_inv_law : forall (a : G), @Eq.{v} H (f (invG a)) (invH (f a))), P), P"
+    },
+    {
+      "declaration": "KernelPred",
+      "source_kind": "explicit_def_value",
+      "term": "fun G => fun H => fun oneH => fun f => fun a => @Eq.{v} H (f a) oneH"
+    },
+    {
+      "declaration": "KerRel",
+      "source_kind": "explicit_def_value",
+      "term": "fun G => fun H => fun f => fun a => fun b => @Eq.{v} H (f a) (f b)"
+    },
+    {
+      "declaration": "group_mul_assoc",
+      "source_kind": "explicit_term",
+      "term": "fun G => fun one => fun mul => fun inv => fun group_args => fun a => fun b => fun c => group_args (@Eq.{u} G (mul (mul a b) c) (mul a (mul b c))) (fun (mul_assoc_arg : forall (a : G), forall (b : G), forall (c : G), @Eq.{u} G (mul (mul a b) c) (mul a (mul b c))) => fun (one_mul_arg : forall (a : G), @Eq.{u} G (mul one a) a) => fun (mul_one_arg : forall (a : G), @Eq.{u} G (mul a one) a) => fun (inv_mul_arg : forall (a : G), @Eq.{u} G (mul (inv a) a) one) => fun (mul_inv_arg : forall (a : G), @Eq.{u} G (mul a (inv a)) one) => mul_assoc_arg a b c)"
+    },
+    {
+      "declaration": "group_one_mul",
+      "source_kind": "explicit_term",
+      "term": "fun G => fun one => fun mul => fun inv => fun group_args => fun a => group_args (@Eq.{u} G (mul one a) a) (fun (mul_assoc_arg : forall (a : G), forall (b : G), forall (c : G), @Eq.{u} G (mul (mul a b) c) (mul a (mul b c))) => fun (one_mul_arg : forall (a : G), @Eq.{u} G (mul one a) a) => fun (mul_one_arg : forall (a : G), @Eq.{u} G (mul a one) a) => fun (inv_mul_arg : forall (a : G), @Eq.{u} G (mul (inv a) a) one) => fun (mul_inv_arg : forall (a : G), @Eq.{u} G (mul a (inv a)) one) => one_mul_arg a)"
+    },
+    {
+      "declaration": "group_mul_one",
+      "source_kind": "explicit_term",
+      "term": "fun G => fun one => fun mul => fun inv => fun group_args => fun a => group_args (@Eq.{u} G (mul a one) a) (fun (mul_assoc_arg : forall (a : G), forall (b : G), forall (c : G), @Eq.{u} G (mul (mul a b) c) (mul a (mul b c))) => fun (one_mul_arg : forall (a : G), @Eq.{u} G (mul one a) a) => fun (mul_one_arg : forall (a : G), @Eq.{u} G (mul a one) a) => fun (inv_mul_arg : forall (a : G), @Eq.{u} G (mul (inv a) a) one) => fun (mul_inv_arg : forall (a : G), @Eq.{u} G (mul a (inv a)) one) => mul_one_arg a)"
+    },
+    {
+      "declaration": "group_inv_mul",
+      "source_kind": "explicit_term",
+      "term": "fun G => fun one => fun mul => fun inv => fun group_args => fun a => group_args (@Eq.{u} G (mul (inv a) a) one) (fun (mul_assoc_arg : forall (a : G), forall (b : G), forall (c : G), @Eq.{u} G (mul (mul a b) c) (mul a (mul b c))) => fun (one_mul_arg : forall (a : G), @Eq.{u} G (mul one a) a) => fun (mul_one_arg : forall (a : G), @Eq.{u} G (mul a one) a) => fun (inv_mul_arg : forall (a : G), @Eq.{u} G (mul (inv a) a) one) => fun (mul_inv_arg : forall (a : G), @Eq.{u} G (mul a (inv a)) one) => inv_mul_arg a)"
+    },
+    {
+      "declaration": "group_mul_inv",
+      "source_kind": "explicit_term",
+      "term": "fun G => fun one => fun mul => fun inv => fun group_args => fun a => group_args (@Eq.{u} G (mul a (inv a)) one) (fun (mul_assoc_arg : forall (a : G), forall (b : G), forall (c : G), @Eq.{u} G (mul (mul a b) c) (mul a (mul b c))) => fun (one_mul_arg : forall (a : G), @Eq.{u} G (mul one a) a) => fun (mul_one_arg : forall (a : G), @Eq.{u} G (mul a one) a) => fun (inv_mul_arg : forall (a : G), @Eq.{u} G (mul (inv a) a) one) => fun (mul_inv_arg : forall (a : G), @Eq.{u} G (mul a (inv a)) one) => mul_inv_arg a)"
+    },
+    {
+      "declaration": "group_left_cancel",
+      "source_kind": "explicit_term",
+      "term": "fun G => fun one => fun mul => fun inv => fun group_args => fun a => fun b => fun c => fun h => @eq_trans.{u} G b (mul one b) c (@eq_symm.{u} G (mul one b) b (@group_one_mul.{u} G one mul inv group_args b)) (@eq_trans.{u} G (mul one b) (mul (mul (inv a) a) b) c (@eq_congr_arg.{u,u} G G (fun (z : G) => mul z b) one (mul (inv a) a) (@eq_symm.{u} G (mul (inv a) a) one (@group_inv_mul.{u} G one mul inv group_args a))) (@eq_trans.{u} G (mul (mul (inv a) a) b) (mul (inv a) (mul a b)) c (@group_mul_assoc.{u} G one mul inv group_args (inv a) a b) (@eq_trans.{u} G (mul (inv a) (mul a b)) (mul (inv a) (mul a c)) c (@eq_congr_arg.{u,u} G G (fun (z : G) => mul (inv a) z) (mul a b) (mul a c) h) (@eq_trans.{u} G (mul (inv a) (mul a c)) (mul (mul (inv a) a) c) c (@eq_symm.{u} G (mul (mul (inv a) a) c) (mul (inv a) (mul a c)) (@group_mul_assoc.{u} G one mul inv group_args (inv a) a c)) (@eq_trans.{u} G (mul (mul (inv a) a) c) (mul one c) c (@eq_congr_arg.{u,u} G G (fun (z : G) => mul z c) (mul (inv a) a) one (@group_inv_mul.{u} G one mul inv group_args a)) (@group_one_mul.{u} G one mul inv group_args c))))))"
+    },
+    {
+      "declaration": "group_inv_inv",
+      "source_kind": "explicit_term",
+      "term": "fun G => fun one => fun mul => fun inv => fun group_args => fun a => @group_left_cancel.{u} G one mul inv group_args (inv a) (inv (inv a)) a (@eq_trans.{u} G (mul (inv a) (inv (inv a))) one (mul (inv a) a) (@group_mul_inv.{u} G one mul inv group_args (inv a)) (@eq_symm.{u} G (mul (inv a) a) one (@group_inv_mul.{u} G one mul inv group_args a)))"
+    },
+    {
+      "declaration": "group_inv_mul_left_reassoc",
+      "source_kind": "explicit_term",
+      "term": "fun G => fun one => fun mul => fun inv => fun group_args => fun a => fun b => @eq_trans.{u} G (mul (inv a) (mul a b)) (mul (mul (inv a) a) b) b (@eq_symm.{u} G (mul (mul (inv a) a) b) (mul (inv a) (mul a b)) (@group_mul_assoc.{u} G one mul inv group_args (inv a) a b)) (@eq_trans.{u} G (mul (mul (inv a) a) b) (mul one b) b (@eq_congr_arg.{u,u} G G (fun (z : G) => mul z b) (mul (inv a) a) one (@group_inv_mul.{u} G one mul inv group_args a)) (@group_one_mul.{u} G one mul inv group_args b))"
+    },
+    {
+      "declaration": "group_conj_slide",
+      "source_kind": "explicit_term",
+      "term": "fun G => fun one => fun mul => fun inv => fun group_args => fun k => fun n => @eq_trans.{u} G (mul k (mul (mul (inv k) n) k)) (mul (mul k (mul (inv k) n)) k) (mul n k) (@eq_symm.{u} G (mul (mul k (mul (inv k) n)) k) (mul k (mul (mul (inv k) n) k)) (@group_mul_assoc.{u} G one mul inv group_args k (mul (inv k) n) k)) (@eq_trans.{u} G (mul (mul k (mul (inv k) n)) k) (mul (mul (mul k (inv k)) n) k) (mul n k) (@eq_congr_arg.{u,u} G G (fun (z : G) => mul z k) (mul k (mul (inv k) n)) (mul (mul k (inv k)) n) (@eq_symm.{u} G (mul (mul k (inv k)) n) (mul k (mul (inv k) n)) (@group_mul_assoc.{u} G one mul inv group_args k (inv k) n))) (@eq_trans.{u} G (mul (mul (mul k (inv k)) n) k) (mul (mul one n) k) (mul n k) (@eq_congr_arg.{u,u} G G (fun (z : G) => mul (mul z n) k) (mul k (inv k)) one (@group_mul_inv.{u} G one mul inv group_args k)) (@eq_congr_arg.{u,u} G G (fun (z : G) => mul z k) (mul one n) n (@group_one_mul.{u} G one mul inv group_args n))))"
+    },
+    {
+      "declaration": "group_product_mul_reassoc",
+      "source_kind": "explicit_term",
+      "term": "fun G => fun one => fun mul => fun inv => fun group_args => fun h => fun n => fun k => fun m => @eq_trans.{u} G (mul (mul h k) (mul (mul (mul (inv k) n) k) m)) (mul (mul (mul h k) (mul (mul (inv k) n) k)) m) (mul (mul h n) (mul k m)) (@eq_symm.{u} G (mul (mul (mul h k) (mul (mul (inv k) n) k)) m) (mul (mul h k) (mul (mul (mul (inv k) n) k) m)) (@group_mul_assoc.{u} G one mul inv group_args (mul h k) (mul (mul (inv k) n) k) m)) (@eq_trans.{u} G (mul (mul (mul h k) (mul (mul (inv k) n) k)) m) (mul (mul h (mul k (mul (mul (inv k) n) k))) m) (mul (mul h n) (mul k m)) (@eq_congr_arg.{u,u} G G (fun (z : G) => mul z m) (mul (mul h k) (mul (mul (inv k) n) k)) (mul h (mul k (mul (mul (inv k) n) k))) (@group_mul_assoc.{u} G one mul inv group_args h k (mul (mul (inv k) n) k))) (@eq_trans.{u} G (mul (mul h (mul k (mul (mul (inv k) n) k))) m) (mul (mul h (mul n k)) m) (mul (mul h n) (mul k m)) (@eq_congr_arg.{u,u} G G (fun (z : G) => mul (mul h z) m) (mul k (mul (mul (inv k) n) k)) (mul n k) (@group_conj_slide.{u} G one mul inv group_args k n)) (@eq_trans.{u} G (mul (mul h (mul n k)) m) (mul (mul (mul h n) k) m) (mul (mul h n) (mul k m)) (@eq_congr_arg.{u,u} G G (fun (z : G) => mul z m) (mul h (mul n k)) (mul (mul h n) k) (@eq_symm.{u} G (mul (mul h n) k) (mul h (mul n k)) (@group_mul_assoc.{u} G one mul inv group_args h n k))) (@group_mul_assoc.{u} G one mul inv group_args (mul h n) k m))))"
+    },
+    {
+      "declaration": "group_mul_inv_rev",
+      "source_kind": "explicit_term",
+      "term": "fun G => fun one => fun mul => fun inv => fun group_args => fun a => fun b => @group_left_cancel.{u} G one mul inv group_args (mul a b) (mul (inv b) (inv a)) (inv (mul a b)) (@eq_trans.{u} G (mul (mul a b) (mul (inv b) (inv a))) one (mul (mul a b) (inv (mul a b))) (@eq_trans.{u} G (mul (mul a b) (mul (inv b) (inv a))) (mul (mul (mul a b) (inv b)) (inv a)) one (@eq_symm.{u} G (mul (mul (mul a b) (inv b)) (inv a)) (mul (mul a b) (mul (inv b) (inv a))) (@group_mul_assoc.{u} G one mul inv group_args (mul a b) (inv b) (inv a))) (@eq_trans.{u} G (mul (mul (mul a b) (inv b)) (inv a)) (mul (mul a (mul b (inv b))) (inv a)) one (@eq_congr_arg.{u,u} G G (fun (z : G) => mul z (inv a)) (mul (mul a b) (inv b)) (mul a (mul b (inv b))) (@group_mul_assoc.{u} G one mul inv group_args a b (inv b))) (@eq_trans.{u} G (mul (mul a (mul b (inv b))) (inv a)) (mul (mul a one) (inv a)) one (@eq_congr_arg.{u,u} G G (fun (z : G) => mul (mul a z) (inv a)) (mul b (inv b)) one (@group_mul_inv.{u} G one mul inv group_args b)) (@eq_trans.{u} G (mul (mul a one) (inv a)) (mul a (inv a)) one (@eq_congr_arg.{u,u} G G (fun (z : G) => mul z (inv a)) (mul a one) a (@group_mul_one.{u} G one mul inv group_args a)) (@group_mul_inv.{u} G one mul inv group_args a))))) (@eq_symm.{u} G (mul (mul a b) (inv (mul a b))) one (@group_mul_inv.{u} G one mul inv group_args (mul a b))))"
+    },
+    {
+      "declaration": "group_product_inv_reassoc",
+      "source_kind": "explicit_term",
+      "term": "fun G => fun one => fun mul => fun inv => fun group_args => fun h => fun n => @eq_trans.{u} G (mul (inv h) (mul (mul h (inv n)) (inv h))) (mul (mul (inv h) (mul h (inv n))) (inv h)) (inv (mul h n)) (@eq_symm.{u} G (mul (mul (inv h) (mul h (inv n))) (inv h)) (mul (inv h) (mul (mul h (inv n)) (inv h))) (@group_mul_assoc.{u} G one mul inv group_args (inv h) (mul h (inv n)) (inv h))) (@eq_trans.{u} G (mul (mul (inv h) (mul h (inv n))) (inv h)) (mul (mul (mul (inv h) h) (inv n)) (inv h)) (inv (mul h n)) (@eq_congr_arg.{u,u} G G (fun (z : G) => mul z (inv h)) (mul (inv h) (mul h (inv n))) (mul (mul (inv h) h) (inv n)) (@eq_symm.{u} G (mul (mul (inv h) h) (inv n)) (mul (inv h) (mul h (inv n))) (@group_mul_assoc.{u} G one mul inv group_args (inv h) h (inv n)))) (@eq_trans.{u} G (mul (mul (mul (inv h) h) (inv n)) (inv h)) (mul (mul one (inv n)) (inv h)) (inv (mul h n)) (@eq_congr_arg.{u,u} G G (fun (z : G) => mul (mul z (inv n)) (inv h)) (mul (inv h) h) one (@group_inv_mul.{u} G one mul inv group_args h)) (@eq_trans.{u} G (mul (mul one (inv n)) (inv h)) (mul (inv n) (inv h)) (inv (mul h n)) (@eq_congr_arg.{u,u} G G (fun (z : G) => mul z (inv h)) (mul one (inv n)) (inv n) (@group_one_mul.{u} G one mul inv group_args (inv n))) (@group_mul_inv_rev.{u} G one mul inv group_args h n))))"
+    },
+    {
+      "declaration": "group_inv_rel_symm_reassoc",
+      "source_kind": "explicit_term",
+      "term": "fun G => fun one => fun mul => fun inv => fun group_args => fun a => fun b => @eq_trans.{u} G (inv (mul (inv a) b)) (mul (inv b) (inv (inv a))) (mul (inv b) a) (@eq_symm.{u} G (mul (inv b) (inv (inv a))) (inv (mul (inv a) b)) (@group_mul_inv_rev.{u} G one mul inv group_args (inv a) b)) (@eq_congr_arg.{u,u} G G (fun (z : G) => mul (inv b) z) (inv (inv a)) a (@group_inv_inv.{u} G one mul inv group_args a))"
+    },
+    {
+      "declaration": "group_rel_trans_reassoc",
+      "source_kind": "explicit_term",
+      "term": "fun G => fun one => fun mul => fun inv => fun group_args => fun a => fun b => fun c => @eq_trans.{u} G (mul (mul (inv a) b) (mul (inv b) c)) (mul (mul (mul (inv a) b) (inv b)) c) (mul (inv a) c) (@eq_symm.{u} G (mul (mul (mul (inv a) b) (inv b)) c) (mul (mul (inv a) b) (mul (inv b) c)) (@group_mul_assoc.{u} G one mul inv group_args (mul (inv a) b) (inv b) c)) (@eq_trans.{u} G (mul (mul (mul (inv a) b) (inv b)) c) (mul (mul (inv a) (mul b (inv b))) c) (mul (inv a) c) (@eq_congr_arg.{u,u} G G (fun (z : G) => mul z c) (mul (mul (inv a) b) (inv b)) (mul (inv a) (mul b (inv b))) (@group_mul_assoc.{u} G one mul inv group_args (inv a) b (inv b))) (@eq_trans.{u} G (mul (mul (inv a) (mul b (inv b))) c) (mul (mul (inv a) one) c) (mul (inv a) c) (@eq_congr_arg.{u,u} G G (fun (z : G) => mul (mul (inv a) z) c) (mul b (inv b)) one (@group_mul_inv.{u} G one mul inv group_args b)) (@eq_congr_arg.{u,u} G G (fun (z : G) => mul z c) (mul (inv a) one) (inv a) (@group_mul_one.{u} G one mul inv group_args (inv a)))))"
+    },
+    {
+      "declaration": "group_rel_mul_reassoc",
+      "source_kind": "explicit_term",
+      "term": "fun G => fun one => fun mul => fun inv => fun group_args => fun a => fun a2 => fun b => fun b2 => @eq_trans.{u} G (mul (mul (mul (inv b) (mul (inv a) a2)) b) (mul (inv b) b2)) (mul (mul (inv b) (mul (inv a) a2)) (mul b (mul (inv b) b2))) (mul (inv (mul a b)) (mul a2 b2)) (@group_mul_assoc.{u} G one mul inv group_args (mul (inv b) (mul (inv a) a2)) b (mul (inv b) b2)) (@eq_trans.{u} G (mul (mul (inv b) (mul (inv a) a2)) (mul b (mul (inv b) b2))) (mul (mul (inv b) (mul (inv a) a2)) (mul (mul b (inv b)) b2)) (mul (inv (mul a b)) (mul a2 b2)) (@eq_congr_arg.{u,u} G G (fun (z : G) => mul (mul (inv b) (mul (inv a) a2)) z) (mul b (mul (inv b) b2)) (mul (mul b (inv b)) b2) (@eq_symm.{u} G (mul (mul b (inv b)) b2) (mul b (mul (inv b) b2)) (@group_mul_assoc.{u} G one mul inv group_args b (inv b) b2))) (@eq_trans.{u} G (mul (mul (inv b) (mul (inv a) a2)) (mul (mul b (inv b)) b2)) (mul (mul (inv b) (mul (inv a) a2)) (mul one b2)) (mul (inv (mul a b)) (mul a2 b2)) (@eq_congr_arg.{u,u} G G (fun (z : G) => mul (mul (inv b) (mul (inv a) a2)) (mul z b2)) (mul b (inv b)) one (@group_mul_inv.{u} G one mul inv group_args b)) (@eq_trans.{u} G (mul (mul (inv b) (mul (inv a) a2)) (mul one b2)) (mul (mul (inv b) (mul (inv a) a2)) b2) (mul (inv (mul a b)) (mul a2 b2)) (@eq_congr_arg.{u,u} G G (fun (z : G) => mul (mul (inv b) (mul (inv a) a2)) z) (mul one b2) b2 (@group_one_mul.{u} G one mul inv group_args b2)) (@eq_trans.{u} G (mul (mul (inv b) (mul (inv a) a2)) b2) (mul (mul (mul (inv b) (inv a)) a2) b2) (mul (inv (mul a b)) (mul a2 b2)) (@eq_congr_arg.{u,u} G G (fun (z : G) => mul z b2) (mul (inv b) (mul (inv a) a2)) (mul (mul (inv b) (inv a)) a2) (@eq_symm.{u} G (mul (mul (inv b) (inv a)) a2) (mul (inv b) (mul (inv a) a2)) (@group_mul_assoc.{u} G one mul inv group_args (inv b) (inv a) a2))) (@eq_trans.{u} G (mul (mul (mul (inv b) (inv a)) a2) b2) (mul (mul (inv b) (inv a)) (mul a2 b2)) (mul (inv (mul a b)) (mul a2 b2)) (@group_mul_assoc.{u} G one mul inv group_args (mul (inv b) (inv a)) a2 b2) (@eq_congr_arg.{u,u} G G (fun (z : G) => mul z (mul a2 b2)) (mul (inv b) (inv a)) (inv (mul a b)) (@group_mul_inv_rev.{u} G one mul inv group_args a b)))))))"
+    },
+    {
+      "declaration": "group_rel_inv_reassoc",
+      "source_kind": "explicit_term",
+      "term": "fun G => fun one => fun mul => fun inv => fun group_args => fun a => fun b => @eq_trans.{u} G (mul (mul a (mul (inv b) a)) (inv a)) (mul (mul (mul a (inv b)) a) (inv a)) (mul (inv (inv a)) (inv b)) (@eq_congr_arg.{u,u} G G (fun (z : G) => mul z (inv a)) (mul a (mul (inv b) a)) (mul (mul a (inv b)) a) (@eq_symm.{u} G (mul (mul a (inv b)) a) (mul a (mul (inv b) a)) (@group_mul_assoc.{u} G one mul inv group_args a (inv b) a))) (@eq_trans.{u} G (mul (mul (mul a (inv b)) a) (inv a)) (mul (mul a (inv b)) (mul a (inv a))) (mul (inv (inv a)) (inv b)) (@group_mul_assoc.{u} G one mul inv group_args (mul a (inv b)) a (inv a)) (@eq_trans.{u} G (mul (mul a (inv b)) (mul a (inv a))) (mul (mul a (inv b)) one) (mul (inv (inv a)) (inv b)) (@eq_congr_arg.{u,u} G G (fun (z : G) => mul (mul a (inv b)) z) (mul a (inv a)) one (@group_mul_inv.{u} G one mul inv group_args a)) (@eq_trans.{u} G (mul (mul a (inv b)) one) (mul a (inv b)) (mul (inv (inv a)) (inv b)) (@group_mul_one.{u} G one mul inv group_args (mul a (inv b))) (@eq_congr_arg.{u,u} G G (fun (z : G) => mul z (inv b)) a (inv (inv a)) (@eq_symm.{u} G (inv (inv a)) a (@group_inv_inv.{u} G one mul inv group_args a))))))"
+    },
+    {
+      "declaration": "hom_mul",
+      "source_kind": "explicit_term",
+      "term": "fun G => fun oneG => fun mulG => fun invG => fun H => fun oneH => fun mulH => fun invH => fun f => fun hom_args => fun a => fun b => hom_args (@Eq.{v} H (f (mulG a b)) (mulH (f a) (f b))) (fun (hom_mul_arg : forall (a : G), forall (b : G), @Eq.{v} H (f (mulG a b)) (mulH (f a) (f b))) => fun (hom_one_arg : @Eq.{v} H (f oneG) oneH) => fun (hom_inv_arg : forall (a : G), @Eq.{v} H (f (invG a)) (invH (f a))) => hom_mul_arg a b)"
+    },
+    {
+      "declaration": "hom_one",
+      "source_kind": "explicit_term",
+      "term": "fun G => fun oneG => fun mulG => fun invG => fun H => fun oneH => fun mulH => fun invH => fun f => fun hom_args => hom_args (@Eq.{v} H (f oneG) oneH) (fun (hom_mul_arg : forall (a : G), forall (b : G), @Eq.{v} H (f (mulG a b)) (mulH (f a) (f b))) => fun (hom_one_arg : @Eq.{v} H (f oneG) oneH) => fun (hom_inv_arg : forall (a : G), @Eq.{v} H (f (invG a)) (invH (f a))) => hom_one_arg)"
+    },
+    {
+      "declaration": "hom_inv",
+      "source_kind": "explicit_term",
+      "term": "fun G => fun oneG => fun mulG => fun invG => fun H => fun oneH => fun mulH => fun invH => fun f => fun hom_args => fun a => hom_args (@Eq.{v} H (f (invG a)) (invH (f a))) (fun (hom_mul_arg : forall (a : G), forall (b : G), @Eq.{v} H (f (mulG a b)) (mulH (f a) (f b))) => fun (hom_one_arg : @Eq.{v} H (f oneG) oneH) => fun (hom_inv_arg : forall (a : G), @Eq.{v} H (f (invG a)) (invH (f a))) => hom_inv_arg a)"
+    },
+    {
+      "declaration": "kernel_one",
+      "source_kind": "explicit_term",
+      "term": "fun G => fun oneG => fun mulG => fun invG => fun H => fun oneH => fun mulH => fun invH => fun f => fun hom_args => @hom_one.{u,v} G oneG mulG invG H oneH mulH invH f hom_args"
+    },
+    {
+      "declaration": "ker_rel_refl",
+      "source_kind": "explicit_term",
+      "term": "fun G => fun H => fun f => fun a => @Eq.refl.{v} H (f a)"
+    },
+    {
+      "declaration": "ker_rel_symm",
+      "source_kind": "explicit_term",
+      "term": "fun G => fun H => fun f => fun a => fun b => fun h => @eq_symm.{v} H (f a) (f b) h"
+    },
+    {
+      "declaration": "ker_rel_trans",
+      "source_kind": "explicit_term",
+      "term": "fun G => fun H => fun f => fun a => fun b => fun c => fun hab => fun hbc => @eq_trans.{v} H (f a) (f b) (f c) hab hbc"
+    }
+  ],
+  "acceptance": {
+    "required": ["decode_module_cert", "verify_module_cert"],
+    "accepted_artifact": "Proofs/Ai/Algebra/AbstractGroup/certificate.npcert"
+  }
+}

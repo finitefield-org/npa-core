@@ -1,0 +1,22 @@
+{
+  "schema": "proof_sketch",
+  "node_kinds": [
+    "goal",
+    "lemma",
+    "case_split",
+    "rewrite",
+    "calculation",
+    "solver_call",
+    "certificate_check",
+    "counterexample"
+  ],
+  "contract": [
+    "expected_effect",
+    "fallback_policy",
+    "sketch_hash",
+    "display text",
+    "model scores",
+    "wall-clock timing",
+    "scheduling order"
+  ]
+}

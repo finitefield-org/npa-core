@@ -1,0 +1,5 @@
+import Proofs.Ai.Basic
+
+theorem seed_id_passthrough :
+  forall (A : Type), forall (x : A), A :=
+  fun A => fun x => @id A x

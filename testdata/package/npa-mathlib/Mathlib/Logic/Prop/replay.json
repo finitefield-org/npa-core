@@ -1,0 +1,42 @@
+{
+  "schema": "npa-ai-proof-replay-v0.1",
+  "module": "Mathlib.Logic.Prop",
+  "trusted": false,
+  "profile": "explicit_term_source_certificate_handoff",
+  "steps": [
+    {
+      "declaration": "imp_chain4",
+      "source_kind": "explicit_term",
+      "term": "fun P => fun Q => fun R => fun S => fun pq => fun qr => fun rs => fun p => rs (qr (pq p))"
+    },
+    {
+      "declaration": "imp_permute3",
+      "source_kind": "explicit_term",
+      "term": "fun P => fun Q => fun R => fun S => fun h => fun r => fun p => fun q => h p q r"
+    },
+    {
+      "declaration": "imp_apply_twice",
+      "source_kind": "explicit_term",
+      "term": "fun P => fun h => fun p => h (h p)"
+    },
+    {
+      "declaration": "imp_const3",
+      "source_kind": "explicit_term",
+      "term": "fun P => fun Q => fun R => fun p => fun q => fun r => p"
+    },
+    {
+      "declaration": "imp_flip_chain",
+      "source_kind": "explicit_term",
+      "term": "fun P => fun Q => fun R => fun qr => fun pq => fun p => qr (pq p)"
+    },
+    {
+      "declaration": "imp_higher_apply",
+      "source_kind": "explicit_term",
+      "term": "fun P => fun Q => fun R => fun h => fun f => h f"
+    }
+  ],
+  "acceptance": {
+    "required": ["decode_module_cert", "verify_module_cert"],
+    "accepted_artifact": "Mathlib/Logic/Prop/certificate.npcert"
+  }
+}

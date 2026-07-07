@@ -1,0 +1,26 @@
+{
+  "schema": "repair_operator",
+  "operators": [
+    "ReverseRewrite",
+    "SelectRewriteOccurrence",
+    "InstantiateArgument",
+    "InstantiateUniverse",
+    "IntroduceBinder",
+    "SpecializeHypothesis",
+    "Unfold",
+    "Fold",
+    "InsertEqTransport",
+    "Generalize",
+    "Revert",
+    "ChangeGoal",
+    "ReduceSimpSet",
+    "SwitchStrategy"
+  ],
+  "guards": [
+    "trusted_evidence",
+    "verified_artifact",
+    "proof_acceptance_state",
+    "certificate_verified",
+    "independent_verified"
+  ]
+}

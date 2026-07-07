@@ -1,0 +1,178 @@
+{
+  "schema_version": "npa.pua-m09.solver-fixture-matrix.v1",
+  "advisory_sidecar": true,
+  "proof_acceptance_effect": "none",
+  "commands": [
+    "cargo test -p npa-api solver -- --skip proof_corpus --skip proof_package",
+    "cargo test -p npa-tactic solver -- --skip proof_corpus --skip proof_package",
+    "cargo test -p npa-frontend solver -- --skip proof_corpus --skip proof_package",
+    "cargo run -p npa-proof-corpus -- --changed-only --verified-cache authoring",
+    "./scripts/check-fast.sh",
+    "./scripts/check-corpus-authoring.sh"
+  ],
+  "modules": [
+    "crates/npa-api/src/solver.rs::tests",
+    "crates/npa-api/src/advanced_ai.rs::tests",
+    "crates/npa-tactic/src/lib.rs::tests",
+    "crates/npa-frontend/src/human_parser.rs::tests",
+    "tools/proof-corpus/src/main.rs"
+  ],
+  "rows": [
+    {
+      "id": "finite_decide.source_free_bool_universal",
+      "family": "finite_decide",
+      "positive_test": "finite_decide_source_free_checked_proof_response_binds_identity_and_policy",
+      "negative_test": "finite_decide_source_free_rejects_false_folds_duplicates_and_budget_exhaustion",
+      "modules": ["crates/npa-api/src/solver.rs::tests"],
+      "ws08": ["WS08-T01"],
+      "negative_acceptance": [
+        "false_fold",
+        "duplicate_enumeration",
+        "resource_exhaustion",
+        "stale_policy_hash"
+      ],
+      "metrics": [
+        "proof_bytes",
+        "generated_term_nodes",
+        "proof_steps",
+        "resource_policy_outcomes"
+      ]
+    },
+    {
+      "id": "omega.presburger_trace",
+      "family": "omega",
+      "positive_test": "omega_reconstruction_accepts_rule_trace_and_replay_metadata_without_trusting_search",
+      "negative_test": "omega_reconstruction_rejects_malformed_wrong_coefficients_missing_side_conditions_and_unsupported_fragments",
+      "modules": ["crates/npa-api/src/solver.rs::tests"],
+      "ws08": ["WS08-T02"],
+      "negative_acceptance": [
+        "malformed_certificate",
+        "unsupported_fragment",
+        "hash_mismatch",
+        "stale_policy_hash"
+      ],
+      "metrics": [
+        "certificate_bytes",
+        "reconstruction_steps",
+        "generated_term_nodes",
+        "resource_policy_outcomes"
+      ]
+    },
+    {
+      "id": "ring_nf.checked_polynomial_equality",
+      "family": "ring_nf",
+      "positive_test": "ring_nf_reconstruction_checked_proof_response_binds_hashes_laws_policy_and_size",
+      "negative_test": "ring_nf_reconstruction_rejects_mismatched_normal_forms_stale_maps_wrong_profile_missing_law_and_budget",
+      "modules": ["crates/npa-api/src/solver.rs::tests"],
+      "ws08": ["WS08-T03"],
+      "negative_acceptance": [
+        "hash_mismatch",
+        "unsupported_fragment",
+        "resource_exhaustion",
+        "stale_policy_hash"
+      ],
+      "metrics": [
+        "proof_bytes",
+        "generated_term_nodes",
+        "reconstruction_steps",
+        "resource_policy_outcomes"
+      ]
+    },
+    {
+      "id": "bitblast.lrat_soundness_bridge",
+      "family": "bitblast",
+      "positive_test": "bitblast_lrat_end_to_end_accepts_checked_lrat_and_binds_bridge_metadata",
+      "negative_test": "bitblast_lrat_end_to_end_rejects_malformed_lrat_wrong_cnf_and_raw_unsat",
+      "modules": ["crates/npa-api/src/solver.rs::tests"],
+      "ws08": ["WS08-T04"],
+      "negative_acceptance": [
+        "malformed_lrat",
+        "hash_mismatch",
+        "opaque_solver_output",
+        "resource_exhaustion"
+      ],
+      "metrics": [
+        "cnf_size",
+        "lrat_size",
+        "certificate_bytes",
+        "generated_term_nodes",
+        "resource_policy_outcomes"
+      ]
+    },
+    {
+      "id": "lrat.minimal_unsat_bridge",
+      "family": "lrat",
+      "positive_test": "lrat_soundness_bridge_derives_cnf_unsat_theorem_from_checked_lrat",
+      "negative_test": "lrat_malformed_rejects_raw_unsat_payload_cnf_hash_mismatch_and_bad_ordinal",
+      "modules": ["crates/npa-api/src/solver.rs::tests"],
+      "ws08": ["WS08-T05"],
+      "negative_acceptance": [
+        "malformed_lrat",
+        "opaque_solver_output",
+        "hash_mismatch",
+        "resource_exhaustion"
+      ],
+      "metrics": [
+        "certificate_bytes",
+        "cnf_size",
+        "lrat_size",
+        "reconstruction_steps",
+        "resource_policy_outcomes"
+      ]
+    },
+    {
+      "id": "smt.registry_reconstruction",
+      "family": "smt",
+      "positive_test": "smt_certificate_metadata_solver_contract_reuses_advanced_smt_fields",
+      "negative_test": "smt_solver_handoff_rejects_resource_exhaustion_version_mismatch_and_unsupported_fragment",
+      "modules": [
+        "crates/npa-api/src/solver.rs::tests",
+        "crates/npa-api/src/advanced_ai.rs::tests"
+      ],
+      "ws08": ["WS08-T06", "WS08-T07"],
+      "negative_acceptance": [
+        "unsupported_smt_fragment",
+        "opaque_solver_output",
+        "resource_exhaustion",
+        "hash_mismatch"
+      ],
+      "metrics": [
+        "certificate_bytes",
+        "proof_bytes",
+        "reconstruction_steps",
+        "resource_policy_outcomes"
+      ]
+    },
+    {
+      "id": "resource_policy.default_profiles",
+      "family": "resource_policy",
+      "positive_test": "solver_resource_policy_defaults_are_named_and_deterministic",
+      "negative_test": "solver_resource_policy_timeout_memory_and_output_do_not_validate_accepting_response",
+      "modules": ["crates/npa-api/src/solver.rs::tests"],
+      "ws08": ["WS08-T08"],
+      "negative_acceptance": [
+        "resource_exhaustion",
+        "stale_policy_hash",
+        "timeout",
+        "memory_limit",
+        "output_limit"
+      ],
+      "metrics": [
+        "input_nodes",
+        "proof_bytes",
+        "certificate_bytes",
+        "generated_term_nodes",
+        "resource_policy_outcomes"
+      ]
+    }
+  ],
+  "criteria": [
+    "successful_solver_paths_end_in_checked_proof_or_checked_certificate",
+    "raw_solver_output_is_untrusted",
+    "deterministic_hashes_have_version_tags",
+    "resource_policies_cover_size_time_memory_output_and_nested_limits",
+    "unsupported_fragments_fail_closed",
+    "positive_and_negative_solver_fixtures_exist",
+    "optional_solver_support_stays_off_kernel_checker_and_normal_verify_hot_paths"
+  ]
+}

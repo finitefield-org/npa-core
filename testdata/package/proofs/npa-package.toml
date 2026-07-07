@@ -1,0 +1,131 @@
+schema = "npa.package.v0.1"
+package = "npa-proof-corpus"
+version = "0.1.0"
+license = "Apache-2.0"
+
+core_spec = "npa.core.v0.1"
+kernel_profile = "npa.kernel.v0.1"
+certificate_format = "npa.certificate.canonical.v0.1"
+checker_profile = "npa.checker.reference.v0.1"
+
+[policy]
+allow_custom_axioms = false
+allowed_axioms = ["Eq.rec"]
+
+[[imports]]
+module = "Std.Logic.Eq"
+package = "npa-std"
+version = "0.1.0"
+certificate = "vendor/npa-std/Std/Logic/Eq/certificate.npcert"
+export_hash = "sha256:1f203117abf6f3417d663138bbf5b95f2a155b73502be59678b8a57f31bd9eb1"
+certificate_hash = "sha256:0308e48e6f6353e601fe14c737a0e0882e37657fd864cabbdb3a7250a90b82ab"
+
+[[imports]]
+module = "Std.Nat.Basic"
+package = "npa-std"
+version = "0.1.0"
+certificate = "vendor/npa-std/Std/Nat/Basic/certificate.npcert"
+export_hash = "sha256:e85268fd687033d93b216fe7c6fa635f65fe7ab8ba33fb857f41fc02611f18d1"
+certificate_hash = "sha256:cfd13908deb983ee4b10ff5010c10a78c621b2a1cd641a7088f4d22576b27588"
+
+[[modules]]
+module = "Proofs.Ai.Basic"
+source = "Proofs/Ai/Basic/source.npa"
+certificate = "Proofs/Ai/Basic/certificate.npcert"
+meta = "Proofs/Ai/Basic/meta.json"
+replay = "Proofs/Ai/Basic/replay.json"
+producer_profile = "human-surface-explicit-term"
+expected_source_hash = "sha256:2176be7570deae66754789868aa373ab01434512b4f50b992089886d2c655387"
+expected_certificate_file_hash = "sha256:448a3de71485d4f38e45ac7bf3b637b0e9e38d7ce215dd4847a2a2188099ee21"
+expected_export_hash = "sha256:6cbf881b56f61d413c2584eb9b1cdd6fb09e504f6ff6c855fa73ee55d763b839"
+expected_axiom_report_hash = "sha256:fed11e73accfbfb0dfc28b4f510e151fa33d8af82d58fdb23b92567e04e59e40"
+expected_certificate_hash = "sha256:7a50b381af353fe15c0b602fad60f4b9d5f70613dfe6f47832da2d8c11b391dd"
+imports = []
+definitions = []
+theorems = ["id", "const_left", "const_right", "apply_fn", "compose", "flip", "duplicate", "prop_id", "modus_ponens", "imp_trans", "compose_assoc", "apply_twice", "ignore_middle", "select_middle", "select_last", "imp_swap", "imp_compose", "imp_ignore", "imp_duplicate", "higher_apply"]
+axioms = []
+
+[[modules]]
+module = "Proofs.Ai.Eq"
+source = "Proofs/Ai/Eq/source.npa"
+certificate = "Proofs/Ai/Eq/certificate.npcert"
+meta = "Proofs/Ai/Eq/meta.json"
+replay = "Proofs/Ai/Eq/replay.json"
+producer_profile = "human-surface-explicit-term"
+expected_source_hash = "sha256:840d68cb64b2b75fe048cf8f47b5908b05d72c488a6c4168777980d88052a954"
+expected_certificate_file_hash = "sha256:81faeec8e690de07b6573667d31cecf8f02f26d108409b033c5ff7074b1e4b1d"
+expected_export_hash = "sha256:26c481a8a16f7856b484a90eba875b58f8b1739dd84a86410c09ff72501222f5"
+expected_axiom_report_hash = "sha256:bc3aec4eabbf2c61f399239a21f359b264c36873e750ed25c9059fee86484bea"
+expected_certificate_hash = "sha256:4100f149cc5f92cd46abb78c54360e40218fe9e86cd8a17ecea5394d185d1fbd"
+imports = ["Std.Logic.Eq", "Std.Nat.Basic"]
+definitions = []
+theorems = ["eq_refl_self", "eq_refl_fn_app", "eq_refl_compose", "eq_self_imp", "eq_refl_prop", "eq_refl_apply_twice", "eq_refl_higher_apply", "eq_refl_nested_compose", "eq_refl_prop_apply", "eq_local_passthrough", "eq_refl_nat_function"]
+axioms = []
+
+[[modules]]
+module = "Proofs.Ai.EqReasoning"
+source = "Proofs/Ai/EqReasoning/source.npa"
+certificate = "Proofs/Ai/EqReasoning/certificate.npcert"
+meta = "Proofs/Ai/EqReasoning/meta.json"
+replay = "Proofs/Ai/EqReasoning/replay.json"
+producer_profile = "human-surface-explicit-term"
+expected_source_hash = "sha256:676d15f72088b4f107773ad566920c02a5e29d8773a4c5c24ccb0a1b19de930f"
+expected_certificate_file_hash = "sha256:ffc6f428215aca3b28761989ba03160821e2c4aa76dea44e5d5a3af7d2858b2c"
+expected_export_hash = "sha256:4727d19030aece233f2fc0e44ea6a0bff83bf8347fabb0232ea2b52cfc1d10d7"
+expected_axiom_report_hash = "sha256:5283e4bbd120c3ffa60356b600be06364c3739f9c1992538f75aa4c7df947968"
+expected_certificate_hash = "sha256:b73e42bf01fc55ebd79309367d9b3661697b7b11bf97955742fb036711121aba"
+imports = ["Std.Logic.Eq"]
+definitions = []
+theorems = ["eq_symm", "eq_trans", "eq_congr_arg", "eq_congr_fun", "eq_congr2", "eq_subst", "eq_transport_const", "eq_rewrite_left", "eq_rewrite_right", "eq_cast_trans", "eq_calc3"]
+axioms = ["Eq.rec"]
+
+[[modules]]
+module = "Proofs.Ai.Analysis.AbstractMetricTopology"
+source = "Proofs/Ai/Analysis/AbstractMetricTopology/source.npa"
+certificate = "Proofs/Ai/Analysis/AbstractMetricTopology/certificate.npcert"
+meta = "Proofs/Ai/Analysis/AbstractMetricTopology/meta.json"
+replay = "Proofs/Ai/Analysis/AbstractMetricTopology/replay.json"
+producer_profile = "human-surface-explicit-term"
+expected_source_hash = "sha256:312ea718eae8fed39071f79e4e56a5f8cf242a422a13859e4c73fa54f205b82e"
+expected_certificate_file_hash = "sha256:52aaf68ecf4f18cfef564379d7d6502234b5a26268b5a3cb9a4a29a67591c223"
+expected_export_hash = "sha256:f5e79bd74e7b370861e7d8580e3a0a1bb628bc21e9bfa14eb4b7a944c2f5ec86"
+expected_axiom_report_hash = "sha256:6821508440c560fb4a20c6b8dde9b28116f41a1733e43c2dd5163cd66c37b969"
+expected_certificate_hash = "sha256:4515f43c4bc871ee762e35297b4a008e671b73425b75ce1fd70626692aa9fc85"
+imports = ["Std.Logic.Eq", "Proofs.Ai.EqReasoning"]
+definitions = ["MetricBall", "Neighborhood", "LocalMem", "LocalPred", "LocalEq", "LocalUnique"]
+theorems = ["metric_ball_intro", "metric_ball_elim", "neighborhood_intro", "neighborhood_center", "neighborhood_shrink", "local_mem_intro", "local_mem_elim", "local_pred_intro", "local_pred_apply", "local_pred_shrink", "metric_ball_mono", "local_eq_refl", "local_eq_symm", "local_eq_trans", "local_unique_apply"]
+axioms = ["Eq.rec"]
+
+[[modules]]
+module = "Proofs.Ai.Algebra.AbstractGroup"
+source = "Proofs/Ai/Algebra/AbstractGroup/source.npa"
+certificate = "Proofs/Ai/Algebra/AbstractGroup/certificate.npcert"
+meta = "Proofs/Ai/Algebra/AbstractGroup/meta.json"
+replay = "Proofs/Ai/Algebra/AbstractGroup/replay.json"
+producer_profile = "human-surface-explicit-term"
+expected_source_hash = "sha256:b736134945c7141ec3d7512a58f6b91722e3fcab7c9a7ce8fc427390005eab5f"
+expected_certificate_file_hash = "sha256:f190a26c4aba6084821e2ca55e33abd19529ce86cb1688da4b33aa66d3173bc2"
+expected_export_hash = "sha256:6a8a08770d9106f13ff3fc3534ecdaf47b8cdab11e98b0375f23267a30318283"
+expected_axiom_report_hash = "sha256:63c3ca0596e94ceb5c525266931264176f2096a320083864a9662bbc9db78269"
+expected_certificate_hash = "sha256:a3c6c193e78e7617d0f6e9b6f3c4961adebed6b8ad16dde55055a403d482654e"
+imports = ["Std.Logic.Eq", "Proofs.Ai.EqReasoning"]
+definitions = ["GroupLawArgs", "GroupHomLawArgs", "KernelPred", "KerRel"]
+theorems = ["group_mul_assoc", "group_one_mul", "group_mul_one", "group_inv_mul", "group_mul_inv", "group_left_cancel", "group_inv_inv", "group_inv_mul_left_reassoc", "group_conj_slide", "group_product_mul_reassoc", "group_mul_inv_rev", "group_product_inv_reassoc", "group_inv_rel_symm_reassoc", "group_rel_trans_reassoc", "group_rel_mul_reassoc", "group_rel_inv_reassoc", "hom_mul", "hom_one", "hom_inv", "kernel_one", "ker_rel_refl", "ker_rel_symm", "ker_rel_trans"]
+axioms = ["Eq.rec"]
+
+[[modules]]
+module = "Proofs.Ai.Algebra.AbstractGroupImage"
+source = "Proofs/Ai/Algebra/AbstractGroupImage/source.npa"
+certificate = "Proofs/Ai/Algebra/AbstractGroupImage/certificate.npcert"
+meta = "Proofs/Ai/Algebra/AbstractGroupImage/meta.json"
+replay = "Proofs/Ai/Algebra/AbstractGroupImage/replay.json"
+producer_profile = "human-surface-explicit-term"
+expected_source_hash = "sha256:d6a07e58a010f508eb13459485e11849da3d057804ea928629a6963f4147b1e0"
+expected_certificate_file_hash = "sha256:2769eb60a2c3c7a6f16ee98b1b80878e886288da3b2ededeb1e28bb07a584874"
+expected_export_hash = "sha256:a1d87860dba08518f05698d3afaa6edb8accbba9f2863733859f49e4d83fb2ea"
+expected_axiom_report_hash = "sha256:0869976f857fbf07454df1db004a649ae3ee9ede0e1429dbf40af6dfaac5bfeb"
+expected_certificate_hash = "sha256:b16989d25cb9c54dd53ec8efb092ddcb499c5282aed4b301a856b53c40ec4c07"
+imports = ["Std.Logic.Eq", "Proofs.Ai.EqReasoning", "Proofs.Ai.Algebra.AbstractGroup"]
+definitions = ["ImagePred"]
+theorems = ["image_intro", "image_elim", "image_one", "image_mul_closed", "image_inv_closed"]
+axioms = ["Eq.rec"]

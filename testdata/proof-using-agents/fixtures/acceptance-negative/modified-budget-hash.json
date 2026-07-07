@@ -1,0 +1,6 @@
+{
+  "id": "modified-budget-hash",
+  "kind": "modified_budget_hash",
+  "rejection_kind": "modified_budget_hash_changes_identity",
+  "blocked_target_state": "replay_verified"
+}

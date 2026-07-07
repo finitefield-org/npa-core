@@ -1,0 +1,6 @@
+{
+  "id": "unverified-lemma-sharing",
+  "kind": "unverified_lemma_sharing",
+  "rejection_kind": "unverified_lemma_sharing_rejected",
+  "blocked_target_state": "certificate_verified"
+}

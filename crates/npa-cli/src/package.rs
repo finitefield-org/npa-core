@@ -11,6 +11,7 @@ use crate::fs::{artifact_io_error, join_package_path, render_package_path, rende
 use crate::package_artifacts::run_package_check_generated;
 use crate::package_axiom_report::run_package_axiom_report;
 use crate::package_build::run_package_build_certs;
+use crate::package_candidate_metadata::run_package_export_candidate_metadata;
 use crate::package_check::run_package_check;
 use crate::package_export_summary::run_package_export_summary;
 use crate::package_gate_plan::run_package_gate_plan;
@@ -18,6 +19,7 @@ use crate::package_hashes::run_package_check_hashes;
 use crate::package_high_trust::run_package_high_trust;
 use crate::package_index::run_package_index;
 use crate::package_publish::run_package_publish_plan;
+use crate::package_refactor_plan::run_package_refactor_plan;
 use crate::package_verify::run_package_verify_certs;
 
 /// Package-relative manifest path used by CLR-04 package commands.
@@ -110,11 +112,15 @@ pub fn run_package_command(command: PackageCommand) -> CommandResult {
         PackageCommand::AxiomReport(options) => run_package_axiom_report(options),
         PackageCommand::Index(options) => run_package_index(options),
         PackageCommand::ExportSummary(options) => run_package_export_summary(options),
+        PackageCommand::ExportCandidateMetadata(options) => {
+            run_package_export_candidate_metadata(options)
+        }
         PackageCommand::VerifyCerts(options) => run_package_verify_certs(options),
         PackageCommand::CheckHashes(options) => run_package_check_hashes(options),
         PackageCommand::PublishPlan(options) => run_package_publish_plan(options),
         PackageCommand::CheckGenerated(options) => run_package_check_generated(options),
         PackageCommand::HighTrust(options) => run_package_high_trust(*options),
         PackageCommand::GatePlan(options) => run_package_gate_plan(options),
+        PackageCommand::RefactorPlan(options) => run_package_refactor_plan(options),
     }
 }

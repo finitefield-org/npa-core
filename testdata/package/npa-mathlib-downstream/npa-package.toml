@@ -1,0 +1,37 @@
+schema = "npa.package.v0.1"
+package = "npa-mathlib-downstream"
+version = "0.1.0"
+license = "Apache-2.0"
+description = "Downstream import fixture for public npa-mathlib release artifacts."
+
+core_spec = "npa.core.v0.1"
+kernel_profile = "npa.kernel.v0.1"
+certificate_format = "npa.certificate.canonical.v0.1"
+checker_profile = "npa.checker.reference.v0.1"
+
+[policy]
+allow_custom_axioms = false
+allowed_axioms = []
+
+[[imports]]
+module = "Mathlib.Logic.Basic"
+package = "npa-mathlib"
+version = "0.1.0"
+certificate = "vendor/npa-mathlib/Mathlib/Logic/Basic/certificate.npcert"
+export_hash = "sha256:8ce56ca9f292f4c7b5beea361ddeb2393ce5179c3b7a6f64bb1f768b61c51407"
+certificate_hash = "sha256:bf60ceeaaf42b7167ebc382a87903b639f2cfebd657758247bfd949d05db2047"
+
+[[modules]]
+module = "Downstream.MathlibBasic"
+source = "Downstream/MathlibBasic/source.npa"
+certificate = "Downstream/MathlibBasic/certificate.npcert"
+producer_profile = "human-surface-explicit-term"
+imports = ["Mathlib.Logic.Basic"]
+expected_source_hash = "sha256:4746406557b3424e3c6ecae18aea11706d8daf4163d55d18be6fd8a9587c3de7"
+expected_certificate_file_hash = "sha256:98005fb0ee104e61ffbdc5f183d86275a03cda27f6deb8709123136624da94c4"
+expected_export_hash = "sha256:29d82e16979c7ccc76c6a240fa4a2f8564fbebf730c7ecd7612c8711d51d7feb"
+expected_axiom_report_hash = "sha256:a1ef77782ab68d41aede3e412c79174432934c3cac66c319dd2d406cf514f40e"
+expected_certificate_hash = "sha256:855f470de3b52203ca4c59f8fa2006927fc444f8a33c916b31af8f3c7766b23d"
+definitions = []
+theorems = ["mathlib_id_passthrough"]
+axioms = []

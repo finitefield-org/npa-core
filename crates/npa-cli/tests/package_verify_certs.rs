@@ -32,6 +32,7 @@ static NEXT_TEMP_DIR: AtomicUsize = AtomicUsize::new(0);
 
 struct TestPackage {
     path: PathBuf,
+    cleanup_path: PathBuf,
 }
 
 impl TestPackage {
@@ -45,11 +46,18 @@ impl TestPackage {
             fs::remove_dir_all(&path).unwrap();
         }
         fs::create_dir_all(&path).unwrap();
-        Self { path }
+        Self {
+            path: path.clone(),
+            cleanup_path: path,
+        }
     }
 
     fn path(&self) -> &Path {
         &self.path
+    }
+
+    fn cleanup_path(&self) -> &Path {
+        &self.cleanup_path
     }
 
     fn artifact_path(&self, relative: &str) -> PathBuf {
@@ -59,7 +67,7 @@ impl TestPackage {
 
 impl Drop for TestPackage {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.path);
+        let _ = fs::remove_dir_all(&self.cleanup_path);
     }
 }
 
@@ -146,6 +154,102 @@ fn package_verify_certs_fast_succeeds_and_is_labeled_fast_kernel() {
         .diagnostics
         .iter()
         .all(|diagnostic| diagnostic.checker.as_deref() != Some("npa-checker-ref")));
+}
+
+#[test]
+fn package_verify_certs_changed_verifies_changed_certificate_path_source_free() {
+    let package = build_source_free_modules_fixture(
+        "changed-certificate-source-free",
+        &[
+            "Proofs.Ai.Basic",
+            "Proofs.Ai.EqReasoning",
+            "Proofs.Ai.Analysis.AbstractMetricTopology",
+        ],
+        &["Eq.rec"],
+    );
+    assert!(!package.artifact_path("Proofs/Ai/Basic/source.npa").exists());
+    assert!(!package
+        .artifact_path("Proofs/Ai/EqReasoning/source.npa")
+        .exists());
+    assert!(!package
+        .artifact_path("Proofs/Ai/Analysis/AbstractMetricTopology/source.npa")
+        .exists());
+    init_git_baseline(&package);
+    stage_worktree_mode_changed(&package, "Proofs/Ai/EqReasoning/certificate.npcert");
+
+    let result = run_verify_changed(&package, PackageChecker::Reference);
+
+    assert_eq!(result.exit_code(), CommandExitCode::Success);
+    let verified_modules = result
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.reason_code == "module_verified")
+        .map(|diagnostic| diagnostic.module.as_deref().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        verified_modules,
+        vec!["Std.Logic.Eq", "Proofs.Ai.EqReasoning"]
+    );
+}
+
+#[test]
+fn package_verify_certs_changed_ignores_staged_certificate_when_worktree_restored_source_free() {
+    let package = build_source_free_modules_fixture(
+        "changed-certificate-index-only-source-free",
+        &["Proofs.Ai.Basic", "Proofs.Ai.EqReasoning"],
+        &["Eq.rec"],
+    );
+    init_git_baseline(&package);
+    stage_changed_then_restore(
+        &package,
+        "Proofs/Ai/EqReasoning/certificate.npcert",
+        b"\nchanged-index-bytes",
+    );
+
+    let result = run_verify_changed(&package, PackageChecker::Reference);
+
+    assert_eq!(result.exit_code(), CommandExitCode::Success);
+    assert!(result
+        .diagnostics
+        .iter()
+        .all(|diagnostic| diagnostic.reason_code != "module_verified"));
+    let aggregate = result
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.reason_code == "package_verified")
+        .and_then(|diagnostic| diagnostic.actual_value.as_deref())
+        .expect("package aggregate diagnostic");
+    assert!(aggregate.contains("modules=0"));
+}
+
+#[test]
+fn package_verify_certs_changed_verifies_nested_package_certificate_path_source_free() {
+    let mut package = build_source_free_modules_fixture(
+        "changed-certificate-nested-source-free",
+        &[
+            "Proofs.Ai.Basic",
+            "Proofs.Ai.EqReasoning",
+            "Proofs.Ai.Analysis.AbstractMetricTopology",
+        ],
+        &["Eq.rec"],
+    );
+    nest_package_in_worktree(&mut package, "packages/proofs space");
+    init_git_worktree_baseline(&package);
+    mark_worktree_mode_changed(&package, "Proofs/Ai/EqReasoning/certificate.npcert");
+
+    let result = run_verify_changed(&package, PackageChecker::Reference);
+
+    assert_eq!(result.exit_code(), CommandExitCode::Success);
+    let verified_modules = result
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.reason_code == "module_verified")
+        .map(|diagnostic| diagnostic.module.as_deref().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        verified_modules,
+        vec!["Std.Logic.Eq", "Proofs.Ai.EqReasoning"]
+    );
 }
 
 #[test]
@@ -305,7 +409,8 @@ fn package_verify_certs_rejects_stale_certificate_hash_before_checker_status() {
         build_source_free_fixture("stale-certificate", "Proofs.Ai.Basic", false, &["Eq.rec"]);
     fs::write(
         package.artifact_path("Proofs/Ai/Basic/certificate.npcert"),
-        fs::read(repo_root().join("proofs/Proofs/Ai/Prop/certificate.npcert")).unwrap(),
+        fs::read(repo_root().join("testdata/package/proofs/Proofs/Ai/Prop/certificate.npcert"))
+            .unwrap(),
     )
     .unwrap();
 
@@ -444,6 +549,7 @@ fn package_verify_certs_audit_cache_external_read_through_is_rejected() {
             json: true,
         },
         checker: PackageChecker::External,
+        changed: false,
         audit_cache: PackageAuditCacheMode::ReadThrough,
         verifier_memo: PackageVerifierMemoMode::Off,
         jobs: 1,
@@ -606,6 +712,7 @@ fn package_verify_certs_local_hit_external_is_rejected() {
             json: true,
         },
         checker: PackageChecker::External,
+        changed: false,
         audit_cache: PackageAuditCacheMode::LocalHit,
         verifier_memo: PackageVerifierMemoMode::Off,
         jobs: 1,
@@ -629,10 +736,14 @@ fn package_verify_certs_local_hit_external_is_rejected() {
 
 #[test]
 fn package_verify_certs_local_hit_does_not_run_from_package_gate_scripts() {
-    let package_gate = fs::read_to_string(repo_root().join("scripts/check-corpus-package.sh"))
-        .expect("package gate script");
-    let full_gate = fs::read_to_string(repo_root().join("scripts/check-corpus-full.sh"))
-        .expect("full gate script");
+    let Some(package_gate_path) = corpus_script_path("check-corpus-package.sh") else {
+        return;
+    };
+    let Some(full_gate_path) = corpus_script_path("check-corpus-full.sh") else {
+        return;
+    };
+    let package_gate = fs::read_to_string(package_gate_path).expect("package gate script");
+    let full_gate = fs::read_to_string(full_gate_path).expect("full gate script");
 
     assert!(!package_gate.contains("--audit-cache"));
     assert!(!full_gate.contains("--audit-cache"));
@@ -1006,6 +1117,7 @@ fn package_verify_certs_disk_memo_external_is_rejected() {
             json: true,
         },
         checker: PackageChecker::External,
+        changed: false,
         audit_cache: PackageAuditCacheMode::Off,
         verifier_memo: PackageVerifierMemoMode::Disk,
         jobs: 1,
@@ -1126,6 +1238,7 @@ fn package_verify_certs_jobs_audit_cache_parallel_is_rejected() {
             json: true,
         },
         checker: PackageChecker::Fast,
+        changed: false,
         audit_cache: PackageAuditCacheMode::ReadThrough,
         verifier_memo: PackageVerifierMemoMode::Off,
         jobs: 4,
@@ -1281,6 +1394,120 @@ fn run_verify(
     run_verify_with_audit_cache(package, checker, PackageAuditCacheMode::Off)
 }
 
+fn run_verify_changed(
+    package: &TestPackage,
+    checker: PackageChecker,
+) -> npa_cli::diagnostic::CommandResult {
+    run_package_verify_certs(PackageVerifyCertsOptions {
+        common: PackageCommonOptions {
+            root: package.path().to_path_buf(),
+            json: true,
+        },
+        checker,
+        changed: true,
+        audit_cache: PackageAuditCacheMode::Off,
+        verifier_memo: PackageVerifierMemoMode::Off,
+        jobs: 1,
+        external: None,
+        timings: PackageTimingMode::Off,
+    })
+}
+
+fn init_git_baseline(package: &TestPackage) {
+    run_git_at(package.path(), &["init"]);
+    run_git_at(package.path(), &["add", "."]);
+    run_git_at(
+        package.path(),
+        &[
+            "-c",
+            "user.name=NPA Test",
+            "-c",
+            "user.email=npa-test@example.invalid",
+            "commit",
+            "-m",
+            "baseline",
+        ],
+    );
+}
+
+fn init_git_worktree_baseline(package: &TestPackage) {
+    run_git_at(package.cleanup_path(), &["init"]);
+    run_git_at(package.cleanup_path(), &["add", "."]);
+    run_git_at(
+        package.cleanup_path(),
+        &[
+            "-c",
+            "user.name=NPA Test",
+            "-c",
+            "user.email=npa-test@example.invalid",
+            "commit",
+            "-m",
+            "baseline",
+        ],
+    );
+}
+
+fn nest_package_in_worktree(package: &mut TestPackage, relative_path: &str) {
+    let original_package_root = package.path.clone();
+    let worktree_root = original_package_root.with_file_name(format!(
+        "{}-worktree",
+        original_package_root.file_name().unwrap().to_string_lossy()
+    ));
+    if worktree_root.exists() {
+        fs::remove_dir_all(&worktree_root).unwrap();
+    }
+    let nested_package_root = worktree_root.join(relative_path);
+    fs::create_dir_all(nested_package_root.parent().unwrap()).unwrap();
+    fs::rename(&original_package_root, &nested_package_root).unwrap();
+    package.path = nested_package_root;
+    package.cleanup_path = worktree_root;
+}
+
+fn stage_changed_then_restore(package: &TestPackage, relative_path: &str, suffix: &[u8]) {
+    let path = package.artifact_path(relative_path);
+    let original = fs::read(&path).unwrap();
+    let mut staged = original.clone();
+    staged.extend_from_slice(suffix);
+    fs::write(&path, staged).unwrap();
+    run_git(package, &["add", relative_path]);
+    fs::write(&path, original).unwrap();
+}
+
+fn mark_worktree_mode_changed(package: &TestPackage, relative_path: &str) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = package.artifact_path(relative_path);
+        let mut permissions = fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions).unwrap();
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (package, relative_path);
+        panic!("worktree mode-change fixture requires unix permissions");
+    }
+}
+
+fn stage_worktree_mode_changed(package: &TestPackage, relative_path: &str) {
+    mark_worktree_mode_changed(package, relative_path);
+    run_git(package, &["add", relative_path]);
+}
+
+fn run_git(package: &TestPackage, args: &[&str]) {
+    run_git_at(package.path(), args);
+}
+
+fn run_git_at(cwd: &Path, args: &[&str]) {
+    let status = Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .status()
+        .unwrap();
+    assert!(status.success(), "git {args:?} failed with {status}");
+}
+
 fn run_verify_with_jobs(
     package: &TestPackage,
     checker: PackageChecker,
@@ -1292,6 +1519,7 @@ fn run_verify_with_jobs(
             json: true,
         },
         checker,
+        changed: false,
         audit_cache: PackageAuditCacheMode::Off,
         verifier_memo: PackageVerifierMemoMode::Off,
         jobs,
@@ -1311,6 +1539,7 @@ fn run_verify_with_timings(
             json: true,
         },
         checker,
+        changed: false,
         audit_cache: PackageAuditCacheMode::Off,
         verifier_memo: PackageVerifierMemoMode::Off,
         jobs: 1,
@@ -1331,6 +1560,7 @@ fn run_verify_with_verifier_memo(
             json: true,
         },
         checker,
+        changed: false,
         audit_cache: PackageAuditCacheMode::Off,
         verifier_memo,
         jobs: 1,
@@ -1350,6 +1580,7 @@ fn run_verify_with_audit_cache(
             json: true,
         },
         checker,
+        changed: false,
         audit_cache,
         verifier_memo: PackageVerifierMemoMode::Off,
         jobs: 1,
@@ -1431,6 +1662,7 @@ fn run_verify_external(
             json: true,
         },
         checker: PackageChecker::External,
+        changed: false,
         audit_cache: PackageAuditCacheMode::Off,
         verifier_memo: PackageVerifierMemoMode::Off,
         jobs: 1,
@@ -1525,16 +1757,18 @@ fn audit_cache_test_lock() -> MutexGuard<'static, ()> {
 }
 
 fn process_memo_test_lock() -> MutexGuard<'static, ()> {
-    static LOCK: Mutex<()> = Mutex::new(());
-    LOCK.lock().unwrap()
+    shared_process_state_test_lock()
 }
 
 fn disk_memo_test_lock() -> MutexGuard<'static, ()> {
-    static LOCK: Mutex<()> = Mutex::new(());
-    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    shared_process_state_test_lock()
 }
 
 fn decode_cache_test_lock() -> MutexGuard<'static, ()> {
+    shared_process_state_test_lock()
+}
+
+fn shared_process_state_test_lock() -> MutexGuard<'static, ()> {
     static LOCK: Mutex<()> = Mutex::new(());
     LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
@@ -1928,7 +2162,7 @@ fn write_lock(package: &TestPackage, manifest_source: &str) {
 }
 
 fn copy_artifact(package: &TestPackage, relative: &str) {
-    let source = repo_root().join("proofs").join(relative);
+    let source = repo_root().join("testdata/package/proofs").join(relative);
     let target = package.artifact_path(relative);
     fs::create_dir_all(target.parent().unwrap()).unwrap();
     fs::copy(source, target).unwrap();
@@ -1963,7 +2197,8 @@ fn refresh_expected_certificate_file_hash(package: &TestPackage, certificate: &P
 }
 
 fn proof_manifest() -> npa_package::ValidatedPackageManifest {
-    let source = fs::read_to_string(repo_root().join("proofs/npa-package.toml")).unwrap();
+    let source =
+        fs::read_to_string(repo_root().join("testdata/package/proofs/npa-package.toml")).unwrap();
     parse_and_validate_manifest_str(&source).unwrap()
 }
 
@@ -1972,4 +2207,14 @@ fn repo_root() -> PathBuf {
         .join("../..")
         .components()
         .collect()
+}
+
+fn corpus_script_path(script: &str) -> Option<PathBuf> {
+    let root = repo_root();
+    let standalone_path = root.join("scripts").join(script);
+    if standalone_path.exists() {
+        return Some(standalone_path);
+    }
+    let container_path = root.join("../npa-corpus/scripts").join(script);
+    container_path.exists().then_some(container_path)
 }

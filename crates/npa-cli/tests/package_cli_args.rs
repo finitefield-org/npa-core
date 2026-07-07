@@ -2,10 +2,12 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use npa_cli::args::{
-    parse_cli_args, CliAction, CliCommand, HelpTopic, PackageAuditCacheMode,
-    PackageBuildCheckCacheMode, PackageChecker, PackageCommand, PackageTimingMode,
-    PackageVerifierMemoMode, UsageReason,
+    parse_cli_args, render_help, CliAction, CliCommand, HelpTopic, PackageAuditCacheMode,
+    PackageBuildCheckCacheMode, PackageChecker, PackageCommand, PackageRefactorPlanScope,
+    PackageTimingMode, PackageVerifierMemoMode, UsageReason,
 };
+use npa_cli::diagnostic::{CommandStatus, DiagnosticKind};
+use npa_cli::package::run_package_command;
 
 fn parse(args: &[&str]) -> CliAction {
     parse_cli_args(args.iter().copied()).unwrap()
@@ -81,6 +83,150 @@ fn package_gate_plan_cli_args_reject_missing_duplicate_and_help() {
 
     let help = parse(&["package", "gate-plan", "--help"]);
     assert_eq!(help, CliAction::Help(HelpTopic::PackageGatePlan));
+}
+
+#[test]
+fn package_cli_args_refactor_plan_parse_defaults() {
+    let action = parse(&["package", "refactor-plan"]);
+
+    let CliAction::Run(CliCommand::Package(PackageCommand::RefactorPlan(options))) = action else {
+        panic!("expected package refactor-plan command");
+    };
+    assert_eq!(options.common.root, PathBuf::from("."));
+    assert!(!options.common.json);
+    assert_eq!(options.scope, PackageRefactorPlanScope::Modules);
+    assert_eq!(options.module, None);
+    assert_eq!(options.top, 20);
+    assert!(!options.include_source_metrics);
+}
+
+#[test]
+fn package_cli_args_refactor_plan_parse_scope_module_top_root_and_json() {
+    let action = parse(&[
+        "package",
+        "refactor-plan",
+        "--scope",
+        "theorems",
+        "--module",
+        "Proofs.Ai.Basic",
+        "--top",
+        "1",
+        "--root",
+        "proofs",
+        "--json",
+    ]);
+
+    let CliAction::Run(CliCommand::Package(PackageCommand::RefactorPlan(options))) = action else {
+        panic!("expected package refactor-plan command");
+    };
+    assert_eq!(options.common.root, PathBuf::from("proofs"));
+    assert!(options.common.json);
+    assert_eq!(options.scope, PackageRefactorPlanScope::Theorems);
+    assert_eq!(
+        options.module.as_ref().map(|module| module.as_dotted()),
+        Some("Proofs.Ai.Basic".to_owned())
+    );
+    assert_eq!(options.top, 1);
+
+    let action = parse(&[
+        "package",
+        "refactor-plan",
+        "--scope=both",
+        "--module=Mathlib.Logic.Basic",
+        "--top=200",
+    ]);
+    let CliAction::Run(CliCommand::Package(PackageCommand::RefactorPlan(options))) = action else {
+        panic!("expected package refactor-plan command");
+    };
+    assert_eq!(options.scope, PackageRefactorPlanScope::Both);
+    assert_eq!(
+        options.module.as_ref().map(|module| module.as_dotted()),
+        Some("Mathlib.Logic.Basic".to_owned())
+    );
+    assert_eq!(options.top, 200);
+}
+
+#[test]
+fn package_cli_args_refactor_plan_reject_invalid_values_and_reserved_source_metrics() {
+    let invalid_scope = parse_error(&["package", "refactor-plan", "--scope", "module"]);
+    assert_eq!(invalid_scope.reason, UsageReason::InvalidFlagValue);
+    assert_eq!(invalid_scope.flag.as_deref(), Some("--scope"));
+    assert_eq!(invalid_scope.value.as_deref(), Some("module"));
+
+    let invalid_module = parse_error(&["package", "refactor-plan", "--module", "Proofs..Bad"]);
+    assert_eq!(invalid_module.reason, UsageReason::InvalidModuleName);
+    assert_eq!(invalid_module.flag.as_deref(), Some("--module"));
+    assert_eq!(invalid_module.value.as_deref(), Some("Proofs..Bad"));
+
+    for value in ["0", "201", "abc"] {
+        let error = parse_error(&["package", "refactor-plan", "--top", value]);
+        assert_eq!(error.reason, UsageReason::InvalidFlagValue, "{value}");
+        assert_eq!(error.flag.as_deref(), Some("--top"), "{value}");
+        assert_eq!(error.value.as_deref(), Some(value), "{value}");
+    }
+
+    let source_metrics = parse_error(&["package", "refactor-plan", "--include-source-metrics"]);
+    assert_eq!(source_metrics.reason, UsageReason::UnsupportedFlag);
+    assert_eq!(
+        source_metrics.flag.as_deref(),
+        Some("--include-source-metrics")
+    );
+    assert_eq!(
+        source_metrics.command.as_deref(),
+        Some("package refactor-plan")
+    );
+
+    let source_metrics_equals =
+        parse_error(&["package", "refactor-plan", "--include-source-metrics=true"]);
+    assert_eq!(source_metrics_equals.reason, UsageReason::UnsupportedFlag);
+    assert_eq!(
+        source_metrics_equals.flag.as_deref(),
+        Some("--include-source-metrics")
+    );
+    assert_eq!(
+        source_metrics_equals.command.as_deref(),
+        Some("package refactor-plan")
+    );
+}
+
+#[test]
+fn package_cli_args_refactor_plan_reject_duplicate_flags_and_help() {
+    for (flag, first, second) in [
+        ("--scope", "modules", "both"),
+        ("--module", "Proofs.Ai.Basic", "Proofs.Ai.Other"),
+        ("--top", "1", "2"),
+    ] {
+        let error = parse_error(&["package", "refactor-plan", flag, first, flag, second]);
+        assert_eq!(error.reason, UsageReason::DuplicateFlag, "{flag}");
+        assert_eq!(error.flag.as_deref(), Some(flag), "{flag}");
+    }
+
+    let help = parse(&["package", "refactor-plan", "--help"]);
+    assert_eq!(help, CliAction::Help(HelpTopic::PackageRefactorPlan));
+
+    let rendered = render_help(HelpTopic::PackageRefactorPlan);
+    assert!(rendered.contains("not proof evidence"));
+    assert!(!rendered.contains("--include-source-metrics"));
+}
+
+#[test]
+fn package_cli_args_refactor_plan_runtime_reports_missing_manifest() {
+    let action = parse(&["package", "refactor-plan", "--root", "missing-package"]);
+    let CliAction::Run(CliCommand::Package(command)) = action else {
+        panic!("expected package refactor-plan command");
+    };
+
+    let result = run_package_command(command);
+    assert_eq!(result.command, "package refactor-plan");
+    assert_eq!(result.root, "missing-package");
+    assert_eq!(result.status, CommandStatus::Failed);
+    assert_eq!(result.diagnostics.len(), 1);
+    assert_eq!(result.diagnostics[0].kind, DiagnosticKind::PackageManifest);
+    assert_eq!(result.diagnostics[0].reason_code, "manifest_missing");
+    assert_eq!(
+        result.diagnostics[0].path.as_deref(),
+        Some("npa-package.toml")
+    );
 }
 
 #[test]
@@ -306,6 +452,46 @@ fn package_cli_args_parses_package_export_summary_check_mode() {
 }
 
 #[test]
+fn package_cli_args_parses_package_export_candidate_metadata() {
+    let action = parse(&[
+        "package",
+        "export-candidate-metadata",
+        "--root=proofs",
+        "--module",
+        "Proofs.Ai.Basic",
+        "--declaration=compose",
+        "--out",
+        "target/candidates/compose.metadata.json",
+        "--json",
+    ]);
+
+    let CliAction::Run(CliCommand::Package(PackageCommand::ExportCandidateMetadata(options))) =
+        action
+    else {
+        panic!("expected package export-candidate-metadata command");
+    };
+    assert_eq!(options.common.root, PathBuf::from("proofs"));
+    assert!(options.common.json);
+    assert_eq!(options.module, "Proofs.Ai.Basic");
+    assert_eq!(options.declaration, "compose");
+    assert_eq!(
+        options.out.as_path(),
+        Path::new("target/candidates/compose.metadata.json")
+    );
+
+    let missing = parse_error(&[
+        "package",
+        "export-candidate-metadata",
+        "--module",
+        "Proofs.Ai.Basic",
+        "--out",
+        "target/candidates/compose.metadata.json",
+    ]);
+    assert_eq!(missing.reason, UsageReason::MissingRequiredFlag);
+    assert_eq!(missing.flag.as_deref(), Some("--declaration"));
+}
+
+#[test]
 fn package_timings_cli_args_parse_for_projection_commands() {
     let action = parse(&["package", "index", "--timings=summary"]);
     let CliAction::Run(CliCommand::Package(PackageCommand::Index(options))) = action else {
@@ -405,6 +591,7 @@ fn package_cli_args_defaults_verify_certs_checker_to_reference() {
         panic!("expected package verify-certs command");
     };
     assert_eq!(options.checker, PackageChecker::Reference);
+    assert!(!options.changed);
     assert_eq!(options.audit_cache, PackageAuditCacheMode::Off);
     assert_eq!(options.verifier_memo, PackageVerifierMemoMode::Off);
     assert_eq!(options.jobs, 1);
@@ -427,11 +614,73 @@ fn package_cli_args_parses_verify_certs_fast_checker() {
         panic!("expected package verify-certs command");
     };
     assert_eq!(options.checker, PackageChecker::Fast);
+    assert!(!options.changed);
     assert_eq!(options.audit_cache, PackageAuditCacheMode::Off);
     assert_eq!(options.verifier_memo, PackageVerifierMemoMode::Off);
     assert_eq!(options.jobs, 1);
     assert_eq!(options.timings, PackageTimingMode::Off);
     assert_eq!(options.common.root, PathBuf::from("proofs"));
+}
+
+#[test]
+fn package_cli_args_parses_verify_certs_changed_certificate_selection() {
+    let action = parse(&[
+        "package",
+        "verify-certs",
+        "--changed",
+        "--checker=fast",
+        "--root",
+        "proofs",
+    ]);
+
+    let CliAction::Run(CliCommand::Package(PackageCommand::VerifyCerts(options))) = action else {
+        panic!("expected package verify-certs command");
+    };
+    assert!(options.changed);
+    assert_eq!(options.checker, PackageChecker::Fast);
+    assert_eq!(options.audit_cache, PackageAuditCacheMode::Off);
+    assert_eq!(options.verifier_memo, PackageVerifierMemoMode::Off);
+    assert_eq!(options.common.root, PathBuf::from("proofs"));
+
+    let duplicate = parse_error(&["package", "verify-certs", "--changed", "--changed"]);
+    assert_eq!(duplicate.reason, UsageReason::DuplicateFlag);
+    assert_eq!(duplicate.flag.as_deref(), Some("--changed"));
+
+    let external = parse_error(&[
+        "package",
+        "verify-certs",
+        "--changed",
+        "--checker=external",
+        "--runner-policy",
+        "ci/runner.release.json",
+        "--runner-policy-hash",
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "--checker-registry",
+        "ci/checker-binaries.json",
+    ]);
+    assert_eq!(external.reason, UsageReason::UnsupportedFlag);
+    assert_eq!(external.flag.as_deref(), Some("--changed"));
+    assert_eq!(external.value.as_deref(), Some("external"));
+
+    let audit_cache = parse_error(&[
+        "package",
+        "verify-certs",
+        "--changed",
+        "--audit-cache=read-through",
+    ]);
+    assert_eq!(audit_cache.reason, UsageReason::UnsupportedFlag);
+    assert_eq!(audit_cache.flag.as_deref(), Some("--audit-cache"));
+    assert_eq!(audit_cache.value.as_deref(), Some("read-through"));
+
+    let verifier_memo = parse_error(&[
+        "package",
+        "verify-certs",
+        "--changed",
+        "--verifier-memo=disk",
+    ]);
+    assert_eq!(verifier_memo.reason, UsageReason::UnsupportedFlag);
+    assert_eq!(verifier_memo.flag.as_deref(), Some("--verifier-memo"));
+    assert_eq!(verifier_memo.value.as_deref(), Some("disk"));
 }
 
 #[test]
@@ -834,6 +1083,17 @@ fn package_cli_args_rejects_missing_flag_values() {
     let timing_error = parse_error(&["package", "axiom-report", "--timings"]);
     assert_eq!(timing_error.reason, UsageReason::MissingFlagValue);
     assert_eq!(timing_error.flag.as_deref(), Some("--timings"));
+
+    for flag in ["--scope", "--module", "--top"] {
+        let error = parse_error(&["package", "refactor-plan", flag]);
+        assert_eq!(error.reason, UsageReason::MissingFlagValue, "{flag}");
+        assert_eq!(error.flag.as_deref(), Some(flag), "{flag}");
+
+        let equals_flag = format!("{flag}=");
+        let error = parse_error(&["package", "refactor-plan", &equals_flag]);
+        assert_eq!(error.reason, UsageReason::MissingFlagValue, "{flag}");
+        assert_eq!(error.flag.as_deref(), Some(flag), "{flag}");
+    }
 }
 
 #[test]
@@ -867,6 +1127,18 @@ fn package_cli_args_parses_help_topics() {
         parse(&["package", "high-trust", "--help"]),
         CliAction::Help(HelpTopic::PackageHighTrust)
     );
+    assert_eq!(
+        parse(&["package", "refactor-plan", "--help"]),
+        CliAction::Help(HelpTopic::PackageRefactorPlan)
+    );
+}
+
+#[test]
+fn package_verify_certs_help_documents_changed_certificate_selection() {
+    let help = render_help(HelpTopic::PackageVerifyCerts);
+
+    assert!(help.contains("[--changed]"));
+    assert!(help.contains("certificate files are changed in Git"));
 }
 
 #[test]

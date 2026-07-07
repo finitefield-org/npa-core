@@ -1,0 +1,50 @@
+import Std.Logic.Eq
+import Std.Nat.Basic
+
+theorem nat_zero_self_eq :
+  @Eq.{1} Nat Nat.zero Nat.zero :=
+  @Eq.refl.{1} Nat Nat.zero
+
+theorem nat_succ_zero_self_eq :
+  @Eq.{1} Nat (Nat.succ Nat.zero) (Nat.succ Nat.zero) :=
+  @Eq.refl.{1} Nat (Nat.succ Nat.zero)
+
+theorem nat_id :
+  forall (n : Nat), Nat :=
+  fun n => n
+
+theorem nat_const_zero :
+  forall (n : Nat), Nat :=
+  fun n => Nat.zero
+
+theorem nat_apply_fn :
+  forall (f : forall (n : Nat), Nat), forall (n : Nat), Nat :=
+  fun f => fun n => f n
+
+theorem nat_const_succ_zero :
+  forall (n : Nat), Nat :=
+  fun n => Nat.succ Nat.zero
+
+theorem nat_apply_twice :
+  forall (f : forall (n : Nat), Nat), forall (n : Nat), Nat :=
+  fun f => fun n => f (f n)
+
+theorem nat_compose :
+  forall (f : forall (n : Nat), Nat), forall (g : forall (n : Nat), Nat), forall (n : Nat), Nat :=
+  fun f => fun g => fun n => f (g n)
+
+theorem nat_ignore_middle :
+  forall (x : Nat), forall (y : Nat), forall (z : Nat), Nat :=
+  fun x => fun y => fun z => x
+
+theorem nat_select_middle :
+  forall (x : Nat), forall (y : Nat), forall (z : Nat), Nat :=
+  fun x => fun y => fun z => y
+
+theorem nat_select_last :
+  forall (x : Nat), forall (y : Nat), forall (z : Nat), Nat :=
+  fun x => fun y => fun z => z
+
+theorem nat_succ_self_eq :
+  forall (n : Nat), @Eq.{1} Nat (Nat.succ n) (Nat.succ n) :=
+  fun n => @Eq.refl.{1} Nat (Nat.succ n)

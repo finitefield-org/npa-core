@@ -1,0 +1,29 @@
+{
+  "schema": "npa-ai-proof-meta-v0.1",
+  "module": "Proofs.Ai.Eq",
+  "source": "Proofs/Ai/Eq/source.npa",
+  "certificate": "Proofs/Ai/Eq/certificate.npcert",
+  "producer_profile": "human-surface-explicit-term",
+  "trusted_status": "verified_by_certificate",
+  "source_sha256": "sha256:840d68cb64b2b75fe048cf8f47b5908b05d72c488a6c4168777980d88052a954",
+  "certificate_file_sha256": "sha256:4b7afc156ec23739738393b0237d9a69792b0410fd96b877e6dada217274cd01",
+  "export_hash": "sha256:80b826d1aa6c9877b2e551521e781fcfdd3777cd8aec6cd27f4000d132eb64ef",
+  "axiom_report_hash": "sha256:bc3aec4eabbf2c61f399239a21f359b264c36873e750ed25c9059fee86484bea",
+  "certificate_hash": "sha256:7e350cb254c1051cb59b9268ef85947a6b618f24607ce71d7fe912ab48019b45",
+  "imports": ["Std.Logic.Eq", "Std.Nat.Basic"],
+  "axioms": [],
+  "declarations": [
+    { "name": "eq_refl_self", "kind": "theorem" },
+    { "name": "eq_refl_fn_app", "kind": "theorem" },
+    { "name": "eq_refl_compose", "kind": "theorem" },
+    { "name": "eq_self_imp", "kind": "theorem" },
+    { "name": "eq_refl_prop", "kind": "theorem" },
+    { "name": "eq_refl_apply_twice", "kind": "theorem" },
+    { "name": "eq_refl_higher_apply", "kind": "theorem" },
+    { "name": "eq_refl_nested_compose", "kind": "theorem" },
+    { "name": "eq_refl_prop_apply", "kind": "theorem" },
+    { "name": "eq_local_passthrough", "kind": "theorem" },
+    { "name": "eq_refl_nat_function", "kind": "theorem" }
+  ],
+  "trust_boundary": "source, replay, and metadata are non-trusted sidecars; only the canonical certificate verified by npa-cert is accepted"
+}

@@ -1,0 +1,115 @@
+schema = "npa.package.v0.1"
+package = "npa-mathlib"
+version = "0.1.0"
+license = "Apache-2.0"
+description = "Public theorem-library fixture for NPA mathlib Layer 0."
+
+core_spec = "npa.core.v0.1"
+kernel_profile = "npa.kernel.v0.1"
+certificate_format = "npa.certificate.canonical.v0.1"
+checker_profile = "npa.checker.reference.v0.1"
+
+[policy]
+allow_custom_axioms = false
+allowed_axioms = []
+
+[[imports]]
+module = "Std.Logic.Eq"
+package = "npa-std"
+version = "0.1.0"
+certificate = "vendor/npa-std/Std/Logic/Eq/certificate.npcert"
+export_hash = "sha256:b78b442d5f593458cc12f079b59e3c70259c0bec4967511e1a01d262d2f0e874"
+certificate_hash = "sha256:5a5b68a51b3e90223f1e0cca730f8b155c79f881b9dca70d67e6bf10058054aa"
+
+[[imports]]
+module = "Std.Nat.Basic"
+package = "npa-std"
+version = "0.1.0"
+certificate = "vendor/npa-std/Std/Nat/Basic/certificate.npcert"
+export_hash = "sha256:30c432b4f2fc69e1e2414f556096e9d067d8e3d8e44f98bee1326169cccb5e4d"
+certificate_hash = "sha256:8a477f8d2becb4cfcb6a6baa1c79bc0112840cfe658302f47c9cf3dfd084d84e"
+
+[[modules]]
+module = "Mathlib.Logic.Basic"
+source = "Mathlib/Logic/Basic/source.npa"
+certificate = "Mathlib/Logic/Basic/certificate.npcert"
+meta = "Mathlib/Logic/Basic/meta.json"
+replay = "Mathlib/Logic/Basic/replay.json"
+producer_profile = "human-surface-explicit-term"
+expected_source_hash = "sha256:2176be7570deae66754789868aa373ab01434512b4f50b992089886d2c655387"
+expected_certificate_file_hash = "sha256:35fb076a01757e704df52b39223e743cbc987cecdcf14427cda19b687b50fb02"
+expected_export_hash = "sha256:8ce56ca9f292f4c7b5beea361ddeb2393ce5179c3b7a6f64bb1f768b61c51407"
+expected_axiom_report_hash = "sha256:fed11e73accfbfb0dfc28b4f510e151fa33d8af82d58fdb23b92567e04e59e40"
+expected_certificate_hash = "sha256:bf60ceeaaf42b7167ebc382a87903b639f2cfebd657758247bfd949d05db2047"
+imports = []
+definitions = []
+theorems = ["id", "const_left", "const_right", "apply_fn", "compose", "flip", "duplicate", "prop_id", "modus_ponens", "imp_trans", "compose_assoc", "apply_twice", "ignore_middle", "select_middle", "select_last", "imp_swap", "imp_compose", "imp_ignore", "imp_duplicate", "higher_apply"]
+axioms = []
+
+[[modules]]
+module = "Mathlib.Logic.Prop"
+source = "Mathlib/Logic/Prop/source.npa"
+certificate = "Mathlib/Logic/Prop/certificate.npcert"
+meta = "Mathlib/Logic/Prop/meta.json"
+replay = "Mathlib/Logic/Prop/replay.json"
+producer_profile = "human-surface-explicit-term"
+expected_source_hash = "sha256:466c82f2aa00708bbf9d91d7e59a5f0a629f5f61af979711c325a0f4ce29dec6"
+expected_certificate_file_hash = "sha256:d2c70b2aceab8964bb4593d909f292c05dc53f37f1fe342adb3e67105cdb35b6"
+expected_export_hash = "sha256:a14d632cdbf0e20c5a34e2c837f05a6f713a1f0090740fcb82e577abe12c7634"
+expected_axiom_report_hash = "sha256:70b2d0f35f9ebfff46bdf399b80487f0c76ffd6460ab930f733af1f889d2fc65"
+expected_certificate_hash = "sha256:b3b1c22af5c53a9d3ff00c0bb5af1def460d4e0cdf24201d684ab56b250ce951"
+imports = []
+definitions = []
+theorems = ["imp_chain4", "imp_permute3", "imp_apply_twice", "imp_const3", "imp_flip_chain", "imp_higher_apply"]
+axioms = []
+
+[[modules]]
+module = "Mathlib.Logic.Eq"
+source = "Mathlib/Logic/Eq/source.npa"
+certificate = "Mathlib/Logic/Eq/certificate.npcert"
+meta = "Mathlib/Logic/Eq/meta.json"
+replay = "Mathlib/Logic/Eq/replay.json"
+producer_profile = "human-surface-explicit-term"
+expected_source_hash = "sha256:840d68cb64b2b75fe048cf8f47b5908b05d72c488a6c4168777980d88052a954"
+expected_certificate_file_hash = "sha256:94afd37804c75a3d5518bdab88d19a9ad426dcd643c7a33ba424607a95096c5f"
+expected_export_hash = "sha256:67c5c2fd52e7af8e926165b468818adb56f000c82f10e302426e22baca2445b0"
+expected_axiom_report_hash = "sha256:bc3aec4eabbf2c61f399239a21f359b264c36873e750ed25c9059fee86484bea"
+expected_certificate_hash = "sha256:d308fc30d6143ba13bb6f01e59b872873a13df0bd086cb5821b91a66311f549e"
+imports = ["Std.Logic.Eq", "Std.Nat.Basic"]
+definitions = []
+theorems = ["eq_refl_self", "eq_refl_fn_app", "eq_refl_compose", "eq_self_imp", "eq_refl_prop", "eq_refl_apply_twice", "eq_refl_higher_apply", "eq_refl_nested_compose", "eq_refl_prop_apply", "eq_local_passthrough", "eq_refl_nat_function"]
+axioms = []
+
+[[modules]]
+module = "Mathlib.Data.Nat.Basic"
+source = "Mathlib/Data/Nat/Basic/source.npa"
+certificate = "Mathlib/Data/Nat/Basic/certificate.npcert"
+meta = "Mathlib/Data/Nat/Basic/meta.json"
+replay = "Mathlib/Data/Nat/Basic/replay.json"
+producer_profile = "human-surface-explicit-term"
+expected_source_hash = "sha256:f899f8fcded51dfeef0f37960bb6050d50de22e134e076b6f44805d939bea8cd"
+expected_certificate_file_hash = "sha256:9bf7962b4ffd581f0de1f0a3312ff3be8d90a501d90a11422ec840784c72d112"
+expected_export_hash = "sha256:1f6fde56848c99ec09f3014655c469031a5d003b1923c9ae38d73d793766cb58"
+expected_axiom_report_hash = "sha256:7715c06c634de0020345067c58ecf3bd23c10e71d84f4b97cd4c2e00e82c1a07"
+expected_certificate_hash = "sha256:a3d7bafbb2cae926651c155430e0268bfd548b8df2d782eede2c1969b7c12dfd"
+imports = ["Std.Logic.Eq", "Std.Nat.Basic"]
+definitions = []
+theorems = ["nat_zero_self_eq", "nat_succ_zero_self_eq", "nat_id", "nat_const_zero", "nat_apply_fn", "nat_const_succ_zero", "nat_apply_twice", "nat_compose", "nat_ignore_middle", "nat_select_middle", "nat_select_last", "nat_succ_self_eq"]
+axioms = []
+
+[[modules]]
+module = "Mathlib.Core.Reduction"
+source = "Mathlib/Core/Reduction/source.npa"
+certificate = "Mathlib/Core/Reduction/certificate.npcert"
+meta = "Mathlib/Core/Reduction/meta.json"
+replay = "Mathlib/Core/Reduction/replay.json"
+producer_profile = "human-surface-explicit-term"
+expected_source_hash = "sha256:53f6a264f4626ff04d6c5de4d5537e3788ea03b28c0c507c8137de1c55fbf531"
+expected_certificate_file_hash = "sha256:1a0b901c538b0df97e2598a6b4b4c2647850f153ae3cb27842961ceaee8996e0"
+expected_export_hash = "sha256:30b3880e479a31246205ff016d35c3b0aa39880d436a262ea5130a20ebb7da46"
+expected_axiom_report_hash = "sha256:70b2d0f35f9ebfff46bdf399b80487f0c76ffd6460ab930f733af1f889d2fc65"
+expected_certificate_hash = "sha256:80b6936506954844e26f0d55ab5294b4574fdcfdc27baf3a07aa8b18f444f513"
+imports = ["Std.Nat.Basic"]
+definitions = ["reduction_id_nat"]
+theorems = ["beta_id_nat", "beta_const_nat", "let_id_nat", "let_const_nat", "delta_id_nat"]
+axioms = []
