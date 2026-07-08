@@ -17,7 +17,8 @@ RUST_TOOLCHAIN_VERSION = 1.95.0
 ```
 
 `v0.1.0` does not contain the SRA-02 `npa-std` fixture builder path and must
-not be used to build or check the SRA-02 `fixtures/npa-std` package fixture.
+not be used to build or check the SRA-02 `testdata/package/npa-std` package
+fixture.
 
 ## Historical Ref
 
@@ -38,26 +39,7 @@ RUST_TOOLCHAIN_VERSION = 1.95.0
 `NPA_GIT_COMMIT` is also supported when a repository wants to pin the full
 40-hex commit SHA instead of a tag. `NPA_BINARY_PATH` remains supported for
 runner-local binary provisioning. `NPA_VERSION` is reserved for a later
-release-download mode and is rejected by the current setup script.
-
-## Setup Contract
-
-Copy these files into external theorem repositories:
-
-```text
-ci-templates/github-actions/npa-package-pr.yml
-ci-templates/github-actions/npa-package-release.yml
-ci-templates/github-actions/setup-pinned-npa.sh
-ci-templates/github-actions/summarize-npa-diagnostics.py
-```
-
-Copy `ci-templates/github-actions/npa-package-high-trust.yml` only when the
-repository also supplies CLR-08 pinned external checker binaries, runner
-policies, checker registry data, and release audit evidence.
-
-The setup script fetches only the pinned `npa` implementation and exact Rust
-toolchain needed to build `npa-cli`. It must not fetch theorem package
-dependencies, package imports, registry metadata, or hidden package caches.
+release-download mode and is not a valid current package-command pin.
 
 ## Package Commands
 
@@ -103,7 +85,7 @@ Untrusted helper data remains:
 - replay and meta files
 - theorem indexes
 - publish plans
-- CI status
+- command status
 - Git tags and release pages
 - registry seed entries
 - future registry or API responses
@@ -114,12 +96,7 @@ The SRA-01 local gate is:
 
 ```sh
 cargo build -p npa-cli
-cargo run -p npa-cli -- package check --root fixtures/npa-mathlib --json
-python3 ci-templates/github-actions/validate-workflows.py
+cargo run -p npa-cli -- package check --root testdata/package/npa-mathlib --json
 cargo test -q -p npa-cli package_cli_args
-tmpdir="$(mktemp -d)"
-GITHUB_PATH="$tmpdir/github-path" RUNNER_TEMP="$tmpdir" GITHUB_WORKSPACE="$PWD" \
-  NPA_BINARY_PATH=target/debug/npa \
-  bash ci-templates/github-actions/setup-pinned-npa.sh
 ./scripts/check-fast.sh
 ```

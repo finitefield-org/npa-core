@@ -736,14 +736,10 @@ fn package_verify_certs_local_hit_external_is_rejected() {
 
 #[test]
 fn package_verify_certs_local_hit_does_not_run_from_package_gate_scripts() {
-    let Some(package_gate_path) = corpus_script_path("check-corpus-package.sh") else {
-        return;
-    };
-    let Some(full_gate_path) = corpus_script_path("check-corpus-full.sh") else {
-        return;
-    };
-    let package_gate = fs::read_to_string(package_gate_path).expect("package gate script");
-    let full_gate = fs::read_to_string(full_gate_path).expect("full gate script");
+    let package_gate = fs::read_to_string(corpus_script_path("check-corpus-package.sh"))
+        .expect("package gate script");
+    let full_gate =
+        fs::read_to_string(corpus_script_path("check-corpus-full.sh")).expect("full gate script");
 
     assert!(!package_gate.contains("--audit-cache"));
     assert!(!full_gate.contains("--audit-cache"));
@@ -2209,12 +2205,11 @@ fn repo_root() -> PathBuf {
         .collect()
 }
 
-fn corpus_script_path(script: &str) -> Option<PathBuf> {
+fn corpus_script_path(script: &str) -> PathBuf {
     let root = repo_root();
     let standalone_path = root.join("scripts").join(script);
     if standalone_path.exists() {
-        return Some(standalone_path);
+        return standalone_path;
     }
-    let container_path = root.join("../npa-corpus/scripts").join(script);
-    container_path.exists().then_some(container_path)
+    root.join("../npa-corpus/scripts").join(script)
 }

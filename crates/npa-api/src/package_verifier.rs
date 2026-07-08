@@ -4574,7 +4574,7 @@ mod tests {
     }
 
     fn proofs_root() -> PathBuf {
-        repo_root().join("proofs")
+        repo_root().join("testdata/package/proofs")
     }
 
     fn read(path: PathBuf) -> Vec<u8> {

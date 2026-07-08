@@ -1315,7 +1315,7 @@ mod tests {
             .expect("npa-api is under crates")
             .parent()
             .expect("crates is under repo root")
-            .join("../npa/develop/proof-using-agents/fixtures/pua-m16-counterexample-gate")
+            .join("testdata/proof-using-agents/fixtures/pua-m16-counterexample-gate")
             .join(name)
     }
 

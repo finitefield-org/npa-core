@@ -1668,7 +1668,7 @@ mod tests {
             .expect("crate has workspace parent")
             .parent()
             .expect("workspace has repo root")
-            .join("../npa/develop/proof-using-agents/fixtures/pua-m08-proof-skeleton")
+            .join("testdata/proof-using-agents/fixtures/pua-m08-proof-skeleton")
             .join(name)
     }
 
@@ -1912,7 +1912,7 @@ mod tests {
                 .expect("crate has workspace parent")
                 .parent()
                 .expect("workspace has repo root")
-                .join("../npa/develop/proof-using-agents/schemas/proof_skeleton.schema.json"),
+                .join("testdata/proof-using-agents/schemas/proof_skeleton.schema.json"),
         )
         .expect("schema should exist");
         for term_kind in PROOF_SKELETON_TERM_KINDS {

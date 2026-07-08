@@ -4712,7 +4712,7 @@ mod tests {
             .expect("crate has workspace parent")
             .parent()
             .expect("workspace has repo root")
-            .join("../npa/develop/proof-using-agents/fixtures/pua-m08-proof-sketch")
+            .join("testdata/proof-using-agents/fixtures/pua-m08-proof-sketch")
             .join(name)
     }
 
@@ -6193,7 +6193,7 @@ mod tests {
             .parent()
             .expect("workspace has repo root");
         let schema = std::fs::read_to_string(
-            repo_root.join("../npa/develop/proof-using-agents/schemas/proof_sketch.schema.json"),
+            repo_root.join("testdata/proof-using-agents/schemas/proof_sketch.schema.json"),
         )
         .expect("schema should exist");
         for node_kind in PROOF_SKETCH_NODE_KINDS {
@@ -6207,10 +6207,11 @@ mod tests {
         assert!(schema.contains("wall-clock timing"));
         assert!(schema.contains("scheduling order"));
 
-        let revision_schema = std::fs::read_to_string(repo_root.join(
-            "../npa/develop/proof-using-agents/schemas/proof_sketch_revision_patch.schema.json",
-        ))
-        .expect("revision patch schema should exist");
+        let revision_schema =
+            std::fs::read_to_string(repo_root.join(
+                "testdata/proof-using-agents/schemas/proof_sketch_revision_patch.schema.json",
+            ))
+            .expect("revision patch schema should exist");
         for patch_kind in [
             "replace_node",
             "split_node",

@@ -24,7 +24,7 @@ RUST_TOOLCHAIN_VERSION = 1.95.0
 `NPA_GIT_COMMIT` is also supported when a repository wants to pin the full
 40-hex commit SHA instead of a tag. `NPA_BINARY_PATH` remains supported for
 runner-local binary provisioning. `NPA_VERSION` is reserved for a later
-release-download mode and is rejected by the current setup script.
+release-download mode and is not a valid current package-command pin.
 
 ## Current Recommendation
 
@@ -38,35 +38,16 @@ RUST_TOOLCHAIN_VERSION = 1.95.0
 ## SRA-02 Compatibility
 
 This ref includes the `std-library-legacy-core-builder` producer profile used
-by the first `npa-std` package fixture. A checkout at this ref can rebuild and
-check the local `fixtures/npa-std` package fixture without registry or network
-package resolution.
+by the first `npa-std` package fixture. The local `npa-core` regression fixture
+is checked in at `testdata/package/npa-std` and can be rebuilt and checked
+without registry or network package resolution.
 
 The previous `v0.1.0` ref remains the original SRA-01 toolchain reference, but
 it does not contain the SRA-02 `npa-std` fixture builder path and cannot pass
-`package build-certs --check` for `fixtures/npa-std`.
+`package build-certs --check` for `testdata/package/npa-std`.
 
 Do not use `v0.1.0` as the current external package pin for SRA-02-compatible
 package fixtures.
-
-## Setup Contract
-
-Copy these files into external theorem repositories:
-
-```text
-ci-templates/github-actions/npa-package-pr.yml
-ci-templates/github-actions/npa-package-release.yml
-ci-templates/github-actions/setup-pinned-npa.sh
-ci-templates/github-actions/summarize-npa-diagnostics.py
-```
-
-Copy `ci-templates/github-actions/npa-package-high-trust.yml` only when the
-repository also supplies CLR-08 pinned external checker binaries, runner
-policies, checker registry data, and release audit evidence.
-
-The setup script fetches only the pinned `npa` implementation and exact Rust
-toolchain needed to build `npa-cli`. It must not fetch theorem package
-dependencies, package imports, registry metadata, or hidden package caches.
 
 ## Package Commands
 
@@ -162,7 +143,7 @@ Untrusted helper data remains:
 - replay and meta files
 - theorem indexes
 - publish plans
-- CI status
+- command status
 - Git tags and release pages
 - registry seed entries
 - future registry or API responses
@@ -173,18 +154,13 @@ The SRA-02-compatible local gate is:
 
 ```sh
 cargo build -p npa-cli
-cargo run -p npa-cli -- package check --root fixtures/npa-std --json
-cargo run -p npa-cli -- package build-certs --root fixtures/npa-std --check --json
-cargo run -p npa-cli -- package verify-certs --root fixtures/npa-std --checker reference --json
-cargo run -p npa-cli -- package check-hashes --root fixtures/npa-std --json
-cargo run -p npa-cli -- package axiom-report --root fixtures/npa-std --check --json
-cargo run -p npa-cli -- package index --root fixtures/npa-std --check --json
-cargo run -p npa-cli -- package publish-plan --root fixtures/npa-std --check --json
-python3 ci-templates/github-actions/validate-workflows.py
+cargo run -p npa-cli -- package check --root testdata/package/npa-std --json
+cargo run -p npa-cli -- package build-certs --root testdata/package/npa-std --check --json
+cargo run -p npa-cli -- package verify-certs --root testdata/package/npa-std --checker reference --json
+cargo run -p npa-cli -- package check-hashes --root testdata/package/npa-std --json
+cargo run -p npa-cli -- package axiom-report --root testdata/package/npa-std --check --json
+cargo run -p npa-cli -- package index --root testdata/package/npa-std --check --json
+cargo run -p npa-cli -- package publish-plan --root testdata/package/npa-std --check --json
 cargo test -q -p npa-cli package_cli_args
-tmpdir="$(mktemp -d)"
-GITHUB_PATH="$tmpdir/github-path" RUNNER_TEMP="$tmpdir" GITHUB_WORKSPACE="$PWD" \
-  NPA_BINARY_PATH=target/debug/npa \
-  bash ci-templates/github-actions/setup-pinned-npa.sh
 ./scripts/check-fast.sh
 ```

@@ -1773,7 +1773,12 @@ mod tests {
     }
 
     fn basic_certificate_bytes() -> Vec<u8> {
-        fs::read(repo_root().join("proofs").join(BASIC_CERTIFICATE_PATH)).unwrap()
+        fs::read(
+            repo_root()
+                .join("testdata/package/proofs")
+                .join(BASIC_CERTIFICATE_PATH),
+        )
+        .unwrap()
     }
 
     fn proof_certificate_buffer(root: &Path, path: &str) -> CertificateBuffer {
@@ -1916,7 +1921,7 @@ axioms = ["Eq.rec"]
         PackageArtifactExtraction,
         PackageArtifactFileReference,
     ) {
-        let root = repo_root().join("proofs");
+        let root = repo_root().join("testdata/package/proofs");
         let manifest_source = eq_reasoning_manifest_source();
         let validated = parse_and_validate_manifest_str(&manifest_source).unwrap();
         let buffers = vec![
@@ -1951,7 +1956,7 @@ axioms = ["Eq.rec"]
     fn proof_corpus_certificate_buffers(
         validated: &ValidatedPackageManifest,
     ) -> Vec<CertificateBuffer> {
-        let root = repo_root().join("proofs");
+        let root = repo_root().join("testdata/package/proofs");
         let mut buffers = Vec::new();
         if let Some(imports) = &validated.manifest().imports {
             for import in imports {
@@ -2289,7 +2294,7 @@ axioms = ["Eq.rec"]
             )
             .stack_size(16 * 1024 * 1024)
             .spawn(|| {
-                let root = repo_root().join("proofs");
+                let root = repo_root().join("testdata/package/proofs");
                 let manifest_source = fs::read_to_string(root.join("npa-package.toml")).unwrap();
                 let validated = parse_and_validate_manifest_str(&manifest_source).unwrap();
                 let lock_source =

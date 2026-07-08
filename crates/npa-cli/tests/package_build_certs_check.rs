@@ -152,7 +152,8 @@ fn package_build_certs_check_read_through_preserves_live_failure() {
     let package = build_minimal_fixture("cache-failure");
     fs::write(
         package.artifact_path("Proofs/Ai/Basic/certificate.npcert"),
-        fs::read(repo_root().join("proofs/Proofs/Ai/Prop/certificate.npcert")).unwrap(),
+        fs::read(repo_root().join("testdata/package/proofs/Proofs/Ai/Prop/certificate.npcert"))
+            .unwrap(),
     )
     .unwrap();
 
@@ -187,7 +188,8 @@ fn package_build_certs_check_rejects_checked_in_certificate_byte_drift() {
     let package = build_minimal_fixture("byte-drift");
     fs::write(
         package.artifact_path("Proofs/Ai/Basic/certificate.npcert"),
-        fs::read(repo_root().join("proofs/Proofs/Ai/Prop/certificate.npcert")).unwrap(),
+        fs::read(repo_root().join("testdata/package/proofs/Proofs/Ai/Prop/certificate.npcert"))
+            .unwrap(),
     )
     .unwrap();
 
@@ -255,7 +257,7 @@ fn package_build_certs_check_builds_local_imports_topologically() {
 #[test]
 fn package_build_certs_check_accepts_legacy_std_producer_profile_fixture() {
     let result = run_package_build_certs_check(PackageCommonOptions {
-        root: repo_root().join("../npa/fixtures/npa-std"),
+        root: repo_root().join("testdata/package/npa-std"),
         json: true,
     });
 

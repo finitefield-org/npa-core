@@ -134,7 +134,7 @@ fn package_axiom_report_check_succeeds_and_writes_no_files() {
 
 #[test]
 fn package_axiom_report_proof_corpus_check_mode_succeeds_without_mutating_generated_artifacts() {
-    let root = repo_root().join("proofs");
+    let root = repo_root().join("testdata/package/proofs");
     let report_path = root.join(PACKAGE_AXIOM_REPORT_PATH);
     let index_path = root.join(PACKAGE_THEOREM_INDEX_PATH);
     let before_report = fs::read(&report_path).unwrap();
@@ -594,14 +594,15 @@ fn write_lock(package: &TestPackage, manifest_source: &str) {
 }
 
 fn copy_artifact(package: &TestPackage, relative: &str) {
-    let source = repo_root().join("proofs").join(relative);
+    let source = repo_root().join("testdata/package/proofs").join(relative);
     let target = package.artifact_path(relative);
     fs::create_dir_all(target.parent().unwrap()).unwrap();
     fs::copy(source, target).unwrap();
 }
 
 fn proof_manifest() -> npa_package::ValidatedPackageManifest {
-    let source = fs::read_to_string(repo_root().join("proofs/npa-package.toml")).unwrap();
+    let source =
+        fs::read_to_string(repo_root().join("testdata/package/proofs/npa-package.toml")).unwrap();
     parse_and_validate_manifest_str(&source).unwrap()
 }
 

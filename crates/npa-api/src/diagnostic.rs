@@ -3383,7 +3383,7 @@ mod tests {
         ));
 
         let schema = include_str!(
-            "../../../../npa/develop/proof-using-agents/schemas/diagnostic_tree.schema.json"
+            "../../../testdata/proof-using-agents/schemas/diagnostic_tree.schema.json"
         );
         assert!(schema.contains("trusted_evidence_claim"));
         assert!(schema.contains("proof_acceptance_state"));

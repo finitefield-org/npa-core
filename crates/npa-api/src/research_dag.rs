@@ -1670,7 +1670,7 @@ mod tests {
             .expect("crate has workspace parent")
             .parent()
             .expect("workspace has repo root")
-            .join("../npa/develop/proof-using-agents/fixtures/pua-m16-research-dag")
+            .join("testdata/proof-using-agents/fixtures/pua-m16-research-dag")
             .join(name)
     }
 

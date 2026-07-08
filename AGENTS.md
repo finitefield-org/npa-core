@@ -55,14 +55,13 @@ Trusted:
 Before making large implementation changes, review the current specification
 and the documents for the relevant subsystem.
 
-- Implementation baseline: `../npa/develop/core-spec-v0.1.md`
-- Current NPA specification: `../npa/develop/npa-spec.md`
-- Overall design: `../npa/develop/overall-design.md`
-- implemented kernel / certificate / frontend / tactic / API / standard library
-  / AI search / independent checker / advanced-feature behavior:
-  `../npa/develop/npa-spec.md`
-- AI-assisted proof corpus expansion now lives in the sibling
-  `../npa-corpus` repository.
+- Repository overview, trust boundary, and local gates: `README.md`.
+- Package-author and toolchain references: `docs/README.md` and
+  `docs/npa-toolchain-reference-v0.2.0.md`.
+- Crate-local specification snapshot used by tests:
+  `testdata/docs/npa-spec.md`.
+- For implemented kernel / certificate / frontend / tactic / API / package
+  behavior, inspect the relevant crate source and focused tests.
 
 ## Rust Kernel Design Rules
 
@@ -80,8 +79,9 @@ and the documents for the relevant subsystem.
 
 ## Test Policy
 
-In normal development, use the fast core gate first. The proof corpus lives in
-the sibling `../npa-corpus` repository and has its own corpus gates.
+In normal development, use the fast core gate first. `npa-core` must remain
+self-contained: its local tests and gates use in-repository code plus compact
+snapshots under `testdata/`, not sibling NPA repository checkouts.
 
 ```sh
 ./scripts/check-fast.sh
@@ -138,9 +138,9 @@ Rust builds/tests, prefer package- or test-specific commands and use
 multiple Codex threads are involved, reduce concurrency before rerunning
 expensive checks.
 
-For proof-corpus theorem work, change into `../npa-corpus` and follow that
-repository's README / AGENTS guidance. Keep corpus package/full gates out of
-this core repository's normal hot path.
+For package/verifier changes that touch checked fixture behavior, run focused
+tests and local package checks against `testdata/package/proofs`. Keep full
+theorem-corpus workflows out of this core repository's hot path.
 
 Around the kernel, add at least the following cases.
 
@@ -154,8 +154,9 @@ Around the kernel, add at least the following cases.
 ## Notes When Changing Files
 
 - Do not revert unrelated design documents or user changes.
-- For changes that cross subsystem responsibilities, also update the README or
-  `../npa/develop/npa-spec.md`.
+- For changes that cross subsystem responsibilities, also update the README,
+  docs under `docs/`, or the crate-local specification snapshot in
+  `testdata/docs/npa-spec.md` when those files describe the changed contract.
 - If existing debug options are insufficient, add documentation that states
   which debug options are missing and why they are needed.
 - For changes that expand the kernel trusted base, always document the reason,
@@ -163,4 +164,5 @@ Around the kernel, add at least the following cases.
 - In the standard library, do not rely on `sorry`-equivalent behavior or
   unauthorized axioms.
 - Do not add unresolved conjectures to standard-library theorem declarations.
-  Proof-corpus conjecture policy is maintained in `../npa-corpus`.
+  `npa-core` keeps only compact regression fixtures, not proof-corpus authoring
+  policy.

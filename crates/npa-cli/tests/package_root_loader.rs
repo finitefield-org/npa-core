@@ -40,7 +40,8 @@ impl Drop for TestDir {
 
 #[test]
 fn package_root_loader_loads_checked_in_proof_package_manifest() {
-    let loaded = load_package_root(repo_root().join("proofs"), "package check").unwrap();
+    let loaded =
+        load_package_root(repo_root().join("testdata/package/proofs"), "package check").unwrap();
 
     assert_eq!(loaded.root_display, "<absolute-root>");
     assert_eq!(loaded.manifest_path.as_str(), PACKAGE_MANIFEST_PATH);

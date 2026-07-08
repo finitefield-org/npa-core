@@ -1,13 +1,13 @@
 # npa-checker-ext
 
 `npa-checker-ext` is the clean-room OCaml external checker prototype for NPA
-high-trust release workflows. It is intentionally outside the Cargo workspace
-and has no Rust crate dependency.
+high-trust release checks. It is intentionally outside the Cargo workspace and
+has no Rust crate dependency.
 
 This checker is not part of the default public package-author path. Base
-external package CI remains reference-checker-only, with an optional labeled
-fast-kernel verifier result. External checker evidence is optional high-trust
-release evidence only when the release workflow supplies pinned checker
+external package verification remains reference-checker-only, with an optional
+labeled fast-kernel verifier result. External checker evidence is optional
+high-trust release evidence only when the release check supplies pinned checker
 binaries, runner policy, checker registry, release policy, and release audit
 evidence.
 
@@ -41,15 +41,13 @@ plugins
 source-derived unchecked environments
 ```
 
-GitHub Actions status, release pages, registry metadata, benchmark rows, and
-uploaded artifacts are review or release metadata. They are not proof evidence
-by themselves.
+Release pages, registry metadata, benchmark rows, and uploaded artifacts are
+review or release metadata. They are not proof evidence by themselves.
 
 ## High-Trust Use
 
-Use this checker only through an explicit high-trust release workflow such as
-`ci-templates/github-actions/npa-package-high-trust.yml`. That workflow must
-provide all of these inputs before external checker commands run:
+Use this checker only through an explicit high-trust release check. That check
+must provide all of these inputs before external checker commands run:
 
 ```text
 NPA_CHECKER_EXT_BINARY_PATH
@@ -160,7 +158,6 @@ scripts/test.sh positivity
 scripts/test.sh recursor
 ```
 
-The tests are local checker development tests. External theorem package CI
-should use the package workflows documented in
-`docs/external-theorem-library-ci.md` instead of copying these development
-commands.
+The tests are local checker development tests. External theorem packages should
+use `npa package ...` commands against their own package root instead of
+copying these development commands.

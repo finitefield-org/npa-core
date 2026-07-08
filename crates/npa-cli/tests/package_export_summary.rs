@@ -169,7 +169,7 @@ fn package_export_summary_custom_out_is_package_relative() {
 
 #[test]
 fn package_export_summary_proof_corpus_check_mode_succeeds_with_checked_in_artifact() {
-    let root = repo_root().join("proofs");
+    let root = repo_root().join("testdata/package/proofs");
     let summary_path = root.join(PACKAGE_VERIFIED_EXPORT_SUMMARY_PATH);
     let before_summary = fs::read(&summary_path).unwrap();
 
@@ -245,8 +245,12 @@ fn source_free_fixture(label: &str) -> TestPackage {
         package.artifact_path(PACKAGE_MANIFEST_PATH),
         &manifest_source,
     );
-    let certificate_bytes =
-        fs::read(repo_root().join("proofs").join(BASIC_CERTIFICATE_PATH)).unwrap();
+    let certificate_bytes = fs::read(
+        repo_root()
+            .join("testdata/package/proofs")
+            .join(BASIC_CERTIFICATE_PATH),
+    )
+    .unwrap();
     write_bytes(
         package.artifact_path(BASIC_CERTIFICATE_PATH),
         certificate_bytes.as_slice(),

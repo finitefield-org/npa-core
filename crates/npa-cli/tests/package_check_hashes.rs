@@ -54,7 +54,12 @@ impl Drop for TestPackage {
 fn package_check_hashes_succeeds_on_proof_corpus_fixture() {
     let output = Command::new(env!("CARGO_BIN_EXE_npa"))
         .current_dir(repo_root())
-        .args(["package", "check-hashes", "--root", "proofs"])
+        .args([
+            "package",
+            "check-hashes",
+            "--root",
+            "testdata/package/proofs",
+        ])
         .output()
         .unwrap();
 
@@ -70,7 +75,13 @@ fn package_check_hashes_succeeds_on_proof_corpus_fixture() {
 fn package_check_hashes_succeeds_on_proof_corpus_fixture_json() {
     let output = Command::new(env!("CARGO_BIN_EXE_npa"))
         .current_dir(repo_root())
-        .args(["package", "check-hashes", "--root", "proofs", "--json"])
+        .args([
+            "package",
+            "check-hashes",
+            "--root",
+            "testdata/package/proofs",
+            "--json",
+        ])
         .output()
         .unwrap();
 
@@ -78,7 +89,7 @@ fn package_check_hashes_succeeds_on_proof_corpus_fixture_json() {
     assert!(output.stderr.is_empty());
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
-        "{\"schema\":\"npa.package.command_result.v0.1\",\"command\":\"package check-hashes\",\"root\":\"proofs\",\"status\":\"passed\",\"diagnostics\":[],\"artifacts\":[]}\n"
+        "{\"schema\":\"npa.package.command_result.v0.1\",\"command\":\"package check-hashes\",\"root\":\"testdata/package/proofs\",\"status\":\"passed\",\"diagnostics\":[],\"artifacts\":[]}\n"
     );
 }
 
@@ -106,7 +117,10 @@ fn package_check_hashes_rejects_stale_local_certificate_file_hash() {
     let package = build_minimal_fixture("stale-local-cert", false);
     fs::write(
         package.artifact_path("Proofs/Ai/Basic/certificate.npcert"),
-        fs::read(repo_root().join("proofs/Proofs/Ai/EqReasoning/certificate.npcert")).unwrap(),
+        fs::read(
+            repo_root().join("testdata/package/proofs/Proofs/Ai/EqReasoning/certificate.npcert"),
+        )
+        .unwrap(),
     )
     .unwrap();
 
@@ -413,7 +427,7 @@ fn module_imports_array(module: &PackageModule) -> String {
 }
 
 fn copy_artifact(package: &TestPackage, relative: &str) {
-    let source = repo_root().join("proofs").join(relative);
+    let source = repo_root().join("testdata/package/proofs").join(relative);
     let target = package.artifact_path(relative);
     fs::create_dir_all(target.parent().unwrap()).unwrap();
     fs::copy(source, target).unwrap();
@@ -458,7 +472,8 @@ fn refresh_expected_certificate_file_hash(package: &TestPackage, certificate: &P
 }
 
 fn proof_manifest() -> npa_package::ValidatedPackageManifest {
-    let source = fs::read_to_string(repo_root().join("proofs/npa-package.toml")).unwrap();
+    let source =
+        fs::read_to_string(repo_root().join("testdata/package/proofs/npa-package.toml")).unwrap();
     parse_and_validate_manifest_str(&source).unwrap()
 }
 

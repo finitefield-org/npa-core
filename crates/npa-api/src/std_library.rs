@@ -10868,7 +10868,7 @@ mod tests {
     #[test]
     fn docs_pin_human_ai_stdlib_release_contracts() {
         let readme = include_str!(concat!("../../../", "README.md"));
-        let spec = include_str!(concat!("../../../../npa/develop/", "npa-spec.md"));
+        let spec = include_str!(concat!("../../../testdata/docs/", "npa-spec.md"));
 
         for module in ["Std.Logic", "Std.Nat", "Std.List", "Std.Algebra.Basic"] {
             assert_doc_contains(readme, module);

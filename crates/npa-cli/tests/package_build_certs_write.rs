@@ -340,7 +340,7 @@ fn write_std_logic_eq_external_import(
 ) -> (ManifestImport, VerifiedModule, HumanImportedSourceInterface) {
     let certificate_path = "vendor/npa-std/Std/Logic/Eq/certificate.npcert";
     let bytes =
-        fs::read(repo_root().join("../npa/fixtures/npa-std/Std/Logic/Eq/certificate.npcert"))
+        fs::read(repo_root().join("testdata/package/npa-std/Std/Logic/Eq/certificate.npcert"))
             .unwrap();
     write_artifact(package, certificate_path, &bytes);
 
@@ -520,7 +520,7 @@ fn write_artifact(package: &TestPackage, relative: &str, bytes: &[u8]) {
 }
 
 fn replacement_certificate_bytes() -> Vec<u8> {
-    fs::read(repo_root().join("../npa/fixtures/npa-std/Std/Nat/Basic/certificate.npcert")).unwrap()
+    fs::read(repo_root().join("testdata/package/npa-std/Std/Nat/Basic/certificate.npcert")).unwrap()
 }
 
 fn repo_root() -> PathBuf {

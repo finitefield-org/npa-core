@@ -1127,17 +1127,17 @@ mod tests {
             .expect("npa-api crate lives under crates/")
             .parent()
             .expect("crates/ lives under the npa repository")
-            .join("../npa-corpus")
+            .join("testdata/package")
     }
 
     fn sketch_lifecycle_certificate() -> Vec<u8> {
         fs::read(corpus_root().join("proofs/Proofs/Ai/SketchLifecycle/certificate.npcert"))
-            .expect("SketchLifecycle certificate should exist in ../npa-corpus")
+            .expect("SketchLifecycle certificate should exist in testdata/package")
     }
 
     fn sketch_lifecycle_replay() -> String {
         fs::read_to_string(corpus_root().join("proofs/Proofs/Ai/SketchLifecycle/replay.json"))
-            .expect("SketchLifecycle replay should exist in ../npa-corpus")
+            .expect("SketchLifecycle replay should exist in testdata/package")
     }
 
     fn hash(byte: u8) -> Hash {

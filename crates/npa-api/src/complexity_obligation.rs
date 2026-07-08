@@ -1401,7 +1401,7 @@ mod tests {
             .expect("npa-api is under crates")
             .parent()
             .expect("crates is under repo root")
-            .join("../npa/develop/proof-using-agents/fixtures/pua-m16-complexity-obligation")
+            .join("testdata/proof-using-agents/fixtures/pua-m16-complexity-obligation")
             .join(name)
     }
 
@@ -1426,7 +1426,7 @@ mod tests {
             .expect("npa-api is under crates")
             .parent()
             .expect("crates is under repo root")
-            .join("../npa/develop/proof-using-agents/fixtures/pua-m16-cook-levin")
+            .join("testdata/proof-using-agents/fixtures/pua-m16-cook-levin")
             .join(name)
     }
 

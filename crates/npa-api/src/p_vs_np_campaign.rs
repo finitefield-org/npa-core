@@ -14,9 +14,9 @@ use std::path::{Path, PathBuf};
 
 const CAMPAIGN_FIXTURE_API_VERSION: &str = "npa.p-vs-np-campaign-fixture.v1";
 const CAMPAIGN_FIXTURE_PATH: &str =
-    "../npa/develop/proof-using-agents/fixtures/pua-m16-campaign/p-vs-np-campaign-fixture.json";
+    "testdata/proof-using-agents/fixtures/pua-m16-campaign/p-vs-np-campaign-fixture.json";
 const CAMPAIGN_NEGATIVE_FIXTURE_PATH: &str =
-    "../npa/develop/proof-using-agents/fixtures/pua-m16-campaign/top-level-resolution-without-prerequisites.json";
+    "testdata/proof-using-agents/fixtures/pua-m16-campaign/top-level-resolution-without-prerequisites.json";
 
 #[test]
 fn p_vs_np_campaign_fixture() {
@@ -494,7 +494,7 @@ fn repo_path(path: &str) -> PathBuf {
         return local_path;
     }
     if path.starts_with("develop/") {
-        return root.join("../npa").join(path);
+        return root.join("../npa-core").join(path);
     }
     local_path
 }

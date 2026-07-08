@@ -34,7 +34,7 @@ fn workspace_root() -> PathBuf {
 }
 
 fn acceptance_negative_fixture_dir() -> PathBuf {
-    workspace_root().join("../npa/develop/proof-using-agents/fixtures/acceptance-negative")
+    workspace_root().join("testdata/proof-using-agents/fixtures/acceptance-negative")
 }
 
 fn fixture_for(kind: ProofAcceptanceNegativeFixtureKind) -> ProofAcceptanceNegativeFixture {

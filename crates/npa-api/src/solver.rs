@@ -16714,7 +16714,7 @@ mod tests {
     #[test]
     fn solver_fixture_matrix_covers_source_free_replay_metrics_and_negative_acceptance() {
         let matrix = include_str!(
-            "../../../../npa/develop/proof-using-agents/fixtures/pua-m09-solver-fixture-matrix.json"
+            "../../../testdata/proof-using-agents/fixtures/pua-m09-solver-fixture-matrix.json"
         );
         assert_matrix_string(
             matrix,

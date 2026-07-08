@@ -9320,7 +9320,7 @@ mod tests {
     #[test]
     fn repair_operator_schema_lists_all_variants_and_trust_rejections() {
         let schema = include_str!(
-            "../../../../npa/develop/proof-using-agents/schemas/repair_operator.schema.json"
+            "../../../testdata/proof-using-agents/schemas/repair_operator.schema.json"
         );
         for variant in [
             "ReverseRewrite",
@@ -9877,9 +9877,8 @@ mod tests {
 
     #[test]
     fn failure_memory_schema_lists_identity_fields_and_trust_rejections() {
-        let schema = include_str!(
-            "../../../../npa/develop/proof-using-agents/schemas/failure_memory.schema.json"
-        );
+        let schema =
+            include_str!("../../../testdata/proof-using-agents/schemas/failure_memory.schema.json");
         crate::json::JsonDocument::parse(schema).expect("failure memory schema should parse");
         for required in [
             "failure_memory",
@@ -9915,7 +9914,7 @@ mod tests {
     #[test]
     fn minimal_failing_artifact_schema_and_identity_are_deterministic() {
         let schema = include_str!(
-            "../../../../npa/develop/proof-using-agents/schemas/minimal_failing_artifact.schema.json"
+            "../../../testdata/proof-using-agents/schemas/minimal_failing_artifact.schema.json"
         );
         crate::json::JsonDocument::parse(schema)
             .expect("minimal failing artifact schema should parse");
