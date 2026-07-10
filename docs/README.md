@@ -37,6 +37,10 @@ reports.
 - [Package Refactor Plan Command Design](refactor-plan-command-design.md):
   design record for the implemented read-only CLI command that ranks module and
   theorem-family refactor candidates from package metadata.
+- [Package Artifact Refresh Command Design](package-artifact-refresh-command-design.md):
+  design and implementation record for the package artifact refresh mode that
+  rebuilds local certificates, updates local manifest hash pins, and
+  regenerates the package lock without weakening import identity checks.
 
 ## Verify A Package
 

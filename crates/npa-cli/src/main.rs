@@ -1,11 +1,17 @@
 use std::process::ExitCode;
 
+use npa_cli::agent_adapter::{
+    is_agent_adapter_invocation, run_agent_adapter_process, AgentAdapterExecutable,
+};
 use npa_cli::args::{parse_cli_args, render_help, CliAction};
 use npa_cli::diagnostic::CommandResult;
 use npa_cli::package::run_package_command;
 
 fn main() -> ExitCode {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
+    if is_agent_adapter_invocation(&args) {
+        return run_agent_adapter_process(AgentAdapterExecutable::Npa);
+    }
     let wants_json = args.iter().any(|arg| arg == "--json");
     match parse_cli_args(args) {
         Ok(CliAction::Help(topic)) => {

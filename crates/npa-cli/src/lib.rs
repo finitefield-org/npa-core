@@ -6,6 +6,7 @@
 //! argument parsing only; later milestones add package loading and command
 //! execution behind the parsed command model.
 
+pub mod agent_adapter;
 pub mod args;
 pub mod diagnostic;
 pub mod fs;
@@ -20,6 +21,7 @@ pub mod package_gate_plan;
 pub mod package_hashes;
 pub mod package_high_trust;
 pub mod package_index;
+pub mod package_lock;
 pub mod package_publish;
 pub mod package_refactor_plan;
 pub mod package_verify;

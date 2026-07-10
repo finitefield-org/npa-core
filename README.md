@@ -100,6 +100,22 @@ run:
 npa package publish-plan --root . --check --json
 ```
 
+When intentionally refreshing local package artifacts after source changes,
+use the supported local hash-pin refresh path:
+
+```sh
+npa package build-certs --root . --update-manifest-hashes --check --json
+npa package build-certs --root . --update-manifest-hashes --json
+npa package check-hashes --root . --json
+npa package verify-certs --root . --checker reference --json
+```
+
+The `--check` form is a no-write dry run. Write mode updates only local
+certificate files, local module hash pins in `npa-package.toml`, and
+`generated/package-lock.json`. It does not update external import pins, and it
+is artifact maintenance rather than proof evidence; source-free checker
+verification remains required.
+
 For advisory refactor planning from package metadata, use:
 
 ```sh

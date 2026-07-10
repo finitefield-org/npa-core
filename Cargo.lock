@@ -130,6 +130,7 @@ dependencies = [
  "npa-cert",
  "npa-frontend",
  "npa-package",
+ "toml_edit",
 ]
 
 [[package]]

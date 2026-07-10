@@ -3,8 +3,8 @@ use std::process::Command;
 
 use npa_cli::args::{
     parse_cli_args, render_help, CliAction, CliCommand, HelpTopic, PackageAuditCacheMode,
-    PackageBuildCheckCacheMode, PackageChecker, PackageCommand, PackageRefactorPlanScope,
-    PackageTimingMode, PackageVerifierMemoMode, UsageReason,
+    PackageBuildCheckCacheMode, PackageChecker, PackageCommand, PackageLockCommand,
+    PackageRefactorPlanScope, PackageTimingMode, PackageVerifierMemoMode, UsageReason,
 };
 use npa_cli::diagnostic::{CommandStatus, DiagnosticKind};
 use npa_cli::package::run_package_command;
@@ -37,6 +37,70 @@ fn package_cli_args_parses_common_root_and_json_flags() {
     };
     assert_eq!(options.root, PathBuf::from("proofs"));
     assert!(options.json);
+}
+
+#[test]
+fn package_lock_cli_args_parse_check_write_root_and_json() {
+    let action = parse(&["package", "lock", "check", "--root", "proofs", "--json"]);
+
+    let CliAction::Run(CliCommand::Package(PackageCommand::Lock(PackageLockCommand::Check(
+        options,
+    )))) = action
+    else {
+        panic!("expected package lock check command");
+    };
+    assert_eq!(options.root, PathBuf::from("proofs"));
+    assert!(options.json);
+
+    let action = parse(&["package", "lock", "write", "--root=proofs", "--json"]);
+
+    let CliAction::Run(CliCommand::Package(PackageCommand::Lock(PackageLockCommand::Write(
+        options,
+    )))) = action
+    else {
+        panic!("expected package lock write command");
+    };
+    assert_eq!(options.root, PathBuf::from("proofs"));
+    assert!(options.json);
+}
+
+#[test]
+fn package_lock_cli_args_reject_missing_subcommand_and_unknown_flag() {
+    let missing = parse_error(&["package", "lock"]);
+    assert_eq!(missing.reason, UsageReason::UnknownCommand);
+    assert_eq!(missing.command.as_deref(), Some("package lock"));
+
+    let unknown_flag = parse_error(&["package", "lock", "--json"]);
+    assert_eq!(unknown_flag.reason, UsageReason::UnknownFlag);
+    assert_eq!(unknown_flag.command.as_deref(), Some("package lock"));
+    assert_eq!(unknown_flag.flag.as_deref(), Some("--json"));
+
+    let unknown_subcommand = parse_error(&["package", "lock", "repair"]);
+    assert_eq!(unknown_subcommand.reason, UsageReason::UnknownCommand);
+    assert_eq!(
+        unknown_subcommand.command.as_deref(),
+        Some("package lock repair")
+    );
+}
+
+#[test]
+fn package_lock_cli_args_common_errors_use_nested_command_name() {
+    let duplicate = parse_error(&[
+        "package",
+        "lock",
+        "check",
+        "--root",
+        "proofs",
+        "--root=other",
+    ]);
+    assert_eq!(duplicate.reason, UsageReason::DuplicateFlag);
+    assert_eq!(duplicate.command.as_deref(), Some("package lock check"));
+    assert_eq!(duplicate.flag.as_deref(), Some("--root"));
+
+    let unknown = parse_error(&["package", "lock", "write", "--bogus"]);
+    assert_eq!(unknown.reason, UsageReason::UnknownFlag);
+    assert_eq!(unknown.command.as_deref(), Some("package lock write"));
+    assert_eq!(unknown.flag.as_deref(), Some("--bogus"));
 }
 
 #[test]
@@ -286,6 +350,7 @@ fn package_cli_args_parses_build_certs_check_mode() {
     assert!(options.common.json);
     assert!(options.check);
     assert_eq!(options.build_check_cache, PackageBuildCheckCacheMode::Off);
+    assert!(!options.update_manifest_hashes);
 }
 
 #[test]
@@ -308,6 +373,7 @@ fn package_cli_args_parses_build_certs_build_check_cache_read_through() {
         options.build_check_cache,
         PackageBuildCheckCacheMode::ReadThrough
     );
+    assert!(!options.update_manifest_hashes);
 
     let action = parse(&[
         "package",
@@ -319,6 +385,40 @@ fn package_cli_args_parses_build_certs_build_check_cache_read_through() {
         panic!("expected package build-certs command");
     };
     assert_eq!(options.build_check_cache, PackageBuildCheckCacheMode::Off);
+    assert!(!options.update_manifest_hashes);
+}
+
+#[test]
+fn package_cli_args_parses_build_certs_update_manifest_hashes() {
+    let action = parse(&[
+        "package",
+        "build-certs",
+        "--root=proofs",
+        "--json",
+        "--update-manifest-hashes",
+    ]);
+
+    let CliAction::Run(CliCommand::Package(PackageCommand::BuildCerts(options))) = action else {
+        panic!("expected package build-certs command");
+    };
+    assert_eq!(options.common.root, PathBuf::from("proofs"));
+    assert!(options.common.json);
+    assert!(!options.check);
+    assert_eq!(options.build_check_cache, PackageBuildCheckCacheMode::Off);
+    assert!(options.update_manifest_hashes);
+
+    let action = parse(&[
+        "package",
+        "build-certs",
+        "--check",
+        "--update-manifest-hashes",
+    ]);
+    let CliAction::Run(CliCommand::Package(PackageCommand::BuildCerts(options))) = action else {
+        panic!("expected package build-certs command");
+    };
+    assert!(options.check);
+    assert_eq!(options.build_check_cache, PackageBuildCheckCacheMode::Off);
+    assert!(options.update_manifest_hashes);
 }
 
 #[test]
@@ -353,6 +453,82 @@ fn package_cli_args_rejects_build_certs_build_check_cache_duplicate_unknown_and_
     assert_eq!(write_mode.reason, UsageReason::UnsupportedFlag);
     assert_eq!(write_mode.flag.as_deref(), Some("--build-check-cache"));
     assert_eq!(write_mode.value.as_deref(), Some("read-through"));
+}
+
+#[test]
+fn package_cli_args_rejects_build_certs_update_manifest_hashes_misuse() {
+    let duplicate = parse_error(&[
+        "package",
+        "build-certs",
+        "--update-manifest-hashes",
+        "--update-manifest-hashes",
+    ]);
+    assert_eq!(duplicate.reason, UsageReason::DuplicateFlag);
+    assert_eq!(duplicate.command.as_deref(), Some("package build-certs"));
+    assert_eq!(duplicate.flag.as_deref(), Some("--update-manifest-hashes"));
+
+    let value_form = parse_error(&["package", "build-certs", "--update-manifest-hashes=true"]);
+    assert_eq!(value_form.reason, UsageReason::UnsupportedFlag);
+    assert_eq!(value_form.command.as_deref(), Some("package build-certs"));
+    assert_eq!(value_form.flag.as_deref(), Some("--update-manifest-hashes"));
+    assert_eq!(value_form.value.as_deref(), Some("true"));
+
+    let read_through = parse_error(&[
+        "package",
+        "build-certs",
+        "--check",
+        "--update-manifest-hashes",
+        "--build-check-cache",
+        "read-through",
+    ]);
+    assert_eq!(read_through.reason, UsageReason::UnsupportedFlag);
+    assert_eq!(read_through.command.as_deref(), Some("package build-certs"));
+    assert_eq!(read_through.flag.as_deref(), Some("--build-check-cache"));
+    assert_eq!(read_through.value.as_deref(), Some("read-through"));
+
+    let write_read_through = parse_error(&[
+        "package",
+        "build-certs",
+        "--update-manifest-hashes",
+        "--build-check-cache",
+        "read-through",
+    ]);
+    assert_eq!(write_read_through.reason, UsageReason::UnsupportedFlag);
+    assert_eq!(
+        write_read_through.command.as_deref(),
+        Some("package build-certs")
+    );
+    assert_eq!(
+        write_read_through.flag.as_deref(),
+        Some("--build-check-cache")
+    );
+    assert_eq!(write_read_through.value.as_deref(), Some("read-through"));
+}
+
+#[test]
+fn package_cli_args_build_certs_update_manifest_hashes_runtime_loads_package_root() {
+    let action = parse(&[
+        "package",
+        "build-certs",
+        "--root",
+        "missing-package",
+        "--update-manifest-hashes",
+    ]);
+    let CliAction::Run(CliCommand::Package(command)) = action else {
+        panic!("expected package build-certs command");
+    };
+
+    let result = run_package_command(command);
+    assert_eq!(result.command, "package build-certs");
+    assert_eq!(result.root, "missing-package");
+    assert_eq!(result.status, CommandStatus::Failed);
+    assert_eq!(result.diagnostics.len(), 1);
+    assert_eq!(result.diagnostics[0].kind, DiagnosticKind::PackageManifest);
+    assert_eq!(result.diagnostics[0].reason_code, "manifest_missing");
+    assert_eq!(
+        result.diagnostics[0].path.as_deref(),
+        Some("npa-package.toml")
+    );
 }
 
 #[test]
@@ -1108,8 +1284,24 @@ fn package_cli_args_parses_help_topics() {
         CliAction::Help(HelpTopic::PackageCheck)
     );
     assert_eq!(
+        parse(&["package", "build-certs", "--help"]),
+        CliAction::Help(HelpTopic::PackageBuildCerts)
+    );
+    assert_eq!(
         parse(&["package", "verify-certs", "--help"]),
         CliAction::Help(HelpTopic::PackageVerifyCerts)
+    );
+    assert_eq!(
+        parse(&["package", "lock", "--help"]),
+        CliAction::Help(HelpTopic::PackageLock)
+    );
+    assert_eq!(
+        parse(&["package", "lock", "check", "--help"]),
+        CliAction::Help(HelpTopic::PackageLockCheck)
+    );
+    assert_eq!(
+        parse(&["package", "lock", "write", "--help"]),
+        CliAction::Help(HelpTopic::PackageLockWrite)
     );
     assert_eq!(
         parse(&["package", "axiom-report", "--help"]),
@@ -1131,6 +1323,15 @@ fn package_cli_args_parses_help_topics() {
         parse(&["package", "refactor-plan", "--help"]),
         CliAction::Help(HelpTopic::PackageRefactorPlan)
     );
+}
+
+#[test]
+fn package_build_certs_help_documents_update_manifest_hashes() {
+    let help = render_help(HelpTopic::PackageBuildCerts);
+
+    assert!(help.contains("[--update-manifest-hashes]"));
+    assert!(help.contains("refreshes local module hash pins"));
+    assert!(help.contains("incompatible with --build-check-cache read-through"));
 }
 
 #[test]

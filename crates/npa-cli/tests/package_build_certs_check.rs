@@ -5,11 +5,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 use npa_cert::{AxiomPolicy, Name, VerifiedModule};
-use npa_cli::args::{PackageBuildCheckCacheMode, PackageCommonOptions};
+use npa_cli::args::{PackageBuildCertsOptions, PackageBuildCheckCacheMode, PackageCommonOptions};
 use npa_cli::diagnostic::{CommandExitCode, CommandResult, DiagnosticKind};
 use npa_cli::package::PACKAGE_MANIFEST_PATH;
 use npa_cli::package_build::{
-    run_package_build_certs_check, run_package_build_certs_check_with_cache,
+    run_package_build_certs, run_package_build_certs_check,
+    run_package_build_certs_check_with_cache,
 };
 use npa_frontend::{
     compile_human_source_to_certificate_output_with_source_interfaces_and_axiom_policy, FileId,
@@ -97,6 +98,204 @@ fn package_build_certs_check_succeeds_and_writes_no_files() {
     assert!(result.diagnostics.is_empty());
     assert_eq!(fs::read(certificate_path).unwrap(), certificate_before);
     assert_eq!(fs::read(lock_path).unwrap(), lock_before);
+}
+
+#[test]
+fn package_build_certs_refresh_check_succeeds_and_writes_no_files() {
+    let package = build_minimal_fixture("refresh-check-fresh");
+    let manifest_path = package.artifact_path(PACKAGE_MANIFEST_PATH);
+    let certificate_path = package.artifact_path("Proofs/Ai/Basic/certificate.npcert");
+    let lock_path = package.artifact_path(LOCK_PATH);
+    let manifest_before = fs::read_to_string(&manifest_path).unwrap();
+    let certificate_before = fs::read(&certificate_path).unwrap();
+    let lock_before = fs::read(&lock_path).unwrap();
+
+    let result = run_refresh_check(&package);
+
+    assert_eq!(result.exit_code(), CommandExitCode::Success);
+    assert!(result.diagnostics.is_empty());
+    assert_eq!(fs::read_to_string(manifest_path).unwrap(), manifest_before);
+    assert_eq!(fs::read(certificate_path).unwrap(), certificate_before);
+    assert_eq!(fs::read(lock_path).unwrap(), lock_before);
+}
+
+#[test]
+fn package_build_certs_refresh_check_accepts_empty_modules_array() {
+    let package = build_empty_modules_array_fixture("refresh-empty-modules-array");
+    let manifest_path = package.artifact_path(PACKAGE_MANIFEST_PATH);
+    let lock_path = package.artifact_path(LOCK_PATH);
+    let manifest_before = fs::read_to_string(&manifest_path).unwrap();
+    let lock_before = fs::read(&lock_path).unwrap();
+
+    let result = run_refresh_check(&package);
+
+    assert_eq!(result.exit_code(), CommandExitCode::Success);
+    assert!(result.diagnostics.is_empty());
+    assert_eq!(fs::read_to_string(manifest_path).unwrap(), manifest_before);
+    assert_eq!(fs::read(lock_path).unwrap(), lock_before);
+}
+
+#[test]
+fn package_build_certs_refresh_check_accepts_inline_module_array() {
+    let package = build_inline_module_array_fixture("refresh-inline-module-array");
+    let manifest_path = package.artifact_path(PACKAGE_MANIFEST_PATH);
+    let certificate_path = package.artifact_path("Proofs/Ai/Basic/certificate.npcert");
+    let lock_path = package.artifact_path(LOCK_PATH);
+    let manifest_before = fs::read_to_string(&manifest_path).unwrap();
+    let certificate_before = fs::read(&certificate_path).unwrap();
+    let lock_before = fs::read(&lock_path).unwrap();
+
+    let result = run_refresh_check(&package);
+
+    assert_eq!(result.exit_code(), CommandExitCode::Success);
+    assert!(result.diagnostics.is_empty());
+    assert_eq!(fs::read_to_string(manifest_path).unwrap(), manifest_before);
+    assert_eq!(fs::read(certificate_path).unwrap(), certificate_before);
+    assert_eq!(fs::read(lock_path).unwrap(), lock_before);
+}
+
+#[test]
+fn package_build_certs_refresh_check_rewrites_stale_source_hash_in_memory_without_writes() {
+    let package = build_minimal_fixture("refresh-check-stale-source");
+    replace_manifest_hash(
+        &package,
+        "expected_source_hash = \"",
+        "expected_source_hash = \"",
+        ZERO_HASH,
+    );
+    let manifest_path = package.artifact_path(PACKAGE_MANIFEST_PATH);
+    let certificate_path = package.artifact_path("Proofs/Ai/Basic/certificate.npcert");
+    let lock_path = package.artifact_path(LOCK_PATH);
+    let manifest_before = fs::read_to_string(&manifest_path).unwrap();
+    let certificate_before = fs::read(&certificate_path).unwrap();
+    let lock_before = fs::read(&lock_path).unwrap();
+
+    let result = run_refresh_check(&package);
+
+    assert_eq!(result.exit_code(), CommandExitCode::PackageFailure);
+    assert_eq!(result.diagnostics.len(), 1);
+    assert_eq!(result.diagnostics[0].kind, DiagnosticKind::HashMismatch);
+    assert_eq!(result.diagnostics[0].reason_code, "manifest_hashes_stale");
+    assert_eq!(
+        result.diagnostics[0].path.as_deref(),
+        Some(PACKAGE_MANIFEST_PATH)
+    );
+    assert!(result.diagnostics[0].expected_hash.is_some());
+    assert!(result.diagnostics[0].actual_hash.is_some());
+    let json = result.render_json();
+    assert!(json.contains("\"reason_code\":\"manifest_hashes_stale\""));
+    assert!(json.contains("\"path\":\"npa-package.toml\""));
+    assert!(json.contains("\"artifacts\":[]"));
+    assert_eq!(fs::read_to_string(manifest_path).unwrap(), manifest_before);
+    assert_eq!(fs::read(certificate_path).unwrap(), certificate_before);
+    assert_eq!(fs::read(lock_path).unwrap(), lock_before);
+}
+
+#[test]
+fn package_build_certs_refresh_check_rejects_checked_in_certificate_byte_drift() {
+    let package = build_minimal_fixture("refresh-byte-drift");
+    let manifest_path = package.artifact_path(PACKAGE_MANIFEST_PATH);
+    let certificate_path = package.artifact_path("Proofs/Ai/Basic/certificate.npcert");
+    let lock_path = package.artifact_path(LOCK_PATH);
+    let manifest_before = fs::read_to_string(&manifest_path).unwrap();
+    let lock_before = fs::read(&lock_path).unwrap();
+    fs::write(
+        &certificate_path,
+        fs::read(repo_root().join("testdata/package/proofs/Proofs/Ai/Prop/certificate.npcert"))
+            .unwrap(),
+    )
+    .unwrap();
+    let certificate_before = fs::read(&certificate_path).unwrap();
+
+    let result = run_refresh_check(&package);
+
+    assert_failure(
+        &result,
+        DiagnosticKind::Build,
+        "build_certificate_changed",
+        Some("Proofs/Ai/Basic/certificate.npcert"),
+        None,
+    );
+    assert_eq!(fs::read_to_string(manifest_path).unwrap(), manifest_before);
+    assert_eq!(fs::read(certificate_path).unwrap(), certificate_before);
+    assert_eq!(fs::read(lock_path).unwrap(), lock_before);
+}
+
+#[test]
+fn package_build_certs_refresh_check_rejects_missing_package_lock() {
+    let package = build_minimal_fixture("refresh-missing-lock");
+    let manifest_path = package.artifact_path(PACKAGE_MANIFEST_PATH);
+    let certificate_path = package.artifact_path("Proofs/Ai/Basic/certificate.npcert");
+    let lock_path = package.artifact_path(LOCK_PATH);
+    let manifest_before = fs::read_to_string(&manifest_path).unwrap();
+    let certificate_before = fs::read(&certificate_path).unwrap();
+    fs::remove_file(&lock_path).unwrap();
+
+    let result = run_refresh_check(&package);
+
+    assert_failure(
+        &result,
+        DiagnosticKind::PackageLock,
+        "package_lock_missing",
+        Some(LOCK_PATH),
+        None,
+    );
+    assert_eq!(fs::read_to_string(manifest_path).unwrap(), manifest_before);
+    assert_eq!(fs::read(certificate_path).unwrap(), certificate_before);
+    assert!(!lock_path.exists());
+}
+
+#[test]
+fn package_build_certs_check_refresh_rejects_missing_certificate_without_writes() {
+    let package = build_minimal_fixture("refresh-missing-certificate");
+    let manifest_path = package.artifact_path(PACKAGE_MANIFEST_PATH);
+    let certificate_path = package.artifact_path("Proofs/Ai/Basic/certificate.npcert");
+    let lock_path = package.artifact_path(LOCK_PATH);
+    let manifest_before = fs::read_to_string(&manifest_path).unwrap();
+    let lock_before = fs::read(&lock_path).unwrap();
+    fs::remove_file(&certificate_path).unwrap();
+
+    let result = run_refresh_check(&package);
+
+    assert_failure(
+        &result,
+        DiagnosticKind::ArtifactIo,
+        "certificate_missing",
+        Some("Proofs/Ai/Basic/certificate.npcert"),
+        None,
+    );
+    assert_eq!(fs::read_to_string(manifest_path).unwrap(), manifest_before);
+    assert!(!certificate_path.exists());
+    assert_eq!(fs::read(lock_path).unwrap(), lock_before);
+}
+
+#[test]
+fn package_build_certs_refresh_check_rejects_protected_certificate_targets() {
+    let package = build_minimal_fixture("refresh-check-target");
+    let manifest_path = package.artifact_path(PACKAGE_MANIFEST_PATH);
+    let original_manifest = fs::read_to_string(&manifest_path).unwrap();
+    let rewritten_manifest = original_manifest.replace(
+        r#"certificate = "Proofs/Ai/Basic/certificate.npcert""#,
+        r#"certificate = "npa-package.toml""#,
+    );
+    fs::write(&manifest_path, &rewritten_manifest).unwrap();
+    let certificate_path = package.artifact_path("Proofs/Ai/Basic/certificate.npcert");
+    let certificate_before = fs::read(&certificate_path).unwrap();
+
+    let result = run_refresh_check(&package);
+
+    assert_failure(
+        &result,
+        DiagnosticKind::ArtifactIo,
+        "certificate_write_target_forbidden",
+        Some("npa-package.toml"),
+        Some("modules[0].certificate"),
+    );
+    assert_eq!(
+        fs::read_to_string(manifest_path).unwrap(),
+        rewritten_manifest
+    );
+    assert_eq!(fs::read(certificate_path).unwrap(), certificate_before);
 }
 
 #[test]
@@ -255,6 +454,67 @@ fn package_build_certs_check_builds_local_imports_topologically() {
 }
 
 #[test]
+fn package_build_certs_check_rejects_stale_local_direct_import_identity() {
+    let package = build_synthetic_local_import_fixture("stale-local-import");
+    replace_module_manifest_hash(&package, "Fixture.A", "expected_export_hash", ZERO_HASH);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_npa"))
+        .args(["package", "build-certs", "--root"])
+        .arg(package.path())
+        .arg("--check")
+        .arg("--json")
+        .env("NPA_SKIP_PACKAGE_BUILD_HASH_CHECKS", "1")
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stderr.is_empty());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("\"reason_code\":\"export_hash_mismatch\""));
+    assert!(stdout.contains("\"path\":\"modules[0].imports[0].export_hash\""));
+    assert!(stdout.contains("\"field\":\"export_hash\""));
+}
+
+#[test]
+fn package_build_certs_refresh_check_rebuilds_stale_local_direct_import_identity() {
+    let package = build_synthetic_local_import_fixture("refresh-stale-local-import");
+    replace_module_manifest_hash(&package, "Fixture.A", "expected_export_hash", ZERO_HASH);
+
+    let result = run_refresh_check(&package);
+
+    assert_eq!(result.exit_code(), CommandExitCode::PackageFailure);
+    assert_eq!(result.diagnostics.len(), 1);
+    assert_eq!(result.diagnostics[0].kind, DiagnosticKind::HashMismatch);
+    assert_eq!(result.diagnostics[0].reason_code, "manifest_hashes_stale");
+}
+
+#[test]
+fn package_build_certs_refresh_check_accepts_duplicate_local_imports() {
+    let package = build_synthetic_duplicate_local_import_fixture("refresh-duplicate-local-import");
+
+    let result = run_refresh_check(&package);
+
+    assert_eq!(result.exit_code(), CommandExitCode::Success);
+    assert!(result.diagnostics.is_empty());
+}
+
+#[test]
+fn package_build_certs_refresh_check_accepts_proofs_fixture_import_order() {
+    let result = run_package_build_certs(PackageBuildCertsOptions {
+        common: PackageCommonOptions {
+            root: repo_root().join("testdata/package/proofs"),
+            json: true,
+        },
+        check: true,
+        build_check_cache: PackageBuildCheckCacheMode::Off,
+        update_manifest_hashes: true,
+    });
+
+    assert_eq!(result.exit_code(), CommandExitCode::Success);
+    assert!(result.diagnostics.is_empty());
+}
+
+#[test]
 fn package_build_certs_check_accepts_legacy_std_producer_profile_fixture() {
     let result = run_package_build_certs_check(PackageCommonOptions {
         root: repo_root().join("testdata/package/npa-std"),
@@ -280,6 +540,18 @@ fn run_build_check_read_through(package: &TestPackage) -> npa_cli::diagnostic::C
         },
         PackageBuildCheckCacheMode::ReadThrough,
     )
+}
+
+fn run_refresh_check(package: &TestPackage) -> npa_cli::diagnostic::CommandResult {
+    run_package_build_certs(PackageBuildCertsOptions {
+        common: PackageCommonOptions {
+            root: package.path().to_path_buf(),
+            json: true,
+        },
+        check: true,
+        build_check_cache: PackageBuildCheckCacheMode::Off,
+        update_manifest_hashes: true,
+    })
 }
 
 fn build_check_cache_guard() -> BuildCheckCacheGuard {
@@ -385,6 +657,34 @@ fn build_minimal_fixture(label: &str) -> TestPackage {
     package
 }
 
+fn build_inline_module_array_fixture(label: &str) -> TestPackage {
+    let package = TestPackage::new(label);
+    let source =
+        "theorem basic_id :\n  forall (P : Prop), forall (p : P), P :=\n  fun P => fun p => p\n";
+    let (cert, _verified, _interface) =
+        compile_fixture_module(0, "Proofs.Ai.Basic", source, &[], &[]);
+    let source_path = "Proofs/Ai/Basic/source.npa";
+    let cert_path = "Proofs/Ai/Basic/certificate.npcert";
+    write_artifact(&package, source_path, source.as_bytes());
+    write_artifact(&package, cert_path, &cert);
+
+    let manifest_source = inline_fixture_manifest(&generated_manifest_module(
+        "Proofs.Ai.Basic",
+        source_path,
+        cert_path,
+        source.as_bytes(),
+        &cert,
+        Vec::new(),
+    ));
+    fs::write(
+        package.artifact_path(PACKAGE_MANIFEST_PATH),
+        &manifest_source,
+    )
+    .unwrap();
+    write_lock(&package, &manifest_source);
+    package
+}
+
 fn build_synthetic_local_import_fixture(label: &str) -> TestPackage {
     let package = TestPackage::new(label);
     let source_a =
@@ -428,6 +728,89 @@ fn build_synthetic_local_import_fixture(label: &str) -> TestPackage {
     );
 
     let manifest_source = fixture_manifest(&[module_b, module_a]);
+    fs::write(
+        package.artifact_path(PACKAGE_MANIFEST_PATH),
+        &manifest_source,
+    )
+    .unwrap();
+    write_lock(&package, &manifest_source);
+    package
+}
+
+fn build_synthetic_duplicate_local_import_fixture(label: &str) -> TestPackage {
+    let package = TestPackage::new(label);
+    let source_a =
+        "theorem a_id :\n  forall (P : Prop), forall (p : P), P :=\n  fun P => fun p => p\n";
+    let source_b = "import Fixture.A\nimport Fixture.A\n\ntheorem b_use :\n  forall (P : Prop), forall (p : P), P :=\n  fun P => fun p => @a_id P p\n";
+
+    let (cert_a, verified_a, interface_a) =
+        compile_fixture_module(0, "Fixture.A", source_a, &[], &[]);
+    let verified_imports = vec![verified_a.clone(), verified_a];
+    let interface_imports = vec![interface_a.clone(), interface_a];
+    let (cert_b, _verified_b, _interface_b) = compile_fixture_module(
+        1,
+        "Fixture.B",
+        source_b,
+        &verified_imports,
+        &interface_imports,
+    );
+
+    let a_source_path = "Fixture/A/source.npa";
+    let a_cert_path = "Fixture/A/certificate.npcert";
+    let b_source_path = "Fixture/B/source.npa";
+    let b_cert_path = "Fixture/B/certificate.npcert";
+    write_artifact(&package, a_source_path, source_a.as_bytes());
+    write_artifact(&package, a_cert_path, &cert_a);
+    write_artifact(&package, b_source_path, source_b.as_bytes());
+    write_artifact(&package, b_cert_path, &cert_b);
+
+    let module_a = generated_manifest_module(
+        "Fixture.A",
+        a_source_path,
+        a_cert_path,
+        source_a.as_bytes(),
+        &cert_a,
+        Vec::new(),
+    );
+    let module_b = generated_manifest_module(
+        "Fixture.B",
+        b_source_path,
+        b_cert_path,
+        source_b.as_bytes(),
+        &cert_b,
+        vec![
+            Name::from_dotted("Fixture.A"),
+            Name::from_dotted("Fixture.A"),
+        ],
+    );
+
+    let manifest_source = fixture_manifest(&[module_b, module_a]);
+    fs::write(
+        package.artifact_path(PACKAGE_MANIFEST_PATH),
+        &manifest_source,
+    )
+    .unwrap();
+    write_lock(&package, &manifest_source);
+    package
+}
+
+fn build_empty_modules_array_fixture(label: &str) -> TestPackage {
+    let package = TestPackage::new(label);
+    let manifest_source = String::from(
+        r#"schema = "npa.package.v0.1"
+package = "fixture-package"
+version = "0.1.0"
+core_spec = "npa.core.v0.1"
+kernel_profile = "npa.kernel.v0.1"
+certificate_format = "npa.certificate.canonical.v0.1"
+checker_profile = "npa.checker.reference.v0.1"
+modules = []
+
+[policy]
+allow_custom_axioms = false
+allowed_axioms = []
+"#,
+    );
     fs::write(
         package.artifact_path(PACKAGE_MANIFEST_PATH),
         &manifest_source,
@@ -547,6 +930,33 @@ fn module_imports_array(imports: &[Name]) -> String {
     format!("[{imports}]")
 }
 
+fn inline_fixture_manifest(module: &ManifestModule) -> String {
+    format!(
+        r#"schema = "npa.package.v0.1"
+package = "fixture-package"
+version = "0.1.0"
+core_spec = "npa.core.v0.1"
+kernel_profile = "npa.kernel.v0.1"
+certificate_format = "npa.certificate.canonical.v0.1"
+checker_profile = "npa.checker.reference.v0.1"
+modules = [{{ module = "{}", source = "{}", certificate = "{}", imports = {}, expected_source_hash = "{}", expected_certificate_file_hash = "{}", expected_export_hash = "{}", expected_axiom_report_hash = "{}", expected_certificate_hash = "{}" }}]
+
+[policy]
+allow_custom_axioms = false
+allowed_axioms = []
+"#,
+        module.module.as_dotted(),
+        module.source,
+        module.certificate,
+        module_imports_array(&module.imports),
+        format_package_hash(&module.source_hash),
+        format_package_hash(&module.certificate_file_hash),
+        format_package_hash(&module.export_hash),
+        format_package_hash(&module.axiom_report_hash),
+        format_package_hash(&module.certificate_hash),
+    )
+}
+
 fn write_lock(package: &TestPackage, manifest_source: &str) {
     let validated = parse_and_validate_manifest_str(manifest_source).unwrap();
     let lock = build_package_lock_from_package_root(
@@ -581,6 +991,40 @@ fn replace_manifest_hash(
         .unwrap();
     let replacement = format!("{replacement_prefix}{replacement_hash}\"");
     fs::write(path, source.replacen(line, &replacement, 1)).unwrap();
+}
+
+fn replace_module_manifest_hash(
+    package: &TestPackage,
+    module_name: &str,
+    field: &str,
+    replacement_hash: &str,
+) {
+    let path = package.artifact_path(PACKAGE_MANIFEST_PATH);
+    let source = fs::read_to_string(&path).unwrap();
+    let module_line = format!("module = \"{module_name}\"");
+    let field_prefix = format!("{field} = \"");
+    let mut output = String::new();
+    let mut in_target_module = false;
+    let mut replaced = false;
+    for line in source.lines() {
+        if line == "[[modules]]" {
+            in_target_module = false;
+        } else if line == module_line {
+            in_target_module = true;
+        }
+        if in_target_module && line.starts_with(&field_prefix) {
+            output.push_str(&format!("{field} = \"{replacement_hash}\""));
+            replaced = true;
+        } else {
+            output.push_str(line);
+        }
+        output.push('\n');
+    }
+    if !source.ends_with('\n') {
+        output.pop();
+    }
+    assert!(replaced, "expected to replace {field} for {module_name}");
+    fs::write(path, output).unwrap();
 }
 
 fn repo_root() -> PathBuf {

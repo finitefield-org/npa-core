@@ -1,6 +1,6 @@
 //! Implementation of `npa package export-candidate-metadata`.
 
-use std::{fs, io, path::PathBuf};
+use std::{fs, io, path::Path};
 
 use npa_package::{
     format_package_hash, package_file_hash, parse_package_theorem_index_json, PackagePath,
@@ -26,17 +26,17 @@ pub fn run_package_export_candidate_metadata(
 
     let manifest_bytes = match read_package_file(&options.common.root, PACKAGE_MANIFEST_PATH) {
         Ok(bytes) => bytes,
-        Err(diagnostic) => return CommandResult::failed(COMMAND, root_display, vec![diagnostic]),
+        Err(diagnostic) => return CommandResult::failed(COMMAND, root_display, vec![*diagnostic]),
     };
     let lock_bytes = match read_package_file(&options.common.root, PACKAGE_LOCK_PATH) {
         Ok(bytes) => bytes,
-        Err(diagnostic) => return CommandResult::failed(COMMAND, root_display, vec![diagnostic]),
+        Err(diagnostic) => return CommandResult::failed(COMMAND, root_display, vec![*diagnostic]),
     };
     let theorem_index_json =
         match read_package_file_to_string(&options.common.root, PACKAGE_THEOREM_INDEX_PATH) {
             Ok(source) => source,
             Err(diagnostic) => {
-                return CommandResult::failed(COMMAND, root_display, vec![diagnostic]);
+                return CommandResult::failed(COMMAND, root_display, vec![*diagnostic]);
             }
         };
     let theorem_index = match parse_package_theorem_index_json(&theorem_index_json) {
@@ -85,7 +85,7 @@ pub fn run_package_export_candidate_metadata(
         &format_package_hash(&theorem_index.theorem_index_hash),
     );
     if let Err(diagnostic) = write_output(&options.common.root, &target, metadata.as_bytes()) {
-        return CommandResult::failed(COMMAND, root_display, vec![diagnostic]);
+        return CommandResult::failed(COMMAND, root_display, vec![*diagnostic]);
     }
 
     let mut result = CommandResult::passed(COMMAND, root_display);
@@ -188,59 +188,98 @@ fn candidate_snapshot_hash(
     format_package_hash(&package_file_hash(body.as_bytes()))
 }
 
-fn read_package_file(root: &PathBuf, relative: &str) -> Result<Vec<u8>, CommandDiagnostic> {
+fn read_package_file(root: &Path, relative: &str) -> Result<Vec<u8>, Box<CommandDiagnostic>> {
     let path = PackagePath::new(relative);
-    let full_path = join_package_path(root, &path, relative).map_err(|diagnostic| *diagnostic)?;
-    fs::read(full_path).map_err(|_| {
-        CommandDiagnostic::error(DiagnosticKind::ArtifactIo, "package_artifact_read_failed")
-            .with_path(relative)
+    let full_path = join_package_path(root, &path, relative)?;
+    fs::read(full_path).map_err(|error| {
+        if error.kind() == io::ErrorKind::NotFound {
+            if let Some(diagnostic) = missing_prerequisite_diagnostic(relative) {
+                return Box::new(diagnostic);
+            }
+        }
+        Box::new(
+            CommandDiagnostic::error(DiagnosticKind::ArtifactIo, "package_artifact_read_failed")
+                .with_path(relative),
+        )
     })
 }
 
+fn missing_prerequisite_diagnostic(relative: &str) -> Option<CommandDiagnostic> {
+    match relative {
+        PACKAGE_LOCK_PATH => Some(
+            CommandDiagnostic::error(
+                DiagnosticKind::GeneratedArtifact,
+                "candidate_metadata_package_lock_missing",
+            )
+            .with_path(PACKAGE_LOCK_PATH)
+            .with_expected_value("run `npa package build-certs --root <proofs> --json` first")
+            .with_actual_value("missing"),
+        ),
+        PACKAGE_THEOREM_INDEX_PATH => Some(
+            CommandDiagnostic::error(
+                DiagnosticKind::GeneratedArtifact,
+                "candidate_metadata_theorem_index_missing",
+            )
+            .with_path(PACKAGE_THEOREM_INDEX_PATH)
+            .with_expected_value("run `npa package index --root <proofs> --json` first")
+            .with_actual_value("missing"),
+        ),
+        _ => None,
+    }
+}
+
 fn read_package_file_to_string(
-    root: &PathBuf,
+    root: &Path,
     relative: &str,
-) -> Result<String, CommandDiagnostic> {
+) -> Result<String, Box<CommandDiagnostic>> {
     let bytes = read_package_file(root, relative)?;
     String::from_utf8(bytes).map_err(|_| {
-        CommandDiagnostic::error(DiagnosticKind::ArtifactIo, "package_artifact_utf8_failed")
-            .with_path(relative)
+        Box::new(
+            CommandDiagnostic::error(DiagnosticKind::ArtifactIo, "package_artifact_utf8_failed")
+                .with_path(relative),
+        )
     })
 }
 
 fn write_output(
-    root: &PathBuf,
+    root: &Path,
     target: &PackagePath,
     contents: &[u8],
-) -> Result<(), CommandDiagnostic> {
-    let full_path = join_package_path(root, target, "/out").map_err(|diagnostic| *diagnostic)?;
+) -> Result<(), Box<CommandDiagnostic>> {
+    let full_path = join_package_path(root, target, "/out")?;
     match fs::read(&full_path) {
         Ok(existing) if existing == contents => return Ok(()),
         Ok(_) => {}
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(_) => {
-            return Err(CommandDiagnostic::error(
-                DiagnosticKind::GeneratedArtifact,
-                "generated_artifact_read_failed",
-            )
-            .with_path(render_package_path(target)));
+            return Err(Box::new(
+                CommandDiagnostic::error(
+                    DiagnosticKind::GeneratedArtifact,
+                    "generated_artifact_read_failed",
+                )
+                .with_path(render_package_path(target)),
+            ));
         }
     }
     if let Some(parent) = full_path.parent() {
         fs::create_dir_all(parent).map_err(|_| {
+            Box::new(
+                CommandDiagnostic::error(
+                    DiagnosticKind::GeneratedArtifact,
+                    "generated_artifact_write_failed",
+                )
+                .with_path(render_package_path(target)),
+            )
+        })?;
+    }
+    fs::write(full_path, contents).map_err(|_| {
+        Box::new(
             CommandDiagnostic::error(
                 DiagnosticKind::GeneratedArtifact,
                 "generated_artifact_write_failed",
             )
-            .with_path(render_package_path(target))
-        })?;
-    }
-    fs::write(full_path, contents).map_err(|_| {
-        CommandDiagnostic::error(
-            DiagnosticKind::GeneratedArtifact,
-            "generated_artifact_write_failed",
+            .with_path(render_package_path(target)),
         )
-        .with_path(render_package_path(target))
     })
 }
 

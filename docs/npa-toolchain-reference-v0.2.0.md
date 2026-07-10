@@ -51,6 +51,48 @@ npa package axiom-report --root . --check --json
 npa package index --root . --check --json
 ```
 
+### Package Artifact Refresh
+
+When an intentional local source change alters local certificate identities,
+use refresh mode instead of editing manifest hashes by hand. A dry run rebuilds
+local certificates in memory, refreshes the local module hash pins in memory,
+regenerates the package lock in memory, writes no files, and fails if any
+checked artifact would change:
+
+```sh
+npa package build-certs --root . --update-manifest-hashes --check --json
+```
+
+Write mode performs the same rebuild and, after the whole refresh succeeds,
+updates only local module certificate files, the local module hash fields in
+`npa-package.toml`, and `generated/package-lock.json`:
+
+```sh
+npa package build-certs --root . --update-manifest-hashes --json
+npa package check-hashes --root . --json
+npa package verify-certs --root . --checker reference --json
+```
+
+After a write refresh, regenerate or check any release metadata your package
+tracks, such as `axiom-report`, `index`, `export-summary`, or `publish-plan`,
+using the existing package metadata commands.
+
+Use write mode only at explicit package artifact refresh boundaries. Refresh
+mode is metadata and artifact maintenance; it is not proof evidence. Source
+files, refreshed manifest pins, generated JSON, and command success remain
+untrusted. Proof acceptance still depends on canonical `.npcert` bytes and
+source-free checker or kernel verification.
+
+Refresh mode does not update top-level external `[[imports]]` pins. External
+`export_hash` and `certificate_hash` mismatches remain hard failures; updating
+external package pins is future work and must be handled outside this command.
+`package lock write` remains a source-free lock rewrite from the current
+manifest and certificate artifacts, and ordinary `build-certs`,
+`build-certs --check`, `check-hashes`, and `verify-certs` behavior is unchanged
+when `--update-manifest-hashes` is absent.
+
+Refresh mode is incompatible with `--build-check-cache read-through`.
+
 For local certificate-only edits after certificates have already been generated,
 `verify-certs --changed` selects changed checked-in certificate paths from Git
 and verifies only those package modules, plus source-free imports required for a

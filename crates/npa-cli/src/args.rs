@@ -51,6 +51,8 @@ pub enum PackageCommand {
     VerifyCerts(PackageVerifyCertsOptions),
     /// `npa package check-hashes`.
     CheckHashes(PackageCommonOptions),
+    /// `npa package lock ...`.
+    Lock(PackageLockCommand),
     /// `npa package publish-plan`.
     PublishPlan(PackagePublishPlanOptions),
     /// `npa package check-generated`.
@@ -75,6 +77,7 @@ impl PackageCommand {
             Self::ExportCandidateMetadata(_) => "package export-candidate-metadata",
             Self::VerifyCerts(_) => "package verify-certs",
             Self::CheckHashes(_) => "package check-hashes",
+            Self::Lock(command) => command.command_name(),
             Self::PublishPlan(_) => "package publish-plan",
             Self::CheckGenerated(_) => "package check-generated",
             Self::HighTrust(_) => "package high-trust",
@@ -87,6 +90,7 @@ impl PackageCommand {
     pub fn common_options(&self) -> &PackageCommonOptions {
         match self {
             Self::Check(options) | Self::CheckHashes(options) => options,
+            Self::Lock(command) => command.common_options(),
             Self::BuildCerts(options) => &options.common,
             Self::AxiomReport(options) => &options.common,
             Self::Index(options) => &options.common,
@@ -98,6 +102,32 @@ impl PackageCommand {
             Self::HighTrust(options) => &options.common,
             Self::GatePlan(options) => &options.common,
             Self::RefactorPlan(options) => &options.common,
+        }
+    }
+}
+
+/// Parsed `npa package lock` subcommand.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PackageLockCommand {
+    /// `npa package lock check`.
+    Check(PackageCommonOptions),
+    /// `npa package lock write`.
+    Write(PackageCommonOptions),
+}
+
+impl PackageLockCommand {
+    /// Stable command name used in diagnostics.
+    pub fn command_name(&self) -> &'static str {
+        match self {
+            Self::Check(_) => "package lock check",
+            Self::Write(_) => "package lock write",
+        }
+    }
+
+    /// Common options for the package lock subcommand.
+    pub fn common_options(&self) -> &PackageCommonOptions {
+        match self {
+            Self::Check(options) | Self::Write(options) => options,
         }
     }
 }
@@ -164,6 +194,8 @@ pub struct PackageBuildCertsOptions {
     pub check: bool,
     /// Local build-check cache mode for check mode.
     pub build_check_cache: PackageBuildCheckCacheMode,
+    /// Refresh local module hash pins in npa-package.toml after rebuilding certificates.
+    pub update_manifest_hashes: bool,
 }
 
 /// Local package build-check cache mode for `package build-certs --check`.
@@ -453,6 +485,12 @@ pub enum HelpTopic {
     PackageVerifyCerts,
     /// `npa package check-hashes --help`.
     PackageCheckHashes,
+    /// `npa package lock --help`.
+    PackageLock,
+    /// `npa package lock check --help`.
+    PackageLockCheck,
+    /// `npa package lock write --help`.
+    PackageLockWrite,
     /// `npa package publish-plan --help`.
     PackagePublishPlan,
     /// `npa package check-generated --help`.
@@ -612,6 +650,7 @@ fn parse_package_args(args: &[String]) -> Result<CliAction, CliUsageError> {
         "export-candidate-metadata" => parse_package_export_candidate_metadata_args(&args[1..]),
         "verify-certs" => parse_package_verify_certs_args(&args[1..]),
         "check-hashes" => parse_package_check_hashes_args(&args[1..]),
+        "lock" => parse_package_lock_args(&args[1..]),
         "publish-plan" => parse_package_publish_plan_args(&args[1..]),
         "check-generated" => parse_package_check_generated_args(&args[1..]),
         "high-trust" => parse_package_high_trust_args(&args[1..]),
@@ -623,6 +662,42 @@ fn parse_package_args(args: &[String]) -> Result<CliAction, CliUsageError> {
         command => Err(CliUsageError::new(UsageReason::UnknownCommand)
             .with_command(format!("package {command}"))),
     }
+}
+
+fn parse_package_lock_args(args: &[String]) -> Result<CliAction, CliUsageError> {
+    if args.is_empty() {
+        return Err(CliUsageError::new(UsageReason::UnknownCommand).with_command("package lock"));
+    }
+    match args[0].as_str() {
+        "--help" | "-h" => Ok(CliAction::Help(HelpTopic::PackageLock)),
+        "check" => parse_package_lock_check_args(&args[1..]),
+        "write" => parse_package_lock_write_args(&args[1..]),
+        command if command.starts_with('-') => {
+            Err(flag_error(command, UsageReason::UnknownFlag).with_command("package lock"))
+        }
+        command => Err(CliUsageError::new(UsageReason::UnknownCommand)
+            .with_command(format!("package lock {command}"))),
+    }
+}
+
+fn parse_package_lock_check_args(args: &[String]) -> Result<CliAction, CliUsageError> {
+    if contains_help(args) {
+        return Ok(CliAction::Help(HelpTopic::PackageLockCheck));
+    }
+    let common = parse_common_options(args, "package lock check", &[])?;
+    Ok(CliAction::Run(CliCommand::Package(PackageCommand::Lock(
+        PackageLockCommand::Check(common),
+    ))))
+}
+
+fn parse_package_lock_write_args(args: &[String]) -> Result<CliAction, CliUsageError> {
+    if contains_help(args) {
+        return Ok(CliAction::Help(HelpTopic::PackageLockWrite));
+    }
+    let common = parse_common_options(args, "package lock write", &[])?;
+    Ok(CliAction::Run(CliCommand::Package(PackageCommand::Lock(
+        PackageLockCommand::Write(common),
+    ))))
 }
 
 fn parse_package_check_args(args: &[String]) -> Result<CliAction, CliUsageError> {
@@ -772,6 +847,7 @@ fn parse_package_build_certs_args(args: &[String]) -> Result<CliAction, CliUsage
     let mut common_tokens = Vec::new();
     let mut check = false;
     let mut build_check_cache = None::<PackageBuildCheckCacheMode>;
+    let mut update_manifest_hashes = false;
     let mut index = 0usize;
     while index < args.len() {
         match args[index].as_str() {
@@ -831,6 +907,23 @@ fn parse_package_build_certs_args(args: &[String]) -> Result<CliAction, CliUsage
                 build_check_cache = Some(parse_build_check_cache_mode(value)?);
                 index += 1;
             }
+            "--update-manifest-hashes" => {
+                if update_manifest_hashes {
+                    return Err(
+                        flag_error("--update-manifest-hashes", UsageReason::DuplicateFlag)
+                            .with_command("package build-certs"),
+                    );
+                }
+                update_manifest_hashes = true;
+                index += 1;
+            }
+            token if token.starts_with("--update-manifest-hashes=") => {
+                let value = token.trim_start_matches("--update-manifest-hashes=");
+                return Err(CliUsageError::new(UsageReason::UnsupportedFlag)
+                    .with_command("package build-certs")
+                    .with_flag("--update-manifest-hashes")
+                    .with_value(value));
+            }
             token => {
                 common_tokens.push(token.to_owned());
                 index += 1;
@@ -841,9 +934,15 @@ fn parse_package_build_certs_args(args: &[String]) -> Result<CliAction, CliUsage
     let common = parse_common_options(
         &common_tokens,
         "package build-certs",
-        &["--check", "--build-check-cache"],
+        &["--check", "--build-check-cache", "--update-manifest-hashes"],
     )?;
     let build_check_cache = build_check_cache.unwrap_or(PackageBuildCheckCacheMode::Off);
+    if update_manifest_hashes && build_check_cache.uses_local_store() {
+        return Err(CliUsageError::new(UsageReason::UnsupportedFlag)
+            .with_command("package build-certs")
+            .with_flag("--build-check-cache")
+            .with_value(build_check_cache.as_str()));
+    }
     if build_check_cache.uses_local_store() && !check {
         return Err(CliUsageError::new(UsageReason::UnsupportedFlag)
             .with_command("package build-certs")
@@ -855,6 +954,7 @@ fn parse_package_build_certs_args(args: &[String]) -> Result<CliAction, CliUsage
             common,
             check,
             build_check_cache,
+            update_manifest_hashes,
         }),
     )))
 }
@@ -2228,13 +2328,13 @@ pub fn render_help(topic: HelpTopic) -> &'static str {
             "Usage: npa <command> [options]\n\nCommands:\n  package    Package manifest and certificate commands\n  version    Print npa CLI version\n\nOptions:\n  --help\n  --version"
         }
         HelpTopic::Package => {
-            "Usage: npa package <command> [options]\n\nCommands:\n  check\n  build-certs\n  axiom-report\n  index\n  export-summary\n  export-candidate-metadata\n  verify-certs\n  check-hashes\n  publish-plan\n  check-generated\n  high-trust\n  gate-plan\n  refactor-plan\n\nCommon options:\n  --root PATH    Package root, default: .\n  --json         Emit deterministic JSON diagnostics\n  --help         Show help"
+            "Usage: npa package <command> [options]\n\nCommands:\n  check\n  build-certs\n  axiom-report\n  index\n  export-summary\n  export-candidate-metadata\n  verify-certs\n  check-hashes\n  lock\n  publish-plan\n  check-generated\n  high-trust\n  gate-plan\n  refactor-plan\n\nCommon options:\n  --root PATH    Package root, default: .\n  --json         Emit deterministic JSON diagnostics\n  --help         Show help"
         }
         HelpTopic::PackageCheck => {
             "Usage: npa package check [--root PATH] [--json]\n\nValidate npa-package.toml metadata without reading source or certificate artifacts."
         }
         HelpTopic::PackageBuildCerts => {
-            "Usage: npa package build-certs [--root PATH] [--json] [--check] [--build-check-cache off|read-through]\n\nRebuild package certificates. --check writes no files; write mode updates local certificates and generated/package-lock.json. read-through still runs live source-to-certificate comparison and only records untrusted local cache counters."
+            "Usage: npa package build-certs [--root PATH] [--json] [--check] [--build-check-cache off|read-through] [--update-manifest-hashes]\n\nRebuild package certificates. --check writes no files; write mode updates local certificates and generated/package-lock.json. --update-manifest-hashes refreshes local module hash pins in npa-package.toml after a successful rebuild and is currently incompatible with --build-check-cache read-through. read-through still runs live source-to-certificate comparison and only records untrusted local cache counters."
         }
         HelpTopic::PackageAxiomReport => {
             "Usage: npa package axiom-report [--root PATH] [--json] [--check] [--timings off|summary|detailed]\n\nGenerate or check generated/axiom-report.json from source-free package certificate artifacts. Timing telemetry is informational and is not proof evidence."
@@ -2253,6 +2353,15 @@ pub fn render_help(topic: HelpTopic) -> &'static str {
         }
         HelpTopic::PackageCheckHashes => {
             "Usage: npa package check-hashes [--root PATH] [--json]\n\nCheck checked-in package artifact hashes."
+        }
+        HelpTopic::PackageLock => {
+            "Usage: npa package lock <command> [options]\n\nCommands:\n  check\n  write\n\nCommon options:\n  --root PATH    Package root, default: .\n  --json         Emit deterministic JSON diagnostics\n  --help         Show help"
+        }
+        HelpTopic::PackageLockCheck => {
+            "Usage: npa package lock check [--root PATH] [--json]\n\nCheck generated/package-lock.json against the current package manifest and certificate artifacts without writing files."
+        }
+        HelpTopic::PackageLockWrite => {
+            "Usage: npa package lock write [--root PATH] [--json]\n\nRegenerate generated/package-lock.json from the current package manifest and certificate artifacts without rebuilding certificates."
         }
         HelpTopic::PackagePublishPlan => {
             "Usage: npa package publish-plan [--root PATH] [--json] [--check] [--timings off|summary|detailed]\n\nGenerate or check generated/publish-plan.json from source-free package release metadata. Timing telemetry is informational and is not proof evidence."

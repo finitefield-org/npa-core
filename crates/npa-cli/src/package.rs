@@ -18,6 +18,7 @@ use crate::package_gate_plan::run_package_gate_plan;
 use crate::package_hashes::run_package_check_hashes;
 use crate::package_high_trust::run_package_high_trust;
 use crate::package_index::run_package_index;
+use crate::package_lock::run_package_lock_command;
 use crate::package_publish::run_package_publish_plan;
 use crate::package_refactor_plan::run_package_refactor_plan;
 use crate::package_verify::run_package_verify_certs;
@@ -117,6 +118,7 @@ pub fn run_package_command(command: PackageCommand) -> CommandResult {
         }
         PackageCommand::VerifyCerts(options) => run_package_verify_certs(options),
         PackageCommand::CheckHashes(options) => run_package_check_hashes(options),
+        PackageCommand::Lock(command) => run_package_lock_command(command),
         PackageCommand::PublishPlan(options) => run_package_publish_plan(options),
         PackageCommand::CheckGenerated(options) => run_package_check_generated(options),
         PackageCommand::HighTrust(options) => run_package_high_trust(*options),
