@@ -11,17 +11,45 @@
 
 #![deny(missing_docs)]
 #![forbid(unsafe_code)]
+// The public structured rejection intentionally retains complete bounded
+// reference identities; keeping that API value-owned is more important than
+// optimizing the cold error path's enum size.
+#![allow(clippy::result_large_err)]
 
 mod decode;
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
+use sha2::{Digest, Sha256};
+
+/// Stable checker identifier emitted by the standalone raw-result contract.
+pub const REFERENCE_CHECKER_ID: &str = "npa-checker-ref";
+
+/// Crate version of the built-in reference checker.
+pub const REFERENCE_CHECKER_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 /// Canonical certificate format tag accepted by the reference checker.
 pub const REFERENCE_CERTIFICATE_FORMAT: &str = "NPA-CERT-0.2.0";
 
 /// Canonical core spec tag accepted by the reference checker.
 pub const REFERENCE_CORE_SPEC: &str = "NPA-Core-0.2.0";
+
+/// Return the deterministic logical build identity used by the standalone checker.
+///
+/// This hashes the checker id, crate version, core specification, and certificate
+/// format. It is not a hash of the compiled executable.
+pub fn reference_checker_build_hash() -> ReferenceHash {
+    let digest = Sha256::digest(
+        format!(
+            "{REFERENCE_CHECKER_ID}:{REFERENCE_CHECKER_VERSION}:{REFERENCE_CORE_SPEC}:{REFERENCE_CERTIFICATE_FORMAT}"
+        )
+        .as_bytes(),
+    );
+    let mut hash = [0_u8; 32];
+    hash.copy_from_slice(&digest);
+    hash
+}
 
 pub(crate) const REFERENCE_PREVIOUS_CERTIFICATE_FORMAT: &str = "NPA-CERT-0.1.2";
 pub(crate) const REFERENCE_PREVIOUS_CORE_SPEC: &str = "NPA-Core-0.1.2";
@@ -192,6 +220,7 @@ pub struct ReferencePublicEnvironment {
     exports: Vec<ReferencePublicExport>,
     module_axioms: Vec<ReferenceAxiomDependency>,
     core_features: Vec<ReferenceCoreFeature>,
+    inductive_groups: Vec<ReferencePublicInductiveGroup>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -200,12 +229,35 @@ struct ReferencePublicImport {
     export_hash: ReferenceHash,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ReferencePublicRecursorLayout {
+    pub(crate) name: ReferenceModuleName,
+    pub(crate) minor_start: usize,
+    pub(crate) major_index: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ReferencePublicInductiveLayout {
+    pub(crate) name: ReferenceModuleName,
+    pub(crate) param_count: usize,
+    pub(crate) index_count: usize,
+    pub(crate) constructors: Vec<ReferenceModuleName>,
+    pub(crate) recursor: Option<ReferencePublicRecursorLayout>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ReferencePublicInductiveGroup {
+    pub(crate) decl_interface_hash: ReferenceHash,
+    pub(crate) families: Vec<ReferencePublicInductiveLayout>,
+}
+
 impl ReferencePublicEnvironment {
     pub(crate) fn new(
         imports: Vec<(ReferenceModuleName, ReferenceHash)>,
         exports: Vec<ReferencePublicExport>,
         module_axioms: Vec<ReferenceAxiomDependency>,
         core_features: Vec<ReferenceCoreFeature>,
+        inductive_groups: Vec<ReferencePublicInductiveGroup>,
     ) -> Self {
         Self {
             imports: imports
@@ -218,6 +270,7 @@ impl ReferencePublicEnvironment {
             exports,
             module_axioms,
             core_features,
+            inductive_groups,
         }
     }
 
@@ -536,8 +589,12 @@ pub struct ReferenceModuleHashes {
 pub enum ReferenceHashObject {
     /// Declaration interface hash.
     DeclInterface,
+    /// Declaration interface hash whose payload contains dependency material.
+    DeclInterfaceDependencyMaterial,
     /// Declaration certificate hash.
     DeclCertificate,
+    /// Declaration certificate hash whose payload contains dependency material.
+    DeclCertificateDependencyMaterial,
     /// Export block hash.
     ExportBlock,
     /// Axiom report hash.
@@ -729,6 +786,91 @@ impl ReferenceCheckedModule {
     }
 }
 
+/// Complete identity of an import resolved by the reference checker.
+#[non_exhaustive]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReferenceCheckResolvedImportIdentity {
+    /// Index in the import list that owns this identity.
+    pub import_index: usize,
+    /// Canonical imported module name.
+    pub module: ReferenceModuleName,
+    /// Resolved imported module export hash.
+    pub export_hash: ReferenceHash,
+}
+
+impl ReferenceCheckResolvedImportIdentity {
+    /// Creates a complete resolved-import diagnostic identity.
+    pub fn new(
+        import_index: usize,
+        module: ReferenceModuleName,
+        export_hash: ReferenceHash,
+    ) -> Self {
+        Self {
+            import_index,
+            module,
+            export_hash,
+        }
+    }
+}
+
+/// Import target requested by an unresolved declaration reference.
+#[non_exhaustive]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReferenceCheckImportTarget {
+    /// The target import index was outside the available import environment.
+    Unresolved {
+        /// Requested import index.
+        import_index: usize,
+    },
+    /// The target import entry was available and has a complete identity.
+    Resolved(ReferenceCheckResolvedImportIdentity),
+}
+
+/// Typed identity of a declaration/global reference rejected by the checker.
+#[non_exhaustive]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReferenceCheckReference {
+    /// Builtin declaration reference.
+    Builtin {
+        /// Exact canonical declaration name.
+        declaration: ReferenceModuleName,
+        /// Requested declaration-interface hash.
+        decl_interface_hash: ReferenceHash,
+    },
+    /// Imported declaration reference.
+    Imported {
+        /// Resolved current import whose public environment contained this
+        /// reference, or `None` for the current certificate's import list.
+        owner_import: Option<ReferenceCheckResolvedImportIdentity>,
+        /// Requested target import.
+        import: ReferenceCheckImportTarget,
+        /// Exact canonical declaration name.
+        declaration: ReferenceModuleName,
+        /// Requested declaration-interface hash.
+        decl_interface_hash: ReferenceHash,
+    },
+    /// Local declaration reference.
+    Local {
+        /// Resolved current import whose public environment illegally contained
+        /// this local reference, or `None` for the current certificate.
+        owner_import: Option<ReferenceCheckResolvedImportIdentity>,
+        /// Requested declaration-table index.
+        declaration_index: usize,
+        /// Exact canonical declaration name when available.
+        declaration: Option<ReferenceModuleName>,
+    },
+    /// Generated local constructor or recursor reference.
+    LocalGenerated {
+        /// Resolved current import whose public environment illegally contained
+        /// this generated local reference, or `None` for the current certificate.
+        owner_import: Option<ReferenceCheckResolvedImportIdentity>,
+        /// Parent declaration-table index.
+        declaration_index: usize,
+        /// Exact canonical generated declaration name.
+        declaration: ReferenceModuleName,
+    },
+}
+
 /// Deterministic structured reference checker error.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReferenceCheckError {
@@ -740,6 +882,12 @@ pub struct ReferenceCheckError {
     pub offset: usize,
     /// Optional stable reason code for this error.
     pub reason: Option<ReferenceCheckReason>,
+    /// Typed declaration/import identity for declaration/global
+    /// [`ReferenceCheckReason::UnknownReference`] failures.
+    ///
+    /// The two existing universe-parameter failures that reuse that reason do
+    /// not carry declaration reference context.
+    pub reference: Option<ReferenceCheckReference>,
 }
 
 impl ReferenceCheckError {
@@ -749,6 +897,7 @@ impl ReferenceCheckError {
             section: ReferenceCertificateSection::HeaderFormat,
             offset: 0,
             reason: None,
+            reference: None,
         }
     }
 
@@ -762,6 +911,7 @@ impl ReferenceCheckError {
             section,
             offset,
             reason: Some(reason),
+            reference: None,
         }
     }
 
@@ -771,6 +921,7 @@ impl ReferenceCheckError {
             section: ReferenceCertificateSection::FullCertificate,
             offset,
             reason: Some(ReferenceCheckReason::ReferenceCheckerBodyUnimplemented),
+            reference: None,
         }
     }
 
@@ -780,6 +931,7 @@ impl ReferenceCheckError {
             section: ReferenceCertificateSection::AxiomReport,
             offset,
             reason: Some(ReferenceCheckReason::UnsupportedCoreFeature),
+            reference: None,
         }
     }
 
@@ -793,6 +945,7 @@ impl ReferenceCheckError {
             section,
             offset,
             reason: Some(reason),
+            reference: None,
         }
     }
 
@@ -806,6 +959,21 @@ impl ReferenceCheckError {
             section,
             offset,
             reason: Some(reason),
+            reference: None,
+        }
+    }
+
+    pub(crate) fn unknown_reference(
+        section: ReferenceCertificateSection,
+        offset: usize,
+        reference: ReferenceCheckReference,
+    ) -> Self {
+        Self {
+            kind: ReferenceCheckErrorKind::TypeCheck,
+            section,
+            offset,
+            reason: Some(ReferenceCheckReason::UnknownReference),
+            reference: Some(reference),
         }
     }
 }
@@ -908,6 +1076,8 @@ pub enum ReferenceCheckReason {
     ReservedCorePrimitive,
     /// An import binding appeared more than once.
     DuplicateImport,
+    /// The requested high-trust import closure contains a cycle.
+    ImportCycle,
     /// A level table entry was not normalized.
     NonNormalizedLevel,
     /// A term table entry was not normalized.
@@ -916,6 +1086,8 @@ pub enum ReferenceCheckReason {
     UnusedTableEntry,
     /// Extra bytes remained after the canonical certificate sections.
     TrailingBytes,
+    /// A source or replay path was supplied where only certificate inputs are allowed.
+    SourceInputForbidden,
     /// A requested import module was not available in the explicit import store.
     MissingImport,
     /// An import module was present, but not with the requested export hash.
@@ -956,6 +1128,8 @@ pub enum ReferenceCheckReason {
     ResourceLimit,
     /// An inductive constructor did not return its declared family.
     BadConstructorResult,
+    /// A non-parameter constructor field lives above the inductive family's sort.
+    ConstructorUniverseBoundViolation,
     /// A constructor contains a recursive occurrence outside the MVP strictly positive shape.
     NonPositiveOccurrence,
     /// A generated recursor rule index did not match the declaration shape.
@@ -994,6 +1168,7 @@ impl ReferenceCheckError {
             section,
             offset,
             reason: Some(ReferenceCheckReason::AxiomReportMismatch),
+            reference: None,
         }
     }
 
@@ -1007,6 +1182,7 @@ impl ReferenceCheckError {
             section,
             offset,
             reason: Some(reason),
+            reference: None,
         }
     }
 
@@ -1020,6 +1196,7 @@ impl ReferenceCheckError {
             section,
             offset,
             reason: Some(ReferenceCheckReason::HashMismatch { object }),
+            reference: None,
         }
     }
 }
@@ -1100,7 +1277,6 @@ mod tests {
         ResourceLimitKind, UniverseConstraint, UniverseContext, MAX_UNIVERSE_CONTEXT_NODES,
     };
     use sha2::{Digest, Sha256};
-    use std::{fs, path::Path};
 
     fn encode_uvar(mut value: u64) -> Vec<u8> {
         let mut out = Vec::new();
@@ -1160,6 +1336,10 @@ mod tests {
 
     fn rmax(lhs: ReferenceCoreLevel, rhs: ReferenceCoreLevel) -> ReferenceCoreLevel {
         ReferenceCoreLevel::Max(Arc::new(lhs), Arc::new(rhs))
+    }
+
+    fn rimax(lhs: ReferenceCoreLevel, rhs: ReferenceCoreLevel) -> ReferenceCoreLevel {
+        ReferenceCoreLevel::IMax(Arc::new(lhs), Arc::new(rhs))
     }
 
     fn rc_le(lhs: ReferenceCoreLevel, rhs: ReferenceCoreLevel) -> ReferenceUniverseConstraint {
@@ -1492,6 +1672,7 @@ mod tests {
             ],
             None,
         )
+        .with_universe_constraints(vec![UniverseConstraint::le(type0(), u)])
     }
 
     fn fin_type(n: Expr) -> Expr {
@@ -2840,8 +3021,17 @@ mod tests {
         terms: &[TestTerm],
         spec: TestInductiveSpec,
     ) -> DeclarationCertificateFixture {
-        let level_hashes = test_level_hashes(terms);
+        let mut level_hashes = test_level_hashes(terms);
+        while level_hashes.len() <= spec.sort {
+            let mut payload = vec![0x01];
+            payload.extend(level_hashes.last().unwrap());
+            level_hashes.push(hash_with_domain(b"NPA-LEVEL-0.1", &payload));
+        }
         let term_hashes = test_term_hashes(&level_hashes, terms);
+        let family_type_term = terms
+            .iter()
+            .position(|term| matches!(term, TestTerm::Sort(level) if *level == spec.sort))
+            .expect("single-inductive fixture includes its family sort term");
 
         let mut recursor_sig_payload = Vec::new();
         let mut recursor_rule_payload = Vec::new();
@@ -2942,9 +3132,9 @@ mod tests {
         export_block.push(0x03);
         encode_usize_vec(&mut export_block, &spec.universe_params);
         encode_universe_constraints_empty(&mut export_block);
-        export_block.extend(encode_uvar(0)); // inductive type is Sort sort for these fixtures
+        export_block.extend(encode_uvar(family_type_term as u64));
         encode_option_usize(&mut export_block, None);
-        export_block.extend(term_hashes[0]);
+        export_block.extend(term_hashes[family_type_term]);
         encode_option_hash(&mut export_block, None);
         export_block.push(0x00);
         export_block.push(0x00);
@@ -3231,6 +3421,129 @@ mod tests {
         assert_eq!(error.reason, Some(reason), "{error:?}");
     }
 
+    fn diagnostic_name(value: &str) -> ReferenceModuleName {
+        ReferenceModuleName::from_dotted(value).unwrap()
+    }
+
+    #[test]
+    fn unknown_reference_constructor_preserves_every_reference_lane() {
+        let owner = ReferenceCheckResolvedImportIdentity {
+            import_index: 2,
+            module: diagnostic_name("Owner.Module"),
+            export_hash: [0x22; 32],
+        };
+        let target = ReferenceCheckResolvedImportIdentity {
+            import_index: 1,
+            module: diagnostic_name("Target.Module"),
+            export_hash: [0x11; 32],
+        };
+        let contexts = vec![
+            ReferenceCheckReference::Builtin {
+                declaration: diagnostic_name("Eq.refl"),
+                decl_interface_hash: [0x01; 32],
+            },
+            ReferenceCheckReference::Imported {
+                owner_import: None,
+                import: ReferenceCheckImportTarget::Resolved(target.clone()),
+                declaration: diagnostic_name("Target.Module.value"),
+                decl_interface_hash: [0x02; 32],
+            },
+            ReferenceCheckReference::Imported {
+                owner_import: Some(owner.clone()),
+                import: ReferenceCheckImportTarget::Unresolved { import_index: 7 },
+                declaration: diagnostic_name("Nested.missing"),
+                decl_interface_hash: [0x03; 32],
+            },
+            ReferenceCheckReference::Local {
+                owner_import: None,
+                declaration_index: 4,
+                declaration: Some(diagnostic_name("Current.local")),
+            },
+            ReferenceCheckReference::LocalGenerated {
+                owner_import: None,
+                declaration_index: 5,
+                declaration: diagnostic_name("Current.generated"),
+            },
+            ReferenceCheckReference::Local {
+                owner_import: Some(owner.clone()),
+                declaration_index: 6,
+                declaration: None,
+            },
+            ReferenceCheckReference::LocalGenerated {
+                owner_import: Some(owner),
+                declaration_index: 8,
+                declaration: diagnostic_name("Imported.generated"),
+            },
+        ];
+
+        for context in contexts {
+            let error = ReferenceCheckError::unknown_reference(
+                ReferenceCertificateSection::Declarations,
+                37,
+                context.clone(),
+            );
+            assert_eq!(error.kind, ReferenceCheckErrorKind::TypeCheck);
+            assert_eq!(error.reason, Some(ReferenceCheckReason::UnknownReference));
+            assert_eq!(error.section, ReferenceCertificateSection::Declarations);
+            assert_eq!(error.offset, 37);
+            assert_eq!(error.reference, Some(context));
+        }
+    }
+
+    #[test]
+    fn unknown_reference_context_disambiguates_the_same_offset() {
+        let local = ReferenceCheckError::unknown_reference(
+            ReferenceCertificateSection::Declarations,
+            91,
+            ReferenceCheckReference::Local {
+                owner_import: None,
+                declaration_index: 0,
+                declaration: Some(diagnostic_name("Current.local")),
+            },
+        );
+        let imported = ReferenceCheckError::unknown_reference(
+            ReferenceCertificateSection::Declarations,
+            91,
+            ReferenceCheckReference::Imported {
+                owner_import: None,
+                import: ReferenceCheckImportTarget::Unresolved { import_index: 0 },
+                declaration: diagnostic_name("Imported.missing"),
+                decl_interface_hash: [0x44; 32],
+            },
+        );
+
+        assert_eq!(local.offset, imported.offset);
+        assert_ne!(local.reference, imported.reference);
+    }
+
+    #[test]
+    fn unknown_reference_call_site_inventory_preserves_universe_exceptions() {
+        let source = include_str!("decode.rs");
+        let production_source = source
+            .split_once("#[cfg(test)]")
+            .map(|(production_source, _)| production_source)
+            .expect("decode tests remain separated from production code");
+        assert_eq!(
+            production_source
+                .matches("ReferenceCheckError::unknown_reference(")
+                .count(),
+            14
+        );
+        assert_eq!(
+            production_source
+                .matches("ReferenceCheckReason::UnknownReference")
+                .count(),
+            2
+        );
+
+        let universe_error = ReferenceCheckError::type_check(
+            ReferenceCertificateSection::Declarations,
+            13,
+            ReferenceCheckReason::UnknownReference,
+        );
+        assert_eq!(universe_error.reference, None);
+    }
+
     #[test]
     fn public_api_is_certificate_bytes_import_store_and_policy_only() {
         let _: fn(&[u8], &ReferenceImportStore, &ReferenceCheckerPolicy) -> ReferenceCheckResult =
@@ -3247,6 +3560,7 @@ mod tests {
                 section: ReferenceCertificateSection::HeaderFormat,
                 offset: 0,
                 reason: None,
+                reference: None,
             })
         );
     }
@@ -3281,6 +3595,7 @@ mod tests {
                 section: ReferenceCertificateSection::HeaderFormat,
                 offset: 1,
                 reason: Some(ReferenceCheckReason::FormatMismatch),
+                reference: None,
             })
         );
     }
@@ -3423,7 +3738,7 @@ mod tests {
 
     #[test]
     fn hash_verifier_rejects_decl_certificate_hash_mismatch_by_object() {
-        let fixture = axiom_certificate_fixture();
+        let fixture = axiom_certificate_fixture_with_axiom_dependencies(false);
         let mut cert = fixture.bytes;
         cert[fixture.decl_certificate_hash_offset] ^= 0x01;
 
@@ -3435,6 +3750,23 @@ mod tests {
             ReferenceCertificateSection::Declarations,
             fixture.decl_certificate_hash_offset,
             ReferenceHashObject::DeclCertificate,
+        );
+    }
+
+    #[test]
+    fn hash_verifier_classifies_dependency_material_hash_mismatch() {
+        let fixture = axiom_certificate_fixture_with_axiom_dependencies(true);
+        let mut cert = fixture.bytes;
+        cert[fixture.decl_certificate_hash_offset] ^= 0x01;
+
+        let error = verify_certificate_hashes(&cert)
+            .expect_err("dependency-bearing declaration certificate hash mismatch rejects");
+
+        assert_hash_mismatch(
+            error,
+            ReferenceCertificateSection::Declarations,
+            fixture.decl_certificate_hash_offset,
+            ReferenceHashObject::DeclCertificateDependencyMaterial,
         );
     }
 
@@ -4156,6 +4488,116 @@ mod tests {
     }
 
     #[test]
+    fn inductive_rejects_constructor_field_above_declared_sort_with_structured_error() {
+        let terms = [
+            TestTerm::Sort(1),
+            TestTerm::ConstLocal { decl_index: 0 },
+            TestTerm::Pi { ty: 0, body: 1 },
+        ];
+        let fixture = single_inductive_certificate_fixture(
+            &terms,
+            TestInductiveSpec {
+                names: vec![
+                    &["Audit", "Code"],
+                    &["Audit", "Code", "mk"],
+                    &["Std", "Nat"],
+                ],
+                name: 0,
+                universe_params: vec![],
+                params: vec![],
+                indices: vec![],
+                sort: 1,
+                constructors: vec![TestConstructorSpec { name: 1, ty: 2 }],
+                recursor: None,
+            },
+        );
+
+        let result = check_certificate(
+            &fixture.bytes,
+            &ReferenceImportStore::default(),
+            &ReferenceCheckerPolicy::default(),
+        );
+
+        assert_type_check(
+            result.error().unwrap().clone(),
+            ReferenceCheckReason::ConstructorUniverseBoundViolation,
+        );
+    }
+
+    #[test]
+    fn inductive_universe_bound_preserves_canonical_prop_exception() {
+        let terms = [
+            TestTerm::Sort(0),
+            TestTerm::Sort(1),
+            TestTerm::ConstLocal { decl_index: 0 },
+            TestTerm::Pi { ty: 1, body: 2 },
+        ];
+        let fixture = single_inductive_certificate_fixture(
+            &terms,
+            TestInductiveSpec {
+                names: vec![
+                    &["Audit", "PropBox"],
+                    &["Audit", "PropBox", "mk"],
+                    &["Std", "Nat"],
+                ],
+                name: 0,
+                universe_params: vec![],
+                params: vec![],
+                indices: vec![],
+                sort: 0,
+                constructors: vec![TestConstructorSpec { name: 1, ty: 3 }],
+                recursor: None,
+            },
+        );
+
+        let result = check_certificate(
+            &fixture.bytes,
+            &ReferenceImportStore::default(),
+            &ReferenceCheckerPolicy::default(),
+        );
+        assert!(result.is_checked(), "Prop fixture rejected: {result:?}");
+    }
+
+    #[test]
+    fn inductive_universe_bound_checks_dependent_fields_sequentially() {
+        let terms = [
+            TestTerm::Sort(2),
+            TestTerm::Sort(1),
+            TestTerm::BVar(0),
+            TestTerm::ConstLocal { decl_index: 0 },
+            TestTerm::Pi { ty: 2, body: 3 },
+            TestTerm::Pi { ty: 1, body: 4 },
+        ];
+        let fixture = single_inductive_certificate_fixture(
+            &terms,
+            TestInductiveSpec {
+                names: vec![
+                    &["Audit", "DependentStore"],
+                    &["Audit", "DependentStore", "mk"],
+                    &["Std", "Nat"],
+                ],
+                name: 0,
+                universe_params: vec![],
+                params: vec![],
+                indices: vec![],
+                sort: 2,
+                constructors: vec![TestConstructorSpec { name: 1, ty: 5 }],
+                recursor: None,
+            },
+        );
+
+        let result = check_certificate(
+            &fixture.bytes,
+            &ReferenceImportStore::default(),
+            &ReferenceCheckerPolicy::default(),
+        );
+        assert!(
+            result.is_checked(),
+            "dependent fixture rejected: {result:?}"
+        );
+    }
+
+    #[test]
     fn inductive_rejects_recursor_result_mismatch_with_structured_error() {
         let terms = [
             TestTerm::Sort(0),
@@ -4439,17 +4881,13 @@ mod tests {
     }
 
     #[test]
-    fn proof_corpus_eq_reasoning_uses_checked_std_logic_eq_builtin_bridge() {
-        let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .and_then(Path::parent)
-            .expect("checker crate lives under crates/");
-        let logic_bytes =
-            fs::read(repo.join("proofs/vendor/npa-std/Std/Logic/Eq/certificate.npcert"))
-                .expect("proof corpus Std.Logic.Eq certificate fixture is readable");
-        let eq_reasoning_bytes =
-            fs::read(repo.join("proofs/Proofs/Ai/EqReasoning/certificate.npcert"))
-                .expect("proof corpus EqReasoning certificate fixture is readable");
+    fn eq_reasoning_fixture_uses_checked_std_logic_eq_builtin_bridge() {
+        let logic_bytes = include_bytes!(
+            "../../../testdata/package/proofs/vendor/npa-std/Std/Logic/Eq/certificate.npcert"
+        );
+        let eq_reasoning_bytes = include_bytes!(
+            "../../../testdata/package/proofs/Proofs/Ai/EqReasoning/certificate.npcert"
+        );
         let policy = ReferenceCheckerPolicy {
             trust_mode: ReferenceTrustMode::HighTrust,
             allowed_axioms: vec!["Eq.rec".to_owned()],
@@ -4457,56 +4895,17 @@ mod tests {
             ..ReferenceCheckerPolicy::default()
         };
         let ReferenceCheckResult::Checked(logic) =
-            check_certificate(&logic_bytes, &ReferenceImportStore::default(), &policy)
+            check_certificate(logic_bytes, &ReferenceImportStore::default(), &policy)
         else {
             panic!("Std.Logic.Eq fixture must check before it can be imported");
         };
         let store = ReferenceImportStore::from_checked_modules([logic]).unwrap();
 
-        let result = check_certificate(&eq_reasoning_bytes, &store, &policy);
+        let result = check_certificate(eq_reasoning_bytes, &store, &policy);
 
         assert!(
             result.is_checked(),
             "checked Std.Logic.Eq exports must bridge Eq, Eq.refl, and Eq.rec to canonical builtins"
-        );
-    }
-
-    #[test]
-    fn proof_corpus_cardinal_arithmetic_accepts_normalized_const_universe_levels() {
-        let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .and_then(Path::parent)
-            .expect("checker crate lives under crates/");
-        let import_paths = [
-            "proofs/vendor/npa-std/Std/Logic/Eq/certificate.npcert",
-            "proofs/Proofs/Ai/EqReasoning/certificate.npcert",
-            "proofs/Proofs/Ai/Logic/Iff/certificate.npcert",
-            "proofs/Proofs/Ai/SetTheory/Basic/certificate.npcert",
-            "proofs/Proofs/Ai/SetTheory/Cardinal/Basic/certificate.npcert",
-        ];
-        let import_bytes = import_paths
-            .into_iter()
-            .map(|path| {
-                fs::read(repo.join(path)).unwrap_or_else(|error| {
-                    panic!("{path} certificate fixture is readable: {error}")
-                })
-            })
-            .collect::<Vec<_>>();
-        let store = ReferenceImportStore::from_source_free_certificates(
-            import_bytes.iter().map(Vec::as_slice),
-        )
-        .expect("proof corpus import store builds");
-        let cardinal_arithmetic_bytes = fs::read(
-            repo.join("proofs/Proofs/Ai/SetTheory/Cardinal/Arithmetic/certificate.npcert"),
-        )
-        .expect("Cardinal.Arithmetic certificate fixture is readable");
-        let policy = ReferenceCheckerPolicy::default();
-
-        let result = check_certificate(&cardinal_arithmetic_bytes, &store, &policy);
-
-        assert!(
-            result.is_checked(),
-            "const universe arguments must compare by normalized level equality: {result:?}"
         );
     }
 
@@ -4586,6 +4985,7 @@ mod tests {
                 section: ReferenceCertificateSection::Imports,
                 offset,
                 reason: Some(ReferenceCheckReason::NonCanonicalUvar),
+                reference: None,
             }
         );
     }
@@ -4706,6 +5106,7 @@ mod tests {
                 section: ReferenceCertificateSection::FullCertificate,
                 offset,
                 reason: Some(ReferenceCheckReason::TrailingBytes),
+                reference: None,
             }
         );
     }
@@ -4725,6 +5126,7 @@ mod tests {
                 section: ReferenceCertificateSection::HeaderFormat,
                 offset: 1,
                 reason: Some(ReferenceCheckReason::InvalidUtf8),
+                reference: None,
             }
         );
     }
@@ -4954,10 +5356,65 @@ mod tests {
         reference_context
             .entails(&[rc_le(rmax(rp("u"), rp("v")), rp("w"))], 0)
             .unwrap();
+
+        kernel_context
+            .entails(&[UniverseConstraint::le(
+                Level::param("u"),
+                Level::max(Level::param("v"), Level::param("w")),
+            )])
+            .unwrap();
+        reference_context
+            .entails(&[rc_le(rp("u"), rmax(rp("v"), rp("w")))], 0)
+            .unwrap();
+
+        assert!(!kernel_context
+            .entails_level_le(
+                &Level::succ(Level::param("v")),
+                &Level::max(Level::param("u"), Level::param("w")),
+            )
+            .unwrap());
+        assert!(!reference_context
+            .entails_level_le(&rs(rp("v")), &rmax(rp("u"), rp("w")), 0,)
+            .unwrap());
+
+        assert!(kernel_context
+            .entails_level_le(
+                &Level::imax(Level::succ(Level::zero()), Level::param("u")),
+                &Level::max(Level::succ(Level::zero()), Level::param("u")),
+            )
+            .unwrap());
+        assert!(reference_context
+            .entails_level_le(&rimax(rs(rz()), rp("u")), &rmax(rs(rz()), rp("u")), 0,)
+            .unwrap());
     }
 
     #[test]
     fn universe_constraint_semantics_match_kernel_for_rejections() {
+        let kernel_context = UniverseContext::from_params(vec!["u".to_owned()]).unwrap();
+        let reference_context =
+            ReferenceUniverseContext::from_params(ref_params(&["u"]), 0).unwrap();
+        let kernel_rhs = Level::IMax(
+            Box::new(Level::succ(Level::zero())),
+            Box::new(Level::param("u")),
+        );
+        let reference_rhs = rimax(rs(rz()), rp("u"));
+
+        assert!(matches!(
+            kernel_context.entails_level_le(
+                &Level::max(Level::succ(Level::zero()), Level::param("u")),
+                &kernel_rhs,
+            ),
+            Err(Error::UnsupportedUniverseConstraint { .. })
+        ));
+        assert_eq!(
+            reason(
+                reference_context
+                    .entails_level_le(&rmax(rs(rz()), rp("u")), &reference_rhs, 0)
+                    .unwrap_err()
+            ),
+            Some(ReferenceCheckReason::UnsupportedUniverseConstraint)
+        );
+
         assert_eq!(
             UniverseContext::new(
                 vec!["u".to_owned()],
@@ -5058,6 +5515,29 @@ mod tests {
         assert_eq!(
             reason(
                 ReferenceUniverseContext::from_params(too_many_reference_params, 0).unwrap_err()
+            ),
+            Some(ReferenceCheckReason::ResourceLimit)
+        );
+
+        let bounded_reference_params = (0..64)
+            .map(|index| ref_name(&format!("v{index:03}")))
+            .collect::<Vec<_>>();
+        let reference_context =
+            ReferenceUniverseContext::from_params(bounded_reference_params.clone(), 0).unwrap();
+        let max_level = |params: &[ReferenceModuleName]| {
+            params.iter().cloned().fold(rz(), |level, param| {
+                rmax(level, ReferenceCoreLevel::Param(param))
+            })
+        };
+        assert_eq!(
+            reason(
+                reference_context
+                    .entails_level_le(
+                        &max_level(&bounded_reference_params[..32]),
+                        &max_level(&bounded_reference_params[31..]),
+                        0,
+                    )
+                    .unwrap_err()
             ),
             Some(ReferenceCheckReason::ResourceLimit)
         );

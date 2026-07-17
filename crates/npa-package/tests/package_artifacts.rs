@@ -219,7 +219,7 @@ fn assert_artifact_error(
 
 #[test]
 fn package_artifacts_checked_in_generated_axiom_report_and_theorem_index_parse_source_free() {
-    let root = repo_root().join("proofs/generated");
+    let root = repo_root().join("testdata/package/proofs/generated");
     let report_source = fs::read_to_string(root.join("axiom-report.json")).unwrap();
     let index_source = fs::read_to_string(root.join("theorem-index.json")).unwrap();
     let report = parse_package_axiom_report_json(&report_source).unwrap();

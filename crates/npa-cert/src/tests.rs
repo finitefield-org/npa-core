@@ -194,6 +194,38 @@ fn universe_meta_param_certificate_bytes() -> Vec<u8> {
 }
 
 #[test]
+fn decode_with_import_offsets_preserves_import_order() {
+    let id_cert = build_module_cert(id_module("A", "x"), &[]).unwrap();
+    let mut session = VerifierSession::new();
+    let verified_id = verify_cert(&id_cert, &mut session);
+    let use_id_cert = build_module_cert(use_id_module(), &[verified_id]).unwrap();
+    let bytes = encode_module_cert(&use_id_cert).unwrap();
+
+    let (decoded, import_offsets) = decode_module_cert_with_import_offsets(&bytes).unwrap();
+
+    assert_eq!(decoded, use_id_cert);
+    assert_eq!(import_offsets.len(), decoded.imports.len());
+    assert_eq!(import_offsets.len(), 1);
+    assert!(import_offsets[0] < bytes.len());
+}
+
+#[test]
+fn hash_only_verification_rejects_a_corrupted_stored_certificate_hash() {
+    let cert = build_module_cert(id_module("HashOnly", "x"), &[]).unwrap();
+    let mut bytes = encode_module_cert(&cert).unwrap();
+    let last = bytes.last_mut().expect("certificate hash trailer");
+    *last ^= 1;
+
+    assert!(matches!(
+        verify_module_cert_hashes(&bytes),
+        Err(CertError::HashMismatch {
+            object: HashObject::ModuleCertificate,
+            ..
+        })
+    ));
+}
+
+#[test]
 fn canonical_certificate_name_grammar_allows_ascii_prime() {
     assert!(Name::from_dotted("Math.Algebra.eq_trans'").is_canonical());
     assert!(Name::from_dotted("Foo.Bar.baz''").is_canonical());
@@ -1288,6 +1320,7 @@ fn vec_inductive_base() -> InductiveDecl {
         ],
         None,
     )
+    .with_universe_constraints(vec![UniverseConstraint::le(type0(), u)])
 }
 
 fn fin_type(n: Expr) -> Expr {
@@ -1689,6 +1722,10 @@ fn recursor_artifact_hashes(cert: &ModuleCert) -> (Hash, Hash) {
             DeclPayload::Inductive {
                 recursor: Some(recursor),
                 ..
+            }
+            | DeclPayload::InductiveConstrained {
+                recursor: Some(recursor),
+                ..
             } => Some(recursor),
             _ => None,
         })
@@ -1702,6 +1739,11 @@ fn recursor_artifact_hashes_for(cert: &ModuleCert, name: &str) -> (Hash, Hash) {
         .iter()
         .find_map(|decl| match &decl.decl {
             DeclPayload::Inductive {
+                name: decl_name,
+                recursor: Some(recursor),
+                ..
+            }
+            | DeclPayload::InductiveConstrained {
                 name: decl_name,
                 recursor: Some(recursor),
                 ..
@@ -2611,6 +2653,35 @@ fn transitive_imported_builtin_axioms_remain_builtin() {
 #[test]
 fn current_builtin_eq_rec_can_coexist_with_imported_eq_shape() {
     let eq_cert = build_module_cert(eq_axiom_module_without_rec(), &[]).unwrap();
+    let mut session = VerifierSession::new();
+    let verified_eq = verify_module_cert(
+        &encode_module_cert(&eq_cert).unwrap(),
+        &mut session,
+        &AxiomPolicy::normal(),
+    )
+    .unwrap();
+
+    let use_eq_rec_cert =
+        build_module_cert(use_builtin_eq_rec_with_imported_eq_module(), &[verified_eq]).unwrap();
+    let axiom = use_eq_rec_cert
+        .axiom_report
+        .module_axioms
+        .iter()
+        .find(|axiom| use_eq_rec_cert.name_table[axiom.name] == Name::from_dotted("Eq.rec"))
+        .expect("current module should report the builtin Eq.rec axiom");
+
+    assert!(matches!(axiom.global_ref, GlobalRef::Builtin { .. }));
+    verify_module_cert(
+        &encode_module_cert(&use_eq_rec_cert).unwrap(),
+        &mut session,
+        &AxiomPolicy::normal(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn current_builtin_eq_rec_remains_builtin_when_import_exports_builtin_eq_rec() {
+    let eq_cert = build_module_cert(eq_module(), &[]).unwrap();
     let mut session = VerifierSession::new();
     let verified_eq = verify_module_cert(
         &encode_module_cert(&eq_cert).unwrap(),
@@ -3586,6 +3657,7 @@ fn indexed_inductive_generated_recursor_artifact_hashes_are_stable_and_scoped() 
             matches!(
                 &decl.decl,
                 DeclPayload::Inductive { name, .. }
+                    | DeclPayload::InductiveConstrained { name, .. }
                     if cert.name_table[*name] == Name::from_dotted("Vec")
             )
         })
@@ -3595,6 +3667,10 @@ fn indexed_inductive_generated_recursor_artifact_hashes_are_stable_and_scoped() 
     let mut rules_changed = cert.clone();
     match &mut rules_changed.declarations[vec_index].decl {
         DeclPayload::Inductive {
+            recursor: Some(recursor),
+            ..
+        }
+        | DeclPayload::InductiveConstrained {
             recursor: Some(recursor),
             ..
         } => recursor.rules.major_index += 1,

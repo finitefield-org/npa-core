@@ -1,8 +1,7 @@
 # NPA Core Implementation Specification v0.2.0
 
-This document records the core behavior implemented by the current v0.2.0
-Rust crates. It supersedes the historical v0.1.2 implementation snapshot for
-certificate-format and universe-constraint behavior.
+This document records the certificate-format and universe-constraint behavior
+implemented by the current v0.2.0 Rust crates.
 
 New certificates use:
 
@@ -191,11 +190,31 @@ The implemented solver is a conservative difference-constraint fragment.
 `UniverseContext` decomposes supported constraints into atom inequalities over
 `zero`, declared universe parameters, and finite `succ` offsets. `max` is
 supported on the left-hand side by decomposing it into obligations for each
-atom. Equality is checked as both directions of `<=`. `imax` is supported only
-when deterministic level normalization reduces it to this fragment. A
-right-hand side that decomposes to multiple atoms, nonlinear arithmetic, or any
-level shape outside this fragment is rejected as an unsupported universe
-constraint.
+atom. A symbolic left-hand `imax a b` is handled by the same decomposition as
+`max a b`: this is conservative because `imax a b <= max a b` for every
+valuation, so the approximation may reject a valid constraint but cannot admit
+an invalid one. Equality is checked as both directions of `<=`. Other `imax`
+uses are supported only when deterministic level normalization reduces them to
+the atom fragment. A right-hand symbolic `imax`, a right-hand side that
+decomposes to multiple atoms in a stored constraint, nonlinear arithmetic, or
+any other level shape outside this fragment is rejected as an unsupported
+universe constraint.
+
+This rule expands the trusted universe-checking behavior in both the Rust
+kernel and the independent reference checker. Exact symbolic `imax` case
+splitting was not added: it would enlarge the solver and its proof surface.
+The checking boundary is therefore deliberately asymmetric—only a left-hand
+`imax` receives the sound upper-bound approximation, while a symbolic
+right-hand `imax` remains fail-closed.
+
+Entailment obligations are slightly more expressive than stored assumptions:
+a finite `max` is supported on the right-hand side. To prove
+`max lhs_atoms <= max rhs_atoms`, each left atom must have at least one right
+atom that bounds it in the closed difference relation. This obligation-only
+rule is used for instantiated public-signature constraints and constructor
+field bounds. It does not permit a stored declaration constraint with a
+multi-atom right-hand side. All semantic implementations cap the atom-pair
+search at the universe-constraint resource limit.
 
 The kernel and reference checker reject unsatisfiable declaration contexts. A
 constant reference checks universe arity and well-formed level arguments, then
@@ -367,6 +386,31 @@ Pi fields, I params index_args
 
 Constructors returning a non-target type, wrong parameter count, wrong
 universe arguments, or non-canonical parameter arguments are rejected.
+
+Let the family result be `Sort u`, and let the constructor have `p` uniform
+parameter domains followed by non-parameter domains. Constructor domains are
+checked sequentially under all preceding domains. If a non-parameter domain
+type inhabits `Sort v`, the declaration universe context must entail:
+
+```text
+v <= u
+```
+
+The first `p` constructor domains are the canonical uniform-parameter prefix
+and are excluded from this bound. Every later domain is included, including
+index-determining, recursive, mutually recursive, and dependent fields. The
+check uses inferred sorts rather than surface syntax and does not infer a
+missing universe constraint.
+
+A family is exempt only when its normalized declared sort is syntactically
+`Sort 0` (Prop). A universe parameter constrained equal to zero is not treated
+as Prop. This impredicative-field exception is paired with the existing rule
+that Prop recursor motives return Prop; singleton or other Prop-to-Type
+elimination exceptions are not implemented.
+
+Each member of a mutual block is checked against its own family sort using the
+block's shared universe context. A failure rejects the complete block before
+any family, constructor, or recursor artifact is installed.
 
 ### 8.4 Positivity
 

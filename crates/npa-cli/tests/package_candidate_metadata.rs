@@ -2,10 +2,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use npa_cli::args::{
-    PackageCandidateMetadataOptions, PackageCommonOptions, PackageIndexOptions, PackageTimingMode,
-};
+use npa_cli::args::{PackageCandidateMetadataOptions, PackageIndexOptions, PackageTimingMode};
 use npa_cli::diagnostic::{CommandExitCode, DiagnosticKind};
+use npa_cli::package_api::v1::common_options;
 use npa_cli::package_artifacts::{PACKAGE_LOCK_PATH, PACKAGE_THEOREM_INDEX_PATH};
 use npa_cli::package_build::run_package_build_certs_write;
 use npa_cli::package_candidate_metadata::run_package_export_candidate_metadata;
@@ -36,6 +35,36 @@ fn package_export_candidate_metadata_writes_metadata_for_checked_theorem_index_e
     assert!(metadata.contains("\"proof_evidence\": false"));
 
     fs::remove_file(metadata_path).unwrap();
+}
+
+#[test]
+fn package_export_candidate_metadata_rejects_root_qualified_outputs_before_prerequisites() {
+    let package = TempPackage::from_fixture("root-qualified");
+    fs::remove_file(package.artifact_path(PACKAGE_LOCK_PATH)).unwrap();
+    fs::remove_file(package.artifact_path(PACKAGE_THEOREM_INDEX_PATH)).unwrap();
+    let marker = package.path().file_name().unwrap().to_string_lossy();
+    let outputs = [
+        PathBuf::from(format!("{marker}/generated/name.metadata.json")),
+        PathBuf::from(format!(
+            "npa-project-example/{marker}/generated/name.metadata.json"
+        )),
+    ];
+
+    for out in outputs {
+        let result = run_export_at(
+            package.path(),
+            "Proofs.Ai.Algebra.AbstractGroup",
+            "group_conj_slide",
+            &out,
+        );
+
+        assert_repeated_root_failure(&result, &out);
+        assert_eq!(result.root, "<absolute-root>");
+        assert!(!package.artifact_path(&out).exists());
+        assert!(!result
+            .render_json()
+            .contains(&package.path().to_string_lossy().to_string()));
+    }
 }
 
 #[test]
@@ -135,18 +164,12 @@ fn package_export_candidate_metadata_after_regenerating_standalone_artifacts() {
     fs::remove_file(package.artifact_path(PACKAGE_LOCK_PATH)).unwrap();
     fs::remove_file(package.artifact_path(PACKAGE_THEOREM_INDEX_PATH)).unwrap();
 
-    let build = run_package_build_certs_write(PackageCommonOptions {
-        root: package.path().to_path_buf(),
-        json: true,
-    });
+    let build = run_package_build_certs_write(common_options(package.path(), true));
     assert_eq!(build.exit_code(), CommandExitCode::Success);
     assert!(package.artifact_path(PACKAGE_LOCK_PATH).exists());
 
     let index = run_package_index(PackageIndexOptions {
-        common: PackageCommonOptions {
-            root: package.path().to_path_buf(),
-            json: true,
-        },
+        common: common_options(package.path(), true),
         check: false,
         timings: PackageTimingMode::Off,
     });
@@ -196,14 +219,30 @@ fn run_export_at(
     out: &Path,
 ) -> npa_cli::diagnostic::CommandResult {
     run_package_export_candidate_metadata(PackageCandidateMetadataOptions {
-        common: PackageCommonOptions {
-            root: root.to_path_buf(),
-            json: true,
-        },
+        common: common_options(root, true),
         module: module.to_owned(),
         declaration: declaration.to_owned(),
         out: out.to_path_buf(),
     })
+}
+
+fn assert_repeated_root_failure(result: &npa_cli::diagnostic::CommandResult, out: &Path) {
+    assert_eq!(result.exit_code(), CommandExitCode::UsageOrInternal);
+    assert_eq!(result.diagnostics.len(), 1);
+    let diagnostic = &result.diagnostics[0];
+    assert_eq!(diagnostic.kind, DiagnosticKind::Usage);
+    assert_eq!(diagnostic.reason_code, "package_output_path_repeats_root");
+    assert_eq!(diagnostic.path.as_deref(), out.to_str());
+    assert_eq!(diagnostic.field.as_deref(), Some("--out"));
+    assert_eq!(
+        diagnostic.expected_value.as_deref(),
+        Some("path relative to --root without the package-root directory")
+    );
+    assert_eq!(
+        diagnostic.actual_value.as_deref(),
+        Some("root-qualified path")
+    );
+    assert!(result.artifacts.is_empty());
 }
 
 struct TempPackage {

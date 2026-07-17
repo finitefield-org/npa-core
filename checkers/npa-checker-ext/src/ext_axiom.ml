@@ -9,8 +9,6 @@ let default_policy =
 
 let policy_format = "npa.independent-checker.axiom_policy.v1"
 
-let legacy_policy_format = "npa.phase8.axiom_policy.v1"
-
 type policy_parse_error = {
   policy_field : string;
   expected_value : string;
@@ -49,6 +47,47 @@ let has_utf8_bom text =
   && Char.code text.[0] = 0xef
   && Char.code text.[1] = 0xbb
   && Char.code text.[2] = 0xbf
+
+let utf8_codepoint_at text index =
+  let byte offset = Char.code text.[index + offset] in
+  let first = byte 0 in
+  if first < 0x80 then (first, index + 1)
+  else if first < 0xe0 then
+    (((first land 0x1f) lsl 6) lor (byte 1 land 0x3f), index + 2)
+  else if first < 0xf0 then
+    ( ((first land 0x0f) lsl 12)
+      lor ((byte 1 land 0x3f) lsl 6)
+      lor (byte 2 land 0x3f),
+      index + 3 )
+  else
+    ( ((first land 0x07) lsl 18)
+      lor ((byte 1 land 0x3f) lsl 12)
+      lor ((byte 2 land 0x3f) lsl 6)
+      lor (byte 3 land 0x3f),
+      index + 4 )
+
+let is_policy_whitespace codepoint =
+  (codepoint >= 0x0009 && codepoint <= 0x000d)
+  || codepoint = 0x0020 || codepoint = 0x0085 || codepoint = 0x00a0
+  || codepoint = 0x1680
+  || (codepoint >= 0x2000 && codepoint <= 0x200a)
+  || codepoint = 0x2028 || codepoint = 0x2029 || codepoint = 0x202f
+  || codepoint = 0x205f || codepoint = 0x3000
+
+let trim_policy_whitespace text =
+  let rec loop index first last =
+    if index >= String.length text then
+      match first with
+      | None -> ""
+      | Some start -> String.sub text start (last - start)
+    else
+      let codepoint, next = utf8_codepoint_at text index in
+      if is_policy_whitespace codepoint then loop next first last
+      else
+        let first = match first with None -> Some index | Some _ -> first in
+        loop next first next
+  in
+  loop 0 None 0
 
 let schema_path_component value =
   let length = String.length value in
@@ -133,18 +172,18 @@ let collect_policy_assignments source =
       match strip_toml_comment line with
       | Error err -> Error err
       | Ok without_comment ->
-          let trimmed = String.trim without_comment in
+          let trimmed = trim_policy_whitespace without_comment in
           if trimmed = "" then loop (index + 1) assignments
           else if starts_with trimmed "[" then (
             match find_char_from trimmed 0 ']' with
             | None -> policy_invalid_toml ()
             | Some close_index ->
-                if String.trim (String.sub trimmed (close_index + 1)
+                if trim_policy_whitespace (String.sub trimmed (close_index + 1)
                                   (String.length trimmed - close_index - 1))
                    <> ""
                 then policy_invalid_toml ()
                 else
-                  let key = String.trim (String.sub trimmed 1 (close_index - 1)) in
+                  let key = trim_policy_whitespace (String.sub trimmed 1 (close_index - 1)) in
                   if key = "" then policy_invalid_toml ()
                   else
                     loop (index + 1)
@@ -154,16 +193,16 @@ let collect_policy_assignments source =
             match find_char_from trimmed 0 '=' with
             | None -> policy_invalid_toml ()
             | Some eq_index ->
-                let key = String.trim (String.sub trimmed 0 eq_index) in
+                let key = trim_policy_whitespace (String.sub trimmed 0 eq_index) in
                 if key = "" || not (key_path_valid key) then policy_invalid_toml ()
                 else
                   let value =
-                    String.trim
+                    trim_policy_whitespace
                       (String.sub trimmed (eq_index + 1)
                          (String.length trimmed - eq_index - 1))
                   in
                   let rec collect_array current_index value =
-                    if starts_with (String.trim value) "[" then
+                    if starts_with (trim_policy_whitespace value) "[" then
                       match toml_array_closed value with
                       | Error err -> Error err
                       | Ok true -> Ok (current_index, value)
@@ -177,7 +216,7 @@ let collect_policy_assignments source =
                             | Ok next_without_comment ->
                                 collect_array next_index
                                   (value ^ "\n"
-                                  ^ String.trim next_without_comment))
+                                  ^ trim_policy_whitespace next_without_comment))
                     else Ok (current_index, value)
                   in
                   (match collect_array index value with
@@ -193,9 +232,8 @@ let toml_skip_ws value index =
   let rec loop index =
     if index >= String.length value then index
     else
-      match value.[index] with
-      | ' ' | '\t' | '\n' | '\r' -> loop (index + 1)
-      | _ -> index
+      let codepoint, next = utf8_codepoint_at value index in
+      if is_policy_whitespace codepoint then loop next else index
   in
   loop index
 
@@ -237,26 +275,19 @@ let parse_toml_basic_string_at value start =
     loop (start + 1)
 
 let parse_toml_string_value value =
-  let trimmed = String.trim value in
+  let trimmed = trim_policy_whitespace value in
   if trimmed = "null" then policy_invalid_toml ()
   else if not (starts_with trimmed "\"") then Ok None
   else
     match parse_toml_basic_string_at trimmed 0 with
     | Error err -> Error err
     | Ok (text, next) ->
-        if String.trim (String.sub trimmed next (String.length trimmed - next)) = "" then
+        if trim_policy_whitespace (String.sub trimmed next (String.length trimmed - next)) = "" then
           Ok (Some text)
         else policy_invalid_toml ()
 
-let parse_toml_bool_value field value =
-  let trimmed = String.trim value in
-  if trimmed = "null" then policy_invalid_toml ()
-  else if trimmed = "true" then Ok true
-  else if trimmed = "false" then Ok false
-  else policy_parse_error field "bool" "wrong_type"
-
 let parse_toml_string_array_value value =
-  let trimmed = String.trim value in
+  let trimmed = trim_policy_whitespace value in
   if trimmed = "null" then policy_invalid_toml ()
   else if not (starts_with trimmed "[") then Ok None
   else
@@ -265,7 +296,7 @@ let parse_toml_string_array_value value =
       if index >= String.length trimmed then policy_invalid_toml ()
       else if trimmed.[index] = ']' then
         let next = index + 1 in
-        if String.trim (String.sub trimmed next (String.length trimmed - next)) = "" then
+        if trim_policy_whitespace (String.sub trimmed next (String.length trimmed - next)) = "" then
           Ok (Some (List.rev entries))
         else policy_invalid_toml ()
       else
@@ -283,7 +314,7 @@ let parse_toml_string_array_value value =
                 | _ -> find_end (cursor + 1)
             in
             let end_index = find_end index in
-            let raw = String.trim (String.sub trimmed index (end_index - index)) in
+            let raw = trim_policy_whitespace (String.sub trimmed index (end_index - index)) in
             if raw = "null" then policy_invalid_toml ()
             else Ok (Policy_non_string, end_index)
         in
@@ -344,8 +375,10 @@ let validate_policy_allowed_axioms assignment =
             match remaining with
             | [] -> Ok ()
             | name :: rest ->
-                let cmp = String.compare (Ext_name.to_string name)
-                    (Ext_name.to_string previous)
+                let cmp =
+                  String.compare
+                    (Ext_canonical.encode_name name)
+                    (Ext_canonical.encode_name previous)
                 in
                 if cmp < 0 then
                   policy_parse_error
@@ -374,7 +407,8 @@ let validate_policy_allowed_axioms assignment =
               check_duplicates 0 [] names))
 
 let parse_policy_toml source =
-  if has_utf8_bom source then policy_invalid_toml ()
+  if Ext_bytes.utf8_invalid_offset source <> None || has_utf8_bom source then
+    policy_invalid_toml ()
   else
     match collect_policy_assignments source with
     | Error err -> Error err
@@ -384,7 +418,9 @@ let parse_policy_toml source =
         | Ok () ->
             let parse_format policy =
               match find_policy_assignment "format" assignments with
-              | None -> Ok policy
+              | None ->
+                  policy_parse_error "axiom_policy.format" policy_format
+                    "missing"
               | Some assignment -> (
                   match parse_toml_string_value assignment.assignment_value with
                   | Error err -> Error err
@@ -392,26 +428,17 @@ let parse_policy_toml source =
                       policy_parse_error "axiom_policy.format" policy_format
                         "wrong_type"
                   | Ok (Some value) ->
-                      if value = policy_format || value = legacy_policy_format then
+                      if value = policy_format then
                         Ok policy
                       else
                         policy_parse_error "axiom_policy.format" policy_format
                           "invalid_fixed_value")
             in
-            let parse_bool_field key update policy =
-              match find_policy_assignment key assignments with
-              | None -> Ok policy
-              | Some assignment -> (
-                  match
-                    parse_toml_bool_value (policy_field_for_key key)
-                      assignment.assignment_value
-                  with
-                  | Error err -> Error err
-                  | Ok value -> Ok (update policy value))
-            in
             let parse_allowed policy =
               match find_policy_assignment "allowed_axioms" assignments with
-              | None -> Ok policy
+              | None ->
+                  policy_parse_error "axiom_policy.allowed_axioms" "array"
+                    "missing"
               | Some assignment -> (
                   match validate_policy_allowed_axioms assignment with
                   | Error err -> Error err
@@ -419,8 +446,7 @@ let parse_policy_toml source =
             in
             let parse_unknown policy =
               let known key =
-                key = "format" || key = "deny_sorry"
-                || key = "deny_custom_axioms" || key = "allowed_axioms"
+                key = "format" || key = "allowed_axioms"
               in
               let unknown =
                 List.filter
@@ -446,18 +472,7 @@ let parse_policy_toml source =
               | Ok value -> f value
             in
             bind_policy (parse_format default_policy) (fun policy ->
-                bind_policy
-                  (parse_bool_field "deny_sorry"
-                     (fun policy value -> { policy with deny_sorry = value })
-                     policy)
-                  (fun policy ->
-                    bind_policy
-                      (parse_bool_field "deny_custom_axioms"
-                         (fun policy value ->
-                           { policy with deny_custom_axioms = value })
-                         policy)
-                      (fun policy ->
-                        bind_policy (parse_allowed policy) parse_unknown))))
+                bind_policy (parse_allowed policy) parse_unknown))
 
 type error = {
   section : Ext_bytes.certificate_section;

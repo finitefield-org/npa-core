@@ -7,14 +7,15 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use npa_checker_ref::{
-    check_certificate, decode_certificate, ReferenceCertificateSection, ReferenceCheckError,
-    ReferenceCheckErrorKind, ReferenceCheckReason, ReferenceCheckResult, ReferenceCheckerPolicy,
+    check_certificate, decode_certificate, reference_checker_build_hash,
+    ReferenceCertificateSection, ReferenceCheckError, ReferenceCheckErrorKind,
+    ReferenceCheckImportTarget, ReferenceCheckReason, ReferenceCheckReference,
+    ReferenceCheckResolvedImportIdentity, ReferenceCheckResult, ReferenceCheckerPolicy,
     ReferenceHash, ReferenceHashObject, ReferenceImportStore, ReferenceTrustMode,
-    REFERENCE_CERTIFICATE_FORMAT, REFERENCE_CORE_SPEC,
+    REFERENCE_CHECKER_ID, REFERENCE_CHECKER_VERSION,
 };
 use sha2::{Digest, Sha256};
 
-const CHECKER_ID: &str = "npa-checker-ref";
 const CHECKER_RAW_RESULT_SCHEMA: &str = "npa.independent-checker.checker_raw_result.v1";
 
 fn main() -> ExitCode {
@@ -424,9 +425,9 @@ fn raw_checked_json(
     format!(
         "{{\"schema\":\"{}\",\"checker_id\":\"{}\",\"checker_version\":\"{}\",\"checker_build_hash\":\"{}\",\"status\":\"checked\",\"module\":{},\"certificate_hash\":\"{}\",\"export_hash\":\"{}\",\"axiom_report_hash\":\"{}\"}}",
         CHECKER_RAW_RESULT_SCHEMA,
-        CHECKER_ID,
-        env!("CARGO_PKG_VERSION"),
-        format_hash(&checker_build_hash()),
+        REFERENCE_CHECKER_ID,
+        REFERENCE_CHECKER_VERSION,
+        format_hash(&reference_checker_build_hash()),
         json_string(&module),
         format_hash(certificate_hash),
         format_hash(export_hash),
@@ -440,11 +441,11 @@ fn raw_rejected_json(
 ) -> String {
     let mut fields = vec![
         format!("\"schema\":\"{}\"", CHECKER_RAW_RESULT_SCHEMA),
-        format!("\"checker_id\":\"{}\"", CHECKER_ID),
-        format!("\"checker_version\":\"{}\"", env!("CARGO_PKG_VERSION")),
+        format!("\"checker_id\":\"{}\"", REFERENCE_CHECKER_ID),
+        format!("\"checker_version\":\"{}\"", REFERENCE_CHECKER_VERSION),
         format!(
             "\"checker_build_hash\":\"{}\"",
-            format_hash(&checker_build_hash())
+            format_hash(&reference_checker_build_hash())
         ),
         "\"status\":\"failed\"".to_owned(),
     ];
@@ -463,21 +464,145 @@ fn raw_rejected_json(
 }
 
 fn raw_error_json(error: &ReferenceCheckError) -> String {
-    format!(
-        "{{\"kind\":\"{}\",\"section\":{},\"offset\":{}}}",
-        raw_error_kind(error),
-        json_string(section_name(error.section)),
-        error.offset
-    )
+    let mut fields = vec![format!("\"kind\":\"{}\"", raw_error_kind(error))];
+    let reason_code = match error.reason {
+        Some(ReferenceCheckReason::HashMismatch {
+            object:
+                ReferenceHashObject::DeclInterface
+                | ReferenceHashObject::DeclInterfaceDependencyMaterial,
+        }) => Some("decl_interface_hash_mismatch"),
+        Some(ReferenceCheckReason::HashMismatch {
+            object:
+                ReferenceHashObject::DeclCertificate
+                | ReferenceHashObject::DeclCertificateDependencyMaterial,
+        }) => Some("decl_certificate_hash_mismatch"),
+        Some(ReferenceCheckReason::ConstructorUniverseBoundViolation) => {
+            Some("constructor_universe_bound_violation")
+        }
+        Some(ReferenceCheckReason::UnknownReference) => Some("unknown_reference"),
+        _ => None,
+    };
+    if let Some(reason_code) = reason_code {
+        fields.push(format!("\"reason_code\":\"{reason_code}\""));
+    }
+    if let Some(reference) = &error.reference {
+        let (declaration, core_path) = reference_projection(reference);
+        if let Some(declaration) = declaration {
+            fields.push(format!("\"declaration\":{}", json_string(&declaration)));
+        }
+        if !core_path.is_empty() {
+            fields.push(format!(
+                "\"core_path\":[{}]",
+                core_path
+                    .iter()
+                    .map(|token| json_string(token))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ));
+        }
+    }
+    fields.push(format!(
+        "\"section\":{}",
+        json_string(section_name(error.section))
+    ));
+    fields.push(format!("\"offset\":{}", error.offset));
+    format!("{{{}}}", fields.join(","))
+}
+
+fn append_import_identity(path: &mut Vec<String>, identity: &ReferenceCheckResolvedImportIdentity) {
+    path.push(format!("module={}", identity.module.dotted()));
+    path.push(format!(
+        "export_hash={}",
+        format_hash(&identity.export_hash)
+    ));
+}
+
+fn append_import_target(path: &mut Vec<String>, target: &ReferenceCheckImportTarget) {
+    match target {
+        ReferenceCheckImportTarget::Unresolved { import_index, .. } => {
+            path.push(format!("imports[{import_index}]"));
+        }
+        ReferenceCheckImportTarget::Resolved(identity) => {
+            path.push(format!("imports[{}]", identity.import_index));
+            append_import_identity(path, identity);
+        }
+        _ => {}
+    }
+}
+
+fn append_owner_import_path(
+    path: &mut Vec<String>,
+    owner_import: &ReferenceCheckResolvedImportIdentity,
+) {
+    path.push(format!("imports[{}]", owner_import.import_index));
+    append_import_identity(path, owner_import);
+    path.push("public_environment".to_owned());
+}
+
+fn reference_projection(reference: &ReferenceCheckReference) -> (Option<String>, Vec<String>) {
+    match reference {
+        ReferenceCheckReference::Builtin { declaration, .. } => (
+            Some(declaration.dotted()),
+            vec!["reference".to_owned(), "builtin".to_owned()],
+        ),
+        ReferenceCheckReference::Imported {
+            owner_import,
+            import,
+            declaration,
+            ..
+        } => {
+            let mut path = vec!["reference".to_owned(), "imported".to_owned()];
+            if let Some(owner_import) = owner_import {
+                append_owner_import_path(&mut path, owner_import);
+            }
+            append_import_target(&mut path, import);
+            (Some(declaration.dotted()), path)
+        }
+        ReferenceCheckReference::Local {
+            owner_import,
+            declaration_index,
+            declaration,
+            ..
+        } => {
+            let mut path = if let Some(owner_import) = owner_import {
+                let mut path = vec!["reference".to_owned(), "imported".to_owned()];
+                append_owner_import_path(&mut path, owner_import);
+                path.push("local".to_owned());
+                path
+            } else {
+                vec!["reference".to_owned(), "local".to_owned()]
+            };
+            path.push(format!("declarations[{declaration_index}]"));
+            (declaration.as_ref().map(|name| name.dotted()), path)
+        }
+        ReferenceCheckReference::LocalGenerated {
+            owner_import,
+            declaration_index,
+            declaration,
+            ..
+        } => {
+            let mut path = if let Some(owner_import) = owner_import {
+                let mut path = vec!["reference".to_owned(), "imported".to_owned()];
+                append_owner_import_path(&mut path, owner_import);
+                path.push("local_generated".to_owned());
+                path
+            } else {
+                vec!["reference".to_owned(), "local_generated".to_owned()]
+            };
+            path.push(format!("declarations[{declaration_index}]"));
+            (Some(declaration.dotted()), path)
+        }
+        _ => (None, Vec::new()),
+    }
 }
 
 fn raw_internal_error_json(section: &'static str, offset: usize) -> String {
     format!(
         "{{\"schema\":\"{}\",\"checker_id\":\"{}\",\"checker_version\":\"{}\",\"checker_build_hash\":\"{}\",\"status\":\"failed\",\"error\":{{\"kind\":\"checker_internal_error\",\"reason_code\":\"checker_reported_internal_error\",\"section\":{},\"offset\":{}}}}}",
         CHECKER_RAW_RESULT_SCHEMA,
-        CHECKER_ID,
-        env!("CARGO_PKG_VERSION"),
-        format_hash(&checker_build_hash()),
+        REFERENCE_CHECKER_ID,
+        REFERENCE_CHECKER_VERSION,
+        format_hash(&reference_checker_build_hash()),
         json_string(section),
         offset
     )
@@ -488,6 +613,11 @@ fn raw_error_kind(error: &ReferenceCheckError) -> &'static str {
         ReferenceCheckErrorKind::EmptyCertificate
         | ReferenceCheckErrorKind::MalformedCertificate => "certificate_decode_error",
         ReferenceCheckErrorKind::HashMismatch => match error.reason {
+            Some(ReferenceCheckReason::HashMismatch {
+                object:
+                    ReferenceHashObject::DeclInterfaceDependencyMaterial
+                    | ReferenceHashObject::DeclCertificateDependencyMaterial,
+            }) => "dependency_hash_mismatch",
             Some(ReferenceCheckReason::HashMismatch {
                 object: ReferenceHashObject::ExportBlock,
             }) => "export_hash_mismatch",
@@ -519,7 +649,10 @@ fn raw_error_kind(error: &ReferenceCheckError) -> &'static str {
             | Some(ReferenceCheckReason::BadRecursorType) => "inductive_invalid",
             Some(ReferenceCheckReason::BadUniverseArity)
             | Some(ReferenceCheckReason::DuplicateUniverseParam)
-            | Some(ReferenceCheckReason::UnresolvedMetavariable) => "universe_inconsistency",
+            | Some(ReferenceCheckReason::UnresolvedMetavariable)
+            | Some(ReferenceCheckReason::ConstructorUniverseBoundViolation) => {
+                "universe_inconsistency"
+            }
             _ => "type_mismatch",
         },
         ReferenceCheckErrorKind::UnsupportedSkeleton => "unsupported_schema_version",
@@ -543,16 +676,6 @@ fn section_name(section: ReferenceCertificateSection) -> &'static str {
         ReferenceCertificateSection::ImportStore => "import_store",
         ReferenceCertificateSection::FullCertificate => "full_certificate",
     }
-}
-
-fn checker_build_hash() -> ReferenceHash {
-    sha256(
-        format!(
-            "{CHECKER_ID}:{}:{REFERENCE_CORE_SPEC}:{REFERENCE_CERTIFICATE_FORMAT}",
-            env!("CARGO_PKG_VERSION")
-        )
-        .as_bytes(),
-    )
 }
 
 fn set_once_path(slot: &mut Option<PathBuf>, value: String) -> Result<(), CliError> {
@@ -816,6 +939,218 @@ mod tests {
     #[test]
     fn cli_policy_rejects_malformed_bool_literal() {
         assert!(parse_policy_text("deny_custom_axioms = trueish").is_err());
+    }
+
+    #[test]
+    fn cli_reports_constructor_universe_bound_reason() {
+        let cert_path = Path::new(env!("CARGO_MANIFEST_DIR")).join(
+            "../../testdata/certificates/security/inductive-constructor-universe-bound-v0.1.npcert",
+        );
+
+        let (json, code) = run_with_args([
+            "--cert".to_owned(),
+            cert_path.display().to_string(),
+            "--output".to_owned(),
+            "json".to_owned(),
+        ]);
+
+        assert_eq!(code, 1);
+        assert!(json.contains("\"kind\":\"universe_inconsistency\""));
+        assert!(json.contains("\"reason_code\":\"constructor_universe_bound_violation\""));
+    }
+
+    #[test]
+    fn raw_dependency_hash_mismatch_preserves_declaration_role() {
+        for (object, expected_reason) in [
+            (
+                ReferenceHashObject::DeclInterfaceDependencyMaterial,
+                "decl_interface_hash_mismatch",
+            ),
+            (
+                ReferenceHashObject::DeclCertificateDependencyMaterial,
+                "decl_certificate_hash_mismatch",
+            ),
+        ] {
+            let error = ReferenceCheckError {
+                kind: ReferenceCheckErrorKind::HashMismatch,
+                section: ReferenceCertificateSection::Declarations,
+                offset: 17,
+                reason: Some(ReferenceCheckReason::HashMismatch { object }),
+                reference: None,
+            };
+            let json = raw_error_json(&error);
+            assert!(json.contains("\"kind\":\"dependency_hash_mismatch\""));
+            assert!(json.contains(&format!("\"reason_code\":\"{expected_reason}\"")));
+        }
+    }
+
+    fn reference_name(value: &str) -> npa_checker_ref::ReferenceModuleName {
+        npa_checker_ref::ReferenceModuleName::from_dotted(value).unwrap()
+    }
+
+    #[test]
+    fn raw_unknown_reference_projects_nested_import_identity() {
+        let owner = ReferenceCheckResolvedImportIdentity::new(
+            0,
+            reference_name("Owner.Module"),
+            [0xab; 32],
+        );
+        let target = ReferenceCheckResolvedImportIdentity::new(
+            3,
+            reference_name("Std.Logic.Eq"),
+            [0xcd; 32],
+        );
+        let error = ReferenceCheckError {
+            kind: ReferenceCheckErrorKind::TypeCheck,
+            section: ReferenceCertificateSection::Declarations,
+            offset: 417,
+            reason: Some(ReferenceCheckReason::UnknownReference),
+            reference: Some(ReferenceCheckReference::Imported {
+                owner_import: Some(owner),
+                import: ReferenceCheckImportTarget::Resolved(target),
+                declaration: reference_name("Std.Logic.Eq.rec"),
+                decl_interface_hash: [0xef; 32],
+            }),
+        };
+
+        assert_eq!(
+            raw_error_json(&error),
+            format!(
+                "{{\"kind\":\"type_mismatch\",\"reason_code\":\"unknown_reference\",\"declaration\":\"Std.Logic.Eq.rec\",\"core_path\":[\"reference\",\"imported\",\"imports[0]\",\"module=Owner.Module\",\"export_hash={}\",\"public_environment\",\"imports[3]\",\"module=Std.Logic.Eq\",\"export_hash={}\"],\"section\":\"declarations\",\"offset\":417}}",
+                format_hash(&[0xab; 32]),
+                format_hash(&[0xcd; 32]),
+            )
+        );
+    }
+
+    #[test]
+    fn raw_unknown_reference_omits_unavailable_import_identity() {
+        let error = ReferenceCheckError {
+            kind: ReferenceCheckErrorKind::TypeCheck,
+            section: ReferenceCertificateSection::Declarations,
+            offset: 29,
+            reason: Some(ReferenceCheckReason::UnknownReference),
+            reference: Some(ReferenceCheckReference::Imported {
+                owner_import: None,
+                import: ReferenceCheckImportTarget::Unresolved { import_index: 7 },
+                declaration: reference_name("Missing.value"),
+                decl_interface_hash: [0x11; 32],
+            }),
+        };
+
+        assert_eq!(
+            raw_error_json(&error),
+            "{\"kind\":\"type_mismatch\",\"reason_code\":\"unknown_reference\",\"declaration\":\"Missing.value\",\"core_path\":[\"reference\",\"imported\",\"imports[7]\"],\"section\":\"declarations\",\"offset\":29}"
+        );
+    }
+
+    #[test]
+    fn raw_unknown_reference_projects_builtin_local_and_generated_lanes() {
+        let cases = [
+            (
+                ReferenceCheckReference::Builtin {
+                    declaration: reference_name("Eq.refl"),
+                    decl_interface_hash: [0x01; 32],
+                },
+                "\"declaration\":\"Eq.refl\",\"core_path\":[\"reference\",\"builtin\"]",
+            ),
+            (
+                ReferenceCheckReference::Local {
+                    owner_import: None,
+                    declaration_index: 2,
+                    declaration: Some(reference_name("Current.local")),
+                },
+                "\"declaration\":\"Current.local\",\"core_path\":[\"reference\",\"local\",\"declarations[2]\"]",
+            ),
+            (
+                ReferenceCheckReference::LocalGenerated {
+                    owner_import: None,
+                    declaration_index: 4,
+                    declaration: reference_name("Current.generated"),
+                },
+                "\"declaration\":\"Current.generated\",\"core_path\":[\"reference\",\"local_generated\",\"declarations[4]\"]",
+            ),
+        ];
+
+        for (reference, expected) in cases {
+            let error = ReferenceCheckError {
+                kind: ReferenceCheckErrorKind::TypeCheck,
+                section: ReferenceCertificateSection::Declarations,
+                offset: 5,
+                reason: Some(ReferenceCheckReason::UnknownReference),
+                reference: Some(reference),
+            };
+            assert!(raw_error_json(&error).contains(expected));
+        }
+    }
+
+    #[test]
+    fn raw_unknown_reference_projects_imported_environment_local_lanes() {
+        let owner = ReferenceCheckResolvedImportIdentity::new(
+            2,
+            reference_name("Owner.Module"),
+            [0x22; 32],
+        );
+        let cases = [
+            (
+                ReferenceCheckReference::Local {
+                    owner_import: Some(owner.clone()),
+                    declaration_index: 6,
+                    declaration: None,
+                },
+                format!(
+                    "\"core_path\":[\"reference\",\"imported\",\"imports[2]\",\"module=Owner.Module\",\"export_hash={}\",\"public_environment\",\"local\",\"declarations[6]\"]",
+                    format_hash(&[0x22; 32])
+                ),
+                None,
+            ),
+            (
+                ReferenceCheckReference::LocalGenerated {
+                    owner_import: Some(owner),
+                    declaration_index: 8,
+                    declaration: reference_name("Imported.generated"),
+                },
+                format!(
+                    "\"core_path\":[\"reference\",\"imported\",\"imports[2]\",\"module=Owner.Module\",\"export_hash={}\",\"public_environment\",\"local_generated\",\"declarations[8]\"]",
+                    format_hash(&[0x22; 32])
+                ),
+                Some("\"declaration\":\"Imported.generated\""),
+            ),
+        ];
+
+        for (reference, expected_path, expected_declaration) in cases {
+            let error = ReferenceCheckError {
+                kind: ReferenceCheckErrorKind::TypeCheck,
+                section: ReferenceCertificateSection::Declarations,
+                offset: 5,
+                reason: Some(ReferenceCheckReason::UnknownReference),
+                reference: Some(reference),
+            };
+            let json = raw_error_json(&error);
+            assert!(json.contains(&expected_path), "{json}");
+            if let Some(expected_declaration) = expected_declaration {
+                assert!(json.contains(expected_declaration), "{json}");
+            } else {
+                assert!(!json.contains("\"declaration\""), "{json}");
+            }
+        }
+    }
+
+    #[test]
+    fn raw_context_free_universe_unknown_reference_emits_only_reason_and_location() {
+        let error = ReferenceCheckError {
+            kind: ReferenceCheckErrorKind::TypeCheck,
+            section: ReferenceCertificateSection::Declarations,
+            offset: 13,
+            reason: Some(ReferenceCheckReason::UnknownReference),
+            reference: None,
+        };
+
+        assert_eq!(
+            raw_error_json(&error),
+            "{\"kind\":\"type_mismatch\",\"reason_code\":\"unknown_reference\",\"section\":\"declarations\",\"offset\":13}"
+        );
+        assert_eq!(json_string("a\"b\\c\n"), "\"a\\\"b\\\\c\\n\"");
     }
 
     #[test]

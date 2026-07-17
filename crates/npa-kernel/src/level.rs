@@ -147,23 +147,68 @@ impl UniverseContext {
         if obligations.is_empty() {
             return Ok(());
         }
-        ensure_universe_constraints_wf(&self.params, obligations)?;
-        let param_indices = universe_param_indices(&self.params);
         for obligation in obligations {
-            for inequality in decompose_constraint(obligation)? {
-                let from = atom_base_index(&inequality.rhs.base, &param_indices)?;
-                let to = atom_base_index(&inequality.lhs.base, &param_indices)?;
-                let bound = i128::from(offset_bound(&inequality.rhs)?)
-                    - i128::from(offset_bound(&inequality.lhs)?);
-                if !self.closure.entails(from, to, bound) {
-                    return Err(Error::UniverseConstraintViolation {
-                        declaration: String::new(),
-                        constraint: normalize_constraint(obligation),
-                    });
+            let normalized = normalize_constraint(obligation);
+            let entailed = match normalized.relation {
+                UniverseConstraintRelation::Le => {
+                    self.entails_level_le(&normalized.lhs, &normalized.rhs)?
                 }
+                UniverseConstraintRelation::Eq => {
+                    self.entails_level_le(&normalized.lhs, &normalized.rhs)?
+                        && self.entails_level_le(&normalized.rhs, &normalized.lhs)?
+                }
+            };
+            if !entailed {
+                return Err(Error::UniverseConstraintViolation {
+                    declaration: String::new(),
+                    constraint: normalized,
+                });
             }
         }
         Ok(())
+    }
+
+    /// Checks whether the current context entails one level inequality.
+    ///
+    /// Unlike stored declaration constraints, proof obligations may have a
+    /// finite `max` on the right. The check remains conservative: every atom
+    /// on the left must be bounded by at least one atom on the right.
+    pub fn entails_level_le(&self, lhs: &Level, rhs: &Level) -> Result<bool> {
+        ensure_level_wf(&self.params, lhs)?;
+        ensure_level_wf(&self.params, rhs)?;
+        let lhs = normalize_level(lhs.clone());
+        let rhs = normalize_level(rhs.clone());
+        if lhs == rhs {
+            return Ok(true);
+        }
+        let lhs_atoms = decompose_lhs_level_expr(&lhs)?;
+        let rhs_atoms = decompose_level_expr(&rhs)?;
+        let comparison_count =
+            lhs_atoms
+                .len()
+                .checked_mul(rhs_atoms.len())
+                .ok_or(Error::ResourceLimit {
+                    kind: ResourceLimitKind::UniverseConstraints,
+                })?;
+        ensure_universe_edge_limit(comparison_count)?;
+        let param_indices = universe_param_indices(&self.params);
+        for lhs_atom in &lhs_atoms {
+            let to = atom_base_index(&lhs_atom.base, &param_indices)?;
+            let lhs_offset = i128::from(offset_bound(lhs_atom)?);
+            let mut witnessed = false;
+            for rhs_atom in &rhs_atoms {
+                let from = atom_base_index(&rhs_atom.base, &param_indices)?;
+                let bound = i128::from(offset_bound(rhs_atom)?) - lhs_offset;
+                if self.closure.entails(from, to, bound) {
+                    witnessed = true;
+                    break;
+                }
+            }
+            if !witnessed {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     pub fn substitute_constraints(
@@ -443,7 +488,7 @@ fn decompose_le_constraint(lhs: Level, rhs: Level) -> Result<Vec<AtomInequality>
     if lhs == rhs {
         return Ok(Vec::new());
     }
-    let lhs_atoms = decompose_level_expr(&lhs)?;
+    let lhs_atoms = decompose_lhs_level_expr(&lhs)?;
     let rhs_atoms = decompose_level_expr(&rhs)?;
     let [rhs_atom] = rhs_atoms.as_slice() else {
         return Err(Error::UnsupportedUniverseConstraint {
@@ -464,6 +509,27 @@ fn decompose_level_expr(level: &Level) -> Result<Vec<Atom>> {
         Level::Max(lhs, rhs) => {
             let mut atoms = decompose_level_expr(&lhs)?;
             atoms.extend(decompose_level_expr(&rhs)?);
+            atoms.sort();
+            atoms.dedup();
+            Ok(atoms)
+        }
+        level => Ok(vec![decompose_atom(&level)?]),
+    }
+}
+
+/// Conservatively decomposes a universe expression used on the left of `<=`.
+///
+/// `imax(a, b) <= max(a, b)` holds for every universe valuation: when `b = 0`
+/// the left side is `0`, and otherwise it is `max(a, b)`. Replacing a left-hand
+/// `imax` by `max` can therefore only reject additional valid constraints; it
+/// cannot admit an invalid one. The right-hand side deliberately continues to
+/// use `decompose_level_expr` and fails closed on symbolic `imax`, where the
+/// same replacement would be unsound.
+fn decompose_lhs_level_expr(level: &Level) -> Result<Vec<Atom>> {
+    match normalize_level(level.clone()) {
+        Level::Max(lhs, rhs) | Level::IMax(lhs, rhs) => {
+            let mut atoms = decompose_lhs_level_expr(&lhs)?;
+            atoms.extend(decompose_lhs_level_expr(&rhs)?);
             atoms.sort();
             atoms.dedup();
             Ok(atoms)
@@ -591,6 +657,82 @@ mod tests {
                 Level::param("w"),
             )])
             .unwrap();
+    }
+
+    #[test]
+    fn universe_context_entails_obligations_with_max_on_the_right() {
+        let context = UniverseContext::new(
+            vec!["u".to_owned(), "v".to_owned(), "w".to_owned()],
+            vec![UniverseConstraint::le(Level::param("u"), Level::param("v"))],
+        )
+        .unwrap();
+
+        assert!(context
+            .entails_level_le(
+                &Level::param("u"),
+                &Level::max(Level::param("v"), Level::param("w")),
+            )
+            .unwrap());
+        context
+            .entails(&[UniverseConstraint::le(
+                Level::param("u"),
+                Level::max(Level::param("v"), Level::param("w")),
+            )])
+            .unwrap();
+        assert!(!context
+            .entails_level_le(
+                &Level::succ(Level::param("v")),
+                &Level::max(Level::param("u"), Level::param("w")),
+            )
+            .unwrap());
+    }
+
+    #[test]
+    fn universe_context_bounds_left_imax_by_corresponding_max() {
+        let context = UniverseContext::from_params(vec!["u".to_owned()]).unwrap();
+        let one = Level::succ(Level::zero());
+        let u = Level::param("u");
+
+        assert!(context
+            .entails_level_le(&Level::imax(one.clone(), u.clone()), &Level::max(one, u),)
+            .unwrap());
+    }
+
+    #[test]
+    fn universe_context_keeps_symbolic_imax_on_right_fail_closed() {
+        let context = UniverseContext::from_params(vec!["u".to_owned()]).unwrap();
+        let one = Level::succ(Level::zero());
+        let u = Level::param("u");
+        let rhs = Level::IMax(Box::new(one.clone()), Box::new(u.clone()));
+
+        assert_eq!(
+            context.entails_level_le(&Level::max(one, u), &rhs),
+            Err(Error::UnsupportedUniverseConstraint {
+                constraint: UniverseConstraint::le(rhs.clone(), rhs),
+            })
+        );
+    }
+
+    #[test]
+    fn universe_context_bounds_max_obligation_atom_pairs() {
+        let params = (0..64)
+            .map(|index| format!("u{index:03}"))
+            .collect::<Vec<_>>();
+        let context = UniverseContext::from_params(params.clone()).unwrap();
+        let max_levels = |names: &[String]| {
+            names.iter().fold(Level::zero(), |level, name| {
+                Level::max(level, Level::param(name.clone()))
+            })
+        };
+        let lhs = max_levels(&params[..32]);
+        let rhs = max_levels(&params[31..]);
+
+        assert_eq!(
+            context.entails_level_le(&lhs, &rhs),
+            Err(Error::ResourceLimit {
+                kind: ResourceLimitKind::UniverseConstraints,
+            })
+        );
     }
 
     #[test]

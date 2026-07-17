@@ -1927,7 +1927,7 @@ pub fn advanced_external_index_update_key_hash(
     ))
 }
 
-/// Build the PUA-M06 opt-in update plan for external authoring indexes.
+/// Build the external-index opt-in update plan for external authoring indexes.
 ///
 /// Scheduler-driven asynchronous coalescing remains deferred behind this
 /// explicit authoring/service boundary; normal verification does not consult

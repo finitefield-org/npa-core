@@ -10,12 +10,14 @@ use sha2::{Digest, Sha256};
 use crate::{
     reference_name_component_is_canonical, ReferenceAxiomDependency,
     ReferenceCertificateFormatVersion, ReferenceCertificateHeader, ReferenceCertificateSection,
-    ReferenceCheckError, ReferenceCheckErrorKind, ReferenceCheckReason, ReferenceCheckedModule,
-    ReferenceCheckerPolicy, ReferenceCoreExpr, ReferenceCoreFeature, ReferenceCoreGlobalRef,
-    ReferenceCoreLevel, ReferenceDecodedCertificate, ReferenceDecodedCertificateCounts,
-    ReferenceExportKind, ReferenceHash, ReferenceHashObject, ReferenceImportEntry,
-    ReferenceImportEnvironment, ReferenceImportStore, ReferenceModuleHashes, ReferenceModuleName,
-    ReferencePublicEnvironment, ReferencePublicExport, ReferenceResolvedImport, ReferenceTrustMode,
+    ReferenceCheckError, ReferenceCheckImportTarget, ReferenceCheckReason, ReferenceCheckReference,
+    ReferenceCheckResolvedImportIdentity, ReferenceCheckedModule, ReferenceCheckerPolicy,
+    ReferenceCoreExpr, ReferenceCoreFeature, ReferenceCoreGlobalRef, ReferenceCoreLevel,
+    ReferenceDecodedCertificate, ReferenceDecodedCertificateCounts, ReferenceExportKind,
+    ReferenceHash, ReferenceHashObject, ReferenceImportEntry, ReferenceImportEnvironment,
+    ReferenceImportStore, ReferenceModuleHashes, ReferenceModuleName, ReferencePublicEnvironment,
+    ReferencePublicExport, ReferencePublicInductiveGroup, ReferencePublicInductiveLayout,
+    ReferencePublicRecursorLayout, ReferenceResolvedImport, ReferenceTrustMode,
     REFERENCE_CERTIFICATE_FORMAT, REFERENCE_CORE_SPEC, REFERENCE_LEGACY_CERTIFICATE_FORMAT,
     REFERENCE_LEGACY_CORE_SPEC, REFERENCE_LEGACY_MODULE_CERT_DOMAIN,
     REFERENCE_LEGACY_MODULE_EXPORT_DOMAIN, REFERENCE_MODULE_CERT_DOMAIN,
@@ -33,6 +35,29 @@ const CORE_FEATURE_REPORT_TAG: &str = "core_features";
 pub(crate) const MAX_UNIVERSE_CONTEXT_NODES: usize = 65;
 #[allow(dead_code)]
 pub(crate) const MAX_UNIVERSE_ATOM_INEQUALITIES: usize = 1024;
+
+fn resolved_import_identity(
+    import_index: usize,
+    import: &ReferenceResolvedImport,
+) -> ReferenceCheckResolvedImportIdentity {
+    ReferenceCheckResolvedImportIdentity {
+        import_index,
+        module: import.module.clone(),
+        export_hash: import.export_hash,
+    }
+}
+
+fn import_target(
+    imports: &ReferenceImportEnvironment,
+    import_index: usize,
+) -> ReferenceCheckImportTarget {
+    imports.imports().get(import_index).map_or(
+        ReferenceCheckImportTarget::Unresolved { import_index },
+        |import| {
+            ReferenceCheckImportTarget::Resolved(resolved_import_identity(import_index, import))
+        },
+    )
+}
 
 fn reference_certificate_format_version(
     header: &ReferenceCertificateHeader,
@@ -236,7 +261,85 @@ impl DecodedModuleCertificate {
             exports,
             self.public_axiom_dependencies(&self.axiom_report.module_axioms),
             self.axiom_report.core_features.clone(),
+            self.public_inductive_groups(),
         ))
+    }
+
+    fn public_inductive_groups(&self) -> Vec<ReferencePublicInductiveGroup> {
+        self.declarations
+            .iter()
+            .filter_map(|declaration| {
+                let family_layout =
+                    |name: usize,
+                     params: &[BinderType],
+                     indices: &[BinderType],
+                     constructors: &[ConstructorSpec],
+                     recursor: &Option<RecursorSpec>| {
+                        ReferencePublicInductiveLayout {
+                            name: self.name_table[name].value.clone(),
+                            param_count: params.len(),
+                            index_count: indices.len(),
+                            constructors: constructors
+                                .iter()
+                                .map(|constructor| self.name_table[constructor.name].value.clone())
+                                .collect(),
+                            recursor: recursor.as_ref().map(|recursor| {
+                                ReferencePublicRecursorLayout {
+                                    name: self.name_table[recursor.name].value.clone(),
+                                    minor_start: recursor.rules.minor_start,
+                                    major_index: recursor.rules.major_index,
+                                }
+                            }),
+                        }
+                    };
+                let families = match &declaration.value.decl {
+                    DeclPayload::Inductive {
+                        name,
+                        params,
+                        indices,
+                        constructors,
+                        recursor,
+                        ..
+                    }
+                    | DeclPayload::InductiveConstrained {
+                        name,
+                        params,
+                        indices,
+                        constructors,
+                        recursor,
+                        ..
+                    } => vec![family_layout(
+                        *name,
+                        params,
+                        indices,
+                        constructors,
+                        recursor,
+                    )],
+                    DeclPayload::MutualInductiveBlock { inductives, .. } => inductives
+                        .iter()
+                        .map(|inductive| {
+                            family_layout(
+                                inductive.name,
+                                &inductive.params,
+                                &inductive.indices,
+                                &inductive.constructors,
+                                &inductive.recursor,
+                            )
+                        })
+                        .collect(),
+                    DeclPayload::Axiom { .. }
+                    | DeclPayload::AxiomConstrained { .. }
+                    | DeclPayload::Def { .. }
+                    | DeclPayload::DefConstrained { .. }
+                    | DeclPayload::Theorem { .. }
+                    | DeclPayload::TheoremConstrained { .. } => return None,
+                };
+                Some(ReferencePublicInductiveGroup {
+                    decl_interface_hash: declaration.value.hashes.decl_interface_hash,
+                    families,
+                })
+            })
+            .collect()
     }
 
     fn public_universe_constraints(
@@ -386,6 +489,57 @@ impl DecodedModuleCertificate {
             .collect()
     }
 
+    fn local_declaration_name(&self, declaration_index: usize) -> Option<ReferenceModuleName> {
+        self.declarations.get(declaration_index).map(|declaration| {
+            self.name_table[declaration.value.decl.name_id()]
+                .value
+                .clone()
+        })
+    }
+
+    fn reference_context(
+        &self,
+        imports: Option<&ReferenceImportEnvironment>,
+        global_ref: &GlobalRef,
+    ) -> ReferenceCheckReference {
+        match global_ref {
+            GlobalRef::Builtin {
+                name,
+                decl_interface_hash,
+            } => ReferenceCheckReference::Builtin {
+                declaration: self.name_table[*name].value.clone(),
+                decl_interface_hash: *decl_interface_hash,
+            },
+            GlobalRef::Imported {
+                import_index,
+                name,
+                decl_interface_hash,
+            } => ReferenceCheckReference::Imported {
+                owner_import: None,
+                import: imports.map_or(
+                    ReferenceCheckImportTarget::Unresolved {
+                        import_index: *import_index,
+                    },
+                    |imports| import_target(imports, *import_index),
+                ),
+                declaration: self.name_table[*name].value.clone(),
+                decl_interface_hash: *decl_interface_hash,
+            },
+            GlobalRef::Local { decl_index } => ReferenceCheckReference::Local {
+                owner_import: None,
+                declaration_index: *decl_index,
+                declaration: self.local_declaration_name(*decl_index),
+            },
+            GlobalRef::LocalGenerated { decl_index, name } => {
+                ReferenceCheckReference::LocalGenerated {
+                    owner_import: None,
+                    declaration_index: *decl_index,
+                    declaration: self.name_table[*name].value.clone(),
+                }
+            }
+        }
+    }
+
     fn build_import_environment(
         &self,
         import_store: &ReferenceImportStore,
@@ -519,14 +673,22 @@ impl DecodedModuleCertificate {
                 return Err(ReferenceCheckError::hash_mismatch(
                     ReferenceCertificateSection::Declarations,
                     declaration.value.hashes.decl_interface_hash_offset,
-                    ReferenceHashObject::DeclInterface,
+                    if expected.interface_has_dependency_material {
+                        ReferenceHashObject::DeclInterfaceDependencyMaterial
+                    } else {
+                        ReferenceHashObject::DeclInterface
+                    },
                 ));
             }
             if expected.decl_certificate_hash != declaration.value.hashes.decl_certificate_hash {
                 return Err(ReferenceCheckError::hash_mismatch(
                     ReferenceCertificateSection::Declarations,
                     declaration.value.hashes.decl_certificate_hash_offset,
-                    ReferenceHashObject::DeclCertificate,
+                    if expected.certificate_has_dependency_material {
+                        ReferenceHashObject::DeclCertificateDependencyMaterial
+                    } else {
+                        ReferenceHashObject::DeclCertificate
+                    },
                 ));
             }
         }
@@ -681,10 +843,13 @@ impl DecodedModuleCertificate {
             };
             let name_value = &self.name_table[*name].value;
             if builtin_decl_interface_hash(name_value) != Some(*decl_interface_hash) {
-                return Err(ReferenceCheckError::type_check(
+                return Err(ReferenceCheckError::unknown_reference(
                     ReferenceCertificateSection::TermTable,
                     term.offset,
-                    ReferenceCheckReason::UnknownReference,
+                    ReferenceCheckReference::Builtin {
+                        declaration: name_value.clone(),
+                        decl_interface_hash: *decl_interface_hash,
+                    },
                 ));
             }
         }
@@ -806,10 +971,10 @@ impl DecodedModuleCertificate {
                 if builtin_decl_interface_hash(name_value) == Some(*decl_interface_hash) {
                     Ok(*decl_interface_hash)
                 } else {
-                    Err(ReferenceCheckError::type_check(
+                    Err(ReferenceCheckError::unknown_reference(
                         ReferenceCertificateSection::Declarations,
                         offset,
-                        ReferenceCheckReason::UnknownReference,
+                        self.reference_context(Some(imports), global_ref),
                     ))
                 }
             }
@@ -867,10 +1032,10 @@ impl DecodedModuleCertificate {
             ));
         };
         let import = imports.imports().get(*import_index).ok_or_else(|| {
-            ReferenceCheckError::type_check(
+            ReferenceCheckError::unknown_reference(
                 ReferenceCertificateSection::Declarations,
                 offset,
-                ReferenceCheckReason::UnknownReference,
+                self.reference_context(Some(imports), global_ref),
             )
         })?;
         let name_value = &self.name_table[*name].value;
@@ -883,10 +1048,10 @@ impl DecodedModuleCertificate {
             })
             .cloned()
             .ok_or_else(|| {
-                ReferenceCheckError::type_check(
+                ReferenceCheckError::unknown_reference(
                     ReferenceCertificateSection::Declarations,
                     offset,
-                    ReferenceCheckReason::UnknownReference,
+                    self.reference_context(Some(imports), global_ref),
                 )
             })
     }
@@ -2595,6 +2760,10 @@ impl<'a> TypeChecker<'a> {
     const WHNF_FUEL: usize = 5_000_000;
     const DEFEQ_FUEL: usize = 5_000_000;
 
+    fn typecheck_fuel() -> usize {
+        Self::WHNF_FUEL.saturating_add(Self::DEFEQ_FUEL)
+    }
+
     fn new(
         cert: &'a DecodedModuleCertificate,
         imports: &'a ReferenceImportEnvironment,
@@ -2617,6 +2786,76 @@ impl<'a> TypeChecker<'a> {
         };
         checker.imported_recursors = checker.imported_recursors(0)?;
         Ok(checker)
+    }
+
+    fn local_declaration_name(&self, declaration_index: usize) -> Option<ReferenceModuleName> {
+        self.cert
+            .declarations
+            .get(declaration_index)
+            .map(|declaration| {
+                self.cert.name_table[declaration.value.decl.name_id()]
+                    .value
+                    .clone()
+            })
+    }
+
+    fn owner_import_identity(
+        &self,
+        owner_import_index: usize,
+    ) -> Option<ReferenceCheckResolvedImportIdentity> {
+        self.imports
+            .imports()
+            .get(owner_import_index)
+            .map(|import| resolved_import_identity(owner_import_index, import))
+    }
+
+    fn reference_context(&self, global_ref: &ReferenceCoreGlobalRef) -> ReferenceCheckReference {
+        match global_ref {
+            ReferenceCoreGlobalRef::Builtin {
+                name,
+                decl_interface_hash,
+            } => ReferenceCheckReference::Builtin {
+                declaration: name.clone(),
+                decl_interface_hash: *decl_interface_hash,
+            },
+            ReferenceCoreGlobalRef::Imported {
+                import_index,
+                name,
+                decl_interface_hash,
+            } => ReferenceCheckReference::Imported {
+                owner_import: None,
+                import: import_target(self.imports, *import_index),
+                declaration: name.clone(),
+                decl_interface_hash: *decl_interface_hash,
+            },
+            ReferenceCoreGlobalRef::Local { decl_index } => ReferenceCheckReference::Local {
+                owner_import: None,
+                declaration_index: *decl_index,
+                declaration: self.local_declaration_name(*decl_index),
+            },
+            ReferenceCoreGlobalRef::LocalGenerated { decl_index, name } => {
+                ReferenceCheckReference::LocalGenerated {
+                    owner_import: None,
+                    declaration_index: *decl_index,
+                    declaration: name.clone(),
+                }
+            }
+        }
+    }
+
+    fn imported_reference_context(
+        &self,
+        owner_import_index: usize,
+        import: ReferenceCheckImportTarget,
+        declaration: &ReferenceModuleName,
+        decl_interface_hash: ReferenceHash,
+    ) -> ReferenceCheckReference {
+        ReferenceCheckReference::Imported {
+            owner_import: self.owner_import_identity(owner_import_index),
+            import,
+            declaration: declaration.clone(),
+            decl_interface_hash,
+        }
     }
 
     fn check_declarations(&mut self) -> DecodeResult<()> {
@@ -2860,56 +3099,62 @@ impl<'a> TypeChecker<'a> {
     ) -> DecodeResult<BTreeMap<ImportedRecursorKey, ReferenceImportedRecursorRuntime>> {
         let mut recursors = BTreeMap::new();
         for (import_index, import) in self.imports.imports().iter().enumerate() {
-            let groups = imported_inductive_export_groups(import.public_environment.exports());
-            for group in groups.values() {
-                let Some((key, runtime)) = self.imported_single_recursor_runtime(
+            for group in &import.public_environment.inductive_groups {
+                for (key, runtime) in self.imported_group_recursor_runtimes(
                     import_index,
                     &import.public_environment,
                     group,
                     offset,
-                )?
-                else {
-                    continue;
-                };
-                recursors.insert(key, runtime);
+                )? {
+                    recursors.insert(key, runtime);
+                }
             }
         }
         Ok(recursors)
     }
 
-    fn imported_single_recursor_runtime(
+    fn imported_group_recursor_runtimes(
         &self,
         import_index: usize,
         environment: &ReferencePublicEnvironment,
-        group: &ImportedInductiveExportGroup<'_>,
+        group: &ReferencePublicInductiveGroup,
         offset: usize,
-    ) -> DecodeResult<Option<(ImportedRecursorKey, ReferenceImportedRecursorRuntime)>> {
-        let [inductive] = group.inductives.as_slice() else {
-            return Ok(None);
-        };
-        let [recursor_export] = group.recursors.as_slice() else {
-            return Ok(None);
-        };
-
-        let family_ty =
-            self.instantiate_public_expr(import_index, environment, &inductive.ty, offset)?;
-        let (family_domains, family_result) = peel_pi_domains(&family_ty);
-        let ReferenceCoreExpr::Sort(sort) = family_result else {
-            return Ok(None);
-        };
-        let recursor_ty =
-            self.instantiate_public_expr(import_index, environment, &recursor_export.ty, offset)?;
-        let (recursor_domains, recursor_result) = peel_pi_domains(&recursor_ty);
-        let constructor_count = group.constructors.len();
-        if recursor_domains.len() != family_domains.len() + constructor_count + 2 {
-            return Ok(None);
+    ) -> DecodeResult<Vec<(ImportedRecursorKey, ReferenceImportedRecursorRuntime)>> {
+        if group.families.is_empty() {
+            return Ok(Vec::new());
         }
 
-        let constructors = group
-            .constructors
-            .iter()
-            .map(|constructor| {
-                Ok(ReferenceConstructorSignature {
+        let mut block = Vec::with_capacity(group.families.len());
+        for layout in &group.families {
+            let Some(inductive) = unique_public_export(
+                environment,
+                group.decl_interface_hash,
+                ReferenceExportKind::Inductive,
+                &layout.name,
+            ) else {
+                return Ok(Vec::new());
+            };
+            let family_ty =
+                self.instantiate_public_expr(import_index, environment, &inductive.ty, offset)?;
+            let (family_domains, family_result) = peel_pi_domains(&family_ty);
+            let ReferenceCoreExpr::Sort(sort) = family_result else {
+                return Ok(Vec::new());
+            };
+            if family_domains.len() != layout.param_count + layout.index_count {
+                return Ok(Vec::new());
+            }
+
+            let mut constructors = Vec::with_capacity(layout.constructors.len());
+            for constructor_name in &layout.constructors {
+                let Some(constructor) = unique_public_export(
+                    environment,
+                    group.decl_interface_hash,
+                    ReferenceExportKind::Constructor,
+                    constructor_name,
+                ) else {
+                    return Ok(Vec::new());
+                };
+                constructors.push(ReferenceConstructorSignature {
                     name: constructor.name.clone(),
                     ty: self.instantiate_public_expr(
                         import_index,
@@ -2917,195 +3162,103 @@ impl<'a> TypeChecker<'a> {
                         &constructor.ty,
                         offset,
                     )?,
-                })
-            })
-            .collect::<DecodeResult<Vec<_>>>()?;
+                });
+            }
 
-        for param_count in 0..=family_domains.len() {
-            let index_count = family_domains.len() - param_count;
-            let rules = RecursorRulesSpec {
-                minor_start: param_count + 1,
-                major_index: param_count + 1 + constructor_count + index_count,
+            let recursor = if let Some(recursor_layout) = &layout.recursor {
+                let Some(recursor_export) = unique_public_export(
+                    environment,
+                    group.decl_interface_hash,
+                    ReferenceExportKind::Recursor,
+                    &recursor_layout.name,
+                ) else {
+                    return Ok(Vec::new());
+                };
+                Some(ReferenceRecursorSignature {
+                    name: recursor_export.name.clone(),
+                    universe_params: recursor_export.universe_params.clone(),
+                    ty: self.instantiate_public_expr(
+                        import_index,
+                        environment,
+                        &recursor_export.ty,
+                        offset,
+                    )?,
+                    rules: RecursorRulesSpec {
+                        minor_start: recursor_layout.minor_start,
+                        major_index: recursor_layout.major_index,
+                    },
+                })
+            } else {
+                None
             };
-            let recursor = ReferenceRecursorSignature {
-                name: recursor_export.name.clone(),
-                universe_params: recursor_export.universe_params.clone(),
-                ty: recursor_ty.clone(),
-                rules,
-            };
-            let mut data = ReferenceInductiveSignature {
+
+            block.push(ReferenceInductiveSignature {
                 decl_index: usize::MAX,
                 global_ref: ReferenceCoreGlobalRef::Imported {
                     import_index,
-                    name: inductive.name.clone(),
-                    decl_interface_hash: inductive.decl_interface_hash,
+                    name: layout.name.clone(),
+                    decl_interface_hash: group.decl_interface_hash,
                 },
                 universe_params: inductive.universe_params.clone(),
                 universe_constraints: Vec::new(),
-                params: family_domains[..param_count].to_vec(),
-                indices: family_domains[param_count..].to_vec(),
-                sort: sort.clone(),
-                constructors: constructors.clone(),
-                recursor: None,
-            };
-
-            if !self.imported_recursor_shape_matches(
-                &data,
-                &recursor,
-                &recursor_domains,
-                &recursor_result,
-                offset,
-            )? {
-                continue;
-            }
-            let Some(ordered_constructors) = self.order_imported_constructors(
-                &data,
-                &recursor,
-                &recursor_domains,
-                &constructors,
-                offset,
-            )?
-            else {
-                continue;
-            };
-            data.constructors = ordered_constructors;
-            data.recursor = Some(recursor.clone());
-
-            let expected_ty = expected_recursor_type(&data, &recursor, offset)?;
-            if recursor.ty != expected_ty {
-                continue;
-            }
-
-            let key = ImportedRecursorKey {
-                import_index,
-                name: recursor_export.name.clone(),
-                decl_interface_hash: recursor_export.decl_interface_hash,
-            };
-            return Ok(Some((
-                key,
-                ReferenceImportedRecursorRuntime { data, recursor },
-            )));
+                params: family_domains[..layout.param_count].to_vec(),
+                indices: family_domains[layout.param_count..].to_vec(),
+                sort,
+                constructors,
+                recursor,
+            });
         }
 
-        Ok(None)
-    }
-
-    fn imported_recursor_shape_matches(
-        &self,
-        data: &ReferenceInductiveSignature,
-        recursor: &ReferenceRecursorSignature,
-        domains: &[ReferenceCoreExpr],
-        result: &ReferenceCoreExpr,
-        offset: usize,
-    ) -> DecodeResult<bool> {
-        if recursor.rules.major_index + 1 != domains.len() {
-            return Ok(false);
-        }
-        let ok = self.imported_recursor_shape_result(data, recursor, domains, result, offset);
-        match ok {
-            Ok(()) => Ok(true),
-            Err(error) if error.kind == ReferenceCheckErrorKind::TypeCheck => Ok(false),
-            Err(error) => Err(error),
-        }
-    }
-
-    fn imported_recursor_shape_result(
-        &self,
-        data: &ReferenceInductiveSignature,
-        recursor: &ReferenceRecursorSignature,
-        domains: &[ReferenceCoreExpr],
-        result: &ReferenceCoreExpr,
-        offset: usize,
-    ) -> DecodeResult<()> {
-        let universe_context =
-            ReferenceUniverseContext::from_params(recursor.universe_params.clone(), offset)?;
-        self.check_recursor_params(data, &universe_context, domains, offset)?;
-        let motive_domain = domains.get(data.params.len()).ok_or_else(|| {
-            ReferenceCheckError::type_check(
-                ReferenceCertificateSection::Declarations,
-                offset,
-                ReferenceCheckReason::BadRecursorMotive,
-            )
-        })?;
-        self.check_motive_domain(data, recursor, motive_domain, offset)?;
-        self.check_recursor_indices(data, recursor, domains, offset)?;
-        self.check_recursor_target(
-            data,
-            &domains[recursor.rules.major_index],
-            ReferenceCheckReason::BadRecursorMajor,
-            recursor.rules.major_index,
-            recursor.rules.minor_start + data.constructors.len(),
-            offset,
-        )?;
-        self.check_recursor_result(data, recursor, domains, result, offset)
-    }
-
-    fn order_imported_constructors(
-        &self,
-        data: &ReferenceInductiveSignature,
-        recursor: &ReferenceRecursorSignature,
-        domains: &[ReferenceCoreExpr],
-        constructors: &[ReferenceConstructorSignature],
-        offset: usize,
-    ) -> DecodeResult<Option<Vec<ReferenceConstructorSignature>>> {
-        let mut remaining = constructors.to_vec();
-        let mut ordered = Vec::with_capacity(constructors.len());
-        if self.order_imported_constructors_from(
-            data,
-            recursor,
-            domains,
-            offset,
-            &mut remaining,
-            &mut ordered,
-        )? {
-            Ok(Some(ordered))
-        } else {
-            Ok(None)
-        }
-    }
-
-    fn order_imported_constructors_from(
-        &self,
-        data: &ReferenceInductiveSignature,
-        recursor: &ReferenceRecursorSignature,
-        domains: &[ReferenceCoreExpr],
-        offset: usize,
-        remaining: &mut Vec<ReferenceConstructorSignature>,
-        ordered: &mut Vec<ReferenceConstructorSignature>,
-    ) -> DecodeResult<bool> {
-        if remaining.is_empty() {
-            return Ok(true);
-        }
-
-        let constructor_index = ordered.len();
-        let minor_index = recursor.rules.minor_start + constructor_index;
-        let Some(actual_minor) = domains.get(minor_index) else {
-            return Ok(false);
+        let Some(first) = block.first() else {
+            return Ok(Vec::new());
         };
-        let prefix_ctx = recursor_prefix_ctx(&domains[..minor_index]);
-        for index in 0..remaining.len() {
-            let constructor = remaining.remove(index);
-            let expected_minor =
-                expected_minor_type(data, &constructor, constructor_index, offset)?;
-            let matches = self.is_defeq(
-                &prefix_ctx,
-                &recursor.universe_params,
-                actual_minor,
-                &expected_minor,
-                offset,
-            )?;
-            if matches {
-                ordered.push(constructor.clone());
-                if self.order_imported_constructors_from(
-                    data, recursor, domains, offset, remaining, ordered,
-                )? {
-                    return Ok(true);
-                }
-                ordered.pop();
-            }
-            remaining.insert(index, constructor);
+        if block.iter().any(|family| {
+            family.universe_params != first.universe_params || family.params != first.params
+        }) {
+            return Ok(Vec::new());
         }
-        Ok(false)
+
+        let constructor_count = mutual_constructor_count(&block);
+        let block: Arc<[ReferenceInductiveSignature]> = block.into();
+        let mut runtimes = Vec::with_capacity(block.len());
+        for (target_index, data) in block.iter().enumerate() {
+            let Some(recursor) = data.recursor.clone() else {
+                return Ok(Vec::new());
+            };
+            let expected_minor_start = if block.len() == 1 {
+                data.params.len() + 1
+            } else {
+                data.params.len() + block.len()
+            };
+            let expected_major_index =
+                expected_minor_start + constructor_count + data.indices.len();
+            if recursor.rules.minor_start != expected_minor_start
+                || recursor.rules.major_index != expected_major_index
+            {
+                return Ok(Vec::new());
+            }
+            let expected_ty = if block.len() == 1 {
+                expected_recursor_type(data, &recursor, offset)?
+            } else {
+                expected_mutual_recursor_type(&block, target_index, &recursor, offset)?
+            };
+            if recursor.ty != expected_ty {
+                return Ok(Vec::new());
+            }
+            runtimes.push((
+                ImportedRecursorKey {
+                    import_index,
+                    name: recursor.name.clone(),
+                    decl_interface_hash: group.decl_interface_hash,
+                },
+                ReferenceImportedRecursorRuntime {
+                    block: Arc::clone(&block),
+                    target_index,
+                    recursor,
+                },
+            ));
+        }
+        Ok(runtimes)
     }
 
     fn check_inductive_decl(&mut self, decl: &DeclCert, offset: usize) -> DecodeResult<()> {
@@ -3572,7 +3725,14 @@ impl<'a> TypeChecker<'a> {
             &result,
             offset,
         )?;
-        self.check_constructor_result(data, constructor_sig, domains.len(), result, offset)
+        self.check_constructor_result(data, constructor_sig, domains.len(), result, offset)?;
+        self.check_constructor_universe_bounds(
+            data,
+            constructor_sig,
+            &domains,
+            universe_context,
+            offset,
+        )
     }
 
     fn check_mutual_constructor_decl(
@@ -3611,7 +3771,46 @@ impl<'a> TypeChecker<'a> {
             &result,
             offset,
         )?;
-        self.check_constructor_result(data, constructor, domains.len(), result, offset)
+        self.check_constructor_result(data, constructor, domains.len(), result, offset)?;
+        self.check_constructor_universe_bounds(
+            data,
+            constructor,
+            &domains,
+            universe_context,
+            offset,
+        )
+    }
+
+    fn check_constructor_universe_bounds(
+        &self,
+        data: &ReferenceInductiveSignature,
+        _constructor: &ReferenceConstructorSignature,
+        domains: &[ReferenceCoreExpr],
+        universe_context: &ReferenceUniverseContext,
+        offset: usize,
+    ) -> DecodeResult<()> {
+        let inductive_sort = normalize_reference_level(data.sort.clone());
+        if inductive_sort == ReferenceCoreLevel::Zero {
+            return Ok(());
+        }
+
+        let mut ctx = TypeContext::default();
+        let mut fuel = Self::typecheck_fuel();
+        for (domain_index, domain) in domains.iter().enumerate() {
+            let field_level =
+                self.expect_sort_with_fuel(&ctx, universe_context, domain, offset, &mut fuel)?;
+            if domain_index >= data.params.len()
+                && !universe_context.entails_level_le(&field_level, &inductive_sort, offset)?
+            {
+                return Err(ReferenceCheckError::type_check(
+                    ReferenceCertificateSection::Declarations,
+                    offset,
+                    ReferenceCheckReason::ConstructorUniverseBoundViolation,
+                ));
+            }
+            ctx.push_assumption(domain.clone());
+        }
+        Ok(())
     }
 
     fn check_constructor_domain_positive(
@@ -4186,12 +4385,13 @@ impl<'a> TypeChecker<'a> {
         }
     }
 
-    fn infer(
+    fn infer_with_fuel(
         &self,
         ctx: &TypeContext,
         universe_context: &ReferenceUniverseContext,
         term: &ReferenceCoreExpr,
         offset: usize,
+        fuel: &mut usize,
     ) -> DecodeResult<ReferenceCoreExpr> {
         let delta = &universe_context.params;
         match term {
@@ -4227,30 +4427,33 @@ impl<'a> TypeChecker<'a> {
                 ))
             }
             ReferenceCoreExpr::Pi { ty, body } => {
-                let domain_sort = self.expect_sort(ctx, universe_context, ty, offset)?;
+                let domain_sort =
+                    self.expect_sort_with_fuel(ctx, universe_context, ty, offset, fuel)?;
                 let mut body_ctx = ctx.clone();
                 body_ctx.push_assumption((**ty).clone());
-                let body_sort = self.expect_sort(&body_ctx, universe_context, body, offset)?;
+                let body_sort =
+                    self.expect_sort_with_fuel(&body_ctx, universe_context, body, offset, fuel)?;
                 Ok(ReferenceCoreExpr::Sort(ReferenceCoreLevel::IMax(
                     Arc::new(domain_sort),
                     Arc::new(body_sort),
                 )))
             }
             ReferenceCoreExpr::Lam { ty, body } => {
-                self.expect_sort(ctx, universe_context, ty, offset)?;
+                self.expect_sort_with_fuel(ctx, universe_context, ty, offset, fuel)?;
                 let mut body_ctx = ctx.clone();
                 body_ctx.push_assumption((**ty).clone());
-                let body_ty = self.infer(&body_ctx, universe_context, body, offset)?;
+                let body_ty =
+                    self.infer_with_fuel(&body_ctx, universe_context, body, offset, fuel)?;
                 Ok(ReferenceCoreExpr::Pi {
                     ty: ty.clone(),
                     body: Arc::new(body_ty),
                 })
             }
             ReferenceCoreExpr::App(fun, arg) => {
-                let fun_ty = self.infer(ctx, universe_context, fun, offset)?;
-                match self.whnf(ctx, delta, &fun_ty, offset)? {
+                let fun_ty = self.infer_with_fuel(ctx, universe_context, fun, offset, fuel)?;
+                match self.whnf_with_fuel(ctx, delta, &fun_ty, offset, fuel)? {
                     ReferenceCoreExpr::Pi { ty, body } => {
-                        self.check(ctx, universe_context, arg, &ty, offset)?;
+                        self.check_with_fuel(ctx, universe_context, arg, &ty, offset, fuel)?;
                         instantiate(&body, arg, offset)
                     }
                     _ => Err(ReferenceCheckError::type_check(
@@ -4261,11 +4464,12 @@ impl<'a> TypeChecker<'a> {
                 }
             }
             ReferenceCoreExpr::Let { ty, value, body } => {
-                self.expect_sort(ctx, universe_context, ty, offset)?;
-                self.check(ctx, universe_context, value, ty, offset)?;
+                self.expect_sort_with_fuel(ctx, universe_context, ty, offset, fuel)?;
+                self.check_with_fuel(ctx, universe_context, value, ty, offset, fuel)?;
                 let mut body_ctx = ctx.clone();
                 body_ctx.push_definition((**ty).clone(), (**value).clone());
-                let body_ty = self.infer(&body_ctx, universe_context, body, offset)?;
+                let body_ty =
+                    self.infer_with_fuel(&body_ctx, universe_context, body, offset, fuel)?;
                 instantiate(&body_ty, value, offset)
             }
         }
@@ -4279,8 +4483,28 @@ impl<'a> TypeChecker<'a> {
         expected: &ReferenceCoreExpr,
         offset: usize,
     ) -> DecodeResult<()> {
-        let actual = self.infer(ctx, universe_context, term, offset)?;
-        if self.is_defeq(ctx, &universe_context.params, &actual, expected, offset)? {
+        let mut fuel = Self::typecheck_fuel();
+        self.check_with_fuel(ctx, universe_context, term, expected, offset, &mut fuel)
+    }
+
+    fn check_with_fuel(
+        &self,
+        ctx: &TypeContext,
+        universe_context: &ReferenceUniverseContext,
+        term: &ReferenceCoreExpr,
+        expected: &ReferenceCoreExpr,
+        offset: usize,
+        fuel: &mut usize,
+    ) -> DecodeResult<()> {
+        let actual = self.infer_with_fuel(ctx, universe_context, term, offset, fuel)?;
+        if self.is_defeq_with_fuel(
+            ctx,
+            &universe_context.params,
+            &actual,
+            expected,
+            offset,
+            fuel,
+        )? {
             Ok(())
         } else {
             Err(ReferenceCheckError::type_check(
@@ -4298,8 +4522,20 @@ impl<'a> TypeChecker<'a> {
         term: &ReferenceCoreExpr,
         offset: usize,
     ) -> DecodeResult<ReferenceCoreLevel> {
-        let ty = self.infer(ctx, universe_context, term, offset)?;
-        match self.whnf(ctx, &universe_context.params, &ty, offset)? {
+        let mut fuel = Self::typecheck_fuel();
+        self.expect_sort_with_fuel(ctx, universe_context, term, offset, &mut fuel)
+    }
+
+    fn expect_sort_with_fuel(
+        &self,
+        ctx: &TypeContext,
+        universe_context: &ReferenceUniverseContext,
+        term: &ReferenceCoreExpr,
+        offset: usize,
+        fuel: &mut usize,
+    ) -> DecodeResult<ReferenceCoreLevel> {
+        let ty = self.infer_with_fuel(ctx, universe_context, term, offset, fuel)?;
+        match self.whnf_with_fuel(ctx, &universe_context.params, &ty, offset, fuel)? {
             ReferenceCoreExpr::Sort(level) => Ok(level),
             _ => Err(ReferenceCheckError::type_check(
                 ReferenceCertificateSection::Declarations,
@@ -4325,10 +4561,10 @@ impl<'a> TypeChecker<'a> {
                 let signature = reference_builtin_signature(name, *decl_interface_hash)
                     .map(Arc::new)
                     .ok_or_else(|| {
-                        ReferenceCheckError::type_check(
+                        ReferenceCheckError::unknown_reference(
                             ReferenceCertificateSection::Declarations,
                             offset,
-                            ReferenceCheckReason::UnknownReference,
+                            self.reference_context(global_ref),
                         )
                     })?;
                 self.builtin_signatures
@@ -4346,10 +4582,10 @@ impl<'a> TypeChecker<'a> {
                     return Ok(Arc::clone(signature));
                 }
                 let import = self.imports.imports().get(*import_index).ok_or_else(|| {
-                    ReferenceCheckError::type_check(
+                    ReferenceCheckError::unknown_reference(
                         ReferenceCertificateSection::Declarations,
                         offset,
-                        ReferenceCheckReason::UnknownReference,
+                        self.reference_context(global_ref),
                     )
                 })?;
                 let export = import
@@ -4360,10 +4596,10 @@ impl<'a> TypeChecker<'a> {
                         export.name == *name && export.decl_interface_hash == *decl_interface_hash
                     })
                     .ok_or_else(|| {
-                        ReferenceCheckError::type_check(
+                        ReferenceCheckError::unknown_reference(
                             ReferenceCertificateSection::Declarations,
                             offset,
-                            ReferenceCheckReason::UnknownReference,
+                            self.reference_context(global_ref),
                         )
                     })?;
                 let signature = Arc::new(TypeSignature {
@@ -4398,17 +4634,17 @@ impl<'a> TypeChecker<'a> {
                 if self.cert.declarations.get(*decl_index).is_some_and(|decl| {
                     matches!(decl.value.decl, DeclPayload::MutualInductiveBlock { .. })
                 }) {
-                    return Err(ReferenceCheckError::type_check(
+                    return Err(ReferenceCheckError::unknown_reference(
                         ReferenceCertificateSection::Declarations,
                         offset,
-                        ReferenceCheckReason::UnknownReference,
+                        self.reference_context(global_ref),
                     ));
                 }
                 self.locals.get(*decl_index).cloned().ok_or_else(|| {
-                    ReferenceCheckError::type_check(
+                    ReferenceCheckError::unknown_reference(
                         ReferenceCertificateSection::Declarations,
                         offset,
-                        ReferenceCheckReason::UnknownReference,
+                        self.reference_context(global_ref),
                     )
                 })
             }
@@ -4417,10 +4653,10 @@ impl<'a> TypeChecker<'a> {
                 .get(&GeneratedKey::new(*decl_index, name.clone()))
                 .cloned()
                 .ok_or_else(|| {
-                    ReferenceCheckError::type_check(
+                    ReferenceCheckError::unknown_reference(
                         ReferenceCertificateSection::Declarations,
                         offset,
-                        ReferenceCheckReason::UnknownReference,
+                        self.reference_context(global_ref),
                     )
                 }),
         }
@@ -4558,12 +4794,24 @@ impl<'a> TypeChecker<'a> {
                     .imports
                     .get(*import_index)
                     .ok_or_else(|| {
-                        ReferenceCheckError::type_check(
+                        ReferenceCheckError::unknown_reference(
                             ReferenceCertificateSection::Declarations,
                             offset,
-                            ReferenceCheckReason::UnknownReference,
+                            self.imported_reference_context(
+                                owner_import_index,
+                                ReferenceCheckImportTarget::Unresolved {
+                                    import_index: *import_index,
+                                },
+                                name,
+                                *decl_interface_hash,
+                            ),
                         )
                     })?;
+                let source_identity = ReferenceCheckResolvedImportIdentity {
+                    import_index: *import_index,
+                    module: source.module.clone(),
+                    export_hash: source.export_hash,
+                };
                 let remapped = self
                     .imports
                     .imports()
@@ -4572,10 +4820,15 @@ impl<'a> TypeChecker<'a> {
                         import.module == source.module && import.export_hash == source.export_hash
                     })
                     .ok_or_else(|| {
-                        ReferenceCheckError::type_check(
+                        ReferenceCheckError::unknown_reference(
                             ReferenceCertificateSection::Declarations,
                             offset,
-                            ReferenceCheckReason::UnknownReference,
+                            self.imported_reference_context(
+                                owner_import_index,
+                                ReferenceCheckImportTarget::Resolved(source_identity),
+                                name,
+                                *decl_interface_hash,
+                            ),
                         )
                     })?;
                 ReferenceCoreGlobalRef::Imported {
@@ -4584,12 +4837,26 @@ impl<'a> TypeChecker<'a> {
                     decl_interface_hash: *decl_interface_hash,
                 }
             }
-            ReferenceCoreGlobalRef::Local { .. }
-            | ReferenceCoreGlobalRef::LocalGenerated { .. } => {
-                return Err(ReferenceCheckError::type_check(
+            ReferenceCoreGlobalRef::Local { decl_index }
+            | ReferenceCoreGlobalRef::LocalGenerated { decl_index, .. } => {
+                let reference =
+                    if let ReferenceCoreGlobalRef::LocalGenerated { name, .. } = global_ref {
+                        ReferenceCheckReference::LocalGenerated {
+                            owner_import: self.owner_import_identity(owner_import_index),
+                            declaration_index: *decl_index,
+                            declaration: name.clone(),
+                        }
+                    } else {
+                        ReferenceCheckReference::Local {
+                            owner_import: self.owner_import_identity(owner_import_index),
+                            declaration_index: *decl_index,
+                            declaration: None,
+                        }
+                    };
+                return Err(ReferenceCheckError::unknown_reference(
                     ReferenceCertificateSection::Declarations,
                     offset,
-                    ReferenceCheckReason::UnknownReference,
+                    reference,
                 ));
             }
         })
@@ -4696,7 +4963,6 @@ impl<'a> TypeChecker<'a> {
                     name: name.clone(),
                     decl_interface_hash: *decl_interface_hash,
                 },
-                name,
             ),
             ReferenceCoreGlobalRef::Builtin { .. } | ReferenceCoreGlobalRef::Local { .. } => {
                 Ok(None)
@@ -4852,7 +5118,6 @@ impl<'a> TypeChecker<'a> {
         &self,
         request: &mut RecursorReductionRequest<'_>,
         recursor_key: ImportedRecursorKey,
-        recursor_name: &ReferenceModuleName,
     ) -> DecodeResult<Option<ReferenceCoreExpr>> {
         let Some(recursor) = self.imported_recursors.get(&recursor_key) else {
             return Ok(None);
@@ -4889,7 +5154,13 @@ impl<'a> TypeChecker<'a> {
             return Ok(None);
         }
 
-        let data = &recursor.data;
+        let Some(data) = recursor.block.get(recursor.target_index) else {
+            return Ok(None);
+        };
+        let target_constructor_offset = recursor.block[..recursor.target_index]
+            .iter()
+            .map(|family| family.constructors.len())
+            .sum::<usize>();
         let Some(ctor_index) = data
             .constructors
             .iter()
@@ -4899,7 +5170,7 @@ impl<'a> TypeChecker<'a> {
         };
         let Some(minor) = request
             .args
-            .get(recursor.recursor.rules.minor_start + ctor_index)
+            .get(recursor.recursor.rules.minor_start + target_constructor_offset + ctor_index)
             .cloned()
         else {
             return Ok(None);
@@ -4923,8 +5194,8 @@ impl<'a> TypeChecker<'a> {
             field_args.iter().zip(field_domains).enumerate()
         {
             reduced = ReferenceCoreExpr::App(Arc::new(reduced), Arc::new(field_arg.clone()));
-            if is_direct_recursive_domain(
-                data,
+            if let Some((field_family_index, index_args)) = direct_mutual_recursive_index_args(
+                &recursor.block,
                 field_domain,
                 param_count + field_index,
                 request.offset,
@@ -4932,9 +5203,7 @@ impl<'a> TypeChecker<'a> {
                 let source_ctx_len = param_count + field_index;
                 let source_args = &ctor_args[..source_ctx_len];
                 let mut recursive_args = request.args[..index_start].to_vec();
-                for index_arg in
-                    direct_recursive_index_args(data, field_domain, source_ctx_len, request.offset)?
-                {
+                for index_arg in index_args {
                     recursive_args.push(instantiate_constructor_args(
                         &index_arg,
                         source_args,
@@ -4942,11 +5211,18 @@ impl<'a> TypeChecker<'a> {
                     )?);
                 }
                 recursive_args.push(field_arg.clone());
+                let Some(field_recursor) = recursor
+                    .block
+                    .get(field_family_index)
+                    .and_then(|family| family.recursor.as_ref())
+                else {
+                    return Ok(None);
+                };
                 let recursive_call = apps(
                     ReferenceCoreExpr::Const {
                         global_ref: ReferenceCoreGlobalRef::Imported {
                             import_index: recursor_key.import_index,
-                            name: recursor_name.clone(),
+                            name: field_recursor.name.clone(),
                             decl_interface_hash: recursor_key.decl_interface_hash,
                         },
                         levels: request.levels.to_vec(),
@@ -5033,10 +5309,10 @@ impl<'a> TypeChecker<'a> {
             return Ok(false);
         }
         let import = self.imports.imports().get(*import_index).ok_or_else(|| {
-            ReferenceCheckError::type_check(
+            ReferenceCheckError::unknown_reference(
                 ReferenceCertificateSection::Declarations,
                 offset,
-                ReferenceCheckReason::UnknownReference,
+                self.reference_context(imported_ref),
             )
         })?;
         if import.module.dotted() != "Std.Logic.Eq" {
@@ -5059,6 +5335,9 @@ impl<'a> TypeChecker<'a> {
         offset: usize,
         fuel: &mut usize,
     ) -> DecodeResult<bool> {
+        if lhs == rhs {
+            return Ok(true);
+        }
         spend_fuel(fuel, offset)?;
 
         let lhs = self.whnf_with_fuel(ctx, delta, lhs, offset, fuel)?;
@@ -5454,7 +5733,8 @@ struct ImportedRecursorKey {
 
 #[derive(Clone, Debug)]
 struct ReferenceImportedRecursorRuntime {
-    data: ReferenceInductiveSignature,
+    block: Arc<[ReferenceInductiveSignature]>,
+    target_index: usize,
     recursor: ReferenceRecursorSignature,
 }
 
@@ -5467,40 +5747,19 @@ struct RecursorReductionRequest<'a> {
     fuel: &'a mut usize,
 }
 
-#[derive(Default)]
-struct ImportedInductiveExportGroup<'a> {
-    inductives: Vec<&'a ReferencePublicExport>,
-    constructors: Vec<&'a ReferencePublicExport>,
-    recursors: Vec<&'a ReferencePublicExport>,
-}
-
-fn imported_inductive_export_groups(
-    exports: &[ReferencePublicExport],
-) -> BTreeMap<ReferenceHash, ImportedInductiveExportGroup<'_>> {
-    let mut groups: BTreeMap<ReferenceHash, ImportedInductiveExportGroup<'_>> = BTreeMap::new();
-    for export in exports {
-        match export.kind {
-            ReferenceExportKind::Inductive => groups
-                .entry(export.decl_interface_hash)
-                .or_default()
-                .inductives
-                .push(export),
-            ReferenceExportKind::Constructor => groups
-                .entry(export.decl_interface_hash)
-                .or_default()
-                .constructors
-                .push(export),
-            ReferenceExportKind::Recursor => groups
-                .entry(export.decl_interface_hash)
-                .or_default()
-                .recursors
-                .push(export),
-            ReferenceExportKind::Axiom
-            | ReferenceExportKind::Def
-            | ReferenceExportKind::Theorem => {}
-        }
-    }
-    groups
+fn unique_public_export<'a>(
+    environment: &'a ReferencePublicEnvironment,
+    decl_interface_hash: ReferenceHash,
+    kind: ReferenceExportKind,
+    name: &ReferenceModuleName,
+) -> Option<&'a ReferencePublicExport> {
+    let mut matches = environment.exports.iter().filter(|export| {
+        export.decl_interface_hash == decl_interface_hash
+            && export.kind == kind
+            && export.name == *name
+    });
+    let found = matches.next()?;
+    matches.next().is_none().then_some(found)
 }
 
 #[derive(Clone, Debug, Default)]
@@ -5841,7 +6100,7 @@ fn decompose_reference_le_constraint(
     if lhs == rhs {
         return Ok(Vec::new());
     }
-    let lhs_atoms = decompose_reference_level_expr(&lhs, offset)?;
+    let lhs_atoms = decompose_reference_lhs_level_expr(&lhs, offset)?;
     let rhs_atoms = decompose_reference_level_expr(&rhs, offset)?;
     let [rhs_atom] = rhs_atoms.as_slice() else {
         return Err(ReferenceCheckError::type_check(
@@ -5868,6 +6127,30 @@ fn decompose_reference_level_expr(
         ReferenceCoreLevel::Max(lhs, rhs) => {
             let mut atoms = decompose_reference_level_expr(&lhs, offset)?;
             atoms.extend(decompose_reference_level_expr(&rhs, offset)?);
+            atoms.sort();
+            atoms.dedup();
+            Ok(atoms)
+        }
+        level => Ok(vec![decompose_reference_atom(&level, offset)?]),
+    }
+}
+
+/// Conservatively decomposes a universe expression used on the left of `<=`.
+///
+/// `imax(a, b) <= max(a, b)` holds for every universe valuation: when `b = 0`
+/// the left side is `0`, and otherwise it is `max(a, b)`. Replacing a
+/// left-hand `imax` by `max` can therefore only reject additional valid
+/// constraints; it cannot admit an invalid one. The right-hand side
+/// deliberately continues to use `decompose_reference_level_expr` and fails
+/// closed on symbolic `imax`, where the same replacement would be unsound.
+fn decompose_reference_lhs_level_expr(
+    level: &ReferenceCoreLevel,
+    offset: usize,
+) -> DecodeResult<Vec<ReferenceAtom>> {
+    match normalize_reference_level(level.clone()) {
+        ReferenceCoreLevel::Max(lhs, rhs) | ReferenceCoreLevel::IMax(lhs, rhs) => {
+            let mut atoms = decompose_reference_lhs_level_expr(&lhs, offset)?;
+            atoms.extend(decompose_reference_lhs_level_expr(&rhs, offset)?);
             atoms.sort();
             atoms.dedup();
             Ok(atoms)
@@ -7769,24 +8052,72 @@ impl ReferenceUniverseContext {
         if obligations.is_empty() {
             return Ok(());
         }
-        ensure_reference_universe_constraints_wf(&self.params, obligations, offset)?;
-        let param_indices = reference_universe_param_indices(&self.params);
         for obligation in obligations {
-            for inequality in decompose_reference_constraint(obligation, offset)? {
-                let from = reference_atom_base_index(&inequality.rhs.base, &param_indices, offset)?;
-                let to = reference_atom_base_index(&inequality.lhs.base, &param_indices, offset)?;
-                let bound = i128::from(reference_offset_bound(&inequality.rhs, offset)?)
-                    - i128::from(reference_offset_bound(&inequality.lhs, offset)?);
-                if !self.closure.entails(from, to, bound) {
-                    return Err(ReferenceCheckError::type_check(
-                        ReferenceCertificateSection::Declarations,
-                        offset,
-                        ReferenceCheckReason::UniverseConstraintViolation,
-                    ));
+            let normalized = normalize_reference_constraint(obligation);
+            let entailed = match normalized.relation {
+                UniverseConstraintRelation::Le => {
+                    self.entails_level_le(&normalized.lhs, &normalized.rhs, offset)?
                 }
+                UniverseConstraintRelation::Eq => {
+                    self.entails_level_le(&normalized.lhs, &normalized.rhs, offset)?
+                        && self.entails_level_le(&normalized.rhs, &normalized.lhs, offset)?
+                }
+            };
+            if !entailed {
+                return Err(ReferenceCheckError::type_check(
+                    ReferenceCertificateSection::Declarations,
+                    offset,
+                    ReferenceCheckReason::UniverseConstraintViolation,
+                ));
             }
         }
         Ok(())
+    }
+
+    pub(crate) fn entails_level_le(
+        &self,
+        lhs: &ReferenceCoreLevel,
+        rhs: &ReferenceCoreLevel,
+        offset: usize,
+    ) -> DecodeResult<bool> {
+        ensure_level_wf(lhs, &self.params, offset)?;
+        ensure_level_wf(rhs, &self.params, offset)?;
+        let lhs = normalize_reference_level(lhs.clone());
+        let rhs = normalize_reference_level(rhs.clone());
+        if lhs == rhs {
+            return Ok(true);
+        }
+        let lhs_atoms = decompose_reference_lhs_level_expr(&lhs, offset)?;
+        let rhs_atoms = decompose_reference_level_expr(&rhs, offset)?;
+        let comparison_count = lhs_atoms
+            .len()
+            .checked_mul(rhs_atoms.len())
+            .ok_or_else(|| {
+                ReferenceCheckError::type_check(
+                    ReferenceCertificateSection::Declarations,
+                    offset,
+                    ReferenceCheckReason::ResourceLimit,
+                )
+            })?;
+        ensure_reference_universe_edge_limit(comparison_count, offset)?;
+        let param_indices = reference_universe_param_indices(&self.params);
+        for lhs_atom in &lhs_atoms {
+            let to = reference_atom_base_index(&lhs_atom.base, &param_indices, offset)?;
+            let lhs_offset = i128::from(reference_offset_bound(lhs_atom, offset)?);
+            let mut witnessed = false;
+            for rhs_atom in &rhs_atoms {
+                let from = reference_atom_base_index(&rhs_atom.base, &param_indices, offset)?;
+                let bound = i128::from(reference_offset_bound(rhs_atom, offset)?) - lhs_offset;
+                if self.closure.entails(from, to, bound) {
+                    witnessed = true;
+                    break;
+                }
+            }
+            if !witnessed {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     pub(crate) fn substitute_constraints(
@@ -9252,6 +9583,8 @@ fn term_node_key(
 struct ComputedDeclHashes {
     decl_interface_hash: ReferenceHash,
     decl_certificate_hash: ReferenceHash,
+    interface_has_dependency_material: bool,
+    certificate_has_dependency_material: bool,
 }
 
 fn compute_decl_hashes(
@@ -9264,6 +9597,27 @@ fn compute_decl_hashes(
     names: &[Located<ReferenceModuleName>],
 ) -> DecodeResult<ComputedDeclHashes> {
     let interface_dependencies = interface_dependencies_for_decl(decl, dependencies, term_table)?;
+    let is_axiom = matches!(
+        decl,
+        DeclPayload::Axiom { .. } | DeclPayload::AxiomConstrained { .. }
+    );
+    let interface_has_dependency_material =
+        !interface_dependencies.is_empty() || (!is_axiom && !axiom_dependencies.is_empty());
+    let certificate_has_dependency_material = match decl {
+        DeclPayload::Axiom { .. } | DeclPayload::AxiomConstrained { .. } => {
+            !axiom_dependencies.is_empty()
+        }
+        DeclPayload::Theorem { .. } | DeclPayload::TheoremConstrained { .. } => {
+            !dependencies.is_empty()
+        }
+        DeclPayload::Def { .. }
+        | DeclPayload::DefConstrained { .. }
+        | DeclPayload::Inductive { .. }
+        | DeclPayload::InductiveConstrained { .. }
+        | DeclPayload::MutualInductiveBlock { .. } => {
+            !dependencies.is_empty() || !axiom_dependencies.is_empty()
+        }
+    };
     let interface_hash = hash_with_domain(
         b"NPA-DECL-IFACE-0.1",
         &decl_interface_payload(
@@ -9288,6 +9642,8 @@ fn compute_decl_hashes(
     Ok(ComputedDeclHashes {
         decl_interface_hash: interface_hash,
         decl_certificate_hash: certificate_hash,
+        interface_has_dependency_material,
+        certificate_has_dependency_material,
     })
 }
 
@@ -10253,12 +10609,325 @@ fn encode_uvar_to(out: &mut Vec<u8>, mut value: u64) {
 mod tests {
     use super::*;
 
+    const MUTUAL_PROVIDER: &[u8] = include_bytes!(
+        "../../../checkers/npa-checker-ext/test/fixtures/conformance/mutual-v0.2.npcert"
+    );
+    const MUTUAL_CONSUMER: &[u8] = include_bytes!(
+        "../../../checkers/npa-checker-ext/test/fixtures/conformance/imported-mutual-iota-v0.2.npcert"
+    );
+
     fn param(name: &str) -> ReferenceCoreLevel {
         ReferenceCoreLevel::Param(rname(name))
     }
 
     fn succ(level: ReferenceCoreLevel) -> ReferenceCoreLevel {
         ReferenceCoreLevel::Succ(Arc::new(level))
+    }
+
+    fn mutual_consumer_certificate_and_imports(
+    ) -> (DecodedModuleCertificate, ReferenceImportEnvironment) {
+        let provider = check_certificate_impl(
+            MUTUAL_PROVIDER,
+            &ReferenceImportStore::default(),
+            &ReferenceCheckerPolicy::default(),
+        )
+        .expect("mutual provider checks");
+        let store = ReferenceImportStore::from_checked_modules([provider]).unwrap();
+        let policy = ReferenceCheckerPolicy {
+            trust_mode: ReferenceTrustMode::HighTrust,
+            ..ReferenceCheckerPolicy::default()
+        };
+        let certificate = decode_module_certificate(MUTUAL_CONSUMER).unwrap();
+        certificate.verify_hashes(MUTUAL_CONSUMER).unwrap();
+        let imports = certificate
+            .build_import_environment(&store, &policy)
+            .unwrap();
+        (certificate, imports)
+    }
+
+    fn assert_unknown_reference(
+        error: ReferenceCheckError,
+        offset: usize,
+        reference: ReferenceCheckReference,
+    ) {
+        assert_eq!(
+            error,
+            ReferenceCheckError::unknown_reference(
+                ReferenceCertificateSection::Declarations,
+                offset,
+                reference,
+            )
+        );
+    }
+
+    #[test]
+    fn imported_mutual_runtimes_share_block_storage() {
+        let (certificate, imports) = mutual_consumer_certificate_and_imports();
+        let checker = TypeChecker::new(&certificate, &imports).unwrap();
+        let runtimes = checker.imported_recursors.values().collect::<Vec<_>>();
+
+        assert_eq!(runtimes.len(), 2);
+        assert!(Arc::ptr_eq(&runtimes[0].block, &runtimes[1].block));
+    }
+
+    #[test]
+    fn decoded_reference_context_preserves_each_reference_identity() {
+        let (certificate, imports) = mutual_consumer_certificate_and_imports();
+        let declaration = certificate.name_table[0].value.clone();
+        let decl_interface_hash = [0x91; 32];
+        let resolved_import = resolved_import_identity(0, &imports.imports()[0]);
+
+        assert_eq!(
+            certificate.reference_context(
+                Some(&imports),
+                &GlobalRef::Builtin {
+                    name: 0,
+                    decl_interface_hash,
+                },
+            ),
+            ReferenceCheckReference::Builtin {
+                declaration: declaration.clone(),
+                decl_interface_hash,
+            }
+        );
+        assert_eq!(
+            certificate.reference_context(
+                Some(&imports),
+                &GlobalRef::Imported {
+                    import_index: 0,
+                    name: 0,
+                    decl_interface_hash,
+                },
+            ),
+            ReferenceCheckReference::Imported {
+                owner_import: None,
+                import: ReferenceCheckImportTarget::Resolved(resolved_import),
+                declaration: declaration.clone(),
+                decl_interface_hash,
+            }
+        );
+        assert_eq!(
+            certificate.reference_context(
+                None,
+                &GlobalRef::Local {
+                    decl_index: usize::MAX
+                }
+            ),
+            ReferenceCheckReference::Local {
+                owner_import: None,
+                declaration_index: usize::MAX,
+                declaration: None,
+            }
+        );
+        assert_eq!(
+            certificate.reference_context(
+                None,
+                &GlobalRef::LocalGenerated {
+                    decl_index: 7,
+                    name: 0,
+                },
+            ),
+            ReferenceCheckReference::LocalGenerated {
+                owner_import: None,
+                declaration_index: 7,
+                declaration,
+            }
+        );
+    }
+
+    #[test]
+    fn signature_resolution_unknown_references_preserve_requested_identity() {
+        let (certificate, imports) = mutual_consumer_certificate_and_imports();
+        let checker = TypeChecker::new(&certificate, &imports).unwrap();
+        let resolved_import = resolved_import_identity(0, &imports.imports()[0]);
+        let declaration = rname("Missing.declaration");
+        let decl_interface_hash = [0xa1; 32];
+
+        let builtin = ReferenceCoreGlobalRef::Builtin {
+            name: rname("Missing.Builtin"),
+            decl_interface_hash,
+        };
+        assert_unknown_reference(
+            checker.resolve_signature(&builtin, 101).unwrap_err(),
+            101,
+            ReferenceCheckReference::Builtin {
+                declaration: rname("Missing.Builtin"),
+                decl_interface_hash,
+            },
+        );
+
+        let imported_missing_export = ReferenceCoreGlobalRef::Imported {
+            import_index: 0,
+            name: declaration.clone(),
+            decl_interface_hash,
+        };
+        assert_unknown_reference(
+            checker
+                .resolve_signature(&imported_missing_export, 102)
+                .unwrap_err(),
+            102,
+            ReferenceCheckReference::Imported {
+                owner_import: None,
+                import: ReferenceCheckImportTarget::Resolved(resolved_import),
+                declaration: declaration.clone(),
+                decl_interface_hash,
+            },
+        );
+
+        let missing_import_index = imports.len() + 3;
+        let imported_missing_closure = ReferenceCoreGlobalRef::Imported {
+            import_index: missing_import_index,
+            name: declaration.clone(),
+            decl_interface_hash,
+        };
+        assert_unknown_reference(
+            checker
+                .resolve_signature(&imported_missing_closure, 103)
+                .unwrap_err(),
+            103,
+            ReferenceCheckReference::Imported {
+                owner_import: None,
+                import: ReferenceCheckImportTarget::Unresolved {
+                    import_index: missing_import_index,
+                },
+                declaration: declaration.clone(),
+                decl_interface_hash,
+            },
+        );
+
+        let local_name = certificate.local_declaration_name(0);
+        assert!(local_name.is_some(), "fixture must contain a declaration");
+        let local = ReferenceCoreGlobalRef::Local { decl_index: 0 };
+        assert_unknown_reference(
+            checker.resolve_signature(&local, 104).unwrap_err(),
+            104,
+            ReferenceCheckReference::Local {
+                owner_import: None,
+                declaration_index: 0,
+                declaration: local_name,
+            },
+        );
+
+        let generated_name = rname("Missing.generated");
+        let local_generated = ReferenceCoreGlobalRef::LocalGenerated {
+            decl_index: 0,
+            name: generated_name.clone(),
+        };
+        assert_unknown_reference(
+            checker
+                .resolve_signature(&local_generated, 105)
+                .unwrap_err(),
+            105,
+            ReferenceCheckReference::LocalGenerated {
+                owner_import: None,
+                declaration_index: 0,
+                declaration: generated_name,
+            },
+        );
+    }
+
+    #[test]
+    fn imported_environment_unknown_references_identify_owner_and_target() {
+        let (certificate, imports) = mutual_consumer_certificate_and_imports();
+        let checker = TypeChecker::new(&certificate, &imports).unwrap();
+        let owner_import = resolved_import_identity(0, &imports.imports()[0]);
+        let declaration = rname("Missing.declaration");
+        let decl_interface_hash = [0xb1; 32];
+        let empty_environment = ReferencePublicEnvironment::default();
+
+        let missing_import_index = 4;
+        let unresolved_nested_import = ReferenceCoreGlobalRef::Imported {
+            import_index: missing_import_index,
+            name: declaration.clone(),
+            decl_interface_hash,
+        };
+        assert_unknown_reference(
+            checker
+                .instantiate_public_global_ref(
+                    0,
+                    &empty_environment,
+                    &unresolved_nested_import,
+                    201,
+                )
+                .unwrap_err(),
+            201,
+            ReferenceCheckReference::Imported {
+                owner_import: Some(owner_import.clone()),
+                import: ReferenceCheckImportTarget::Unresolved {
+                    import_index: missing_import_index,
+                },
+                declaration: declaration.clone(),
+                decl_interface_hash,
+            },
+        );
+
+        let nested_module = rname("Missing.Module");
+        let nested_export_hash = [0xb2; 32];
+        let unremappable_environment = ReferencePublicEnvironment::new(
+            vec![(nested_module.clone(), nested_export_hash)],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        let unremappable_nested_import = ReferenceCoreGlobalRef::Imported {
+            import_index: 0,
+            name: declaration.clone(),
+            decl_interface_hash,
+        };
+        assert_unknown_reference(
+            checker
+                .instantiate_public_global_ref(
+                    0,
+                    &unremappable_environment,
+                    &unremappable_nested_import,
+                    202,
+                )
+                .unwrap_err(),
+            202,
+            ReferenceCheckReference::Imported {
+                owner_import: Some(owner_import.clone()),
+                import: ReferenceCheckImportTarget::Resolved(
+                    ReferenceCheckResolvedImportIdentity {
+                        import_index: 0,
+                        module: nested_module,
+                        export_hash: nested_export_hash,
+                    },
+                ),
+                declaration: declaration.clone(),
+                decl_interface_hash,
+            },
+        );
+
+        let illegal_local = ReferenceCoreGlobalRef::Local { decl_index: 9 };
+        assert_unknown_reference(
+            checker
+                .instantiate_public_global_ref(0, &empty_environment, &illegal_local, 203)
+                .unwrap_err(),
+            203,
+            ReferenceCheckReference::Local {
+                owner_import: Some(owner_import.clone()),
+                declaration_index: 9,
+                declaration: None,
+            },
+        );
+
+        let generated_name = rname("Missing.generated");
+        let illegal_generated = ReferenceCoreGlobalRef::LocalGenerated {
+            decl_index: 10,
+            name: generated_name.clone(),
+        };
+        assert_unknown_reference(
+            checker
+                .instantiate_public_global_ref(0, &empty_environment, &illegal_generated, 204)
+                .unwrap_err(),
+            204,
+            ReferenceCheckReference::LocalGenerated {
+                owner_import: Some(owner_import),
+                declaration_index: 10,
+                declaration: generated_name,
+            },
+        );
     }
 
     #[test]
@@ -10333,6 +11002,33 @@ mod tests {
         assert_eq!(
             error.reason,
             Some(ReferenceCheckReason::UniverseConstraintViolation)
+        );
+    }
+
+    #[test]
+    fn const_universe_arguments_compare_by_normalized_level_equality() {
+        let certificate = decode_module_certificate(MUTUAL_PROVIDER).unwrap();
+        certificate.verify_hashes(MUTUAL_PROVIDER).unwrap();
+        let imports = certificate
+            .build_import_environment(
+                &ReferenceImportStore::default(),
+                &ReferenceCheckerPolicy::default(),
+            )
+            .unwrap();
+        let checker = TypeChecker::new(&certificate, &imports).unwrap();
+        let canonical = succ(ReferenceCoreLevel::Zero);
+        let redundant_max = ReferenceCoreLevel::Max(
+            Arc::new(ReferenceCoreLevel::Zero),
+            Arc::new(canonical.clone()),
+        );
+        let lhs = rbuiltin("Eq", vec![canonical]);
+        let rhs = rbuiltin("Eq", vec![redundant_max]);
+
+        assert!(
+            checker
+                .is_defeq(&TypeContext::default(), &[], &lhs, &rhs, 0)
+                .unwrap(),
+            "constant universe arguments must compare after level normalization"
         );
     }
 }

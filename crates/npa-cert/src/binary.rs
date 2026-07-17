@@ -604,9 +604,14 @@ impl<'a> Decoder<'a> {
     }
 
     pub(crate) fn module_cert(&mut self) -> Result<ModuleCert> {
+        self.module_cert_with_import_offsets()
+            .map(|(certificate, _)| certificate)
+    }
+
+    pub(crate) fn module_cert_with_import_offsets(&mut self) -> Result<(ModuleCert, Vec<usize>)> {
         let header = self.header()?;
         let version = certificate_format_version(&header)?;
-        let imports = self.imports()?;
+        let (imports, import_offsets) = self.imports_with_offsets()?;
         let name_table = self.name_table()?;
         let level_table = self.level_table()?;
         let term_table = self.term_table()?;
@@ -621,17 +626,20 @@ impl<'a> Decoder<'a> {
             axiom_report_hash: self.hash()?,
             certificate_hash: self.hash()?,
         };
-        Ok(ModuleCert {
-            header,
-            imports,
-            name_table,
-            level_table,
-            term_table,
-            declarations,
-            export_block,
-            axiom_report,
-            hashes,
-        })
+        Ok((
+            ModuleCert {
+                header,
+                imports,
+                name_table,
+                level_table,
+                term_table,
+                declarations,
+                export_block,
+                axiom_report,
+                hashes,
+            },
+            import_offsets,
+        ))
     }
 
     fn header(&mut self) -> Result<CertHeader> {
@@ -642,17 +650,19 @@ impl<'a> Decoder<'a> {
         })
     }
 
-    fn imports(&mut self) -> Result<Vec<ImportEntry>> {
+    fn imports_with_offsets(&mut self) -> Result<(Vec<ImportEntry>, Vec<usize>)> {
         let len = self.bounded_len()?;
-        (0..len)
-            .map(|_| {
-                Ok(ImportEntry {
-                    module: self.name()?,
-                    export_hash: self.hash()?,
-                    certificate_hash: self.option_hash()?,
-                })
-            })
-            .collect()
+        let mut imports = Vec::with_capacity(len);
+        let mut offsets = Vec::with_capacity(len);
+        for _ in 0..len {
+            offsets.push(self.offset);
+            imports.push(ImportEntry {
+                module: self.name()?,
+                export_hash: self.hash()?,
+                certificate_hash: self.option_hash()?,
+            });
+        }
+        Ok((imports, offsets))
     }
 
     fn name_table(&mut self) -> Result<Vec<Name>> {

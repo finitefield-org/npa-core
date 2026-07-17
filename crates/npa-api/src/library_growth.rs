@@ -6925,7 +6925,7 @@ mod tests {
 
     fn base_library_reuse_score_input(stage: LibraryGrowthStage) -> LibraryReuseScoreInput {
         LibraryReuseScoreInput {
-            candidate_id: "pua-m14-generated-reuse-helper".to_owned(),
+            candidate_id: "library-growth-generated-reuse-helper".to_owned(),
             target_module: "Proofs.Ai.LibraryGrowth".to_owned(),
             declaration_name: "generated_reuse_helper".to_owned(),
             theorem_level: TheoremLevel::L2DerivedCertificate,

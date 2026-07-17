@@ -12,6 +12,7 @@ mod hash;
 mod inductive;
 mod kernel;
 mod producer;
+mod theorem_premise_analysis;
 mod types;
 mod verify;
 
@@ -23,6 +24,7 @@ pub use inductive::{
 };
 pub use kernel::{builtin_decl_interface_hash, verified_module_to_kernel_decls};
 pub use producer::*;
+pub use theorem_premise_analysis::*;
 pub use types::*;
 
 pub(crate) use binary::*;
@@ -98,6 +100,23 @@ pub fn build_module_cert_from_import_refs(
     canonical::build_module_cert_from_import_refs_impl(module, imports)
 }
 
+/// Build a canonical module certificate with explicit providers for referenced imported names.
+///
+/// This has the same trust requirements as `build_module_cert_from_import_refs`. The preferred
+/// provider map lets frontends preserve source-resolution identity when the broader certificate
+/// import closure contains another module that exports the same public name.
+pub fn build_module_cert_from_import_refs_with_preferred_imports(
+    module: CoreModule,
+    imports: &[&VerifiedModule],
+    preferred_imports: &std::collections::BTreeMap<Name, ImportEntry>,
+) -> Result<ModuleCert> {
+    canonical::build_module_cert_from_import_refs_with_preferred_imports_impl(
+        module,
+        imports,
+        preferred_imports,
+    )
+}
+
 /// Encode a module certificate as the canonical `.npcert` binary representation.
 ///
 /// The returned bytes are the exact bytes used by certificate verification and module hashing.
@@ -116,6 +135,30 @@ pub fn decode_module_cert(bytes: &[u8]) -> Result<ModuleCert> {
         return Err(CertError::DecodeError);
     }
     Ok(cert)
+}
+
+/// Decode a certificate and return the byte offset of each import entry.
+///
+/// Offsets are ordered exactly like [`ModuleCert::imports`] and point to the
+/// first byte of the corresponding encoded import. This is useful for callers
+/// that must preserve precise import-resolution diagnostics.
+pub fn decode_module_cert_with_import_offsets(bytes: &[u8]) -> Result<(ModuleCert, Vec<usize>)> {
+    let mut decoder = binary::Decoder::new(bytes);
+    let decoded = decoder.module_cert_with_import_offsets()?;
+    if !decoder.is_done() {
+        return Err(CertError::DecodeError);
+    }
+    Ok(decoded)
+}
+
+/// Decode a canonical certificate and verify its stored structural hashes.
+///
+/// This checks canonical encoding, table structure, declaration and module
+/// hashes, declaration order, and generated inductive artifacts. It does not
+/// resolve imports, apply an axiom policy, type check declarations, or register
+/// the result as verified proof evidence.
+pub fn verify_module_cert_hashes(bytes: &[u8]) -> Result<ModuleCert> {
+    verify::verify_module_cert_hashes_impl(bytes)
 }
 
 /// Verify a canonical module certificate and register the verified module in `session`.

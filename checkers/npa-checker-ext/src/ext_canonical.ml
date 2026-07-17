@@ -10,11 +10,34 @@ let domain_generated_recursor_signature = "NPA-GEN-REC-SIG-0.1"
 
 let domain_generated_computation_rule = "NPA-GEN-COMP-RULE-0.1"
 
-let domain_module_export = "NPA-MODULE-EXPORT-0.1"
+let domain_module_export_current = "NPA-MODULE-EXPORT-0.2.0"
+
+let domain_module_export_previous = "NPA-MODULE-EXPORT-0.1.2"
+
+let domain_module_export_legacy = "NPA-MODULE-EXPORT-0.1"
+
+(* Legacy alias retained for the existing legacy golden-vector tests. *)
+let domain_module_export = domain_module_export_legacy
 
 let domain_axiom_report = "NPA-AXIOM-REPORT-0.1"
 
-let domain_module_certificate = "NPA-MODULE-CERT-0.1"
+let domain_module_certificate_current = "NPA-MODULE-CERT-0.2.0"
+
+let domain_module_certificate_previous = "NPA-MODULE-CERT-0.1.2"
+
+let domain_module_certificate_legacy = "NPA-MODULE-CERT-0.1"
+
+let domain_module_certificate = domain_module_certificate_legacy
+
+let module_export_domain = function
+  | Ext_cert.Current -> domain_module_export_current
+  | Ext_cert.Previous -> domain_module_export_previous
+  | Ext_cert.Legacy -> domain_module_export_legacy
+
+let module_certificate_domain = function
+  | Ext_cert.Current -> domain_module_certificate_current
+  | Ext_cert.Previous -> domain_module_certificate_previous
+  | Ext_cert.Legacy -> domain_module_certificate_legacy
 
 let bind result f =
   match result with
@@ -67,6 +90,15 @@ let term_id section offset term_table term =
         if entry.Ext_term.term = term then Ok index else loop (index + 1) rest
   in
   loop 0 term_table
+
+let level_id section offset level_table level =
+  let rec loop index entries =
+    match entries with
+    | [] -> error section offset Ext_bytes.Dangling_reference
+    | entry :: rest ->
+        if entry.Ext_level.level = level then Ok index else loop (index + 1) rest
+  in
+  loop 0 level_table
 
 let encode_name_id section offset name_table name =
   bind (name_id section offset name_table name) (fun id -> Ok (encode_uvar id))
@@ -753,12 +785,12 @@ let verify_declaration_hashes (decoded : Ext_cert.decoded_module) =
               Ok
                 (Declaration_hash_mismatch
                    (make_declaration_hash_mismatch index declaration Decl_interface_hash
-                      stored_interface interface_hash))
+                      interface_hash stored_interface))
             else if certificate_hash <> stored_certificate then
               Ok
                 (Declaration_hash_mismatch
                    (make_declaration_hash_mismatch index declaration Decl_certificate_hash
-                      stored_certificate certificate_hash))
+                      certificate_hash stored_certificate))
             else loop (index + 1) rest)
   in
   loop 0 decoded.Ext_cert.declaration_table
@@ -789,7 +821,30 @@ let encode_option_usize value =
   | None -> Ok (byte 0x00)
   | Some value -> Ok (byte 0x01 ^ encode_uvar value)
 
-let encode_export_entries name_table term_table entries =
+let encode_universe_constraint_ids section offset level_table constraints =
+  let rec loop remaining encoded =
+    match remaining with
+    | [] ->
+        Ok
+          (encode_uvar (List.length constraints)
+          ^ String.concat "" (List.rev encoded))
+    | constraint_ :: rest ->
+        bind
+          (level_id section offset level_table constraint_.Ext_cert.constraint_lhs)
+          (fun lhs_id ->
+            bind
+              (level_id section offset level_table constraint_.Ext_cert.constraint_rhs)
+              (fun rhs_id ->
+                loop rest
+                  ((encode_uvar lhs_id
+                   ^ encode_universe_constraint_relation
+                       constraint_.Ext_cert.constraint_relation
+                   ^ encode_uvar rhs_id)
+                  :: encoded)))
+  in
+  loop constraints []
+
+let encode_export_entries version name_table level_table term_table entries =
   let section = Ext_bytes.Export_block in
   let rec loop remaining encoded =
     match remaining with
@@ -800,6 +855,12 @@ let encode_export_entries name_table term_table entries =
             bind
               (list_name_ids section offset name_table export.Ext_cert.export_universe_params)
               (fun universe_param_ids ->
+                bind
+                  (if Ext_cert.version_encodes_export_universe_constraints version then
+                     encode_universe_constraint_ids section offset level_table
+                       export.Ext_cert.export_universe_constraints
+                   else Ok "")
+                  (fun universe_constraints ->
                 bind (term_id section offset term_table export.Ext_cert.export_ty) (fun ty_id ->
                     bind
                       (match export.Ext_cert.export_body with
@@ -821,23 +882,635 @@ let encode_export_entries name_table term_table entries =
                                           ((encode_uvar export_name_id
                                            ^ encode_export_kind export.Ext_cert.export_kind
                                            ^ encode_usize_vector universe_param_ids
-                                           ^ encode_uvar ty_id ^ body
+                                           ^ universe_constraints ^ encode_uvar ty_id ^ body
                                            ^ encode_hash export.Ext_cert.export_type_hash ^ body_hash
                                            ^ reducibility ^ opacity
                                            ^ encode_hash export.Ext_cert.export_decl_interface_hash
                                           ^ axioms)
-                                          :: encoded)))))))))
+                                          :: encoded))))))))))
   in
   loop entries []
 
 let encode_export_block decoded =
-  encode_export_entries decoded.Ext_cert.name_table decoded.Ext_cert.term_table
-    decoded.Ext_cert.export_block
+  encode_export_entries decoded.Ext_cert.header.Ext_cert.version
+    decoded.Ext_cert.name_table decoded.Ext_cert.level_table
+    decoded.Ext_cert.term_table decoded.Ext_cert.export_block
+
+let encode_option_value encode = function
+  | None -> Ok (byte 0x00)
+  | Some value -> bind (encode value) (fun encoded -> Ok (byte 0x01 ^ encoded))
+
+let encode_hash_option value = encode_option_value (fun hash -> Ok hash) value
+
+let encode_import_table imports =
+  let rec loop remaining encoded =
+    match remaining with
+    | [] ->
+        Ok
+          (encode_uvar (List.length imports)
+          ^ String.concat "" (List.rev encoded))
+    | import :: rest ->
+        let entry = import.Ext_cert.import_entry in
+        bind (encode_hash_option entry.Ext_import.certificate_hash)
+          (fun certificate_hash ->
+            loop rest
+              ((encode_name entry.Ext_import.module_name
+               ^ entry.Ext_import.export_hash ^ certificate_hash)
+              :: encoded))
+  in
+  loop imports []
+
+let encode_name_table_binary names =
+  encode_uvar (List.length names)
+  ^ String.concat ""
+      (List.map (fun entry -> encode_name entry.Ext_cert.name) names)
+
+let encode_level_table_binary name_table level_table =
+  let section = Ext_bytes.Level_table in
+  let rec entry_bytes entry =
+    let offset = entry.Ext_level.offset in
+    match entry.Ext_level.level with
+    | Ext_level.Zero -> Ok (byte 0x00)
+    | Ext_level.Succ inner ->
+        bind (level_id section offset level_table inner) (fun id ->
+            Ok (byte 0x01 ^ encode_uvar id))
+    | Ext_level.Max (lhs, rhs) ->
+        bind (level_id section offset level_table lhs) (fun lhs_id ->
+            bind (level_id section offset level_table rhs) (fun rhs_id ->
+                Ok (byte 0x02 ^ encode_uvar lhs_id ^ encode_uvar rhs_id)))
+    | Ext_level.Imax (lhs, rhs) ->
+        bind (level_id section offset level_table lhs) (fun lhs_id ->
+            bind (level_id section offset level_table rhs) (fun rhs_id ->
+                Ok (byte 0x03 ^ encode_uvar lhs_id ^ encode_uvar rhs_id)))
+    | Ext_level.Param name ->
+        bind (name_id section offset name_table name) (fun id ->
+            Ok (byte 0x04 ^ encode_uvar id))
+  in
+  let rec loop remaining encoded =
+    match remaining with
+    | [] ->
+        Ok
+          (encode_uvar (List.length level_table)
+          ^ String.concat "" (List.rev encoded))
+    | entry :: rest ->
+        bind (entry_bytes entry) (fun bytes -> loop rest (bytes :: encoded))
+  in
+  loop level_table []
+
+let encode_level_ids section offset level_table levels =
+  let rec loop remaining encoded =
+    match remaining with
+    | [] ->
+        Ok
+          (encode_uvar (List.length levels)
+          ^ String.concat "" (List.rev encoded))
+    | level :: rest ->
+        bind (level_id section offset level_table level) (fun id ->
+            loop rest (encode_uvar id :: encoded))
+  in
+  loop levels []
+
+let encode_term_table_binary name_table level_table term_table =
+  let section = Ext_bytes.Term_table in
+  let entry_bytes entry =
+    let offset = entry.Ext_term.offset in
+    match entry.Ext_term.term with
+    | Ext_term.Sort level ->
+        bind (level_id section offset level_table level) (fun id ->
+            Ok (byte 0x00 ^ encode_uvar id))
+    | Ext_term.BVar index -> Ok (byte 0x01 ^ encode_uvar index)
+    | Ext_term.Const (global_ref, levels) ->
+        bind (encode_global_ref section offset name_table global_ref)
+          (fun global_ref_bytes ->
+            bind (encode_level_ids section offset level_table levels)
+              (fun level_bytes ->
+                Ok (byte 0x02 ^ global_ref_bytes ^ level_bytes)))
+    | Ext_term.App (fn, arg) ->
+        bind (term_id section offset term_table fn) (fun fn_id ->
+            bind (term_id section offset term_table arg) (fun arg_id ->
+                Ok (byte 0x03 ^ encode_uvar fn_id ^ encode_uvar arg_id)))
+    | Ext_term.Lam (ty, body) ->
+        bind (term_id section offset term_table ty) (fun ty_id ->
+            bind (term_id section offset term_table body) (fun body_id ->
+                Ok (byte 0x04 ^ encode_uvar ty_id ^ encode_uvar body_id)))
+    | Ext_term.Pi (ty, body) ->
+        bind (term_id section offset term_table ty) (fun ty_id ->
+            bind (term_id section offset term_table body) (fun body_id ->
+                Ok (byte 0x05 ^ encode_uvar ty_id ^ encode_uvar body_id)))
+    | Ext_term.Let (ty, value, body) ->
+        bind (term_id section offset term_table ty) (fun ty_id ->
+            bind (term_id section offset term_table value) (fun value_id ->
+                bind (term_id section offset term_table body) (fun body_id ->
+                    Ok
+                      (byte 0x06 ^ encode_uvar ty_id ^ encode_uvar value_id
+                     ^ encode_uvar body_id))))
+  in
+  let rec loop remaining encoded =
+    match remaining with
+    | [] ->
+        Ok
+          (encode_uvar (List.length term_table)
+          ^ String.concat "" (List.rev encoded))
+    | entry :: rest ->
+        bind (entry_bytes entry) (fun bytes -> loop rest (bytes :: encoded))
+  in
+  loop term_table []
+
+let encode_binder_types_binary section offset term_table binders =
+  let rec loop remaining encoded =
+    match remaining with
+    | [] ->
+        Ok
+          (encode_uvar (List.length binders)
+          ^ String.concat "" (List.rev encoded))
+    | binder :: rest ->
+        bind (term_id section offset term_table binder.Ext_cert.binder_ty)
+          (fun id -> loop rest (encode_uvar id :: encoded))
+  in
+  loop binders []
+
+let encode_constructor_specs_binary section offset name_table term_table
+    constructors =
+  let rec loop remaining encoded =
+    match remaining with
+    | [] ->
+        Ok
+          (encode_uvar (List.length constructors)
+          ^ String.concat "" (List.rev encoded))
+    | constructor :: rest ->
+        bind
+          (name_id section offset name_table
+             constructor.Ext_cert.constructor_name)
+          (fun name_id_value ->
+            bind
+              (term_id section offset term_table
+                 constructor.Ext_cert.constructor_ty)
+              (fun ty_id ->
+                loop rest
+                  ((encode_uvar name_id_value ^ encode_uvar ty_id) :: encoded)))
+  in
+  loop constructors []
+
+let encode_recursor_spec_binary section offset name_table term_table = function
+  | None -> Ok (byte 0x00)
+  | Some recursor ->
+      bind
+        (name_id section offset name_table recursor.Ext_cert.recursor_name)
+        (fun name_id_value ->
+          bind
+            (list_name_ids section offset name_table
+               recursor.Ext_cert.recursor_universe_params)
+            (fun universe_param_ids ->
+              bind
+                (term_id section offset term_table recursor.Ext_cert.recursor_ty)
+                (fun ty_id ->
+                  Ok
+                    (byte 0x01 ^ encode_uvar name_id_value
+                   ^ encode_usize_vector universe_param_ids ^ encode_uvar ty_id
+                   ^ encode_uvar recursor.Ext_cert.recursor_rules.minor_start
+                   ^ encode_uvar recursor.Ext_cert.recursor_rules.major_index))))
+
+let encode_mutual_specs_binary section offset name_table level_table term_table
+    inductives =
+  let rec loop remaining encoded =
+    match remaining with
+    | [] ->
+        Ok
+          (encode_uvar (List.length inductives)
+          ^ String.concat "" (List.rev encoded))
+    | inductive :: rest ->
+        bind
+          (name_id section offset name_table inductive.Ext_cert.mutual_name)
+          (fun name_id_value ->
+            bind
+              (encode_binder_types_binary section offset term_table
+                 inductive.Ext_cert.mutual_params)
+              (fun params ->
+                bind
+                  (encode_binder_types_binary section offset term_table
+                     inductive.Ext_cert.mutual_indices)
+                  (fun indices ->
+                    bind
+                      (level_id section offset level_table
+                         inductive.Ext_cert.mutual_sort)
+                      (fun sort_id ->
+                        bind
+                          (encode_constructor_specs_binary section offset name_table
+                             term_table inductive.Ext_cert.mutual_constructors)
+                          (fun constructors ->
+                            bind
+                              (encode_recursor_spec_binary section offset name_table
+                                 term_table inductive.Ext_cert.mutual_recursor)
+                              (fun recursor ->
+                                loop rest
+                                  ((encode_uvar name_id_value ^ params ^ indices
+                                   ^ encode_uvar sort_id ^ constructors ^ recursor)
+                                  :: encoded)))))))
+  in
+  loop inductives []
+
+let encode_decl_payload_binary name_table level_table term_table
+    (declaration : Ext_cert.declaration) =
+  let section = Ext_bytes.Declarations in
+  let offset = declaration.Ext_cert.offset in
+  let name value = name_id section offset name_table value in
+  let names values =
+    bind (list_name_ids section offset name_table values) (fun ids ->
+        Ok (encode_usize_vector ids))
+  in
+  let term value = term_id section offset term_table value in
+  let constraints values =
+    encode_universe_constraint_ids section offset level_table values
+  in
+  let binders values =
+    encode_binder_types_binary section offset term_table values
+  in
+  let constructors values =
+    encode_constructor_specs_binary section offset name_table term_table values
+  in
+  let recursor value =
+    encode_recursor_spec_binary section offset name_table term_table value
+  in
+  capture (fun () ->
+      match declaration.Ext_cert.payload with
+      | Ext_cert.AxiomDecl
+          {
+            decl_name;
+            decl_universe_params;
+            decl_universe_constraints = [];
+            decl_ty;
+          } ->
+          byte 0x00 ^ encode_uvar (unwrap (name decl_name))
+          ^ unwrap (names decl_universe_params)
+          ^ encode_uvar (unwrap (term decl_ty))
+      | Ext_cert.AxiomDecl
+          {
+            decl_name;
+            decl_universe_params;
+            decl_universe_constraints;
+            decl_ty;
+          } ->
+          byte 0x10 ^ encode_uvar (unwrap (name decl_name))
+          ^ unwrap (names decl_universe_params)
+          ^ unwrap (constraints decl_universe_constraints)
+          ^ encode_uvar (unwrap (term decl_ty))
+      | Ext_cert.DefDecl
+          {
+            decl_name;
+            decl_universe_params;
+            decl_universe_constraints;
+            decl_ty;
+            decl_value;
+            decl_reducibility;
+          } ->
+          let tag =
+            if decl_universe_constraints = [] then byte 0x01 else byte 0x11
+          in
+          tag ^ encode_uvar (unwrap (name decl_name))
+          ^ unwrap (names decl_universe_params)
+          ^ (if decl_universe_constraints = [] then ""
+             else unwrap (constraints decl_universe_constraints))
+          ^ encode_uvar (unwrap (term decl_ty))
+          ^ encode_uvar (unwrap (term decl_value))
+          ^ encode_reducibility decl_reducibility
+      | Ext_cert.TheoremDecl
+          {
+            decl_name;
+            decl_universe_params;
+            decl_universe_constraints;
+            decl_ty;
+            decl_proof;
+            decl_opacity;
+          } ->
+          let tag =
+            if decl_universe_constraints = [] then byte 0x02 else byte 0x12
+          in
+          tag ^ encode_uvar (unwrap (name decl_name))
+          ^ unwrap (names decl_universe_params)
+          ^ (if decl_universe_constraints = [] then ""
+             else unwrap (constraints decl_universe_constraints))
+          ^ encode_uvar (unwrap (term decl_ty))
+          ^ encode_uvar (unwrap (term decl_proof))
+          ^ encode_opacity decl_opacity
+      | Ext_cert.InductiveDecl
+          {
+            decl_name;
+            decl_universe_params;
+            decl_universe_constraints;
+            ind_params;
+            ind_indices;
+            ind_sort;
+            ind_constructors;
+            ind_recursor;
+          } ->
+          let tag =
+            if decl_universe_constraints = [] then byte 0x03 else byte 0x13
+          in
+          tag ^ encode_uvar (unwrap (name decl_name))
+          ^ unwrap (names decl_universe_params)
+          ^ (if decl_universe_constraints = [] then ""
+             else unwrap (constraints decl_universe_constraints))
+          ^ unwrap (binders ind_params) ^ unwrap (binders ind_indices)
+          ^ encode_uvar (unwrap (level_id section offset level_table ind_sort))
+          ^ unwrap (constructors ind_constructors) ^ unwrap (recursor ind_recursor)
+      | Ext_cert.MutualInductiveBlockDecl
+          {
+            decl_name;
+            decl_universe_params;
+            decl_universe_constraints;
+            mutual_inductives;
+          } ->
+          byte 0x04 ^ encode_uvar (unwrap (name decl_name))
+          ^ unwrap (names decl_universe_params)
+          ^ unwrap (constraints decl_universe_constraints)
+          ^ unwrap
+              (encode_mutual_specs_binary section offset name_table level_table
+                 term_table mutual_inductives))
+
+let encode_declaration_table_binary name_table level_table term_table
+    (declarations : Ext_cert.declaration list) =
+  let rec loop (remaining : Ext_cert.declaration list) encoded =
+    match remaining with
+    | [] ->
+        Ok
+          (encode_uvar (List.length declarations)
+          ^ String.concat "" (List.rev encoded))
+    | declaration :: rest ->
+        let offset = declaration.Ext_cert.offset in
+        bind
+          (encode_decl_payload_binary name_table level_table term_table declaration)
+          (fun payload ->
+            bind
+              (encode_dependency_entries Ext_bytes.Declarations offset name_table
+                 declaration.Ext_cert.dependencies)
+              (fun dependencies ->
+                bind
+                  (encode_axiom_refs Ext_bytes.Declarations offset name_table
+                     declaration.Ext_cert.axiom_dependencies)
+                  (fun axioms ->
+                    loop rest
+                      ((payload ^ dependencies ^ axioms
+                       ^ declaration.Ext_cert.hashes.Ext_cert.decl_interface_hash
+                       ^ declaration.Ext_cert.hashes.Ext_cert.decl_certificate_hash)
+                      :: encoded))))
+  in
+  loop declarations []
+
+let encode_axiom_report_binary name_table report =
+  let section = Ext_bytes.Axiom_report in
+  let rec encode_decl_reports remaining encoded =
+    match remaining with
+    | [] ->
+        Ok
+          (encode_uvar (List.length report.Ext_cert.per_declaration)
+          ^ String.concat "" (List.rev encoded))
+    | entry :: rest ->
+        bind
+          (encode_axiom_refs section entry.Ext_cert.report_offset name_table
+             entry.Ext_cert.report_direct_axioms)
+          (fun direct ->
+            bind
+              (encode_axiom_refs section entry.Ext_cert.report_offset name_table
+                 entry.Ext_cert.report_transitive_axioms)
+              (fun transitive ->
+                encode_decl_reports rest
+                  ((encode_uvar entry.Ext_cert.report_decl_index ^ direct
+                   ^ transitive)
+                  :: encoded)))
+  in
+  bind (encode_decl_reports report.Ext_cert.per_declaration [])
+    (fun per_declaration ->
+      bind
+        (encode_axiom_refs section report.Ext_cert.module_axioms_offset name_table
+           report.Ext_cert.module_axioms)
+        (fun module_axioms ->
+          let core_features =
+            match report.Ext_cert.core_features with
+            | [] -> ""
+            | features ->
+                encode_string Ext_cert.core_feature_report_tag
+                ^ encode_uvar (List.length features)
+                ^ String.concat ""
+                    (List.map
+                       (fun feature -> encode_string feature.Ext_feature.feature)
+                       features)
+          in
+          Ok (per_declaration ^ module_axioms ^ core_features)))
+
+let encode_module_bytes decoded =
+  bind (encode_import_table decoded.Ext_cert.imports) (fun imports ->
+      bind
+        (encode_level_table_binary decoded.Ext_cert.name_table
+           decoded.Ext_cert.level_table)
+        (fun levels ->
+          bind
+            (encode_term_table_binary decoded.Ext_cert.name_table
+               decoded.Ext_cert.level_table decoded.Ext_cert.term_table)
+            (fun terms ->
+              bind
+                (encode_declaration_table_binary decoded.Ext_cert.name_table
+                   decoded.Ext_cert.level_table decoded.Ext_cert.term_table
+                   decoded.Ext_cert.declaration_table)
+                (fun declarations ->
+                  bind (encode_export_block decoded) (fun exports ->
+                      bind
+                        (encode_axiom_report_binary decoded.Ext_cert.name_table
+                           decoded.Ext_cert.axiom_report)
+                        (fun axioms ->
+                          Ok
+                            (encode_string decoded.Ext_cert.header.Ext_cert.format
+                            ^ encode_string
+                                decoded.Ext_cert.header.Ext_cert.core_spec
+                            ^ encode_name
+                                decoded.Ext_cert.header.Ext_cert.module_name
+                            ^ imports
+                            ^ encode_name_table_binary
+                                decoded.Ext_cert.name_table
+                            ^ levels ^ terms ^ declarations ^ exports ^ axioms
+                            ^ decoded.Ext_cert.hashes.Ext_cert.export_hash
+                            ^ decoded.Ext_cert.hashes.Ext_cert.axiom_report_hash
+                            ^ decoded.Ext_cert.hashes.Ext_cert.certificate_hash)))))))
+
+let strictly_increasing compare values =
+  let rec loop previous remaining =
+    match remaining with
+    | [] -> true
+    | value :: rest ->
+        compare previous value < 0 && loop value rest
+  in
+  match values with
+  | [] | [ _ ] -> true
+  | first :: rest -> loop first rest
+
+let import_order_key import =
+  let entry = import.Ext_cert.import_entry in
+  ( Ext_name.components entry.Ext_import.module_name,
+    entry.Ext_import.export_hash,
+    entry.Ext_import.certificate_hash )
+
+let encoded_dependency_key name_table offset dependency =
+  bind
+    (encode_global_ref Ext_bytes.Declarations offset name_table
+       dependency.Ext_cert.dependency_global_ref)
+    (fun global_ref ->
+      Ok (global_ref ^ dependency.Ext_cert.dependency_decl_interface_hash))
+
+let encoded_axiom_key section name_table offset axiom =
+  bind
+    (encode_global_ref section offset name_table axiom.Ext_cert.axiom_global_ref)
+    (fun global_ref ->
+      bind (name_id section offset name_table axiom.Ext_cert.axiom_name)
+        (fun name_id_value ->
+          Ok
+            (global_ref ^ encode_uvar name_id_value
+           ^ axiom.Ext_cert.axiom_decl_interface_hash)))
+
+let validate_encoded_vector_order section offset key entries =
+  let rec collect remaining keys =
+    match remaining with
+    | [] ->
+        if strictly_increasing String.compare (List.rev keys) then Ok ()
+        else error section offset Ext_bytes.Noncanonical_order
+    | entry :: rest -> bind (key entry) (fun value -> collect rest (value :: keys))
+  in
+  collect entries []
+
+let local_dependency_indices dependencies =
+  List.fold_left
+    (fun indices dependency ->
+      match dependency.Ext_cert.dependency_global_ref with
+      | Ext_term.Local { decl_index }
+      | Ext_term.LocalGenerated { decl_index; _ } ->
+          if List.mem decl_index indices then indices else decl_index :: indices
+      | Ext_term.Imported _ | Ext_term.Builtin _ -> indices)
+    [] dependencies
+
+let validate_declaration_order (decoded : Ext_cert.decoded_module) =
+  let declarations = Array.of_list decoded.Ext_cert.declaration_table in
+  let count = Array.length declarations in
+  let dependency_sets =
+    Array.mapi
+      (fun index declaration ->
+        let dependencies = local_dependency_indices declaration.Ext_cert.dependencies in
+        if List.exists (fun dependency -> dependency >= index) dependencies then None
+        else Some dependencies)
+      declarations
+  in
+  if Array.exists (fun dependencies -> dependencies = None) dependency_sets then
+    error Ext_bytes.Declarations 0 Ext_bytes.Noncanonical_order
+  else
+    let emitted = Array.make count false in
+    let remaining = ref (List.init count (fun index -> index)) in
+    let expected = ref [] in
+    let name index =
+      Ext_name.components declarations.(index).Ext_cert.name
+    in
+    let rec rounds () =
+      match !remaining with
+      | [] -> Ok ()
+      | values ->
+          let ready =
+            List.filter
+              (fun index ->
+                match dependency_sets.(index) with
+                | None -> false
+                | Some dependencies ->
+                    List.for_all (fun dependency -> emitted.(dependency)) dependencies)
+              values
+            |> List.sort (fun lhs rhs -> Stdlib.compare (name lhs) (name rhs))
+          in
+          if ready = [] then
+            error Ext_bytes.Declarations 0 Ext_bytes.Noncanonical_order
+          else (
+            List.iter (fun index -> emitted.(index) <- true) ready;
+            remaining := List.filter (fun index -> not (List.mem index ready)) values;
+            expected := !expected @ ready;
+            rounds ())
+    in
+    bind (rounds ()) (fun () ->
+        if !expected = List.init count (fun index -> index) then Ok ()
+        else error Ext_bytes.Declarations 0 Ext_bytes.Noncanonical_order)
+
+let validate_all_vector_orders (decoded : Ext_cert.decoded_module) =
+  let name_table = decoded.Ext_cert.name_table in
+  let rec declarations (values : Ext_cert.declaration list) =
+    match values with
+    | [] -> Ok ()
+    | declaration :: rest ->
+        let offset = declaration.Ext_cert.offset in
+        bind
+          (validate_encoded_vector_order Ext_bytes.Declarations offset
+             (encoded_dependency_key name_table offset)
+             declaration.Ext_cert.dependencies)
+          (fun () ->
+            bind
+              (validate_encoded_vector_order Ext_bytes.Declarations offset
+                 (encoded_axiom_key Ext_bytes.Declarations name_table offset)
+                 declaration.Ext_cert.axiom_dependencies)
+              (fun () -> declarations rest))
+  in
+  let rec exports (values : Ext_cert.export_entry list) =
+    match values with
+    | [] -> Ok ()
+    | export :: rest ->
+        let offset = export.Ext_cert.export_offset in
+        bind
+          (validate_encoded_vector_order Ext_bytes.Export_block offset
+             (encoded_axiom_key Ext_bytes.Export_block name_table offset)
+             export.Ext_cert.export_axiom_dependencies)
+          (fun () -> exports rest)
+  in
+  let rec reports previous_index (values : Ext_cert.decl_axiom_report list) =
+    match values with
+    | [] -> Ok ()
+    | report :: rest ->
+        let offset = report.Ext_cert.report_offset in
+        if report.Ext_cert.report_decl_index <= previous_index then
+          error Ext_bytes.Axiom_report offset Ext_bytes.Noncanonical_order
+        else
+          bind
+            (validate_encoded_vector_order Ext_bytes.Axiom_report offset
+               (encoded_axiom_key Ext_bytes.Axiom_report name_table offset)
+               report.Ext_cert.report_direct_axioms)
+            (fun () ->
+              bind
+                (validate_encoded_vector_order Ext_bytes.Axiom_report offset
+                   (encoded_axiom_key Ext_bytes.Axiom_report name_table offset)
+                   report.Ext_cert.report_transitive_axioms)
+                (fun () -> reports report.Ext_cert.report_decl_index rest))
+  in
+  bind (declarations decoded.Ext_cert.declaration_table) (fun () ->
+      bind (exports decoded.Ext_cert.export_block) (fun () ->
+          bind (reports (-1) decoded.Ext_cert.axiom_report.Ext_cert.per_declaration)
+            (fun () ->
+              let offset =
+                decoded.Ext_cert.axiom_report.Ext_cert.module_axioms_offset
+              in
+              validate_encoded_vector_order Ext_bytes.Axiom_report offset
+                (encoded_axiom_key Ext_bytes.Axiom_report name_table offset)
+                decoded.Ext_cert.axiom_report.Ext_cert.module_axioms)))
+
+let verify_canonical_bytes certificate_bytes (decoded : Ext_cert.decoded_module) =
+  if
+    not
+      (strictly_increasing Stdlib.compare
+         (List.map import_order_key decoded.Ext_cert.imports))
+  then error Ext_bytes.Imports 0 Ext_bytes.Noncanonical_order
+  else
+    bind (validate_declaration_order decoded) (fun () ->
+        bind (validate_all_vector_orders decoded) (fun () ->
+            bind (encode_module_bytes decoded) (fun canonical ->
+                if canonical = certificate_bytes then Ok ()
+                else
+                  error Ext_bytes.Full_certificate 0
+                    Ext_bytes.Noncanonical_order)))
 
 let export_entry_material_equal lhs rhs =
   Ext_name.equal lhs.Ext_cert.export_name rhs.Ext_cert.export_name
   && lhs.Ext_cert.export_kind = rhs.Ext_cert.export_kind
   && lhs.Ext_cert.export_universe_params = rhs.Ext_cert.export_universe_params
+  && lhs.Ext_cert.export_universe_constraints
+     = rhs.Ext_cert.export_universe_constraints
   && lhs.Ext_cert.export_ty = rhs.Ext_cert.export_ty
   && lhs.Ext_cert.export_body = rhs.Ext_cert.export_body
   && lhs.Ext_cert.export_type_hash = rhs.Ext_cert.export_type_hash
@@ -869,12 +1542,14 @@ let inductive_export_type_term params indices sort =
     (fun binder body -> Ext_term.Pi (binder.Ext_cert.binder_ty, body))
     (params @ indices) Ext_term.(Sort sort)
 
-let expected_export_entry ~offset ~name ~kind ~universe_params ~ty ~body ~body_hash
-    ~reducibility ~opacity ~decl_interface_hash ~axiom_dependencies type_hash =
+let expected_export_entry ?(universe_constraints = []) ~offset ~name ~kind
+    ~universe_params ~ty ~body ~body_hash ~reducibility ~opacity
+    ~decl_interface_hash ~axiom_dependencies type_hash =
   {
     Ext_cert.export_name = name;
     export_kind = kind;
     export_universe_params = universe_params;
+    export_universe_constraints = universe_constraints;
     export_ty = ty;
     export_body = body;
     export_type_hash = type_hash;
@@ -914,18 +1589,26 @@ let expected_export_block (decoded : Ext_cert.decoded_module) =
                 in
                 let add entry = exports_for_declarations rest (entry :: entries) in
                 (match declaration.Ext_cert.payload with
-                | Ext_cert.AxiomDecl { decl_name; decl_universe_params; decl_ty; _ } ->
+                | Ext_cert.AxiomDecl
+                    {
+                      decl_name;
+                      decl_universe_params;
+                      decl_universe_constraints;
+                      decl_ty;
+                    } ->
                     with_term_hash decl_ty (fun type_hash ->
                         add
                           (expected_export_entry ~offset ~name:decl_name
                              ~kind:Ext_cert.Export_axiom
                              ~universe_params:decl_universe_params ~ty:decl_ty ~body:None
+                             ~universe_constraints:decl_universe_constraints
                              ~body_hash:None ~reducibility:None ~opacity:None
                              ~decl_interface_hash ~axiom_dependencies type_hash))
                 | Ext_cert.DefDecl
                     {
                       decl_name;
                       decl_universe_params;
+                      decl_universe_constraints;
                       decl_ty;
                       decl_value;
                       decl_reducibility;
@@ -943,15 +1626,24 @@ let expected_export_block (decoded : Ext_cert.decoded_module) =
                               (expected_export_entry ~offset ~name:decl_name
                                  ~kind:Ext_cert.Export_def
                                  ~universe_params:decl_universe_params ~ty:decl_ty ~body
+                                 ~universe_constraints:decl_universe_constraints
                                  ~body_hash ~reducibility:(Some decl_reducibility)
                                  ~opacity:None ~decl_interface_hash ~axiom_dependencies
                                  type_hash)))
-                | Ext_cert.TheoremDecl { decl_name; decl_universe_params; decl_ty; _ } ->
+                | Ext_cert.TheoremDecl
+                    {
+                      decl_name;
+                      decl_universe_params;
+                      decl_universe_constraints;
+                      decl_ty;
+                      _;
+                    } ->
                     with_term_hash decl_ty (fun type_hash ->
                         add
                           (expected_export_entry ~offset ~name:decl_name
                              ~kind:Ext_cert.Export_theorem
                              ~universe_params:decl_universe_params ~ty:decl_ty ~body:None
+                             ~universe_constraints:decl_universe_constraints
                              ~body_hash:None ~reducibility:None
                              ~opacity:(Some Ext_cert.Opaque) ~decl_interface_hash
                              ~axiom_dependencies type_hash))
@@ -959,6 +1651,7 @@ let expected_export_block (decoded : Ext_cert.decoded_module) =
                     {
                       decl_name;
                       decl_universe_params;
+                      decl_universe_constraints;
                       ind_params;
                       ind_indices;
                       ind_sort;
@@ -974,6 +1667,7 @@ let expected_export_block (decoded : Ext_cert.decoded_module) =
                           expected_export_entry ~offset ~name:decl_name
                             ~kind:Ext_cert.Export_inductive
                             ~universe_params:decl_universe_params ~ty:ind_ty ~body:None
+                            ~universe_constraints:decl_universe_constraints
                             ~body_hash:None ~reducibility:None ~opacity:None
                             ~decl_interface_hash ~axiom_dependencies type_hash
                         in
@@ -986,6 +1680,7 @@ let expected_export_block (decoded : Ext_cert.decoded_module) =
                                   ~name:constructor.Ext_cert.constructor_name
                                   ~kind:Ext_cert.Export_constructor
                                   ~universe_params:decl_universe_params
+                                  ~universe_constraints:decl_universe_constraints
                                   ~ty:constructor.Ext_cert.constructor_ty ~body:None
                                   ~body_hash:None ~reducibility:None ~opacity:None
                                   ~decl_interface_hash ~axiom_dependencies constructor_hash
@@ -1012,6 +1707,7 @@ let expected_export_block (decoded : Ext_cert.decoded_module) =
                                         ~kind:Ext_cert.Export_recursor
                                         ~universe_params:
                                           recursor.Ext_cert.recursor_universe_params
+                                        ~universe_constraints:decl_universe_constraints
                                         ~ty:recursor.Ext_cert.recursor_ty ~body:None
                                         ~body_hash:None ~reducibility:None ~opacity:None
                                         ~decl_interface_hash ~axiom_dependencies
@@ -1019,7 +1715,13 @@ let expected_export_block (decoded : Ext_cert.decoded_module) =
                                     in
                                     exports_for_declarations rest
                                       (recursor_entry :: entries))))
-                | Ext_cert.MutualInductiveBlockDecl { decl_universe_params; mutual_inductives; _ }
+                | Ext_cert.MutualInductiveBlockDecl
+                    {
+                      decl_universe_params;
+                      decl_universe_constraints;
+                      mutual_inductives;
+                      _;
+                    }
                   ->
                     let add_inductive entries inductive =
                       let ind_ty =
@@ -1032,6 +1734,7 @@ let expected_export_block (decoded : Ext_cert.decoded_module) =
                               ~name:inductive.Ext_cert.mutual_name
                               ~kind:Ext_cert.Export_inductive
                               ~universe_params:decl_universe_params ~ty:ind_ty ~body:None
+                              ~universe_constraints:decl_universe_constraints
                               ~body_hash:None ~reducibility:None ~opacity:None
                               ~decl_interface_hash ~axiom_dependencies type_hash
                           in
@@ -1047,6 +1750,7 @@ let expected_export_block (decoded : Ext_cert.decoded_module) =
                                         ~name:constructor.Ext_cert.constructor_name
                                         ~kind:Ext_cert.Export_constructor
                                         ~universe_params:decl_universe_params
+                                        ~universe_constraints:decl_universe_constraints
                                         ~ty:constructor.Ext_cert.constructor_ty ~body:None
                                         ~body_hash:None ~reducibility:None ~opacity:None
                                         ~decl_interface_hash ~axiom_dependencies
@@ -1069,6 +1773,7 @@ let expected_export_block (decoded : Ext_cert.decoded_module) =
                                           ~kind:Ext_cert.Export_recursor
                                           ~universe_params:
                                             recursor.Ext_cert.recursor_universe_params
+                                          ~universe_constraints:decl_universe_constraints
                                           ~ty:recursor.Ext_cert.recursor_ty ~body:None
                                           ~body_hash:None ~reducibility:None ~opacity:None
                                           ~decl_interface_hash ~axiom_dependencies
@@ -1120,12 +1825,23 @@ let encode_axiom_report name_table report =
           Ok (per_declaration ^ module_axioms ^ core_features)))
 
 let export_hash decoded =
-  bind (encode_export_block decoded) (fun payload -> Ok (hash_with_domain domain_module_export payload))
+  bind (encode_export_block decoded) (fun payload ->
+      Ok
+        (hash_with_domain
+           (module_export_domain decoded.Ext_cert.header.Ext_cert.version)
+           payload))
 
 let expected_export_hash decoded =
   bind (expected_export_block decoded) (fun entries ->
-      bind (encode_export_entries decoded.Ext_cert.name_table decoded.Ext_cert.term_table entries)
-        (fun payload -> Ok (hash_with_domain domain_module_export payload)))
+      bind
+        (encode_export_entries decoded.Ext_cert.header.Ext_cert.version
+           decoded.Ext_cert.name_table decoded.Ext_cert.level_table
+           decoded.Ext_cert.term_table entries)
+        (fun payload ->
+          Ok
+            (hash_with_domain
+               (module_export_domain decoded.Ext_cert.header.Ext_cert.version)
+               payload)))
 
 let axiom_report_hash decoded =
   bind (encode_axiom_report decoded.Ext_cert.name_table decoded.Ext_cert.axiom_report) (fun payload ->
@@ -1137,7 +1853,8 @@ let certificate_hash certificate_bytes (decoded : Ext_cert.decoded_module) =
     error Ext_bytes.Hashes offset Ext_bytes.Unexpected_eof
   else
     Ok
-      (hash_with_domain domain_module_certificate
+      (hash_with_domain
+         (module_certificate_domain decoded.Ext_cert.header.Ext_cert.version)
          (String.sub certificate_bytes 0 offset))
 
 type module_hash_role =
@@ -1178,12 +1895,30 @@ let make_module_hash_mismatch decoded role expected_hash actual_hash =
 
 let verify_module_hashes certificate_bytes (decoded : Ext_cert.decoded_module) =
   bind (expected_export_block decoded) (fun expected_exports ->
+      let legacy_compatibility =
+        if decoded.Ext_cert.header.Ext_cert.version <> Ext_cert.Legacy then Ok ()
+        else
+          match
+            List.find_opt
+              (fun export ->
+                export.Ext_cert.export_universe_constraints <> [])
+              expected_exports
+          with
+          | None -> Ok ()
+          | Some export ->
+              error Ext_bytes.Export_block export.Ext_cert.export_offset
+                Ext_bytes.Constrained_export_requires_format_upgrade
+      in
+      bind legacy_compatibility (fun () ->
       bind
-        (encode_export_entries decoded.Ext_cert.name_table decoded.Ext_cert.term_table
-           expected_exports)
+        (encode_export_entries decoded.Ext_cert.header.Ext_cert.version
+           decoded.Ext_cert.name_table decoded.Ext_cert.level_table
+           decoded.Ext_cert.term_table expected_exports)
         (fun expected_export_payload ->
           let expected_export_hash =
-            hash_with_domain domain_module_export expected_export_payload
+            hash_with_domain
+              (module_export_domain decoded.Ext_cert.header.Ext_cert.version)
+              expected_export_payload
           in
           let stored_export_hash = decoded.Ext_cert.hashes.Ext_cert.export_hash in
           if
@@ -1192,8 +1927,8 @@ let verify_module_hashes certificate_bytes (decoded : Ext_cert.decoded_module) =
           then
             Ok
               (Module_hash_mismatch
-                 (make_module_hash_mismatch decoded Export_hash stored_export_hash
-                    expected_export_hash))
+                 (make_module_hash_mismatch decoded Export_hash expected_export_hash
+                    stored_export_hash))
           else
             bind (axiom_report_hash decoded) (fun expected_axiom_hash ->
                 let stored_axiom_hash =
@@ -1203,7 +1938,7 @@ let verify_module_hashes certificate_bytes (decoded : Ext_cert.decoded_module) =
                   Ok
                     (Module_hash_mismatch
                        (make_module_hash_mismatch decoded Axiom_report_hash
-                          stored_axiom_hash expected_axiom_hash))
+                          expected_axiom_hash stored_axiom_hash))
                 else
                   bind (certificate_hash certificate_bytes decoded)
                     (fun expected_certificate_hash ->
@@ -1214,5 +1949,5 @@ let verify_module_hashes certificate_bytes (decoded : Ext_cert.decoded_module) =
                         Ok
                           (Module_hash_mismatch
                              (make_module_hash_mismatch decoded Certificate_hash
-                                stored_certificate_hash expected_certificate_hash))
-                      else Ok Module_hashes_ok))))
+                                expected_certificate_hash stored_certificate_hash))
+                      else Ok Module_hashes_ok)))))

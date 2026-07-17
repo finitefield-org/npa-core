@@ -32,12 +32,6 @@ by the first `npa-std` package fixture. The local `npa-core` regression fixture
 is checked in at `testdata/package/npa-std` and can be rebuilt and checked
 without registry or network package resolution.
 
-The previous `v0.1.1` ref remains a historical SRA-02-compatible toolchain
-reference, but it is no longer the current package-author pin.
-
-Do not use `v0.1.1` as the current external package pin for SRA-02-compatible
-package fixtures.
-
 ## Package Commands
 
 The reference-checker PR gate uses:

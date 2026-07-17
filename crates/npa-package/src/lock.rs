@@ -162,6 +162,41 @@ pub fn build_package_lock_from_artifacts<'a>(
     manifest_bytes: &[u8],
     artifacts: impl IntoIterator<Item = PackageLockArtifact<'a>>,
 ) -> PackageLockResult<PackageLockManifest> {
+    build_package_lock_from_artifacts_impl(
+        validated,
+        manifest_path,
+        manifest_bytes,
+        artifacts,
+        true,
+    )
+}
+
+/// Build a package lock from freshly rebuilt local certificate bytes.
+///
+/// This is intended for package write mode, where local certificate hashes in the manifest may
+/// still describe the previous checked-in artifacts. External import hashes remain strict.
+pub fn build_package_lock_from_artifacts_allowing_local_hash_updates<'a>(
+    validated: &ValidatedPackageManifest,
+    manifest_path: PackagePath,
+    manifest_bytes: &[u8],
+    artifacts: impl IntoIterator<Item = PackageLockArtifact<'a>>,
+) -> PackageLockResult<PackageLockManifest> {
+    build_package_lock_from_artifacts_impl(
+        validated,
+        manifest_path,
+        manifest_bytes,
+        artifacts,
+        false,
+    )
+}
+
+fn build_package_lock_from_artifacts_impl<'a>(
+    validated: &ValidatedPackageManifest,
+    manifest_path: PackagePath,
+    manifest_bytes: &[u8],
+    artifacts: impl IntoIterator<Item = PackageLockArtifact<'a>>,
+    check_local_manifest_hashes: bool,
+) -> PackageLockResult<PackageLockManifest> {
     validate_lock_path(&manifest_path, "manifest.path")?;
     let manifest = validated.manifest();
     let artifact_bytes = artifact_byte_map(artifacts)?;
@@ -171,7 +206,12 @@ pub fn build_package_lock_from_artifacts<'a>(
         let certificate_path = format!("modules[{index}].certificate");
         let bytes =
             certificate_artifact_bytes(&artifact_bytes, &module.certificate, &certificate_path)?;
-        entries.push(local_lock_entry(index, module, bytes)?);
+        entries.push(local_lock_entry(
+            index,
+            module,
+            bytes,
+            check_local_manifest_hashes,
+        )?);
     }
 
     for (index, import) in manifest
@@ -198,7 +238,11 @@ pub fn build_package_lock_from_artifacts<'a>(
         entries,
     };
     validate_package_lock_manifest(&lock)?;
-    validate_package_lock_against_manifest_graph(validated, &lock)?;
+    validate_package_lock_against_manifest_graph_impl(
+        validated,
+        &lock,
+        check_local_manifest_hashes,
+    )?;
     Ok(normalized_package_lock(&lock))
 }
 
@@ -207,6 +251,28 @@ pub fn build_package_lock_from_package_root(
     validated: &ValidatedPackageManifest,
     package_root: impl AsRef<Path>,
     manifest_path: PackagePath,
+) -> PackageLockResult<PackageLockManifest> {
+    build_package_lock_from_package_root_impl(validated, package_root, manifest_path, true)
+}
+
+/// Build a package lock from a package root while allowing local certificate hash refreshes.
+///
+/// This is intended for package write/sync workflows that have already rebuilt local certificate
+/// files but have not yet rewritten the local module hash fields in `npa-package.toml`. External
+/// import hashes remain strict.
+pub fn build_package_lock_from_package_root_allowing_local_hash_updates(
+    validated: &ValidatedPackageManifest,
+    package_root: impl AsRef<Path>,
+    manifest_path: PackagePath,
+) -> PackageLockResult<PackageLockManifest> {
+    build_package_lock_from_package_root_impl(validated, package_root, manifest_path, false)
+}
+
+fn build_package_lock_from_package_root_impl(
+    validated: &ValidatedPackageManifest,
+    package_root: impl AsRef<Path>,
+    manifest_path: PackagePath,
+    check_local_manifest_hashes: bool,
 ) -> PackageLockResult<PackageLockManifest> {
     let package_root = package_root.as_ref();
     validate_lock_path(&manifest_path, "manifest.path")?;
@@ -239,7 +305,13 @@ pub fn build_package_lock_from_package_root(
             path: path.clone(),
             bytes: bytes.as_slice(),
         });
-    build_package_lock_from_artifacts(validated, manifest_path, &manifest_bytes, artifacts)
+    build_package_lock_from_artifacts_impl(
+        validated,
+        manifest_path,
+        &manifest_bytes,
+        artifacts,
+        check_local_manifest_hashes,
+    )
 }
 
 /// Validate a package lock against manifest-resolved imports and return its lock graph.
@@ -247,10 +319,34 @@ pub fn validate_package_lock_against_manifest_graph(
     validated: &ValidatedPackageManifest,
     lock: &PackageLockManifest,
 ) -> PackageLockResult<PackageLockGraph> {
+    validate_package_lock_against_manifest_graph_impl(validated, lock, true)
+}
+
+/// Validate an observed package lock while allowing local manifest hash-pin drift.
+///
+/// This audit-only boundary keeps package identity, lock shape, module/import
+/// accountability, and external pins strict. Ordinary package verification must
+/// use [`validate_package_lock_against_manifest_graph`].
+#[doc(hidden)]
+pub fn validate_observed_package_lock_against_manifest_graph(
+    validated: &ValidatedPackageManifest,
+    lock: &PackageLockManifest,
+) -> PackageLockResult<PackageLockGraph> {
+    validate_package_lock_against_manifest_graph_impl(validated, lock, false)
+}
+
+fn validate_package_lock_against_manifest_graph_impl(
+    validated: &ValidatedPackageManifest,
+    lock: &PackageLockManifest,
+    check_local_hashes: bool,
+) -> PackageLockResult<PackageLockGraph> {
     let graph = build_package_lock_graph(lock)?;
     let normalized = normalized_package_lock(lock);
     validate_manifest_lock_entries(validated, &normalized)?;
-    validate_local_certificate_imports(validated, &normalized)?;
+    validate_local_certificate_imports(validated, &normalized, check_local_hashes)?;
+    if check_local_hashes {
+        validate_local_manifest_hashes(validated, &normalized)?;
+    }
     Ok(graph)
 }
 
@@ -330,15 +426,18 @@ fn local_lock_entry(
     index: usize,
     module: &PackageModule,
     certificate_bytes: &[u8],
+    check_manifest_hashes: bool,
 ) -> PackageLockResult<PackageLockEntry> {
     let base_path = format!("modules[{index}]");
     let certificate_file_hash = package_file_hash(certificate_bytes);
-    check_certificate_file_hash(
-        format!("{base_path}.expected_certificate_file_hash"),
-        "expected_certificate_file_hash",
-        module.expected_certificate_file_hash,
-        certificate_file_hash,
-    )?;
+    if check_manifest_hashes {
+        check_certificate_file_hash(
+            format!("{base_path}.expected_certificate_file_hash"),
+            "expected_certificate_file_hash",
+            module.expected_certificate_file_hash,
+            certificate_file_hash,
+        )?;
+    }
 
     let cert = decode_lock_certificate(certificate_bytes, format!("{base_path}.certificate"))?;
     check_certificate_module(
@@ -346,24 +445,26 @@ fn local_lock_entry(
         &module.module,
         &cert.header.module,
     )?;
-    check_export_hash(
-        format!("{base_path}.expected_export_hash"),
-        "expected_export_hash",
-        module.expected_export_hash,
-        PackageHash::from(cert.hashes.export_hash),
-    )?;
-    check_axiom_report_hash(
-        format!("{base_path}.expected_axiom_report_hash"),
-        "expected_axiom_report_hash",
-        module.expected_axiom_report_hash,
-        PackageHash::from(cert.hashes.axiom_report_hash),
-    )?;
-    check_certificate_hash(
-        format!("{base_path}.expected_certificate_hash"),
-        "expected_certificate_hash",
-        module.expected_certificate_hash,
-        PackageHash::from(cert.hashes.certificate_hash),
-    )?;
+    if check_manifest_hashes {
+        check_export_hash(
+            format!("{base_path}.expected_export_hash"),
+            "expected_export_hash",
+            module.expected_export_hash,
+            PackageHash::from(cert.hashes.export_hash),
+        )?;
+        check_axiom_report_hash(
+            format!("{base_path}.expected_axiom_report_hash"),
+            "expected_axiom_report_hash",
+            module.expected_axiom_report_hash,
+            PackageHash::from(cert.hashes.axiom_report_hash),
+        )?;
+        check_certificate_hash(
+            format!("{base_path}.expected_certificate_hash"),
+            "expected_certificate_hash",
+            module.expected_certificate_hash,
+            PackageHash::from(cert.hashes.certificate_hash),
+        )?;
+    }
 
     Ok(PackageLockEntry {
         module: module.module.clone(),
@@ -658,6 +759,14 @@ fn validate_manifest_lock_entries(
                 entry.origin.as_str(),
             ));
         }
+        if entry.certificate != module.certificate {
+            return Err(PackageLockError::lock_entry_identity_missing(
+                format!("entries[{entry_index}].certificate"),
+                "certificate",
+                module.certificate.as_str(),
+                entry.certificate.as_str(),
+            ));
+        }
     }
 
     for (import_index, import) in manifest
@@ -681,6 +790,91 @@ fn validate_manifest_lock_entries(
                 entry.origin.as_str(),
             ));
         }
+        let entry_package = entry
+            .package
+            .as_ref()
+            .expect("validated external lock entry carries package identity");
+        if entry_package != &import.package {
+            return Err(PackageLockError::lock_entry_identity_missing(
+                format!("entries[{entry_index}].package"),
+                "package",
+                import.package.as_str(),
+                entry_package.as_str(),
+            ));
+        }
+        let entry_version = entry
+            .version
+            .as_ref()
+            .expect("validated external lock entry carries package version");
+        if entry_version != &import.version {
+            return Err(PackageLockError::lock_entry_identity_missing(
+                format!("entries[{entry_index}].version"),
+                "version",
+                import.version.as_str(),
+                entry_version.as_str(),
+            ));
+        }
+        if entry.certificate != import.certificate {
+            return Err(PackageLockError::lock_entry_identity_missing(
+                format!("entries[{entry_index}].certificate"),
+                "certificate",
+                import.certificate.as_str(),
+                entry.certificate.as_str(),
+            ));
+        }
+        check_export_hash(
+            format!("entries[{entry_index}].export_hash"),
+            "export_hash",
+            import.export_hash,
+            entry.export_hash,
+        )?;
+        check_certificate_hash(
+            format!("entries[{entry_index}].certificate_hash"),
+            "certificate_hash",
+            import.certificate_hash,
+            entry.certificate_hash,
+        )?;
+    }
+
+    Ok(())
+}
+
+fn validate_local_manifest_hashes(
+    validated: &ValidatedPackageManifest,
+    lock: &PackageLockManifest,
+) -> PackageLockResult<()> {
+    let entry_indices = lock_entry_indices(&lock.entries);
+
+    for module in &validated.manifest().modules {
+        let entry_index = entry_indices
+            .get(&module.module)
+            .copied()
+            .expect("validated manifest lock entry exists");
+        let entry = &lock.entries[entry_index];
+        check_certificate_file_hash(
+            format!("entries[{entry_index}].certificate_file_hash"),
+            "certificate_file_hash",
+            module.expected_certificate_file_hash,
+            entry.certificate_file_hash,
+        )?;
+        check_export_hash(
+            format!("entries[{entry_index}].export_hash"),
+            "export_hash",
+            module.expected_export_hash,
+            entry.export_hash,
+        )?;
+        check_axiom_report_hash(
+            format!("entries[{entry_index}].axiom_report_hash"),
+            "axiom_report_hash",
+            module.expected_axiom_report_hash,
+            entry.axiom_report_hash,
+        )?;
+        check_certificate_hash(
+            format!("entries[{entry_index}].certificate_hash"),
+            "certificate_hash",
+            module.expected_certificate_hash,
+            entry.certificate_hash,
+        )?;
     }
 
     Ok(())
@@ -689,6 +883,7 @@ fn validate_manifest_lock_entries(
 fn validate_local_certificate_imports(
     validated: &ValidatedPackageManifest,
     lock: &PackageLockManifest,
+    check_import_hashes: bool,
 ) -> PackageLockResult<()> {
     let entry_indices = lock_entry_indices(&lock.entries);
     let manifest = validated.manifest();
@@ -705,6 +900,7 @@ fn validate_local_certificate_imports(
             &module.module,
             &validated.graph().resolved_module_imports[module_index],
             &entry.imports,
+            check_import_hashes,
         )?;
     }
 
@@ -717,6 +913,7 @@ fn compare_manifest_imports(
     owner_module: &Name,
     expected_imports: &[ResolvedModuleImport],
     actual_imports: &[PackageLockImport],
+    check_import_hashes: bool,
 ) -> PackageLockResult<()> {
     let owner_module_name = owner_module.as_dotted();
     let mut expected_by_module = BTreeMap::<Name, (usize, &ResolvedModuleImport)>::new();
@@ -727,25 +924,30 @@ fn compare_manifest_imports(
     let mut actual_modules = BTreeSet::<Name>::new();
     for (import_index, actual) in actual_imports.iter().enumerate() {
         let Some((_, expected)) = expected_by_module.get(&actual.module) else {
-            return Err(PackageLockError::manifest_import_missing(
-                format!("entries[{entry_index}].imports[{import_index}].module"),
-                actual.module.as_dotted(),
-            )
-            .with_module(owner_module_name.clone()));
+            // Certificate imports may include verified interface dependencies
+            // that are not direct source imports in the manifest.
+            continue;
         };
 
-        check_lock_import_export_hash(
-            format!("entries[{entry_index}].imports[{import_index}].export_hash"),
-            expected.export_hash,
-            actual.export_hash,
-        )
-        .map_err(|error| error.with_module(owner_module_name.clone()))?;
-        check_lock_import_certificate_hash(
-            format!("entries[{entry_index}].imports[{import_index}].certificate_hash"),
-            expected.certificate_hash,
-            actual.certificate_hash,
-        )
-        .map_err(|error| error.with_module(owner_module_name.clone()))?;
+        if check_import_hashes
+            || matches!(
+                expected.kind,
+                crate::graph::ResolvedModuleImportKind::External { .. }
+            )
+        {
+            check_lock_import_export_hash(
+                format!("entries[{entry_index}].imports[{import_index}].export_hash"),
+                expected.export_hash,
+                actual.export_hash,
+            )
+            .map_err(|error| error.with_module(owner_module_name.clone()))?;
+            check_lock_import_certificate_hash(
+                format!("entries[{entry_index}].imports[{import_index}].certificate_hash"),
+                expected.certificate_hash,
+                actual.certificate_hash,
+            )
+            .map_err(|error| error.with_module(owner_module_name.clone()))?;
+        }
         actual_modules.insert(actual.module.clone());
     }
 

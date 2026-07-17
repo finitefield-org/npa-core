@@ -16,7 +16,7 @@ use npa_package::{
 
 use crate::args::{PackageCommonOptions, PackageExportSummaryOptions};
 use crate::diagnostic::{CommandArtifact, CommandDiagnostic, CommandResult, DiagnosticKind};
-use crate::fs::{join_package_path, render_package_root};
+use crate::fs::{join_package_path, render_package_root, validate_package_output_path};
 use crate::package_artifacts::{
     load_package_artifact_extraction_with_timings, LoadedPackageArtifactExtraction,
     LoadedPackageAuditSnapshot, PackageGeneratedArtifactReadMode,
@@ -44,7 +44,7 @@ fn run_package_export_summary_check(
     out: Option<&Path>,
     timings: &mut PackageTimingCollector,
 ) -> CommandResult {
-    let target = match timings.time_phase(TIMING_SELECTION_MS, || output_path(out)) {
+    let target = match timings.time_phase(TIMING_SELECTION_MS, || output_path(&options.root, out)) {
         Ok(path) => path,
         Err(diagnostic) => {
             return CommandResult::failed(
@@ -168,7 +168,7 @@ pub(crate) fn run_package_export_summary_check_with_snapshot(
     loaded: &LoadedPackageAuditSnapshot,
     timings: &mut PackageTimingCollector,
 ) -> CommandResult {
-    let target = match timings.time_phase(TIMING_SELECTION_MS, || output_path(out)) {
+    let target = match timings.time_phase(TIMING_SELECTION_MS, || output_path(&options.root, out)) {
         Ok(path) => path,
         Err(diagnostic) => {
             return CommandResult::failed(COMMAND, loaded.root_display.clone(), vec![*diagnostic]);
@@ -303,7 +303,7 @@ fn run_package_export_summary_write(
     out: Option<&Path>,
     timings: &mut PackageTimingCollector,
 ) -> CommandResult {
-    let target = match timings.time_phase(TIMING_SELECTION_MS, || output_path(out)) {
+    let target = match timings.time_phase(TIMING_SELECTION_MS, || output_path(&options.root, out)) {
         Ok(path) => path,
         Err(diagnostic) => {
             return CommandResult::failed(
@@ -424,13 +424,12 @@ fn record_incremental_reuse_json(timings: &mut PackageTimingCollector, checked_j
     timings.time_phase(TIMING_JSON_WRITE_MS, || checked_json.len());
 }
 
-fn output_path(out: Option<&Path>) -> Result<PackagePath, Box<CommandDiagnostic>> {
+fn output_path(root: &Path, out: Option<&Path>) -> Result<PackagePath, Box<CommandDiagnostic>> {
     let Some(out) = out else {
         return Ok(PackagePath::new(PACKAGE_VERIFIED_EXPORT_SUMMARY_PATH));
     };
     let path = PackagePath::new(out.to_string_lossy().replace('\\', "/"));
-    npa_package::validate_package_path(&path, "--out")
-        .map_err(|error| Box::new(CommandDiagnostic::from_package_manifest_error(&error)))?;
+    validate_package_output_path(root, &path, "--out")?;
     Ok(path)
 }
 
@@ -566,4 +565,64 @@ fn write_failed_diagnostic(target: &PackagePath) -> CommandDiagnostic {
         "generated_artifact_write_failed",
     )
     .with_path(target.as_str())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use npa_api::PackageArtifactReferenceSummaryMode;
+
+    use super::*;
+    use crate::args::PackageTimingMode;
+    use crate::package_api::v1::common_options;
+    use crate::package_artifacts::{load_package_audit_snapshot, PackageGeneratedArtifactReadMode};
+
+    const PROOF_CORPUS_TEST_STACK_SIZE: usize = 64 * 1024 * 1024;
+
+    #[test]
+    fn snapshot_check_rejects_root_qualified_output_before_reading_it() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../testdata/package/proofs")
+            .components()
+            .collect::<PathBuf>();
+
+        std::thread::Builder::new()
+            .stack_size(PROOF_CORPUS_TEST_STACK_SIZE)
+            .spawn(move || {
+                let loaded = load_package_audit_snapshot(
+                    &root,
+                    "package export-summary snapshot test",
+                    PackageGeneratedArtifactReadMode::none(),
+                    PackageArtifactReferenceSummaryMode::Omit,
+                )
+                .unwrap();
+                let options = common_options(&root, true);
+                let out = Path::new("proofs/generated/missing-export-summary.json");
+                let mut timings = PackageTimingCollector::new(PackageTimingMode::Off);
+
+                let result = run_package_export_summary_check_with_snapshot(
+                    &options,
+                    Some(out),
+                    &loaded,
+                    &mut timings,
+                );
+
+                assert_eq!(
+                    result.exit_code(),
+                    crate::diagnostic::CommandExitCode::UsageOrInternal
+                );
+                assert_eq!(result.diagnostics.len(), 1);
+                assert_eq!(result.diagnostics[0].kind, DiagnosticKind::Usage);
+                assert_eq!(
+                    result.diagnostics[0].reason_code,
+                    "package_output_path_repeats_root"
+                );
+                assert_eq!(result.diagnostics[0].path.as_deref(), out.to_str());
+                assert!(result.artifacts.is_empty());
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
 }

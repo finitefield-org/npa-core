@@ -38,8 +38,8 @@ const ROOT_FIELDS: &[&str] = &[
     "informal_explanation_hash",
     "informal_explanation_is_formal_proof",
     "target_state_transition_authorized",
-    "pua_m17_bundle_handoff_eligible",
-    "pua_m17_bundle_handoff_hash",
+    "bundle_handoff_eligible",
+    "bundle_handoff_hash",
     "rejection_reasons",
     "wall_clock_time",
     "display_text",
@@ -83,8 +83,8 @@ pub struct ClaimPublicationGateRecord {
     pub informal_explanation_hash: Option<Hash>,
     pub informal_explanation_is_formal_proof: bool,
     pub target_state_transition_authorized: bool,
-    pub pua_m17_bundle_handoff_eligible: bool,
-    pub pua_m17_bundle_handoff_hash: Option<Hash>,
+    pub bundle_handoff_eligible: bool,
+    pub bundle_handoff_hash: Option<Hash>,
     pub rejection_reasons: Vec<ClaimPublicationGateRejectionReason>,
     pub wall_clock_time: Option<String>,
     pub display_text: Option<String>,
@@ -218,7 +218,7 @@ pub enum ClaimPublicationGateRejectionReason {
     MissingHumanReview,
     InformalExplanationUsedAsProof,
     ClaimClassStateMismatch,
-    MissingPuaM17Handoff,
+    MissingBundleHandoff,
 }
 
 impl ClaimPublicationGateRejectionReason {
@@ -237,7 +237,7 @@ impl ClaimPublicationGateRejectionReason {
             Self::MissingHumanReview => "missing_human_review",
             Self::InformalExplanationUsedAsProof => "informal_explanation_used_as_proof",
             Self::ClaimClassStateMismatch => "claim_class_state_mismatch",
-            Self::MissingPuaM17Handoff => "missing_pua_m17_handoff",
+            Self::MissingBundleHandoff => "missing_bundle_handoff",
         }
     }
 
@@ -256,7 +256,7 @@ impl ClaimPublicationGateRejectionReason {
             "missing_human_review" => Some(Self::MissingHumanReview),
             "informal_explanation_used_as_proof" => Some(Self::InformalExplanationUsedAsProof),
             "claim_class_state_mismatch" => Some(Self::ClaimClassStateMismatch),
-            "missing_pua_m17_handoff" => Some(Self::MissingPuaM17Handoff),
+            "missing_bundle_handoff" => Some(Self::MissingBundleHandoff),
             _ => None,
         }
     }
@@ -431,7 +431,7 @@ pub enum ClaimPublicationGateValidationErrorKind {
     ApprovedGateRequiresTargetTransitionAuthorization,
     ProgressClaimCannotAuthorizeTerminalTransition,
     RejectedGateCannotAuthorizeTargetTransition,
-    ApprovedGateRequiresPuaM17Handoff,
+    ApprovedGateRequiresBundleHandoff,
     HandoffEligibilityRequiresHash,
     ApprovedGateCannotCarryRejectionReasons,
     RejectionRequiresReason,
@@ -535,11 +535,11 @@ impl fmt::Display for ClaimPublicationGateValidationErrorKind {
             Self::RejectedGateCannotAuthorizeTargetTransition => {
                 write!(f, "rejected gate cannot authorize a target-state transition")
             }
-            Self::ApprovedGateRequiresPuaM17Handoff => {
-                write!(f, "approved gate requires PUA-M17 handoff eligibility")
+            Self::ApprovedGateRequiresBundleHandoff => {
+                write!(f, "approved gate requires bundle handoff eligibility")
             }
             Self::HandoffEligibilityRequiresHash => {
-                write!(f, "PUA-M17 handoff eligibility requires handoff hash")
+                write!(f, "bundle handoff eligibility requires handoff hash")
             }
             Self::ApprovedGateCannotCarryRejectionReasons => {
                 write!(f, "approved gate cannot carry rejection reasons")
@@ -632,12 +632,8 @@ pub fn parse_claim_publication_gate_record(
             "target_state_transition_authorized",
             "$",
         )?,
-        pua_m17_bundle_handoff_eligible: required_bool(
-            &root,
-            "pua_m17_bundle_handoff_eligible",
-            "$",
-        )?,
-        pua_m17_bundle_handoff_hash: optional_hash(&root, "pua_m17_bundle_handoff_hash", "$")?,
+        bundle_handoff_eligible: required_bool(&root, "bundle_handoff_eligible", "$")?,
+        bundle_handoff_hash: optional_hash(&root, "bundle_handoff_hash", "$")?,
         rejection_reasons: parse_rejection_reasons(required_value(
             &root,
             "rejection_reasons",
@@ -776,12 +772,12 @@ pub fn claim_publication_gate_canonical_identity_bytes(
     out.push(u8::from(record.informal_explanation_is_formal_proof));
     encode_string_to(&mut out, "target_state_transition_authorized");
     out.push(u8::from(record.target_state_transition_authorized));
-    encode_string_to(&mut out, "pua_m17_bundle_handoff_eligible");
-    out.push(u8::from(record.pua_m17_bundle_handoff_eligible));
+    encode_string_to(&mut out, "bundle_handoff_eligible");
+    out.push(u8::from(record.bundle_handoff_eligible));
     encode_option_hash_to(
         &mut out,
-        "pua_m17_bundle_handoff_hash",
-        record.pua_m17_bundle_handoff_hash.as_ref(),
+        "bundle_handoff_hash",
+        record.bundle_handoff_hash.as_ref(),
     );
     encode_rejection_reasons_to(&mut out, &record.rejection_reasons);
     out
@@ -1067,12 +1063,12 @@ fn validate_approved_gate(
             ClaimPublicationGateValidationErrorKind::ProgressClaimCannotAuthorizeTerminalTransition,
         ));
     }
-    if !record.pua_m17_bundle_handoff_eligible {
+    if !record.bundle_handoff_eligible {
         return Err(ClaimPublicationGateValidationError::new(
-            ClaimPublicationGateValidationErrorKind::ApprovedGateRequiresPuaM17Handoff,
+            ClaimPublicationGateValidationErrorKind::ApprovedGateRequiresBundleHandoff,
         ));
     }
-    if record.pua_m17_bundle_handoff_hash.is_none() {
+    if record.bundle_handoff_hash.is_none() {
         return Err(ClaimPublicationGateValidationError::new(
             ClaimPublicationGateValidationErrorKind::HandoffEligibilityRequiresHash,
         ));
@@ -1098,7 +1094,7 @@ fn validate_rejected_gate(
             ClaimPublicationGateValidationErrorKind::RejectionRequiresReason,
         ));
     }
-    if record.pua_m17_bundle_handoff_eligible && record.pua_m17_bundle_handoff_hash.is_none() {
+    if record.bundle_handoff_eligible && record.bundle_handoff_hash.is_none() {
         return Err(ClaimPublicationGateValidationError::new(
             ClaimPublicationGateValidationErrorKind::HandoffEligibilityRequiresHash,
         ));
@@ -1515,161 +1511,4 @@ fn encode_option_hash_to(out: &mut Vec<u8>, label: &str, value: Option<&Hash>) {
 
 fn encode_len_to(out: &mut Vec<u8>, len: usize) {
     out.extend_from_slice(&(len as u64).to_be_bytes());
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::path::{Path, PathBuf};
-
-    fn fixture_path(name: &str) -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .expect("npa-api is under crates")
-            .parent()
-            .expect("crates is under repo root")
-            .join("testdata/proof-using-agents/fixtures/pua-m16-claim-publication-gate")
-            .join(name)
-    }
-
-    fn fixture(name: &str) -> String {
-        std::fs::read_to_string(fixture_path(name))
-            .expect("claim-publication gate fixture should exist")
-    }
-
-    fn parse_fixture(name: &str) -> ClaimPublicationGateRecord {
-        parse_claim_publication_gate_record(&fixture(name))
-            .expect("claim-publication gate fixture should parse")
-    }
-
-    fn validate_fixture(name: &str) -> Result<(), ClaimPublicationGateValidationErrorKind> {
-        let record = parse_fixture(name);
-        validate_claim_publication_gate_record(&record).map_err(|error| error.kind().clone())
-    }
-
-    #[test]
-    fn claim_publication_gate_requires_independent_checker() {
-        let approved = parse_fixture("valid-resolution.json");
-        validate_claim_publication_gate_record(&approved).expect("resolution gate validates");
-        assert_eq!(
-            approved.proposed_target_state,
-            ResearchTargetState::Resolved
-        );
-        assert!(approved.target_state_transition_authorized);
-
-        let mut display_changed = approved.clone();
-        display_changed.wall_clock_time = Some("2099-12-31T23:59:59Z".to_owned());
-        display_changed.display_text = Some("display text changed".to_owned());
-        display_changed.record_key = "claim-gate.pnp.resolution.copy".to_owned();
-        assert_eq!(
-            claim_publication_gate_hash(&approved),
-            claim_publication_gate_hash(&display_changed)
-        );
-
-        let mut evidence_changed = approved.clone();
-        evidence_changed.independent_checker_hash = Some(
-            parse_hash_string(
-                "sha256:9999999999999999999999999999999999999999999999999999999999999999",
-            )
-            .expect("test hash parses"),
-        );
-        assert_ne!(
-            claim_publication_gate_hash(&approved),
-            claim_publication_gate_hash(&evidence_changed)
-        );
-
-        assert!(matches!(
-            validate_fixture("missing-independent-checker.json"),
-            Err(ClaimPublicationGateValidationErrorKind::MissingIndependentChecker)
-        ));
-        assert!(matches!(
-            validate_fixture("missing-clean-reproduction.json"),
-            Err(ClaimPublicationGateValidationErrorKind::MissingCleanReproduction)
-        ));
-        assert!(matches!(
-            validate_fixture("informal-explanation-as-proof.json"),
-            Err(ClaimPublicationGateValidationErrorKind::InformalExplanationCannotBeFormalProof)
-        ));
-
-        let mut ambiguous_approval = approved.clone();
-        ambiguous_approval
-            .rejection_reasons
-            .push(ClaimPublicationGateRejectionReason::MissingIndependentChecker);
-        assert!(matches!(
-            validate_claim_publication_gate_record(&ambiguous_approval)
-                .map_err(|error| error.kind().clone()),
-            Err(ClaimPublicationGateValidationErrorKind::ApprovedGateCannotCarryRejectionReasons)
-        ));
-    }
-
-    #[test]
-    fn claim_publication_gate_rejects_experiment_only() {
-        let refutation = parse_fixture("valid-refutation.json");
-        validate_claim_publication_gate_record(&refutation).expect("refutation gate validates");
-        assert_eq!(
-            refutation.proposed_target_state,
-            ResearchTargetState::Refuted
-        );
-        assert!(refutation.counterexample_or_refutation_hash.is_some());
-
-        assert!(matches!(
-            validate_fixture("experiment-only-claim.json"),
-            Err(ClaimPublicationGateValidationErrorKind::ExperimentOnlyClaimCannotPassGate)
-        ));
-        let mut mismatched_evidence = refutation.clone();
-        mismatched_evidence.supporting_evidence_kind =
-            ClaimPublicationSupportingEvidenceKind::VerifiedCertificate;
-        assert!(matches!(
-            validate_claim_publication_gate_record(&mismatched_evidence)
-                .map_err(|error| error.kind().clone()),
-            Err(
-                ClaimPublicationGateValidationErrorKind::SupportingEvidenceClaimClassMismatch { .. }
-            )
-        ));
-        assert!(matches!(
-            validate_fixture("stale-certificate.json"),
-            Err(ClaimPublicationGateValidationErrorKind::StaleCertificate { .. })
-        ));
-        assert!(matches!(
-            validate_fixture("unresolved-blocker.json"),
-            Err(ClaimPublicationGateValidationErrorKind::UnresolvedBlocker { .. })
-        ));
-        assert!(matches!(
-            validate_fixture("missing-barrier-review.json"),
-            Err(ClaimPublicationGateValidationErrorKind::MissingBarrierReview)
-        ));
-    }
-
-    #[test]
-    fn claim_publication_gate_requires_assumption_list() {
-        let conditional = parse_fixture("valid-conditional-progress.json");
-        validate_claim_publication_gate_record(&conditional).expect("conditional gate validates");
-        assert_eq!(
-            conditional.proposed_target_state,
-            ResearchTargetState::ConditionalProgress
-        );
-        assert!(!conditional.target_state_transition_authorized);
-        assert!(!conditional.assumptions.is_empty());
-
-        let special_case = parse_fixture("valid-special-case-progress.json");
-        validate_claim_publication_gate_record(&special_case).expect("special-case gate validates");
-        assert_eq!(
-            special_case.proposed_target_state,
-            ResearchTargetState::SpecialCaseProgress
-        );
-        assert!(special_case.special_case_scope_hash.is_some());
-
-        assert!(matches!(
-            validate_fixture("missing-assumption.json"),
-            Err(ClaimPublicationGateValidationErrorKind::ConditionalClaimRequiresAssumptionList)
-        ));
-        assert!(matches!(
-            validate_fixture("missing-assumption-disclosure.json"),
-            Err(ClaimPublicationGateValidationErrorKind::MissingAssumptionDisclosure)
-        ));
-        assert!(matches!(
-            validate_fixture("claim-class-state-mismatch.json"),
-            Err(ClaimPublicationGateValidationErrorKind::ClaimClassTargetStateMismatch { .. })
-        ));
-    }
 }

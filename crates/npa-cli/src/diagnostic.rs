@@ -5,7 +5,7 @@ use std::fmt::Write as _;
 use crate::args::CliUsageError;
 
 /// Stable schema string for package command results.
-pub const PACKAGE_COMMAND_RESULT_SCHEMA: &str = "npa.package.command_result.v0.1";
+pub const PACKAGE_COMMAND_RESULT_SCHEMA: &str = "npa.package.command_result.v0.3";
 /// Stable schema string for optional package timing telemetry.
 pub const PACKAGE_TIMINGS_SCHEMA: &str = "npa.package.timings.v0.1";
 
@@ -150,7 +150,199 @@ impl DiagnosticSeverity {
     }
 }
 
+/// Source-local context for a command diagnostic.
+#[non_exhaustive]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CommandDiagnosticSourceContext {
+    /// Package-relative Human source path.
+    path: String,
+    /// Inclusive UTF-8 byte offset of the primary span start.
+    start_byte: u32,
+    /// Exclusive UTF-8 byte offset of the primary span end.
+    end_byte: u32,
+    /// Containing source declaration, relative to the current module.
+    declaration: Option<String>,
+    /// One-based source line for `start_byte`, when safely derived.
+    line: Option<u32>,
+    /// One-based Unicode-scalar column for `start_byte`, when safely derived.
+    column: Option<u32>,
+    /// Exact bounded primary-span token, when safe to expose.
+    token: Option<String>,
+}
+
+/// Bounded kernel conversion context in command diagnostics.
+#[non_exhaustive]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CommandDiagnosticConversionContext {
+    phase: String,
+    outcome: String,
+    lhs_head: String,
+    rhs_head: String,
+    depth: u32,
+}
+
+impl CommandDiagnosticConversionContext {
+    /// Build a context when phase, outcome, and heads use bounded stable forms.
+    pub fn new(
+        phase: impl Into<String>,
+        outcome: impl Into<String>,
+        lhs_head: impl Into<String>,
+        rhs_head: impl Into<String>,
+        depth: u32,
+    ) -> Option<Self> {
+        let phase = phase.into();
+        let outcome = outcome.into();
+        let lhs_head = lhs_head.into();
+        let rhs_head = rhs_head.into();
+        const PHASES: &[&str] = &[
+            "term_check",
+            "declaration_type",
+            "declaration_value",
+            "inductive_constructor",
+            "inductive_recursor",
+            "definitional_equality",
+        ];
+        if !PHASES.contains(&phase.as_str())
+            || !matches!(outcome.as_str(), "not_defeq" | "fuel_exhausted")
+            || !valid_kernel_head(&lhs_head)
+            || !valid_kernel_head(&rhs_head)
+        {
+            return None;
+        }
+        Some(Self {
+            phase,
+            outcome,
+            lhs_head,
+            rhs_head,
+            depth,
+        })
+    }
+
+    /// Return the stable kernel phase.
+    pub fn phase(&self) -> &str {
+        &self.phase
+    }
+
+    /// Return the stable comparison outcome.
+    pub fn outcome(&self) -> &str {
+        &self.outcome
+    }
+
+    /// Return the bounded left expression head.
+    pub fn lhs_head(&self) -> &str {
+        &self.lhs_head
+    }
+
+    /// Return the bounded right expression head.
+    pub fn rhs_head(&self) -> &str {
+        &self.rhs_head
+    }
+
+    /// Return conversion recursion depth.
+    pub const fn depth(&self) -> u32 {
+        self.depth
+    }
+}
+
+fn valid_kernel_head(head: &str) -> bool {
+    matches!(
+        head,
+        "sort" | "bound_variable" | "application" | "lambda" | "pi" | "let" | "unknown"
+    ) || head.strip_prefix("constant:").is_some_and(|name| {
+        !name.is_empty() && name.len() <= 256 && !name.chars().any(char::is_control)
+    })
+}
+
+impl CommandDiagnosticSourceContext {
+    /// Build source context for a nonempty path and non-reversed byte range.
+    pub fn new(path: impl Into<String>, start_byte: u32, end_byte: u32) -> Option<Self> {
+        let path = path.into();
+        if path.is_empty() || start_byte > end_byte {
+            return None;
+        }
+        Some(Self {
+            path,
+            start_byte,
+            end_byte,
+            declaration: None,
+            line: None,
+            column: None,
+            token: None,
+        })
+    }
+
+    /// Attach a containing source declaration when the name is nonempty.
+    #[must_use]
+    pub fn with_declaration(mut self, declaration: impl Into<String>) -> Self {
+        let declaration = declaration.into();
+        if !declaration.is_empty() {
+            self.declaration = Some(declaration);
+        }
+        self
+    }
+
+    /// Attach one-based line and Unicode-scalar column when both are positive.
+    #[must_use]
+    pub fn with_display_location(mut self, line: u32, column: u32) -> Self {
+        if line > 0 && column > 0 {
+            self.line = Some(line);
+            self.column = Some(column);
+        }
+        self
+    }
+
+    /// Attach an exact bounded token when it satisfies the public output bound.
+    #[must_use]
+    pub fn with_token(mut self, token: impl Into<String>) -> Self {
+        let token = token.into();
+        if !token.is_empty()
+            && token.len() <= 64
+            && !token.chars().any(char::is_control)
+            && !token.chars().all(char::is_whitespace)
+        {
+            self.token = Some(token);
+        }
+        self
+    }
+
+    /// Return the package-relative source path.
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    /// Return the inclusive UTF-8 byte offset of the primary span start.
+    pub const fn start_byte(&self) -> u32 {
+        self.start_byte
+    }
+
+    /// Return the exclusive UTF-8 byte offset of the primary span end.
+    pub const fn end_byte(&self) -> u32 {
+        self.end_byte
+    }
+
+    /// Return the containing source declaration when available.
+    pub fn declaration(&self) -> Option<&str> {
+        self.declaration.as_deref()
+    }
+
+    /// Return the one-based source line when available.
+    pub const fn line(&self) -> Option<u32> {
+        self.line
+    }
+
+    /// Return the one-based Unicode-scalar column when available.
+    pub const fn column(&self) -> Option<u32> {
+        self.column
+    }
+
+    /// Return the bounded primary-span token when available.
+    pub fn token(&self) -> Option<&str> {
+        self.token.as_deref()
+    }
+}
+
 /// A single deterministic command diagnostic.
+#[non_exhaustive]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CommandDiagnostic {
     /// Diagnostic category.
@@ -175,6 +367,10 @@ pub struct CommandDiagnostic {
     pub actual_value: Option<String>,
     /// Checker name, when applicable.
     pub checker: Option<String>,
+    /// Source-local context, when the diagnostic originates in authoring text.
+    pub source: Option<CommandDiagnosticSourceContext>,
+    /// Bounded kernel conversion context, when available.
+    pub conversion: Option<CommandDiagnosticConversionContext>,
 }
 
 impl CommandDiagnostic {
@@ -192,6 +388,8 @@ impl CommandDiagnostic {
             expected_value: None,
             actual_value: None,
             checker: None,
+            source: None,
+            conversion: None,
         }
     }
 
@@ -209,6 +407,8 @@ impl CommandDiagnostic {
             expected_value: None,
             actual_value: None,
             checker: None,
+            source: None,
+            conversion: None,
         }
     }
 
@@ -245,6 +445,20 @@ impl CommandDiagnostic {
     /// Attach the checker implementation that produced or owns the result.
     pub fn with_checker(mut self, checker: impl Into<String>) -> Self {
         self.checker = Some(checker.into());
+        self
+    }
+
+    /// Attach source-local context.
+    #[must_use]
+    pub fn with_source(mut self, source: CommandDiagnosticSourceContext) -> Self {
+        self.source = Some(source);
+        self
+    }
+
+    /// Attach bounded kernel conversion context.
+    #[must_use]
+    pub fn with_conversion(mut self, conversion: CommandDiagnosticConversionContext) -> Self {
+        self.conversion = Some(conversion);
         self
     }
 
@@ -285,6 +499,8 @@ impl CommandDiagnostic {
             expected_value: error.expected_value.clone(),
             actual_value: error.actual_value.clone(),
             checker: None,
+            source: None,
+            conversion: None,
         }
     }
 
@@ -308,6 +524,8 @@ impl CommandDiagnostic {
             expected_value: error.expected_value.clone(),
             actual_value: error.actual_value.clone(),
             checker: None,
+            source: None,
+            conversion: None,
         };
         if kind == DiagnosticKind::HashMismatch {
             diagnostic.expected_hash = error.expected_value.clone();
@@ -333,6 +551,36 @@ impl CommandDiagnostic {
         }
         if let Some(field) = &self.field {
             message.push_str(&format!(" field={field}"));
+        }
+        if let Some(source) = &self.source {
+            message.push_str(&format!(
+                " source={}:byte[{}..{}]",
+                source.path, source.start_byte, source.end_byte
+            ));
+            if let Some(line) = source.line {
+                message.push_str(&format!(" line={line}"));
+            }
+            if let Some(column) = source.column {
+                message.push_str(&format!(" column={column}"));
+            }
+            if let Some(declaration) = &source.declaration {
+                message.push_str(&format!(" declaration={declaration}"));
+            }
+            if let Some(token) = &source.token {
+                let mut quoted = String::new();
+                push_json_string(&mut quoted, token);
+                message.push_str(&format!(" token={quoted}"));
+            }
+        }
+        if let Some(conversion) = &self.conversion {
+            message.push_str(&format!(
+                " conversion=phase:{},outcome:{},lhs:{},rhs:{},depth:{}",
+                conversion.phase,
+                conversion.outcome,
+                conversion.lhs_head,
+                conversion.rhs_head,
+                conversion.depth
+            ));
         }
         if let Some(expected) = &self.expected_value {
             message.push_str(&format!(" expected={expected}"));
@@ -572,9 +820,84 @@ fn push_diagnostics_json(output: &mut String, diagnostics: &[CommandDiagnostic])
         );
         push_optional_json_pair(output, "actual_value", diagnostic.actual_value.as_deref());
         push_optional_json_pair(output, "checker", diagnostic.checker.as_deref());
+        if let Some(source) = &diagnostic.source {
+            output.push_str(",\"source\":");
+            push_command_diagnostic_source_json(output, source);
+        }
+        if let Some(conversion) = &diagnostic.conversion {
+            output.push_str(",\"conversion\":");
+            push_command_diagnostic_conversion_json(output, conversion);
+        }
         output.push('}');
     }
     output.push(']');
+}
+
+fn push_command_diagnostic_conversion_json(
+    output: &mut String,
+    conversion: &CommandDiagnosticConversionContext,
+) {
+    output.push('{');
+    push_json_pair(output, "phase", &JsonValue::String(&conversion.phase), true);
+    push_json_pair(
+        output,
+        "outcome",
+        &JsonValue::String(&conversion.outcome),
+        false,
+    );
+    push_json_pair(
+        output,
+        "lhs_head",
+        &JsonValue::String(&conversion.lhs_head),
+        false,
+    );
+    push_json_pair(
+        output,
+        "rhs_head",
+        &JsonValue::String(&conversion.rhs_head),
+        false,
+    );
+    push_json_pair(
+        output,
+        "depth",
+        &JsonValue::U128(u128::from(conversion.depth)),
+        false,
+    );
+    output.push('}');
+}
+
+fn push_command_diagnostic_source_json(
+    output: &mut String,
+    source: &CommandDiagnosticSourceContext,
+) {
+    output.push('{');
+    push_json_pair(output, "path", &JsonValue::String(&source.path), true);
+    push_json_pair(
+        output,
+        "start_byte",
+        &JsonValue::U128(u128::from(source.start_byte)),
+        false,
+    );
+    push_json_pair(
+        output,
+        "end_byte",
+        &JsonValue::U128(u128::from(source.end_byte)),
+        false,
+    );
+    push_optional_json_pair(output, "declaration", source.declaration.as_deref());
+    if let Some(line) = source.line {
+        push_json_pair(output, "line", &JsonValue::U128(u128::from(line)), false);
+    }
+    if let Some(column) = source.column {
+        push_json_pair(
+            output,
+            "column",
+            &JsonValue::U128(u128::from(column)),
+            false,
+        );
+    }
+    push_optional_json_pair(output, "token", source.token.as_deref());
+    output.push('}');
 }
 
 fn push_artifacts_json(output: &mut String, artifacts: &[CommandArtifact]) {
@@ -639,4 +962,62 @@ fn push_json_string(output: &mut String, value: &str) {
         }
     }
     output.push('"');
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        CommandDiagnostic, CommandDiagnosticConversionContext, CommandDiagnosticSourceContext,
+        CommandResult, DiagnosticKind,
+    };
+
+    #[test]
+    fn command_diagnostic_source_context_builder_preserves_supported_values() {
+        assert!(CommandDiagnosticSourceContext::new("", 0, 0).is_none());
+        assert!(CommandDiagnosticSourceContext::new("source.npa", 2, 1).is_none());
+        let source = CommandDiagnosticSourceContext::new("source.npa", 3, 3)
+            .unwrap()
+            .with_declaration("")
+            .with_declaration(" namespace.term ")
+            .with_display_location(4, 7)
+            .with_token("term");
+        assert_eq!(source.path(), "source.npa");
+        assert_eq!(source.start_byte(), 3);
+        assert_eq!(source.end_byte(), 3);
+        assert_eq!(source.declaration(), Some(" namespace.term "));
+        assert_eq!(source.line(), Some(4));
+        assert_eq!(source.column(), Some(7));
+        assert_eq!(source.token(), Some("term"));
+    }
+
+    #[test]
+    fn command_diagnostic_source_context_unit_renderers_keep_exact_order() {
+        let source = CommandDiagnosticSourceContext::new("Proofs/A/source.npa", 10, 11)
+            .unwrap()
+            .with_declaration("A.term")
+            .with_display_location(3, 5)
+            .with_token("x");
+        let conversion = CommandDiagnosticConversionContext::new(
+            "definitional_equality",
+            "not_defeq",
+            "application",
+            "constant:A.expected",
+            7,
+        )
+        .unwrap();
+        let diagnostic = CommandDiagnostic::error(DiagnosticKind::Build, "build_failed")
+            .with_field("elaborator")
+            .with_actual_value("failure")
+            .with_source(source)
+            .with_conversion(conversion);
+        let result = CommandResult::failed("package build-certs", ".", vec![diagnostic]);
+        assert_eq!(
+            result.render_json(),
+            "{\"schema\":\"npa.package.command_result.v0.3\",\"command\":\"package build-certs\",\"root\":\".\",\"status\":\"failed\",\"diagnostics\":[{\"kind\":\"Build\",\"reason_code\":\"build_failed\",\"severity\":\"error\",\"field\":\"elaborator\",\"actual_value\":\"failure\",\"source\":{\"path\":\"Proofs/A/source.npa\",\"start_byte\":10,\"end_byte\":11,\"declaration\":\"A.term\",\"line\":3,\"column\":5,\"token\":\"x\"},\"conversion\":{\"phase\":\"definitional_equality\",\"outcome\":\"not_defeq\",\"lhs_head\":\"application\",\"rhs_head\":\"constant:A.expected\",\"depth\":7}}],\"artifacts\":[]}"
+        );
+        assert_eq!(
+            result.render_human(),
+            "package build-certs: failed\nerror Build build_failed field=elaborator source=Proofs/A/source.npa:byte[10..11] line=3 column=5 declaration=A.term token=\"x\" conversion=phase:definitional_equality,outcome:not_defeq,lhs:application,rhs:constant:A.expected,depth:7 actual=failure"
+        );
+    }
 }

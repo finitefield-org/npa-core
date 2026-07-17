@@ -85,8 +85,8 @@ const BUDGET_FIELDS: &[FieldSpec] = &[
     ),
 ];
 
-pub(crate) const PUA_M04_V2_REQUIRED_FEATURES: &[MachineTacticFeature] =
-    &[MachineTacticFeature::PuaM04StructuralTactics];
+pub(crate) const STRUCTURAL_V2_REQUIRED_FEATURES: &[MachineTacticFeature] =
+    &[MachineTacticFeature::StructuralTactics];
 
 const RUN_SCHEDULER_FIELDS: &[FieldSpec] = &[
     FieldSpec::optional(
@@ -4861,8 +4861,8 @@ fn run_machine_lazy_diagnostic_request_parsed(
         request.goal_id,
         candidate.clone(),
         request.deterministic_budget,
-        MachineTacticProfileVersion::PuaM04V2,
-        PUA_M04_V2_REQUIRED_FEATURES,
+        MachineTacticProfileVersion::StructuralV2,
+        STRUCTURAL_V2_REQUIRED_FEATURES,
     ) {
         Ok(validated) => LazyDiagnosticCandidateValidation::Validated(validated),
         Err(error) => {
@@ -5703,8 +5703,8 @@ fn run_machine_tactic_request_parsed(
         request.goal_id,
         candidate,
         request.deterministic_budget,
-        MachineTacticProfileVersion::PuaM04V2,
-        PUA_M04_V2_REQUIRED_FEATURES,
+        MachineTacticProfileVersion::StructuralV2,
+        STRUCTURAL_V2_REQUIRED_FEATURES,
     )
     .map_err(|error| {
         let candidate_hash = error.candidate_hash.map(|candidate_payload_hash| {
@@ -5956,8 +5956,8 @@ fn run_machine_tactic_batch_request_parsed(
             request.goal_id,
             candidate,
             request.deterministic_budget,
-            MachineTacticProfileVersion::PuaM04V2,
-            PUA_M04_V2_REQUIRED_FEATURES,
+            MachineTacticProfileVersion::StructuralV2,
+            STRUCTURAL_V2_REQUIRED_FEATURES,
         ) {
             Ok(validated) => validated,
             Err(error) => {
@@ -9264,8 +9264,8 @@ mod tests {
             state_fingerprint: state.fingerprint,
             diagnostic,
             deterministic_budget: TacticBudget::default(),
-            profile_version: MachineTacticProfileVersion::PuaM04V2,
-            required_features: PUA_M04_V2_REQUIRED_FEATURES,
+            profile_version: MachineTacticProfileVersion::StructuralV2,
+            required_features: STRUCTURAL_V2_REQUIRED_FEATURES,
             max_proposals: DEFAULT_MAX_REPAIR_OPERATOR_BATCH_LEN,
         }
     }
@@ -9280,8 +9280,8 @@ mod tests {
             state_fingerprint: state.fingerprint,
             diagnostic,
             deterministic_budget: TacticBudget::default(),
-            profile_version: MachineTacticProfileVersion::PuaM04V2,
-            required_features: PUA_M04_V2_REQUIRED_FEATURES,
+            profile_version: MachineTacticProfileVersion::StructuralV2,
+            required_features: STRUCTURAL_V2_REQUIRED_FEATURES,
             limits,
         }
     }
@@ -9315,43 +9315,6 @@ mod tests {
 
     fn diagnostic_budget_report() -> npa_tactic::DiagnosticBudgetReport {
         npa_tactic::DiagnosticBudget::default().report(npa_tactic::DiagnosticBudgetUsage::default())
-    }
-
-    #[test]
-    fn repair_operator_schema_lists_all_variants_and_trust_rejections() {
-        let schema = include_str!(
-            "../../../testdata/proof-using-agents/schemas/repair_operator.schema.json"
-        );
-        for variant in [
-            "ReverseRewrite",
-            "SelectRewriteOccurrence",
-            "InstantiateArgument",
-            "InstantiateUniverse",
-            "IntroduceBinder",
-            "SpecializeHypothesis",
-            "Unfold",
-            "Fold",
-            "InsertEqTransport",
-            "Generalize",
-            "Revert",
-            "ChangeGoal",
-            "ReduceSimpSet",
-            "SwitchStrategy",
-        ] {
-            assert!(schema.contains(variant), "schema missing {variant}");
-        }
-        for forbidden in [
-            "trusted_evidence",
-            "verified_artifact",
-            "proof_acceptance_state",
-            "certificate_verified",
-            "independent_verified",
-        ] {
-            assert!(
-                schema.contains(forbidden),
-                "schema missing trusted-evidence guard {forbidden}"
-            );
-        }
     }
 
     #[test]
@@ -9615,7 +9578,7 @@ mod tests {
             key,
             import_identity_hash,
             FailureMemoryObservation::new(clock),
-            Some("pua-m05-test-profile".to_owned()),
+            Some("structural-test-profile".to_owned()),
             FailureMemoryBudgetClass::Normal,
         )
     }
@@ -9841,8 +9804,8 @@ mod tests {
             GoalId(0),
             candidate.clone(),
             TacticBudget::default(),
-            MachineTacticProfileVersion::PuaM04V2,
-            PUA_M04_V2_REQUIRED_FEATURES,
+            MachineTacticProfileVersion::StructuralV2,
+            STRUCTURAL_V2_REQUIRED_FEATURES,
         )
         .expect_err("invalid candidate name should fail before tactic execution");
 
@@ -9861,8 +9824,8 @@ mod tests {
             GoalId(0),
             candidate,
             TacticBudget::default(),
-            MachineTacticProfileVersion::PuaM04V2,
-            PUA_M04_V2_REQUIRED_FEATURES,
+            MachineTacticProfileVersion::StructuralV2,
+            STRUCTURAL_V2_REQUIRED_FEATURES,
         )
         .expect_err("failure memory must not change validation");
 
@@ -9876,81 +9839,7 @@ mod tests {
     }
 
     #[test]
-    fn failure_memory_schema_lists_identity_fields_and_trust_rejections() {
-        let schema =
-            include_str!("../../../testdata/proof-using-agents/schemas/failure_memory.schema.json");
-        crate::json::JsonDocument::parse(schema).expect("failure memory schema should parse");
-        for required in [
-            "failure_memory",
-            "environment_hash",
-            "goal_fingerprint",
-            "candidate_shape_hash",
-            "error_kind",
-            "diagnostic_hash",
-            "import_identity_hash",
-            "repair_attempts",
-            "successful_repair",
-            "alternative_used_in_final_proof",
-            "model_or_profile",
-            "budget_class",
-            "advisory_only",
-        ] {
-            assert!(schema.contains(required), "schema missing {required}");
-        }
-        for forbidden in [
-            "trusted_evidence",
-            "verified_artifact",
-            "proof_acceptance_state",
-            "certificate_verified",
-            "independent_verified",
-        ] {
-            assert!(
-                schema.contains(forbidden),
-                "schema missing trusted-evidence guard {forbidden}"
-            );
-        }
-    }
-
-    #[test]
-    fn minimal_failing_artifact_schema_and_identity_are_deterministic() {
-        let schema = include_str!(
-            "../../../testdata/proof-using-agents/schemas/minimal_failing_artifact.schema.json"
-        );
-        crate::json::JsonDocument::parse(schema)
-            .expect("minimal failing artifact schema should parse");
-        for required in [
-            "minimal_failing_artifact",
-            "artifact_hash",
-            "sidecar_only",
-            "proof_acceptance_state",
-            "diagnostic_only",
-            "imports",
-            "checked_current_decls",
-            "local_context",
-            "candidate_payload_hash",
-            "deterministic_budget_hash",
-            "expected_policy",
-            "structured_diagnostic",
-            "Focused replay",
-        ] {
-            assert!(schema.contains(required), "schema missing {required}");
-        }
-        for forbidden in [
-            "trusted_evidence",
-            "verified_artifact",
-            "certificate_verified",
-            "source text",
-            "prompts",
-            "model completions",
-            "filesystem paths",
-            "theorem-graph scores",
-        ] {
-            assert!(
-                schema.contains(forbidden),
-                "schema missing non-identity guard {forbidden}"
-            );
-        }
-
+    fn minimal_failing_artifact_identity_is_deterministic() {
         let state = repair_generator_state(prop_expr());
         let candidate = MachineTacticCandidate::Exact {
             term: RawMachineTerm::new("Prop"),
@@ -9961,8 +9850,8 @@ mod tests {
             GoalId(0),
             candidate.clone(),
             TacticBudget::default(),
-            MachineTacticProfileVersion::PuaM04V2,
-            PUA_M04_V2_REQUIRED_FEATURES,
+            MachineTacticProfileVersion::StructuralV2,
+            STRUCTURAL_V2_REQUIRED_FEATURES,
         )
         .expect("type-mismatched exact should build a minimal failing artifact");
         let second = build_minimal_failing_artifact(
@@ -9970,8 +9859,8 @@ mod tests {
             GoalId(0),
             candidate,
             TacticBudget::default(),
-            MachineTacticProfileVersion::PuaM04V2,
-            PUA_M04_V2_REQUIRED_FEATURES,
+            MachineTacticProfileVersion::StructuralV2,
+            STRUCTURAL_V2_REQUIRED_FEATURES,
         )
         .expect("minimal failing artifact should be deterministic");
 
@@ -10016,8 +9905,8 @@ mod tests {
             GoalId(0),
             candidate,
             TacticBudget::default(),
-            MachineTacticProfileVersion::PuaM04V2,
-            PUA_M04_V2_REQUIRED_FEATURES,
+            MachineTacticProfileVersion::StructuralV2,
+            STRUCTURAL_V2_REQUIRED_FEATURES,
         )
         .expect("type-mismatched exact should build a minimal failing artifact");
 
@@ -10059,8 +9948,8 @@ mod tests {
                 term: RawMachineTerm::new("Prop"),
             },
             TacticBudget::default(),
-            MachineTacticProfileVersion::PuaM04V2,
-            PUA_M04_V2_REQUIRED_FEATURES,
+            MachineTacticProfileVersion::StructuralV2,
+            STRUCTURAL_V2_REQUIRED_FEATURES,
         )
         .expect("imported type-mismatch should build a minimal failing artifact");
         assert_eq!(imported_artifact.imports.len(), 1);
@@ -10104,8 +9993,8 @@ mod tests {
                 term: RawMachineTerm::new("Prop"),
             },
             TacticBudget::default(),
-            MachineTacticProfileVersion::PuaM04V2,
-            PUA_M04_V2_REQUIRED_FEATURES,
+            MachineTacticProfileVersion::StructuralV2,
+            STRUCTURAL_V2_REQUIRED_FEATURES,
         )
         .expect("type-mismatched exact should build a minimal failing artifact");
 
@@ -10263,8 +10152,8 @@ mod tests {
                 term: RawMachineTerm::new("Prop"),
             },
             TacticBudget::default(),
-            MachineTacticProfileVersion::PuaM04V2,
-            PUA_M04_V2_REQUIRED_FEATURES,
+            MachineTacticProfileVersion::StructuralV2,
+            STRUCTURAL_V2_REQUIRED_FEATURES,
         )
         .expect("type-mismatched exact should build a minimal failing artifact");
         let artifact = build_focused_replay_failure_artifact(
@@ -10352,8 +10241,8 @@ mod tests {
                 term: RawMachineTerm::new("Prop"),
             },
             TacticBudget::default(),
-            MachineTacticProfileVersion::PuaM04V2,
-            PUA_M04_V2_REQUIRED_FEATURES,
+            MachineTacticProfileVersion::StructuralV2,
+            STRUCTURAL_V2_REQUIRED_FEATURES,
         )
         .expect("imported type-mismatch should build a minimal failing artifact");
         let imported_artifact = build_focused_replay_failure_artifact(
@@ -10415,8 +10304,8 @@ mod tests {
             GoalId(0),
             candidate.clone(),
             budget,
-            MachineTacticProfileVersion::PuaM04V2,
-            PUA_M04_V2_REQUIRED_FEATURES,
+            MachineTacticProfileVersion::StructuralV2,
+            STRUCTURAL_V2_REQUIRED_FEATURES,
         )
         .expect("type-mismatched exact should build a minimal failing artifact");
         let diagnostic = compact_diagnostic_from_minimal(&minimal);
@@ -10432,8 +10321,8 @@ mod tests {
                 candidate_payload_hash: Some(minimal.candidate_payload_hash),
                 deterministic_budget: budget,
                 deterministic_budget_hash: Some(minimal.deterministic_budget_hash),
-                profile_version: MachineTacticProfileVersion::PuaM04V2,
-                required_features: PUA_M04_V2_REQUIRED_FEATURES,
+                profile_version: MachineTacticProfileVersion::StructuralV2,
+                required_features: STRUCTURAL_V2_REQUIRED_FEATURES,
                 diagnostic: &diagnostic,
             },
         )
@@ -10449,8 +10338,8 @@ mod tests {
                 candidate_payload_hash: Some(minimal.candidate_payload_hash),
                 deterministic_budget: budget,
                 deterministic_budget_hash: Some(minimal.deterministic_budget_hash),
-                profile_version: MachineTacticProfileVersion::PuaM04V2,
-                required_features: PUA_M04_V2_REQUIRED_FEATURES,
+                profile_version: MachineTacticProfileVersion::StructuralV2,
+                required_features: STRUCTURAL_V2_REQUIRED_FEATURES,
                 diagnostic: &diagnostic,
             },
         )
@@ -10483,8 +10372,8 @@ mod tests {
             GoalId(0),
             candidate.clone(),
             budget,
-            MachineTacticProfileVersion::PuaM04V2,
-            PUA_M04_V2_REQUIRED_FEATURES,
+            MachineTacticProfileVersion::StructuralV2,
+            STRUCTURAL_V2_REQUIRED_FEATURES,
         )
         .expect("type-mismatched exact should build a minimal failing artifact");
         let diagnostic = compact_diagnostic_from_minimal(&minimal);
@@ -10504,8 +10393,8 @@ mod tests {
                     candidate_payload_hash,
                     deterministic_budget: budget,
                     deterministic_budget_hash,
-                    profile_version: MachineTacticProfileVersion::PuaM04V2,
-                    required_features: PUA_M04_V2_REQUIRED_FEATURES,
+                    profile_version: MachineTacticProfileVersion::StructuralV2,
+                    required_features: STRUCTURAL_V2_REQUIRED_FEATURES,
                     diagnostic,
                 },
             )
@@ -10574,8 +10463,8 @@ mod tests {
                 term: RawMachineTerm::new("Prop"),
             },
             TacticBudget::default(),
-            MachineTacticProfileVersion::PuaM04V2,
-            PUA_M04_V2_REQUIRED_FEATURES,
+            MachineTacticProfileVersion::StructuralV2,
+            STRUCTURAL_V2_REQUIRED_FEATURES,
         )
         .expect("type-mismatched exact should build a minimal failing artifact");
         let key = FailureMemoryKey::new(
@@ -11224,7 +11113,7 @@ mod tests {
         assert_eq!(report.budget.generated_goal_count, 0);
     }
 
-    fn pua_m04_v2_candidate_fixtures() -> Vec<(&'static str, String)> {
+    fn structural_v2_candidate_fixtures() -> Vec<(&'static str, String)> {
         let ctor = imported_head_json("Std.Bool.true", 1);
         let recursor = imported_head_json("Std.Nat.rec", 2);
         let unfold_const = imported_head_json("Scratch.f", 3);
@@ -11645,8 +11534,8 @@ mod tests {
     }
 
     #[test]
-    fn pua_m04_tactic_integration_v2_candidate_wire_shapes_parse() {
-        for (expected_kind, candidate) in pua_m04_v2_candidate_fixtures() {
+    fn structural_tactic_integration_v2_candidate_wire_shapes_parse() {
+        for (expected_kind, candidate) in structural_v2_candidate_fixtures() {
             let parsed = parse_wire_candidate(&candidate);
             assert_eq!(
                 npa_tactic::machine_tactic_candidate_kind(&parsed),
@@ -11664,7 +11553,7 @@ mod tests {
     }
 
     #[test]
-    fn pua_m04_v2_candidate_parser_rejects_malformed_payloads() {
+    fn structural_v2_candidate_parser_rejects_malformed_payloads() {
         let duplicate_branch_names =
             r#"{"kind":"cases","major_local":"h","motive":null,"branch_names":["b","b"]}"#;
         let err = parse_candidate_wire_shape_at(
@@ -11705,7 +11594,7 @@ mod tests {
     }
 
     #[test]
-    fn pua_m04_tactic_integration_source_free_constructor_cases_and_induction_verify() {
+    fn structural_tactic_integration_source_free_constructor_cases_and_induction_verify() {
         let ctor = constructor_fixture_module();
         let mut session = create_machine_session(&session_json_with_imports("Ctor.True", &[ctor]))
             .unwrap()
@@ -11789,7 +11678,7 @@ mod tests {
     }
 
     #[test]
-    fn pua_m04_tactic_integration_source_free_refine_have_and_suffices_verify() {
+    fn structural_tactic_integration_source_free_refine_have_and_suffices_verify() {
         let mut session = create_machine_session(&minimal_session_json("Type 0"))
             .unwrap()
             .session;
@@ -11886,7 +11775,7 @@ mod tests {
     }
 
     #[test]
-    fn pua_m04_tactic_integration_source_free_rejects_open_children_and_invalid_recursor() {
+    fn structural_tactic_integration_source_free_rejects_open_children_and_invalid_recursor() {
         let mut session = create_machine_session(&minimal_session_json("Type 0"))
             .unwrap()
             .session;
@@ -12056,7 +11945,7 @@ mod tests {
     }
 
     #[test]
-    fn pua_m04_tactic_integration_reserved_solvers_fail_as_unsupported_with_identity_hash() {
+    fn structural_tactic_integration_reserved_solvers_fail_as_unsupported_with_identity_hash() {
         let mut session = create_machine_session(&minimal_session_json("Type 0"))
             .unwrap()
             .session;

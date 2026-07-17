@@ -37,8 +37,7 @@ mod human_ide;
 mod independent_checker;
 mod json;
 mod library_growth;
-#[cfg(test)]
-mod p_vs_np_campaign;
+mod package_artifact_ledger;
 mod package_artifacts;
 mod package_verifier;
 mod parent_proof_integration;
@@ -331,10 +330,10 @@ pub use experiment_artifact::{
     EXPERIMENT_ARTIFACT_API_VERSION, EXPERIMENT_ARTIFACT_HASH_DOMAIN,
 };
 pub use fast_loop_measurement::{
-    fast_loop_measurement_report_json, fast_loop_pua_m13_handoff_items,
+    fast_loop_measurement_report_json, fast_loop_performance_handoff_items,
     FastLoopAuthoringCacheStatus, FastLoopCandidateStage, FastLoopMeasurementCounter,
     FastLoopMeasurementLabel, FastLoopMeasurementMode, FastLoopMeasurementRecorder,
-    FastLoopMeasurementReport, FastLoopMeasurementUnit, FastLoopPuaM13HandoffItem,
+    FastLoopMeasurementReport, FastLoopMeasurementUnit, FastLoopPerformanceHandoffItem,
     FAST_LOOP_MEASUREMENT_SCHEMA, FAST_LOOP_MEASUREMENT_TRUST_BOUNDARY,
 };
 pub use human::{
@@ -681,10 +680,17 @@ pub use npa_tactic::{
     DiagnosticBudgetReport, DiagnosticBudgetUsage, DiagnosticExecutionPlane, DiagnosticProfile,
     DiagnosticProfileCapabilities, DiagnosticProfilePlan, DiagnosticRequestPath,
 };
+pub use package_artifact_ledger::{
+    observe_package_artifacts_with_reference_checker, PackageArtifactLedgerCheckerIdentity,
+    PackageArtifactLedgerCheckerModuleObservation, PackageArtifactLedgerCheckerReport,
+    PackageArtifactLedgerCheckerStatus,
+};
 pub use package_artifacts::{
     build_package_audit_snapshot_source_free, extract_package_artifacts_source_free,
     project_package_axiom_report_from_extraction, project_package_axiom_report_source_free,
     project_package_theorem_index_from_extraction, project_package_theorem_index_source_free,
+    project_package_theorem_premise_report_from_extraction,
+    project_package_theorem_premise_report_source_free,
     project_package_verified_export_summary_from_extraction,
     project_package_verified_export_summary_source_free, PackageArtifactExtraction,
     PackageArtifactExtractionInput, PackageArtifactReferenceSummaryMode,
@@ -692,7 +698,7 @@ pub use package_artifacts::{
     PackageAuditCertificateInput, PackageAuditProjectionInputHashes, PackageAuditSnapshot,
     PackageAuditSnapshotBuildError, PackageAuditSnapshotBuildResult, PackageAuditSnapshotInput,
     PackageAxiomReportProjectionInput, PackageTheoremIndexProjectionInput,
-    PackageVerifiedExportSummaryProjectionInput,
+    PackageTheoremPremiseReportProjectionInput, PackageVerifiedExportSummaryProjectionInput,
 };
 pub use package_verifier::{
     clear_package_import_context_export_disk_cache, clear_package_verification_decode_cache,

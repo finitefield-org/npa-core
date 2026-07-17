@@ -9,7 +9,9 @@ use npa_package::{
 
 use crate::args::PackageCandidateMetadataOptions;
 use crate::diagnostic::{CommandArtifact, CommandDiagnostic, CommandResult, DiagnosticKind};
-use crate::fs::{join_package_path, render_package_path, render_package_root};
+use crate::fs::{
+    join_package_path, render_package_path, render_package_root, validate_package_output_path,
+};
 use crate::package::PACKAGE_MANIFEST_PATH;
 use crate::package_artifacts::{PACKAGE_LOCK_PATH, PACKAGE_THEOREM_INDEX_PATH};
 
@@ -22,6 +24,9 @@ pub fn run_package_export_candidate_metadata(
 ) -> CommandResult {
     let root_display = render_package_root(&options.common.root);
     let target = PackagePath::new(options.out.to_string_lossy().as_ref());
+    if let Err(diagnostic) = validate_package_output_path(&options.common.root, &target, "--out") {
+        return CommandResult::failed(COMMAND, root_display, vec![*diagnostic]);
+    }
     let target_display = render_package_path(&target);
 
     let manifest_bytes = match read_package_file(&options.common.root, PACKAGE_MANIFEST_PATH) {

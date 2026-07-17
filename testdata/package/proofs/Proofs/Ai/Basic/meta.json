@@ -12,27 +12,6 @@
   "certificate_hash": "sha256:7a50b381af353fe15c0b602fad60f4b9d5f70613dfe6f47832da2d8c11b391dd",
   "imports": [],
   "axioms": [],
-  "declarations": [
-    { "name": "id", "kind": "theorem" },
-    { "name": "const_left", "kind": "theorem" },
-    { "name": "const_right", "kind": "theorem" },
-    { "name": "apply_fn", "kind": "theorem" },
-    { "name": "compose", "kind": "theorem" },
-    { "name": "flip", "kind": "theorem" },
-    { "name": "duplicate", "kind": "theorem" },
-    { "name": "prop_id", "kind": "theorem" },
-    { "name": "modus_ponens", "kind": "theorem" },
-    { "name": "imp_trans", "kind": "theorem" },
-    { "name": "compose_assoc", "kind": "theorem" },
-    { "name": "apply_twice", "kind": "theorem" },
-    { "name": "ignore_middle", "kind": "theorem" },
-    { "name": "select_middle", "kind": "theorem" },
-    { "name": "select_last", "kind": "theorem" },
-    { "name": "imp_swap", "kind": "theorem" },
-    { "name": "imp_compose", "kind": "theorem" },
-    { "name": "imp_ignore", "kind": "theorem" },
-    { "name": "imp_duplicate", "kind": "theorem" },
-    { "name": "higher_apply", "kind": "theorem" }
-  ],
+  "declarations": [{"name":"id","kind":"theorem"},{"name":"const_left","kind":"theorem"},{"name":"const_right","kind":"theorem"},{"name":"apply_fn","kind":"theorem"},{"name":"compose","kind":"theorem"},{"name":"flip","kind":"theorem"},{"name":"duplicate","kind":"theorem"},{"name":"prop_id","kind":"theorem"},{"name":"modus_ponens","kind":"theorem"},{"name":"imp_trans","kind":"theorem"},{"name":"compose_assoc","kind":"theorem"},{"name":"apply_twice","kind":"theorem"},{"name":"ignore_middle","kind":"theorem"},{"name":"select_middle","kind":"theorem"},{"name":"select_last","kind":"theorem"},{"name":"imp_swap","kind":"theorem"},{"name":"imp_compose","kind":"theorem"},{"name":"imp_ignore","kind":"theorem"},{"name":"imp_duplicate","kind":"theorem"},{"name":"higher_apply","kind":"theorem"}],
   "trust_boundary": "source, replay, and metadata are non-trusted sidecars; only the canonical certificate verified by npa-cert is accepted"
 }

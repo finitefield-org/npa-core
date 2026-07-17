@@ -141,8 +141,13 @@ const INDEPENDENT_CHECKER_RUNNER_FORBIDDEN_CONTROL_ARG_FLAGS: &[&str] = &[
     "--plugins",
     "--network",
 ];
-pub const INDEPENDENT_CHECKER_NPA_CHECKER_EXT_DYNAMIC_FLAGS: &[&str] =
-    &["--cert", "--import-dir", "--policy", "--output"];
+pub const INDEPENDENT_CHECKER_NPA_CHECKER_EXT_DYNAMIC_FLAGS: &[&str] = &[
+    "--cert",
+    "--import-dir",
+    "--policy",
+    "--policy-hash",
+    "--output",
+];
 
 const REQUEST_HASH_EXCLUDED_FIELDS: &[&str] = &["request_id", "request_hash"];
 const MACHINE_CHECK_RESULT_HASH_EXCLUDED_FIELDS: &[&str] = &[
@@ -7938,6 +7943,7 @@ pub struct IndependentCheckerNpaCheckerExtDynamicArgs {
     pub certificate_path: String,
     pub import_dir: String,
     pub policy_path: String,
+    pub policy_hash: Hash,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -8120,6 +8126,8 @@ pub fn independent_checker_npa_checker_ext_argv(
         dynamic.import_dir.clone(),
         "--policy".to_owned(),
         dynamic.policy_path.clone(),
+        "--policy-hash".to_owned(),
+        format_hash_string(&dynamic.policy_hash),
         "--output".to_owned(),
         "json".to_owned(),
     ]
@@ -8129,11 +8137,13 @@ pub fn independent_checker_npa_checker_ext_launch_plan(
     resolved: &IndependentCheckerResolvedCheckerExecutable,
     request: &IndependentCheckerMachineCheckRequest,
     import_dir: impl Into<String>,
+    policy_hash: Hash,
 ) -> IndependentCheckerRunnerLaunchPlan {
     let dynamic = IndependentCheckerNpaCheckerExtDynamicArgs {
         certificate_path: request.certificate.path.clone(),
         import_dir: import_dir.into(),
         policy_path: request.axiom_policy.clone(),
+        policy_hash,
     };
     IndependentCheckerRunnerLaunchPlan {
         argv: independent_checker_npa_checker_ext_argv(&resolved.path, &dynamic),
@@ -17160,6 +17170,7 @@ fn independent_checker_raw_checker_error_kind_allowed(kind: &str) -> bool {
             | "declaration_hash_mismatch"
             | "dependency_hash_mismatch"
             | "forbidden_axiom"
+            | "policy_input_error"
             | "checker_internal_error"
     )
 }
@@ -31498,6 +31509,7 @@ mod tests {
             &resolved,
             &materialized.request,
             "build/import-certs",
+            policy.axiom_policy.hash,
         );
         assert_eq!(
             launch.argv,
@@ -31509,6 +31521,8 @@ mod tests {
                 "build/import-certs".to_owned(),
                 "--policy".to_owned(),
                 "ci/axiom-policy.toml".to_owned(),
+                "--policy-hash".to_owned(),
+                format_hash_string(&policy.axiom_policy.hash),
                 "--output".to_owned(),
                 "json".to_owned(),
             ]
@@ -33190,6 +33204,59 @@ mod tests {
     }
 
     #[test]
+    fn unknown_reference_raw_context_parses_and_changes_failure_key() {
+        let raw = format!(
+            r#"{{
+              "schema":"npa.independent-checker.checker_raw_result.v1",
+              "checker_id":"npa-checker-ref",
+              "checker_version":"0.3.0",
+              "checker_build_hash":"{}",
+              "status":"failed",
+              "module":"Current.Module",
+              "certificate_hash":"{}",
+              "error":{{
+                "kind":"type_mismatch",
+                "reason_code":"unknown_reference",
+                "declaration":"Std.Logic.Eq.rec",
+                "core_path":[
+                  "reference",
+                  "imported",
+                  "imports[0]",
+                  "module=Std.Logic.Eq",
+                  "export_hash={}"
+                ],
+                "section":"declarations",
+                "offset":417
+              }}
+            }}"#,
+            hash_wire(11),
+            hash_wire(70),
+            hash_wire(90),
+        );
+        let parsed = parse_independent_checker_raw_result(&raw).unwrap();
+        let enriched = parsed.error.expect("failed result error");
+        assert_eq!(enriched.declaration.as_deref(), Some("Std.Logic.Eq.rec"));
+        assert_eq!(
+            enriched.core_path,
+            Some(vec![
+                "reference".to_owned(),
+                "imported".to_owned(),
+                "imports[0]".to_owned(),
+                "module=Std.Logic.Eq".to_owned(),
+                format!("export_hash={}", hash_wire(90)),
+            ])
+        );
+
+        let mut omitted = enriched.clone();
+        omitted.declaration = None;
+        omitted.core_path = None;
+        assert_ne!(
+            IndependentCheckerNormalizedFailureKey::from_error(&enriched).failure_key_hash(),
+            IndependentCheckerNormalizedFailureKey::from_error(&omitted).failure_key_hash(),
+        );
+    }
+
+    #[test]
     fn m3_adopts_checker_internal_error_payload() {
         let (request, policy) = m3_request_and_policy();
         let raw = format!(
@@ -33237,6 +33304,33 @@ mod tests {
         );
         assert_eq!(error.section.as_deref(), Some("type"));
         assert_eq!(error.offset, Some(3));
+    }
+
+    #[test]
+    fn m3_parses_external_checker_policy_input_error() {
+        let raw = format!(
+            r#"{{
+              "schema":"npa.independent-checker.checker_raw_result.v1",
+              "checker_id":"npa-checker-ext",
+              "checker_version":"0.2.0",
+              "checker_build_hash":"{}",
+              "status":"failed",
+              "error":{{
+                "kind":"policy_input_error",
+                "reason_code":"request_axiom_policy_invalid",
+                "section":"policy",
+                "offset":0
+              }}
+            }}"#,
+            hash_wire(11)
+        );
+        let parsed = parse_independent_checker_raw_result(&raw).unwrap();
+        let error = parsed.error.expect("failed result must carry an error");
+        assert_eq!(error.kind, "policy_input_error");
+        assert_eq!(
+            error.reason_code.as_deref(),
+            Some("request_axiom_policy_invalid")
+        );
     }
 
     #[test]
@@ -34151,6 +34245,74 @@ mod tests {
                 .as_str(),
             "reference"
         );
+    }
+
+    #[test]
+    fn m5_unknown_reference_context_omission_is_failure_key_disagreement() {
+        let policy = parse_independent_checker_runner_policy(&m4_runner_policy_json()).unwrap();
+        let fast = m4_stored_request(&policy, "fast-kernel", "mchkreq_fast");
+        let reference = m4_stored_request(&policy, "reference", "mchkreq_ref");
+        let external = m4_stored_request(&policy, "external", "mchkreq_ext");
+        let stored_requests = vec![fast.clone(), reference.clone(), external.clone()];
+        let request_store = m4_request_store_manifest(&stored_requests);
+        let mut fast_result =
+            m5_failed_result(&fast.request, &policy, "mchkres_fast", "Std.Logic.Eq.rec");
+        let mut reference_result = m5_failed_result(
+            &reference.request,
+            &policy,
+            "mchkres_ref",
+            "Std.Logic.Eq.rec",
+        );
+        let mut external_result = m5_failed_result(
+            &external.request,
+            &policy,
+            "mchkres_ext",
+            "Std.Logic.Eq.rec",
+        );
+
+        for result in [
+            &mut fast_result,
+            &mut reference_result,
+            &mut external_result,
+        ] {
+            let error = result.error.as_mut().expect("failed result error");
+            error.reason_code = Some("unknown_reference".to_owned());
+            error.section = Some("declarations".to_owned());
+            error.offset = Some(417);
+        }
+        fast_result.error.as_mut().unwrap().declaration = None;
+        external_result.error.as_mut().unwrap().declaration = None;
+        reference_result.error.as_mut().unwrap().core_path = Some(vec![
+            "reference".to_owned(),
+            "imported".to_owned(),
+            "imports[0]".to_owned(),
+            "module=Std.Logic.Eq".to_owned(),
+            format!("export_hash={}", hash_wire(90)),
+        ]);
+
+        let normalized = independent_checker_normalize_results(
+            "norm_Std.Nat_unknown_reference_context",
+            "normerr_Std.Nat_unknown_reference_context",
+            &policy,
+            &request_store,
+            &stored_requests,
+            &[fast_result, reference_result, external_result],
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            normalized.comparison.status,
+            IndependentCheckerNormalizedComparisonStatus::Disagreement
+        );
+        assert_eq!(normalized.comparison.disagreements.len(), 1);
+        let disagreement = &normalized.comparison.disagreements[0];
+        assert_eq!(disagreement.field, "failure_key");
+        assert_eq!(
+            disagreement.baseline_checker_profile.as_deref(),
+            Some("fast-kernel")
+        );
+        assert_eq!(disagreement.checker_profile, "reference");
     }
 
     #[test]

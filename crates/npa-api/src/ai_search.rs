@@ -509,7 +509,7 @@ pub const AI_SEARCH_CHEAP_FIRST_STAGE_ORDER: &[AiSearchCheapFirstStage] = &[
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AiSearchCheapFirstSkipReason {
     ReservedUntypedSolverBucket,
-    DeferredToPuaM14,
+    DeferredToLibraryGrowth,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -530,7 +530,7 @@ pub fn ai_search_cheap_first_skip_reason(
             Some(AiSearchCheapFirstSkipReason::ReservedUntypedSolverBucket)
         }
         AiSearchCheapFirstStage::NewLibraryTheorem => {
-            Some(AiSearchCheapFirstSkipReason::DeferredToPuaM14)
+            Some(AiSearchCheapFirstSkipReason::DeferredToLibraryGrowth)
         }
         AiSearchCheapFirstStage::LocalExact
         | AiSearchCheapFirstStage::KnownExact
@@ -9049,7 +9049,7 @@ mod tests {
         );
         assert_eq!(
             ai_search_cheap_first_skip_reason(AiSearchCheapFirstStage::NewLibraryTheorem),
-            Some(AiSearchCheapFirstSkipReason::DeferredToPuaM14)
+            Some(AiSearchCheapFirstSkipReason::DeferredToLibraryGrowth)
         );
         assert_eq!(
             ai_search_cheap_first_skip_reason(AiSearchCheapFirstStage::Apply),

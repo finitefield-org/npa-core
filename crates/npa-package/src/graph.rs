@@ -1,6 +1,6 @@
 //! Package module graph validation helpers.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use npa_cert::Name;
 
@@ -21,6 +21,87 @@ pub struct PackageGraph {
     pub resolved_module_imports: Vec<Vec<ResolvedModuleImport>>,
     /// Deterministic dependency-topological order of local module indices.
     pub topological_order: Vec<usize>,
+}
+
+/// Return the deterministic transitive local dependency closure of `seeds`.
+///
+/// The result excludes the seeds and follows the graph's dependency-topological
+/// order. Invalid seed indices are ignored; callers that accept untrusted
+/// indices must validate them before calling this helper.
+pub fn package_graph_transitive_dependencies(
+    graph: &PackageGraph,
+    seeds: &BTreeSet<usize>,
+) -> Vec<usize> {
+    let mut closure = BTreeSet::new();
+    let mut pending = seeds.iter().copied().collect::<VecDeque<_>>();
+    while let Some(module_index) = pending.pop_front() {
+        let Some(imports) = graph.resolved_module_imports.get(module_index) else {
+            continue;
+        };
+        for import in imports {
+            let ResolvedModuleImportKind::Local {
+                module_index: dependency_index,
+            } = import.kind
+            else {
+                continue;
+            };
+            if !seeds.contains(&dependency_index) && closure.insert(dependency_index) {
+                pending.push_back(dependency_index);
+            }
+        }
+    }
+    graph
+        .topological_order
+        .iter()
+        .copied()
+        .filter(|module_index| closure.contains(module_index))
+        .collect()
+}
+
+/// Return `seeds` plus every transitive local reverse dependent.
+///
+/// The result follows dependency-topological order, so a rebuilt import always
+/// precedes every rebuilt importer.
+pub fn package_graph_dependent_closure(
+    graph: &PackageGraph,
+    seeds: &BTreeSet<usize>,
+) -> Vec<usize> {
+    let mut reverse = vec![Vec::new(); graph.resolved_module_imports.len()];
+    for (importer_index, imports) in graph.resolved_module_imports.iter().enumerate() {
+        for import in imports {
+            if let ResolvedModuleImportKind::Local {
+                module_index: dependency_index,
+            } = import.kind
+            {
+                if let Some(dependents) = reverse.get_mut(dependency_index) {
+                    dependents.push(importer_index);
+                }
+            }
+        }
+    }
+    for dependents in &mut reverse {
+        dependents.sort_unstable();
+        dependents.dedup();
+    }
+
+    let mut closure = seeds.clone();
+    let mut pending = seeds.iter().copied().collect::<VecDeque<_>>();
+    while let Some(module_index) = pending.pop_front() {
+        let Some(dependents) = reverse.get(module_index) else {
+            continue;
+        };
+        for &dependent_index in dependents {
+            if closure.insert(dependent_index) {
+                pending.push_back(dependent_index);
+            }
+        }
+    }
+    graph
+        .topological_order
+        .iter()
+        .copied()
+        .filter(|module_index| closure.contains(module_index))
+        .collect()
 }
 
 /// A module-level import resolved against local modules or hash-pinned imports.
@@ -190,4 +271,59 @@ fn visit_module(
     states[module_index] = VisitState::Visited;
     order.push(module_index);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn local_import(module: &str, module_index: usize) -> ResolvedModuleImport {
+        ResolvedModuleImport {
+            module: Name::from_dotted(module),
+            kind: ResolvedModuleImportKind::Local { module_index },
+            export_hash: PackageHash::new([0; 32]),
+            certificate_hash: PackageHash::new([0; 32]),
+        }
+    }
+
+    fn diamond_graph() -> PackageGraph {
+        // A <- B, A <- C, B/C <- D, plus isolated E.
+        PackageGraph {
+            resolved_module_imports: vec![
+                vec![],
+                vec![local_import("A", 0)],
+                vec![local_import("A", 0)],
+                vec![local_import("B", 1), local_import("C", 2)],
+                vec![],
+            ],
+            topological_order: vec![0, 1, 2, 3, 4],
+        }
+    }
+
+    #[test]
+    fn package_graph_selection_dependencies_are_topological_and_exclude_seeds() {
+        let graph = diamond_graph();
+        assert_eq!(
+            package_graph_transitive_dependencies(&graph, &BTreeSet::from([3])),
+            vec![0, 1, 2]
+        );
+        assert_eq!(
+            package_graph_transitive_dependencies(&graph, &BTreeSet::from([1, 3])),
+            vec![0, 2]
+        );
+    }
+
+    #[test]
+    fn package_graph_selection_dependents_are_topological_and_deduplicated() {
+        let graph = diamond_graph();
+        assert_eq!(
+            package_graph_dependent_closure(&graph, &BTreeSet::from([0])),
+            vec![0, 1, 2, 3]
+        );
+        assert_eq!(
+            package_graph_dependent_closure(&graph, &BTreeSet::from([1, 2])),
+            vec![1, 2, 3]
+        );
+        assert!(package_graph_dependent_closure(&graph, &BTreeSet::new()).is_empty());
+    }
 }

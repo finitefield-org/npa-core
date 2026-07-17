@@ -17,6 +17,43 @@ pub const PACKAGE_AXIOM_REPORT_SCHEMA: &str = "npa.package.axiom_report.v0.1";
 /// Generated package theorem index schema.
 pub const PACKAGE_THEOREM_INDEX_SCHEMA: &str = "npa.package.theorem_index.v0.1";
 
+/// Repository-governed L2 acceptance authority policy schema.
+///
+/// This policy is governance metadata, not proof evidence.
+pub const L2_ACCEPTANCE_POLICY_SCHEMA: &str = "npa.l2_acceptance_policy.v1";
+
+/// Hash-bound theorem-level L2 acceptance record schema.
+///
+/// This record is promotion-policy metadata, not proof evidence.
+pub const L2_ACCEPTANCE_SCHEMA: &str = "npa.l2_acceptance.v1";
+
+/// Serialized theorem-specific L2 review input schema.
+pub const L2_REVIEW_INPUT_SCHEMA: &str = "npa.l2.review-input.v2";
+
+/// Structured independent sub-agent L2 review report schema.
+pub const L2_REVIEW_REPORT_SCHEMA: &str = "npa.l2.review-report.v1";
+
+/// Current hash-bound theorem-level L2 acceptance record schema.
+pub const L2_ACCEPTANCE_V2_SCHEMA: &str = "npa.l2_acceptance.v2";
+
+/// Namespace-only L2 transport policy schema.
+pub const L2_NAMESPACE_TRANSPORT_POLICY_SCHEMA: &str = "npa.l2_namespace_transport_policy.v1";
+
+/// Namespace-only L2 transport mapping request schema.
+pub const L2_NAMESPACE_TRANSPORT_REQUEST_SCHEMA: &str = "npa.l2_namespace_transport_request.v1";
+
+/// Namespace-only L2 transport attestation schema.
+pub const L2_NAMESPACE_TRANSPORT_ATTESTATION_SCHEMA: &str =
+    "npa.l2_namespace_transport_attestation.v2";
+
+/// Canonical generic mathlib promotion plan schema.
+pub const MATHLIB_PROMOTION_PLAN_SCHEMA: &str = "npa.mathlib.promotion_plan.v1";
+/// Canonical mathlib promotion-origin registry schema.
+pub const MATHLIB_PROMOTION_ORIGIN_REGISTRY_SCHEMA: &str =
+    "npa.mathlib.promotion_origin_registry.v1";
+/// Recoverable promotion transaction journal schema.
+pub const MATHLIB_PROMOTION_TRANSACTION_SCHEMA: &str = "npa.mathlib.promotion_transaction.v1";
+
 /// Generated package publish plan schema.
 pub const PACKAGE_PUBLISH_PLAN_SCHEMA: &str = "npa.package.publish_plan.v0.1";
 
@@ -47,9 +84,12 @@ pub const CHECKER_PROFILE_REFERENCE_V0_1: &str = "npa.checker.reference.v0.1";
 mod tests {
     use super::{
         CERTIFICATE_FORMAT_CANONICAL_V0_1, CHECKER_PROFILE_REFERENCE_V0_1, CORE_SPEC_V0_1,
-        KERNEL_PROFILE_V0_1, PACKAGE_AXIOM_REPORT_SCHEMA, PACKAGE_LOCK_SCHEMA,
-        PACKAGE_MANIFEST_SCHEMA, PACKAGE_PUBLISH_PLAN_SCHEMA, PACKAGE_THEOREM_INDEX_SCHEMA,
-        PACKAGE_VERIFIED_HIGH_TRUST_SCHEMA, REGISTRY_MODULE_SCHEMA,
+        KERNEL_PROFILE_V0_1, L2_ACCEPTANCE_POLICY_SCHEMA, L2_ACCEPTANCE_SCHEMA,
+        L2_ACCEPTANCE_V2_SCHEMA, L2_NAMESPACE_TRANSPORT_ATTESTATION_SCHEMA,
+        L2_NAMESPACE_TRANSPORT_POLICY_SCHEMA, L2_NAMESPACE_TRANSPORT_REQUEST_SCHEMA,
+        L2_REVIEW_INPUT_SCHEMA, L2_REVIEW_REPORT_SCHEMA, PACKAGE_AXIOM_REPORT_SCHEMA,
+        PACKAGE_LOCK_SCHEMA, PACKAGE_MANIFEST_SCHEMA, PACKAGE_PUBLISH_PLAN_SCHEMA,
+        PACKAGE_THEOREM_INDEX_SCHEMA, PACKAGE_VERIFIED_HIGH_TRUST_SCHEMA, REGISTRY_MODULE_SCHEMA,
     };
 
     #[test]
@@ -57,6 +97,23 @@ mod tests {
         assert_eq!(PACKAGE_MANIFEST_SCHEMA, "npa.package.v0.1");
         assert_eq!(PACKAGE_LOCK_SCHEMA, "npa.package.lock.v0.1");
         assert_eq!(PACKAGE_AXIOM_REPORT_SCHEMA, "npa.package.axiom_report.v0.1");
+        assert_eq!(L2_ACCEPTANCE_POLICY_SCHEMA, "npa.l2_acceptance_policy.v1");
+        assert_eq!(L2_ACCEPTANCE_SCHEMA, "npa.l2_acceptance.v1");
+        assert_eq!(L2_REVIEW_INPUT_SCHEMA, "npa.l2.review-input.v2");
+        assert_eq!(L2_REVIEW_REPORT_SCHEMA, "npa.l2.review-report.v1");
+        assert_eq!(L2_ACCEPTANCE_V2_SCHEMA, "npa.l2_acceptance.v2");
+        assert_eq!(
+            L2_NAMESPACE_TRANSPORT_POLICY_SCHEMA,
+            "npa.l2_namespace_transport_policy.v1"
+        );
+        assert_eq!(
+            L2_NAMESPACE_TRANSPORT_REQUEST_SCHEMA,
+            "npa.l2_namespace_transport_request.v1"
+        );
+        assert_eq!(
+            L2_NAMESPACE_TRANSPORT_ATTESTATION_SCHEMA,
+            "npa.l2_namespace_transport_attestation.v2"
+        );
         assert_eq!(
             PACKAGE_THEOREM_INDEX_SCHEMA,
             "npa.package.theorem_index.v0.1"

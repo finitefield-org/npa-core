@@ -4,8 +4,27 @@ type public_export = {
   public_decl_interface_hash : Ext_hash.digest;
   public_axiom_dependencies : Ext_cert.axiom_ref list;
   public_universe_params : Ext_name.t list;
+  public_universe_constraints : Ext_cert.universe_constraint list;
   public_ty : Ext_term.t;
   public_body : Ext_term.t option;
+}
+
+type public_recursor_layout = {
+  public_recursor_name : Ext_name.t;
+  public_recursor_rules : Ext_cert.recursor_rules;
+}
+
+type public_inductive_layout = {
+  public_inductive_name : Ext_name.t;
+  public_param_count : int;
+  public_index_count : int;
+  public_constructor_names : Ext_name.t list;
+  public_recursor_layout : public_recursor_layout option;
+}
+
+type public_inductive_group = {
+  public_group_decl_interface_hash : Ext_hash.digest;
+  public_group_families : public_inductive_layout list;
 }
 
 type public_environment = {
@@ -13,6 +32,7 @@ type public_environment = {
   public_exports : public_export list;
   public_module_axioms : Ext_cert.axiom_ref list;
   public_core_features : Ext_feature.feature_report_entry list;
+  public_inductive_groups : public_inductive_group list;
 }
 
 (* Public interfaces use a fixed sentinel for references to the imported module itself. *)
@@ -119,21 +139,23 @@ let has_suffix text suffix =
   text_len >= suffix_len
   && String.sub text (text_len - suffix_len) suffix_len = suffix
 
-let contains_substring text needle =
-  let text_len = String.length text in
-  let needle_len = String.length needle in
-  let rec loop index =
-    if needle_len = 0 then true
-    else if index + needle_len > text_len then false
-    else if String.sub text index needle_len = needle then true
-    else loop (index + 1)
-  in
-  loop 0
-
 let is_source_or_replay_path path =
-  has_suffix path ".npa" || contains_substring path ".npa/"
-  || contains_substring path ".npa\\" || has_suffix path "replay.json"
-  || contains_substring path "/replay.json" || contains_substring path "\\replay.json"
+  let path_len = String.length path in
+  let is_separator char = char = '/' || (Sys.win32 && char = '\\') in
+  let matches_component start finish =
+    let length = finish - start in
+    if length <= 0 then false
+    else
+      let component = String.sub path start length in
+      has_suffix component ".npa" || component = "replay.json"
+  in
+  let rec loop start index =
+    if index = path_len then matches_component start index
+    else if is_separator path.[index] then
+      matches_component start index || loop (index + 1) (index + 1)
+    else loop start (index + 1)
+  in
+  loop 0 0
 
 let is_npcert_path path = has_suffix path ".npcert"
 
@@ -147,42 +169,203 @@ let sorted_unique paths =
   in
   loop (List.sort String.compare paths) None []
 
-let is_directory path =
-  try Sys.is_directory path with Sys_error _ -> false
+let max_import_candidates = 4_096
+let max_import_directory_depth = 128
+let max_import_directory_entries = 16_384
 
-let collect_cert_paths import_dir =
-  if is_source_or_replay_path import_dir then Error Source_or_replay_input_rejected
-  else if not (is_directory import_dir) then Error Import_dir_unavailable
+let close_descriptor descriptor =
+  try Unix.close descriptor with Unix.Unix_error _ -> ()
+
+let certificate_resource_limit offset =
+  Error
+    (Certificate_decode_error
+       {
+         Ext_bytes.section = Ext_bytes.Full_certificate;
+         offset = max 0 offset;
+         reason = Ext_bytes.Resource_limit;
+       })
+
+let read_binary_descriptor_with_limit descriptor max_bytes =
+  let effective_limit = min max_bytes Ext_bytes.max_certificate_bytes in
+  let finish result =
+    close_descriptor descriptor;
+    result
+  in
+  if effective_limit < 0 then finish (certificate_resource_limit effective_limit)
   else
-    let rec collect_dir dir paths =
-      let entries =
-        try Ok (Array.to_list (Sys.readdir dir))
-        with Sys_error _ -> Error Import_dir_unavailable
+    try
+      let stat = Unix.fstat descriptor in
+      if stat.Unix.st_kind <> Unix.S_REG then
+        finish (Error Import_dir_unavailable)
+      else if stat.Unix.st_size > effective_limit then
+        finish (certificate_resource_limit effective_limit)
+      else
+        let chunk = Bytes.create (min 65_536 (effective_limit + 1)) in
+        let contents = Buffer.create (min stat.Unix.st_size effective_limit) in
+        let rec read total =
+          if total > effective_limit then
+            finish (certificate_resource_limit effective_limit)
+          else
+            let remaining = effective_limit + 1 - total in
+            let count =
+              Unix.read descriptor chunk 0 (min (Bytes.length chunk) remaining)
+            in
+            if count = 0 then finish (Ok (Buffer.contents contents))
+            else (
+              Buffer.add_subbytes contents chunk 0 count;
+              read (total + count))
+        in
+        read 0
+    with Unix.Unix_error _ -> finish (Error Import_dir_unavailable)
+
+type collected_certificate = {
+  collected_path : string;
+  collected_bytes : string option;
+}
+
+let collect_certificates ?max_candidate_bytes import_dir =
+  if is_source_or_replay_path import_dir then Error Source_or_replay_input_rejected
+  else
+    let resource_limit section =
+      Error
+        (Certificate_decode_error
+           { Ext_bytes.section; offset = 0; reason = Ext_bytes.Resource_limit })
+    in
+    let visited_entries = ref 0 in
+    let candidate_count = ref 0 in
+    let total_bytes = ref 0 in
+    let collected = ref [] in
+    let read_directory_entries descriptor =
+      let remaining = max_import_directory_entries - !visited_entries in
+      try
+        let entries = Ext_unix.read_dir_names_bounded descriptor remaining in
+        visited_entries := !visited_entries + List.length entries;
+        Ok (List.sort String.compare entries)
+      with
+      | Unix.Unix_error (Unix.EOVERFLOW, _, _) ->
+          resource_limit Ext_bytes.Imports
+      | Unix.Unix_error _ -> Error Import_dir_unavailable
+    in
+    let rec collect_dir depth dir descriptor =
+      let finish result =
+        close_descriptor descriptor;
+        result
       in
-      bind entries (fun entries ->
-          let rec loop remaining paths =
+      if depth > max_import_directory_depth then
+        finish (resource_limit Ext_bytes.Import_store)
+      else
+        match read_directory_entries descriptor with
+        | Error error -> finish (Error error)
+        | Ok entries ->
+          let rec loop remaining =
             match remaining with
-            | [] -> Ok paths
+            | [] -> finish (Ok ())
             | name :: rest ->
                 let path = Filename.concat dir name in
-                if is_source_or_replay_path path then loop rest paths
-                else if is_directory path then
-                  bind (collect_dir path paths) (fun paths -> loop rest paths)
-                else if is_npcert_path path then loop rest (path :: paths)
-                else loop rest paths
+                if is_source_or_replay_path path then loop rest
+                else
+                  match
+                    try Ok (Ext_unix.path_kind_at_nofollow descriptor name) with
+                    | Unix.Unix_error _ -> Error `Unavailable
+                  with
+                  | Error `Unavailable -> finish (Error Import_dir_unavailable)
+                  | Ok Ext_unix.Symlink | Ok Ext_unix.Other -> loop rest
+                  | Ok Ext_unix.Directory -> (
+                      match
+                        try Ok (Ext_unix.openat_nofollow descriptor name true) with
+                        | Unix.Unix_error (Unix.ELOOP, _, _) -> Error `Symlink
+                        | Unix.Unix_error _ -> Error `Unavailable
+                      with
+                      | Error `Symlink -> loop rest
+                      | Error `Unavailable -> finish (Error Import_dir_unavailable)
+                      | Ok child -> (
+                          match collect_dir (depth + 1) path child with
+                          | Error error -> finish (Error error)
+                          | Ok () -> loop rest))
+                  | Ok Ext_unix.Regular ->
+                      if not (is_npcert_path path) then loop rest
+                      else
+                        (match
+                           try Ok (Ext_unix.openat_nofollow descriptor name false) with
+                           | Unix.Unix_error (Unix.ELOOP, _, _) -> Error `Symlink
+                           | Unix.Unix_error _ -> Error `Unavailable
+                         with
+                        | Error `Symlink -> loop rest
+                        | Error `Unavailable -> finish (Error Import_dir_unavailable)
+                        | Ok child ->
+                          if !candidate_count >= max_import_candidates then (
+                            close_descriptor child;
+                            finish (resource_limit Ext_bytes.Imports))
+                          else (
+                            candidate_count := !candidate_count + 1;
+                            match max_candidate_bytes with
+                            | None ->
+                                close_descriptor child;
+                                collected :=
+                                  { collected_path = path; collected_bytes = None }
+                                  :: !collected;
+                                loop rest
+                            | Some max_bytes -> (
+                                let remaining_bytes = max_bytes - !total_bytes in
+                                match
+                                  read_binary_descriptor_with_limit child remaining_bytes
+                                with
+                                | Error error -> finish (Error error)
+                                | Ok bytes ->
+                                    total_bytes := !total_bytes + String.length bytes;
+                                    collected :=
+                                      {
+                                        collected_path = path;
+                                        collected_bytes = Some bytes;
+                                    }
+                                    :: !collected;
+                                    loop rest)))
           in
-          loop entries paths)
+          loop entries
     in
-    bind (collect_dir import_dir []) (fun paths -> Ok (sorted_unique paths))
+    match
+      try Ok (Ext_unix.open_path_nofollow import_dir true) with
+      | Unix.Unix_error (Unix.ELOOP, _, _) -> Error `Symlink
+      | Unix.Unix_error _ -> Error `Unavailable
+    with
+    | Error `Symlink -> Error Source_or_replay_input_rejected
+    | Error `Unavailable -> Error Import_dir_unavailable
+    | Ok root -> (
+        match collect_dir 1 import_dir root with
+        | Error error -> Error error
+        | Ok _ -> Ok (List.rev !collected))
+
+let collect_cert_paths import_dir =
+  bind (collect_certificates import_dir) (fun certificates ->
+      Ok
+        (sorted_unique
+           (List.map
+              (fun certificate -> certificate.collected_path)
+              certificates)))
+
+let collect_certificate_bytes_with_limit import_dir max_candidate_bytes =
+  bind
+    (collect_certificates ~max_candidate_bytes import_dir)
+    (fun certificates ->
+      let rec bytes remaining collected =
+        match remaining with
+        | [] -> Ok (List.rev collected)
+        | { collected_bytes = Some value; _ } :: rest ->
+            bytes rest (value :: collected)
+        | { collected_bytes = None; _ } :: _ -> Error Import_dir_unavailable
+      in
+      bytes certificates [])
+
+let read_binary_file_with_limit path max_bytes =
+  try
+    let descriptor = Ext_unix.open_path_nofollow path false in
+    read_binary_descriptor_with_limit descriptor max_bytes
+  with
+  | Unix.Unix_error (Unix.ELOOP, _, _) -> Error Source_or_replay_input_rejected
+  | Unix.Unix_error _ -> Error Import_dir_unavailable
 
 let read_binary_file path =
-  try
-    let channel = open_in_bin path in
-    let length = in_channel_length channel in
-    let contents = really_input_string channel length in
-    close_in channel;
-    Ok contents
-  with Sys_error _ -> Error Import_dir_unavailable
+  read_binary_file_with_limit path Ext_bytes.max_certificate_bytes
 
 let import_hash_mismatch kind section offset =
   { hash_mismatch_kind = kind; hash_mismatch_section = section; hash_mismatch_offset = offset }
@@ -267,10 +450,35 @@ let public_axiom_ref section offset declarations axiom =
         (fun public_ref ->
           Ok { axiom with Ext_cert.axiom_global_ref = public_ref })
 
-let public_export_of_export declarations export =
-  bind
-    (public_term Ext_bytes.Export_block export.Ext_cert.export_offset declarations
-       export.Ext_cert.export_ty)
+let declaration_constraints payload =
+  match payload with
+  | Ext_cert.AxiomDecl { decl_universe_constraints; _ }
+  | Ext_cert.DefDecl { decl_universe_constraints; _ }
+  | Ext_cert.TheoremDecl { decl_universe_constraints; _ }
+  | Ext_cert.InductiveDecl { decl_universe_constraints; _ }
+  | Ext_cert.MutualInductiveBlockDecl { decl_universe_constraints; _ } ->
+      decl_universe_constraints
+
+let rec export_owner_constraints (declarations : Ext_cert.declaration list)
+    (export : Ext_cert.export_entry) =
+  match declarations with
+  | [] -> []
+  | declaration :: rest ->
+      if
+        declaration.Ext_cert.hashes.Ext_cert.decl_interface_hash
+        = export.Ext_cert.export_decl_interface_hash
+      then declaration_constraints declaration.Ext_cert.payload
+      else export_owner_constraints rest export
+
+let public_export_of_export version declarations export =
+  let owner_constraints = export_owner_constraints declarations export in
+  if version = Ext_cert.Legacy && owner_constraints <> [] then
+    Ext_bytes.error Ext_bytes.Export_block export.Ext_cert.export_offset
+      Ext_bytes.Constrained_export_requires_format_upgrade
+  else
+    bind
+      (public_term Ext_bytes.Export_block export.Ext_cert.export_offset declarations
+         export.Ext_cert.export_ty)
     (fun public_ty ->
       bind
         (map_option_result
@@ -290,14 +498,80 @@ let public_export_of_export declarations export =
                   public_decl_interface_hash = export.Ext_cert.export_decl_interface_hash;
                   public_axiom_dependencies;
                   public_universe_params = export.Ext_cert.export_universe_params;
+                  public_universe_constraints =
+                    export.Ext_cert.export_universe_constraints;
                   public_ty;
                   public_body;
                 })))
 
 let public_environment_of_decoded decoded =
+  let recursor_layout = function
+    | None -> None
+    | Some recursor ->
+        Some
+          {
+            public_recursor_name = recursor.Ext_cert.recursor_name;
+            public_recursor_rules = recursor.Ext_cert.recursor_rules;
+          }
+  in
+  let family_layout name params indices constructors recursor =
+    {
+      public_inductive_name = name;
+      public_param_count = List.length params;
+      public_index_count = List.length indices;
+      public_constructor_names =
+        List.map
+          (fun constructor -> constructor.Ext_cert.constructor_name)
+          constructors;
+      public_recursor_layout = recursor_layout recursor;
+    }
+  in
+  let rec collect_groups declarations groups =
+    match declarations with
+    | [] -> List.rev groups
+    | declaration :: rest ->
+        let families =
+          match declaration.Ext_cert.payload with
+          | Ext_cert.InductiveDecl
+              {
+                decl_name;
+                ind_params;
+                ind_indices;
+                ind_constructors;
+                ind_recursor;
+                _;
+              } ->
+              [
+                family_layout decl_name ind_params ind_indices ind_constructors
+                  ind_recursor;
+              ]
+          | Ext_cert.MutualInductiveBlockDecl { mutual_inductives; _ } ->
+              List.map
+                (fun mutual ->
+                  family_layout mutual.Ext_cert.mutual_name
+                    mutual.Ext_cert.mutual_params mutual.Ext_cert.mutual_indices
+                    mutual.Ext_cert.mutual_constructors
+                    mutual.Ext_cert.mutual_recursor)
+                mutual_inductives
+          | Ext_cert.AxiomDecl _ | Ext_cert.DefDecl _ | Ext_cert.TheoremDecl _ ->
+              []
+        in
+        let groups =
+          if families = [] then groups
+          else
+            {
+              public_group_decl_interface_hash =
+                declaration.Ext_cert.hashes.Ext_cert.decl_interface_hash;
+              public_group_families = families;
+            }
+            :: groups
+        in
+        collect_groups rest groups
+  in
   bind
     (map_result
-       (public_export_of_export decoded.Ext_cert.declaration_table)
+       (public_export_of_export decoded.Ext_cert.header.Ext_cert.version
+          decoded.Ext_cert.declaration_table)
        decoded.Ext_cert.export_block)
     (fun public_exports ->
       bind
@@ -316,6 +590,8 @@ let public_environment_of_decoded decoded =
               public_exports;
               public_module_axioms;
               public_core_features = decoded.Ext_cert.axiom_report.Ext_cert.core_features;
+              public_inductive_groups =
+                collect_groups decoded.Ext_cert.declaration_table [];
             }))
 
 let module_entry_of_decoded decoded =
@@ -334,9 +610,20 @@ let module_entry_of_decoded decoded =
         })
 
 let module_entry_from_source_free_certificate bytes =
-  match Ext_cert.read_module (Ext_bytes.of_string bytes) with
+  if String.length bytes > Ext_bytes.max_certificate_bytes then
+    Error
+      (Certificate_decode_error
+         {
+           Ext_bytes.section = Ext_bytes.Full_certificate;
+           offset = Ext_bytes.max_certificate_bytes;
+           reason = Ext_bytes.Resource_limit;
+         })
+  else match Ext_cert.read_module (Ext_bytes.of_string bytes) with
   | Error err -> Error (Certificate_decode_error err)
   | Ok (decoded, _next) -> (
+      match Ext_canonical.verify_canonical_bytes bytes decoded with
+      | Error err -> Error (Certificate_decode_error err)
+      | Ok () -> (
       match Ext_canonical.verify_declaration_hashes decoded with
       | Error err -> Error (Certificate_decode_error err)
       | Ok Ext_canonical.Declaration_hashes_ok -> (
@@ -349,7 +636,7 @@ let module_entry_from_source_free_certificate bytes =
           | Ok (Ext_canonical.Module_hash_mismatch mismatch) ->
               Error (module_hash_error mismatch))
       | Ok (Ext_canonical.Declaration_hash_mismatch mismatch) ->
-          Error (declaration_hash_error mismatch))
+          Error (declaration_hash_error mismatch)))
 
 let duplicate_binding first second offset =
   if
@@ -395,20 +682,10 @@ let from_source_free_certificates certificates =
   in
   loop certificates []
 
-let from_checked_modules modules =
-  let mark_checked_by_ext_checker entry = { entry with checked_by_ext_checker = true } in
-  validate_unique (List.map mark_checked_by_ext_checker modules)
-
 let load_import_dir import_dir =
-  bind (collect_cert_paths import_dir) (fun paths ->
-      let rec read_all remaining bytes =
-        match remaining with
-        | [] -> from_source_free_certificates (List.rev bytes)
-        | path :: rest ->
-            bind (read_binary_file path) (fun contents ->
-                read_all rest (contents :: bytes))
-      in
-      read_all paths [])
+  bind
+    (collect_certificate_bytes_with_limit import_dir Ext_bytes.max_certificate_bytes)
+    from_source_free_certificates
 
 let same_module entry requested =
   Ext_name.equal entry.import_entry.Ext_import.module_name requested.Ext_import.module_name

@@ -11363,7 +11363,7 @@ mod tests {
         let body = import_proposal_json(
             &session,
             &candidates,
-            r#"["PUA-M06-T10","PUA-M06-T10"]"#,
+            r#"["search-task-10","search-task-10"]"#,
             "",
         );
 
@@ -11373,7 +11373,7 @@ mod tests {
             import_proposal_ok_fields(propose_machine_imports_for_goal(&body, &session).unwrap());
 
         assert_eq!(first, second);
-        assert_eq!(first.proposed_for_tasks, vec!["PUA-M06-T10".to_owned()]);
+        assert_eq!(first.proposed_for_tasks, vec!["search-task-10".to_owned()]);
         assert!(first.rejected_candidates.is_empty());
         assert_eq!(first.proposals.len(), 1);
         let proposal = &first.proposals[0];

@@ -1,25 +1,36 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use npa_cert::{
-    AxiomRef, DeclPayload, ExportEntry, ExportKind, GlobalRef, Hash, Name, NameId, TermId,
-    TermNode, VerifiedModule,
+    analyze_verified_module_theorem_premises, AxiomRef, DeclPayload, ExportEntry, ExportKind,
+    GlobalRef, Hash, Name, NameId, TermId, TermNode, VerifiedModule,
+    VerifiedTheoremGlobalDependency, VerifiedTheoremGlobalDependencyKind,
+    VerifiedTheoremPremiseAnalysis, VerifiedTheoremPremiseAnalysisError,
+    VerifiedTheoremPremiseAnalysisErrorReason, VerifiedTheoremPremiseUseSite,
+    VERIFIED_THEOREM_PREMISE_ANALYSIS_LIMITS_V1,
 };
 use npa_package::{
     build_package_lock_from_artifacts, format_package_hash, package_audit_direct_imports_for_entry,
     package_axiom_report_summary, package_file_hash, package_lock_reverse_dependencies,
-    package_theorem_index_summary, validate_package_path, PackageArtifactError,
-    PackageArtifactFileReference, PackageArtifactOrigin, PackageArtifactPolicy,
-    PackageArtifactResult, PackageAxiomPolicyStatus, PackageAxiomPolicyStatusKind,
-    PackageAxiomPolicyViolation, PackageAxiomPolicyViolationReason, PackageAxiomReference,
-    PackageAxiomReport, PackageAxiomReportModule, PackageCheckerMode, PackageCheckerSummary,
-    PackageGlobalRef, PackageGlobalRefView, PackageHash, PackageId, PackageLockArtifact,
-    PackageLockEntry, PackageLockEntryOrigin, PackageLockError, PackageLockErrorKind,
-    PackageLockErrorReason, PackageLockManifest, PackageLockManifestReference, PackagePath,
+    package_theorem_index_summary, package_theorem_premise_classification,
+    package_theorem_premise_summary, package_theorem_proof_profile, validate_package_path,
+    PackageArtifactError, PackageArtifactErrorReason, PackageArtifactFileReference,
+    PackageArtifactOrigin, PackageArtifactPolicy, PackageArtifactResult, PackageAxiomPolicyStatus,
+    PackageAxiomPolicyStatusKind, PackageAxiomPolicyViolation, PackageAxiomPolicyViolationReason,
+    PackageAxiomReference, PackageAxiomReport, PackageAxiomReportModule, PackageCheckerMode,
+    PackageCheckerSummary, PackageGlobalRef, PackageGlobalRefView, PackageHash, PackageId,
+    PackageLockArtifact, PackageLockEntry, PackageLockEntryOrigin, PackageLockError,
+    PackageLockErrorKind, PackageLockErrorReason, PackageLockManifest,
+    PackageLockManifestReference, PackagePath, PackageTheoremDependencyProfile,
+    PackageTheoremFactPremise, PackageTheoremGlobalDependency,
+    PackageTheoremGlobalDependencyIdentity, PackageTheoremGlobalDependencyKind,
     PackageTheoremIndex, PackageTheoremIndexArtifact, PackageTheoremIndexEntry,
-    PackageTheoremIndexKind, PackageTheoremIndexMode, PackageTheoremStatement,
-    PackageVerifiedExportSummary, PackageVerifiedExportSummaryModule, PackageVersion,
-    ValidatedPackageManifest, PACKAGE_AXIOM_REPORT_SCHEMA,
-    PACKAGE_THEOREM_INDEX_CERTIFICATE_DERIVED_PROFILE, PACKAGE_THEOREM_INDEX_SCHEMA,
+    PackageTheoremIndexKind, PackageTheoremIndexMode, PackageTheoremPremiseEntry,
+    PackageTheoremPremiseReport, PackageTheoremPremiseUseSite, PackageTheoremStatement,
+    PackageTheoremTelescopeProfile, PackageVerifiedExportSummary,
+    PackageVerifiedExportSummaryModule, PackageVersion, ValidatedPackageManifest,
+    PACKAGE_AXIOM_REPORT_SCHEMA, PACKAGE_THEOREM_INDEX_CERTIFICATE_DERIVED_PROFILE,
+    PACKAGE_THEOREM_INDEX_SCHEMA, PACKAGE_THEOREM_PREMISE_ANALYSIS_LIMITS_V1,
+    PACKAGE_THEOREM_PREMISE_REPORT_PROFILE, PACKAGE_THEOREM_PREMISE_REPORT_SCHEMA,
     PACKAGE_VERIFIED_EXPORT_SUMMARY_MODULE_ORDER_TOPOLOGICAL,
     PACKAGE_VERIFIED_EXPORT_SUMMARY_SCHEMA, PACKAGE_VERIFIED_EXPORT_SUMMARY_TRUST_BOUNDARY,
 };
@@ -338,6 +349,22 @@ impl PackageAuditSnapshot {
         })
     }
 
+    /// Project the package theorem-premise report from this snapshot.
+    pub fn project_theorem_premise_report(
+        &self,
+    ) -> PackageArtifactResult<PackageTheoremPremiseReport> {
+        let manifest = self.validated.manifest();
+        let extraction = self.fast_projection_extraction();
+        project_package_theorem_premise_report_source_free(
+            PackageTheoremPremiseReportProjectionInput {
+                package: manifest.package.clone(),
+                version: manifest.version.clone(),
+                package_lock: self.package_lock.clone(),
+                extraction: &extraction,
+            },
+        )
+    }
+
     /// Project the verified export summary from this snapshot.
     pub fn project_verified_export_summary(
         &self,
@@ -450,6 +477,19 @@ pub struct PackageAxiomReportProjectionInput<'a> {
 /// Source-free input for projecting a package theorem index artifact.
 #[derive(Clone, Debug)]
 pub struct PackageTheoremIndexProjectionInput<'a> {
+    /// Package id copied from the validated package manifest.
+    pub package: PackageId,
+    /// Package version copied from the validated package manifest.
+    pub version: PackageVersion,
+    /// Exact generated package lock file identity used for extraction.
+    pub package_lock: PackageArtifactFileReference,
+    /// Source-free verified module extraction.
+    pub extraction: &'a PackageArtifactExtraction,
+}
+
+/// Source-free input for projecting a package theorem-premise report artifact.
+#[derive(Clone, Debug)]
+pub struct PackageTheoremPremiseReportProjectionInput<'a> {
     /// Package id copied from the validated package manifest.
     pub package: PackageId,
     /// Package version copied from the validated package manifest.
@@ -620,6 +660,87 @@ pub fn project_package_theorem_index_from_extraction(
 ) -> PackageArtifactResult<PackageTheoremIndex> {
     let manifest = validated.manifest();
     project_package_theorem_index_source_free(PackageTheoremIndexProjectionInput {
+        package: manifest.package.clone(),
+        version: manifest.version.clone(),
+        package_lock,
+        extraction,
+    })
+}
+
+/// Project `npa.package.theorem_premise_report.v0.1` from verified local theorems.
+///
+/// This projection consumes only source-free certificate extraction output.
+/// It classifies theorem telescopes, checked-proof premise uses, direct global
+/// dependencies, and verifier-recomputed transitive axioms without reading
+/// proof source, replay sidecars, theorem search metadata, caches, or network
+/// state.
+pub fn project_package_theorem_premise_report_source_free(
+    input: PackageTheoremPremiseReportProjectionInput<'_>,
+) -> PackageArtifactResult<PackageTheoremPremiseReport> {
+    let limits = project_theorem_premise_analysis_limits()?;
+    let entries = project_package_theorem_premise_entries(input.extraction)?;
+    PackageTheoremPremiseReport {
+        schema: PACKAGE_THEOREM_PREMISE_REPORT_SCHEMA.to_owned(),
+        package: input.package,
+        version: input.version,
+        manifest: PackageArtifactFileReference {
+            path: input.extraction.manifest.path.clone(),
+            file_hash: input.extraction.manifest.file_hash,
+        },
+        package_lock: input.package_lock,
+        analysis_profile: PACKAGE_THEOREM_PREMISE_REPORT_PROFILE.to_owned(),
+        limits,
+        summary: package_theorem_premise_summary(&entries),
+        entries,
+        checker_summaries: input
+            .extraction
+            .checker_summaries
+            .iter()
+            .filter(|summary| summary.mode == PackageCheckerMode::Fast)
+            .cloned()
+            .collect(),
+        report_hash: PackageHash::new([0_u8; 32]),
+    }
+    .with_computed_hash()
+}
+
+fn project_theorem_premise_analysis_limits(
+) -> PackageArtifactResult<npa_package::PackageTheoremPremiseAnalysisLimits> {
+    let certificate = VERIFIED_THEOREM_PREMISE_ANALYSIS_LIMITS_V1;
+    let projected = npa_package::PackageTheoremPremiseAnalysisLimits {
+        telescope_binders_per_theorem: u64::try_from(certificate.telescope_binders_per_theorem)
+            .map_err(|_| theorem_premise_projection_failure("telescope limit exceeds u64"))?,
+        kernel_whnf_fuel_per_theorem: u64::try_from(certificate.kernel_whnf_fuel_per_theorem)
+            .map_err(|_| theorem_premise_projection_failure("WHNF limit exceeds u64"))?,
+        kernel_conversion_fuel_per_theorem: u64::try_from(
+            certificate.kernel_conversion_fuel_per_theorem,
+        )
+        .map_err(|_| theorem_premise_projection_failure("conversion limit exceeds u64"))?,
+        expression_traversal_states_per_theorem: u64::try_from(
+            certificate.expression_traversal_states_per_theorem,
+        )
+        .map_err(|_| theorem_premise_projection_failure("traversal limit exceeds u64"))?,
+        resolved_global_dependencies_per_theorem: u64::try_from(
+            certificate.resolved_global_dependencies_per_theorem,
+        )
+        .map_err(|_| theorem_premise_projection_failure("dependency limit exceeds u64"))?,
+    };
+    if projected != PACKAGE_THEOREM_PREMISE_ANALYSIS_LIMITS_V1 {
+        return Err(theorem_premise_projection_failure(
+            "certificate and package theorem-premise analysis limits disagree",
+        ));
+    }
+    Ok(projected)
+}
+
+/// Project a theorem-premise report using package identity from a validated manifest.
+pub fn project_package_theorem_premise_report_from_extraction(
+    validated: &ValidatedPackageManifest,
+    extraction: &PackageArtifactExtraction,
+    package_lock: PackageArtifactFileReference,
+) -> PackageArtifactResult<PackageTheoremPremiseReport> {
+    let manifest = validated.manifest();
+    project_package_theorem_premise_report_source_free(PackageTheoremPremiseReportProjectionInput {
         package: manifest.package.clone(),
         version: manifest.version.clone(),
         package_lock,
@@ -1014,6 +1135,325 @@ fn project_package_axiom_report_modules(
     Ok(modules)
 }
 
+fn project_package_theorem_premise_entries(
+    extraction: &PackageArtifactExtraction,
+) -> PackageArtifactResult<Vec<PackageTheoremPremiseEntry>> {
+    let mut entries = Vec::new();
+    for key in &extraction.topological_order {
+        let module = extraction.verified_modules.get(key).ok_or_else(|| {
+            theorem_premise_projection_failure(format!(
+                "module {} is absent from verified extraction",
+                key.module.as_dotted()
+            ))
+        })?;
+        if module.origin != PackageArtifactOrigin::Local {
+            continue;
+        }
+        let mut imports = Vec::with_capacity(module.verified_module.imports().len());
+        for import_index in 0..module.verified_module.imports().len() {
+            let imported = imported_module_for_global_ref(extraction, module, import_index)
+                .map_err(|_| {
+                    theorem_premise_projection_failure(format!(
+                        "module {} import {import_index} is not uniquely resolved",
+                        module.key.module.as_dotted()
+                    ))
+                })?;
+            imports.push(&imported.verified_module);
+        }
+        let analyses = analyze_verified_module_theorem_premises(
+            &module.verified_module,
+            &imports,
+            VERIFIED_THEOREM_PREMISE_ANALYSIS_LIMITS_V1,
+        )
+        .map_err(|error| theorem_premise_analysis_error(module, error))?;
+        for analysis in analyses {
+            entries.push(project_package_theorem_premise_entry(
+                extraction, module, analysis,
+            )?);
+        }
+    }
+    Ok(entries)
+}
+
+fn project_package_theorem_premise_entry(
+    extraction: &PackageArtifactExtraction,
+    module: &PackageArtifactVerifiedModule,
+    analysis: VerifiedTheoremPremiseAnalysis,
+) -> PackageArtifactResult<PackageTheoremPremiseEntry> {
+    let export =
+        unique_export_by_name_and_hash(module, &analysis.export_name, analysis.decl_interface_hash)
+            .filter(|export| export.kind == ExportKind::Theorem)
+            .ok_or_else(|| {
+                theorem_premise_projection_failure(format!(
+                    "module {} theorem {} lacks a unique public export",
+                    module.key.module.as_dotted(),
+                    analysis.export_name.as_dotted()
+                ))
+            })?;
+    if export.type_hash != analysis.statement_hash {
+        return Err(theorem_premise_projection_failure(format!(
+            "module {} theorem {} statement hash disagrees with its export",
+            module.key.module.as_dotted(),
+            analysis.export_name.as_dotted()
+        )));
+    }
+
+    let fact_premises = analysis
+        .fact_premises
+        .into_iter()
+        .map(|premise| {
+            Ok(PackageTheoremFactPremise {
+                binder_index: theorem_premise_index_to_u64(
+                    module,
+                    "fact_premises.binder_index",
+                    premise.binder_index,
+                )?,
+                type_hash: PackageHash::from(premise.type_hash),
+                depends_on_prior_binder_indices: theorem_premise_indices_to_u64(
+                    module,
+                    "fact_premises.depends_on_prior_binder_indices",
+                    premise.depends_on_prior_binder_indices,
+                )?,
+                use_sites: premise
+                    .use_sites
+                    .into_iter()
+                    .map(project_theorem_premise_use_site)
+                    .collect::<PackageArtifactResult<Vec<_>>>()?,
+            })
+        })
+        .collect::<PackageArtifactResult<Vec<_>>>()?;
+    let telescope = PackageTheoremTelescopeProfile {
+        binder_count: theorem_premise_index_to_u64(
+            module,
+            "telescope.binder_count",
+            analysis.binder_count,
+        )?,
+        sort_parameter_indices: theorem_premise_indices_to_u64(
+            module,
+            "telescope.sort_parameter_indices",
+            analysis.sort_parameter_indices,
+        )?,
+        data_parameter_indices: theorem_premise_indices_to_u64(
+            module,
+            "telescope.data_parameter_indices",
+            analysis.data_parameter_indices,
+        )?,
+        fact_premises,
+        conclusion_hash: PackageHash::from(analysis.conclusion_hash),
+        conclusion_depends_on_binder_indices: theorem_premise_indices_to_u64(
+            module,
+            "telescope.conclusion_depends_on_binder_indices",
+            analysis.conclusion_depends_on_binder_indices,
+        )?,
+    };
+    let global_dependencies = analysis
+        .global_dependencies
+        .into_iter()
+        .map(|dependency| project_theorem_global_dependency(extraction, module, dependency))
+        .collect::<PackageArtifactResult<Vec<_>>>()?;
+    let mut axiom_dependencies = BTreeMap::new();
+    for axiom in &analysis.axiom_dependencies {
+        insert_projected_axiom(&mut axiom_dependencies, extraction, module, axiom).map_err(
+            |_| {
+                theorem_premise_projection_failure(format!(
+                    "module {} theorem {} has an unprojectable axiom dependency",
+                    module.key.module.as_dotted(),
+                    analysis.export_name.as_dotted()
+                ))
+            },
+        )?;
+    }
+    let dependency_basis = PackageTheoremDependencyProfile {
+        global_dependencies,
+        axiom_dependencies: axiom_dependencies.into_values().collect(),
+    };
+    let proof = package_theorem_proof_profile(&telescope.fact_premises);
+    let classification =
+        package_theorem_premise_classification(&telescope, &proof, &dependency_basis);
+
+    Ok(PackageTheoremPremiseEntry {
+        global_ref: PackageGlobalRef {
+            module: module.key.module.clone(),
+            name: analysis.export_name,
+            export_hash: module.key.export_hash,
+            certificate_hash: module.key.certificate_hash,
+            decl_interface_hash: PackageHash::from(analysis.decl_interface_hash),
+        },
+        statement_hash: PackageHash::from(analysis.statement_hash),
+        module_axiom_report_hash: module.axiom_report_hash,
+        artifact: PackageTheoremIndexArtifact {
+            origin: module.origin,
+            certificate: module.certificate.path.clone(),
+        },
+        telescope,
+        proof,
+        dependency_basis,
+        classification,
+    })
+}
+
+fn project_theorem_premise_use_site(
+    site: VerifiedTheoremPremiseUseSite,
+) -> PackageArtifactResult<PackageTheoremPremiseUseSite> {
+    match site {
+        VerifiedTheoremPremiseUseSite::DirectResult => {
+            Ok(PackageTheoremPremiseUseSite::DirectResult)
+        }
+        VerifiedTheoremPremiseUseSite::ApplicationHead => {
+            Ok(PackageTheoremPremiseUseSite::ApplicationHead)
+        }
+        VerifiedTheoremPremiseUseSite::ApplicationArgument => {
+            Ok(PackageTheoremPremiseUseSite::ApplicationArgument)
+        }
+        VerifiedTheoremPremiseUseSite::TermBody => Ok(PackageTheoremPremiseUseSite::TermBody),
+        VerifiedTheoremPremiseUseSite::DependentType => {
+            Ok(PackageTheoremPremiseUseSite::DependentType)
+        }
+        VerifiedTheoremPremiseUseSite::LetValue => Ok(PackageTheoremPremiseUseSite::LetValue),
+        _ => Err(theorem_premise_projection_failure(
+            "unsupported certificate theorem-premise use-site kind",
+        )),
+    }
+}
+
+fn project_theorem_global_dependency(
+    extraction: &PackageArtifactExtraction,
+    module: &PackageArtifactVerifiedModule,
+    dependency: VerifiedTheoremGlobalDependency,
+) -> PackageArtifactResult<PackageTheoremGlobalDependency> {
+    let kind = project_theorem_global_dependency_kind(dependency.kind)?;
+    let identity = match &dependency.global_ref {
+        GlobalRef::Builtin { name, .. } => {
+            let name = module
+                .verified_module
+                .name_table()
+                .get(*name)
+                .cloned()
+                .ok_or_else(|| {
+                    theorem_premise_projection_failure(format!(
+                        "module {} theorem dependency has an invalid builtin name",
+                        module.key.module.as_dotted()
+                    ))
+                })?;
+            PackageTheoremGlobalDependencyIdentity::Builtin {
+                name,
+                decl_interface_hash: PackageHash::from(dependency.decl_interface_hash),
+            }
+        }
+        _ => PackageTheoremGlobalDependencyIdentity::PackageGlobal(
+            project_package_global_ref(extraction, module, &dependency.global_ref).map_err(
+                |_| {
+                    theorem_premise_projection_failure(format!(
+                        "module {} theorem dependency is not uniquely package-projectable",
+                        module.key.module.as_dotted()
+                    ))
+                },
+            )?,
+        ),
+    };
+    Ok(PackageTheoremGlobalDependency { identity, kind })
+}
+
+fn project_theorem_global_dependency_kind(
+    kind: VerifiedTheoremGlobalDependencyKind,
+) -> PackageArtifactResult<PackageTheoremGlobalDependencyKind> {
+    match kind {
+        VerifiedTheoremGlobalDependencyKind::BuiltinPrimitive => {
+            Ok(PackageTheoremGlobalDependencyKind::BuiltinPrimitive)
+        }
+        VerifiedTheoremGlobalDependencyKind::BuiltinAxiom => {
+            Ok(PackageTheoremGlobalDependencyKind::BuiltinAxiom)
+        }
+        VerifiedTheoremGlobalDependencyKind::Definition => {
+            Ok(PackageTheoremGlobalDependencyKind::Definition)
+        }
+        VerifiedTheoremGlobalDependencyKind::Theorem => {
+            Ok(PackageTheoremGlobalDependencyKind::Theorem)
+        }
+        VerifiedTheoremGlobalDependencyKind::Axiom => Ok(PackageTheoremGlobalDependencyKind::Axiom),
+        VerifiedTheoremGlobalDependencyKind::Inductive => {
+            Ok(PackageTheoremGlobalDependencyKind::Inductive)
+        }
+        VerifiedTheoremGlobalDependencyKind::Constructor => {
+            Ok(PackageTheoremGlobalDependencyKind::Constructor)
+        }
+        VerifiedTheoremGlobalDependencyKind::Recursor => {
+            Ok(PackageTheoremGlobalDependencyKind::Recursor)
+        }
+        _ => Err(theorem_premise_projection_failure(
+            "unsupported certificate theorem dependency kind",
+        )),
+    }
+}
+
+fn theorem_premise_indices_to_u64(
+    module: &PackageArtifactVerifiedModule,
+    field: &str,
+    indices: Vec<usize>,
+) -> PackageArtifactResult<Vec<u64>> {
+    indices
+        .into_iter()
+        .map(|index| theorem_premise_index_to_u64(module, field, index))
+        .collect()
+}
+
+fn theorem_premise_index_to_u64(
+    module: &PackageArtifactVerifiedModule,
+    field: &str,
+    value: usize,
+) -> PackageArtifactResult<u64> {
+    u64::try_from(value).map_err(|_| {
+        theorem_premise_projection_failure(format!(
+            "module {} {field} value {value} exceeds u64",
+            module.key.module.as_dotted()
+        ))
+    })
+}
+
+fn theorem_premise_analysis_error(
+    module: &PackageArtifactVerifiedModule,
+    error: VerifiedTheoremPremiseAnalysisError,
+) -> PackageArtifactError {
+    let reason_code = match error.reason {
+        VerifiedTheoremPremiseAnalysisErrorReason::TelescopeLimit => {
+            PackageArtifactErrorReason::TheoremPremiseTelescopeLimit
+        }
+        VerifiedTheoremPremiseAnalysisErrorReason::WhnfFuelLimit => {
+            PackageArtifactErrorReason::TheoremPremiseWhnfFuelLimit
+        }
+        VerifiedTheoremPremiseAnalysisErrorReason::ConversionFuelLimit => {
+            PackageArtifactErrorReason::TheoremPremiseConversionFuelLimit
+        }
+        VerifiedTheoremPremiseAnalysisErrorReason::ExpressionTraversalLimit => {
+            PackageArtifactErrorReason::TheoremPremiseExpressionTraversalLimit
+        }
+        VerifiedTheoremPremiseAnalysisErrorReason::DependencyLimit => {
+            PackageArtifactErrorReason::TheoremPremiseDependencyLimit
+        }
+        VerifiedTheoremPremiseAnalysisErrorReason::ImportContextMismatch
+        | VerifiedTheoremPremiseAnalysisErrorReason::InvalidVerifiedModule => {
+            PackageArtifactErrorReason::TheoremPremiseProjectionFailed
+        }
+        _ => PackageArtifactErrorReason::TheoremPremiseProjectionFailed,
+    };
+    PackageArtifactError::theorem_premise_projection(
+        reason_code,
+        format!(
+            "module={} declaration_index={:?} analysis_reason={:?}",
+            module.key.module.as_dotted(),
+            error.declaration_index,
+            error.reason
+        ),
+    )
+}
+
+fn theorem_premise_projection_failure(actual: impl Into<String>) -> PackageArtifactError {
+    PackageArtifactError::theorem_premise_projection(
+        PackageArtifactErrorReason::TheoremPremiseProjectionFailed,
+        actual,
+    )
+}
+
 fn project_package_theorem_index_entries(
     extraction: &PackageArtifactExtraction,
 ) -> PackageArtifactResult<Vec<PackageTheoremIndexEntry>> {
@@ -1272,6 +1712,34 @@ fn project_global_ref_view(
             })
         }
     }
+}
+
+fn project_package_global_ref(
+    extraction: &PackageArtifactExtraction,
+    owner: &PackageArtifactVerifiedModule,
+    global_ref: &GlobalRef,
+) -> PackageArtifactResult<PackageGlobalRef> {
+    let view = project_global_ref_view(extraction, owner, global_ref)?;
+    let provider = match global_ref {
+        GlobalRef::Builtin { .. } => {
+            return Err(theorem_projection_error(
+                owner,
+                "global_ref",
+                "package-exported declaration reference",
+            ));
+        }
+        GlobalRef::Imported { import_index, .. } => {
+            imported_module_for_global_ref(extraction, owner, *import_index)?
+        }
+        GlobalRef::Local { .. } | GlobalRef::LocalGenerated { .. } => owner,
+    };
+    Ok(PackageGlobalRef {
+        module: view.module,
+        name: view.name,
+        export_hash: view.export_hash,
+        certificate_hash: provider.key.certificate_hash,
+        decl_interface_hash: view.decl_interface_hash,
+    })
 }
 
 fn unique_export_by_name_and_hash<'a>(
@@ -1723,7 +2191,8 @@ mod tests {
     use npa_package::{
         build_package_lock_from_artifacts, parse_and_validate_manifest_str,
         parse_package_axiom_report_json, parse_package_lock_json, parse_package_theorem_index_json,
-        PackageLockError, PackageLockImport, PackageTheoremIndexMode, PACKAGE_THEOREM_INDEX_SCHEMA,
+        parse_package_theorem_premise_report_json, PackageLockError, PackageLockImport,
+        PackageTheoremIndexMode, PACKAGE_THEOREM_INDEX_SCHEMA,
     };
 
     use super::*;
@@ -2248,6 +2717,73 @@ axioms = ["Eq.rec"]
 
         let json = index.canonical_json().unwrap();
         assert_eq!(parse_package_theorem_index_json(&json).unwrap(), index);
+    }
+
+    #[test]
+    fn package_theorem_premise_projection_reports_only_public_local_theorems() {
+        let (validated, extraction, package_lock) = eq_reasoning_projection_fixture();
+
+        let report = project_package_theorem_premise_report_from_extraction(
+            &validated,
+            &extraction,
+            package_lock,
+        )
+        .unwrap();
+
+        assert_eq!(report.schema, PACKAGE_THEOREM_PREMISE_REPORT_SCHEMA);
+        assert_eq!(
+            report.analysis_profile,
+            PACKAGE_THEOREM_PREMISE_REPORT_PROFILE
+        );
+        assert_eq!(report.limits, PACKAGE_THEOREM_PREMISE_ANALYSIS_LIMITS_V1);
+        assert_eq!(report.summary.theorem_count as usize, report.entries.len());
+        assert_eq!(report.entries.len(), 11);
+        assert!(report.entries.iter().all(|entry| {
+            entry.global_ref.module.as_dotted() == "Proofs.Ai.EqReasoning"
+                && entry.artifact.origin == PackageArtifactOrigin::Local
+                && entry.artifact.certificate.as_str() == EQ_REASONING_CERTIFICATE_PATH
+        }));
+        assert!(report.entries.iter().any(|entry| {
+            entry
+                .dependency_basis
+                .axiom_dependencies
+                .iter()
+                .any(|axiom| axiom.name.as_dotted() == "Eq.rec")
+        }));
+        assert!(report
+            .checker_summaries
+            .iter()
+            .all(|summary| summary.mode == PackageCheckerMode::Fast));
+
+        let json = report.canonical_json().unwrap();
+        assert_eq!(
+            parse_package_theorem_premise_report_json(&json).unwrap(),
+            report
+        );
+    }
+
+    #[test]
+    fn package_theorem_premise_projection_ignores_reference_checker_summaries() {
+        let (validated, extraction, package_lock) = eq_reasoning_projection_fixture();
+        let fast_only = project_package_theorem_premise_report_from_extraction(
+            &validated,
+            &extraction,
+            package_lock.clone(),
+        )
+        .unwrap();
+        let mut with_reference = extraction;
+        let mut reference = with_reference.checker_summaries[0].clone();
+        reference.checker = "npa-checker-ref".to_owned();
+        reference.mode = PackageCheckerMode::Reference;
+        with_reference.checker_summaries.push(reference);
+
+        let projected = project_package_theorem_premise_report_from_extraction(
+            &validated,
+            &with_reference,
+            package_lock,
+        )
+        .unwrap();
+        assert_eq!(projected, fast_only);
     }
 
     #[test]

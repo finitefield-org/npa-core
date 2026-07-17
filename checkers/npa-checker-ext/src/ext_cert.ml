@@ -1,5 +1,10 @@
 type hash = string
 
+type certificate_version =
+  | Current
+  | Previous
+  | Legacy
+
 type declaration_kind =
   | Axiom
   | Definition
@@ -130,6 +135,7 @@ type header = {
   format : string;
   core_spec : string;
   module_name : Ext_name.t;
+  version : certificate_version;
 }
 
 type located_name = {
@@ -154,6 +160,7 @@ type export_entry = {
   export_name : Ext_name.t;
   export_kind : export_kind;
   export_universe_params : Ext_name.t list;
+  export_universe_constraints : universe_constraint list;
   export_ty : Ext_term.t;
   export_body : Ext_term.t option;
   export_type_hash : hash;
@@ -201,9 +208,38 @@ type decoded_module = {
   hashes : module_hashes;
 }
 
-let expected_format = "NPA-CERT-0.1"
+let current_format = "NPA-CERT-0.2.0"
 
-let expected_core_spec = "NPA-Core-0.1"
+let current_core_spec = "NPA-Core-0.2.0"
+
+let previous_format = "NPA-CERT-0.1.2"
+
+let previous_core_spec = "NPA-Core-0.1.2"
+
+let legacy_format = "NPA-CERT-0.1"
+
+let legacy_core_spec = "NPA-Core-0.1"
+
+(* Kept as aliases for the legacy golden builders while the conformance corpus
+   exercises all three explicit versions. Production decoding never uses these
+   aliases to select a version. *)
+let expected_format = legacy_format
+
+let expected_core_spec = legacy_core_spec
+
+let version_encodes_export_universe_constraints = function
+  | Current | Previous -> true
+  | Legacy -> false
+
+let format_of_version = function
+  | Current -> current_format
+  | Previous -> previous_format
+  | Legacy -> legacy_format
+
+let core_spec_of_version = function
+  | Current -> current_core_spec
+  | Previous -> previous_core_spec
+  | Legacy -> legacy_core_spec
 
 let bind result f =
   match result with
@@ -221,7 +257,7 @@ let find_dot_offset component =
 let read_hash section reader = Ext_bytes.take section 32 reader
 
 let read_vector section read_item reader =
-  match Ext_bytes.read_usize section reader with
+  match Ext_bytes.read_count section reader with
   | Error err -> Error err
   | Ok (count, after_count) ->
       if count > Ext_bytes.remaining after_count then
@@ -341,11 +377,11 @@ let read_opacity section reader =
       | 0x00 -> Ok (Opaque, next)
       | tag -> Ext_bytes.error section offset (Ext_bytes.Unknown_tag tag))
 
-let read_universe_constraints levels reader =
+let read_universe_constraints section levels reader =
   let read_constraint current =
-    bind (read_level_ref Ext_bytes.Declarations levels current) (fun (lhs, after_lhs) ->
+    bind (read_level_ref section levels current) (fun (lhs, after_lhs) ->
         let relation_offset = Ext_bytes.offset after_lhs in
-        match Ext_bytes.read_byte Ext_bytes.Declarations after_lhs with
+        match Ext_bytes.read_byte section after_lhs with
         | Error err -> Error err
         | Ok (relation_tag, after_relation) -> (
             let relation =
@@ -353,15 +389,15 @@ let read_universe_constraints levels reader =
               | 0x00 -> Ok Le
               | 0x01 -> Ok Eq
               | tag ->
-                  Ext_bytes.error Ext_bytes.Declarations relation_offset
+                  Ext_bytes.error section relation_offset
                     (Ext_bytes.Unknown_tag tag)
             in
             bind relation (fun constraint_relation ->
-                bind (read_level_ref Ext_bytes.Declarations levels after_relation)
+                bind (read_level_ref section levels after_relation)
                   (fun (rhs, next) ->
                     Ok ({ constraint_lhs = lhs; constraint_relation; constraint_rhs = rhs }, next)))))
   in
-  read_vector Ext_bytes.Declarations read_constraint reader
+  read_vector section read_constraint reader
 
 let read_binder_types terms reader =
   read_vector Ext_bytes.Declarations
@@ -458,7 +494,7 @@ let read_decl_payload names levels terms reader =
             (fun (decl_name, after_name) ->
               bind (read_name_vec Ext_bytes.Declarations names after_name)
                 (fun (decl_universe_params, after_params) ->
-                  bind (read_universe_constraints levels after_params)
+                  bind (read_universe_constraints Ext_bytes.Declarations levels after_params)
                     (fun (decl_universe_constraints, after_constraints) ->
                       bind (read_term_ref Ext_bytes.Declarations terms after_constraints)
                         (fun (decl_ty, next) ->
@@ -498,7 +534,7 @@ let read_decl_payload names levels terms reader =
             (fun (decl_name, after_name) ->
               bind (read_name_vec Ext_bytes.Declarations names after_name)
                 (fun (decl_universe_params, after_params) ->
-                  bind (read_universe_constraints levels after_params)
+                  bind (read_universe_constraints Ext_bytes.Declarations levels after_params)
                     (fun (decl_universe_constraints, after_constraints) ->
                       bind (read_term_ref Ext_bytes.Declarations terms after_constraints)
                         (fun (decl_ty, after_ty) ->
@@ -544,7 +580,7 @@ let read_decl_payload names levels terms reader =
             (fun (decl_name, after_name) ->
               bind (read_name_vec Ext_bytes.Declarations names after_name)
                 (fun (decl_universe_params, after_params) ->
-                  bind (read_universe_constraints levels after_params)
+                  bind (read_universe_constraints Ext_bytes.Declarations levels after_params)
                     (fun (decl_universe_constraints, after_constraints) ->
                       bind (read_term_ref Ext_bytes.Declarations terms after_constraints)
                         (fun (decl_ty, after_ty) ->
@@ -569,7 +605,8 @@ let read_decl_payload names levels terms reader =
               bind (read_name_vec Ext_bytes.Declarations names after_name)
                 (fun (decl_universe_params, after_params) ->
                   let constraints_result =
-                    if tag = 0x13 then read_universe_constraints levels after_params
+                    if tag = 0x13 then
+                      read_universe_constraints Ext_bytes.Declarations levels after_params
                     else Ok (no_constraints, after_params)
                   in
                   bind constraints_result (fun (decl_universe_constraints, after_constraints) ->
@@ -601,7 +638,7 @@ let read_decl_payload names levels terms reader =
             (fun (decl_name, after_name) ->
               bind (read_name_vec Ext_bytes.Declarations names after_name)
                 (fun (decl_universe_params, after_params) ->
-                  bind (read_universe_constraints levels after_params)
+                  bind (read_universe_constraints Ext_bytes.Declarations levels after_params)
                     (fun (decl_universe_constraints, after_constraints) ->
                       bind
                         (read_vector Ext_bytes.Declarations
@@ -719,7 +756,7 @@ let read_declarations import_count names levels terms reader =
 
 let read_name section reader =
   let name_offset = Ext_bytes.offset reader in
-  match Ext_bytes.read_usize section reader with
+  match Ext_bytes.read_count section reader with
   | Error err -> Error err
   | Ok (component_count, after_count) ->
       if component_count = 0 then Ext_bytes.error section name_offset Ext_bytes.Empty_name
@@ -753,20 +790,28 @@ let read_header reader =
   match Ext_bytes.read_string Ext_bytes.Header_format reader with
   | Error err -> Error err
   | Ok (format, after_format) ->
-      if format <> expected_format then
-        Ext_bytes.error Ext_bytes.Header_format (Ext_bytes.offset after_format)
-          Ext_bytes.Format_mismatch
-      else (
+      let version_and_core =
+        if format = current_format then Some (Current, current_core_spec)
+        else if format = previous_format then Some (Previous, previous_core_spec)
+        else if format = legacy_format then Some (Legacy, legacy_core_spec)
+        else None
+      in
+      (match version_and_core with
+      | None ->
+          Ext_bytes.error Ext_bytes.Header_format (Ext_bytes.offset after_format)
+            Ext_bytes.Format_mismatch
+      | Some (version, expected_core) ->
         match Ext_bytes.read_string Ext_bytes.Header_core_spec after_format with
         | Error err -> Error err
         | Ok (core_spec, after_core_spec) ->
-            if core_spec <> expected_core_spec then
+            if core_spec <> expected_core then
               Ext_bytes.error Ext_bytes.Header_core_spec (Ext_bytes.offset after_core_spec)
                 Ext_bytes.Core_spec_mismatch
             else (
               match read_name Ext_bytes.Header_module after_core_spec with
               | Error err -> Error err
-              | Ok (module_name, next) -> Ok ({ format; core_spec; module_name }, next)))
+              | Ok (module_name, next) ->
+                  Ok ({ format; core_spec; module_name; version }, next)))
 
 let read_imports reader =
   read_vector Ext_bytes.Imports
@@ -781,7 +826,7 @@ let read_imports reader =
     reader
 
 let read_name_table reader =
-  match Ext_bytes.read_usize Ext_bytes.Name_table reader with
+  match Ext_bytes.read_count Ext_bytes.Name_table reader with
   | Error err -> Error err
   | Ok (name_count, after_count) ->
       let rec loop remaining current names =
@@ -814,7 +859,7 @@ let read_export_kind reader =
       | 0x05 -> Ok (Export_recursor, next)
       | tag -> Ext_bytes.error Ext_bytes.Export_block offset (Ext_bytes.Unknown_tag tag))
 
-let read_export_block import_count names terms declaration_count reader =
+let read_export_block version import_count names levels terms declaration_count reader =
   read_vector Ext_bytes.Export_block
     (fun current ->
       let export_offset = Ext_bytes.offset current in
@@ -822,7 +867,14 @@ let read_export_block import_count names terms declaration_count reader =
           bind (read_export_kind after_name) (fun (export_kind, after_kind) ->
               bind (read_name_vec Ext_bytes.Export_block names after_kind)
                 (fun (export_universe_params, after_params) ->
-                  bind (read_term_ref Ext_bytes.Export_block terms after_params)
+                  let constraints_result =
+                    if version_encodes_export_universe_constraints version then
+                      read_universe_constraints Ext_bytes.Export_block levels after_params
+                    else Ok ([], after_params)
+                  in
+                  bind constraints_result
+                    (fun (export_universe_constraints, after_constraints) ->
+                  bind (read_term_ref Ext_bytes.Export_block terms after_constraints)
                     (fun (export_ty, after_ty) ->
                       bind
                         (validate_term_global_refs Ext_bytes.Export_block import_count
@@ -873,6 +925,7 @@ let read_export_block import_count names terms declaration_count reader =
                                                                 export_name;
                                                                 export_kind;
                                                                 export_universe_params;
+                                                                export_universe_constraints;
                                                                 export_ty;
                                                                 export_body;
                                                                 export_type_hash;
@@ -883,7 +936,7 @@ let read_export_block import_count names terms declaration_count reader =
                                                                 export_axiom_dependencies;
                                                                 export_offset;
                                                               },
-                                                              next )))))))))))))))
+                                                              next ))))))))))))))))
     reader
 
 let read_axiom_report import_count names declaration_count reader =
@@ -999,13 +1052,15 @@ let read_module_sections reader =
                   bind (Ext_term.read_table names level_table after_levels)
                     (fun (term_table, after_terms) ->
                       let term_array = Array.of_list term_table in
+                      let level_array = Array.of_list level_table in
                       bind
                         (read_declarations (List.length imports) names level_table term_table
                            after_terms)
                         (fun (declaration_table, after_declarations) ->
                           bind
-                            (read_export_block (List.length imports) name_array term_array
-                               (List.length declaration_table) after_declarations)
+                            (read_export_block header.version (List.length imports) name_array
+                               level_array term_array (List.length declaration_table)
+                               after_declarations)
                             (fun (export_block, after_exports) ->
                               bind
                                 (read_axiom_report (List.length imports) name_array
@@ -1041,21 +1096,41 @@ let read_module_sections reader =
                                               },
                                               next )))))))))))
 
-let add_unique equal value values =
-  if List.exists (fun existing -> equal existing value) values then values else value :: values
+module Name_set = Hashtbl.Make (struct
+  type t = Ext_name.t
 
-let list_contains equal value values = List.exists (fun existing -> equal existing value) values
+  let equal = Ext_name.equal
+  let hash = Hashtbl.hash
+end)
+
+module Level_identity_set = Hashtbl.Make (struct
+  type t = Ext_level.t
+
+  let equal lhs rhs = lhs == rhs
+  let hash = Hashtbl.hash
+end)
+
+module Term_identity_set = Hashtbl.Make (struct
+  type t = Ext_term.t
+
+  let equal lhs rhs = lhs == rhs
+  let hash = Hashtbl.hash
+end)
 
 type used_tables = {
-  mutable used_names : Ext_name.t list;
-  mutable used_levels : Ext_level.t list;
-  mutable used_terms : Ext_term.t list;
+  used_names : unit Name_set.t;
+  used_levels : unit Level_identity_set.t;
+  used_terms : unit Term_identity_set.t;
 }
 
-let empty_used_tables () = { used_names = []; used_levels = []; used_terms = [] }
+let empty_used_tables () =
+  {
+    used_names = Name_set.create 1_024;
+    used_levels = Level_identity_set.create 1_024;
+    used_terms = Term_identity_set.create 1_024;
+  }
 
-let mark_name used name =
-  used.used_names <- add_unique Ext_name.equal name used.used_names
+let mark_name used name = Name_set.replace used.used_names name ()
 
 let byte value = String.make 1 (Char.chr value)
 
@@ -1202,9 +1277,9 @@ let validate_term_table_order name_table term_table =
           loop first rest)
 
 let rec mark_level used level =
-  if list_contains ( = ) level used.used_levels then Ok ()
+  if Level_identity_set.mem used.used_levels level then Ok ()
   else (
-    used.used_levels <- level :: used.used_levels;
+    Level_identity_set.add used.used_levels level ();
     match level with
     | Ext_level.Zero -> Ok ()
     | Ext_level.Param name ->
@@ -1226,9 +1301,9 @@ let mark_global_ref used import_count declaration_count section offset global_re
       | Ext_term.Local _ -> Ok ())
 
 let rec mark_term used import_count declaration_count section offset term =
-  if list_contains ( = ) term used.used_terms then Ok ()
+  if Term_identity_set.mem used.used_terms term then Ok ()
   else (
-    used.used_terms <- term :: used.used_terms;
+    Term_identity_set.add used.used_terms term ();
     match term with
     | Ext_term.Sort level -> mark_level used level
     | Ext_term.BVar _ -> Ok ()
@@ -1417,19 +1492,21 @@ let mark_declaration used import_count declaration_count declaration =
 let mark_export used import_count declaration_count export =
   mark_name used export.export_name;
   bind (mark_names used export.export_universe_params) (fun () ->
-      bind
-        (mark_term used import_count declaration_count Ext_bytes.Export_block export.export_offset
-           export.export_ty)
-        (fun () ->
+      bind (mark_universe_constraints used export.export_universe_constraints) (fun () ->
           bind
-            (match export.export_body with
-            | None -> Ok ()
-            | Some body ->
-                mark_term used import_count declaration_count Ext_bytes.Export_block
-                  export.export_offset body)
+            (mark_term used import_count declaration_count Ext_bytes.Export_block
+               export.export_offset export.export_ty)
             (fun () ->
-              mark_axiom_refs used import_count declaration_count Ext_bytes.Export_block
-                export.export_offset export.export_axiom_dependencies)))
+              bind
+                (match export.export_body with
+                | None -> Ok ()
+                | Some body ->
+                    mark_term used import_count declaration_count Ext_bytes.Export_block
+                      export.export_offset body)
+                (fun () ->
+                  mark_axiom_refs used import_count declaration_count
+                    Ext_bytes.Export_block export.export_offset
+                    export.export_axiom_dependencies))))
 
 let mark_decl_axiom_report used import_count declaration_count report =
   if report.report_decl_index >= declaration_count then
@@ -1469,7 +1546,7 @@ let collect_roots decoded =
 
 let validate_used_names name_table used_names =
   match
-    List.find_opt (fun entry -> not (list_contains Ext_name.equal entry.name used_names)) name_table
+    List.find_opt (fun entry -> not (Name_set.mem used_names entry.name)) name_table
   with
   | None -> Ok ()
   | Some entry -> Ext_bytes.error Ext_bytes.Name_table entry.offset Ext_bytes.Unused_table_entry
@@ -1479,7 +1556,7 @@ let validate_used_levels level_table used_levels =
     match entries with
     | [] -> Ok ()
     | entry :: rest ->
-        if list_contains ( = ) entry.Ext_level.level used_levels then loop rest
+        if Level_identity_set.mem used_levels entry.Ext_level.level then loop rest
         else Ext_bytes.error Ext_bytes.Level_table entry.offset Ext_bytes.Unused_table_entry
   in
   loop level_table
@@ -1489,10 +1566,84 @@ let validate_used_terms term_table used_terms =
     match entries with
     | [] -> Ok ()
     | entry :: rest ->
-        if list_contains ( = ) entry.Ext_term.term used_terms then loop rest
+        if Term_identity_set.mem used_terms entry.Ext_term.term then loop rest
         else Ext_bytes.error Ext_bytes.Term_table entry.offset Ext_bytes.Unused_table_entry
   in
   loop term_table
+
+let validate_resource_shape decoded =
+  let max_steps = 5_000_000 in
+  let steps = ref 0 in
+  let resource_error section offset =
+    Ext_bytes.error section offset Ext_bytes.Resource_limit
+  in
+  let spend section offset =
+    if !steps >= max_steps then resource_error section offset
+    else (
+      steps := !steps + 1;
+      Ok ())
+  in
+  let rec levels stack =
+    match stack with
+    | [] -> Ok ()
+    | (depth, offset, level) :: rest ->
+        if depth > Ext_bytes.max_node_depth then
+          resource_error Ext_bytes.Level_table offset
+        else
+          match spend Ext_bytes.Level_table offset with
+          | Error error -> Error error
+          | Ok () -> (
+              match level with
+              | Ext_level.Zero | Ext_level.Param _ -> levels rest
+              | Ext_level.Succ inner ->
+                  levels ((depth + 1, offset, inner) :: rest)
+              | Ext_level.Max (lhs, rhs) | Ext_level.Imax (lhs, rhs) ->
+                  levels
+                    ((depth + 1, offset, lhs)
+                    :: (depth + 1, offset, rhs)
+                    :: rest))
+  in
+  let level_stack =
+    List.fold_left
+      (fun stack located ->
+        (1, located.Ext_level.offset, located.Ext_level.level) :: stack)
+      [] decoded.level_table
+  in
+  bind (levels level_stack) (fun () ->
+      let rec terms stack =
+        match stack with
+        | [] -> Ok ()
+        | (depth, offset, term) :: rest ->
+            if depth > Ext_bytes.max_node_depth then
+              resource_error Ext_bytes.Term_table offset
+            else
+              match spend Ext_bytes.Term_table offset with
+              | Error error -> Error error
+              | Ok () -> (
+                  match term with
+                  | Ext_term.Sort _ | Ext_term.BVar _ | Ext_term.Const _ ->
+                      terms rest
+                  | Ext_term.App (fn, arg)
+                  | Ext_term.Lam (fn, arg)
+                  | Ext_term.Pi (fn, arg) ->
+                      terms
+                        ((depth + 1, offset, fn)
+                        :: (depth + 1, offset, arg)
+                        :: rest)
+                  | Ext_term.Let (ty, value, body) ->
+                      terms
+                        ((depth + 1, offset, ty)
+                        :: (depth + 1, offset, value)
+                        :: (depth + 1, offset, body)
+                        :: rest))
+      in
+      let term_stack =
+        List.fold_left
+          (fun stack located ->
+            (1, located.Ext_term.offset, located.Ext_term.term) :: stack)
+          [] decoded.term_table
+      in
+      terms term_stack)
 
 let validate_decoded_module decoded =
   bind (validate_name_table_order decoded.name_table) (fun () ->
@@ -1505,6 +1656,9 @@ let validate_decoded_module decoded =
 
 let read_module reader =
   bind (read_module_sections reader) (fun (decoded, next) ->
-      bind (validate_decoded_module decoded) (fun () ->
-          if Ext_bytes.remaining next = 0 then Ok (decoded, next)
-          else Ext_bytes.error Ext_bytes.Full_certificate (Ext_bytes.offset next) Ext_bytes.Trailing_bytes))
+      bind (validate_resource_shape decoded) (fun () ->
+          bind (validate_decoded_module decoded) (fun () ->
+              if Ext_bytes.remaining next = 0 then Ok (decoded, next)
+              else
+                Ext_bytes.error Ext_bytes.Full_certificate
+                  (Ext_bytes.offset next) Ext_bytes.Trailing_bytes)))

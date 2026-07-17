@@ -2,5 +2,23 @@
   "id": "unverified-lemma-sharing",
   "kind": "unverified_lemma_sharing",
   "rejection_kind": "unverified_lemma_sharing_rejected",
-  "blocked_target_state": "certificate_verified"
+  "blocked_target_state": "certificate_verified",
+  "blocked_sharing_attempts": [
+    {
+      "local_lemma_state": "Proposed",
+      "surface": "premise"
+    },
+    {
+      "local_lemma_state": "TypeChecked",
+      "surface": "theorem_search"
+    },
+    {
+      "local_lemma_state": "ProofTask",
+      "surface": "task_dependency"
+    },
+    {
+      "local_lemma_state": "Verified",
+      "surface": "parent_proof_dependency"
+    }
+  ]
 }

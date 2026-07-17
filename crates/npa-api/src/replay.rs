@@ -20,7 +20,7 @@ use crate::tactic::{
     parse_candidate_wire_shape_at, parse_deterministic_budget_with_error_kind,
     validate_focused_replay_failure_artifact_identity, validate_minimal_failing_artifact_identity,
     FocusedReplayFailureArtifact, MinimalFailingArtifact, MinimalFailingArtifactError,
-    PUA_M04_V2_REQUIRED_FEATURES,
+    STRUCTURAL_V2_REQUIRED_FEATURES,
 };
 use crate::trust::proof_candidate_goal_fingerprint;
 use crate::types::{
@@ -492,8 +492,8 @@ fn replay_step(
         step.goal_id,
         candidate,
         step.deterministic_budget,
-        MachineTacticProfileVersion::PuaM04V2,
-        PUA_M04_V2_REQUIRED_FEATURES,
+        MachineTacticProfileVersion::StructuralV2,
+        STRUCTURAL_V2_REQUIRED_FEATURES,
     )
     .map_err(|error| replay_adapter_error(error, step.goal_id, tactic_kind))?;
     let tactic_kind = Some(validated.tactic_kind);
@@ -1033,8 +1033,8 @@ mod tests {
             GoalId(0),
             candidate.clone(),
             budget,
-            MachineTacticProfileVersion::PuaM04V2,
-            PUA_M04_V2_REQUIRED_FEATURES,
+            MachineTacticProfileVersion::StructuralV2,
+            STRUCTURAL_V2_REQUIRED_FEATURES,
         ) {
             Err(error) => error.diagnostic,
             Ok(validated) => {
@@ -1048,8 +1048,8 @@ mod tests {
             GoalId(0),
             candidate,
             budget,
-            MachineTacticProfileVersion::PuaM04V2,
-            PUA_M04_V2_REQUIRED_FEATURES,
+            MachineTacticProfileVersion::StructuralV2,
+            STRUCTURAL_V2_REQUIRED_FEATURES,
         )
         .expect("type-mismatched exact should build a minimal failing artifact");
         let focused = crate::build_focused_replay_failure_artifact(
@@ -1149,8 +1149,8 @@ mod tests {
                 term: npa_tactic::RawMachineTerm::new("Prop"),
             },
             TacticBudget::default(),
-            MachineTacticProfileVersion::PuaM04V2,
-            PUA_M04_V2_REQUIRED_FEATURES,
+            MachineTacticProfileVersion::StructuralV2,
+            STRUCTURAL_V2_REQUIRED_FEATURES,
         )
         .expect("type-mismatched exact should build a minimal failing artifact");
         let focused = crate::build_focused_replay_failure_artifact(
@@ -1401,8 +1401,8 @@ mod tests {
                 term: npa_tactic::RawMachineTerm::new("Prop"),
             },
             TacticBudget::default(),
-            MachineTacticProfileVersion::PuaM04V2,
-            PUA_M04_V2_REQUIRED_FEATURES,
+            MachineTacticProfileVersion::StructuralV2,
+            STRUCTURAL_V2_REQUIRED_FEATURES,
         )
         .expect("type-mismatched exact should build a minimal failing artifact");
 

@@ -84,6 +84,7 @@ impl HumanDiagnosticPhase {
     }
 }
 
+#[non_exhaustive]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct HumanDiagnosticPayload {
     pub phase: Option<HumanDiagnosticPhase>,
@@ -91,6 +92,84 @@ pub struct HumanDiagnosticPayload {
     pub candidates: Vec<String>,
     pub hole_goals: Vec<HumanHoleGoal>,
     pub unsolved_meta: Option<HumanUnsolvedMeta>,
+    pub conversion: Option<HumanDiagnosticConversionContext>,
+}
+
+impl HumanDiagnosticPayload {
+    #[must_use]
+    pub fn with_candidates(mut self, candidates: Vec<String>) -> Self {
+        self.candidates = candidates;
+        self
+    }
+
+    #[must_use]
+    pub fn with_hole_goals(mut self, hole_goals: Vec<HumanHoleGoal>) -> Self {
+        self.hole_goals = hole_goals;
+        self
+    }
+
+    #[must_use]
+    pub fn with_conversion(mut self, conversion: HumanDiagnosticConversionContext) -> Self {
+        self.conversion = Some(conversion);
+        self
+    }
+}
+
+/// Bounded kernel conversion context projected into a Human diagnostic.
+#[non_exhaustive]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HumanDiagnosticConversionContext {
+    phase: String,
+    outcome: String,
+    lhs_head: String,
+    rhs_head: String,
+    depth: u32,
+}
+
+impl HumanDiagnosticConversionContext {
+    /// Build a bounded conversion projection when every stable field is nonempty.
+    pub fn new(
+        phase: impl Into<String>,
+        outcome: impl Into<String>,
+        lhs_head: impl Into<String>,
+        rhs_head: impl Into<String>,
+        depth: u32,
+    ) -> Option<Self> {
+        let phase = phase.into();
+        let outcome = outcome.into();
+        let lhs_head = lhs_head.into();
+        let rhs_head = rhs_head.into();
+        if phase.is_empty() || outcome.is_empty() || lhs_head.is_empty() || rhs_head.is_empty() {
+            return None;
+        }
+        Some(Self {
+            phase,
+            outcome,
+            lhs_head,
+            rhs_head,
+            depth,
+        })
+    }
+
+    pub fn phase(&self) -> &str {
+        &self.phase
+    }
+
+    pub fn outcome(&self) -> &str {
+        &self.outcome
+    }
+
+    pub fn lhs_head(&self) -> &str {
+        &self.lhs_head
+    }
+
+    pub fn rhs_head(&self) -> &str {
+        &self.rhs_head
+    }
+
+    pub const fn depth(&self) -> u32 {
+        self.depth
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -249,6 +328,9 @@ fn merge_human_diagnostic_payload(
     }
     if next.unsolved_meta.is_none() {
         next.unsolved_meta = existing.unsolved_meta;
+    }
+    if next.conversion.is_none() {
+        next.conversion = existing.conversion;
     }
     next
 }

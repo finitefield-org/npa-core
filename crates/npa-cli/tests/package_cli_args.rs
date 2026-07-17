@@ -3,8 +3,9 @@ use std::process::Command;
 
 use npa_cli::args::{
     parse_cli_args, render_help, CliAction, CliCommand, HelpTopic, PackageAuditCacheMode,
-    PackageBuildCheckCacheMode, PackageChecker, PackageCommand, PackageLockCommand,
-    PackageRefactorPlanScope, PackageTimingMode, PackageVerifierMemoMode, UsageReason,
+    PackageBuildCheckCacheMode, PackageBuildSelection, PackageChecker, PackageCommand,
+    PackageLockCommand, PackageLockInputMode, PackageRefactorPlanScope, PackageTimingMode,
+    PackageVerifierMemoMode, UsageReason,
 };
 use npa_cli::diagnostic::{CommandStatus, DiagnosticKind};
 use npa_cli::package::run_package_command;
@@ -15,6 +16,167 @@ fn parse(args: &[&str]) -> CliAction {
 
 fn parse_error(args: &[&str]) -> npa_cli::args::CliUsageError {
     parse_cli_args(args.iter().copied()).unwrap_err()
+}
+
+#[test]
+fn package_l2_review_and_aggregate_args_parse_strict_contracts() {
+    let action = parse(&[
+        "package",
+        "prepare-l2-review-input",
+        "--root",
+        "proofs",
+        "--policy",
+        "policy.json",
+        "--module",
+        "Proofs.Ai.Finite",
+        "--declaration",
+        "finite_intro",
+        "--out",
+        "l2-reviews/finite.input.json",
+        "--check",
+        "--json",
+    ]);
+    let CliAction::Run(CliCommand::Package(PackageCommand::PrepareL2ReviewInput(options))) = action
+    else {
+        panic!("expected review input command")
+    };
+    assert_eq!(options.common.root, PathBuf::from("proofs"));
+    assert!(options.common.json && options.check);
+    assert_eq!(options.module, "Proofs.Ai.Finite");
+
+    let action = parse(&[
+        "package",
+        "aggregate-l2-acceptance",
+        "--root=proofs",
+        "--policy=policy.json",
+        "--review-input=l2-reviews/finite.input.json",
+        "--review",
+        "l2-reviews/finite.semantic.json",
+        "--review=l2-reviews/finite.adversarial.json",
+        "--existing=l2-acceptance.json",
+        "--replace=Proofs.Ai.Finite::finite_intro",
+        "--out=l2-acceptance.json",
+    ]);
+    let CliAction::Run(CliCommand::Package(PackageCommand::AggregateL2Acceptance(options))) =
+        action
+    else {
+        panic!("expected aggregate command")
+    };
+    assert_eq!(options.review_inputs.len(), 1);
+    assert_eq!(options.reviews.len(), 2);
+    assert_eq!(options.replacements[0].0.as_dotted(), "Proofs.Ai.Finite");
+    assert_eq!(options.replacements[0].1.as_dotted(), "finite_intro");
+
+    let duplicate = parse_error(&[
+        "package",
+        "aggregate-l2-acceptance",
+        "--policy=p",
+        "--review-input=x",
+        "--review=x",
+        "--out=o",
+    ]);
+    assert_eq!(duplicate.reason, UsageReason::DuplicateFlag);
+}
+
+#[test]
+fn package_l2_transport_args_require_three_roots_and_check_output() {
+    let action = parse(&[
+        "package",
+        "validate-l2-namespace-transport",
+        "--source-root",
+        "source",
+        "--target-baseline-root",
+        "baseline",
+        "--target-root",
+        "target",
+        "--acceptance-policy",
+        "acceptance-policy.json",
+        "--source-acceptance",
+        "l2-acceptance.json",
+        "--transport-policy",
+        "transport-policy.json",
+        "--mapping",
+        "l2-transports/request.json",
+        "--out",
+        "l2-transports/attestation.json",
+        "--check",
+        "--json",
+    ]);
+    let CliAction::Run(CliCommand::Package(PackageCommand::ValidateL2NamespaceTransport(options))) =
+        action
+    else {
+        panic!("expected transport command")
+    };
+    assert_eq!(options.common.root, PathBuf::from("source"));
+    assert!(options.common.json && options.check);
+    assert_eq!(options.target_baseline_root, PathBuf::from("baseline"));
+
+    let missing_out = parse_error(&[
+        "package",
+        "validate-l2-namespace-transport",
+        "--source-root=s",
+        "--target-baseline-root=b",
+        "--target-root=t",
+        "--acceptance-policy=a",
+        "--source-acceptance=x",
+        "--transport-policy=p",
+        "--mapping=m",
+        "--check",
+    ]);
+    assert_eq!(missing_out.flag.as_deref(), Some("--out"));
+}
+
+#[test]
+fn package_l2_acceptance_args_require_policy_and_record_and_parse_modules() {
+    let action = parse(&[
+        "package",
+        "validate-l2-acceptance",
+        "--root",
+        "npa-corpus/proofs",
+        "--policy",
+        "npa-mathlib/policy/l2-acceptance-policy.json",
+        "--acceptance=npa-corpus/proofs/l2-acceptance.json",
+        "--module",
+        "Proofs.Logic.Basic",
+        "--module=Proofs.Logic.Basic",
+        "--json",
+    ]);
+    let CliAction::Run(CliCommand::Package(PackageCommand::ValidateL2Acceptance(options))) = action
+    else {
+        panic!("expected package validate-l2-acceptance command");
+    };
+    assert_eq!(options.common.root, PathBuf::from("npa-corpus/proofs"));
+    assert!(options.common.json);
+    assert_eq!(
+        options.policy,
+        PathBuf::from("npa-mathlib/policy/l2-acceptance-policy.json")
+    );
+    assert_eq!(
+        options.acceptance,
+        PathBuf::from("npa-corpus/proofs/l2-acceptance.json")
+    );
+    assert_eq!(options.modules.len(), 1);
+
+    let missing = parse_error(&[
+        "package",
+        "validate-l2-acceptance",
+        "--policy",
+        "policy.json",
+    ]);
+    assert_eq!(missing.reason, UsageReason::MissingRequiredFlag);
+    assert_eq!(missing.flag.as_deref(), Some("--acceptance"));
+
+    let invalid = parse_error(&[
+        "package",
+        "validate-l2-acceptance",
+        "--policy",
+        "policy.json",
+        "--acceptance",
+        "acceptance.json",
+        "--module",
+        "Proofs..Bad",
+    ]);
+    assert_eq!(invalid.reason, UsageReason::InvalidModuleName);
 }
 
 #[test]
@@ -317,6 +479,35 @@ fn package_generated_check_command_cli_args_parse_root_json_and_timings() {
 }
 
 #[test]
+fn package_theorem_premise_report_cli_args_and_help_are_stable() {
+    let action = parse(&[
+        "package",
+        "theorem-premise-report",
+        "--root",
+        "proofs",
+        "--check",
+        "--json",
+        "--timings=detailed",
+    ]);
+    let CliAction::Run(CliCommand::Package(PackageCommand::TheoremPremiseReport(options))) = action
+    else {
+        panic!("expected package theorem-premise-report command");
+    };
+    assert_eq!(options.common.root, PathBuf::from("proofs"));
+    assert!(options.common.json);
+    assert!(options.check);
+    assert_eq!(options.timings, PackageTimingMode::Detailed);
+
+    let help = parse(&["package", "theorem-premise-report", "--help"]);
+    assert_eq!(
+        help,
+        CliAction::Help(HelpTopic::PackageTheoremPremiseReport)
+    );
+    assert!(render_help(HelpTopic::PackageTheoremPremiseReport)
+        .contains("generated/theorem-premise-report.json"));
+}
+
+#[test]
 fn package_generated_check_command_cli_args_reject_duplicate_timings() {
     let duplicate = parse_error(&[
         "package",
@@ -419,6 +610,64 @@ fn package_cli_args_parses_build_certs_update_manifest_hashes() {
     assert!(options.check);
     assert_eq!(options.build_check_cache, PackageBuildCheckCacheMode::Off);
     assert!(options.update_manifest_hashes);
+}
+
+#[test]
+fn package_build_certs_selection_parses_modules_and_changed() {
+    let action = parse(&[
+        "package",
+        "build-certs",
+        "--check",
+        "--module",
+        "Proofs.A",
+        "--module=Proofs.B",
+    ]);
+    let CliAction::Run(CliCommand::Package(PackageCommand::BuildCerts(options))) = action else {
+        panic!("expected package build-certs command");
+    };
+    assert_eq!(
+        options.selection,
+        PackageBuildSelection::Modules(vec![
+            npa_cert::Name::from_dotted("Proofs.A"),
+            npa_cert::Name::from_dotted("Proofs.B"),
+        ])
+    );
+
+    let action = parse(&["package", "build-certs", "--check", "--changed"]);
+    let CliAction::Run(CliCommand::Package(PackageCommand::BuildCerts(options))) = action else {
+        panic!("expected package build-certs command");
+    };
+    assert_eq!(options.selection, PackageBuildSelection::Changed);
+}
+
+#[test]
+fn package_build_certs_selection_rejects_invalid_combinations() {
+    for args in [
+        vec!["package", "build-certs", "--module", "Proofs.A"],
+        vec!["package", "build-certs", "--changed"],
+    ] {
+        let error = parse_error(&args);
+        assert_eq!(error.reason, UsageReason::UnsupportedFlag);
+    }
+    let conflict = parse_error(&[
+        "package",
+        "build-certs",
+        "--check",
+        "--module=Proofs.A",
+        "--changed",
+    ]);
+    assert_eq!(conflict.reason, UsageReason::InvalidFlagValue);
+    let duplicate = parse_error(&[
+        "package",
+        "build-certs",
+        "--check",
+        "--module=Proofs.A",
+        "--module",
+        "Proofs.A",
+    ]);
+    assert_eq!(duplicate.reason, UsageReason::DuplicateFlag);
+    let invalid = parse_error(&["package", "build-certs", "--check", "--module=Proofs..A"]);
+    assert_eq!(invalid.reason, UsageReason::InvalidModuleName);
 }
 
 #[test]
@@ -772,7 +1021,148 @@ fn package_cli_args_defaults_verify_certs_checker_to_reference() {
     assert_eq!(options.verifier_memo, PackageVerifierMemoMode::Off);
     assert_eq!(options.jobs, 1);
     assert_eq!(options.timings, PackageTimingMode::Off);
+    assert_eq!(options.package_lock_mode, PackageLockInputMode::CheckedFile);
     assert_eq!(options.common.root, PathBuf::from("."));
+}
+
+#[test]
+fn package_cli_args_parses_verify_certs_package_lock_modes_with_existing_options() {
+    let checked = parse(&[
+        "package",
+        "verify-certs",
+        "--package-lock",
+        "checked",
+        "--changed",
+        "--checker=fast",
+        "--jobs=2",
+        "--timings=summary",
+    ]);
+    let CliAction::Run(CliCommand::Package(PackageCommand::VerifyCerts(checked))) = checked else {
+        panic!("expected package verify-certs command");
+    };
+    assert_eq!(checked.package_lock_mode, PackageLockInputMode::CheckedFile);
+    assert!(checked.changed);
+    assert_eq!(checked.checker, PackageChecker::Fast);
+    assert_eq!(checked.jobs, 2);
+    assert_eq!(checked.timings, PackageTimingMode::Summary);
+
+    let checked_equals = parse(&["package", "verify-certs", "--package-lock=checked"]);
+    let CliAction::Run(CliCommand::Package(PackageCommand::VerifyCerts(checked_equals))) =
+        checked_equals
+    else {
+        panic!("expected package verify-certs command");
+    };
+    assert_eq!(
+        checked_equals.package_lock_mode,
+        PackageLockInputMode::CheckedFile
+    );
+
+    let reconstructed_with_audit_cache = parse(&[
+        "package",
+        "verify-certs",
+        "--package-lock=reconstructed",
+        "--checker=fast",
+        "--audit-cache=read-through",
+        "--timings=detailed",
+    ]);
+    let CliAction::Run(CliCommand::Package(PackageCommand::VerifyCerts(
+        reconstructed_with_audit_cache,
+    ))) = reconstructed_with_audit_cache
+    else {
+        panic!("expected package verify-certs command");
+    };
+    assert_eq!(
+        reconstructed_with_audit_cache.package_lock_mode,
+        PackageLockInputMode::ReconstructedInMemory
+    );
+    assert_eq!(
+        reconstructed_with_audit_cache.audit_cache,
+        PackageAuditCacheMode::ReadThrough
+    );
+    assert_eq!(
+        reconstructed_with_audit_cache.timings,
+        PackageTimingMode::Detailed
+    );
+
+    let reconstructed_with_memo = parse(&[
+        "package",
+        "verify-certs",
+        "--package-lock",
+        "reconstructed",
+        "--checker=fast",
+        "--verifier-memo=disk",
+        "--jobs=4",
+    ]);
+    let CliAction::Run(CliCommand::Package(PackageCommand::VerifyCerts(reconstructed_with_memo))) =
+        reconstructed_with_memo
+    else {
+        panic!("expected package verify-certs command");
+    };
+    assert_eq!(
+        reconstructed_with_memo.package_lock_mode,
+        PackageLockInputMode::ReconstructedInMemory
+    );
+    assert_eq!(
+        reconstructed_with_memo.verifier_memo,
+        PackageVerifierMemoMode::Disk
+    );
+    assert_eq!(reconstructed_with_memo.jobs, 4);
+}
+
+#[test]
+fn package_cli_args_rejects_invalid_package_lock_selection_before_package_loading() {
+    let duplicate = parse_error(&[
+        "package",
+        "verify-certs",
+        "--package-lock",
+        "checked",
+        "--package-lock=reconstructed",
+    ]);
+    assert_eq!(duplicate.reason, UsageReason::DuplicateFlag);
+    assert_eq!(duplicate.flag.as_deref(), Some("--package-lock"));
+
+    for args in [
+        vec!["package", "verify-certs", "--package-lock"],
+        vec!["package", "verify-certs", "--package-lock="],
+    ] {
+        let missing = parse_error(&args);
+        assert_eq!(missing.reason, UsageReason::MissingFlagValue);
+        assert_eq!(missing.flag.as_deref(), Some("--package-lock"));
+        assert!(missing.value.is_none());
+    }
+
+    for (args, expected_value) in [
+        (
+            vec!["package", "verify-certs", "--package-lock", "auto"],
+            "auto",
+        ),
+        (
+            vec!["package", "verify-certs", "--package-lock=automatic"],
+            "automatic",
+        ),
+    ] {
+        let invalid = parse_error(&args);
+        assert_eq!(invalid.reason, UsageReason::InvalidFlagValue);
+        assert_eq!(invalid.flag.as_deref(), Some("--package-lock"));
+        assert_eq!(invalid.value.as_deref(), Some(expected_value));
+    }
+
+    let reconstructed_external = parse_error(&[
+        "package",
+        "verify-certs",
+        "--root=missing-package-root",
+        "--package-lock=reconstructed",
+        "--checker=external",
+    ]);
+    assert_eq!(reconstructed_external.reason, UsageReason::UnsupportedFlag);
+    assert_eq!(
+        reconstructed_external.flag.as_deref(),
+        Some("--package-lock")
+    );
+    assert_eq!(
+        reconstructed_external.value.as_deref(),
+        Some("reconstructed;checker=external")
+    );
 }
 
 #[test]
@@ -1114,6 +1504,80 @@ fn package_cli_args_rejects_external_checker_without_runner_inputs() {
     assert_eq!(error.reason, UsageReason::MissingRequiredFlag);
     assert_eq!(error.flag.as_deref(), Some("--runner-policy"));
     assert!(error.value.is_none());
+
+    let partial = parse_error(&[
+        "package",
+        "verify-certs",
+        "--checker=external",
+        "--runner-policy",
+        "ci/runner.release.json",
+    ]);
+    assert_eq!(partial.reason, UsageReason::MissingRequiredFlag);
+    assert_eq!(partial.flag.as_deref(), Some("--runner-policy-hash"));
+    assert!(partial.value.is_none());
+
+    let missing_registry = parse_error(&[
+        "package",
+        "verify-certs",
+        "--checker=external",
+        "--runner-policy",
+        "ci/runner.release.json",
+        "--runner-policy-hash",
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    ]);
+    assert_eq!(missing_registry.reason, UsageReason::MissingRequiredFlag);
+    assert_eq!(missing_registry.flag.as_deref(), Some("--checker-registry"));
+    assert!(missing_registry.value.is_none());
+}
+
+#[test]
+fn package_cli_args_shared_verify_validation_rejects_options_in_runtime_order() {
+    let external_parallel = parse_error(&[
+        "package",
+        "verify-certs",
+        "--checker=external",
+        "--jobs=2",
+        "--audit-cache=read-through",
+        "--runner-policy",
+        "ci/runner.release.json",
+        "--runner-policy-hash",
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "--checker-registry",
+        "ci/checker-binaries.json",
+    ]);
+    assert_eq!(external_parallel.reason, UsageReason::UnsupportedFlag);
+    assert_eq!(external_parallel.flag.as_deref(), Some("--jobs"));
+    assert_eq!(external_parallel.value.as_deref(), Some("2"));
+
+    let cache_parallel = parse_error(&[
+        "package",
+        "verify-certs",
+        "--checker=fast",
+        "--jobs=4",
+        "--audit-cache=read-through",
+        "--verifier-memo=disk",
+    ]);
+    assert_eq!(cache_parallel.reason, UsageReason::UnsupportedFlag);
+    assert_eq!(cache_parallel.flag.as_deref(), Some("--jobs"));
+    assert_eq!(
+        cache_parallel.value.as_deref(),
+        Some("jobs=4;audit_cache=read-through")
+    );
+
+    let unexpected_external = parse_error(&[
+        "package",
+        "verify-certs",
+        "--checker=reference",
+        "--runner-policy",
+        "ci/runner.release.json",
+        "--runner-policy-hash",
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "--checker-registry",
+        "ci/checker-binaries.json",
+    ]);
+    assert_eq!(unexpected_external.reason, UsageReason::UnsupportedFlag);
+    assert_eq!(unexpected_external.flag.as_deref(), Some("--runner-policy"));
+    assert!(unexpected_external.value.is_none());
 }
 
 #[test]
@@ -1150,6 +1614,8 @@ fn package_cli_args_rejects_unsupported_clr04_flags() {
         "--include-ai-traces=true",
         "--timings",
         "--timings=summary",
+        "--package-lock",
+        "--package-lock=checked",
     ] {
         let error = parse_error(&["package", "check", flag]);
         assert_eq!(error.reason, UsageReason::UnsupportedFlag, "{flag}");
@@ -1331,15 +1797,33 @@ fn package_build_certs_help_documents_update_manifest_hashes() {
 
     assert!(help.contains("[--update-manifest-hashes]"));
     assert!(help.contains("refreshes local module hash pins"));
-    assert!(help.contains("incompatible with --build-check-cache read-through"));
+    assert!(help.contains("[--module MODULE]... [--changed]"));
+    assert!(help.contains("required release gates"));
+    assert!(help.contains("--check --build-check-cache read-through"));
 }
 
 #[test]
-fn package_verify_certs_help_documents_changed_certificate_selection() {
+fn package_export_help_documents_package_root_relative_output() {
+    let summary_help = render_help(HelpTopic::PackageExportSummary);
+    let candidate_help = render_help(HelpTopic::PackageExportCandidateMetadata);
+
+    for help in [summary_help, candidate_help] {
+        assert!(help.contains("relative to --root"));
+        assert!(help.contains("--root proofs --out generated/"));
+        assert!(!help.contains("--out proofs/"));
+    }
+    assert!(summary_help.contains("Omitting --out uses generated/verified-export-summary.json"));
+}
+
+#[test]
+fn package_verify_certs_help_documents_changed_and_package_lock_selection() {
     let help = render_help(HelpTopic::PackageVerifyCerts);
 
     assert!(help.contains("[--changed]"));
     assert!(help.contains("certificate files are changed in Git"));
+    assert!(help.contains("[--package-lock checked|reconstructed]"));
+    assert!(help.contains("package-lock input defaults to checked"));
+    assert!(help.contains("Reconstructed is unavailable with the external checker"));
 }
 
 #[test]
@@ -1389,8 +1873,217 @@ fn package_cli_args_binary_reports_json_usage_error_when_requested() {
     assert_eq!(output.status.code(), Some(2));
     assert!(output.stderr.is_empty());
     let stdout = String::from_utf8(output.stdout).unwrap();
-    assert!(stdout.contains("\"schema\":\"npa.package.command_result.v0.1\""));
+    assert!(stdout.contains("\"schema\":\"npa.package.command_result.v0.3\""));
     assert!(stdout.contains("\"kind\":\"Usage\""));
     assert!(stdout.contains("\"reason_code\":\"unknown_flag\""));
     assert!(stdout.contains("\"field\":\"--mystery\""));
+}
+
+#[test]
+fn package_cli_args_binary_reports_package_lock_usage_errors() {
+    let human = Command::new(env!("CARGO_BIN_EXE_npa"))
+        .args(["package", "verify-certs", "--package-lock=auto"])
+        .output()
+        .unwrap();
+
+    assert_eq!(human.status.code(), Some(2));
+    assert!(human.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8(human.stderr).unwrap(),
+        "package verify-certs: failed\nerror Usage invalid_flag_value field=--package-lock actual=auto\n"
+    );
+
+    let json = Command::new(env!("CARGO_BIN_EXE_npa"))
+        .args([
+            "package",
+            "verify-certs",
+            "--root=missing-package-root",
+            "--package-lock=reconstructed",
+            "--checker=external",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(json.status.code(), Some(2));
+    assert!(json.stderr.is_empty());
+    let stdout = String::from_utf8(json.stdout).unwrap();
+    assert!(stdout.contains("\"kind\":\"Usage\""));
+    assert!(stdout.contains("\"reason_code\":\"unsupported_flag\""));
+    assert!(stdout.contains("\"field\":\"--package-lock\""));
+    assert!(stdout.contains("\"actual_value\":\"reconstructed;checker=external\""));
+}
+
+#[test]
+fn package_cli_args_parses_artifact_ledger_modules_and_deduplicates() {
+    let action = parse(&[
+        "package",
+        "audit-artifact-ledger",
+        "--root=proofs",
+        "--json",
+        "--module",
+        "Example.Second",
+        "--module=Example.First",
+        "--module=Example.Second",
+    ]);
+    let CliAction::Run(CliCommand::Package(PackageCommand::AuditArtifactLedger(options))) = action
+    else {
+        panic!("expected artifact-ledger audit command");
+    };
+    assert_eq!(options.common.root, PathBuf::from("proofs"));
+    assert!(options.common.json);
+    assert_eq!(
+        options
+            .modules
+            .iter()
+            .map(npa_cert::Name::as_dotted)
+            .collect::<Vec<_>>(),
+        vec!["Example.Second", "Example.First"]
+    );
+}
+
+#[test]
+fn package_cli_args_artifact_ledger_help_and_errors_are_stable() {
+    assert_eq!(
+        parse(&["package", "audit-artifact-ledger", "--help"]),
+        CliAction::Help(HelpTopic::PackageAuditArtifactLedger)
+    );
+    let help = render_help(HelpTopic::PackageAuditArtifactLedger);
+    assert!(help.contains("[--module MODULE]..."));
+    assert!(help.contains("writes no\nfiles"));
+    assert!(!help.contains("--checker"));
+    assert!(!help.contains("--check"));
+
+    let missing = parse_error(&["package", "audit-artifact-ledger", "--module"]);
+    assert_eq!(missing.reason, UsageReason::MissingFlagValue);
+    let invalid = parse_error(&[
+        "package",
+        "audit-artifact-ledger",
+        "--module=not..canonical",
+    ]);
+    assert_eq!(invalid.reason, UsageReason::InvalidModuleName);
+    let unsupported = parse_error(&["package", "audit-artifact-ledger", "--checker=reference"]);
+    assert_eq!(unsupported.reason, UsageReason::UnsupportedFlag);
+}
+
+#[test]
+fn package_promotion_commands_parse_strict_modes() {
+    let prepared = parse(&[
+        "package",
+        "prepare-promotion",
+        "--root",
+        "source",
+        "--target-baseline-root",
+        "baseline",
+        "--acceptance-policy",
+        "acceptance-policy.json",
+        "--source-acceptance",
+        "l2-acceptance.json",
+        "--transport-policy",
+        "transport-policy.json",
+        "--mapping",
+        "promotion/mapping.json",
+        "--equivalent-origin-root",
+        "alias-a",
+        "--equivalent-origin-root=alias-b",
+        "--out",
+        "promotion/plan.json",
+    ]);
+    let CliAction::Run(CliCommand::Package(PackageCommand::PreparePromotion(options))) = prepared
+    else {
+        panic!("expected prepare-promotion");
+    };
+    assert_eq!(options.equivalent_origin_roots.len(), 2);
+
+    let temporary = parse(&[
+        "package",
+        "materialize-promotion",
+        "--root",
+        "source",
+        "--target-baseline-root",
+        "baseline",
+        "--target-root",
+        "target",
+        "--plan",
+        "promotion/plan.json",
+        "--equivalent-origin-root",
+        "alias-a",
+        "--phase",
+        "temporary",
+    ]);
+    let CliAction::Run(CliCommand::Package(PackageCommand::MaterializePromotion(options))) =
+        temporary
+    else {
+        panic!("expected materialize-promotion");
+    };
+    assert!(!options.apply, "dry-run must be the default");
+    assert_eq!(options.equivalent_origin_roots, [PathBuf::from("alias-a")]);
+
+    let missing_attestation = parse_error(&[
+        "package",
+        "materialize-promotion",
+        "--root=source",
+        "--target-baseline-root=baseline",
+        "--target-root=target",
+        "--plan=promotion/plan.json",
+        "--phase=tracked",
+    ]);
+    assert_eq!(missing_attestation.reason, UsageReason::MissingRequiredFlag);
+    assert_eq!(
+        missing_attestation.flag.as_deref(),
+        Some("--transport-attestation")
+    );
+
+    let invalid_recovery = parse_error(&[
+        "package",
+        "materialize-promotion",
+        "--target-root=target",
+        "--recover=journal.json",
+        "--root=source",
+    ]);
+    assert_eq!(invalid_recovery.reason, UsageReason::InvalidFlagValue);
+
+    let recovery_with_alias = parse_error(&[
+        "package",
+        "materialize-promotion",
+        "--target-root=target",
+        "--recover=journal.json",
+        "--equivalent-origin-root=alias-a",
+    ]);
+    assert_eq!(recovery_with_alias.reason, UsageReason::InvalidFlagValue);
+}
+
+#[test]
+fn package_promotion_registry_commands_parse() {
+    let validate = parse(&[
+        "package",
+        "validate-promotion-origin-registry",
+        "--root=mathlib",
+        "--source-root=corpus",
+        "--source-root",
+        "project",
+        "--previous-registry=previous.json",
+    ]);
+    let CliAction::Run(CliCommand::Package(PackageCommand::ValidatePromotionOriginRegistry(
+        options,
+    ))) = validate
+    else {
+        panic!("expected registry validator");
+    };
+    assert_eq!(options.source_roots.len(), 2);
+
+    let register = parse(&[
+        "package",
+        "register-equivalent-promotion-origin",
+        "--root=project",
+        "--target-root=mathlib",
+        "--promotion-id=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    ]);
+    let CliAction::Run(CliCommand::Package(PackageCommand::RegisterEquivalentPromotionOrigin(
+        options,
+    ))) = register
+    else {
+        panic!("expected equivalent-origin registration");
+    };
+    assert!(!options.apply);
 }

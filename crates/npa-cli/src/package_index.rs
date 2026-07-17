@@ -43,6 +43,7 @@ fn run_package_index_check(
         PackageGeneratedArtifactReadMode {
             axiom_report: false,
             theorem_index: true,
+            theorem_premise_report: false,
         },
         PackageArtifactReferenceSummaryMode::Omit,
         timings,

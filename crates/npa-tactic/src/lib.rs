@@ -3443,21 +3443,21 @@ pub fn diagnostic_local_context_summary_with_display_names(
 pub enum MachineTacticProfileVersion {
     V1,
     #[default]
-    PuaM04V2,
+    StructuralV2,
 }
 
 impl MachineTacticProfileVersion {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::V1 => "machine-tactic-v1",
-            Self::PuaM04V2 => "pua-m04-v2",
+            Self::StructuralV2 => "structural-v2",
         }
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum MachineTacticFeature {
-    PuaM04StructuralTactics,
+    StructuralTactics,
     FiniteDecide,
     Omega,
     Ring,
@@ -3467,7 +3467,7 @@ pub enum MachineTacticFeature {
 impl MachineTacticFeature {
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::PuaM04StructuralTactics => "pua-m04-structural-tactics",
+            Self::StructuralTactics => "structural-tactics",
             Self::FiniteDecide => "finite-decide",
             Self::Omega => "omega",
             Self::Ring => "ring",
@@ -4488,12 +4488,12 @@ fn validate_machine_tactic_profile_and_features(
     let Some(tactic_kind) = machine_tactic_kind(tactic) else {
         return Ok(());
     };
-    if is_pua_m04_tactic(tactic) && profile_version == MachineTacticProfileVersion::V1 {
+    if is_structural_tactic(tactic) && profile_version == MachineTacticProfileVersion::V1 {
         return Err(MachineTacticDiagnostic::new(
             MachineTacticDiagnosticKind::UnsupportedMachineTactic,
             format!(
                 "machine tactic {tactic_kind:?} requires profile {}",
-                MachineTacticProfileVersion::PuaM04V2.as_str()
+                MachineTacticProfileVersion::StructuralV2.as_str()
             ),
         )
         .with_goal(goal.id)
@@ -4515,7 +4515,7 @@ fn validate_machine_tactic_profile_and_features(
     Ok(())
 }
 
-fn is_pua_m04_tactic(tactic: &MachineTactic) -> bool {
+fn is_structural_tactic(tactic: &MachineTactic) -> bool {
     !matches!(
         tactic,
         MachineTactic::Exact { .. }
@@ -4550,9 +4550,7 @@ fn machine_tactic_required_feature(tactic: &MachineTactic) -> Option<MachineTact
         | MachineTactic::Unfold { .. }
         | MachineTactic::Congr { .. }
         | MachineTactic::Subst { .. }
-        | MachineTactic::Contradiction { .. } => {
-            Some(MachineTacticFeature::PuaM04StructuralTactics)
-        }
+        | MachineTactic::Contradiction { .. } => Some(MachineTacticFeature::StructuralTactics),
         MachineTactic::FiniteDecide { .. } => Some(MachineTacticFeature::FiniteDecide),
         MachineTactic::Omega { .. } => Some(MachineTacticFeature::Omega),
         MachineTactic::Ring { .. } => Some(MachineTacticFeature::Ring),
@@ -5703,7 +5701,7 @@ pub fn run_machine_tactic_candidates_batch(
             state,
             &tactic,
             MachineTacticValidationBudget::from(budget),
-            MachineTacticProfileVersion::PuaM04V2,
+            MachineTacticProfileVersion::StructuralV2,
             &[],
         ) {
             failures += 1;
@@ -19211,6 +19209,26 @@ fn kernel_diag(err: npa_kernel::Error) -> MachineTacticDiagnostic {
                 UniverseDiagnosticCoreKind::Unsat,
             ))
         }
+        npa_kernel::Error::ConstructorUniverseBoundViolation {
+            inductive,
+            constructor,
+            field_index,
+            field_level,
+            inductive_sort,
+        } => {
+            let constraint = UniverseConstraint::le(field_level, inductive_sort);
+            MachineTacticDiagnostic::new(
+                MachineTacticDiagnosticKind::KernelRejected,
+                format!(
+                    "kernel rejected constructor {constructor} of {inductive} field {field_index} universe bound: {constraint:?}"
+                ),
+            )
+            .with_universe_diagnostic(universe_constraint_diagnostic(
+                UniverseDiagnosticKind::InvalidInstantiation,
+                constraint,
+                UniverseDiagnosticCoreKind::Reduced,
+            ))
+        }
         npa_kernel::Error::UnsupportedUniverseConstraint { constraint } => {
             MachineTacticDiagnostic::new(
                 MachineTacticDiagnosticKind::KernelRejected,
@@ -21989,6 +22007,36 @@ mod tests {
     }
 
     #[test]
+    fn constructor_universe_bound_kernel_error_preserves_universe_diagnostic() {
+        let field_level = Level::succ(Level::succ(Level::zero()));
+        let inductive_sort = Level::succ(Level::zero());
+        let diagnostic = kernel_diag(npa_kernel::Error::ConstructorUniverseBoundViolation {
+            inductive: "Audit.Code".to_owned(),
+            constructor: "Audit.Code.mk".to_owned(),
+            field_index: 0,
+            field_level: field_level.clone(),
+            inductive_sort: inductive_sort.clone(),
+        });
+
+        assert_eq!(diagnostic.kind, MachineTacticDiagnosticKind::KernelRejected);
+        let universe = diagnostic
+            .diagnostic_payloads
+            .and_then(|payloads| payloads.universe_diagnostic)
+            .expect("constructor universe rejection carries a universe diagnostic");
+        assert_eq!(universe.constraints.len(), 1);
+        assert_eq!(
+            universe.constraints[0].kind,
+            UniverseDiagnosticKind::InvalidInstantiation
+        );
+        assert_eq!(
+            universe.constraints[0].relation,
+            UniverseConstraintRelation::Le
+        );
+        assert_eq!(universe.constraints[0].lhs, field_level);
+        assert_eq!(universe.constraints[0].rhs, inductive_sort);
+    }
+
+    #[test]
     fn repair_generator_universe_diagnostic_hints_ignore_display_text() {
         let payload = UniverseDiagnostic {
             subset_kind: UnificationConflictSubsetKind::Minimal,
@@ -24128,8 +24176,8 @@ mod tests {
         );
     }
 
-    fn pua_m04_structural_features() -> [MachineTacticFeature; 1] {
-        [MachineTacticFeature::PuaM04StructuralTactics]
+    fn structural_structural_features() -> [MachineTacticFeature; 1] {
+        [MachineTacticFeature::StructuralTactics]
     }
 
     fn state_assignment_fingerprint(state: &MachineProofState) -> Vec<(MetaVarId, Option<Hash>)> {
@@ -24152,7 +24200,7 @@ mod tests {
         );
     }
 
-    fn pua_m04_feature_gate_candidates() -> Vec<(&'static str, MachineTacticCandidate)> {
+    fn structural_feature_gate_candidates() -> Vec<(&'static str, MachineTacticCandidate)> {
         vec![
             (
                 "constructor",
@@ -24448,12 +24496,12 @@ mod tests {
                 }
             };
         let candidate_hash = machine_tactic_hash(&tactic);
-        let required_features = pua_m04_structural_features();
+        let required_features = structural_structural_features();
         if let Err(diagnostic) = validate_machine_tactic_for_state(
             &fixture.state,
             &tactic,
             MachineTacticValidationBudget::from(fixture.budget),
-            MachineTacticProfileVersion::PuaM04V2,
+            MachineTacticProfileVersion::StructuralV2,
             &required_features,
         ) {
             return replay_error_observation(
@@ -24564,7 +24612,7 @@ mod tests {
         );
     }
 
-    fn pua_m04_success_replay_fixtures() -> Vec<TacticReplayFixture> {
+    fn structural_success_replay_fixtures() -> Vec<TacticReplayFixture> {
         let intro_state_fixture = start_machine_proof(
             MachineProofSpec {
                 theorem_type: Expr::pi("p", prop(), prop()),
@@ -24898,7 +24946,7 @@ mod tests {
         ]
     }
 
-    fn pua_m04_failure_replay_fixtures() -> Vec<TacticReplayFixture> {
+    fn structural_failure_replay_fixtures() -> Vec<TacticReplayFixture> {
         let simp_fail = start_machine_proof(
             MachineProofSpec {
                 theorem_type: eq_nat(nat_zero(), nat_succ(nat_zero())),
@@ -25204,17 +25252,17 @@ mod tests {
     }
 
     #[test]
-    fn pua_m04_replay_determinism_fixtures_cover_success_and_failure() {
-        for fixture in pua_m04_success_replay_fixtures() {
+    fn structural_replay_determinism_fixtures_cover_success_and_failure() {
+        for fixture in structural_success_replay_fixtures() {
             assert_replay_success_fixture(&fixture);
         }
-        for fixture in pua_m04_failure_replay_fixtures() {
+        for fixture in structural_failure_replay_fixtures() {
             assert_replay_failure_fixture(&fixture);
         }
     }
 
     #[test]
-    fn pua_m04_replay_failure_classes_are_transactional() {
+    fn structural_replay_failure_classes_are_transactional() {
         let cases = [
             (
                 TacticReplayFixture {
@@ -25283,7 +25331,7 @@ mod tests {
     }
 
     #[test]
-    fn pua_m04_replay_unresolved_meta_failure_is_deterministic() {
+    fn structural_replay_unresolved_meta_failure_is_deterministic() {
         let fixture = TacticReplayFixture {
             name: "unresolved-meta-refine",
             state: start_trivial(),
@@ -25315,7 +25363,7 @@ mod tests {
     }
 
     #[test]
-    fn pua_m04_replay_minimization_fixtures_reproduce_core_errors() {
+    fn structural_replay_minimization_fixtures_reproduce_core_errors() {
         let validation_full = TacticReplayFixture {
             name: "validation-full",
             state: start_prop_id_context(),
@@ -25391,20 +25439,20 @@ mod tests {
     }
 
     #[test]
-    fn validation_feature_gate_covers_each_pua_m04_tactic_kind() {
+    fn validation_feature_gate_covers_each_structural_tactic_kind() {
         let state = start_trivial();
         let before = state.clone();
 
-        for (expected_kind, candidate) in pua_m04_feature_gate_candidates() {
+        for (expected_kind, candidate) in structural_feature_gate_candidates() {
             let err = validate_machine_tactic_candidate_for_state(
                 &state,
                 GoalId(0),
                 candidate,
                 TacticBudget::default(),
-                MachineTacticProfileVersion::PuaM04V2,
+                MachineTacticProfileVersion::StructuralV2,
                 &[],
             )
-            .expect_err("PUA-M04 tactic should require its feature gate");
+            .expect_err("structural tactic should require its feature gate");
 
             assert_eq!(
                 err.kind,
@@ -25473,7 +25521,7 @@ mod tests {
                 GoalId(0),
                 candidate.clone(),
                 TacticBudget::default(),
-                MachineTacticProfileVersion::PuaM04V2,
+                MachineTacticProfileVersion::StructuralV2,
                 &[],
             )
             .expect_err("solver candidate should require its feature when disabled");
@@ -25488,7 +25536,7 @@ mod tests {
                 GoalId(0),
                 candidate,
                 TacticBudget::default(),
-                MachineTacticProfileVersion::PuaM04V2,
+                MachineTacticProfileVersion::StructuralV2,
                 &[feature],
             )
             .expect("enabled solver candidate should validate structurally");
@@ -25498,7 +25546,7 @@ mod tests {
                 &state,
                 &validation.tactic,
                 over_budget,
-                MachineTacticProfileVersion::PuaM04V2,
+                MachineTacticProfileVersion::StructuralV2,
                 &[feature],
             )
             .expect_err("solver candidates should reject over-budget validation");
@@ -25523,7 +25571,7 @@ mod tests {
             GoalId(0),
             MachineTacticCandidate::Smt { lemmas: Vec::new() },
             TacticBudget::default(),
-            MachineTacticProfileVersion::PuaM04V2,
+            MachineTacticProfileVersion::StructuralV2,
             &[],
         )
         .expect("SMT candidate remains compatible with the existing feature profile");
@@ -25544,7 +25592,7 @@ mod tests {
             GoalId(0),
             MachineTacticCandidate::FiniteDecide,
             TacticBudget::default(),
-            MachineTacticProfileVersion::PuaM04V2,
+            MachineTacticProfileVersion::StructuralV2,
             &[MachineTacticFeature::FiniteDecide],
         )
         .expect("finite_decide should validate as a gated solver candidate");
@@ -25576,7 +25624,7 @@ mod tests {
             GoalId(0),
             MachineTacticCandidate::Omega,
             TacticBudget::default(),
-            MachineTacticProfileVersion::PuaM04V2,
+            MachineTacticProfileVersion::StructuralV2,
             &[MachineTacticFeature::Omega],
         )
         .expect("omega should validate as a gated solver candidate");
@@ -25606,7 +25654,7 @@ mod tests {
             GoalId(0),
             MachineTacticCandidate::Ring,
             TacticBudget::default(),
-            MachineTacticProfileVersion::PuaM04V2,
+            MachineTacticProfileVersion::StructuralV2,
             &[MachineTacticFeature::Ring],
         )
         .expect("ring_nf should validate as a gated solver candidate");
@@ -25651,7 +25699,7 @@ mod tests {
             GoalId(0),
             MachineTacticCandidate::Ring,
             TacticBudget::default(),
-            MachineTacticProfileVersion::PuaM04V2,
+            MachineTacticProfileVersion::StructuralV2,
             &[MachineTacticFeature::Ring],
         )
         .expect("ring_nf should validate with its feature");
@@ -25686,7 +25734,7 @@ mod tests {
             GoalId(0),
             MachineTacticCandidate::Ring,
             TacticBudget::default(),
-            MachineTacticProfileVersion::PuaM04V2,
+            MachineTacticProfileVersion::StructuralV2,
             &[MachineTacticFeature::Ring],
         )
         .expect("ring_nf should validate with its feature");
@@ -25717,7 +25765,7 @@ mod tests {
             GoalId(0),
             MachineTacticCandidate::Ring,
             TacticBudget::default(),
-            MachineTacticProfileVersion::PuaM04V2,
+            MachineTacticProfileVersion::StructuralV2,
             &[MachineTacticFeature::Ring],
         )
         .expect("ring_nf should validate with its feature");
@@ -25753,7 +25801,7 @@ mod tests {
             GoalId(0),
             MachineTacticCandidate::Omega,
             TacticBudget::default(),
-            MachineTacticProfileVersion::PuaM04V2,
+            MachineTacticProfileVersion::StructuralV2,
             &[MachineTacticFeature::Omega],
         )
         .expect("omega should validate with its feature");
@@ -25788,7 +25836,7 @@ mod tests {
             GoalId(0),
             MachineTacticCandidate::Omega,
             TacticBudget::default(),
-            MachineTacticProfileVersion::PuaM04V2,
+            MachineTacticProfileVersion::StructuralV2,
             &[MachineTacticFeature::Omega],
         )
         .expect("omega should validate with its feature");
@@ -25819,7 +25867,7 @@ mod tests {
             GoalId(0),
             MachineTacticCandidate::Omega,
             TacticBudget::default(),
-            MachineTacticProfileVersion::PuaM04V2,
+            MachineTacticProfileVersion::StructuralV2,
             &[MachineTacticFeature::Omega],
         )
         .expect("omega should validate with its feature");
@@ -25855,7 +25903,7 @@ mod tests {
             GoalId(0),
             MachineTacticCandidate::FiniteDecide,
             TacticBudget::default(),
-            MachineTacticProfileVersion::PuaM04V2,
+            MachineTacticProfileVersion::StructuralV2,
             &[MachineTacticFeature::FiniteDecide],
         )
         .expect("finite_decide should validate with its feature");
@@ -25886,7 +25934,7 @@ mod tests {
             GoalId(0),
             MachineTacticCandidate::FiniteDecide,
             TacticBudget::default(),
-            MachineTacticProfileVersion::PuaM04V2,
+            MachineTacticProfileVersion::StructuralV2,
             &[MachineTacticFeature::FiniteDecide],
         )
         .expect("finite_decide should validate over imported Bool");
@@ -25974,7 +26022,7 @@ mod tests {
             GoalId(0),
             MachineTacticCandidate::Bitblast,
             TacticBudget::default(),
-            MachineTacticProfileVersion::PuaM04V2,
+            MachineTacticProfileVersion::StructuralV2,
             &features,
         )
         .expect("bitblast candidate should validate when its feature is enabled");
@@ -26011,8 +26059,8 @@ mod tests {
             GoalId(0),
             candidate,
             TacticBudget::default(),
-            MachineTacticProfileVersion::PuaM04V2,
-            &pua_m04_structural_features(),
+            MachineTacticProfileVersion::StructuralV2,
+            &structural_structural_features(),
         )
         .expect_err("missing local must fail during validation");
 
@@ -26040,8 +26088,8 @@ mod tests {
             GoalId(0),
             candidate,
             budget,
-            MachineTacticProfileVersion::PuaM04V2,
-            &pua_m04_structural_features(),
+            MachineTacticProfileVersion::StructuralV2,
+            &structural_structural_features(),
         )
         .expect_err("refine hole bound must be checked before execution");
 
@@ -26064,14 +26112,14 @@ mod tests {
             locals: vec!["missing".to_owned()],
             dependency_policy: RevertDependencyPolicy::Exact,
         });
-        let features = pua_m04_structural_features();
+        let features = structural_structural_features();
 
         let first = validate_machine_tactic_candidate_for_state(
             &state,
             GoalId(0),
             candidate.clone(),
             TacticBudget::default(),
-            MachineTacticProfileVersion::PuaM04V2,
+            MachineTacticProfileVersion::StructuralV2,
             &features,
         )
         .expect_err("first replay should fail");
@@ -26080,7 +26128,7 @@ mod tests {
             GoalId(0),
             candidate,
             TacticBudget::default(),
-            MachineTacticProfileVersion::PuaM04V2,
+            MachineTacticProfileVersion::StructuralV2,
             &features,
         )
         .expect_err("second replay should fail");
@@ -26093,7 +26141,7 @@ mod tests {
     }
 
     #[test]
-    fn tactic_budget_v1_mapping_exposes_pua_m04_validation_fields() {
+    fn tactic_budget_v1_mapping_exposes_structural_validation_fields() {
         let budget = TacticBudget {
             max_tactic_steps: 1,
             max_whnf_steps: 2,
@@ -27090,8 +27138,8 @@ mod tests {
             &state,
             &local_recursor_tactic,
             MachineTacticValidationBudget::from(TacticBudget::default()),
-            MachineTacticProfileVersion::PuaM04V2,
-            &[MachineTacticFeature::PuaM04StructuralTactics],
+            MachineTacticProfileVersion::StructuralV2,
+            &[MachineTacticFeature::StructuralTactics],
         )
         .expect_err("local recursor implementations must be rejected during validation");
         assert_eq!(

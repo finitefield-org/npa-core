@@ -8,6 +8,7 @@ use npa_package::{parse_and_validate_manifest_str, PackagePath, ValidatedPackage
 use crate::args::PackageCommand;
 use crate::diagnostic::{CommandDiagnostic, CommandResult, DiagnosticKind};
 use crate::fs::{artifact_io_error, join_package_path, render_package_path, render_package_root};
+use crate::package_artifact_ledger::run_package_artifact_ledger_audit;
 use crate::package_artifacts::run_package_check_generated;
 use crate::package_axiom_report::run_package_axiom_report;
 use crate::package_build::run_package_build_certs;
@@ -18,9 +19,20 @@ use crate::package_gate_plan::run_package_gate_plan;
 use crate::package_hashes::run_package_check_hashes;
 use crate::package_high_trust::run_package_high_trust;
 use crate::package_index::run_package_index;
+use crate::package_l2_acceptance::run_package_validate_l2_acceptance;
+use crate::package_l2_acceptance_aggregate::run_package_aggregate_l2_acceptance;
+use crate::package_l2_namespace_transport::run_package_validate_l2_namespace_transport;
+use crate::package_l2_review_input::run_package_prepare_l2_review_input;
 use crate::package_lock::run_package_lock_command;
+use crate::package_promotion_materialize::run_package_materialize_promotion;
+use crate::package_promotion_prepare::run_package_prepare_promotion;
+use crate::package_promotion_registry::{
+    run_package_register_equivalent_promotion_origin,
+    run_package_validate_promotion_origin_registry,
+};
 use crate::package_publish::run_package_publish_plan;
 use crate::package_refactor_plan::run_package_refactor_plan;
+use crate::package_theorem_premise_report::run_package_theorem_premise_report;
 use crate::package_verify::run_package_verify_certs;
 
 /// Package-relative manifest path used by CLR-04 package commands.
@@ -112,13 +124,39 @@ pub fn run_package_command(command: PackageCommand) -> CommandResult {
         PackageCommand::BuildCerts(options) => run_package_build_certs(options),
         PackageCommand::AxiomReport(options) => run_package_axiom_report(options),
         PackageCommand::Index(options) => run_package_index(options),
+        PackageCommand::TheoremPremiseReport(options) => {
+            run_package_theorem_premise_report(options)
+        }
         PackageCommand::ExportSummary(options) => run_package_export_summary(options),
         PackageCommand::ExportCandidateMetadata(options) => {
             run_package_export_candidate_metadata(options)
         }
         PackageCommand::VerifyCerts(options) => run_package_verify_certs(options),
         PackageCommand::CheckHashes(options) => run_package_check_hashes(options),
+        PackageCommand::AuditArtifactLedger(options) => run_package_artifact_ledger_audit(options),
         PackageCommand::Lock(command) => run_package_lock_command(command),
+        PackageCommand::ValidateL2Acceptance(options) => {
+            run_package_validate_l2_acceptance(options)
+        }
+        PackageCommand::PrepareL2ReviewInput(options) => {
+            run_package_prepare_l2_review_input(options)
+        }
+        PackageCommand::AggregateL2Acceptance(options) => {
+            run_package_aggregate_l2_acceptance(*options)
+        }
+        PackageCommand::ValidateL2NamespaceTransport(options) => {
+            run_package_validate_l2_namespace_transport(*options)
+        }
+        PackageCommand::ValidatePromotionOriginRegistry(options) => {
+            run_package_validate_promotion_origin_registry(options)
+        }
+        PackageCommand::PreparePromotion(options) => run_package_prepare_promotion(*options),
+        PackageCommand::MaterializePromotion(options) => {
+            run_package_materialize_promotion(*options)
+        }
+        PackageCommand::RegisterEquivalentPromotionOrigin(options) => {
+            run_package_register_equivalent_promotion_origin(options)
+        }
         PackageCommand::PublishPlan(options) => run_package_publish_plan(options),
         PackageCommand::CheckGenerated(options) => run_package_check_generated(options),
         PackageCommand::HighTrust(options) => run_package_high_trust(*options),

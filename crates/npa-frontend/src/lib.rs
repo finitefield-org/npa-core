@@ -108,16 +108,19 @@ pub use human::{
     HumanTypeclassSearchPolicy, HumanTypeclassSearchStatus, HumanUniverseParam,
 };
 pub use human_diagnostic::{
-    HumanDiagnostic, HumanDiagnosticKind, HumanDiagnosticPayload, HumanDiagnosticPhase,
-    HumanDiagnosticSeverity, HumanHoleGoal, HumanHoleGoalLocal, HumanResult, HumanUnsolvedMeta,
-    HumanUnsolvedMetaKind,
+    HumanDiagnostic, HumanDiagnosticConversionContext, HumanDiagnosticKind, HumanDiagnosticPayload,
+    HumanDiagnosticPhase, HumanDiagnosticSeverity, HumanHoleGoal, HumanHoleGoalLocal, HumanResult,
+    HumanUnsolvedMeta, HumanUnsolvedMetaKind,
 };
 pub use human_elaborator::{
     certificate_imports_for_human_core_module,
     collect_human_by_proof_targets_with_source_interfaces,
+    compile_human_source_to_built_certificate_only_with_available_import_refs,
     compile_human_source_to_built_certificate_only_with_import_refs,
+    compile_human_source_to_built_certificate_output_with_available_import_refs,
     compile_human_source_to_built_certificate_output_with_import_refs,
     compile_human_source_to_certificate,
+    compile_human_source_to_certificate_output_with_available_import_refs_and_axiom_policy,
     compile_human_source_to_certificate_output_with_import_refs_and_axiom_policy,
     compile_human_source_to_certificate_output_with_source_interfaces,
     compile_human_source_to_certificate_output_with_source_interfaces_and_axiom_policy,
@@ -136,7 +139,8 @@ pub use human_elaborator::{
     HumanTacticTermInferOutput,
 };
 pub use human_parser::{
-    parse_human_module, parse_human_module_with_source_interfaces, parse_human_term,
+    parse_human_import_spans, parse_human_module, parse_human_module_with_source_interfaces,
+    parse_human_name_spans, parse_human_term, HumanImportSpan, HumanNameSpan,
 };
 pub use human_resolver::{
     resolve_human_module, resolve_human_module_with_source_interfaces,

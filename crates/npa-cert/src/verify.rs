@@ -20,6 +20,13 @@ pub(crate) fn verify_module_cert_impl(
     Ok(verified)
 }
 
+pub(crate) fn verify_module_cert_hashes_impl(bytes: &[u8]) -> Result<ModuleCert> {
+    let cert = decode_module_cert(bytes)?;
+    verify_canonical_encoding(&cert, bytes)?;
+    verify_pre_import_checks(&cert)?;
+    Ok(cert)
+}
+
 pub(crate) fn verify_decoded_module_cert_impl(
     cert: &ModuleCert,
     bytes: &[u8],
@@ -71,13 +78,7 @@ fn verify_decoded_module_cert_with_import_resolver<'a>(
     policy: &AxiomPolicy,
     resolve_imports: impl FnOnce(&ModuleCert) -> Result<Vec<&'a VerifiedModule>>,
 ) -> Result<VerifiedModule> {
-    let canonical = encode_module_cert_full_for_header(cert)?;
-    if canonical != bytes {
-        return Err(CertError::NonCanonicalEncoding {
-            object: "ModuleCert",
-        });
-    }
-    drop(canonical);
+    verify_canonical_encoding(cert, bytes)?;
     verify_decoded_module_cert_after_encoding_check(cert, policy, resolve_imports)
 }
 
@@ -87,15 +88,19 @@ fn verify_owned_module_cert_with_import_resolver<'a>(
     policy: &AxiomPolicy,
     resolve_imports: impl FnOnce(&ModuleCert) -> Result<Vec<&'a VerifiedModule>>,
 ) -> Result<VerifiedModule> {
-    let canonical = encode_module_cert_full_for_header(&cert)?;
+    verify_canonical_encoding(&cert, bytes)?;
+    verify_decoded_module_cert_checks(&cert, policy, resolve_imports)?;
+    Ok(verified_module_from_owned_cert(cert))
+}
+
+fn verify_canonical_encoding(cert: &ModuleCert, bytes: &[u8]) -> Result<()> {
+    let canonical = encode_module_cert_full_for_header(cert)?;
     if canonical != bytes {
         return Err(CertError::NonCanonicalEncoding {
             object: "ModuleCert",
         });
     }
-    drop(canonical);
-    verify_decoded_module_cert_checks(&cert, policy, resolve_imports)?;
-    Ok(verified_module_from_owned_cert(cert))
+    Ok(())
 }
 
 fn verify_decoded_module_cert_after_encoding_check<'a>(
@@ -112,9 +117,7 @@ fn verify_decoded_module_cert_checks<'a>(
     policy: &AxiomPolicy,
     resolve_imports: impl FnOnce(&ModuleCert) -> Result<Vec<&'a VerifiedModule>>,
 ) -> Result<()> {
-    verify_header(&cert.header)?;
-    verify_tables(cert)?;
-    verify_hashes(cert)?;
+    verify_hash_and_table_checks(cert)?;
     enforce_core_feature_policy(&cert.axiom_report, policy)?;
     verify_declaration_order(cert)?;
     verify_inductive_generated_artifacts(cert)?;
@@ -134,6 +137,20 @@ fn verify_decoded_module_cert_checks<'a>(
     }
     drop(env);
 
+    Ok(())
+}
+
+fn verify_pre_import_checks(cert: &ModuleCert) -> Result<()> {
+    verify_hash_and_table_checks(cert)?;
+    verify_declaration_order(cert)?;
+    verify_inductive_generated_artifacts(cert)?;
+    Ok(())
+}
+
+fn verify_hash_and_table_checks(cert: &ModuleCert) -> Result<()> {
+    verify_header(&cert.header)?;
+    verify_tables(cert)?;
+    verify_hashes(cert)?;
     Ok(())
 }
 
@@ -1199,6 +1216,61 @@ fn add_referenced_imports_to_env(
             }
             GlobalRef::Local { .. } | GlobalRef::LocalGenerated { .. } => {}
         }
+    }
+    Ok(())
+}
+
+pub(crate) fn add_verified_module_referenced_imports_to_env(
+    env: &mut Env,
+    module: &VerifiedModule,
+    imports: &[&VerifiedModule],
+) -> Result<()> {
+    let mut loader = ReferencedImportLoader {
+        imports,
+        loaded: BTreeSet::new(),
+        loading: BTreeSet::new(),
+    };
+    let mut refs = BTreeSet::new();
+    for decl in &module.declarations {
+        for dependency in &decl.dependencies {
+            refs.insert(dependency.global_ref.clone());
+        }
+    }
+    for global_ref in refs {
+        match global_ref {
+            GlobalRef::Builtin {
+                name,
+                decl_interface_hash,
+            } => add_builtin_ref_to_env(env, &module.name_table, name, decl_interface_hash)?,
+            GlobalRef::Imported { .. } => {
+                loader.load_imported_global_ref_from_module(env, module, &global_ref)?;
+            }
+            GlobalRef::Local { .. } | GlobalRef::LocalGenerated { .. } => {}
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn add_selected_import_exports_to_env(
+    env: &mut Env,
+    imports: &[&VerifiedModule],
+    exports: &[(usize, Name, Hash)],
+) -> Result<()> {
+    let mut loader = ReferencedImportLoader {
+        imports,
+        loaded: BTreeSet::new(),
+        loading: BTreeSet::new(),
+    };
+    let mut exports = exports.to_vec();
+    exports.sort();
+    exports.dedup();
+    for (import_index, name, decl_interface_hash) in exports {
+        let module = imports
+            .get(import_index)
+            .copied()
+            .ok_or(CertError::DecodeError)?;
+        let entry = imported_export_entry_by_name(module, &name, decl_interface_hash)?;
+        loader.load_module_export_entry(env, module, entry)?;
     }
     Ok(())
 }

@@ -3,9 +3,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use npa_cli::args::PackageCommonOptions;
 use npa_cli::diagnostic::{CommandExitCode, DiagnosticKind};
 use npa_cli::package::PACKAGE_MANIFEST_PATH;
+use npa_cli::package_api::v1::common_options;
 use npa_cli::package_hashes::run_package_check_hashes;
 use npa_package::{
     build_package_lock_from_package_root, format_package_hash, package_file_hash,
@@ -89,7 +89,7 @@ fn package_check_hashes_succeeds_on_proof_corpus_fixture_json() {
     assert!(output.stderr.is_empty());
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
-        "{\"schema\":\"npa.package.command_result.v0.1\",\"command\":\"package check-hashes\",\"root\":\"testdata/package/proofs\",\"status\":\"passed\",\"diagnostics\":[],\"artifacts\":[]}\n"
+        "{\"schema\":\"npa.package.command_result.v0.3\",\"command\":\"package check-hashes\",\"root\":\"testdata/package/proofs\",\"status\":\"passed\",\"diagnostics\":[],\"artifacts\":[]}\n"
     );
 }
 
@@ -242,10 +242,7 @@ fn package_check_hashes_cli_returns_exit_one_for_hash_failure() {
 }
 
 fn run_hashes(package: &TestPackage) -> npa_cli::diagnostic::CommandResult {
-    run_package_check_hashes(PackageCommonOptions {
-        root: package.path().to_path_buf(),
-        json: true,
-    })
+    run_package_check_hashes(common_options(package.path(), true))
 }
 
 fn assert_hash_failure(

@@ -1,8 +1,0 @@
-{
-  "schema": "diagnostic_tree",
-  "guards": [
-    "trusted_evidence_claim",
-    "proof_acceptance_state",
-    "verified_artifact"
-  ]
-}

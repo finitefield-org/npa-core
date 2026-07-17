@@ -55,6 +55,11 @@ let previous_level values index id offset =
     | None -> Ext_bytes.error Ext_bytes.Level_table offset Ext_bytes.Dangling_reference
     | Some located -> Ok located.level
 
+let previous_depth depths index id offset =
+  if id < 0 || id >= index || depths.(id) = 0 then
+    Ext_bytes.error Ext_bytes.Level_table offset Ext_bytes.Dangling_reference
+  else Ok depths.(id)
+
 let rec level_as_nat level =
   match level with
   | Zero -> Some 0
@@ -113,26 +118,18 @@ let rec normalize level =
       | Succ inner -> normalize (Max (lhs, Succ inner))
       | _ -> Imax (lhs, rhs))
 
-let has_previous_level values index level =
-  let rec loop cursor =
-    if cursor >= index then false
-    else
-      match values.(cursor) with
-      | Some previous when previous.level = level -> true
-      | _ -> loop (cursor + 1)
-  in
-  loop 0
-
-let read_previous_ref values index entry_offset reader =
+let read_previous_ref values depths index entry_offset reader =
   bind (Ext_bytes.read_usize Ext_bytes.Level_table reader) (fun (id, next) ->
-      bind (previous_level values index id entry_offset) (fun level -> Ok (level, next)))
+      bind (previous_level values index id entry_offset) (fun level ->
+          bind (previous_depth depths index id entry_offset) (fun depth ->
+              Ok ((level, depth), next))))
 
 let read_name_ref names entry_offset reader =
   bind (Ext_bytes.read_usize Ext_bytes.Level_table reader) (fun (id, next) ->
       bind (name_at names id entry_offset) (fun name -> Ok (name, next)))
 
 let read_table names reader =
-  match Ext_bytes.read_usize Ext_bytes.Level_table reader with
+  match Ext_bytes.read_count Ext_bytes.Level_table reader with
   | Error err -> Error err
   | Ok (level_count, after_count) ->
       if level_count > Ext_bytes.remaining after_count then
@@ -141,6 +138,8 @@ let read_table names reader =
       else
         let name_values = Array.of_list names in
         let values = Array.make level_count None in
+        let depths = Array.make level_count 0 in
+        let seen_encodings = Hashtbl.create (min level_count 1_024) in
         let rec loop index current decoded =
           if index = level_count then Ok (List.rev decoded, current)
           else
@@ -150,42 +149,68 @@ let read_table names reader =
             | Ok (tag, after_tag) ->
                 let decoded_level =
                   match tag with
-                  | 0x00 -> Ok (Zero, after_tag)
+                  | 0x00 -> Ok ((Zero, 1), after_tag)
                   | 0x01 ->
-                      bind (read_previous_ref values index entry_offset after_tag)
-                        (fun (inner, next) -> Ok (Succ inner, next))
+                      bind
+                        (read_previous_ref values depths index entry_offset
+                           after_tag)
+                        (fun ((inner, depth), next) ->
+                          Ok ((Succ inner, depth + 1), next))
                   | 0x02 ->
                       bind
-                        (read_previous_ref values index entry_offset after_tag)
-                        (fun (lhs, after_lhs) ->
+                        (read_previous_ref values depths index entry_offset
+                           after_tag)
+                        (fun ((lhs, lhs_depth), after_lhs) ->
                           bind
-                            (read_previous_ref values index entry_offset after_lhs)
-                            (fun (rhs, next) -> Ok (Max (lhs, rhs), next)))
+                            (read_previous_ref values depths index entry_offset
+                               after_lhs)
+                            (fun ((rhs, rhs_depth), next) ->
+                              Ok
+                                ( (Max (lhs, rhs),
+                                   1 + max lhs_depth rhs_depth),
+                                  next )))
                   | 0x03 ->
                       bind
-                        (read_previous_ref values index entry_offset after_tag)
-                        (fun (lhs, after_lhs) ->
+                        (read_previous_ref values depths index entry_offset
+                           after_tag)
+                        (fun ((lhs, lhs_depth), after_lhs) ->
                           bind
-                            (read_previous_ref values index entry_offset after_lhs)
-                            (fun (rhs, next) -> Ok (Imax (lhs, rhs), next)))
+                            (read_previous_ref values depths index entry_offset
+                               after_lhs)
+                            (fun ((rhs, rhs_depth), next) ->
+                              Ok
+                                ( (Imax (lhs, rhs),
+                                   1 + max lhs_depth rhs_depth),
+                                  next )))
                   | 0x04 ->
                       bind (read_name_ref name_values entry_offset after_tag)
-                        (fun (name, next) -> Ok (Param name, next))
+                        (fun (name, next) -> Ok ((Param name, 1), next))
                   | tag ->
                       Ext_bytes.error Ext_bytes.Level_table entry_offset
                         (Ext_bytes.Unknown_tag tag)
                 in
                 (match decoded_level with
                 | Error err -> Error err
-                | Ok (level, next) ->
-                    if normalize level <> level then
+                | Ok ((level, depth), next) ->
+                    if depth > Ext_bytes.max_node_depth then
+                      Ext_bytes.error Ext_bytes.Level_table entry_offset
+                        Ext_bytes.Resource_limit
+                    else if normalize level <> level then
                       Ext_bytes.error Ext_bytes.Level_table entry_offset
                         Ext_bytes.Non_normalized_level
-                    else if has_previous_level values index level then
-                      Ext_bytes.error Ext_bytes.Level_table entry_offset Ext_bytes.Noncanonical_order
                     else
+                      let encoding =
+                        String.sub current.Ext_bytes.data entry_offset
+                          (Ext_bytes.offset next - entry_offset)
+                      in
+                      if Hashtbl.mem seen_encodings encoding then
+                        Ext_bytes.error Ext_bytes.Level_table entry_offset
+                          Ext_bytes.Noncanonical_order
+                      else
                       let located = { level; offset = entry_offset } in
                       values.(index) <- Some located;
+                      depths.(index) <- depth;
+                      Hashtbl.add seen_encodings encoding ();
                       loop (index + 1) next (located :: decoded))
         in
         loop 0 after_count []

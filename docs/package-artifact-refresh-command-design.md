@@ -2,7 +2,8 @@
 
 Status: implemented in the current `npa-core` package CLI. This document is
 retained as the design and implementation record; package authors should use
-the workflow documented in `npa-toolchain-reference-v0.2.0.md`.
+the current workflow documented in `npa-toolchain-reference-v0.7.0.md`, which
+retains the v0.6-introduced refresh contract.
 
 ## Summary
 
@@ -14,8 +15,8 @@ npa package build-certs --root . --update-manifest-hashes --check --json
 ```
 
 The mode rebuilds local certificates, updates local module hash pins in
-`npa-package.toml`, and regenerates `generated/package-lock.json` as one
-reviewable refresh operation.
+`npa-package.toml`, refreshes declared module `meta.json` ledgers, and
+regenerates `generated/package-lock.json` as one reviewable refresh operation.
 
 The feature exists to replace ad hoc local edits that weaken import identity
 checks while refreshing artifacts. It must preserve the certificate-first trust
@@ -61,11 +62,15 @@ Implement a new `package build-certs` mode in `npa-cli` that:
   instead of stale local manifest identities;
 - keeps external package import pins strict;
 - rewrites only the allowed local hash fields in `npa-package.toml`;
+- regenerates every declared module metadata sidecar in the rebuild closure
+  from the validated module and verified certificate identities;
 - regenerates `generated/package-lock.json` from the refreshed manifest and
   certificate bytes;
 - supports both write mode and no-write `--check` mode;
-- leaves ordinary `build-certs`, `build-certs --check`, `check-hashes`,
-  `lock write`, and `verify-certs` behavior unchanged when the flag is absent.
+- leaves ordinary `build-certs`, `build-certs --check`, `check-hashes`, and
+  `lock write` behavior unchanged when the flag is absent. Verification's
+  independent checked/reconstructed lock modes and provenance diagnostics are
+  documented in the v0.3.0 toolchain reference.
 
 ## Goals
 
@@ -74,8 +79,8 @@ Implement a new `package build-certs` mode in `npa-cli` that:
 - Avoid weakening direct import identity checks in ordinary build and check
   modes.
 - Keep external import hash pins strict in the MVP.
-- Write `npa-package.toml`, local `.npcert` files, and
-  `generated/package-lock.json` only after the whole refresh succeeds.
+- Write `npa-package.toml`, local `.npcert` files, declared module metadata,
+  and `generated/package-lock.json` only after the whole refresh succeeds.
 - Make the refresh reviewable by keeping command output deterministic and
   reporting changed or stale targets through standard diagnostics.
 - Preserve existing package validation, axiom policy checks, and source-free
@@ -110,7 +115,7 @@ npa package build-certs [--root PATH] [--json] [--check]
 
 - Enables refresh semantics for local module hash pins.
 - In write mode, writes refreshed local certificates, `npa-package.toml`, and
-  `generated/package-lock.json`.
+  declared module metadata, and `generated/package-lock.json`.
 - In `--check` mode, performs the same rebuild in memory and fails if any of
   those files would change.
 - Is incompatible with `--build-check-cache read-through` in the MVP, because
@@ -241,8 +246,9 @@ Primary implementation files:
   coverage.
 - `crates/npa-cli/tests/package_build_certs_write.rs`: write-mode refresh
   coverage.
-- `docs/npa-toolchain-reference-v0.2.0.md`: document the implemented workflow
-  only when the feature ships.
+- `docs/npa-toolchain-reference-v0.6.0.md`: document the current refresh and
+  checked/reconstructed verification workflow while retaining the published
+  v0.2.0 reference unchanged as historical documentation.
 
 Do not change these schemas for the MVP:
 
@@ -367,9 +373,9 @@ Refresh mode must not call `check_generated_source_hash` or
 those hashes is the point of the mode. It must still compute the same values
 and write them into the refreshed manifest.
 
-Refresh mode must not use the terminal checked-certificate reuse optimization
-from `build_local_modules_for_check`; it needs fresh generated certificate
-bytes and fresh source hashes for every local module.
+Refresh mode, like ordinary full check, must freshly compile every rebuilt
+local module. Source size must not permit reuse of checked certificate bytes in
+place of comparing them with a certificate generated from current source.
 
 ## Direct Import Identity Check
 
@@ -411,13 +417,17 @@ fn check_refreshed_certificate_import_identities(
 
 Rules:
 
-- Length must match.
-- Import module names must match in order.
-- `export_hash` must match.
-- `certificate_hash` must be present and match.
+- Duplicate expected direct imports must agree on hashes and are compared once.
+- Certificate import module names must be unique.
+- Every expected direct import must be present in the certificate import table;
+  extra transitive certificate imports are allowed.
+- Matching is by module name rather than import order.
+- `export_hash` must match for every expected direct import.
+- `certificate_hash` must be present and match for every expected direct
+  import.
 - Use `refreshed_import_identity_mismatch` with a path such as
-  `modules[{module_index}].certificate.imports[{import_index}]` for any
-  mismatch.
+  `modules[{module_index}].certificate.imports[{import_index}]` for any missing,
+  duplicate, or hash-mismatched direct import.
 
 ## Manifest Rewrite
 
@@ -498,6 +508,7 @@ Write mode must stage all changed files first:
 
 - local certificate files;
 - `npa-package.toml`;
+- declared module `meta.json` sidecars in the rebuild closure;
 - `generated/package-lock.json`.
 
 For each target:
@@ -508,8 +519,9 @@ For each target:
 3. If any temporary write fails, remove all temporary files and leave existing
    files untouched.
 4. Rename all temporary files into place only after every target is staged.
-5. If a rename fails, clean up remaining temporary files and report the failed
-   path.
+5. If a rename fails, clean up remaining temporary files, roll already renamed
+   targets back in reverse order, and report either the failed target or
+   `artifact_rollback_failed` if recovery itself fails.
 
 Extend `PendingWrite` or add a sibling type so manifest writes can use the same
 staging and cleanup machinery as certificate and lock writes. Use
@@ -517,14 +529,15 @@ staging and cleanup machinery as certificate and lock writes. Use
 `temporary_write_path` already produces a suitable suffix:
 
 ```text
-.npa-package.toml.npa-build-certs.tmp
+.npa-package.toml.npa-build-certs.<pid>.<sequence>.tmp
 ```
 
 Write order should be deterministic:
 
 1. local certificates in manifest module order;
 2. `npa-package.toml`;
-3. `generated/package-lock.json`.
+3. declared module metadata in manifest module order;
+4. `generated/package-lock.json`.
 
 This order is only for deterministic behavior; no target should be renamed
 until every temporary file is staged.
@@ -540,6 +553,8 @@ Suggested diagnostics:
 | --- | --- | --- |
 | `manifest_hashes_stale` | `npa-package.toml` | Refreshed local module hash pins differ from the checked manifest. |
 | `build_certificate_changed` | module certificate path | Existing local certificate bytes differ from rebuilt bytes. |
+| `module_metadata_missing` | module metadata path | Declared refreshed metadata is missing. |
+| `module_metadata_stale` | module metadata path | Declared metadata differs from canonical refreshed bytes. |
 | `package_lock_missing` | `generated/package-lock.json` | Checked package lock is missing. |
 | `package_lock_stale` | `generated/package-lock.json` | Existing package lock differs from refreshed lock JSON. |
 
@@ -548,7 +563,8 @@ matching current `build-certs --check` behavior:
 
 1. manifest hash pins;
 2. local certificate files in manifest module order;
-3. package lock.
+3. declared module metadata in manifest module order;
+4. package lock.
 
 `manifest_hashes_stale` should use `with_hashes` and include both the refreshed
 manifest hash and the current checked-in manifest hash. Keep the field ordering
@@ -574,7 +590,10 @@ Reuse existing diagnostics wherever the meaning is unchanged:
 - `build_certificate_changed`;
 - `package_lock_missing`;
 - `package_lock_stale`;
+- `module_metadata_missing`;
+- `module_metadata_stale`;
 - `certificate_write_failed`;
+- `module_metadata_write_failed`;
 - `package_lock_write_failed`.
 
 Add narrowly scoped diagnostics for refresh-specific failures:
@@ -604,8 +623,8 @@ refresh command should not add `CommandArtifact` entries in the MVP.
 
 `package build-certs --check`
 
-- Existing check behavior remains unchanged unless `--update-manifest-hashes`
-  is set.
+- Ordinary check freshly compiles every selected local target and compares its
+  generated certificate with the checked bytes, regardless of source size.
 - Existing read-through build-check cache behavior remains unchanged when the
   refresh flag is absent.
 
@@ -621,8 +640,13 @@ refresh command should not add `CommandArtifact` entries in the MVP.
 
 `package verify-certs`
 
-- No behavior change. Refreshed certificates must verify through the existing
-  source-free verifier path.
+- Refreshed certificates still verify through the source-free verifier path.
+- Core verification defaults to checked NPA package-lock input; reconstructed
+  authoring is explicit. Both modes emit a separate lock-provenance/hash
+  diagnostic, so output is not literally unchanged from the original refresh
+  design.
+- Release and audit verification must select `--package-lock checked` plus
+  `--audit-cache off --verifier-memo off` explicitly.
 
 Generated metadata commands
 
@@ -644,6 +668,11 @@ Generated metadata commands
 - Missing existing local certificate: refresh write mode may recreate it after
   a successful build; refresh check mode should report `build_certificate_changed`
   or `certificate_missing` consistently with the chosen comparison helper.
+- Missing declared metadata: refresh write mode should create it; refresh check
+  mode should report `module_metadata_missing`.
+- Stale declared metadata: refresh write mode should replace it while
+  preserving valid extension fields; refresh check mode should report
+  `module_metadata_stale`.
 - Missing package lock: refresh write mode should create it; refresh check mode
   should report `package_lock_missing`.
 - Malformed current manifest: fail during `load_package_root` before refresh
@@ -676,6 +705,8 @@ Write-mode tests:
   rebuilt against the new identity.
 - stale source hash only updates `expected_source_hash`.
 - stale local certificate and stale manifest pins are repaired together.
+- declared module metadata is refreshed from the same validated module and
+  verified certificate identities while valid extension fields are preserved.
 - stale package lock is regenerated from the refreshed manifest.
 - idempotent refresh leaves current files unchanged.
 - ordinary `build-certs` still fails on stale local direct import identity.
@@ -689,6 +720,8 @@ Check-mode tests:
   writing files.
 - changed certificate bytes report `build_certificate_changed` without writing
   files.
+- missing metadata reports `module_metadata_missing` without writing files.
+- stale metadata reports `module_metadata_stale` without writing files.
 - missing package lock reports `package_lock_missing` without writing files.
 - fresh package passes and writes no files.
 - read-through build-check cache plus refresh flag is rejected before loading
@@ -697,7 +730,9 @@ Check-mode tests:
 Post-refresh verification tests:
 
 - refreshed manifest plus refreshed lock passes `package check-hashes`.
-- refreshed certificates pass `package verify-certs --checker reference`.
+- refreshed certificates pass explicit checked verification with acceleration
+  disabled.
+- refreshed metadata passes `package audit-artifact-ledger`.
 - regenerated lock validates through `build_package_lock_from_package_root`.
 
 Package-lock regression tests:
@@ -712,17 +747,19 @@ Package-lock regression tests:
 The feature is implementation-complete when:
 
 - `npa package build-certs --update-manifest-hashes --root <pkg>` updates only
-  local certificate files, `npa-package.toml`, and
-  `generated/package-lock.json`.
+  local certificate files, `npa-package.toml`, declared module metadata in the
+  rebuild closure, and `generated/package-lock.json`.
 - `npa package build-certs --update-manifest-hashes --check --root <pkg>`
-  writes no files and reports stale manifest, certificate, or lock artifacts
-  deterministically.
+  writes no files and reports stale manifest, certificate, metadata, or lock
+  artifacts deterministically.
 - ordinary `npa package build-certs` behavior and diagnostics are unchanged
   when the new flag is absent.
 - top-level external import hash mismatches remain hard failures in refresh
   mode.
-- refreshed packages pass `package check-hashes` and
-  `package verify-certs --checker reference`.
+- refreshed packages pass `package check-hashes` and `package verify-certs`
+  with `--package-lock checked`, `--checker reference`, `--audit-cache off`,
+  and `--verifier-memo off`.
+- refreshed declared metadata passes `package audit-artifact-ledger`.
 - parser and build tests cover the edge cases listed above.
 - `cargo test -q -p npa-cli package_cli_args` passes.
 - targeted package build tests for check and write refresh behavior pass.
@@ -747,7 +784,8 @@ alter certificate identities:
 ```sh
 npa package build-certs --root proofs --update-manifest-hashes --json
 npa package check-hashes --root proofs --json
-npa package verify-certs --root proofs --checker reference --json
+npa package verify-certs --root proofs --package-lock checked \
+  --checker reference --audit-cache off --verifier-memo off --json
 npa package axiom-report --root proofs --json
 npa package index --root proofs --json
 npa package export-summary --root proofs --json
@@ -762,3 +800,11 @@ npa package build-certs --root proofs --update-manifest-hashes --check --json
 
 The dry run should be used in review and CI; the write mode should be used only
 at explicit package artifact refresh boundaries.
+
+The original implementation left declared module `meta.json` ledgers
+unchanged. The v0.6-introduced behavior retained in current v0.7 instead
+regenerates every declared ledger in the rebuild closure from the same verified
+artifacts and includes it in the staged transaction. After write mode, run
+`npa package audit-artifact-ledger --root proofs --json` and require clean
+parity. Do not rewrite certificate bytes to match stale metadata. Neither the
+refresh nor metadata alignment is proof evidence.

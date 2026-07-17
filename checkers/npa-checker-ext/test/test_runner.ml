@@ -162,23 +162,21 @@ let run_sha256_tests () =
          "vendored-sha256-source:test-change")
 
 let run_cli_tests () =
+  let zero_hash = "sha256:" ^ String.make 64 '0' in
   let version = Ext_cli.run [ "--version" ] in
+  let expected_version =
+    "npa-checker-ext 0.2.0\n"
+    ^ "checker_build_hash " ^ Ext_result.checker_build_hash ^ "\n"
+    ^ "certificate_format NPA-CERT-0.2.0\n"
+    ^ "core_spec NPA-Core-0.2.0\n"
+    ^ "implementation_profile ocaml-clean-room\n"
+    ^ "project_directory checkers/npa-checker-ext/\n"
+    ^ "feature_policy_contract m0-05:first-release-empty-core-feature-set\n"
+    ^ "vendored_sha256_source_identity vendored-sha256-source:v1\n"
+    ^ "checker_identity_manifest_signature_required false\n"
+  in
   assert_int_equal "version exit" 0 version.code;
-  assert_contains "version checker id" "npa-checker-ext 0.1.0\n" version.stdout;
-  assert_contains "version build hash" ("checker_build_hash " ^ Ext_result.checker_build_hash)
-    version.stdout;
-  assert_contains "version certificate format" "certificate_format NPA-CERT-0.1\n"
-    version.stdout;
-  assert_contains "version core spec" "core_spec NPA-Core-0.1\n" version.stdout;
-  assert_contains "version implementation profile" "implementation_profile ocaml-clean-room\n"
-    version.stdout;
-  assert_contains "version feature policy contract"
-    "feature_policy_contract m0-05:first-release-empty-core-feature-set\n" version.stdout;
-  assert_contains "version source identity"
-    ("vendored_sha256_source_identity " ^ Ext_sha256.source_identity ^ "\n")
-    version.stdout;
-  assert_contains "version manifest signature"
-    "checker_identity_manifest_signature_required false\n" version.stdout;
+  assert_equal "version exact stdout" expected_version version.stdout;
   assert_equal "version stderr" "" version.stderr;
 
   assert_cli_error "no args" "missing required --cert" [];
@@ -191,6 +189,8 @@ let run_cli_tests () =
     [ "--cert"; "example.npcert"; "--import-dir"; "src/module.npa/imports"; "--policy"; "policy.toml"; "--output"; "json" ];
   assert_cli_error "bad output" "--output must be json"
     [ "--cert"; "example.npcert"; "--import-dir"; "imports"; "--policy"; "policy.toml"; "--output"; "pretty" ];
+  assert_cli_error "bad policy hash" "--policy-hash must be sha256:<lower-hex>"
+    [ "--cert"; "example.npcert"; "--import-dir"; "imports"; "--policy"; "policy.toml"; "--policy-hash"; "sha256:BAD"; "--output"; "json" ];
   assert_cli_error "duplicate cert" "duplicate --cert"
     [
       "--cert";
@@ -211,6 +211,8 @@ let run_cli_tests () =
   assert_cli_error "unknown flag" "unknown flag --audit-bundle" [ "--audit-bundle"; "bundle" ];
   assert_cli_error "positional source" "positional .npa source input is forbidden" [ "example.npa" ];
   assert_cli_error "positional input" "positional input is forbidden" [ "example.npcert" ];
+  assert_cli_error "missing policy hash" "missing required --policy-hash"
+    [ "--cert"; "example.npcert"; "--import-dir"; "imports"; "--policy"; "policy.toml"; "--output"; "json" ];
 
   let check_shape =
     Ext_cli.run
@@ -221,17 +223,21 @@ let run_cli_tests () =
         "imports";
         "--policy";
         "policy.toml";
+        "--policy-hash";
+        zero_hash;
         "--output";
         "json";
       ]
   in
-  assert_int_equal "check shape exit" 0 check_shape.code;
+  assert_int_equal "check shape exit" 1 check_shape.code;
   assert_equal "check shape stderr" "" check_shape.stderr;
   assert_contains "check shape schema" "\"schema\": \"npa.independent-checker.checker_raw_result.v1\""
     check_shape.stdout;
   assert_contains "check shape status" "\"status\": \"failed\"" check_shape.stdout;
-  assert_contains "check shape error" "\"kind\": \"checker_internal_error\""
-    check_shape.stdout
+  assert_contains "check shape error" "\"kind\": \"certificate_decode_error\""
+    check_shape.stdout;
+  assert_contains "check shape reason"
+    "\"reason_code\": \"certificate_input_unavailable\"" check_shape.stdout
 
 let assert_feature_policy_rejects_unsupported feature offset expected_kind =
   assert_bool (feature ^ " is not supported in first release")
@@ -369,7 +375,17 @@ let run_decoder_bytes_tests () =
   let usize_overflow = Ext_bytes.encode_uvar (Int64.add (Int64.of_int max_int) 1L) in
   assert_decode_error "usize overflow" "certificate_decode_error" Ext_bytes.Length_overflow
     Ext_bytes.Imports (String.length usize_overflow - 1)
-    (Ext_bytes.read_usize Ext_bytes.Imports (Ext_bytes.of_string usize_overflow))
+    (Ext_bytes.read_usize Ext_bytes.Imports (Ext_bytes.of_string usize_overflow));
+  let too_many_imports = Ext_bytes.encode_uvar 4_097L in
+  assert_decode_error "import count resource limit" "certificate_decode_error"
+    Ext_bytes.Resource_limit Ext_bytes.Imports 0
+    (Ext_bytes.read_count Ext_bytes.Imports
+       (Ext_bytes.of_string too_many_imports));
+  let too_many_terms = Ext_bytes.encode_uvar 100_001L in
+  assert_decode_error "term count resource limit" "certificate_decode_error"
+    Ext_bytes.Resource_limit Ext_bytes.Term_table 0
+    (Ext_bytes.read_count Ext_bytes.Term_table
+       (Ext_bytes.of_string too_many_terms))
 
 let encode_uvar_int value = Ext_bytes.encode_uvar (Int64.of_int value)
 
@@ -600,7 +616,7 @@ type golden_hash_fixture = {
 
 let golden_hash_fixture label =
   let path =
-    Filename.concat (root_dir ()) "../../crates/npa-cert/tests/fixtures/golden_hashes.tsv"
+    Filename.concat (root_dir ()) "test/golden/legacy_certificate_hashes.tsv"
   in
   let contents = read_binary_file path in
   let rec loop lines =
@@ -643,7 +659,7 @@ let assert_header label expected_module header =
 
 let run_decoder_header_tests () =
   let golden_path =
-    Filename.concat (root_dir ()) "../../proofs/vendor/npa-std/Std/Nat/Basic/certificate.npcert"
+    Filename.concat (root_dir ()) "../../testdata/package/npa-mathlib/vendor/npa-std/Std/Nat/Basic/certificate.npcert"
   in
   let golden = read_binary_file golden_path in
   (match Ext_cert.read_header (Ext_bytes.of_string golden) with
@@ -655,6 +671,28 @@ let run_decoder_header_tests () =
       assert_bool "golden header module is structured"
         (String.length (Ext_name.to_string header.Ext_cert.module_name) > 0);
       assert_bool "golden header advances reader" (Ext_bytes.offset next > 0));
+
+  let assert_versioned_header label relative_path expected_format expected_core
+      expected_version =
+    let bytes = read_binary_file (Filename.concat (root_dir ()) relative_path) in
+    match Ext_cert.read_header (Ext_bytes.of_string bytes) with
+    | Error error ->
+        failwith
+          (label ^ ": unexpected decode error "
+          ^ Ext_bytes.reason_code error.Ext_bytes.reason)
+    | Ok (header, _) ->
+        assert_equal (label ^ " format") expected_format header.Ext_cert.format;
+        assert_equal (label ^ " core spec") expected_core
+          header.Ext_cert.core_spec;
+        assert_bool (label ^ " version")
+          (header.Ext_cert.version = expected_version)
+  in
+  assert_versioned_header "current header"
+    "../../testdata/certificates/security/mutual-inductive-constructor-universe-bound-v0.2.npcert"
+    Ext_cert.current_format Ext_cert.current_core_spec Ext_cert.Current;
+  assert_versioned_header "previous header"
+    "../../testdata/package/npa-mathlib-downstream/vendor/npa-mathlib/Mathlib/Logic/Basic/certificate.npcert"
+    Ext_cert.previous_format Ext_cert.previous_core_spec Ext_cert.Previous;
 
   let valid_header = encode_header [ "Std"; "Nat" ] in
   (match Ext_cert.read_header (Ext_bytes.of_string valid_header) with
@@ -674,6 +712,16 @@ let run_decoder_header_tests () =
   assert_decode_error "core spec mismatch" "certificate_decode_error"
     Ext_bytes.Core_spec_mismatch Ext_bytes.Header_core_spec (String.length core_prefix)
     (Ext_cert.read_header (Ext_bytes.of_string bad_core));
+
+  let mixed_pair_prefix =
+    encode_string Ext_cert.current_format
+    ^ encode_string Ext_cert.previous_core_spec
+  in
+  let mixed_pair = mixed_pair_prefix ^ encode_name [ "Std"; "Nat" ] in
+  assert_decode_error "mixed header pair" "certificate_decode_error"
+    Ext_bytes.Core_spec_mismatch Ext_bytes.Header_core_spec
+    (String.length mixed_pair_prefix)
+    (Ext_cert.read_header (Ext_bytes.of_string mixed_pair));
 
   let invalid_utf8 = encode_raw_string (string_of_codes [ 0xff ]) in
   assert_decode_error "invalid utf8 header" "noncanonical_encoding" Ext_bytes.Invalid_utf8
@@ -818,6 +866,22 @@ let run_decoder_tables_tests () =
     Ext_bytes.Noncanonical_order Ext_bytes.Level_table 2
     (Ext_level.read_table names
        (Ext_bytes.of_string (encode_uvar_int 2 ^ encode_level_zero ^ encode_level_zero)));
+  let level_depth_entries =
+    encode_level_zero
+    ^ String.concat ""
+        (List.init Ext_bytes.max_node_depth (fun index ->
+             encode_level_succ index))
+  in
+  let level_depth_table =
+    encode_uvar_int (Ext_bytes.max_node_depth + 1) ^ level_depth_entries
+  in
+  let last_level_offset =
+    String.length level_depth_table
+    - String.length (encode_level_succ (Ext_bytes.max_node_depth - 1))
+  in
+  assert_decode_error "level depth resource limit" "certificate_decode_error"
+    Ext_bytes.Resource_limit Ext_bytes.Level_table last_level_offset
+    (Ext_level.read_table names (Ext_bytes.of_string level_depth_table));
   assert_decode_error "unresolved universe metavariable" "certificate_decode_error"
     Ext_bytes.Unresolved_metavariable Ext_bytes.Level_table 1
     (Ext_level.read_table [ make_unchecked_name [ "z?meta" ] ]
@@ -901,7 +965,7 @@ let assert_decoded_minimal label decoded expected_feature_count =
 
 let run_decoder_declarations_tests () =
   let golden_path =
-    Filename.concat (root_dir ()) "../../proofs/vendor/npa-std/Std/Nat/Basic/certificate.npcert"
+    Filename.concat (root_dir ()) "../../testdata/package/npa-mathlib/vendor/npa-std/Std/Nat/Basic/certificate.npcert"
   in
   let golden = read_binary_file golden_path in
   (match Ext_cert.read_module (Ext_bytes.of_string golden) with
@@ -1005,8 +1069,9 @@ let run_decoder_declarations_tests () =
   in
   assert_decode_error "export dangling term" "certificate_decode_error"
     Ext_bytes.Dangling_reference Ext_bytes.Export_block 4
-    (Ext_cert.read_export_block 0
+    (Ext_cert.read_export_block Ext_cert.Legacy 0
        (Array.of_list [ make_name [ "A" ] ])
+       (Array.of_list simple_level_table)
        (Array.of_list simple_term_table) 1
        (Ext_bytes.of_string dangling_term_export));
 
@@ -1019,14 +1084,15 @@ let run_decoder_declarations_tests () =
   in
   assert_decode_error "export dangling declaration" "certificate_decode_error"
     Ext_bytes.Dangling_reference Ext_bytes.Export_block dangling_decl_offset
-    (Ext_cert.read_export_block 0
+    (Ext_cert.read_export_block Ext_cert.Legacy 0
        (Array.of_list [ make_name [ "A" ] ])
+       (Array.of_list simple_level_table)
        (Array.of_list simple_term_table) 1
        (Ext_bytes.of_string dangling_decl_export))
 
 let run_decoder_reachability_tests () =
   let golden_path =
-    Filename.concat (root_dir ()) "../../proofs/vendor/npa-std/Std/Nat/Basic/certificate.npcert"
+    Filename.concat (root_dir ()) "../../testdata/package/npa-mathlib/vendor/npa-std/Std/Nat/Basic/certificate.npcert"
   in
   let golden = read_binary_file golden_path in
   (match Ext_cert.read_module (Ext_bytes.of_string golden) with
@@ -1089,6 +1155,38 @@ let run_decoder_reachability_tests () =
   assert_decode_error "reordered name table" "noncanonical_encoding"
     Ext_bytes.Noncanonical_order Ext_bytes.Name_table (String.length reordered_name_prefix)
     (Ext_cert.read_module (Ext_bytes.of_string reordered_name));
+  (match Ext_cli.context_of_bytes reordered_name with
+  | { Ext_cli.module_name = Some "M"; certificate_hash = Some hash } ->
+      assert_equal "reordered name diagnostic certificate hash"
+        ("sha256:" ^ hex_of_raw_hash (hash_bytes 0xa3)) hash
+  | _ -> failwith "reordered name diagnostic context must preserve identity");
+
+  let malformed_without_certificate_hash =
+    encode_header [ "M" ] ^ String.make 10 '\255' ^ hash_bytes 0xb1
+    ^ hash_bytes 0xb2
+  in
+  let malformed_certificate_hash =
+    Ext_canonical.hash_with_domain
+      (Ext_canonical.module_certificate_domain Ext_cert.Legacy)
+      malformed_without_certificate_hash
+  in
+  let malformed_later_section =
+    malformed_without_certificate_hash ^ malformed_certificate_hash
+  in
+  assert_decode_error "malformed later section" "certificate_decode_error"
+    Ext_bytes.Uvar_overflow Ext_bytes.Imports
+    (String.length (encode_header [ "M" ]) + 9)
+    (Ext_cert.read_module (Ext_bytes.of_string malformed_later_section));
+  (match Ext_cli.context_of_bytes malformed_later_section with
+  | { Ext_cli.module_name = Some "M"; certificate_hash = Some hash } ->
+      assert_equal "malformed later diagnostic certificate hash"
+        (Ext_result.wire_hash malformed_certificate_hash) hash
+  | _ -> failwith "malformed later diagnostic context must preserve identity");
+  assert_bool "malformed later diagnostic hash must bind exact bytes"
+    (Ext_cli.context_of_bytes
+       (mutate_byte malformed_later_section
+          (String.length malformed_later_section - 1))
+    = Ext_cli.empty_context);
 
   let unused_level_prefix =
     encode_header [ "M" ] ^ encode_imports [] ^ encode_name_table [ [ "A" ] ]
@@ -1332,16 +1430,50 @@ let assert_declaration_hash_rejects label expected_kind expected_reason decoded 
       assert_equal (label ^ " reason") expected_reason reason;
       assert_bool (label ^ " expected differs from actual")
         (mismatch.Ext_canonical.expected_hash <> mismatch.Ext_canonical.actual_hash);
+      let declaration =
+        match
+          List.nth_opt decoded.Ext_cert.declaration_table
+            mismatch.Ext_canonical.mismatch_decl_index
+        with
+        | Some declaration -> declaration
+        | None -> failwith (label ^ ": mismatch declaration index is invalid")
+      in
+      let expected_interface, expected_certificate =
+        assert_ok (label ^ " recomputed mismatch hashes")
+          (Ext_canonical.declaration_hashes decoded.Ext_cert.name_table
+             decoded.Ext_cert.level_table decoded.Ext_cert.term_table declaration)
+      in
+      let expected_hash, actual_hash =
+        match mismatch.Ext_canonical.mismatch_role with
+        | Ext_canonical.Decl_interface_hash ->
+            ( expected_interface,
+              declaration.Ext_cert.hashes.Ext_cert.decl_interface_hash )
+        | Ext_canonical.Decl_certificate_hash ->
+            ( expected_certificate,
+              declaration.Ext_cert.hashes.Ext_cert.decl_certificate_hash )
+      in
+      assert_equal (label ^ " exact expected hash") expected_hash
+        mismatch.Ext_canonical.expected_hash;
+      assert_equal (label ^ " exact actual hash") actual_hash
+        mismatch.Ext_canonical.actual_hash;
       let raw =
-        Ext_result.hash_mismatch_failure ~kind ~reason_code:reason
-          ~section:"declarations" ~offset
+        Ext_result.render_failed
+          (Ext_result.checker_error ~reason_code:reason
+             ~section:"declarations" ~offset
+             ~expected_hash:(Ext_result.wire_hash expected_hash)
+             ~actual_hash:(Ext_result.wire_hash actual_hash) kind)
       in
       assert_contains (label ^ " raw kind") ("\"kind\": \"" ^ expected_kind ^ "\"") raw;
       assert_contains (label ^ " raw reason")
         ("\"reason_code\": \"" ^ expected_reason ^ "\"")
         raw;
       assert_contains (label ^ " raw section") "\"section\": \"declarations\"" raw;
-      assert_contains (label ^ " raw offset") ("\"offset\": " ^ string_of_int offset) raw
+      assert_contains (label ^ " raw offset") ("\"offset\": " ^ string_of_int offset) raw;
+      assert_contains (label ^ " raw expected hash")
+        ("\"expected_hash\": \"" ^ Ext_result.wire_hash expected_hash ^ "\"")
+        raw;
+      assert_contains (label ^ " raw actual hash")
+        ("\"actual_hash\": \"" ^ Ext_result.wire_hash actual_hash ^ "\"") raw
 
 let assert_module_hash_verifies label bytes decoded =
   match
@@ -1374,16 +1506,42 @@ let assert_module_hash_rejects label expected_kind expected_offset bytes decoded
       assert_bool (label ^ " expected differs from actual")
         (mismatch.Ext_canonical.module_expected_hash
         <> mismatch.Ext_canonical.module_actual_hash);
+      let expected_hash, actual_hash =
+        match mismatch.Ext_canonical.module_mismatch_role with
+        | Ext_canonical.Export_hash ->
+            ( assert_ok (label ^ " recomputed expected export hash")
+                (Ext_canonical.expected_export_hash decoded),
+              decoded.Ext_cert.hashes.Ext_cert.export_hash )
+        | Ext_canonical.Axiom_report_hash ->
+            ( assert_ok (label ^ " recomputed expected axiom hash")
+                (Ext_canonical.axiom_report_hash decoded),
+              decoded.Ext_cert.hashes.Ext_cert.axiom_report_hash )
+        | Ext_canonical.Certificate_hash ->
+            ( assert_ok (label ^ " recomputed expected certificate hash")
+                (Ext_canonical.certificate_hash bytes decoded),
+              decoded.Ext_cert.hashes.Ext_cert.certificate_hash )
+      in
+      assert_equal (label ^ " exact expected hash") expected_hash
+        mismatch.Ext_canonical.module_expected_hash;
+      assert_equal (label ^ " exact actual hash") actual_hash
+        mismatch.Ext_canonical.module_actual_hash;
       let raw =
-        Ext_result.hash_mismatch_failure ~kind ~reason_code:kind ~section:"hashes"
-          ~offset
+        Ext_result.render_failed
+          (Ext_result.checker_error ~reason_code:kind ~section:"hashes" ~offset
+             ~expected_hash:(Ext_result.wire_hash expected_hash)
+             ~actual_hash:(Ext_result.wire_hash actual_hash) kind)
       in
       assert_contains (label ^ " raw kind") ("\"kind\": \"" ^ expected_kind ^ "\"") raw;
       assert_contains (label ^ " raw reason")
         ("\"reason_code\": \"" ^ expected_kind ^ "\"")
         raw;
       assert_contains (label ^ " raw section") "\"section\": \"hashes\"" raw;
-      assert_contains (label ^ " raw offset") ("\"offset\": " ^ string_of_int offset) raw
+      assert_contains (label ^ " raw offset") ("\"offset\": " ^ string_of_int offset) raw;
+      assert_contains (label ^ " raw expected hash")
+        ("\"expected_hash\": \"" ^ Ext_result.wire_hash expected_hash ^ "\"")
+        raw;
+      assert_contains (label ^ " raw actual hash")
+        ("\"actual_hash\": \"" ^ Ext_result.wire_hash actual_hash ^ "\"") raw
 
 let import_store_load_error_code error =
   match error with
@@ -1680,9 +1838,9 @@ let run_hash_level_term_tests () =
     assert_export_term_hashes label decoded
   in
   assert_golden_export_terms "nat"
-    (Filename.concat (root_dir ()) "../../proofs/vendor/npa-std/Std/Nat/Basic/certificate.npcert");
+    (Filename.concat (root_dir ()) "../../testdata/package/npa-mathlib/vendor/npa-std/Std/Nat/Basic/certificate.npcert");
   assert_golden_export_terms "eq"
-    (Filename.concat (root_dir ()) "../../proofs/vendor/npa-std/Std/Logic/Eq/certificate.npcert")
+    (Filename.concat (root_dir ()) "../../testdata/package/npa-mathlib/vendor/npa-std/Std/Logic/Eq/certificate.npcert")
 
 let run_hash_declarations_tests () =
   let assert_golden_declarations label path =
@@ -1692,9 +1850,9 @@ let run_hash_declarations_tests () =
     assert_declaration_hash_verifies label decoded
   in
   assert_golden_declarations "nat"
-    (Filename.concat (root_dir ()) "../../proofs/vendor/npa-std/Std/Nat/Basic/certificate.npcert");
+    (Filename.concat (root_dir ()) "../../testdata/package/npa-mathlib/vendor/npa-std/Std/Nat/Basic/certificate.npcert");
   assert_golden_declarations "eq"
-    (Filename.concat (root_dir ()) "../../proofs/vendor/npa-std/Std/Logic/Eq/certificate.npcert");
+    (Filename.concat (root_dir ()) "../../testdata/package/npa-mathlib/vendor/npa-std/Std/Logic/Eq/certificate.npcert");
 
   let simple_theorem_decl =
     encode_decl_cert (encode_theorem_decl_payload 0x02 0 [] 0 1) [] []
@@ -1799,10 +1957,10 @@ let run_hash_module_tests () =
   let golden_paths =
     [
       ( "nat",
-        Filename.concat (root_dir ()) "../../proofs/vendor/npa-std/Std/Nat/Basic/certificate.npcert"
+        Filename.concat (root_dir ()) "../../testdata/package/npa-mathlib/vendor/npa-std/Std/Nat/Basic/certificate.npcert"
       );
       ( "eq",
-        Filename.concat (root_dir ()) "../../proofs/vendor/npa-std/Std/Logic/Eq/certificate.npcert"
+        Filename.concat (root_dir ()) "../../testdata/package/npa-mathlib/vendor/npa-std/Std/Logic/Eq/certificate.npcert"
       );
     ]
   in
@@ -1865,7 +2023,7 @@ let run_hash_module_tests () =
 
 let run_import_store_tests () =
   let nat_path =
-    Filename.concat (root_dir ()) "../../proofs/vendor/npa-std/Std/Nat/Basic/certificate.npcert"
+    Filename.concat (root_dir ()) "../../testdata/package/npa-mathlib/vendor/npa-std/Std/Nat/Basic/certificate.npcert"
   in
   let nat_dir = Filename.dirname nat_path in
   let nat_store =
@@ -1933,6 +2091,48 @@ let run_import_store_tests () =
     wrong_certificate_request;
 
   let nat_bytes = read_binary_file nat_path in
+  assert_import_store_load_error "bounded certificate read enforces aggregate remainder"
+    "certificate_decode_error:resource_limit"
+    (Ext_import_store.read_binary_file_with_limit nat_path
+       (String.length nat_bytes - 1));
+  let aggregate_dir = Filename.temp_file "npa-checker-ext-aggregate" ".dir" in
+  Sys.remove aggregate_dir;
+  Unix.mkdir aggregate_dir 0o700;
+  let aggregate_dir = Unix.realpath aggregate_dir in
+  let first_candidate = Filename.concat aggregate_dir "first.npcert" in
+  let second_candidate = Filename.concat aggregate_dir "second.npcert" in
+  let write_candidate path =
+    let channel = open_out_bin path in
+    output_string channel nat_bytes;
+    close_out channel
+  in
+  write_candidate first_candidate;
+  write_candidate second_candidate;
+  let aggregate_bytes = 2 * String.length nat_bytes in
+  (match
+     Ext_session.load_candidates_with_budget
+       ~max_candidate_bytes:aggregate_bytes aggregate_dir
+   with
+  | Ok candidates ->
+      assert_int_equal "aggregate candidate byte budget accepts exact total" 2
+        (List.length candidates)
+  | Error _ -> failwith "exact aggregate candidate byte budget must accept");
+  (match
+     Ext_session.load_candidates_with_budget
+       ~max_candidate_bytes:(aggregate_bytes - 1) aggregate_dir
+   with
+  | Error
+      (Ext_session.Load_error
+        (Ext_import_store.Certificate_decode_error error)) ->
+      assert_equal "aggregate candidate byte budget reason" "resource_limit"
+        (Ext_bytes.reason_code error.Ext_bytes.reason);
+      assert_int_equal "aggregate candidate byte budget remaining offset"
+        (String.length nat_bytes - 1) error.Ext_bytes.offset
+  | Ok _ -> failwith "aggregate candidate byte budget must reject combined size"
+  | Error _ -> failwith "aggregate candidate byte budget returned wrong error");
+  Sys.remove first_candidate;
+  Sys.remove second_candidate;
+  Unix.rmdir aggregate_dir;
   assert_import_store_load_error "duplicate module export binding rejects"
     "duplicate_import_binding"
     (Ext_import_store.from_source_free_certificates [ nat_bytes; nat_bytes ]);
@@ -1956,7 +2156,19 @@ let run_import_store_tests () =
   assert_import_store_load_error "source import dir path is rejected"
     "source_or_replay_input_rejected"
     (Ext_import_store.load_import_dir
-       (Filename.concat source_replay_fixture "ignored.npa"))
+       (Filename.concat source_replay_fixture "ignored.npa"));
+  assert_bool "replay prefix is not an exact replay component"
+    (not
+       (Ext_import_store.is_source_or_replay_path
+          (Filename.concat source_replay_fixture "replay.json.backup")));
+  let symlink_target = Filename.temp_file "npa-checker-ext-source" ".npa" in
+  let symlink_path = symlink_target ^ ".link.npcert" in
+  Unix.symlink symlink_target symlink_path;
+  assert_import_store_load_error "symbolic-link certificate is not followed"
+    "source_or_replay_input_rejected"
+    (Ext_import_store.read_binary_file symlink_path);
+  Sys.remove symlink_path;
+  Sys.remove symlink_target
 
 let decoded_import_request label module_name export_hash certificate_hash =
   decode_module_bytes label
@@ -1995,7 +2207,7 @@ let load_single_import_entry label path =
 
 let run_import_normal_tests () =
   let nat_path =
-    Filename.concat (root_dir ()) "../../proofs/vendor/npa-std/Std/Nat/Basic/certificate.npcert"
+    Filename.concat (root_dir ()) "../../testdata/package/npa-mathlib/vendor/npa-std/Std/Nat/Basic/certificate.npcert"
   in
   let nat_store =
     assert_import_store_ok "normal nat import dir"
@@ -2200,26 +2412,11 @@ let run_import_normal_tests () =
 
 let run_import_high_trust_tests () =
   let nat_path =
-    Filename.concat (root_dir ()) "../../proofs/vendor/npa-std/Std/Nat/Basic/certificate.npcert"
-  in
-  let eq_path =
-    Filename.concat (root_dir ()) "../../proofs/vendor/npa-std/Std/Logic/Eq/certificate.npcert"
+    Filename.concat (root_dir ()) "../../testdata/package/npa-mathlib/vendor/npa-std/Std/Nat/Basic/certificate.npcert"
   in
   let nat_module = load_single_import_entry "high-trust nat fixture" nat_path in
-  let eq_module = load_single_import_entry "high-trust eq fixture" eq_path in
   assert_bool "source-free nat fixture starts unchecked"
     (not nat_module.Ext_import_store.checked_by_ext_checker);
-  let checked_nat_store =
-    assert_import_store_ok "checked nat store"
-      (Ext_import_store.from_checked_modules [ nat_module ])
-  in
-  let checked_nat =
-    match Ext_import_store.entries checked_nat_store with
-    | [ entry ] -> entry
-    | _ -> failwith "expected checked nat entry"
-  in
-  assert_bool "from_checked_modules marks entries checked"
-    checked_nat.Ext_import_store.checked_by_ext_checker;
   let nat_request_without_hash =
     decoded_import_request "high-trust missing certificate hash request"
       nat_module.Ext_import_store.import_entry.Ext_import.module_name
@@ -2227,7 +2424,7 @@ let run_import_high_trust_tests () =
   in
   assert_import_environment_rejects ~policy:Ext_import_store.high_trust_policy
     "high-trust rejects missing import certificate hash"
-    "import_not_found" "missing_import_certificate_hash" checked_nat_store
+    "import_not_found" "missing_import_certificate_hash" [ nat_module ]
     nat_request_without_hash;
   let nat_request_with_hash =
     decoded_import_request "high-trust nat request"
@@ -2248,55 +2445,8 @@ let run_import_high_trust_tests () =
   in
   assert_import_environment_rejects ~policy:Ext_import_store.high_trust_policy
     "high-trust rejects certificate hash mismatch"
-    "import_hash_mismatch" "import_certificate_hash_mismatch" checked_nat_store
-    wrong_certificate_request;
-  let high_trust_environment =
-    assert_import_environment_ok ~policy:Ext_import_store.high_trust_policy
-      "high-trust accepts checked certificate import" checked_nat_store
-      nat_request_with_hash
-  in
-  let high_trust_import =
-    single_resolved_import "high-trust nat import" high_trust_environment
-  in
-  assert_equal "high-trust resolved module" "Std.Nat.Basic"
-    (Ext_name.to_string high_trust_import.Ext_import_store.resolved_module_name);
-  assert_bool "high-trust carries resolved certificate hash"
-    (high_trust_import.Ext_import_store.resolved_certificate_hash
-    = nat_module.Ext_import_store.import_entry.Ext_import.certificate_hash);
-
-  let ordered_store =
-    assert_import_store_ok "topological checked import store"
-      (Ext_import_store.from_checked_modules [ eq_module; nat_module ])
-  in
-  let ordered_request =
-    decoded_import_requests "high-trust ordered import closure"
-      [
-        ( eq_module.Ext_import_store.import_entry.Ext_import.module_name,
-          eq_module.Ext_import_store.import_entry.Ext_import.export_hash,
-          eq_module.Ext_import_store.import_entry.Ext_import.certificate_hash );
-        ( nat_module.Ext_import_store.import_entry.Ext_import.module_name,
-          nat_module.Ext_import_store.import_entry.Ext_import.export_hash,
-          nat_module.Ext_import_store.import_entry.Ext_import.certificate_hash );
-      ]
-  in
-  let ordered_environment =
-    assert_import_environment_ok ~policy:Ext_import_store.high_trust_policy
-      "high-trust topological closure resolves" ordered_store ordered_request
-  in
-  let resolved_names =
-    List.map
-      (fun import ->
-        Ext_name.to_string import.Ext_import_store.resolved_module_name)
-      (Ext_import_store.import_environment_imports ordered_environment)
-  in
-  assert_equal "high-trust import order first" "Std.Logic.Eq"
-    (List.nth resolved_names 0);
-  assert_equal "high-trust import order second" "Std.Nat.Basic"
-    (List.nth resolved_names 1);
-  assert_bool "high-trust closure source-free exports copied"
-    (List.length
-       (Ext_import_store.import_environment_public_exports ordered_environment)
-    > 0)
+    "import_hash_mismatch" "import_certificate_hash_mismatch" [ nat_module ]
+    wrong_certificate_request
 
 let declaration_fixture ?(offset = 0) ?(interface_hash = hash_bytes 0x51)
     ?(certificate_hash = hash_bytes 0x52) kind payload =
@@ -2362,6 +2512,7 @@ let decoded_axiom_report_fixture ?(module_name = make_name [ "AxiomReportFixture
         format = Ext_cert.expected_format;
         core_spec = Ext_cert.expected_core_spec;
         module_name;
+        version = Ext_cert.Legacy;
       };
     imports = [];
     name_table = located_names names;
@@ -2504,17 +2655,15 @@ let run_axiom_policy_parse_tests () =
       (Ext_axiom.parse_policy_toml
          {|
 format = "npa.independent-checker.axiom_policy.v1"
-deny_sorry = false
-deny_custom_axioms = true
 allowed_axioms = [
-  "Std.Logic.Eq.rec",
   "User.Custom.P",
+  "Std.Logic.Eq.rec",
 ]
 |})
   in
-  assert_bool "axiom policy parses deny_sorry false"
-    (not policy.Ext_axiom.deny_sorry);
-  assert_bool "axiom policy parses deny_custom true"
+  assert_bool "axiom policy keeps mandatory sorry denial"
+    policy.Ext_axiom.deny_sorry;
+  assert_bool "axiom policy keeps mandatory custom denial"
     policy.Ext_axiom.deny_custom_axioms;
   assert_bool "axiom policy allows exact Std.Logic.Eq.rec"
     (Ext_axiom.policy_allows policy (make_name [ "Std"; "Logic"; "Eq"; "rec" ]));
@@ -2525,53 +2674,103 @@ allowed_axioms = [
   assert_bool "axiom policy rejects unlisted axiom"
     (not (Ext_axiom.policy_allows policy (make_name [ "User"; "Other" ])));
 
-  let defaulted =
-    assert_policy_parse_ok "axiom policy missing fields use defaults"
-      (Ext_axiom.parse_policy_toml "")
+  let canonical_name_order =
+    assert_policy_parse_ok "axiom policy uses canonical name-byte order"
+      (Ext_axiom.parse_policy_toml
+         {|
+format = "npa.independent-checker.axiom_policy.v1"
+allowed_axioms = ["B", "AA"]
+|})
   in
-  assert_bool "axiom policy empty input default deny_sorry"
-    defaulted.Ext_axiom.deny_sorry;
-  assert_bool "axiom policy empty input default deny_custom"
-    defaulted.Ext_axiom.deny_custom_axioms;
-  assert_int_equal "axiom policy empty input default allowlist" 0
-    (List.length defaulted.Ext_axiom.allowed_axioms);
+  assert_int_equal "canonical name-byte order keeps both names" 2
+    (List.length canonical_name_order.Ext_axiom.allowed_axioms);
+
+  let nbsp = string_of_codes [ 0xc2; 0xa0 ] in
+  ignore
+    (assert_policy_parse_ok "axiom policy accepts runner Unicode whitespace"
+       (Ext_axiom.parse_policy_toml
+          ("format" ^ nbsp ^ "=" ^ nbsp
+         ^ "\"npa.independent-checker.axiom_policy.v1\"\nallowed_axioms"
+         ^ nbsp ^ "=" ^ nbsp ^ "[]\n")));
+  assert_policy_parse_rejects "axiom policy rejects invalid UTF-8" "axiom_policy"
+    "valid_toml" "invalid_toml"
+    (Ext_axiom.parse_policy_toml
+       ("format = \"npa.independent-checker.axiom_policy.v1\"\n"
+       ^ "allowed_axioms = []\n" ^ string_of_codes [ 0xff ]));
+
+  assert_policy_parse_rejects "axiom policy requires format"
+    "axiom_policy.format" Ext_axiom.policy_format "missing"
+    (Ext_axiom.parse_policy_toml "");
+  assert_policy_parse_rejects "axiom policy requires allowlist"
+    "axiom_policy.allowed_axioms" "array" "missing"
+    (Ext_axiom.parse_policy_toml
+       {|format = "npa.independent-checker.axiom_policy.v1"|});
 
   assert_policy_parse_rejects "axiom policy rejects JSON input" "axiom_policy"
     "valid_toml" "invalid_toml"
     (Ext_axiom.parse_policy_toml
        {|{"deny_sorry": true, "allowed_axioms": []}|});
   assert_policy_parse_rejects "axiom policy duplicate field is deterministic"
-    "axiom_policy.deny_sorry" "unique_object_keys" "duplicate_field"
+    "axiom_policy.format" "unique_object_keys" "duplicate_field"
     (Ext_axiom.parse_policy_toml
        {|
-deny_sorry = true
-deny_sorry = false
+format = "npa.independent-checker.axiom_policy.v1"
+format = "npa.independent-checker.axiom_policy.v1"
+allowed_axioms = []
 |});
-  assert_policy_parse_rejects "axiom policy bool wrong type"
-    "axiom_policy.deny_custom_axioms" "bool" "wrong_type"
-    (Ext_axiom.parse_policy_toml {|deny_custom_axioms = "true"|});
+  assert_policy_parse_rejects "axiom policy rejects custom-denial override"
+    "axiom_policy.deny_custom_axioms" "absent" "unknown_field"
+    (Ext_axiom.parse_policy_toml
+       {|
+format = "npa.independent-checker.axiom_policy.v1"
+allowed_axioms = []
+deny_custom_axioms = false
+|});
   assert_policy_parse_rejects "axiom policy allowlist wrong type"
     "axiom_policy.allowed_axioms" "array" "wrong_type"
-    (Ext_axiom.parse_policy_toml {|allowed_axioms = "Std.Logic.Eq.rec"|});
+    (Ext_axiom.parse_policy_toml
+       {|
+format = "npa.independent-checker.axiom_policy.v1"
+allowed_axioms = "Std.Logic.Eq.rec"
+|});
   assert_policy_parse_rejects "axiom policy allowlist entry wrong type"
     "axiom_policy.allowed_axioms[0]" "axiom_name" "wrong_type"
-    (Ext_axiom.parse_policy_toml {|allowed_axioms = [1]|});
+    (Ext_axiom.parse_policy_toml
+       {|
+format = "npa.independent-checker.axiom_policy.v1"
+allowed_axioms = [1]
+|});
   assert_policy_parse_rejects "axiom policy allowlist invalid name"
     "axiom_policy.allowed_axioms[0]" "axiom_name" "invalid_name_format"
-    (Ext_axiom.parse_policy_toml {|allowed_axioms = ["Std..Logic"]|});
+    (Ext_axiom.parse_policy_toml
+       {|
+format = "npa.independent-checker.axiom_policy.v1"
+allowed_axioms = ["Std..Logic"]
+|});
   assert_policy_parse_rejects "axiom policy allowlist order violation"
     "axiom_policy.allowed_axioms[1]" "axiom_name_canonical_order"
     "order_violation"
     (Ext_axiom.parse_policy_toml
-       {|allowed_axioms = ["User.Z", "Std.Logic.Eq.rec"]|});
+       {|
+format = "npa.independent-checker.axiom_policy.v1"
+allowed_axioms = ["AA", "B"]
+|});
   assert_policy_parse_rejects "axiom policy duplicate axiom name"
     "axiom_policy.allowed_axioms[1]" "unique_axiom_name"
     "duplicate_axiom_name"
     (Ext_axiom.parse_policy_toml
-       {|allowed_axioms = ["Std.Logic.Eq.rec", "Std.Logic.Eq.rec"]|});
+       {|
+format = "npa.independent-checker.axiom_policy.v1"
+allowed_axioms = ["Std.Logic.Eq.rec", "Std.Logic.Eq.rec"]
+|});
   assert_policy_parse_rejects "axiom policy unknown field"
     "axiom_policy.allow_axioms" "absent" "unknown_field"
-    (Ext_axiom.parse_policy_toml {|allow_axioms = []|})
+    (Ext_axiom.parse_policy_toml
+       {|
+format = "npa.independent-checker.axiom_policy.v1"
+allowed_axioms = []
+allow_axioms = []
+|})
 
 let assert_axiom_policy_ok label result =
   match result with
@@ -2709,6 +2908,7 @@ let run_axiom_policy_tests () =
       public_decl_interface_hash = eq_rec_hash;
       public_axiom_dependencies = [ imported_eq_rec ];
       public_universe_params = [];
+      public_universe_constraints = [];
       public_ty = Ext_term.Sort Ext_env.level_type0;
       public_body = None;
     }
@@ -2727,6 +2927,7 @@ let run_axiom_policy_tests () =
                 public_exports;
                 public_module_axioms = [ imported_eq_rec ];
                 public_core_features = [];
+                public_inductive_groups = [];
               };
           };
         ];
@@ -2785,12 +2986,14 @@ let run_axiom_policy_tests () =
                       public_decl_interface_hash = imported_axiom_hash;
                       public_axiom_dependencies = [ imported_axiom ];
                       public_universe_params = [];
+                      public_universe_constraints = [];
                       public_ty = Ext_term.Sort Ext_env.level_type0;
                       public_body = None;
                     };
                   ];
                 public_module_axioms = [ imported_axiom ];
                 public_core_features = [];
+                public_inductive_groups = [];
               };
           };
         ];
@@ -2979,6 +3182,7 @@ let run_axiom_report_tests () =
             public_decl_interface_hash = imported_axiom_hash;
             public_axiom_dependencies = [ imported_axiom ];
             public_universe_params = [];
+            public_universe_constraints = [];
             public_ty = Ext_term.Sort Ext_env.level_type0;
             public_body = None;
           };
@@ -2988,12 +3192,14 @@ let run_axiom_report_tests () =
             public_decl_interface_hash = imported_theorem_hash;
             public_axiom_dependencies = [ imported_axiom ];
             public_universe_params = [];
+            public_universe_constraints = [];
             public_ty = Ext_term.Sort Ext_env.level_type0;
             public_body = None;
           };
         ];
       public_module_axioms = [ imported_axiom ];
       public_core_features = [];
+      public_inductive_groups = [];
     }
   in
   let import_environment =
@@ -3063,7 +3269,7 @@ let assert_duplicate_universe_param_error label result =
 
 let run_type_env_tests () =
   let nat_path =
-    Filename.concat (root_dir ()) "../../proofs/vendor/npa-std/Std/Nat/Basic/certificate.npcert"
+    Filename.concat (root_dir ()) "../../testdata/package/npa-mathlib/vendor/npa-std/Std/Nat/Basic/certificate.npcert"
   in
   let nat_module = load_single_import_entry "type-env nat fixture" nat_path in
   let nat_request =
@@ -3257,12 +3463,14 @@ let run_type_env_tests () =
                       public_decl_interface_hash = imported_theorem_hash;
                       public_axiom_dependencies = [];
                       public_universe_params = [];
+                      public_universe_constraints = [];
                       public_ty = Ext_term.Sort Ext_level.Zero;
                       public_body = Some (Ext_term.BVar 0);
                     };
                   ];
                 public_module_axioms = [];
                 public_core_features = [];
+                public_inductive_groups = [];
               };
           };
         ];
@@ -3334,6 +3542,16 @@ let run_type_core_tests () =
   let nat_zero = Ext_env.nat_zero in
   let theorem_ty = Ext_term.Pi (nat, nat) in
   let theorem_proof = Ext_term.Lam (nat, Ext_term.BVar 0) in
+  assert_infers_term "type-core Sort zero inhabits Sort (succ zero)"
+    (Ext_term.Sort (Ext_level.Succ Ext_level.Zero))
+    (Ext_typecheck.infer Ext_env.empty Ext_typecheck.empty_context
+       (Ext_term.Sort Ext_level.Zero));
+  assert_typecheck_rejects
+    "type-core does not add cumulative Sort subtyping" "type_mismatch"
+    "type_mismatch"
+    (Ext_typecheck.check Ext_env.empty Ext_typecheck.empty_context
+       (Ext_term.Sort Ext_level.Zero)
+       (Ext_term.Sort (Ext_level.Succ (Ext_level.Succ Ext_level.Zero))));
   assert_typecheck_ok "type-core well-typed theorem proof"
     (Ext_typecheck.check Ext_env.empty Ext_typecheck.empty_context theorem_proof
        theorem_ty);
@@ -3695,6 +3913,512 @@ let run_inductive_constructor_tests () =
     "inductive_invalid" "inductive_invalid"
     (Ext_typecheck.check_declarations [ malformed_interface_decl ])
 
+let run_inductive_universe_tests () =
+  (* Audit.Code : Type, with Audit.Code.mk : Type -> Audit.Code.  The
+     constructor domain itself lives one universe above Audit.Code's declared
+     sort and must be rejected. *)
+  let code_name = make_name [ "Audit"; "Code" ] in
+  let mk_name = make_name [ "Audit"; "Code"; "mk" ] in
+  let code = local_family [] in
+  let code_decl =
+    declaration_fixture Ext_cert.Inductive
+      (Ext_cert.InductiveDecl
+         {
+           decl_name = code_name;
+           decl_universe_params = [];
+           decl_universe_constraints = [];
+           ind_params = [];
+           ind_indices = [];
+           ind_sort = Ext_env.level_type0;
+           ind_constructors =
+             [
+               constructor_spec mk_name
+                 (Ext_term.Pi (Ext_term.Sort Ext_env.level_type0, code));
+             ];
+           ind_recursor = None;
+         })
+  in
+  assert_typecheck_rejects
+    "inductive-universe rejects constructor domain above family universe"
+    "universe_inconsistency" "constructor_universe_bound_violation"
+    (Ext_typecheck.check_declarations [ code_decl ]);
+
+  let large_code = local_family [] in
+  let large_code_decl =
+    declaration_fixture Ext_cert.Inductive
+      (Ext_cert.InductiveDecl
+         {
+           decl_name = make_name [ "Audit"; "LargeCode" ];
+           decl_universe_params = [];
+           decl_universe_constraints = [];
+           ind_params = [];
+           ind_indices = [];
+           ind_sort = Ext_level.Succ Ext_env.level_type0;
+           ind_constructors =
+             [
+               constructor_spec (make_name [ "Audit"; "LargeCode"; "mk" ])
+                 (Ext_term.Pi
+                    ( Ext_term.Sort Ext_env.level_type0,
+                      Ext_term.Pi (Ext_term.BVar 0, large_code) ));
+             ];
+           ind_recursor = None;
+         })
+  in
+  ignore
+    (assert_declaration_check_ok
+       "inductive-universe accepts dependent fields under preceding domains"
+       (Ext_typecheck.check_declarations [ large_code_decl ]));
+
+  let le lhs rhs =
+    {
+      Ext_cert.constraint_lhs = lhs;
+      constraint_relation = Ext_cert.Le;
+      constraint_rhs = rhs;
+    }
+  in
+  let u_name = make_name [ "u" ] in
+  let u_level = Ext_level.Param u_name in
+  let polymorphic_family = local_family [ u_level ] in
+  let polymorphic_decl =
+    declaration_fixture Ext_cert.Inductive
+      (Ext_cert.InductiveDecl
+         {
+           decl_name = make_name [ "Audit"; "PolyCode" ];
+           decl_universe_params = [ u_name ];
+           decl_universe_constraints = [];
+           ind_params = [];
+           ind_indices = [];
+           ind_sort = u_level;
+           ind_constructors =
+             [
+               constructor_spec (make_name [ "Audit"; "PolyCode"; "mk" ])
+                 (Ext_term.Pi (Ext_term.Sort u_level, polymorphic_family));
+             ];
+           ind_recursor = None;
+         })
+  in
+  assert_typecheck_rejects
+    "inductive-universe rejects polymorphic succ-u below u"
+    "universe_inconsistency" "constructor_universe_bound_violation"
+    (Ext_typecheck.check_declarations [ polymorphic_decl ]);
+  let constrained_family = local_family [ u_level ] in
+  let constrained_payload constraints =
+    Ext_cert.InductiveDecl
+      {
+        decl_name = make_name [ "Audit"; "Constrained" ];
+        decl_universe_params = [ u_name ];
+        decl_universe_constraints = constraints;
+        ind_params = [];
+        ind_indices = [];
+        ind_sort = u_level;
+        ind_constructors =
+          [
+            constructor_spec (make_name [ "Audit"; "Constrained"; "mk" ])
+              (Ext_term.Pi (Ext_env.nat, constrained_family));
+          ];
+        ind_recursor = None;
+      }
+  in
+  assert_typecheck_rejects
+    "inductive-universe does not invent a missing field constraint"
+    "universe_inconsistency" "constructor_universe_bound_violation"
+    (Ext_typecheck.check_declarations
+       [ declaration_fixture Ext_cert.Inductive (constrained_payload []) ]);
+  let explicit_constraint = le Ext_env.level_type0 u_level in
+  let constrained_env =
+    assert_declaration_check_ok
+      "inductive-universe accepts an explicitly discharged field constraint"
+      (Ext_typecheck.check_declarations
+         [
+           declaration_fixture Ext_cert.Inductive
+             (constrained_payload [ explicit_constraint ]);
+         ])
+  in
+  let constrained_constructor =
+    assert_env_resolves
+      "inductive-universe generated constructor inherits constraints"
+      constrained_env
+      (Ext_term.LocalGenerated
+         { decl_index = 0; name = make_name [ "Audit"; "Constrained"; "mk" ] })
+  in
+  if
+    constrained_constructor.Ext_env.signature_universe_constraints
+    <> [ explicit_constraint ]
+  then failwith "inductive-universe constructor constraints were not inherited";
+  let recursor_name = make_name [ "Audit"; "ConstraintCarrier"; "rec" ] in
+  let recursor_constraint_decl =
+    declaration_fixture Ext_cert.Inductive
+      (Ext_cert.InductiveDecl
+         {
+           decl_name = make_name [ "Audit"; "ConstraintCarrier" ];
+           decl_universe_params = [ u_name ];
+           decl_universe_constraints = [ explicit_constraint ];
+           ind_params = [];
+           ind_indices = [];
+           ind_sort = u_level;
+           ind_constructors = [];
+           ind_recursor =
+             Some
+               {
+                 Ext_cert.recursor_name;
+                 recursor_universe_params = [ u_name; make_name [ "z" ] ];
+                 recursor_ty = Ext_term.Sort u_level;
+                 recursor_rules = { minor_start = 0; major_index = 0 };
+               };
+         })
+  in
+  let recursor_constraint_env =
+    match Ext_env.add_checked_declaration Ext_env.empty recursor_constraint_decl with
+    | Ok env -> env
+    | Error _ -> failwith "inductive-universe could not install signature fixture"
+  in
+  let constrained_recursor =
+    assert_env_resolves "inductive-universe generated recursor inherits constraints"
+      recursor_constraint_env
+      (Ext_term.LocalGenerated { decl_index = 0; name = recursor_name })
+  in
+  if
+    constrained_recursor.Ext_env.signature_universe_constraints
+    <> [ explicit_constraint ]
+  then failwith "inductive-universe recursor constraints were not inherited";
+
+  let parameter_family = local_family [ u_level ] in
+  let parameter_decl =
+    declaration_fixture Ext_cert.Inductive
+      (Ext_cert.InductiveDecl
+         {
+           decl_name = make_name [ "Audit"; "ParameterOnly" ];
+           decl_universe_params = [ u_name ];
+           decl_universe_constraints = [];
+           ind_params = [ binder_type (Ext_term.Sort u_level) ];
+           ind_indices = [];
+           ind_sort = u_level;
+           ind_constructors =
+             [
+               constructor_spec (make_name [ "Audit"; "ParameterOnly"; "mk" ])
+                 (Ext_term.Pi
+                    ( Ext_term.Sort u_level,
+                      Ext_term.App (parameter_family, Ext_term.BVar 0) ));
+             ];
+           ind_recursor = None;
+         })
+  in
+  ignore
+    (assert_declaration_check_ok
+       "inductive-universe excludes the uniform parameter prefix"
+       (Ext_typecheck.check_declarations [ parameter_decl ]));
+
+  let prop_family = local_family [] in
+  let prop_decl =
+    declaration_fixture Ext_cert.Inductive
+      (Ext_cert.InductiveDecl
+         {
+           decl_name = make_name [ "Audit"; "PropBox" ];
+           decl_universe_params = [];
+           decl_universe_constraints = [];
+           ind_params = [];
+           ind_indices = [];
+           ind_sort = Ext_level.Zero;
+           ind_constructors =
+             [
+               constructor_spec (make_name [ "Audit"; "PropBox"; "mk" ])
+                 (Ext_term.Pi (Ext_term.Sort Ext_env.level_type0, prop_family));
+             ];
+           ind_recursor = None;
+         })
+  in
+  ignore
+    (assert_declaration_check_ok
+       "inductive-universe preserves impredicative Prop fields"
+       (Ext_typecheck.check_declarations [ prop_decl ]));
+
+  let zero_constrained_family = local_family [ u_level ] in
+  let zero_constrained_decl =
+    declaration_fixture Ext_cert.Inductive
+      (Ext_cert.InductiveDecl
+         {
+           decl_name = make_name [ "Audit"; "ZeroConstrained" ];
+           decl_universe_params = [ u_name ];
+           decl_universe_constraints =
+             [
+               {
+                 Ext_cert.constraint_lhs = u_level;
+                 constraint_relation = Ext_cert.Eq;
+                 constraint_rhs = Ext_level.Zero;
+               };
+             ];
+           ind_params = [];
+           ind_indices = [];
+           ind_sort = u_level;
+           ind_constructors =
+             [
+               constructor_spec
+                 (make_name [ "Audit"; "ZeroConstrained"; "mk" ])
+                 (Ext_term.Pi
+                    ( Ext_term.Sort Ext_env.level_type0,
+                      zero_constrained_family ));
+             ];
+           ind_recursor = None;
+         })
+  in
+  assert_typecheck_rejects
+    "inductive-universe does not treat a zero-constrained parameter as Prop"
+    "universe_inconsistency" "constructor_universe_bound_violation"
+    (Ext_typecheck.check_declarations [ zero_constrained_decl ]);
+
+  let v_name = make_name [ "v" ] in
+  let w_name = make_name [ "w" ] in
+  let v_level = Ext_level.Param v_name in
+  let w_level = Ext_level.Param w_name in
+  let max_context =
+    match Ext_universe.create [ u_name; v_name; w_name ] [ le u_level v_level ] with
+    | Ok context -> context
+    | Error _ -> failwith "inductive-universe could not construct max context"
+  in
+  (match
+     Ext_universe.entails_level_le max_context u_level
+       (Ext_level.Max (v_level, w_level))
+   with
+  | Ok true -> ()
+  | _ -> failwith "inductive-universe right-hand max obligation was not entailed");
+  let transitive_context =
+    match
+      Ext_universe.create [ u_name; v_name; w_name ]
+        [ le u_level v_level; le v_level w_level ]
+    with
+    | Ok context -> context
+    | Error _ -> failwith "inductive-universe could not construct transitive context"
+  in
+  (match Ext_universe.entails_level_le transitive_context u_level w_level with
+  | Ok true -> ()
+  | _ -> failwith "inductive-universe transitive obligation was not entailed");
+  (match
+     Ext_universe.entails_level_le transitive_context (Ext_level.Succ v_level)
+       (Ext_level.Max (u_level, w_level))
+   with
+  | Ok false -> ()
+  | _ -> failwith "inductive-universe false supported obligation was accepted");
+
+  let constraint_shape_decl name constraints =
+    declaration_fixture Ext_cert.Axiom
+      (Ext_cert.AxiomDecl
+         {
+           decl_name = make_name [ "Audit"; name ];
+           decl_universe_params = [ u_name; v_name; w_name ];
+           decl_universe_constraints = constraints;
+           decl_ty = Ext_term.Sort u_level;
+         })
+  in
+  assert_typecheck_rejects
+    "inductive-universe rejects duplicate stored constraints"
+    "universe_inconsistency" "duplicate_universe_constraint"
+    (Ext_typecheck.check_declarations
+       [
+         constraint_shape_decl "DuplicateConstraint"
+           [ le u_level v_level; le u_level v_level ];
+       ]);
+  assert_typecheck_rejects
+    "inductive-universe rejects unsorted stored constraints"
+    "noncanonical_encoding" "noncanonical_universe_constraints"
+    (Ext_typecheck.check_declarations
+       [
+         constraint_shape_decl "UnsortedConstraint"
+           [ le v_level w_level; le u_level v_level ];
+       ]);
+
+  let resource_params =
+    List.init 64 (fun index -> make_name [ Printf.sprintf "u%03d" index ])
+  in
+  let resource_context =
+    match Ext_universe.create resource_params [] with
+    | Ok context -> context
+    | Error _ -> failwith "inductive-universe could not construct resource context"
+  in
+  let max_level names =
+    List.fold_left
+      (fun level name ->
+        Ext_level.normalize (Ext_level.Max (level, Ext_level.Param name)))
+      Ext_level.Zero names
+  in
+  let rec take_names count names =
+    if count = 0 then []
+    else
+      match names with
+      | [] -> []
+      | name :: rest -> name :: take_names (count - 1) rest
+  in
+  let rec drop_names count names =
+    if count = 0 then names
+    else
+      match names with
+      | [] -> []
+      | _ :: rest -> drop_names (count - 1) rest
+  in
+  (match
+     Ext_universe.entails_level_le resource_context
+       (max_level (take_names 32 resource_params))
+       (max_level (drop_names 31 resource_params))
+   with
+  | Error { Ext_universe.reason = Ext_universe.Resource_limit } -> ()
+  | _ -> failwith "inductive-universe max atom-pair limit was not enforced");
+
+  let too_many_params =
+    List.init 65 (fun index -> make_name [ Printf.sprintf "v%03d" index ])
+  in
+  (match Ext_universe.create too_many_params [] with
+  | Error { Ext_universe.reason = Ext_universe.Resource_limit } -> ()
+  | _ -> failwith "inductive-universe context node limit was not enforced");
+
+  let provider_hash = hash_bytes 0x76 in
+  let provider_decl =
+    declaration_fixture ~interface_hash:provider_hash Ext_cert.Axiom
+      (Ext_cert.AxiomDecl
+         {
+           decl_name = make_name [ "Audit"; "Provider" ];
+           decl_universe_params = [ u_name ];
+           decl_universe_constraints = [ le Ext_env.level_type0 u_level ];
+           decl_ty = Ext_term.Sort u_level;
+         })
+  in
+  let consumer_payload constraints =
+    Ext_cert.AxiomDecl
+      {
+        decl_name = make_name [ "Audit"; "Consumer" ];
+        decl_universe_params = [ v_name ];
+        decl_universe_constraints = constraints;
+        decl_ty = Ext_term.Const (Ext_term.Local { decl_index = 0 }, [ v_level ]);
+      }
+  in
+  assert_typecheck_rejects
+    "inductive-universe enforces instantiated signature constraints"
+    "universe_inconsistency" "universe_constraint_violation"
+    (Ext_typecheck.check_declarations
+       [
+         provider_decl;
+         declaration_fixture Ext_cert.Axiom (consumer_payload []);
+       ]);
+  ignore
+    (assert_declaration_check_ok
+       "inductive-universe accepts entailed instantiated signature constraints"
+       (Ext_typecheck.check_declarations
+          [
+            provider_decl;
+            declaration_fixture Ext_cert.Axiom
+              (consumer_payload [ le Ext_env.level_type0 v_level ]);
+          ]));
+
+  let unsupported_constraint_decl =
+    declaration_fixture Ext_cert.Axiom
+      (Ext_cert.AxiomDecl
+         {
+           decl_name = make_name [ "Audit"; "UnsupportedConstraint" ];
+           decl_universe_params = [ u_name; v_name; w_name ];
+           decl_universe_constraints =
+             [ le u_level (Ext_level.Max (v_level, w_level)) ];
+           decl_ty = Ext_term.Sort u_level;
+         })
+  in
+  assert_typecheck_rejects
+    "inductive-universe rejects stored right-hand max constraints"
+    "universe_inconsistency" "unsupported_universe_constraint"
+    (Ext_typecheck.check_declarations [ unsupported_constraint_decl ]);
+
+  let unsatisfiable_constraint_decl =
+    declaration_fixture Ext_cert.Axiom
+      (Ext_cert.AxiomDecl
+         {
+           decl_name = make_name [ "Audit"; "UnsatisfiableConstraint" ];
+           decl_universe_params = [ u_name ];
+           decl_universe_constraints =
+             [ le (Ext_level.Succ u_level) u_level ];
+           decl_ty = Ext_term.Sort u_level;
+         })
+  in
+  assert_typecheck_rejects "inductive-universe rejects inconsistent assumptions"
+    "universe_inconsistency" "unsatisfiable_universe_constraints"
+    (Ext_typecheck.check_declarations [ unsatisfiable_constraint_decl ]);
+
+  let malicious_mutual_decl =
+    let family_name = make_name [ "Audit"; "Mutual"; "Code" ] in
+    declaration_fixture Ext_cert.Mutual_inductive
+      (Ext_cert.MutualInductiveBlockDecl
+         {
+           decl_name = make_name [ "Audit"; "Mutual" ];
+           decl_universe_params = [];
+           decl_universe_constraints = [];
+           mutual_inductives =
+             [
+               {
+                 Ext_cert.mutual_name = family_name;
+                 mutual_params = [];
+                 mutual_indices = [];
+                 mutual_sort = Ext_env.level_type0;
+                 mutual_constructors =
+                   [
+                     constructor_spec
+                       (make_name [ "Audit"; "Mutual"; "Code"; "mk" ])
+                       (Ext_term.Pi
+                          ( Ext_term.Sort Ext_env.level_type0,
+                            Ext_term.Const
+                              ( Ext_term.LocalGenerated
+                                  { decl_index = 0; name = family_name },
+                                [] ) ));
+                   ];
+                 mutual_recursor = None;
+               };
+             ];
+         })
+  in
+  assert_typecheck_rejects
+    "inductive-universe enforces malicious mutual constructor bounds"
+    "universe_inconsistency" "constructor_universe_bound_violation"
+    (Ext_typecheck.check_declarations [ malicious_mutual_decl ]);
+
+  let legacy_export_offset = 919 in
+  let constrained_export =
+    {
+      Ext_cert.export_name = make_name [ "Audit"; "Provider" ];
+      export_kind = Ext_cert.Export_axiom;
+      export_universe_params = [ u_name ];
+      export_universe_constraints = [];
+      export_ty = Ext_term.Sort u_level;
+      export_body = None;
+      export_type_hash = hash_bytes 0x77;
+      export_body_hash = None;
+      export_reducibility = None;
+      export_opacity = None;
+      export_decl_interface_hash = provider_hash;
+      export_axiom_dependencies = [];
+      export_offset = legacy_export_offset;
+    }
+  in
+  let constrained_legacy_module =
+    {
+      (decoded_axiom_report_fixture
+         [ make_name [ "Audit"; "Provider" ]; u_name ] [ provider_decl ])
+      with
+      Ext_cert.export_block = [ constrained_export ];
+    }
+  in
+  assert_decode_error
+    "inductive-universe legacy exports cannot erase constraints"
+    "unsupported_schema_version"
+    Ext_bytes.Constrained_export_requires_format_upgrade Ext_bytes.Export_block
+    legacy_export_offset
+    (Ext_import_store.public_environment_of_decoded constrained_legacy_module);
+
+  let fixture_path =
+    Filename.concat (root_dir ())
+      "../../testdata/certificates/security/inductive-constructor-universe-bound-v0.1.npcert"
+  in
+  let fixture =
+    decode_module_bytes "inductive-universe frozen fixture"
+      (read_binary_file fixture_path)
+  in
+  assert_typecheck_rejects "inductive-universe rejects frozen exploit fixture"
+    "universe_inconsistency" "constructor_universe_bound_violation"
+    (Ext_typecheck.check_declarations fixture.Ext_cert.declaration_table)
+
 let run_positivity_tests () =
   let positive_name = make_name [ "Positive" ] in
   let positive_family = local_family [] in
@@ -3782,6 +4506,186 @@ let run_positivity_tests () =
   ignore
     (assert_declaration_check_ok "positivity accepts List-like direct recursion"
        (Ext_typecheck.check_declarations [ list_like_decl ]));
+
+  let approved_const decl_index args =
+    Ext_env.apps
+      (Ext_term.Const (Ext_term.Local { decl_index }, [ u_level ]))
+      args
+  in
+  let approved_list = approved_const 0 in
+  let approved_option = approved_const 1 in
+  let approved_prod = approved_const 2 in
+  let approved_list_decl =
+    declaration_fixture Ext_cert.Inductive
+      (Ext_cert.InductiveDecl
+         {
+           decl_name = make_name [ "List" ];
+           decl_universe_params = [ u_name ];
+           decl_universe_constraints = [];
+           ind_params = [ binder_type sort_u ];
+           ind_indices = [];
+           ind_sort = u_level;
+           ind_constructors =
+             [
+               constructor_spec (make_name [ "List"; "nil" ])
+                 (Ext_term.Pi (sort_u, approved_list [ Ext_term.BVar 0 ]));
+               constructor_spec (make_name [ "List"; "cons" ])
+                 (Ext_term.Pi
+                    ( sort_u,
+                      Ext_term.Pi
+                        ( Ext_term.BVar 0,
+                          Ext_term.Pi
+                            ( approved_list [ Ext_term.BVar 1 ],
+                              approved_list [ Ext_term.BVar 2 ] ) ) ));
+             ];
+           ind_recursor = None;
+         })
+  in
+  let approved_option_decl =
+    declaration_fixture Ext_cert.Inductive
+      (Ext_cert.InductiveDecl
+         {
+           decl_name = make_name [ "Option" ];
+           decl_universe_params = [ u_name ];
+           decl_universe_constraints = [];
+           ind_params = [ binder_type sort_u ];
+           ind_indices = [];
+           ind_sort = u_level;
+           ind_constructors =
+             [
+               constructor_spec (make_name [ "Option"; "none" ])
+                 (Ext_term.Pi (sort_u, approved_option [ Ext_term.BVar 0 ]));
+               constructor_spec (make_name [ "Option"; "some" ])
+                 (Ext_term.Pi
+                    ( sort_u,
+                      Ext_term.Pi
+                        ( Ext_term.BVar 0,
+                          approved_option [ Ext_term.BVar 1 ] ) ));
+             ];
+           ind_recursor = None;
+         })
+  in
+  let approved_prod_decl =
+    declaration_fixture Ext_cert.Inductive
+      (Ext_cert.InductiveDecl
+         {
+           decl_name = make_name [ "Prod" ];
+           decl_universe_params = [ u_name ];
+           decl_universe_constraints = [];
+           ind_params = [ binder_type sort_u; binder_type sort_u ];
+           ind_indices = [];
+           ind_sort = u_level;
+           ind_constructors =
+             [
+               constructor_spec (make_name [ "Prod"; "mk" ])
+                 (Ext_term.Pi
+                    ( sort_u,
+                      Ext_term.Pi
+                        ( sort_u,
+                          Ext_term.Pi
+                            ( Ext_term.BVar 1,
+                              Ext_term.Pi
+                                ( Ext_term.BVar 1,
+                                  approved_prod
+                                    [ Ext_term.BVar 3; Ext_term.BVar 2 ] ) ) ) ));
+             ];
+           ind_recursor = None;
+         })
+  in
+  let rose_family =
+    Ext_term.Const (Ext_term.Local { decl_index = 3 }, [ u_level ])
+  in
+  let rose_at arg = Ext_term.App (rose_family, arg) in
+  let rose_nested = rose_at (Ext_term.BVar 1) in
+  let rose_decl =
+    declaration_fixture Ext_cert.Inductive
+      (Ext_cert.InductiveDecl
+         {
+           decl_name = make_name [ "Rose" ];
+           decl_universe_params = [ u_name ];
+           decl_universe_constraints = [];
+           ind_params = [ binder_type sort_u ];
+           ind_indices = [];
+           ind_sort = u_level;
+           ind_constructors =
+             [
+               constructor_spec (make_name [ "Rose"; "node" ])
+                 (Ext_term.Pi
+                    ( sort_u,
+                      Ext_term.Pi
+                        ( Ext_term.BVar 0,
+                          Ext_term.Pi
+                            ( approved_prod
+                                [
+                                  approved_option [ rose_nested ];
+                                  approved_list [ rose_nested ];
+                                ],
+                              rose_at (Ext_term.BVar 2) ) ) ));
+             ];
+           ind_recursor = None;
+         })
+  in
+  ignore
+    (assert_declaration_check_ok
+       "positivity accepts exact List Option Prod nested recursion"
+       (Ext_typecheck.check_declarations
+          [
+            approved_list_decl;
+            approved_option_decl;
+            approved_prod_decl;
+            rose_decl;
+          ]));
+
+  let fake_list_decl =
+    match approved_list_decl.Ext_cert.payload with
+    | Ext_cert.InductiveDecl payload ->
+        {
+          approved_list_decl with
+          Ext_cert.payload =
+            Ext_cert.InductiveDecl
+              {
+                payload with
+                ind_constructors =
+                  [
+                    constructor_spec (make_name [ "List"; "fake" ])
+                      (Ext_term.Pi
+                         (sort_u, approved_list [ Ext_term.BVar 0 ]));
+                  ];
+              };
+        }
+    | _ -> failwith "invalid approved List fixture"
+  in
+  let fake_rose_family =
+    Ext_term.Const (Ext_term.Local { decl_index = 1 }, [ u_level ])
+  in
+  let fake_rose_decl =
+    declaration_fixture Ext_cert.Inductive
+      (Ext_cert.InductiveDecl
+         {
+           decl_name = make_name [ "FakeRose" ];
+           decl_universe_params = [ u_name ];
+           decl_universe_constraints = [];
+           ind_params = [ binder_type sort_u ];
+           ind_indices = [];
+           ind_sort = u_level;
+           ind_constructors =
+             [
+               constructor_spec (make_name [ "FakeRose"; "node" ])
+                 (Ext_term.Pi
+                    ( sort_u,
+                      Ext_term.Pi
+                        ( approved_list
+                            [ Ext_term.App (fake_rose_family, Ext_term.BVar 0) ],
+                          Ext_term.App
+                            (fake_rose_family, Ext_term.BVar 1) ) ));
+             ];
+           ind_recursor = None;
+         })
+  in
+  assert_typecheck_rejects
+    "positivity rejects name-only fake approved List"
+    "positivity_failure" "positivity_failure"
+    (Ext_typecheck.check_declarations [ fake_list_decl; fake_rose_decl ]);
 
   let bad_family = local_family [] in
   let bad_decl =
@@ -4112,6 +5016,281 @@ let run_recursor_tests () =
     (Ext_typecheck.whnf list_env Ext_typecheck.empty_context list_rec_cons);
   assert_typecheck_ok "recursor List-like cons checks through iota"
     (Ext_typecheck.check list_env Ext_typecheck.empty_context list_rec_cons
+       Ext_env.nat);
+
+  let indexed_name = make_name [ "Indexed" ] in
+  let indexed_zero_name = make_name [ "Indexed"; "zero" ] in
+  let indexed_succ_name = make_name [ "Indexed"; "succ" ] in
+  let indexed_rec_name = make_name [ "Indexed"; "rec" ] in
+  let indexed_family = local_family [] in
+  let indexed_at value = Ext_term.App (indexed_family, value) in
+  let indexed_zero =
+    constructor_spec indexed_zero_name (indexed_at Ext_env.nat_zero)
+  in
+  let indexed_succ =
+    constructor_spec indexed_succ_name
+      (Ext_term.Pi
+         ( Ext_env.nat,
+           Ext_term.Pi
+             ( indexed_at (Ext_term.BVar 0),
+               indexed_at (Ext_env.nat_succ (Ext_term.BVar 1)) ) ))
+  in
+  let indexed_rules = { Ext_cert.minor_start = 1; major_index = 4 } in
+  let indexed_placeholder =
+    {
+      Ext_cert.recursor_name = indexed_rec_name;
+      recursor_universe_params = [];
+      recursor_ty = Ext_term.Sort Ext_level.Zero;
+      recursor_rules = indexed_rules;
+    }
+  in
+  let indexed_recursor_ty =
+    match
+      Ext_typecheck.expected_recursor_type Ext_bytes.Declarations 0 0 [] []
+        [ binder_type Ext_env.nat ] Ext_env.level_type0
+        [ indexed_zero; indexed_succ ] indexed_placeholder
+    with
+    | Ok ty -> ty
+    | Error _ -> failwith "failed to construct indexed recursor fixture"
+  in
+  let indexed_recursor =
+    { indexed_placeholder with Ext_cert.recursor_ty = indexed_recursor_ty }
+  in
+  let indexed_decl =
+    declaration_fixture Ext_cert.Inductive
+      (Ext_cert.InductiveDecl
+         {
+           decl_name = indexed_name;
+           decl_universe_params = [];
+           decl_universe_constraints = [];
+           ind_params = [];
+           ind_indices = [ binder_type Ext_env.nat ];
+           ind_sort = Ext_env.level_type0;
+           ind_constructors = [ indexed_zero; indexed_succ ];
+           ind_recursor = Some indexed_recursor;
+         })
+  in
+  let indexed_env =
+    assert_declaration_check_ok "recursor accepts indexed family"
+      (Ext_typecheck.check_declarations [ indexed_decl ])
+  in
+  let indexed_zero_term = local_generated indexed_zero_name [] in
+  let indexed_succ_term index previous =
+    Ext_env.apps (local_generated indexed_succ_name []) [ index; previous ]
+  in
+  let indexed_motive =
+    Ext_term.Lam
+      ( Ext_env.nat,
+        Ext_term.Lam (indexed_at (Ext_term.BVar 0), Ext_env.nat) )
+  in
+  let indexed_step =
+    Ext_term.Lam
+      ( Ext_env.nat,
+        Ext_term.Lam
+          ( indexed_at (Ext_term.BVar 0),
+            Ext_term.Lam (Ext_env.nat, Ext_term.BVar 0) ) )
+  in
+  let indexed_rec = local_generated indexed_rec_name [] in
+  let indexed_rec_zero =
+    Ext_env.apps indexed_rec
+      [
+        indexed_motive;
+        Ext_env.nat_zero;
+        indexed_step;
+        Ext_env.nat_zero;
+        indexed_zero_term;
+      ]
+  in
+  assert_term_result "indexed recursor zero iota" Ext_env.nat_zero
+    (Ext_typecheck.whnf indexed_env Ext_typecheck.empty_context
+       indexed_rec_zero);
+  let indexed_rec_succ =
+    Ext_env.apps indexed_rec
+      [
+        indexed_motive;
+        Ext_env.nat_zero;
+        indexed_step;
+        Ext_env.nat_succ Ext_env.nat_zero;
+        indexed_succ_term Ext_env.nat_zero indexed_zero_term;
+      ]
+  in
+  assert_term_result "indexed recursor succ iota" Ext_env.nat_zero
+    (Ext_typecheck.whnf indexed_env Ext_typecheck.empty_context
+       indexed_rec_succ);
+
+  let even_name = make_name [ "Mutual"; "Even" ] in
+  let odd_name = make_name [ "Mutual"; "Odd" ] in
+  let even_zero_name = make_name [ "Mutual"; "Even"; "zero" ] in
+  let even_step_name = make_name [ "Mutual"; "Even"; "step" ] in
+  let odd_step_name = make_name [ "Mutual"; "Odd"; "step" ] in
+  let even_rec_name = make_name [ "Mutual"; "Even"; "rec" ] in
+  let odd_rec_name = make_name [ "Mutual"; "Odd"; "rec" ] in
+  let mutual_family_const name =
+    Ext_term.Const (Ext_term.LocalGenerated { decl_index = 0; name }, [])
+  in
+  let even_family = mutual_family_const even_name in
+  let odd_family = mutual_family_const odd_name in
+  let even_zero = constructor_spec even_zero_name even_family in
+  let even_step =
+    constructor_spec even_step_name (Ext_term.Pi (odd_family, even_family))
+  in
+  let odd_step =
+    constructor_spec odd_step_name (Ext_term.Pi (even_family, odd_family))
+  in
+  let mutual_rules = { Ext_cert.minor_start = 2; major_index = 5 } in
+  let placeholder name =
+    {
+      Ext_cert.recursor_name = name;
+      recursor_universe_params = [];
+      recursor_ty = Ext_term.Sort Ext_level.Zero;
+      recursor_rules = mutual_rules;
+    }
+  in
+  let base_mutuals =
+    [
+      {
+        Ext_cert.mutual_name = even_name;
+        mutual_params = [];
+        mutual_indices = [];
+        mutual_sort = Ext_env.level_type0;
+        mutual_constructors = [ even_zero; even_step ];
+        mutual_recursor = Some (placeholder even_rec_name);
+      };
+      {
+        Ext_cert.mutual_name = odd_name;
+        mutual_params = [];
+        mutual_indices = [];
+        mutual_sort = Ext_env.level_type0;
+        mutual_constructors = [ odd_step ];
+        mutual_recursor = Some (placeholder odd_rec_name);
+      };
+    ]
+  in
+  let mutual_recursor target_index name =
+    let recursor = placeholder name in
+    match
+      Ext_typecheck.expected_mutual_recursor_type Ext_bytes.Declarations 0 0
+        [] base_mutuals target_index recursor
+    with
+    | Ok ty -> { recursor with Ext_cert.recursor_ty = ty }
+    | Error _ -> failwith "failed to construct mutual recursor fixture"
+  in
+  let mutuals =
+    match base_mutuals with
+    | [ even; odd ] ->
+        [
+          {
+            even with
+            Ext_cert.mutual_recursor =
+              Some (mutual_recursor 0 even_rec_name);
+          };
+          {
+            odd with
+            Ext_cert.mutual_recursor = Some (mutual_recursor 1 odd_rec_name);
+          };
+        ]
+    | _ -> failwith "invalid mutual recursor fixture"
+  in
+  let mutual_decl =
+    declaration_fixture Ext_cert.Mutual_inductive
+      (Ext_cert.MutualInductiveBlockDecl
+         {
+           decl_name = make_name [ "Mutual" ];
+           decl_universe_params = [];
+           decl_universe_constraints = [];
+           mutual_inductives = mutuals;
+         })
+  in
+  let mutual_env =
+    assert_declaration_check_ok "recursor accepts direct mutual block"
+      (Ext_typecheck.check_declarations [ mutual_decl ])
+  in
+  let motive family = Ext_term.Lam (family, Ext_env.nat) in
+  let keep_ih family =
+    Ext_term.Lam (family, Ext_term.Lam (Ext_env.nat, Ext_term.BVar 0))
+  in
+  let even_zero_term = mutual_family_const even_zero_name in
+  let odd_step_term value =
+    Ext_term.App (mutual_family_const odd_step_name, value)
+  in
+  let even_step_term value =
+    Ext_term.App (mutual_family_const even_step_name, value)
+  in
+  let mutual_args major =
+    [
+      motive even_family;
+      motive odd_family;
+      Ext_env.nat_zero;
+      keep_ih odd_family;
+      keep_ih even_family;
+      major;
+    ]
+  in
+  let mutual_zero =
+    Ext_env.apps (mutual_family_const even_rec_name)
+      (mutual_args even_zero_term)
+  in
+  assert_term_result "mutual recursor base iota" Ext_env.nat_zero
+    (Ext_typecheck.whnf mutual_env Ext_typecheck.empty_context mutual_zero);
+  let mutual_cross =
+    Ext_env.apps (mutual_family_const even_rec_name)
+      (mutual_args
+         (even_step_term (odd_step_term even_zero_term)))
+  in
+  assert_term_result "mutual recursor cross-family iota" Ext_env.nat_zero
+    (Ext_typecheck.whnf mutual_env Ext_typecheck.empty_context mutual_cross);
+  assert_typecheck_ok "mutual recursor cross-family iota type checks"
+    (Ext_typecheck.check mutual_env Ext_typecheck.empty_context mutual_cross
+       Ext_env.nat);
+
+  let nested_bytes =
+    read_binary_file
+      (Filename.concat (root_dir ())
+         "test/fixtures/conformance/nested-v0.2.npcert")
+  in
+  let nested_decoded = decode_module_bytes "nested recursor fixture" nested_bytes in
+  let nested_env =
+    assert_declaration_check_ok "recursor accepts generated nested family"
+      (Ext_typecheck.check_declarations nested_decoded.Ext_cert.declaration_table)
+  in
+  let level = Ext_env.level_type0 in
+  let generated decl_index name =
+    Ext_term.Const
+      (Ext_term.LocalGenerated { decl_index; name = make_name name }, [ level ])
+  in
+  let list_family =
+    Ext_term.Const (Ext_term.Local { decl_index = 0 }, [ level ])
+  in
+  let rose_family =
+    Ext_term.Const (Ext_term.Local { decl_index = 1 }, [ level ])
+  in
+  let rose_nat = Ext_term.App (rose_family, Ext_env.nat) in
+  let list_rose_nat = Ext_term.App (list_family, rose_nat) in
+  let empty_children =
+    Ext_term.App (generated 0 [ "List"; "nil" ], rose_nat)
+  in
+  let node =
+    Ext_env.apps (generated 1 [ "Rose"; "node" ])
+      [ Ext_env.nat; Ext_env.nat_zero; empty_children ]
+  in
+  let motive = Ext_term.Lam (rose_nat, Ext_env.nat) in
+  let minor =
+    Ext_term.Lam
+      (Ext_env.nat, Ext_term.Lam (list_rose_nat, Ext_env.nat_zero))
+  in
+  let nested_recursor =
+    Ext_term.Const
+      ( Ext_term.LocalGenerated
+          { decl_index = 1; name = make_name [ "Rose"; "rec" ] },
+        [ level; level ] )
+  in
+  let nested_iota =
+    Ext_env.apps nested_recursor [ Ext_env.nat; motive; minor; node ]
+  in
+  assert_term_result "nested recursor node iota" Ext_env.nat_zero
+    (Ext_typecheck.whnf nested_env Ext_typecheck.empty_context nested_iota);
+  assert_typecheck_ok "nested recursor node iota type checks"
+    (Ext_typecheck.check nested_env Ext_typecheck.empty_context nested_iota
        Ext_env.nat)
 
 let run_subst_tests () =
@@ -4322,7 +5501,19 @@ let run_reduce_tests () =
   assert_typecheck_rejects "reduce recursive fuel exhaustion is deterministic"
     "conversion_failure" "resource_limit"
     (Ext_typecheck.whnf_with_fuel_budget ~fuel_budget:1 Ext_env.empty
-       Ext_typecheck.empty_context beta_term)
+       Ext_typecheck.empty_context beta_term);
+  let reconstruction_fuel = ref 2 in
+  assert_typecheck_rejects "mutual reconstruction work is fuel bounded"
+    "conversion_failure" "resource_limit"
+    (Ext_typecheck.spend_fuel_units Ext_bytes.Declarations 0
+       reconstruction_fuel 3);
+  assert_int_equal "rejected reconstruction keeps fuel" 2 !reconstruction_fuel;
+  (match
+     Ext_typecheck.spend_fuel_units Ext_bytes.Declarations 0
+       reconstruction_fuel 2
+   with
+  | Ok () -> assert_int_equal "accepted reconstruction spends fuel" 0 !reconstruction_fuel
+  | Error _ -> failwith "bounded mutual reconstruction fuel must be spendable")
 
 let run_defeq_tests () =
   let nat = Ext_env.nat in
@@ -4362,6 +5553,82 @@ let run_defeq_tests () =
     (defeq (Ext_env.builtin_const "Eq" [ normalized_level ])
        (Ext_env.builtin_const "Eq" [ Ext_env.level_type0 ]));
 
+  let eq_path =
+    Filename.concat (root_dir ())
+      "../../testdata/package/proofs/vendor/npa-std/Std/Logic/Eq/certificate.npcert"
+  in
+  let eq_module = load_single_import_entry "defeq Eq import fixture" eq_path in
+  let eq_request =
+    decoded_import_request "defeq Eq import request"
+      eq_module.Ext_import_store.import_entry.Ext_import.module_name
+      eq_module.Ext_import_store.import_entry.Ext_import.export_hash None
+  in
+  let eq_import_environment =
+    assert_import_environment_ok "defeq Eq import environment" [ eq_module ]
+      eq_request
+  in
+  let eq_env = Ext_env.of_imports eq_import_environment in
+  let eq_import =
+    single_resolved_import "defeq Eq resolved import" eq_import_environment
+  in
+  let imported_eq_const dotted levels =
+    let imported_name = make_name (Ext_env.split_dotted dotted) in
+    let exports =
+      eq_import.Ext_import_store.resolved_public_environment.public_exports
+    in
+    let export =
+      match
+        List.find_opt
+          (fun (export : Ext_import_store.public_export) ->
+            Ext_name.equal export.Ext_import_store.public_export_name
+              imported_name)
+          exports
+      with
+      | Some export -> export
+      | None ->
+          failwith
+            ("missing imported Eq export " ^ dotted ^ " among "
+            ^ String.concat ","
+                (List.map
+                   (fun (export : Ext_import_store.public_export) ->
+                     Ext_name.to_string
+                       export.Ext_import_store.public_export_name)
+                   exports))
+    in
+    Ext_term.Const
+      ( Ext_term.Imported
+          {
+            import_index = 0;
+            name = imported_name;
+            decl_interface_hash =
+              export.Ext_import_store.public_decl_interface_hash;
+          },
+        levels )
+  in
+  assert_defeq "defeq authenticates imported Eq as builtin" true
+    (defeq ~env:eq_env
+       (imported_eq_const "Eq" [ Ext_level.Zero ])
+       (Ext_env.builtin_const "Eq" [ Ext_level.Zero ]));
+  assert_defeq "defeq authenticates imported Eq.refl as builtin" true
+    (defeq ~env:eq_env
+       (imported_eq_const "Eq.refl" [ Ext_level.Zero ])
+       (Ext_env.builtin_const "Eq.refl" [ Ext_level.Zero ]));
+  let wrong_eq_import =
+    {
+      eq_import with
+      Ext_import_store.resolved_module_name =
+        make_name [ "Not"; "Std"; "Logic"; "Eq" ];
+    }
+  in
+  let wrong_eq_env =
+    Ext_env.of_imports
+      { Ext_import_store.resolved_imports = [ wrong_eq_import ] }
+  in
+  assert_defeq "defeq does not bridge an Eq-shaped untrusted module" false
+    (defeq ~env:wrong_eq_env
+       (imported_eq_const "Eq" [ Ext_level.Zero ])
+       (Ext_env.builtin_const "Eq" [ Ext_level.Zero ]));
+
   let fn_ty = Ext_term.Pi (nat, nat) in
   let fn_context = Ext_typecheck.push_assumption Ext_typecheck.empty_context fn_ty in
   let open_app = Ext_term.App (Ext_term.BVar 0, nat_zero) in
@@ -4394,6 +5661,8 @@ let run_defeq_tests () =
 let run_hash_encoder_tests () =
   let empty_module = encode_module [] [] [] [] [] in
   let empty_decoded = decode_module_bytes "empty hash fixture" empty_module in
+  assert_canonical_bytes "empty full certificate re-encoding" empty_module
+    (Ext_canonical.encode_module_bytes empty_decoded);
   assert_canonical_bytes "empty export payload" (encode_export_block [])
     (Ext_canonical.encode_export_block empty_decoded);
   assert_canonical_bytes "empty axiom report payload" (encode_axiom_report [] [])
@@ -4408,6 +5677,8 @@ let run_hash_encoder_tests () =
 
   let axiom_module = encode_minimal_module [ minimal_axiom_decl ] [ minimal_export_entry ] in
   let axiom_decoded = decode_module_bytes "axiom hash fixture" axiom_module in
+  assert_canonical_bytes "axiom full certificate re-encoding" axiom_module
+    (Ext_canonical.encode_module_bytes axiom_decoded);
   assert_canonical_bytes "axiom export payload" (encode_export_block [ minimal_export_entry ])
     (Ext_canonical.encode_export_block axiom_decoded);
   let axiom_decl = first_declaration axiom_decoded in
@@ -4552,9 +5823,324 @@ let run_hash_encoder_tests () =
       fixture.golden_axiom_report_hash (Ext_canonical.axiom_report_hash decoded)
   in
   assert_golden_module "nat"
-    (Filename.concat (root_dir ()) "../../proofs/vendor/npa-std/Std/Nat/Basic/certificate.npcert");
+    (Filename.concat (root_dir ()) "../../testdata/package/npa-mathlib/vendor/npa-std/Std/Nat/Basic/certificate.npcert");
   assert_golden_module "eq"
-    (Filename.concat (root_dir ()) "../../proofs/vendor/npa-std/Std/Logic/Eq/certificate.npcert")
+    (Filename.concat (root_dir ()) "../../testdata/package/npa-mathlib/vendor/npa-std/Std/Logic/Eq/certificate.npcert");
+
+  let assert_versioned_reencoding label relative_path expected_version =
+    let bytes = read_binary_file (Filename.concat (root_dir ()) relative_path) in
+    let decoded = decode_module_bytes label bytes in
+    assert_bool (label ^ " version")
+      (decoded.Ext_cert.header.Ext_cert.version = expected_version);
+    assert_canonical_bytes (label ^ " full certificate re-encoding") bytes
+      (Ext_canonical.encode_module_bytes decoded);
+    assert_declaration_hashes label decoded;
+    (match Ext_canonical.verify_module_hashes bytes decoded with
+    | Ok Ext_canonical.Module_hashes_ok -> ()
+    | Ok (Ext_canonical.Module_hash_mismatch mismatch) ->
+        failwith
+          (label ^ ": unexpected module hash mismatch "
+          ^ Ext_canonical.module_hash_role_kind_code
+              mismatch.Ext_canonical.module_mismatch_role)
+    | Error error ->
+        failwith
+          (label ^ ": unexpected hash decode error "
+          ^ Ext_bytes.reason_code error.Ext_bytes.reason))
+  in
+  assert_versioned_reencoding "previous certificate"
+    "../../testdata/package/npa-mathlib-downstream/vendor/npa-mathlib/Mathlib/Logic/Basic/certificate.npcert"
+    Ext_cert.Previous;
+  assert_versioned_reencoding "current certificate"
+    "../../testdata/package/npa-mathlib-downstream/Downstream/MathlibBasic/certificate.npcert"
+    Ext_cert.Current
+
+let run_checker_pipeline_tests () =
+  let import_bytes =
+    read_binary_file
+      (Filename.concat (root_dir ())
+         "../../testdata/package/npa-mathlib-downstream/vendor/npa-mathlib/Mathlib/Logic/Basic/certificate.npcert")
+  in
+  let leaf_bytes =
+    read_binary_file
+      (Filename.concat (root_dir ())
+         "../../testdata/package/npa-mathlib-downstream/Downstream/MathlibBasic/certificate.npcert")
+  in
+  let store =
+    match Ext_import_store.from_source_free_certificates [ import_bytes ] with
+    | Ok store -> store
+    | Error _ -> failwith "checker pipeline failed to build import store"
+  in
+  match Ext_checker.check_normal store Ext_axiom.default_policy leaf_bytes with
+  | Error _ -> failwith "checker pipeline unexpectedly rejected current leaf"
+  | Ok checked ->
+      assert_equal "checker pipeline module" "Downstream.MathlibBasic"
+        (Ext_name.to_string (Ext_checker.module_name checked));
+      assert_int_equal "checker pipeline declaration count" 1
+        (Ext_checker.declarations_checked checked);
+      let import_dir =
+        Filename.concat (root_dir ())
+          "../../testdata/package/npa-mathlib-downstream/vendor"
+      in
+      (match
+         Ext_session.check_high_trust import_dir Ext_axiom.default_policy
+           leaf_bytes
+       with
+      | Error _ -> failwith "checker high-trust session rejected valid DAG"
+      | Ok session ->
+          assert_int_equal "checker high-trust import count" 1
+            (List.length session.Ext_session.checked_imports);
+          assert_equal "checker high-trust leaf" "Downstream.MathlibBasic"
+            (Ext_name.to_string
+               (Ext_checker.module_name session.Ext_session.leaf)));
+      let policy_path =
+        Filename.concat (root_dir ()) "test/fixtures/axiom-policy.toml"
+      in
+      let cli =
+        Ext_cli.run
+          [
+            "--cert";
+            Filename.concat (root_dir ())
+              "../../testdata/package/npa-mathlib-downstream/Downstream/MathlibBasic/certificate.npcert";
+            "--import-dir";
+            import_dir;
+            "--policy";
+            policy_path;
+            "--policy-hash";
+            Ext_hash.sha256_prefixed_hex_of_string
+              (read_binary_file policy_path);
+            "--output";
+            "json";
+          ]
+      in
+      assert_int_equal "checker executable-shaped CLI exit" 0 cli.code;
+      assert_equal "checker executable-shaped CLI stderr" "" cli.stderr;
+      let assert_raw_identity label json =
+        assert_contains (label ^ " schema")
+          "\"schema\": \"npa.independent-checker.checker_raw_result.v1\""
+          json;
+        assert_contains (label ^ " checker id")
+          "\"checker_id\": \"npa-checker-ext\"" json;
+        assert_contains (label ^ " checker version")
+          "\"checker_version\": \"0.2.0\"" json;
+        assert_contains (label ^ " checker build hash")
+          ("\"checker_build_hash\": \"" ^ Ext_result.checker_build_hash ^ "\"")
+          json
+      in
+      assert_raw_identity "checker executable-shaped CLI" cli.stdout;
+      assert_contains "checker executable-shaped CLI checked"
+        "\"status\": \"checked\"" cli.stdout;
+      assert_contains "checker executable-shaped CLI module"
+        "\"module\": \"Downstream.MathlibBasic\"" cli.stdout;
+      let policy_hash_mismatch =
+        Ext_cli.run
+          [
+            "--cert";
+            Filename.concat (root_dir ())
+              "../../testdata/package/npa-mathlib-downstream/Downstream/MathlibBasic/certificate.npcert";
+            "--import-dir";
+            import_dir;
+            "--policy";
+            policy_path;
+            "--policy-hash";
+            "sha256:" ^ String.make 64 '0';
+            "--output";
+            "json";
+          ]
+      in
+      assert_int_equal "checker policy hash mismatch exit" 1
+        policy_hash_mismatch.code;
+      assert_raw_identity "checker policy hash mismatch"
+        policy_hash_mismatch.stdout;
+      assert_contains "checker policy hash mismatch kind"
+        "\"kind\": \"policy_input_error\"" policy_hash_mismatch.stdout;
+
+      let boundary_dir =
+        Filename.concat (root_dir ()) "test/fixtures/conformance"
+      in
+      let boundary_file name =
+        read_binary_file (Filename.concat boundary_dir name)
+      in
+      let bad_provider =
+        boundary_file "unchecked-provider-bad-v0.2.npcert"
+      in
+      let unpinned_leaf =
+        boundary_file "unchecked-consumer-unpinned-v0.2.npcert"
+      in
+      let pinned_leaf =
+        boundary_file "unchecked-consumer-pinned-v0.2.npcert"
+      in
+      (match
+         Ext_checker.check_normal [] Ext_axiom.default_policy bad_provider
+       with
+      | Error (Ext_checker.Type_error _) -> ()
+      | _ -> failwith "semantic boundary provider must fail direct checking");
+      let unchecked_store =
+        match
+          Ext_import_store.from_source_free_certificates [ bad_provider ]
+        with
+        | Ok store -> store
+        | Error _ -> failwith "semantic boundary import must hash-check"
+      in
+      (match
+         Ext_checker.check_normal unchecked_store Ext_axiom.default_policy
+           unpinned_leaf
+       with
+      | Ok checked ->
+          assert_equal "normal boundary accepts unchecked public import"
+            "Conformance.UncheckedConsumer"
+            (Ext_name.to_string (Ext_checker.module_name checked))
+      | Error _ ->
+          failwith "normal mode must retain unchecked-import semantics");
+      (match
+         Ext_session.check_high_trust boundary_dir Ext_axiom.default_policy
+           pinned_leaf
+       with
+      | Error (Ext_session.Check_error (Ext_checker.Type_error _)) -> ()
+      | _ ->
+          failwith
+            "high-trust boundary must reject semantically invalid import");
+      let permissive_policy =
+        {
+          Ext_axiom.default_policy with
+          Ext_axiom.deny_sorry = false;
+          Ext_axiom.deny_custom_axioms = false;
+        }
+      in
+      (match
+         Ext_checker.check_high_trust [] permissive_policy
+           (boundary_file "forbidden-axiom-v0.2.npcert")
+       with
+      | Error (Ext_checker.Axiom_policy_error _) -> ()
+      | _ ->
+          failwith
+            "high-trust checker must not permit axiom-denial overrides");
+
+      let decoded_fixture name =
+        decode_module_bytes name (boundary_file name)
+      in
+      let indexed = decoded_fixture "indexed-v0.2.npcert" in
+      let mutual = decoded_fixture "mutual-v0.2.npcert" in
+      let nested = decoded_fixture "nested-v0.2.npcert" in
+      let checked_mutual =
+        match
+          Ext_checker.check_high_trust [] Ext_axiom.default_policy
+            (boundary_file "mutual-v0.2.npcert")
+        with
+        | Ok checked -> checked
+        | Error _ -> failwith "mutual cache provider must check"
+      in
+      let checked_imported_mutual =
+        match
+          Ext_checker.check_high_trust [ checked_mutual ]
+            Ext_axiom.default_policy
+            (boundary_file "imported-mutual-iota-v0.2.npcert")
+        with
+        | Ok checked -> checked
+        | Error _ -> failwith "mutual cache consumer must check"
+      in
+      if Ext_checker.imported_recursor_cache_size checked_imported_mutual < 2
+      then failwith "mutual iota must cache both family recursors";
+      assert_int_equal "mutual iota reconstructs one shared block" 1
+        (Ext_checker.imported_mutual_block_cache_size checked_imported_mutual);
+      assert_bool "mutual iota runtimes share reconstructed family storage"
+        (Ext_checker.imported_mutual_runtimes_share_families
+           checked_imported_mutual);
+      let request ?(certificate_hash = true) offset decoded =
+        {
+          Ext_cert.import_entry =
+            {
+              Ext_import.module_name =
+                decoded.Ext_cert.header.Ext_cert.module_name;
+              export_hash = decoded.Ext_cert.hashes.Ext_cert.export_hash;
+              certificate_hash =
+                (if certificate_hash then
+                   Some decoded.Ext_cert.hashes.Ext_cert.certificate_hash
+                 else None);
+            };
+          import_offset = offset;
+        }
+      in
+      let candidate decoded =
+        { Ext_session.bytes = ""; decoded }
+      in
+      let mutual_with_no_imports = { mutual with Ext_cert.imports = [] } in
+      let indexed_depends_on_mutual =
+        {
+          indexed with
+          Ext_cert.imports = [ request 11 mutual_with_no_imports ];
+        }
+      in
+      let nested_depends_on_indexed =
+        {
+          nested with
+          Ext_cert.imports = [ request 12 indexed_depends_on_mutual ];
+        }
+      in
+      (match
+         Ext_session.topological_plan
+           [ candidate indexed_depends_on_mutual; candidate mutual_with_no_imports ]
+           (candidate nested_depends_on_indexed)
+       with
+      | Ok [ first; second ] ->
+          assert_equal "high-trust plan child first" "Conformance.EvenOdd"
+            (Ext_name.to_string
+               first.Ext_session.decoded.Ext_cert.header.Ext_cert.module_name);
+          assert_equal "high-trust plan consumer second" "Conformance.Indexed"
+            (Ext_name.to_string
+               second.Ext_session.decoded.Ext_cert.header.Ext_cert.module_name)
+      | _ -> failwith "high-trust plan must be deterministic child-first");
+      let mutual_depends_on_indexed =
+        {
+          mutual with
+          Ext_cert.imports = [ request 13 indexed_depends_on_mutual ];
+        }
+      in
+      let indexed_cycle =
+        {
+          indexed with
+          Ext_cert.imports = [ request 14 mutual_depends_on_indexed ];
+        }
+      in
+      (match
+         Ext_session.topological_plan
+           [ candidate indexed_cycle; candidate mutual_depends_on_indexed ]
+           (candidate
+              {
+                nested with
+                Ext_cert.imports = [ request 15 indexed_cycle ];
+              })
+       with
+      | Error (Ext_session.Graph_error { reason = Ext_session.Import_cycle; _ }) ->
+          ()
+      | _ -> failwith "high-trust plan must reject import cycles");
+      (match
+         Ext_session.topological_plan
+           [ candidate mutual_with_no_imports; candidate mutual_with_no_imports ]
+           (candidate
+              {
+                nested with
+                Ext_cert.imports = [ request 16 mutual_with_no_imports ];
+              })
+       with
+      | Error
+          (Ext_session.Graph_error { reason = Ext_session.Duplicate_import; _ }) ->
+          ()
+      | _ -> failwith "high-trust plan must reject duplicate identities");
+      (match
+         Ext_session.topological_plan [ candidate mutual_with_no_imports ]
+           (candidate
+              {
+                nested with
+                Ext_cert.imports =
+                  [ request ~certificate_hash:false 17 mutual_with_no_imports ];
+              })
+       with
+      | Error
+          (Ext_session.Graph_error
+            { reason = Ext_session.Missing_certificate_hash; offset = 17 }) ->
+          ()
+      | _ ->
+          failwith "high-trust plan must reject missing certificate hashes")
 
 let should_run selected name = selected = [] || List.mem name selected
 
@@ -4567,6 +6153,7 @@ let () =
           (List.mem name
              [
                "cli";
+               "checker-pipeline";
                "defeq";
                "axiom-report";
                "axiom-policy";
@@ -4585,6 +6172,7 @@ let () =
                "import-normal";
                "import-store";
                "inductive-constructors";
+               "inductive-universe";
                "positivity";
                "recursor";
                "reduce";
@@ -4617,6 +6205,8 @@ let () =
   if should_run selected "import-high-trust" then run_import_high_trust_tests ();
   if should_run selected "inductive-constructors" then
     run_inductive_constructor_tests ();
+  if should_run selected "inductive-universe" then
+    run_inductive_universe_tests ();
   if should_run selected "positivity" then run_positivity_tests ();
   if should_run selected "recursor" then run_recursor_tests ();
   if should_run selected "reduce" then run_reduce_tests ();
@@ -4625,4 +6215,5 @@ let () =
   if should_run selected "type-core" then run_type_core_tests ();
   if should_run selected "type-declarations" then run_type_declarations_tests ();
   if should_run selected "hash-encoder" then run_hash_encoder_tests ();
+  if should_run selected "checker-pipeline" then run_checker_pipeline_tests ();
   if should_run selected "cli" then run_cli_tests ()

@@ -1,0 +1,81 @@
+{
+  "schema": "npa.generated_artifact_release_manifest.v0.2",
+  "package": "npa-project-iut",
+  "package_root": "proofs",
+  "source_commit": "1111111111111111111111111111111111111111",
+  "tag": "v1.0.0",
+  "npa_core_ref": "2222222222222222222222222222222222222222",
+  "generated_at_utc": "2026-07-12T00:00:00Z",
+  "generator_commands": [
+    "generate"
+  ],
+  "check_commands": [
+    "check"
+  ],
+  "generated_files": [
+    {
+      "path": "proofs/generated/package-lock.json",
+      "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    }
+  ],
+  "omitted_files": [],
+  "archive": {
+    "path": "npa-project-iut-proofs-generated-v1.0.0.tar.gz",
+    "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  },
+  "verification": {
+    "package_lock_mode": "checked",
+    "package_lock_path": "proofs/generated/package-lock.json",
+    "package_lock_sha256": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "command": "cargo run --locked --offline --manifest-path npa-core/Cargo.toml -p npa-cli -- package verify-certs --root npa-project-iut/proofs --package-lock checked --checker fast --audit-cache off --verifier-memo off --json",
+    "command_result": {
+      "schema": "npa.package.command_result.v0.1",
+      "command": "package verify-certs",
+      "root": "npa-project-iut/proofs",
+      "status": "passed",
+      "diagnostics": [
+        {
+          "kind": "FastVerifier",
+          "reason_code": "package_verified",
+          "severity": "info",
+          "field": "verdict_source",
+          "actual_value": "mode=fast-kernel;verdict_source=fast-kernel-certificate-verifier;reference_checker_verdict=false;locally_accelerated=false;modules=1",
+          "checker": "fast-kernel-certificate-verifier"
+        },
+        {
+          "kind": "PackageLock",
+          "reason_code": "package_lock_checked",
+          "severity": "info",
+          "field": "package_lock",
+          "actual_value": "mode=checked;hash=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        {
+          "kind": "FastVerifier",
+          "reason_code": "module_verified",
+          "severity": "info",
+          "module": "Proofs.Ai.Basic",
+          "path": "Proofs/Ai/Basic/certificate.npcert",
+          "field": "status",
+          "expected_value": "passed",
+          "actual_value": "status=passed;evidence=live-checker;proof_evidence=true",
+          "checker": "fast-kernel-certificate-verifier"
+        }
+      ],
+      "artifacts": []
+    },
+    "checker_mode": "fast",
+    "verdict_source": "fast-kernel-certificate-verifier",
+    "npa_core_source_kind": "aggregate",
+    "npa_core_checkout_revision": "2222222222222222222222222222222222222222",
+    "npa_core_tree_hash": "3333333333333333333333333333333333333333",
+    "npa_cli_crate_version": "0.3.0",
+    "cargo_manifest_path": "npa-core/Cargo.toml",
+    "cargo_lock_path": "npa-core/Cargo.lock",
+    "cargo_lock_sha256": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "rust_toolchain": "rustc 1.88.0 (6b00bc388 2025-06-23)",
+    "rust_target": "x86_64-unknown-linux-gnu",
+    "cargo_profile": "dev",
+    "host_executable_name": "npa",
+    "external_checker": null
+  }
+}

@@ -62,6 +62,13 @@ pub enum Error {
         constructor: String,
         result: Expr,
     },
+    ConstructorUniverseBoundViolation {
+        inductive: String,
+        constructor: String,
+        field_index: usize,
+        field_level: crate::level::Level,
+        inductive_sort: crate::level::Level,
+    },
     ResourceLimit {
         kind: ResourceLimitKind,
     },

@@ -89,6 +89,7 @@
 
 #![deny(missing_docs)]
 
+pub mod artifact_ledger;
 pub mod artifacts;
 pub mod audit_cache;
 pub mod audit_selection;
@@ -101,17 +102,33 @@ pub mod graph;
 pub mod hash;
 pub mod incremental_projection;
 mod json;
+pub mod l2_acceptance;
+pub mod l2_acceptance_v2;
+pub mod l2_namespace_transport;
+pub mod l2_review;
 pub mod lock;
 pub mod manifest;
 pub mod name;
 pub mod path;
+pub mod promotion_plan;
+pub mod promotion_registry;
+pub mod promotion_transaction;
+pub mod proof_replay;
 pub mod publish_plan;
 pub mod registry;
 pub mod schema;
 pub mod theorem_index;
+pub mod theorem_premise_report;
 pub mod validate;
 pub mod verified_high_trust;
 
+pub use artifact_ledger::{
+    parse_package_artifact_ledger_metadata, refresh_package_artifact_ledger_metadata,
+    PackageArtifactLedgerDeclaration, PackageArtifactLedgerDeclarationKind,
+    PackageArtifactLedgerMetadata, PackageArtifactLedgerMetadataError,
+    PackageArtifactLedgerMetadataErrorReason, PackageArtifactLedgerMetadataRefreshInput,
+    PACKAGE_ARTIFACT_LEDGER_METADATA_SCHEMA,
+};
 pub use artifacts::{
     PackageArtifactFileReference, PackageArtifactOrigin, PackageArtifactPolicy,
     PackageAxiomReference, PackageCheckerMode, PackageCheckerSummary, PackageGlobalRef,
@@ -184,7 +201,8 @@ pub use gate_plan::{
     PACKAGE_GATE_PLAN_TRUST_BOUNDARY_NOTE,
 };
 pub use graph::{
-    resolve_package_graph, PackageGraph, ResolvedModuleImport, ResolvedModuleImportKind,
+    package_graph_dependent_closure, package_graph_transitive_dependencies, resolve_package_graph,
+    PackageGraph, ResolvedModuleImport, ResolvedModuleImportKind,
 };
 pub use hash::{
     format_package_hash, package_file_hash, parse_package_hash, PackageHash, PackageHashBytes,
@@ -193,9 +211,39 @@ pub use incremental_projection::{
     PackageIncrementalProjectionMode, PackageIncrementalProjectionModule,
     PackageIncrementalProjectionPlan, PACKAGE_INCREMENTAL_PROJECTION_TRUST_BOUNDARY,
 };
+pub use l2_acceptance::{
+    compute_l2_review_input_hash, parse_l2_acceptance_json, parse_l2_acceptance_policy_json,
+    validate_l2_acceptance, validate_l2_acceptance_policy, L2Acceptance, L2AcceptanceApproval,
+    L2AcceptanceAuthority, L2AcceptanceAuthorityStatus, L2AcceptanceEntry, L2AcceptancePolicy,
+    L2_ACCEPTANCE_LEVEL, L2_ACCEPTANCE_REVIEW_PROTOCOL, L2_ACCEPTANCE_REVIEW_PROTOCOL_V2,
+    L2_ACCEPTANCE_VALIDATOR_PROFILE, L2_ACCEPTANCE_VALIDATOR_PROFILE_V2,
+};
+pub use l2_acceptance_v2::{
+    merge_l2_acceptance_v2_entries, parse_l2_acceptance_v2_json, validate_l2_acceptance_v2,
+    L2AcceptanceApprovalV2, L2AcceptanceEntryV2, L2AcceptanceReviewReportRef, L2AcceptanceV2,
+};
+pub use l2_namespace_transport::{
+    l2_transport_derived_mapping_hash, l2_transport_module_declaration_names,
+    l2_transport_module_projection, l2_transport_module_projection_subset,
+    l2_transport_normalized_closure_hash, parse_l2_namespace_transport_attestation_json,
+    parse_l2_namespace_transport_policy_json, parse_l2_namespace_transport_request_json,
+    L2NamespaceTransportAttestation, L2NamespaceTransportPolicy, L2NamespaceTransportRequest,
+    L2TransportAttestationChangedPath, L2TransportAttestationModulePair,
+    L2TransportAttestationTheoremPair, L2TransportDeclarationRename, L2TransportEndpoint,
+    L2TransportModuleMapping, L2TransportModuleRole, L2TransportPackageIdentity,
+};
+pub use l2_review::{
+    compute_l2_review_input_v2_hash, parse_l2_review_input_json, parse_l2_review_report_json,
+    validate_l2_review_input, validate_l2_review_report, L2ReviewCheckDecision,
+    L2ReviewCheckResult, L2ReviewInput, L2ReviewInputImport, L2ReviewInputPolicy,
+    L2ReviewInputSource, L2ReviewReport,
+};
 pub use lock::{
-    build_package_lock_from_artifacts, build_package_lock_from_package_root,
-    build_package_lock_graph, parse_package_lock_json,
+    build_package_lock_from_artifacts,
+    build_package_lock_from_artifacts_allowing_local_hash_updates,
+    build_package_lock_from_package_root,
+    build_package_lock_from_package_root_allowing_local_hash_updates, build_package_lock_graph,
+    parse_package_lock_json, validate_observed_package_lock_against_manifest_graph,
     validate_package_lock_against_manifest_graph, validate_package_lock_manifest,
     PackageLockArtifact, PackageLockEntry, PackageLockEntryOrigin, PackageLockGraph,
     PackageLockImport, PackageLockManifest, PackageLockManifestReference,
@@ -210,6 +258,33 @@ pub use name::{
     validate_canonical_module_name, validate_package_id, PackageId,
 };
 pub use path::{validate_package_path, PackagePath};
+pub use promotion_plan::{
+    mathlib_promotion_plan_hash, mathlib_promotion_route_id, parse_mathlib_promotion_plan_json,
+    validate_mathlib_promotion_plan, MathlibPromotionPlan, PromotionGovernance,
+    PromotionPackageSnapshot, PromotionPlanDependencyMapping, PromotionPlanEndpoint,
+    PromotionPlanExport, PromotionPlanRename, PromotionPlanSelectedModule, PromotionPlanTheorem,
+    PromotionTargetSnapshot,
+};
+pub use promotion_registry::{
+    lookup_promotion_origin, parse_promotion_origin_registry_json,
+    promotion_legacy_target_reservation_id, promotion_origin_registry_hash,
+    validate_promotion_origin_registry, validate_promotion_origin_registry_transition,
+    PromotionAcceptanceEvidence, PromotionAuditLocation, PromotionDeclarationRename,
+    PromotionEvidence, PromotionLegacyTargetReservation, PromotionLifecycle, PromotionModuleRoute,
+    PromotionOriginEntry, PromotionOriginLookup, PromotionOriginRegistry, PromotionReservedTheorem,
+    PromotionRouteTheorem, PromotionSourceModule, PromotionSourceOrigin, PromotionTargetRevision,
+    PromotionTransportEvidence, MATHLIB_PROMOTION_REGISTRY_ID, MATHLIB_PROMOTION_REGISTRY_PATH,
+};
+pub use promotion_transaction::{
+    parse_promotion_transaction_json, promotion_transaction_hash, promotion_transaction_path_hash,
+    validate_promotion_transaction, PromotionOldFile, PromotionReplacementState,
+    PromotionTransactionJournal, PromotionTransactionPhase, PromotionTransactionRow,
+    PromotionTransactionState,
+};
+pub use proof_replay::{
+    parse_package_proof_replay, PackageProofReplay, PackageProofReplayStep,
+    PACKAGE_PROOF_REPLAY_PROFILE, PACKAGE_PROOF_REPLAY_SCHEMA,
+};
 pub use publish_plan::{
     build_package_downstream_import_bundle, build_package_publish_artifacts,
     compute_package_publish_plan_hash, package_checksum_only_signature_policy,
@@ -227,9 +302,11 @@ pub use registry::{
 };
 pub use schema::{
     CERTIFICATE_FORMAT_CANONICAL_V0_1, CHECKER_PROFILE_REFERENCE_V0_1, CORE_SPEC_V0_1,
-    KERNEL_PROFILE_V0_1, PACKAGE_AXIOM_REPORT_SCHEMA, PACKAGE_LOCK_SCHEMA, PACKAGE_MANIFEST_SCHEMA,
-    PACKAGE_PUBLISH_PLAN_SCHEMA, PACKAGE_THEOREM_INDEX_SCHEMA, PACKAGE_VERIFIED_HIGH_TRUST_SCHEMA,
-    REGISTRY_MODULE_SCHEMA,
+    KERNEL_PROFILE_V0_1, L2_ACCEPTANCE_POLICY_SCHEMA, L2_ACCEPTANCE_SCHEMA,
+    MATHLIB_PROMOTION_ORIGIN_REGISTRY_SCHEMA, MATHLIB_PROMOTION_PLAN_SCHEMA,
+    MATHLIB_PROMOTION_TRANSACTION_SCHEMA, PACKAGE_AXIOM_REPORT_SCHEMA, PACKAGE_LOCK_SCHEMA,
+    PACKAGE_MANIFEST_SCHEMA, PACKAGE_PUBLISH_PLAN_SCHEMA, PACKAGE_THEOREM_INDEX_SCHEMA,
+    PACKAGE_VERIFIED_HIGH_TRUST_SCHEMA, REGISTRY_MODULE_SCHEMA,
 };
 pub use theorem_index::{
     compute_package_theorem_index_hash, package_theorem_index_incremental_projection_plan,
@@ -239,6 +316,7 @@ pub use theorem_index::{
     PackageTheoremIndexSummary, PackageTheoremStatement,
     PACKAGE_THEOREM_INDEX_CERTIFICATE_DERIVED_PROFILE,
 };
+pub use theorem_premise_report::*;
 pub use validate::{
     parse_and_validate_manifest_str, validate_manifest, validate_manifest_report,
     validate_manifest_source_report, validate_manifest_with_options, validate_package_version,

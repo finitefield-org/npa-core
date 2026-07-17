@@ -16,6 +16,7 @@ type signature = {
   signature_name : Ext_name.t;
   signature_decl_interface_hash : Ext_hash.digest option;
   signature_universe_params : Ext_name.t list;
+  signature_universe_constraints : Ext_cert.universe_constraint list;
   signature_ty : Ext_term.t;
   signature_unfolding : unfolding;
   signature_origin : signature_origin;
@@ -26,12 +27,43 @@ type generated_key = {
   generated_name : Ext_name.t;
 }
 
+type imported_single_recursor_runtime = {
+  imported_runtime_import_index : int;
+  imported_runtime_decl_interface_hash : Ext_hash.digest;
+  imported_runtime_synthetic_decl_index : int;
+  imported_runtime_universe_params : Ext_name.t list;
+  imported_runtime_params : Ext_cert.binder_type list;
+  imported_runtime_indices : Ext_cert.binder_type list;
+  imported_runtime_constructors : Ext_cert.constructor_spec list;
+  imported_runtime_rules : Ext_cert.recursor_rules;
+}
+
+type imported_mutual_recursor_runtime = {
+  imported_mutual_import_index : int;
+  imported_mutual_decl_interface_hash : Ext_hash.digest;
+  imported_mutual_synthetic_decl_index : int;
+  imported_mutual_universe_params : Ext_name.t list;
+  imported_mutual_families : Ext_cert.mutual_inductive_spec list;
+  imported_mutual_target_index : int;
+  imported_mutual_recursor : Ext_cert.recursor_spec;
+}
+
+type imported_recursor_runtime =
+  | Imported_single of imported_single_recursor_runtime
+  | Imported_mutual of imported_mutual_recursor_runtime
+
 type t = {
   imports : Ext_import_store.import_environment;
   checked_declaration_count : int;
   local_declarations : (int * Ext_cert.declaration) list;
   local_signatures : (int * signature) list;
   generated_signatures : (generated_key * signature) list;
+  imported_recursor_cache :
+    ((int * Ext_name.t * Ext_hash.digest), imported_recursor_runtime option)
+    Hashtbl.t;
+  imported_mutual_block_cache :
+    ((int * Ext_hash.digest), imported_mutual_recursor_runtime list option)
+    Hashtbl.t;
 }
 
 type error_reason =
@@ -51,10 +83,37 @@ let empty =
     local_declarations = [];
     local_signatures = [];
     generated_signatures = [];
+    imported_recursor_cache = Hashtbl.create 0;
+    imported_mutual_block_cache = Hashtbl.create 0;
   }
 
 let of_imports imports =
-  { empty with imports }
+  {
+    empty with
+    imports;
+    imported_recursor_cache = Hashtbl.create 16;
+    imported_mutual_block_cache = Hashtbl.create 8;
+  }
+
+let find_imported_recursor_cache env import_index recursor_name
+    decl_interface_hash =
+  Hashtbl.find_opt env.imported_recursor_cache
+    (import_index, recursor_name, decl_interface_hash)
+
+let cache_imported_recursor env import_index recursor_name decl_interface_hash
+    runtime =
+  Hashtbl.replace env.imported_recursor_cache
+    (import_index, recursor_name, decl_interface_hash)
+    runtime
+
+let find_imported_mutual_block_cache env import_index decl_interface_hash =
+  Hashtbl.find_opt env.imported_mutual_block_cache
+    (import_index, decl_interface_hash)
+
+let cache_imported_mutual_block env import_index decl_interface_hash runtimes =
+  Hashtbl.replace env.imported_mutual_block_cache
+    (import_index, decl_interface_hash)
+    runtimes
 
 let error section offset reason = Error { reason; section; offset }
 
@@ -99,14 +158,15 @@ let validate_universe_params section offset params =
   in
   loop [] params
 
-let make_signature ?decl_interface_hash section offset name universe_params ty unfolding
-    origin =
+let make_signature ?decl_interface_hash section offset name universe_params
+    universe_constraints ty unfolding origin =
   bind (validate_universe_params section offset universe_params) (fun () ->
       Ok
         {
           signature_name = name;
           signature_decl_interface_hash = decl_interface_hash;
           signature_universe_params = universe_params;
+          signature_universe_constraints = universe_constraints;
           signature_ty = ty;
           signature_unfolding = unfolding;
           signature_origin = origin;
@@ -235,6 +295,7 @@ let builtin_signature builtin_name decl_interface_hash =
             signature_name = builtin_name;
             signature_decl_interface_hash = Some decl_interface_hash;
             signature_universe_params = universe_params;
+            signature_universe_constraints = [];
             signature_ty = ty;
             signature_unfolding = No_unfolding;
             signature_origin = Builtin;
@@ -389,7 +450,8 @@ let signature_of_public_export env import_index public_environment section offse
           make_signature
             ~decl_interface_hash:export.Ext_import_store.public_decl_interface_hash
             section offset export.Ext_import_store.public_export_name
-            export.Ext_import_store.public_universe_params ty unfolding
+            export.Ext_import_store.public_universe_params
+            export.Ext_import_store.public_universe_constraints ty unfolding
             (Imported { import_index })))
 
 let declaration_universe_params payload =
@@ -413,39 +475,59 @@ let signature_of_declaration decl_index (declaration : Ext_cert.declaration) =
     declaration.Ext_cert.hashes.Ext_cert.decl_interface_hash
   in
   match declaration.Ext_cert.payload with
-  | Ext_cert.AxiomDecl { decl_name; decl_universe_params; decl_ty; _ } ->
+  | Ext_cert.AxiomDecl
+      { decl_name; decl_universe_params; decl_universe_constraints; decl_ty } ->
       make_signature ~decl_interface_hash section offset decl_name decl_universe_params
-        decl_ty No_unfolding (Local { decl_index })
+        decl_universe_constraints decl_ty No_unfolding (Local { decl_index })
   | Ext_cert.DefDecl
-      { decl_name; decl_universe_params; decl_ty; decl_value; decl_reducibility; _ } ->
+      {
+        decl_name;
+        decl_universe_params;
+        decl_universe_constraints;
+        decl_ty;
+        decl_value;
+        decl_reducibility;
+      } ->
       let unfolding =
         match decl_reducibility with
         | Ext_cert.Reducible -> Reducible decl_value
         | Ext_cert.Opaque_reducibility -> Opaque
       in
       make_signature ~decl_interface_hash section offset decl_name decl_universe_params
-        decl_ty unfolding (Local { decl_index })
-  | Ext_cert.TheoremDecl { decl_name; decl_universe_params; decl_ty; _ } ->
+        decl_universe_constraints decl_ty unfolding (Local { decl_index })
+  | Ext_cert.TheoremDecl
+      { decl_name; decl_universe_params; decl_universe_constraints; decl_ty; _ } ->
       make_signature ~decl_interface_hash section offset decl_name decl_universe_params
-        decl_ty Opaque (Local { decl_index })
+        decl_universe_constraints decl_ty Opaque (Local { decl_index })
   | Ext_cert.InductiveDecl
-      { decl_name; decl_universe_params; ind_params; ind_indices; ind_sort; _ } ->
+      {
+        decl_name;
+        decl_universe_params;
+        decl_universe_constraints;
+        ind_params;
+        ind_indices;
+        ind_sort;
+        _;
+      } ->
       make_signature ~decl_interface_hash section offset decl_name decl_universe_params
+        decl_universe_constraints
         (pi_of_binders (ind_params @ ind_indices) (Ext_term.Sort ind_sort))
         No_unfolding (Local { decl_index })
   | Ext_cert.MutualInductiveBlockDecl _ -> error section offset Unknown_reference
 
-let constructor_signature decl_index decl_interface_hash universe_params offset
-    (constructor : Ext_cert.constructor_spec) =
+let constructor_signature decl_index decl_interface_hash universe_params
+    universe_constraints offset (constructor : Ext_cert.constructor_spec) =
   make_signature ~decl_interface_hash Ext_bytes.Declarations offset
     constructor.Ext_cert.constructor_name
-    universe_params constructor.Ext_cert.constructor_ty No_unfolding
+    universe_params universe_constraints constructor.Ext_cert.constructor_ty No_unfolding
     (Local_generated { decl_index; name = constructor.Ext_cert.constructor_name })
 
-let recursor_signature decl_index decl_interface_hash offset (recursor : Ext_cert.recursor_spec) =
+let recursor_signature decl_index decl_interface_hash universe_constraints offset
+    (recursor : Ext_cert.recursor_spec) =
   make_signature ~decl_interface_hash Ext_bytes.Declarations offset
     recursor.Ext_cert.recursor_name
-    recursor.Ext_cert.recursor_universe_params recursor.Ext_cert.recursor_ty
+    recursor.Ext_cert.recursor_universe_params universe_constraints
+    recursor.Ext_cert.recursor_ty
     No_unfolding
     (Local_generated { decl_index; name = recursor.Ext_cert.recursor_name })
 
@@ -463,32 +545,44 @@ let generated_signatures_of_declaration decl_index (declaration : Ext_cert.decla
     in
     generated @ [ (key, signature) ]
   in
-  let collect_constructor_signatures universe_params constructors generated =
+  let collect_constructor_signatures universe_params universe_constraints constructors generated =
     let rec loop remaining generated =
       match remaining with
       | [] -> Ok generated
       | constructor :: rest ->
           bind
-            (constructor_signature decl_index decl_interface_hash universe_params offset
-               constructor)
+            (constructor_signature decl_index decl_interface_hash universe_params
+               universe_constraints offset constructor)
             (fun signature -> loop rest (add_generated signature generated))
     in
     loop constructors generated
   in
-  let collect_recursor_signature recursor generated =
+  let collect_recursor_signature universe_constraints recursor generated =
     match recursor with
     | None -> Ok generated
     | Some recursor ->
         bind
-          (recursor_signature decl_index decl_interface_hash offset recursor)
+          (recursor_signature decl_index decl_interface_hash universe_constraints offset
+             recursor)
           (fun signature -> Ok (add_generated signature generated))
   in
   match declaration.Ext_cert.payload with
-  | Ext_cert.InductiveDecl { decl_universe_params; ind_constructors; ind_recursor; _ } ->
-      bind (collect_constructor_signatures decl_universe_params ind_constructors []) (fun generated ->
-          collect_recursor_signature ind_recursor generated)
+  | Ext_cert.InductiveDecl
+      {
+        decl_universe_params;
+        decl_universe_constraints;
+        ind_constructors;
+        ind_recursor;
+        _;
+      } ->
+      bind
+        (collect_constructor_signatures decl_universe_params
+           decl_universe_constraints ind_constructors [])
+        (fun generated ->
+          collect_recursor_signature decl_universe_constraints ind_recursor
+            generated)
   | Ext_cert.MutualInductiveBlockDecl
-      { decl_universe_params; mutual_inductives; _ } ->
+      { decl_universe_params; decl_universe_constraints; mutual_inductives; _ } ->
       let rec loop remaining generated =
         match remaining with
         | [] -> Ok generated
@@ -496,7 +590,7 @@ let generated_signatures_of_declaration decl_index (declaration : Ext_cert.decla
             let family_sig =
               make_signature ~decl_interface_hash Ext_bytes.Declarations offset
                 mutual.Ext_cert.mutual_name
-                decl_universe_params
+                decl_universe_params decl_universe_constraints
                 (pi_of_binders
                    (mutual.Ext_cert.mutual_params @ mutual.Ext_cert.mutual_indices)
                    (Ext_term.Sort mutual.Ext_cert.mutual_sort))
@@ -506,10 +600,13 @@ let generated_signatures_of_declaration decl_index (declaration : Ext_cert.decla
             bind family_sig (fun signature ->
                 bind
                   (collect_constructor_signatures decl_universe_params
+                     decl_universe_constraints
                      mutual.Ext_cert.mutual_constructors
                      (add_generated signature generated))
                   (fun generated ->
-                    bind (collect_recursor_signature mutual.Ext_cert.mutual_recursor generated)
+                    bind
+                      (collect_recursor_signature decl_universe_constraints
+                         mutual.Ext_cert.mutual_recursor generated)
                       (fun generated -> loop rest generated)))
       in
       loop mutual_inductives []

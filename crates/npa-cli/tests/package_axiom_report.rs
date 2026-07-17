@@ -5,9 +5,10 @@ use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use npa_cert::Name;
-use npa_cli::args::{PackageAxiomReportOptions, PackageCommonOptions, PackageTimingMode};
+use npa_cli::args::{PackageAxiomReportOptions, PackageTimingMode};
 use npa_cli::diagnostic::{CommandExitCode, DiagnosticKind, PACKAGE_COMMAND_RESULT_SCHEMA};
 use npa_cli::package::PACKAGE_MANIFEST_PATH;
+use npa_cli::package_api::v1::common_options;
 use npa_cli::package_artifacts::{PACKAGE_AXIOM_REPORT_PATH, PACKAGE_THEOREM_INDEX_PATH};
 use npa_cli::package_axiom_report::run_package_axiom_report;
 use npa_package::{
@@ -143,10 +144,7 @@ fn package_axiom_report_proof_corpus_check_mode_succeeds_without_mutating_genera
     let root_for_run = root.clone();
     let result = run_with_proof_corpus_stack(move || {
         run_package_axiom_report(PackageAxiomReportOptions {
-            common: PackageCommonOptions {
-                root: root_for_run,
-                json: true,
-            },
+            common: common_options(root_for_run, true),
             check: true,
             timings: PackageTimingMode::Off,
         })
@@ -331,10 +329,7 @@ fn run_check(package: &TestPackage) -> npa_cli::diagnostic::CommandResult {
 
 fn run_axiom_report(package: &TestPackage, check: bool) -> npa_cli::diagnostic::CommandResult {
     run_package_axiom_report(PackageAxiomReportOptions {
-        common: PackageCommonOptions {
-            root: package.path().to_path_buf(),
-            json: true,
-        },
+        common: common_options(package.path(), true),
         check,
         timings: PackageTimingMode::Off,
     })

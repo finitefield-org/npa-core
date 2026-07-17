@@ -1,17 +1,21 @@
 # OCaml clean-room npa-checker-ext specification
 
-This document specifies making the external checker `npa-checker-ext`, added as
-a Phase 8 / CLR-08 target integration, an **OCaml clean-room implementation**.
+This document specifies the external checker `npa-checker-ext`, added as a
+Phase 8 / CLR-08 **OCaml clean-room implementation**.
 
-Currently, this document is a target specification and release evidence
-contract. `crates/npa-checker-ref` exists as a source-free reference checker,
-and `checkers/npa-checker-ext/` contains the OCaml clean-room source project,
-build scripts, and M0-M7 checker substrate tests. The package runner path for
-`npa package verify-certs --checker external` is also implemented. However,
-`npa-checker-ext` is treated as release / high-trust evidence only when a built
-executable is resolved from a runner-owned checker registry, and runner policy /
-binary hash / checker identity validation plus package external-mode integration
-pass.
+This document is both the implementation specification and the release-evidence
+contract. `crates/npa-checker-ref` remains the source-free Rust reference
+checker, while `checkers/npa-checker-ext/` contains the independent OCaml
+implementation and its conformance gates. The standalone executable now checks
+current v0.2.0, previous v0.1.2, and legacy v0.1 certificates end to end,
+including indexed, mutual, and exact approved nested inductives, recursive
+high-trust imports, axiom policy, and raw-result rendering.
+
+`npa-checker-ext` counts as release / high-trust evidence only when the built
+executable is resolved from a runner-owned checker registry and the runner
+validates its policy, binary hash, checker identity, and build hash. The real
+package gate in `scripts/differential.sh` exercises that contract; an unpinned
+local build is still not release evidence by itself.
 
 ---
 
@@ -47,6 +51,36 @@ output:
   deterministic checker_raw_result JSON
 ```
 
+### 1.1 Toolchain v0.7 host adapter
+
+The implemented host compatibility combination is `npa-cli 0.7.x`,
+`package_api::v1`, and `npa-checker-ext 0.2.0`. The checker continues to decode
+current `NPA-CERT-0.2.0` / `NPA-Core-0.2.0`, previous v0.1.2, and legacy v0.1
+certificate pairs. The host crate version does not change checker semantics,
+raw-result v1 or machine-result v1. The current host emits command-result v0.3;
+historical 0.3/0.4 hosts retain v0.1 and 0.5 hosts retain v0.2.
+
+The Linux closure gate is
+`checkers/npa-checker-ext/scripts/toolchain-v0.7.sh`. It runs the real checker
+through the v1 facade and the exact direct checked external command with one
+job, cache/memo off, canonical runner-policy identity, raw-byte-pinned policy
+inputs, and immutable sealed execution. Its `--functional-only` form is a
+dirty-tree developer gate and explicitly does not create release evidence.
+The full form also creates disposable generated-artifact manifest v0.2 assets,
+validates their bytes, and deletes them on exit.
+
+The obsolete v0.3/v0.4 host scripts and their dedicated compatibility tests
+have been removed. Their design records are historical context only and are
+not supported operator contracts.
+
+Ordinary external checked verification, a byte-validated v0.2 release envelope,
+and `verified_high_trust` are distinct outcomes. The first two do not acquire
+the separate release/challenge policy bundle required by the third. The host
+may create only `generated/checker-imports/.../external/` and
+`generated/checker-results/.../external/`; unsupported immutable staging fails
+with `checker_binary_immutable_snapshot_unsupported` and cannot emit a checked
+artifact.
+
 Reasons for choosing OCaml:
 
 - Pattern matching makes canonical AST / declaration / error classification compact.
@@ -63,7 +97,8 @@ Reasons for choosing OCaml:
 ```text
 - the canonical .npcert specified by --cert
 - import certificate inputs explicitly provided by the runner through --import-dir or --imports
-- the axiom/checker policy specified by --policy
+- the axiom/checker policy specified by --policy, bound to the runner's
+  `--policy-hash`
 - version / build identity embedded in the checker binary itself
 ```
 
@@ -131,6 +166,7 @@ npa-checker-ext \
   --cert path/to/module.npcert \
   --import-dir path/to/import-certs \
   --policy path/to/axiom-policy.toml \
+  --policy-hash sha256:<64-lower-hex> \
   --output json
 ```
 
@@ -138,16 +174,20 @@ Requirements:
 
 - Reject anything other than `--output json`.
 - Reject input paths with the `.npa` extension.
+- Require `--policy-hash` and compare it with the exact policy bytes before
+  parsing or checking.
 - Read `--cert` as the exact bytes of a single certificate file.
 - Use only the import store explicitly provided by the runner for import resolution.
 - Do not perform network access, package discovery, or registry lookup.
 - Run in a deterministic environment equivalent to `LC_ALL=C.UTF-8`, `LANG=C.UTF-8`, `TZ=UTC`.
 - Emit only raw result JSON on stdout.
 - Use stderr only for human-facing diagnostics; do not treat it as proof evidence.
+- Exit 0 only for `checked` (and `--version`), exit 1 for a structured checker
+  rejection, and exit 2 for CLI misuse or a structured internal failure.
 
-If `--imports` / `--imports-hash` / `--policy-hash` are accepted in the future,
-their meaning must match the Phase 8 runner contract. AI output or package
-metadata must not select or override the checker executable.
+If `--imports` / `--imports-hash` are accepted in the future, their meaning
+must match the Phase 8 runner contract. AI output or package metadata must not
+select or override the checker executable.
 
 ---
 
@@ -161,7 +201,7 @@ checked result:
 {
   "schema": "npa.independent-checker.checker_raw_result.v1",
   "checker_id": "npa-checker-ext",
-  "checker_version": "0.1.0",
+  "checker_version": "0.2.0",
   "checker_build_hash": "sha256:...",
   "status": "checked",
   "module": "Std.Nat.Basic",
@@ -177,7 +217,7 @@ failed result:
 {
   "schema": "npa.independent-checker.checker_raw_result.v1",
   "checker_id": "npa-checker-ext",
-  "checker_version": "0.1.0",
+  "checker_version": "0.2.0",
   "checker_build_hash": "sha256:...",
   "status": "failed",
   "module": "Std.Nat.Basic",
@@ -222,6 +262,21 @@ unsupported_schema_version
 checker_internal_error
 ```
 
+Universe-context and constructor checks use these stable reason codes:
+
+```text
+noncanonical_universe_params
+noncanonical_universe_constraints
+duplicate_universe_constraint
+unsupported_universe_constraint
+unsatisfiable_universe_constraints
+universe_constraint_violation
+constructor_universe_bound_violation
+```
+
+The two `noncanonical_*` reasons have kind `noncanonical_encoding`; the other
+five have kind `universe_inconsistency`.
+
 ---
 
 ## 6. Certificate decoding
@@ -231,8 +286,9 @@ The checker accepts only canonical binary `.npcert`.
 Checked targets:
 
 ```text
-- header format = NPA-CERT-0.1
-- core spec = NPA-Core-0.1
+- current header pair = NPA-CERT-0.2.0 / NPA-Core-0.2.0
+- previous header pair = NPA-CERT-0.1.2 / NPA-Core-0.1.2
+- legacy header pair = NPA-CERT-0.1 / NPA-Core-0.1
 - module name grammar
 - import table
 - name table
@@ -360,6 +416,9 @@ Required:
 - declaration dependency check
 - universe parameter arity check
 - unresolved universe metavariable rejection
+- canonical, duplicate-free, satisfiable universe-constraint contexts
+- substituted public-signature constraint entailment
+- obligation-only finite `max` support on the right-hand side
 ```
 
 conversion:
@@ -378,10 +437,13 @@ inductive / recursor:
 
 ```text
 - constructor result targets declared family
+- every non-parameter constructor field in a non-Prop family inhabits a sort
+  entailed to be at most the family sort
+- uniform parameter-prefix exclusion and canonical Prop exemption
 - conservative strict positivity check
 - generated constructor / recursor interface validation
 - recursor parameter / motive / major / minor / result shape validation
-- unsupported inductive skeleton rejected with structured error
+- malformed or unsupported inductive shape rejected with structured error
 ```
 
 Core features unsupported by the initial implementation are rejected as
@@ -419,8 +481,11 @@ Required:
 policy:
 
 ```text
-- deny_sorry = true by default
-- custom axioms can be rejected unless they are on the allowlist
+- the policy TOML contains exactly `format` and `allowed_axioms`
+- `format` is exactly `npa.independent-checker.axiom_policy.v1`
+- missing, duplicate, legacy, or unknown policy fields are rejected
+- deny_sorry and custom-axiom denial are mandatory high-trust gates, not caller overrides
+- custom axioms are rejected unless they are on the exact allowlist
 - the standard exception for Std.Logic.Eq.rec is allowed only by exact name/hash
 - axiom policy parse errors are treated on the runner side as policy input errors, not checker_internal_error
 ```
@@ -435,22 +500,27 @@ based on canonical names and `decl_interface_hash`.
 `npa-checker-ext` has deterministic resource bounds.
 
 ```text
-- max_steps
-- max_memory_mb
-- timeout_ms
-- max_term_depth
-- max_table_entries
-- max_imports
+- certificate/policy file bytes: 64 MiB
+- table/declaration/export/report vectors: 10,000 entries
+- imports and import-directory certificate candidates: 4,096
+- level/term depth: 1,024
+- import-DAG depth: 1,024
+- import-directory depth: 128
+- decoded structural traversal: 5,000,000 nodes
+- each conversion/typechecking fuel budget: 100,000 steps
 ```
+
+The runner separately owns `max_memory_mb` and `timeout_ms`.
 
 Timeout / resource exhaustion enforced by the runner is represented as
 `timeout` / `resource_exhausted` in the runner-owned `MachineCheckResult`, not as
 a checker raw result. When `npa-checker-ext` emits a raw result itself, it must
 not put `resource_exhausted` or `timeout` in `checker_raw.error.kind`.
-Deterministic fuel failure inside the semantic checker is classified as
-`conversion_failure`, `type_mismatch`, or `checker_internal_error` depending on
-where it occurred. OCaml exception backtraces and host-specific messages must
-not be included in raw results.
+Deterministic decoder limits use reason `resource_limit` under the existing
+`certificate_decode_error` kind. Fuel failure inside the semantic checker is
+classified as `conversion_failure` or the applicable typed semantic error.
+OCaml exception backtraces and host-specific messages are never included in raw
+results.
 
 Even when parallelized, result order is fixed to certificate order / import
 topological order.
@@ -480,11 +550,17 @@ ext_term.ml
 ext_cert.ml
   certificate decoder, table validation, root reachability
 
+ext_universe.ml
+  canonical difference constraints, closure, substitution, and entailment
+
 ext_hash.ml
   domain-separated SHA-256 input construction
 
 ext_import.ml
-  source-free import store, normal/high-trust resolution
+  canonical import identity
+
+ext_import_store.ml
+  decoded/hash-checked public environments and normal import resolution
 
 ext_axiom.ml
   axiom report recomputation and policy gates
@@ -492,14 +568,17 @@ ext_axiom.ml
 ext_env.ml
   checked environment and public environment
 
-ext_reduce.ml
-  whnf, beta/delta/iota/zeta reduction with fuel
-
 ext_typecheck.ml
-  inference, checking, definitional equality
+  inference, checking, definitional equality, and beta/delta/iota/zeta reduction
 
 ext_inductive.ml
   positivity and recursor shape checks
+
+ext_checker.ml / ext_checker.mli
+  ordered semantic pipeline and abstract normal/high-trust capabilities
+
+ext_session.ml
+  deterministic child-first policy-checked import DAG
 
 ext_result.ml
   deterministic checker_raw_result JSON
@@ -556,12 +635,12 @@ Natural-language error message equality is not required.
 
 ---
 
-## 14. Milestones
+## 14. Completed milestones
 
 M0: repository and build identity
 
 ```text
-- OCaml project skeleton
+- OCaml project layout and build boundary
 - in-repository OCaml project placement
 - vendored OCaml SHA-256 implementation
 - unsupported core feature rejected for first release
@@ -588,9 +667,11 @@ unsigned varints allow only minimal ULEB128 and reject unexpected EOF,
 non-minimal encoding, u64 overflow, and host length overflow. This layer does
 not reference the filesystem, source parser, or JSON rendering.
 
-M1-02 decodes the header and name grammar source-free. The header requires
-`NPA-CERT-0.1` and `NPA-Core-0.1`; module names and name table entries are stored
-as structured component lists in `Ext_name.t`. Empty names, empty components,
+The original M1-02 slice decoded the legacy `NPA-CERT-0.1` /
+`NPA-Core-0.1` header and the name grammar source-free. The completed
+version-aware decoder now also accepts the current and previous header pairs
+listed in Section 6. Module names and name table entries are stored as
+structured component lists in `Ext_name.t`. Empty names, empty components,
 dotted components, invalid UTF-8, and duplicate name table entries are rejected
 as decode errors with reason codes.
 
@@ -614,6 +695,11 @@ mutual inductive block. Dependency entries and axiom references are decoded
 while preserving the structure of `GlobalRef`, canonical names, and hash bytes.
 Export entries keep name, kind, universe params, type, optional body, type/body
 hash, optional reducibility/opacity, interface hash, and axiom dependencies.
+Because this legacy export layout cannot carry declaration universe
+constraints, public-environment construction rejects an export owned by a
+constrained declaration with kind `unsupported_schema_version`, reason
+`constrained_export_requires_format_upgrade`, and section `export_block`.
+Unconstrained exports carry an explicitly empty signature-constraint vector.
 Duplicate declaration names, dangling term references in the export block, and
 dangling local declaration references in export axiom dependencies become
 deterministic decode errors. However, declaration count mismatches in the axiom
@@ -654,9 +740,11 @@ M5: conversion
 M6: inductive / recursor
 
 ```text
-- conservative positivity
-- simple inductive declarations
-- generated constructor and recursor checks
+- conservative direct and exact approved nested positivity
+- simple, indexed, and mutual inductive declarations
+- generated constructor and recursor checks with indexed/mutual iota routing
+- constructor-field universe bound with explicit declaration constraints
+- canonical Prop exception and atomic mutual-block installation
 ```
 
 M7: axiom report / policy
@@ -703,8 +791,10 @@ checker:
 - missing external checker does not generate a verified_high_trust artifact
 ```
 
-Until these conditions are satisfied, `npa-checker-ext` is a target integration
-and is not treated as required evidence for proof acceptance.
+These conditions are exercised by `scripts/test.sh` and
+`scripts/differential.sh`. Whether external-checker evidence is required for a
+particular release remains an explicit runner/release-policy decision; it is
+never inferred from an unpinned local executable.
 
 ---
 
@@ -732,7 +822,7 @@ checkers/npa-checker-ext/test/golden/
 checkers/npa-checker-ext/scripts/
 ```
 
-M0-02 fixes the skeleton build / test commands as follows.
+M0-02 fixed the project build / test commands as follows.
 
 ```sh
 checkers/npa-checker-ext/scripts/build.sh
@@ -768,13 +858,15 @@ accepted CLI:
   --cert path
   --import-dir path
   --policy path
+  --policy-hash sha256:<64-lower-hex>
   --output json
   --version
 
 --version:
   must be used alone
-  prints checker_id, checker_version, checker_build_hash, certificate_format,
-  core_spec, implementation_profile, project_directory,
+  prints nine ordered lines covering checker_id/checker_version,
+  checker_build_hash, certificate_format, core_spec, implementation_profile,
+  project_directory, feature_policy_contract,
   vendored_sha256_source_identity, and
   checker_identity_manifest_signature_required
 

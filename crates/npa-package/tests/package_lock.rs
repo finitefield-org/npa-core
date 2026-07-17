@@ -4,9 +4,13 @@ use std::path::{Path, PathBuf};
 
 use npa_cert::Name;
 use npa_package::{
-    build_package_lock_from_artifacts, build_package_lock_from_package_root,
-    build_package_lock_graph, package_file_hash, parse_manifest_str, parse_package_hash,
-    parse_package_lock_json, validate_manifest, PackageHash, PackageId, PackageLockArtifact,
+    build_package_lock_from_artifacts,
+    build_package_lock_from_artifacts_allowing_local_hash_updates,
+    build_package_lock_from_package_root,
+    build_package_lock_from_package_root_allowing_local_hash_updates, build_package_lock_graph,
+    package_file_hash, parse_manifest_str, parse_package_hash, parse_package_lock_json,
+    validate_manifest, validate_observed_package_lock_against_manifest_graph,
+    validate_package_lock_against_manifest_graph, PackageHash, PackageId, PackageLockArtifact,
     PackageLockEntry, PackageLockEntryOrigin, PackageLockError, PackageLockErrorKind,
     PackageLockErrorReason, PackageLockImport, PackageLockManifest, PackageLockManifestReference,
     PackagePath, PackageVersion, ValidatedPackageManifest, PACKAGE_LOCK_SCHEMA,
@@ -207,7 +211,12 @@ fn repo_root() -> PathBuf {
 }
 
 fn proofs_root() -> PathBuf {
-    repo_root().join("proofs")
+    let root = repo_root();
+    let direct = root.join("proofs");
+    if direct.join("npa-package.toml").exists() {
+        return direct;
+    }
+    root.join("testdata/package/proofs")
 }
 
 fn read(path: PathBuf) -> Vec<u8> {
@@ -338,6 +347,18 @@ fn build_proof_lock_from_artifacts(
     artifacts: &BTreeMap<PackagePath, Vec<u8>>,
 ) -> Result<PackageLockManifest, PackageLockError> {
     build_package_lock_from_artifacts(
+        validated,
+        PackagePath::new("npa-package.toml"),
+        &proof_manifest_bytes(),
+        package_lock_artifacts(artifacts),
+    )
+}
+
+fn build_proof_lock_from_artifacts_allowing_local_hash_updates(
+    validated: &ValidatedPackageManifest,
+    artifacts: &BTreeMap<PackagePath, Vec<u8>>,
+) -> Result<PackageLockManifest, PackageLockError> {
+    build_package_lock_from_artifacts_allowing_local_hash_updates(
         validated,
         PackagePath::new("npa-package.toml"),
         &proof_manifest_bytes(),
@@ -817,6 +838,187 @@ fn package_lock_builder_stale_local_certificate_file_hash_is_rejected_before_dec
 }
 
 #[test]
+fn package_lock_builder_allowing_local_hash_updates_accepts_stale_local_manifest_hashes() {
+    let mut manifest = proof_manifest();
+    let stale_hash = hash(ZERO_HASH);
+    manifest.modules[0].expected_certificate_file_hash = stale_hash;
+    manifest.modules[0].expected_export_hash = stale_hash;
+    manifest.modules[0].expected_axiom_report_hash = stale_hash;
+    manifest.modules[0].expected_certificate_hash = stale_hash;
+    let validated = validate_manifest(manifest).unwrap();
+    let artifacts = proof_certificate_artifacts(&validated);
+
+    let strict_error = build_proof_lock_from_artifacts(&validated, &artifacts).unwrap_err();
+    assert_lock_error(
+        &strict_error,
+        PackageLockErrorKind::CertificateIdentity,
+        PackageLockErrorReason::CertificateFileHashMismatch,
+        "modules[0].expected_certificate_file_hash",
+        Some("expected_certificate_file_hash"),
+    );
+
+    let refreshed =
+        build_proof_lock_from_artifacts_allowing_local_hash_updates(&validated, &artifacts)
+            .expect("relaxed builder should derive local hashes from rebuilt certificates");
+    let entry = refreshed
+        .entries
+        .iter()
+        .find(|entry| entry.module == validated.manifest().modules[0].module)
+        .expect("refreshed lock contains local module");
+
+    assert_ne!(entry.certificate_file_hash, stale_hash);
+    assert_ne!(entry.export_hash, stale_hash);
+    assert_ne!(entry.axiom_report_hash, stale_hash);
+    assert_ne!(entry.certificate_hash, stale_hash);
+}
+
+#[test]
+fn package_lock_graph_validator_requires_local_manifest_hash_pins() {
+    enum LocalPin {
+        CertificateFile,
+        Export,
+        AxiomReport,
+        Certificate,
+    }
+
+    for (pin, field, reason) in [
+        (
+            LocalPin::CertificateFile,
+            "certificate_file_hash",
+            PackageLockErrorReason::CertificateFileHashMismatch,
+        ),
+        (
+            LocalPin::Export,
+            "export_hash",
+            PackageLockErrorReason::ExportHashMismatch,
+        ),
+        (
+            LocalPin::AxiomReport,
+            "axiom_report_hash",
+            PackageLockErrorReason::AxiomReportHashMismatch,
+        ),
+        (
+            LocalPin::Certificate,
+            "certificate_hash",
+            PackageLockErrorReason::CertificateHashMismatch,
+        ),
+    ] {
+        let mut manifest = proof_manifest();
+        let stale_hash = hash(ZERO_HASH);
+        match pin {
+            LocalPin::CertificateFile => {
+                manifest.modules[0].expected_certificate_file_hash = stale_hash;
+            }
+            LocalPin::Export => manifest.modules[0].expected_export_hash = stale_hash,
+            LocalPin::AxiomReport => {
+                manifest.modules[0].expected_axiom_report_hash = stale_hash;
+            }
+            LocalPin::Certificate => manifest.modules[0].expected_certificate_hash = stale_hash,
+        }
+        let validated = validate_manifest(manifest).unwrap();
+        let artifacts = proof_certificate_artifacts(&validated);
+        let observed_lock =
+            build_proof_lock_from_artifacts_allowing_local_hash_updates(&validated, &artifacts)
+                .expect("observed lock derives current local hashes");
+        let entry_index = lock_entry_index(&observed_lock, &validated.manifest().modules[0].module);
+
+        let error = validate_package_lock_against_manifest_graph(&validated, &observed_lock)
+            .expect_err("strict validation must retain local manifest hash pins");
+        assert_lock_error(
+            &error,
+            PackageLockErrorKind::CertificateIdentity,
+            reason,
+            &format!("entries[{entry_index}].{field}"),
+            Some(field),
+        );
+        validate_observed_package_lock_against_manifest_graph(&validated, &observed_lock)
+            .expect("observer validation may report local manifest hash drift");
+    }
+}
+
+#[test]
+fn observed_package_lock_rejects_manifest_locator_and_external_identity_drift() {
+    let validated = validated_proof_manifest();
+    let artifacts = proof_certificate_artifacts(&validated);
+    let lock = build_proof_lock_from_artifacts_allowing_local_hash_updates(&validated, &artifacts)
+        .expect("build observed lock");
+    let local_module = &validated.manifest().modules[0];
+    let local_entry_index = lock_entry_index(&lock, &local_module.module);
+
+    let mut changed = lock.clone();
+    changed.entries[local_entry_index].certificate =
+        PackagePath::new("moved/local-certificate.npcert");
+    let error = validate_observed_package_lock_against_manifest_graph(&validated, &changed)
+        .expect_err("observed lock must retain the local certificate locator");
+    assert_lock_error(
+        &error,
+        PackageLockErrorKind::Graph,
+        PackageLockErrorReason::LockEntryMissing,
+        &format!("entries[{local_entry_index}].certificate"),
+        Some("certificate"),
+    );
+
+    let external_import = &validated.manifest().imports.as_deref().unwrap()[0];
+    let external_entry_index = lock_entry_index(&lock, &external_import.module);
+    let identity_drifts = [
+        (
+            "package",
+            PackageId::new("different-package"),
+            PackageVersion::new(external_import.version.as_str()),
+            external_import.certificate.clone(),
+        ),
+        (
+            "version",
+            PackageId::new(external_import.package.as_str()),
+            PackageVersion::new("9.9.9"),
+            external_import.certificate.clone(),
+        ),
+        (
+            "certificate",
+            PackageId::new(external_import.package.as_str()),
+            PackageVersion::new(external_import.version.as_str()),
+            PackagePath::new("moved/external-certificate.npcert"),
+        ),
+    ];
+    for (field, package, version, certificate) in identity_drifts {
+        let mut changed = lock.clone();
+        let entry = &mut changed.entries[external_entry_index];
+        entry.package = Some(package);
+        entry.version = Some(version);
+        entry.certificate = certificate;
+
+        let error = validate_observed_package_lock_against_manifest_graph(&validated, &changed)
+            .unwrap_err();
+        assert_lock_error(
+            &error,
+            PackageLockErrorKind::Graph,
+            PackageLockErrorReason::LockEntryMissing,
+            &format!("entries[{external_entry_index}].{field}"),
+            Some(field),
+        );
+    }
+}
+
+#[test]
+fn package_lock_root_builder_allowing_local_hash_updates_matches_strict_current_root() {
+    let validated = validated_proof_manifest();
+    let strict = build_package_lock_from_package_root(
+        &validated,
+        proofs_root(),
+        PackagePath::new("npa-package.toml"),
+    )
+    .unwrap();
+    let relaxed = build_package_lock_from_package_root_allowing_local_hash_updates(
+        &validated,
+        proofs_root(),
+        PackagePath::new("npa-package.toml"),
+    )
+    .unwrap();
+
+    assert_eq!(relaxed, strict);
+}
+
+#[test]
 fn package_lock_builder_stale_local_canonical_certificate_hash_is_rejected() {
     let mut manifest = proof_manifest();
     let mut artifacts = proof_certificate_artifacts(&validate_manifest(manifest.clone()).unwrap());
@@ -932,7 +1134,7 @@ fn package_lock_builder_ignores_source_replay_and_meta_paths() {
 }
 
 #[test]
-fn package_lock_import_identity_rejects_certificate_import_absent_from_manifest_graph() {
+fn package_lock_import_identity_accepts_interface_dependency_absent_from_manifest_direct_imports() {
     let mut manifest = proof_manifest();
     let external = manifest.imports.as_deref().unwrap()[0].clone();
     let module_index = manifest
@@ -958,16 +1160,14 @@ fn package_lock_import_identity_rejects_certificate_import_absent_from_manifest_
     artifacts.insert(certificate_path, tampered);
     let validated = validate_manifest(manifest).unwrap();
 
-    let error = build_proof_lock_from_artifacts(&validated, &artifacts).unwrap_err();
+    let lock = build_proof_lock_from_artifacts(&validated, &artifacts).unwrap();
+    let entry = &lock.entries[entry_index];
 
-    assert_lock_error(
-        &error,
-        PackageLockErrorKind::Graph,
-        PackageLockErrorReason::ManifestImportMissing,
-        &format!("entries[{entry_index}].imports[0].module"),
-        Some("module"),
-    );
-    assert_lock_error_module_context(&error, &owner_module);
+    assert!(entry.imports.iter().any(|import| {
+        import.module == external.module
+            && import.export_hash == external.export_hash
+            && import.certificate_hash == external.certificate_hash
+    }));
 }
 
 #[test]

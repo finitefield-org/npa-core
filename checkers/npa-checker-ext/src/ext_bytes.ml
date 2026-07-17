@@ -23,6 +23,7 @@ type decode_error_reason =
   | Invalid_utf8
   | Format_mismatch
   | Core_spec_mismatch
+  | Constrained_export_requires_format_upgrade
   | Empty_name
   | Empty_name_component
   | Dotted_name_component
@@ -37,6 +38,7 @@ type decode_error_reason =
   | Unused_table_entry
   | Trailing_bytes
   | Unresolved_metavariable
+  | Resource_limit
 
 type decode_error = {
   section : certificate_section;
@@ -50,6 +52,8 @@ type reader = {
 }
 
 type 'a read_result = ('a * reader, decode_error) result
+
+let max_certificate_bytes = 64 * 1024 * 1024
 
 let empty = { data = ""; offset = 0 }
 
@@ -88,6 +92,8 @@ let reason_code reason =
   | Invalid_utf8 -> "invalid_utf8"
   | Format_mismatch -> "format_mismatch"
   | Core_spec_mismatch -> "core_spec_mismatch"
+  | Constrained_export_requires_format_upgrade ->
+      "constrained_export_requires_format_upgrade"
   | Empty_name -> "empty_name"
   | Empty_name_component -> "empty_name_component"
   | Dotted_name_component -> "dotted_name_component"
@@ -102,6 +108,7 @@ let reason_code reason =
   | Unused_table_entry -> "unused_table_entry"
   | Trailing_bytes -> "trailing_bytes"
   | Unresolved_metavariable -> "unresolved_metavariable"
+  | Resource_limit -> "resource_limit"
 
 let error section offset reason = Error { section; offset; reason }
 
@@ -243,6 +250,23 @@ let read_usize section reader =
       if value < 0L || value > Int64.of_int max_int then
         error section (max start (next.offset - 1)) Length_overflow
       else Ok (Int64.to_int value, next)
+
+let max_count_for_section = function
+  | Imports -> 4_096
+  | Name_table | Level_table | Term_table | Declarations | Export_block
+  | Axiom_report -> 10_000
+  | Header_format | Header_core_spec | Header_module | Hashes | Import_store
+  | Full_certificate -> 10_000
+
+let read_count section reader =
+  match read_usize section reader with
+  | Error err -> Error err
+  | Ok (count, next) ->
+      if count > max_count_for_section section then
+        error section (offset reader) Resource_limit
+      else Ok (count, next)
+
+let max_node_depth = 1_024
 
 let read_string_with_offset section reader =
   match read_usize section reader with

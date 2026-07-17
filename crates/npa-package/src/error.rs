@@ -873,6 +873,23 @@ impl PackageLockError {
         )
     }
 
+    /// Build an error for a manifest identity absent from the package lock.
+    pub(crate) fn lock_entry_identity_missing(
+        path: impl Into<String>,
+        field: impl Into<String>,
+        expected: impl Into<String>,
+        actual: impl Into<String>,
+    ) -> Self {
+        Self::new(
+            PackageLockErrorKind::Graph,
+            path,
+            Some(field.into()),
+            PackageLockErrorReason::LockEntryMissing,
+            Some(expected.into()),
+            Some(actual.into()),
+        )
+    }
+
     /// Build a certificate import that is absent from the package manifest graph.
     pub fn manifest_import_missing(path: impl Into<String>, actual: impl Into<String>) -> Self {
         Self::new(
@@ -1120,7 +1137,7 @@ pub enum PackageLockErrorReason {
     CertificateHashMismatch,
     /// A direct import lacks the high-trust certificate hash required by package locks.
     ImportCertificateHashMissing,
-    /// A package-lock entry is missing for a manifest module or external import.
+    /// A package-lock entry matching a manifest module or external import identity is missing.
     LockEntryMissing,
     /// A package-lock entry has the wrong local/external origin.
     LockEntryOriginMismatch,
@@ -1440,6 +1457,21 @@ impl PackageArtifactError {
         )
     }
 
+    /// Build a theorem-premise projection failure.
+    pub fn theorem_premise_projection(
+        reason_code: PackageArtifactErrorReason,
+        actual: impl Into<String>,
+    ) -> Self {
+        Self::new(
+            PackageArtifactErrorKind::Projection,
+            "theorem_premise_report",
+            None,
+            reason_code,
+            None,
+            Some(actual.into()),
+        )
+    }
+
     /// Build a downstream import bundle mismatch error.
     pub fn downstream_import_bundle_mismatch(
         path: impl Into<String>,
@@ -1524,6 +1556,8 @@ pub enum PackageArtifactErrorKind {
     SelfHash,
     /// Deterministic summary counts do not match artifact contents.
     Summary,
+    /// Verified certificate data could not be projected into an audit artifact.
+    Projection,
 }
 
 /// Stable generated package artifact error reason code.
@@ -1583,6 +1617,18 @@ pub enum PackageArtifactErrorReason {
     SummaryMismatch,
     /// Downstream import bundle does not match local registry seed entries.
     DownstreamImportBundleMismatch,
+    /// The theorem-premise telescope limit was exhausted.
+    TheoremPremiseTelescopeLimit,
+    /// The theorem-premise weak-head-reduction fuel was exhausted.
+    TheoremPremiseWhnfFuelLimit,
+    /// The theorem-premise conversion fuel was exhausted.
+    TheoremPremiseConversionFuelLimit,
+    /// The theorem-premise expression traversal limit was exhausted.
+    TheoremPremiseExpressionTraversalLimit,
+    /// The theorem-premise dependency limit was exhausted.
+    TheoremPremiseDependencyLimit,
+    /// Verified theorem data contradicted report projection requirements.
+    TheoremPremiseProjectionFailed,
 }
 
 impl PackageArtifactErrorReason {
@@ -1616,6 +1662,14 @@ impl PackageArtifactErrorReason {
             Self::SelfHashMismatch => "self_hash_mismatch",
             Self::SummaryMismatch => "summary_mismatch",
             Self::DownstreamImportBundleMismatch => "downstream_import_bundle_mismatch",
+            Self::TheoremPremiseTelescopeLimit => "theorem_premise_telescope_limit",
+            Self::TheoremPremiseWhnfFuelLimit => "theorem_premise_whnf_fuel_limit",
+            Self::TheoremPremiseConversionFuelLimit => "theorem_premise_conversion_fuel_limit",
+            Self::TheoremPremiseExpressionTraversalLimit => {
+                "theorem_premise_expression_traversal_limit"
+            }
+            Self::TheoremPremiseDependencyLimit => "theorem_premise_dependency_limit",
+            Self::TheoremPremiseProjectionFailed => "theorem_premise_projection_failed",
         }
     }
 }

@@ -5,25 +5,28 @@ use std::time::{Duration, Instant};
 
 use crate::{
     builtin_machine_callable_profile,
-    elaborator::{certificate_import_refs_for_module, certificate_import_refs_for_module_refs},
+    elaborator::{
+        certificate_import_refs_and_providers_for_module_refs, certificate_import_refs_for_module,
+        combined_verified_module_refs, kernel_env_from_verified_imports,
+    },
     machine_callable_profile_from_human_binders, parse_human_module_with_source_interfaces,
     resolve_human_module_with_source_interfaces, HumanBinder, HumanBinderKind, HumanCompileOptions,
-    HumanDeclValue, HumanDiagnostic, HumanDiagnosticKind, HumanDiagnosticPayload,
-    HumanDiagnosticPhase, HumanExpr, HumanGeneratedDeclarationKind, HumanGlobalRef,
-    HumanGlobalScopeEntry, HumanHoleGoal, HumanHoleGoalLocal, HumanImplicitMode,
+    HumanDeclValue, HumanDiagnostic, HumanDiagnosticConversionContext, HumanDiagnosticKind,
+    HumanDiagnosticPayload, HumanDiagnosticPhase, HumanExpr, HumanGeneratedDeclarationKind,
+    HumanGlobalRef, HumanGlobalScopeEntry, HumanHoleGoal, HumanHoleGoalLocal, HumanImplicitMode,
     HumanImportedSourceInterface, HumanItem, HumanLevel, HumanName, HumanResolvedName,
     HumanResolvedNameUse, HumanResolvedNotationEntry, HumanResolvedNotationUse, HumanResult,
     HumanSourceDeclarationKind, HumanSourceDeclarationMetadata, HumanSourceInterface,
     HumanTacticScript, HumanTypeclassClassMetadata, HumanTypeclassInstanceMetadata,
     HumanTypeclassSearchOutput, HumanTypeclassSearchPolicy, HumanTypeclassSearchStatus,
     HumanUnsolvedMeta, HumanUnsolvedMetaKind, MachineBinder, MachineCallableBinderVisibility,
-    MachineCheckedCurrentDecl, MachineCheckedCurrentGeneratedDecl, MachineDecl, MachineLevel,
-    MachineLocalDecl, MachineName, MachineTerm, MachineUniverseParam, ResolvedHumanModule, Span,
-    VerifiedImport,
+    MachineCheckedCurrentDecl, MachineCheckedCurrentGeneratedDecl, MachineDecl,
+    MachineDiagnosticKind, MachineLevel, MachineLocalDecl, MachineName, MachineTerm,
+    MachineUniverseParam, ResolvedHumanModule, Span, VerifiedImport,
 };
 use npa_kernel::{
-    eq_inductive, eq_rec_type, nat_inductive, subst, Binder, ConstructorDecl, Ctx, Decl, Env,
-    Error, Expr, InductiveDecl, Level, RecursorDecl, Reducibility,
+    eq_inductive, eq_rec_type, nat_inductive, subst, Binder, ConstructorDecl, Ctx, Decl,
+    DiagnosedKernelError, Env, Error, Expr, InductiveDecl, Level, RecursorDecl, Reducibility,
 };
 
 const MAX_HUMAN_IMPLICIT_INSERTION_STEPS: usize = 64;
@@ -149,6 +152,22 @@ pub fn elaborate_human_module(
     verified_imports: &[VerifiedImport],
     options: &HumanCompileOptions,
 ) -> HumanResult<npa_cert::CoreModule> {
+    elaborate_human_module_with_available_imports(
+        module_name,
+        module,
+        verified_imports,
+        verified_imports,
+        options,
+    )
+}
+
+fn elaborate_human_module_with_available_imports(
+    module_name: npa_cert::ModuleName,
+    module: ResolvedHumanModule,
+    direct_imports: &[VerifiedImport],
+    available_imports: &[VerifiedImport],
+    options: &HumanCompileOptions,
+) -> HumanResult<npa_cert::CoreModule> {
     let span = module.module.span;
     let plans = notation_candidate_plans(&module, options.max_notation_candidates)
         .map_err(|diagnostic| diagnostic.with_default_phase(HumanDiagnosticPhase::Elaborator))?;
@@ -159,7 +178,8 @@ pub fn elaborate_human_module(
         match elaborate_human_module_with_notation_plan(
             module_name.clone(),
             &module,
-            verified_imports,
+            direct_imports,
+            available_imports,
             &plan,
             options,
         ) {
@@ -316,11 +336,16 @@ fn prepare_human_proof_start_core_with_notation_plan(
     notation_plan: &[usize],
     options: &HumanCompileOptions,
 ) -> HumanResult<HumanProofStartCore> {
-    let mut lowering =
-        HumanToMachineLowering::new(module, verified_imports, notation_plan, options)?
-            .with_current_module_prefix(module_name.clone());
+    let mut lowering = HumanToMachineLowering::new(
+        module,
+        verified_imports,
+        verified_imports,
+        notation_plan,
+        options,
+    )?
+    .with_current_module_prefix(module_name.clone());
     let lowered = lowering.lower_proof_start(&module_name, theorem_name, module)?;
-    let elaborator = HumanBidirectionalElaborator::new(module, verified_imports)?;
+    let elaborator = HumanBidirectionalElaborator::new(module, verified_imports, verified_imports)?;
     let proof = elaborator.elaborate_proof_start_core(module_name.clone(), lowered)?;
     Ok(prefix_human_current_decl_identities_for_machine_bridge(
         &module_name,
@@ -337,16 +362,21 @@ fn prepare_human_proof_start_core_with_notation_plan_and_by_proofs(
     by_proofs: &BTreeMap<u64, Expr>,
     options: &HumanCompileOptions,
 ) -> HumanResult<HumanProofStartCore> {
-    let mut lowering =
-        HumanToMachineLowering::new(module, verified_imports, notation_plan, options)?
-            .with_current_module_prefix(module_name.clone());
+    let mut lowering = HumanToMachineLowering::new(
+        module,
+        verified_imports,
+        verified_imports,
+        notation_plan,
+        options,
+    )?
+    .with_current_module_prefix(module_name.clone());
     let lowered = lowering.lower_proof_start_with_core_proofs(
         &module_name,
         theorem_name,
         module,
         by_proofs,
     )?;
-    let elaborator = HumanBidirectionalElaborator::new(module, verified_imports)?;
+    let elaborator = HumanBidirectionalElaborator::new(module, verified_imports, verified_imports)?;
     let proof = elaborator.elaborate_proof_start_core(module_name.clone(), lowered)?;
     Ok(prefix_human_current_decl_identities_for_machine_bridge(
         &module_name,
@@ -559,7 +589,8 @@ pub fn search_human_typeclass_from_source(
             .with_phase(HumanDiagnosticPhase::Elaborator)
         })?;
 
-    let mut env_builder = HumanImplicitInserter::new(&search_module, verified_imports, options)?;
+    let mut env_builder =
+        HumanImplicitInserter::new(&search_module, verified_imports, verified_imports, options)?;
     for decl in core_module.declarations {
         env_builder.add_kernel_decl(decl, span)?;
     }
@@ -825,17 +856,44 @@ pub fn compile_human_source_to_certificate_output_with_import_refs_and_axiom_pol
     options: &HumanCompileOptions,
     axiom_policy: &npa_cert::AxiomPolicy,
 ) -> HumanResult<HumanCertificateCompileOutput> {
-    let built = compile_human_source_to_built_certificate_output_with_import_refs(
+    compile_human_source_to_certificate_output_with_available_import_refs_and_axiom_policy(
         file_id,
         module_name,
         source,
         verified_modules,
+        verified_modules,
+        imported_source_interfaces,
+        options,
+        axiom_policy,
+    )
+}
+
+// Direct and transitively available imports stay explicit at this public boundary.
+#[allow(clippy::too_many_arguments)]
+pub fn compile_human_source_to_certificate_output_with_available_import_refs_and_axiom_policy(
+    file_id: crate::FileId,
+    module_name: npa_cert::ModuleName,
+    source: &str,
+    direct_verified_modules: &[&npa_cert::VerifiedModule],
+    available_verified_modules: &[&npa_cert::VerifiedModule],
+    imported_source_interfaces: &[HumanImportedSourceInterface],
+    options: &HumanCompileOptions,
+    axiom_policy: &npa_cert::AxiomPolicy,
+) -> HumanResult<HumanCertificateCompileOutput> {
+    let built = compile_human_source_to_built_certificate_output_with_available_import_refs(
+        file_id,
+        module_name.clone(),
+        source,
+        direct_verified_modules,
+        available_verified_modules,
         imported_source_interfaces,
         options,
     )?;
+    let certificate_imports =
+        combined_verified_module_refs(direct_verified_modules, available_verified_modules);
     let verified_module = npa_cert::verify_built_module_cert_with_import_refs(
         &built.certificate,
-        verified_modules,
+        &certificate_imports,
         axiom_policy,
     )
     .map_err(|err| {
@@ -861,7 +919,31 @@ pub fn compile_human_source_to_built_certificate_output_with_import_refs(
     imported_source_interfaces: &[HumanImportedSourceInterface],
     options: &HumanCompileOptions,
 ) -> HumanResult<HumanBuiltCertificateCompileOutput> {
-    let verified_imports: Vec<_> = verified_modules
+    compile_human_source_to_built_certificate_output_with_available_import_refs(
+        file_id,
+        module_name,
+        source,
+        verified_modules,
+        verified_modules,
+        imported_source_interfaces,
+        options,
+    )
+}
+
+pub fn compile_human_source_to_built_certificate_output_with_available_import_refs(
+    file_id: crate::FileId,
+    module_name: npa_cert::ModuleName,
+    source: &str,
+    direct_verified_modules: &[&npa_cert::VerifiedModule],
+    available_verified_modules: &[&npa_cert::VerifiedModule],
+    imported_source_interfaces: &[HumanImportedSourceInterface],
+    options: &HumanCompileOptions,
+) -> HumanResult<HumanBuiltCertificateCompileOutput> {
+    let direct_verified_imports: Vec<_> = direct_verified_modules
+        .iter()
+        .map(|module| VerifiedImport::from(*module))
+        .collect();
+    let available_verified_imports: Vec<_> = available_verified_modules
         .iter()
         .map(|module| VerifiedImport::from(*module))
         .collect();
@@ -870,36 +952,49 @@ pub fn compile_human_source_to_built_certificate_output_with_import_refs(
     let resolved = resolve_human_module_with_source_interfaces(
         module_name.clone(),
         parsed,
-        &verified_imports,
+        &direct_verified_imports,
         imported_source_interfaces,
         options,
     )?;
     let source_interface = resolved.state.source_interfaces.current.clone();
-    let active_import_indices = active_human_import_indices(&resolved, &verified_imports)
+    let active_import_indices = active_human_import_indices(&resolved, &direct_verified_imports)
         .map_err(|diagnostic| diagnostic.with_default_phase(HumanDiagnosticPhase::Resolver))?;
-    let core = elaborate_human_module(module_name, resolved, &verified_imports, options)
-        .map_err(|diagnostic| diagnostic.with_default_phase(HumanDiagnosticPhase::Elaborator))?;
-    drop(verified_imports);
-    let certificate_imports = certificate_import_refs_for_module_refs(
-        &core,
-        &active_import_indices,
-        verified_modules,
-        file_id,
+    let core = elaborate_human_module_with_available_imports(
+        module_name,
+        resolved,
+        &direct_verified_imports,
+        &available_verified_imports,
+        options,
+    )
+    .map_err(|diagnostic| diagnostic.with_default_phase(HumanDiagnosticPhase::Elaborator))?;
+    drop(direct_verified_imports);
+    drop(available_verified_imports);
+    let verified_modules =
+        combined_verified_module_refs(direct_verified_modules, available_verified_modules);
+    let (certificate_imports, preferred_imports) =
+        certificate_import_refs_and_providers_for_module_refs(
+            &core,
+            &active_import_indices,
+            &verified_modules,
+            file_id,
+        )
+        .map_err(|err| {
+            human_certificate_import_diagnostic(source_span(file_id, source), err)
+                .with_phase(HumanDiagnosticPhase::CertificateHandoff)
+        })?;
+    let cert = npa_cert::build_module_cert_from_import_refs_with_preferred_imports(
+        core,
+        &certificate_imports,
+        &preferred_imports,
     )
     .map_err(|err| {
-        human_certificate_import_diagnostic(source_span(file_id, source), err)
-            .with_phase(HumanDiagnosticPhase::CertificateHandoff)
+        HumanDiagnostic::error(
+            HumanDiagnosticKind::KernelRejected,
+            source_span(file_id, source),
+            format!("certificate certificate handoff rejected Human source: {err:?}"),
+        )
+        .with_phase(HumanDiagnosticPhase::CertificateHandoff)
     })?;
-    let cert = npa_cert::build_module_cert_from_import_refs(core, &certificate_imports).map_err(
-        |err| {
-            HumanDiagnostic::error(
-                HumanDiagnosticKind::KernelRejected,
-                source_span(file_id, source),
-                format!("certificate certificate handoff rejected Human source: {err:?}"),
-            )
-            .with_phase(HumanDiagnosticPhase::CertificateHandoff)
-        },
-    )?;
     let source_interface = source_interface_with_certificate_hashes(source_interface, &cert);
     Ok(HumanBuiltCertificateCompileOutput {
         certificate: cert,
@@ -915,7 +1010,31 @@ pub fn compile_human_source_to_built_certificate_only_with_import_refs(
     imported_source_interfaces: &[HumanImportedSourceInterface],
     options: &HumanCompileOptions,
 ) -> HumanResult<HumanBuiltCertificateOnlyCompileOutput> {
-    let verified_imports: Vec<_> = verified_modules
+    compile_human_source_to_built_certificate_only_with_available_import_refs(
+        file_id,
+        module_name,
+        source,
+        verified_modules,
+        verified_modules,
+        imported_source_interfaces,
+        options,
+    )
+}
+
+pub fn compile_human_source_to_built_certificate_only_with_available_import_refs(
+    file_id: crate::FileId,
+    module_name: npa_cert::ModuleName,
+    source: &str,
+    direct_verified_modules: &[&npa_cert::VerifiedModule],
+    available_verified_modules: &[&npa_cert::VerifiedModule],
+    imported_source_interfaces: &[HumanImportedSourceInterface],
+    options: &HumanCompileOptions,
+) -> HumanResult<HumanBuiltCertificateOnlyCompileOutput> {
+    let direct_verified_imports: Vec<_> = direct_verified_modules
+        .iter()
+        .map(|module| VerifiedImport::from(*module))
+        .collect();
+    let available_verified_imports: Vec<_> = available_verified_modules
         .iter()
         .map(|module| VerifiedImport::from(*module))
         .collect();
@@ -924,35 +1043,48 @@ pub fn compile_human_source_to_built_certificate_only_with_import_refs(
     let resolved = resolve_human_module_with_source_interfaces(
         module_name.clone(),
         parsed,
-        &verified_imports,
+        &direct_verified_imports,
         imported_source_interfaces,
         options,
     )?;
-    let active_import_indices = active_human_import_indices(&resolved, &verified_imports)
+    let active_import_indices = active_human_import_indices(&resolved, &direct_verified_imports)
         .map_err(|diagnostic| diagnostic.with_default_phase(HumanDiagnosticPhase::Resolver))?;
-    let core = elaborate_human_module(module_name, resolved, &verified_imports, options)
-        .map_err(|diagnostic| diagnostic.with_default_phase(HumanDiagnosticPhase::Elaborator))?;
-    drop(verified_imports);
-    let certificate_imports = certificate_import_refs_for_module_refs(
-        &core,
-        &active_import_indices,
-        verified_modules,
-        file_id,
+    let core = elaborate_human_module_with_available_imports(
+        module_name,
+        resolved,
+        &direct_verified_imports,
+        &available_verified_imports,
+        options,
+    )
+    .map_err(|diagnostic| diagnostic.with_default_phase(HumanDiagnosticPhase::Elaborator))?;
+    drop(direct_verified_imports);
+    drop(available_verified_imports);
+    let verified_modules =
+        combined_verified_module_refs(direct_verified_modules, available_verified_modules);
+    let (certificate_imports, preferred_imports) =
+        certificate_import_refs_and_providers_for_module_refs(
+            &core,
+            &active_import_indices,
+            &verified_modules,
+            file_id,
+        )
+        .map_err(|err| {
+            human_certificate_import_diagnostic(source_span(file_id, source), err)
+                .with_phase(HumanDiagnosticPhase::CertificateHandoff)
+        })?;
+    let cert = npa_cert::build_module_cert_from_import_refs_with_preferred_imports(
+        core,
+        &certificate_imports,
+        &preferred_imports,
     )
     .map_err(|err| {
-        human_certificate_import_diagnostic(source_span(file_id, source), err)
-            .with_phase(HumanDiagnosticPhase::CertificateHandoff)
+        HumanDiagnostic::error(
+            HumanDiagnosticKind::KernelRejected,
+            source_span(file_id, source),
+            format!("certificate certificate handoff rejected Human source: {err:?}"),
+        )
+        .with_phase(HumanDiagnosticPhase::CertificateHandoff)
     })?;
-    let cert = npa_cert::build_module_cert_from_import_refs(core, &certificate_imports).map_err(
-        |err| {
-            HumanDiagnostic::error(
-                HumanDiagnosticKind::KernelRejected,
-                source_span(file_id, source),
-                format!("certificate certificate handoff rejected Human source: {err:?}"),
-            )
-            .with_phase(HumanDiagnosticPhase::CertificateHandoff)
-        },
-    )?;
     Ok(HumanBuiltCertificateOnlyCompileOutput { certificate: cert })
 }
 
@@ -1336,6 +1468,35 @@ fn add_human_kernel_imports_to_env(
     )?;
 
     Ok(())
+}
+
+fn human_kernel_env_from_verified_imports(
+    active_imports: &[&VerifiedImport],
+    available_imports: &[VerifiedImport],
+    span: Span,
+) -> HumanResult<Env> {
+    kernel_env_from_verified_imports(
+        active_imports.iter().copied(),
+        available_imports,
+        true,
+        span,
+    )
+    .map_err(|diagnostic| {
+        let kind = match diagnostic.kind {
+            MachineDiagnosticKind::MissingVerifiedImport => {
+                HumanDiagnosticKind::MissingVerifiedImport
+            }
+            MachineDiagnosticKind::ImportResolutionError => {
+                HumanDiagnosticKind::ImportResolutionError
+            }
+            MachineDiagnosticKind::KernelRejected | MachineDiagnosticKind::CertificateRejected => {
+                HumanDiagnosticKind::KernelRejected
+            }
+            _ => HumanDiagnosticKind::MachineElaborationError,
+        };
+        HumanDiagnostic::error(kind, diagnostic.primary_span, diagnostic.message)
+            .with_phase(HumanDiagnosticPhase::KernelHandoff)
+    })
 }
 
 fn add_human_inductive_to_env(env: &mut Env, mut data: InductiveDecl) -> npa_kernel::Result<()> {
@@ -2241,19 +2402,24 @@ fn elaborate_human_tactic_term_infer_with_plan(
 fn elaborate_human_module_with_notation_plan(
     module_name: npa_cert::ModuleName,
     module: &ResolvedHumanModule,
-    verified_imports: &[VerifiedImport],
+    direct_imports: &[VerifiedImport],
+    available_imports: &[VerifiedImport],
     notation_plan: &[usize],
     options: &HumanCompileOptions,
 ) -> HumanResult<npa_cert::CoreModule> {
     let span = module.module.span;
-    let mut lowering =
-        HumanToMachineLowering::new(module, verified_imports, notation_plan, options).map_err(
-            |diagnostic| diagnostic.with_default_phase(HumanDiagnosticPhase::Elaborator),
-        )?;
+    let mut lowering = HumanToMachineLowering::new(
+        module,
+        direct_imports,
+        available_imports,
+        notation_plan,
+        options,
+    )
+    .map_err(|diagnostic| diagnostic.with_default_phase(HumanDiagnosticPhase::Elaborator))?;
     let machine_module = lowering
         .lower_module(module)
         .map_err(|diagnostic| diagnostic.with_default_phase(HumanDiagnosticPhase::Elaborator))?;
-    HumanBidirectionalElaborator::new(module, verified_imports)
+    HumanBidirectionalElaborator::new(module, direct_imports, available_imports)
         .map_err(|diagnostic| diagnostic.with_default_phase(HumanDiagnosticPhase::Elaborator))?
         .elaborate_module(module_name, machine_module)
         .map_err(|diagnostic| {
@@ -2326,14 +2492,19 @@ fn elaborate_human_module_with_notation_plan_and_by_proofs(
     options: &HumanCompileOptions,
 ) -> HumanResult<npa_cert::CoreModule> {
     let span = module.module.span;
-    let mut lowering =
-        HumanToMachineLowering::new(module, verified_imports, notation_plan, options)
-            .map_err(|diagnostic| diagnostic.with_default_phase(HumanDiagnosticPhase::Elaborator))?
-            .with_current_module_prefix(module_name.clone());
+    let mut lowering = HumanToMachineLowering::new(
+        module,
+        verified_imports,
+        verified_imports,
+        notation_plan,
+        options,
+    )
+    .map_err(|diagnostic| diagnostic.with_default_phase(HumanDiagnosticPhase::Elaborator))?
+    .with_current_module_prefix(module_name.clone());
     let machine_module = lowering
         .lower_module_with_core_proofs(module, by_proofs)
         .map_err(|diagnostic| diagnostic.with_default_phase(HumanDiagnosticPhase::Elaborator))?;
-    HumanBidirectionalElaborator::new(module, verified_imports)
+    HumanBidirectionalElaborator::new(module, verified_imports, verified_imports)
         .map_err(|diagnostic| diagnostic.with_default_phase(HumanDiagnosticPhase::Elaborator))?
         .elaborate_module(module_name, machine_module)
         .map_err(|diagnostic| {
@@ -4008,22 +4179,26 @@ struct HumanBidirectionalElaborator {
 }
 
 impl HumanBidirectionalElaborator {
-    fn new(module: &ResolvedHumanModule, verified_imports: &[VerifiedImport]) -> HumanResult<Self> {
-        let mut elaborator = Self { env: Env::new() };
-
-        let active_imports = active_human_imports(module, verified_imports)?;
-        for import in active_imports {
-            elaborator.add_import(import, module.module.span)?;
-        }
+    fn new(
+        module: &ResolvedHumanModule,
+        direct_imports: &[VerifiedImport],
+        available_imports: &[VerifiedImport],
+    ) -> HumanResult<Self> {
+        let active_imports = active_human_imports(module, direct_imports)?;
+        let mut env = human_kernel_env_from_verified_imports(
+            &active_imports,
+            available_imports,
+            module.module.span,
+        )?;
         let builtin_names = human_referenced_builtin_names(module);
         add_human_builtin_decls_for_names(
-            &mut elaborator.env,
+            &mut env,
             &builtin_names,
             module.module.span,
             "Human resolved builtin",
         )?;
 
-        Ok(elaborator)
+        Ok(Self { env })
     }
 
     fn from_tactic_context(context: &HumanTacticTermElabContext) -> Self {
@@ -4254,19 +4429,6 @@ impl HumanBidirectionalElaborator {
             ty: head_ty,
             data: Box::new(data),
         })
-    }
-
-    fn add_import(&mut self, import: &VerifiedImport, span: Span) -> HumanResult<()> {
-        for decl in kernel_decls_for_human_import(import) {
-            self.add_kernel_decl(decl, span)?;
-        }
-        add_human_builtin_eq_rec_import_bridge(
-            &mut self.env,
-            std::iter::once(import),
-            span,
-            "Human import environment",
-        )?;
-        Ok(())
     }
 
     fn elaborate_decl(&self, decl: MachineDecl, kind: HumanLoweredDeclKind) -> HumanResult<Decl> {
@@ -4669,72 +4831,8 @@ impl HumanBidirectionalElaborator {
             "Human declaration handoff",
         )?;
 
-        match decl {
-            Decl::Axiom {
-                name,
-                universe_params,
-                ty,
-            } => self.env.add_axiom(name, universe_params, ty),
-            Decl::AxiomConstrained {
-                name,
-                universe_params,
-                universe_constraints,
-                ty,
-            } => self.env.add_axiom_with_universe_constraints(
-                name,
-                universe_params,
-                universe_constraints,
-                ty,
-            ),
-            Decl::Def {
-                name,
-                universe_params,
-                ty,
-                value,
-                reducibility,
-            } => self
-                .env
-                .add_def(name, universe_params, ty, value, reducibility),
-            Decl::DefConstrained {
-                name,
-                universe_params,
-                universe_constraints,
-                ty,
-                value,
-                reducibility,
-            } => self.env.add_def_with_universe_constraints(
-                name,
-                universe_params,
-                universe_constraints,
-                ty,
-                value,
-                reducibility,
-            ),
-            Decl::Theorem {
-                name,
-                universe_params,
-                ty,
-                proof,
-            } => self.env.add_theorem(name, universe_params, ty, proof),
-            Decl::TheoremConstrained {
-                name,
-                universe_params,
-                universe_constraints,
-                ty,
-                proof,
-            } => self.env.add_theorem_with_universe_constraints(
-                name,
-                universe_params,
-                universe_constraints,
-                ty,
-                proof,
-            ),
-            Decl::Inductive { data, .. } => add_human_inductive_to_env(&mut self.env, *data),
-            Decl::MutualInductiveBlock { data, .. } => self.env.add_mutual_inductive(*data),
-            Decl::Constructor { .. } | Decl::Recursor { .. } => Ok(()),
-        }
-        .map_err(|err| {
-            human_kernel_decl_diagnostic(span, err, "Human declaration handoff")
+        self.env.add_decl_diagnosed(decl).map_err(|err| {
+            human_diagnosed_kernel_decl_diagnostic(span, err, "Human declaration handoff")
                 .with_phase(HumanDiagnosticPhase::KernelHandoff)
         })
     }
@@ -4919,11 +5017,18 @@ enum HumanTypeclassSearchResult {
 impl HumanImplicitInserter {
     fn new(
         module: &ResolvedHumanModule,
-        verified_imports: &[VerifiedImport],
+        direct_imports: &[VerifiedImport],
+        available_imports: &[VerifiedImport],
         options: &HumanCompileOptions,
     ) -> HumanResult<Self> {
+        let active_imports = active_human_imports(module, direct_imports)?;
+        let env = human_kernel_env_from_verified_imports(
+            &active_imports,
+            available_imports,
+            module.module.span,
+        )?;
         let mut inserter = Self {
-            env: Env::new(),
+            env,
             signatures: BTreeMap::new(),
             imported_source_interfaces: module.state.source_interfaces.imports.clone(),
             typeclass_classes: human_typeclass_classes(module),
@@ -4932,9 +5037,8 @@ impl HumanImplicitInserter {
             insertion_steps: 0,
         };
 
-        let active_imports = active_human_imports(module, verified_imports)?;
         for import in active_imports {
-            inserter.add_import(import, module.module.span)?;
+            inserter.add_import_signatures(import);
         }
         inserter.add_referenced_builtins(module)?;
 
@@ -4953,23 +5057,13 @@ impl HumanImplicitInserter {
         }
     }
 
-    fn add_import(&mut self, import: &VerifiedImport, span: Span) -> HumanResult<()> {
-        for decl in kernel_decls_for_human_import(import) {
-            self.add_kernel_decl(decl, span)?;
-        }
-        add_human_builtin_eq_rec_import_bridge(
-            &mut self.env,
-            std::iter::once(import),
-            span,
-            "Human implicit import",
-        )?;
+    fn add_import_signatures(&mut self, import: &VerifiedImport) {
         for export in &import.exports {
             self.signatures.insert(
                 export.name.as_dotted(),
                 human_import_signature(&self.imported_source_interfaces, import, export),
             );
         }
-        Ok(())
     }
 
     fn add_referenced_builtins(&mut self, module: &ResolvedHumanModule) -> HumanResult<()> {
@@ -6538,10 +6632,18 @@ fn human_kernel_expr_diagnostic(span: Span, err: Error, context: &str) -> HumanD
             span,
             format!("{context}: expected a type, got {actual:?}"),
         ),
-        Error::TypeMismatch { expected, actual } => HumanDiagnostic::error(
+        Error::TypeMismatch { .. } => HumanDiagnostic::error(
             HumanDiagnosticKind::TypeMismatch,
             span,
-            format!("{context}: expected {expected:?}, got {actual:?}"),
+            format!("{context}: kernel conversion failed"),
+        ),
+        Error::NotDefEq { .. }
+        | Error::ResourceLimit {
+            kind: npa_kernel::ResourceLimitKind::Conversion,
+        } => HumanDiagnostic::error(
+            HumanDiagnosticKind::KernelRejected,
+            span,
+            format!("{context}: kernel conversion failed"),
         ),
         Error::UnknownConstant(name) => HumanDiagnostic::error(
             HumanDiagnosticKind::UnknownIdentifier,
@@ -6568,10 +6670,18 @@ fn human_kernel_decl_diagnostic(span: Span, err: Error, context: &str) -> HumanD
             span,
             format!("{context}: expected a declaration type, got {actual:?}"),
         ),
-        Error::TypeMismatch { expected, actual } => HumanDiagnostic::error(
+        Error::TypeMismatch { .. } => HumanDiagnostic::error(
             HumanDiagnosticKind::TypeMismatch,
             span,
-            format!("{context}: declaration value has type {actual:?}, expected {expected:?}"),
+            format!("{context}: kernel conversion failed"),
+        ),
+        Error::NotDefEq { .. }
+        | Error::ResourceLimit {
+            kind: npa_kernel::ResourceLimitKind::Conversion,
+        } => HumanDiagnostic::error(
+            HumanDiagnosticKind::KernelRejected,
+            span,
+            format!("{context}: kernel conversion failed"),
         ),
         err => HumanDiagnostic::error(
             HumanDiagnosticKind::KernelRejected,
@@ -6579,6 +6689,50 @@ fn human_kernel_decl_diagnostic(span: Span, err: Error, context: &str) -> HumanD
             format!("{context}: kernel rejected elaborated Human declaration: {err:?}"),
         ),
     }
+}
+
+fn human_diagnosed_kernel_decl_diagnostic(
+    span: Span,
+    error: DiagnosedKernelError,
+    context: &str,
+) -> HumanDiagnostic {
+    let conversion = error.context().and_then(|diagnostic| {
+        diagnostic.conversion().and_then(|conversion| {
+            HumanDiagnosticConversionContext::new(
+                diagnostic.phase().as_str(),
+                conversion.outcome().as_str(),
+                conversion.lhs_head().as_str(),
+                conversion.rhs_head().as_str(),
+                conversion.depth(),
+            )
+        })
+    });
+    let conversion_failure = matches!(
+        error.error(),
+        Error::TypeMismatch { .. }
+            | Error::NotDefEq { .. }
+            | Error::ResourceLimit {
+                kind: npa_kernel::ResourceLimitKind::Conversion
+            }
+    );
+    if !conversion_failure {
+        return human_kernel_decl_diagnostic(span, error.into_error(), context);
+    }
+    let kind = if matches!(error.error(), Error::TypeMismatch { .. }) {
+        HumanDiagnosticKind::TypeMismatch
+    } else {
+        HumanDiagnosticKind::KernelRejected
+    };
+    let wording = conversion
+        .as_ref()
+        .map(|conversion| format!("kernel conversion {}", conversion.outcome()))
+        .unwrap_or_else(|| "kernel conversion failed".to_owned());
+    HumanDiagnostic::error(kind, span, format!("{context}: {wording}")).with_payload(
+        HumanDiagnosticPayload {
+            conversion,
+            ..HumanDiagnosticPayload::default()
+        },
+    )
 }
 
 fn active_human_imports<'a>(
@@ -7224,7 +7378,8 @@ struct HumanToMachineLowering<'a> {
 impl<'a> HumanToMachineLowering<'a> {
     fn new(
         module: &'a ResolvedHumanModule,
-        verified_imports: &[VerifiedImport],
+        direct_imports: &[VerifiedImport],
+        available_imports: &[VerifiedImport],
         notation_plan: &'a [usize],
         options: &HumanCompileOptions,
     ) -> HumanResult<Self> {
@@ -7232,7 +7387,12 @@ impl<'a> HumanToMachineLowering<'a> {
             name_uses: module.resolved_names.iter(),
             notation_uses: module.resolved_notations.iter(),
             notation_choices: notation_plan.iter(),
-            implicit_inserter: HumanImplicitInserter::new(module, verified_imports, options)?,
+            implicit_inserter: HumanImplicitInserter::new(
+                module,
+                direct_imports,
+                available_imports,
+                options,
+            )?,
             meta_store: HumanMetaStore::default(),
             current_module_prefix: None,
             typeclass_classes: human_typeclass_classes(module),
@@ -9727,7 +9887,9 @@ mod tests {
     use super::*;
     use crate::{FileId, HumanDiagnosticKind, MachineDiagnosticKind};
     use npa_kernel::{
-        eq, eq_refl, eq_refl_type, eq_type, nat, type0, Decl, Expr, Level, Reducibility,
+        eq, eq_refl, eq_refl_type, eq_type, nat, type0, Decl, DiagnosedKernelError, Error, Expr,
+        KernelComparisonOutcome, KernelConversionContext, KernelDiagnosticContext,
+        KernelDiagnosticPhase, KernelExprHead, Level, Reducibility,
     };
 
     fn hash(seed: u8) -> npa_cert::Hash {
@@ -11129,6 +11291,50 @@ def bad : Nat := Type",
         .expect_err("ill-typed Human value should be rejected as a structured diagnostic");
 
         assert_eq!(err.kind, HumanDiagnosticKind::TypeMismatch);
+    }
+
+    #[test]
+    fn diagnosed_kernel_conversion_projects_only_bounded_context() {
+        let error = DiagnosedKernelError::new(Error::TypeMismatch {
+            expected: Expr::app(
+                Expr::konst("Expected", Vec::new()),
+                Expr::sort(Level::zero()),
+            ),
+            actual: Expr::konst("Actual", Vec::new()),
+        })
+        .with_context(
+            KernelDiagnosticContext::new(KernelDiagnosticPhase::DeclarationValue).with_conversion(
+                KernelConversionContext::new(
+                    KernelComparisonOutcome::NotDefEq,
+                    KernelExprHead::Application,
+                    KernelExprHead::Constant("Actual".to_owned()),
+                    4,
+                ),
+            ),
+        );
+
+        let diagnostic = human_diagnosed_kernel_decl_diagnostic(
+            Span::empty(FileId(0)),
+            error,
+            "Human declaration handoff",
+        );
+
+        assert_eq!(diagnostic.kind, HumanDiagnosticKind::TypeMismatch);
+        assert_eq!(
+            diagnostic.message,
+            "Human declaration handoff: kernel conversion not_defeq"
+        );
+        assert!(!diagnostic.message.contains("Expected"));
+        let conversion = diagnostic
+            .payload
+            .as_deref()
+            .and_then(|payload| payload.conversion.as_ref())
+            .unwrap();
+        assert_eq!(conversion.phase(), "declaration_value");
+        assert_eq!(conversion.outcome(), "not_defeq");
+        assert_eq!(conversion.lhs_head(), "application");
+        assert_eq!(conversion.rhs_head(), "constant:Actual");
+        assert_eq!(conversion.depth(), 4);
     }
 
     #[test]

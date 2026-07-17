@@ -3303,7 +3303,7 @@ def bad (n : Nat) : Nat where
     }
 
     #[test]
-    fn pua_m03_negative_resolver_fixtures_are_structured_and_deterministic() {
+    fn negative_resolver_fixtures_are_structured_and_deterministic() {
         let disabled_source = "\
 inductive Nat : Type where
 | zero : Nat

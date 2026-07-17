@@ -28,10 +28,26 @@ pub fn elaborate_machine_module(
     verified_imports: &[VerifiedImport],
     options: &MachineCompileOptions,
 ) -> Result<npa_cert::CoreModule> {
-    let active_imports = active_verified_imports(&module.module.items, verified_imports)?;
+    elaborate_machine_module_with_available_imports(
+        module_name,
+        module,
+        verified_imports,
+        verified_imports,
+        options,
+    )
+}
+
+pub(crate) fn elaborate_machine_module_with_available_imports(
+    module_name: npa_cert::ModuleName,
+    module: ResolvedMachineModule,
+    direct_imports: &[VerifiedImport],
+    available_imports: &[VerifiedImport],
+    options: &MachineCompileOptions,
+) -> Result<npa_cert::CoreModule> {
+    let active_imports = active_verified_imports(&module.module.items, direct_imports)?;
     let kernel_env = kernel_env_from_imports(
         active_imports.iter().copied(),
-        verified_imports,
+        available_imports,
         true,
         module.module.span,
     )?
@@ -88,15 +104,61 @@ pub fn compile_machine_source_to_certificate(
     verified_modules: &[npa_cert::VerifiedModule],
     options: &MachineCompileOptions,
 ) -> Result<npa_cert::ModuleCert> {
-    let verified_imports: Vec<_> = verified_modules.iter().map(VerifiedImport::from).collect();
+    compile_machine_source_to_certificate_with_available_imports(
+        file_id,
+        module_name,
+        source,
+        verified_modules,
+        verified_modules,
+        options,
+    )
+}
+
+pub fn compile_machine_source_to_certificate_with_available_imports(
+    file_id: crate::FileId,
+    module_name: npa_cert::ModuleName,
+    source: &str,
+    direct_verified_modules: &[npa_cert::VerifiedModule],
+    available_verified_modules: &[npa_cert::VerifiedModule],
+    options: &MachineCompileOptions,
+) -> Result<npa_cert::ModuleCert> {
+    let direct_imports: Vec<_> = direct_verified_modules
+        .iter()
+        .map(VerifiedImport::from)
+        .collect();
+    let available_imports: Vec<_> = available_verified_modules
+        .iter()
+        .map(VerifiedImport::from)
+        .collect();
     let parsed = parse_machine_module(file_id, source)?;
-    let resolved = resolve_machine_module_with_options(parsed, &verified_imports, options)?;
+    let resolved = resolve_machine_module_with_options(parsed, &direct_imports, options)?;
     let active_import_indices =
-        active_verified_import_indices(&resolved.module.items, &verified_imports)?;
-    let module = elaborate_machine_module(module_name, resolved, &verified_imports, options)?;
-    let certificate_imports =
-        certificate_imports_for_module(&module, &active_import_indices, verified_modules, file_id)?;
-    let cert = npa_cert::build_module_cert(module, &certificate_imports).map_err(|err| {
+        active_verified_import_indices(&resolved.module.items, &direct_imports)?;
+    let module = elaborate_machine_module_with_available_imports(
+        module_name,
+        resolved,
+        &direct_imports,
+        &available_imports,
+        options,
+    )?;
+    let direct_refs = direct_verified_modules.iter().collect::<Vec<_>>();
+    let available_refs = available_verified_modules.iter().collect::<Vec<_>>();
+    let verified_modules = combined_verified_module_refs(&direct_refs, &available_refs);
+    let (certificate_imports, preferred_imports) =
+        certificate_import_refs_and_providers_for_module_refs(
+            &module,
+            &active_import_indices,
+            &verified_modules,
+            file_id,
+        )?;
+    let certificate_imports = certificate_imports.into_iter().cloned().collect::<Vec<_>>();
+    let certificate_import_refs = certificate_imports.iter().collect::<Vec<_>>();
+    let cert = npa_cert::build_module_cert_from_import_refs_with_preferred_imports(
+        module,
+        &certificate_import_refs,
+        &preferred_imports,
+    )
+    .map_err(|err| {
         MachineDiagnostic::error(
             MachineDiagnosticKind::CertificateRejected,
             crate::Span::empty(file_id),
@@ -2225,6 +2287,7 @@ fn find_verified_import_index(
     Ok(first_index)
 }
 
+#[cfg(test)]
 pub(crate) fn certificate_imports_for_module(
     module: &npa_cert::CoreModule,
     active_import_indices: &[usize],
@@ -2256,91 +2319,349 @@ pub(crate) fn certificate_import_refs_for_module_refs<'a>(
     verified_modules: &[&'a npa_cert::VerifiedModule],
     file_id: crate::FileId,
 ) -> Result<Vec<&'a npa_cert::VerifiedModule>> {
-    certificate_import_indices_for_module_refs(
+    certificate_import_selection_for_module_refs(
         module,
         active_import_indices,
         verified_modules,
         file_id,
     )
-    .map(|indices| {
-        indices
+    .map(|selection| {
+        selection
+            .indices
             .into_iter()
             .map(|index| verified_modules[index])
             .collect()
     })
 }
 
-fn certificate_import_indices_for_module_refs(
+pub(crate) fn certificate_import_refs_and_providers_for_module_refs<'a>(
+    module: &npa_cert::CoreModule,
+    active_import_indices: &[usize],
+    verified_modules: &[&'a npa_cert::VerifiedModule],
+    file_id: crate::FileId,
+) -> Result<(
+    Vec<&'a npa_cert::VerifiedModule>,
+    BTreeMap<npa_cert::Name, npa_cert::ImportEntry>,
+)> {
+    certificate_import_selection_for_module_refs(
+        module,
+        active_import_indices,
+        verified_modules,
+        file_id,
+    )
+    .map(|selection| {
+        (
+            selection
+                .indices
+                .into_iter()
+                .map(|index| verified_modules[index])
+                .collect(),
+            selection.preferred_imports,
+        )
+    })
+}
+
+pub(crate) fn combined_verified_module_refs<'a>(
+    direct_modules: &[&'a npa_cert::VerifiedModule],
+    available_modules: &[&'a npa_cert::VerifiedModule],
+) -> Vec<&'a npa_cert::VerifiedModule> {
+    let mut seen = BTreeSet::new();
+    let mut combined = Vec::new();
+    for module in direct_modules
+        .iter()
+        .chain(available_modules.iter())
+        .copied()
+    {
+        let key = (
+            module.module().clone(),
+            module.export_hash(),
+            module.certificate_hash(),
+        );
+        if seen.insert(key) {
+            combined.push(module);
+        }
+    }
+    combined
+}
+
+struct CertificateImportSelection {
+    indices: Vec<usize>,
+    preferred_imports: BTreeMap<npa_cert::Name, npa_cert::ImportEntry>,
+}
+
+fn certificate_import_selection_for_module_refs(
     module: &npa_cert::CoreModule,
     active_import_indices: &[usize],
     verified_modules: &[&npa_cert::VerifiedModule],
     file_id: crate::FileId,
-) -> Result<Vec<usize>> {
+) -> Result<CertificateImportSelection> {
     let span = crate::Span::empty(file_id);
     let referenced_exports = referenced_import_names(module);
     let mut selected = BTreeSet::new();
-    let mut pending: Vec<_> = active_import_indices.to_vec();
+    let mut pending = Vec::new();
+    let mut scanned_exports = BTreeSet::new();
+    let mut preferred_imports = BTreeMap::new();
 
-    while let Some(index) = pending.pop() {
-        if !selected.insert(index) {
-            continue;
-        }
-
+    for index in active_import_indices.iter().copied() {
+        selected.insert(index);
         let import = verified_modules.get(index).copied().ok_or_else(|| {
             import_resolution_diagnostic(span, "verified import index is out of bounds")
         })?;
-        for dependency in import_interface_dependency_targets(import, span)? {
-            let dependency_index = find_verified_module_export_ref(
-                verified_modules,
-                &dependency.name,
-                dependency.hash,
-                span,
-            )?;
-            if !selected.contains(&dependency_index) {
-                pending.push(dependency_index);
-            }
+        enqueue_referenced_import_exports(
+            index,
+            import,
+            &referenced_exports,
+            &mut pending,
+            &mut preferred_imports,
+            span,
+        )?;
+    }
+
+    while let Some(export) = pending.pop() {
+        selected.insert(export.import_index);
+        if !scanned_exports.insert(export.clone()) {
+            continue;
         }
 
-        for dependency in referenced_axiom_dependency_targets(import, &referenced_exports, span)? {
-            let dependency_index = find_verified_module_axiom_export_ref(
-                verified_modules,
-                &dependency.name,
-                dependency.hash,
+        let import = verified_modules
+            .get(export.import_index)
+            .copied()
+            .ok_or_else(|| {
+                import_resolution_diagnostic(span, "verified import index is out of bounds")
+            })?;
+        let entry = find_verified_module_export_entry(import, &export, span)?;
+        for dependency in export_interface_dependency_targets(import, entry, span)? {
+            let dependency_index =
+                find_verified_module_export_ref(verified_modules, &dependency, span)?;
+            let dependency_import = verified_modules[dependency_index];
+            record_preferred_import(
+                &mut preferred_imports,
+                dependency.name.clone(),
+                dependency_import,
+                false,
                 span,
             )?;
-            if !selected.contains(&dependency_index) {
-                pending.push(dependency_index);
-            }
+            pending.push(PendingCertificateImportExport {
+                import_index: dependency_index,
+                name: dependency.name.clone(),
+                hash: dependency.hash,
+            });
+        }
+
+        for dependency in export_axiom_dependency_targets(import, entry, span)? {
+            let dependency_index =
+                find_verified_module_axiom_export_ref(verified_modules, &dependency, span)?;
+            let dependency_import = verified_modules[dependency_index];
+            record_preferred_import(
+                &mut preferred_imports,
+                dependency.name.clone(),
+                dependency_import,
+                false,
+                span,
+            )?;
+            pending.push(PendingCertificateImportExport {
+                import_index: dependency_index,
+                name: dependency.name.clone(),
+                hash: dependency.hash,
+            });
         }
     }
 
-    Ok(selected.into_iter().collect())
+    Ok(CertificateImportSelection {
+        indices: selected.into_iter().collect(),
+        preferred_imports,
+    })
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-struct ImportDependencyTarget {
+struct PendingCertificateImportExport {
+    import_index: usize,
     name: npa_cert::Name,
     hash: npa_cert::Hash,
 }
 
-fn import_interface_dependency_targets(
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct ImportDependencyTarget {
+    import: Option<ImportDependencySource>,
+    name: npa_cert::Name,
+    hash: npa_cert::Hash,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct ImportDependencySource {
+    module: npa_cert::ModuleName,
+    export_hash: npa_cert::Hash,
+    certificate_hash: Option<npa_cert::Hash>,
+}
+
+fn enqueue_referenced_import_exports(
+    index: usize,
     module: &npa_cert::VerifiedModule,
+    referenced_exports: &BTreeSet<npa_cert::Name>,
+    pending: &mut Vec<PendingCertificateImportExport>,
+    preferred_imports: &mut BTreeMap<npa_cert::Name, npa_cert::ImportEntry>,
+    span: crate::Span,
+) -> Result<()> {
+    for entry in module.export_block() {
+        let entry_name = module.name_table().get(entry.name).ok_or_else(|| {
+            import_resolution_diagnostic(span, "verified import export name is missing")
+        })?;
+        if referenced_exports.contains(entry_name) {
+            record_preferred_import(preferred_imports, entry_name.clone(), module, false, span)?;
+            pending.push(PendingCertificateImportExport {
+                import_index: index,
+                name: entry_name.clone(),
+                hash: entry.decl_interface_hash,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn record_preferred_import(
+    preferred_imports: &mut BTreeMap<npa_cert::Name, npa_cert::ImportEntry>,
+    name: npa_cert::Name,
+    module: &npa_cert::VerifiedModule,
+    reject_conflict: bool,
+    span: crate::Span,
+) -> Result<()> {
+    let entry = npa_cert::ImportEntry {
+        module: module.module().clone(),
+        export_hash: module.export_hash(),
+        certificate_hash: Some(module.certificate_hash()),
+    };
+    match preferred_imports.entry(name.clone()) {
+        std::collections::btree_map::Entry::Vacant(slot) => {
+            slot.insert(entry);
+            Ok(())
+        }
+        std::collections::btree_map::Entry::Occupied(existing) if existing.get() == &entry => {
+            Ok(())
+        }
+        std::collections::btree_map::Entry::Occupied(_) if !reject_conflict => Ok(()),
+        std::collections::btree_map::Entry::Occupied(_) => Err(import_resolution_diagnostic(
+            span,
+            format!(
+                "verified dependency {} has multiple selected providers",
+                name.as_dotted()
+            ),
+        )),
+    }
+}
+
+fn find_verified_module_export_entry<'a>(
+    module: &'a npa_cert::VerifiedModule,
+    export: &PendingCertificateImportExport,
+    span: crate::Span,
+) -> Result<&'a npa_cert::ExportEntry> {
+    let matches = module
+        .export_block()
+        .iter()
+        .filter(|entry| {
+            entry.decl_interface_hash == export.hash
+                && module
+                    .name_table()
+                    .get(entry.name)
+                    .is_some_and(|entry_name| entry_name == &export.name)
+        })
+        .collect::<Vec<_>>();
+
+    match matches.as_slice() {
+        [entry] => Ok(*entry),
+        [] => Err(import_resolution_diagnostic(
+            span,
+            format!(
+                "verified dependency {} is missing from the selected import",
+                export.name.as_dotted()
+            ),
+        )),
+        _ => Err(import_resolution_diagnostic(
+            span,
+            format!(
+                "verified dependency {} has multiple matching exports in the selected import",
+                export.name.as_dotted()
+            ),
+        )),
+    }
+}
+
+fn export_interface_dependency_targets(
+    module: &npa_cert::VerifiedModule,
+    entry: &npa_cert::ExportEntry,
     span: crate::Span,
 ) -> Result<BTreeSet<ImportDependencyTarget>> {
     let mut dependencies = BTreeSet::new();
-    for entry in module.export_block() {
-        collect_imported_dependency_targets_from_term(module, entry.ty, &mut dependencies, span)?;
-        if let Some(body) = entry.body {
-            collect_imported_dependency_targets_from_term(module, body, &mut dependencies, span)?;
+    let mut scanned_exports = BTreeSet::new();
+    collect_export_interface_dependency_targets(
+        module,
+        entry,
+        &mut dependencies,
+        &mut scanned_exports,
+        span,
+    )?;
+    Ok(dependencies)
+}
+
+fn collect_export_interface_dependency_targets(
+    module: &npa_cert::VerifiedModule,
+    entry: &npa_cert::ExportEntry,
+    dependencies: &mut BTreeSet<ImportDependencyTarget>,
+    scanned_exports: &mut BTreeSet<(npa_cert::NameId, npa_cert::Hash)>,
+    span: crate::Span,
+) -> Result<()> {
+    if !scanned_exports.insert((entry.name, entry.decl_interface_hash)) {
+        return Ok(());
+    }
+
+    match entry.kind {
+        npa_cert::ExportKind::Inductive
+        | npa_cert::ExportKind::Constructor
+        | npa_cert::ExportKind::Recursor => {
+            let decl_index = source_decl_index_for_verified_export(module, entry, span)?;
+            let decl = module.declarations().get(decl_index).ok_or_else(|| {
+                import_resolution_diagnostic(span, "verified import declaration is missing")
+            })?;
+            for term in verified_decl_term_ids(&decl.decl) {
+                collect_imported_dependency_targets_from_term(
+                    module,
+                    term,
+                    dependencies,
+                    scanned_exports,
+                    Some(decl_index),
+                    span,
+                )?;
+            }
+        }
+        npa_cert::ExportKind::Axiom | npa_cert::ExportKind::Theorem | npa_cert::ExportKind::Def => {
+            collect_imported_dependency_targets_from_term(
+                module,
+                entry.ty,
+                dependencies,
+                scanned_exports,
+                None,
+                span,
+            )?;
+            if let Some(body) = entry.body {
+                collect_imported_dependency_targets_from_term(
+                    module,
+                    body,
+                    dependencies,
+                    scanned_exports,
+                    None,
+                    span,
+                )?;
+            }
         }
     }
-    Ok(dependencies)
+    Ok(())
 }
 
 fn collect_imported_dependency_targets_from_term(
     module: &npa_cert::VerifiedModule,
     term: npa_cert::TermId,
     dependencies: &mut BTreeSet<ImportDependencyTarget>,
+    scanned_exports: &mut BTreeSet<(npa_cert::NameId, npa_cert::Hash)>,
+    skip_local_decl_index: Option<usize>,
     span: crate::Span,
 ) -> Result<()> {
     match module
@@ -2349,14 +2670,25 @@ fn collect_imported_dependency_targets_from_term(
         .ok_or_else(|| import_resolution_diagnostic(span, "verified import term is missing"))?
     {
         npa_cert::TermNode::Sort(_) | npa_cert::TermNode::BVar(_) => {}
-        npa_cert::TermNode::Const { global_ref, .. } => {
-            if let npa_cert::GlobalRef::Imported {
+        npa_cert::TermNode::Const { global_ref, .. } => match global_ref {
+            npa_cert::GlobalRef::Imported {
+                import_index,
                 name,
                 decl_interface_hash,
                 ..
-            } = global_ref
-            {
+            } => {
+                let import = module.imports().get(*import_index).ok_or_else(|| {
+                    import_resolution_diagnostic(
+                        span,
+                        "verified import dependency index is missing",
+                    )
+                })?;
                 dependencies.insert(ImportDependencyTarget {
+                    import: Some(ImportDependencySource {
+                        module: import.module.clone(),
+                        export_hash: import.export_hash,
+                        certificate_hash: import.certificate_hash,
+                    }),
                     name: module
                         .name_table()
                         .get(*name)
@@ -2367,79 +2699,342 @@ fn collect_imported_dependency_targets_from_term(
                     hash: *decl_interface_hash,
                 });
             }
-        }
+            npa_cert::GlobalRef::Builtin { .. } => {}
+            npa_cert::GlobalRef::Local { decl_index } => {
+                if Some(*decl_index) != skip_local_decl_index {
+                    let local_entry =
+                        find_verified_module_local_export_entry(module, *decl_index, span)?;
+                    collect_export_interface_dependency_targets(
+                        module,
+                        local_entry,
+                        dependencies,
+                        scanned_exports,
+                        span,
+                    )?;
+                }
+            }
+            npa_cert::GlobalRef::LocalGenerated {
+                decl_index, name, ..
+            } => {
+                if Some(*decl_index) != skip_local_decl_index {
+                    let local_entry = find_verified_module_local_generated_export_entry(
+                        module,
+                        *decl_index,
+                        *name,
+                        span,
+                    )?;
+                    collect_export_interface_dependency_targets(
+                        module,
+                        local_entry,
+                        dependencies,
+                        scanned_exports,
+                        span,
+                    )?;
+                }
+            }
+        },
         npa_cert::TermNode::App(func, arg) => {
-            collect_imported_dependency_targets_from_term(module, *func, dependencies, span)?;
-            collect_imported_dependency_targets_from_term(module, *arg, dependencies, span)?;
+            collect_imported_dependency_targets_from_term(
+                module,
+                *func,
+                dependencies,
+                scanned_exports,
+                skip_local_decl_index,
+                span,
+            )?;
+            collect_imported_dependency_targets_from_term(
+                module,
+                *arg,
+                dependencies,
+                scanned_exports,
+                skip_local_decl_index,
+                span,
+            )?;
         }
         npa_cert::TermNode::Lam { ty, body } | npa_cert::TermNode::Pi { ty, body } => {
-            collect_imported_dependency_targets_from_term(module, *ty, dependencies, span)?;
-            collect_imported_dependency_targets_from_term(module, *body, dependencies, span)?;
+            collect_imported_dependency_targets_from_term(
+                module,
+                *ty,
+                dependencies,
+                scanned_exports,
+                skip_local_decl_index,
+                span,
+            )?;
+            collect_imported_dependency_targets_from_term(
+                module,
+                *body,
+                dependencies,
+                scanned_exports,
+                skip_local_decl_index,
+                span,
+            )?;
         }
         npa_cert::TermNode::Let { ty, value, body } => {
-            collect_imported_dependency_targets_from_term(module, *ty, dependencies, span)?;
-            collect_imported_dependency_targets_from_term(module, *value, dependencies, span)?;
-            collect_imported_dependency_targets_from_term(module, *body, dependencies, span)?;
+            collect_imported_dependency_targets_from_term(
+                module,
+                *ty,
+                dependencies,
+                scanned_exports,
+                skip_local_decl_index,
+                span,
+            )?;
+            collect_imported_dependency_targets_from_term(
+                module,
+                *value,
+                dependencies,
+                scanned_exports,
+                skip_local_decl_index,
+                span,
+            )?;
+            collect_imported_dependency_targets_from_term(
+                module,
+                *body,
+                dependencies,
+                scanned_exports,
+                skip_local_decl_index,
+                span,
+            )?;
         }
     }
     Ok(())
 }
 
-fn referenced_axiom_dependency_targets(
+fn source_decl_index_for_verified_export(
     module: &npa_cert::VerifiedModule,
-    referenced_exports: &BTreeSet<npa_cert::Name>,
+    entry: &npa_cert::ExportEntry,
+    span: crate::Span,
+) -> Result<usize> {
+    let matches = module
+        .declarations()
+        .iter()
+        .enumerate()
+        .filter_map(|(index, decl)| {
+            verified_decl_export_name_ids(&decl.decl)
+                .contains(&entry.name)
+                .then_some(index)
+        })
+        .collect::<Vec<_>>();
+
+    match matches.as_slice() {
+        [index] => Ok(*index),
+        [] => Err(import_resolution_diagnostic(
+            span,
+            "verified import export source declaration is missing",
+        )),
+        _ => Err(import_resolution_diagnostic(
+            span,
+            "verified import export has multiple source declarations",
+        )),
+    }
+}
+
+fn find_verified_module_local_export_entry(
+    module: &npa_cert::VerifiedModule,
+    decl_index: usize,
+    span: crate::Span,
+) -> Result<&npa_cert::ExportEntry> {
+    let decl = module.declarations().get(decl_index).ok_or_else(|| {
+        import_resolution_diagnostic(span, "verified import local declaration is missing")
+    })?;
+    let name = verified_decl_primary_name(&decl.decl);
+    let hash = decl.hashes.decl_interface_hash;
+    module
+        .export_block()
+        .iter()
+        .find(|entry| entry.name == name && entry.decl_interface_hash == hash)
+        .ok_or_else(|| {
+            import_resolution_diagnostic(span, "verified import local export is missing")
+        })
+}
+
+fn find_verified_module_local_generated_export_entry(
+    module: &npa_cert::VerifiedModule,
+    _decl_index: usize,
+    name: npa_cert::NameId,
+    span: crate::Span,
+) -> Result<&npa_cert::ExportEntry> {
+    let matches = module
+        .export_block()
+        .iter()
+        .filter(|entry| entry.name == name)
+        .collect::<Vec<_>>();
+
+    match matches.as_slice() {
+        [entry] => Ok(*entry),
+        [] => Err(import_resolution_diagnostic(
+            span,
+            "verified import local generated export is missing",
+        )),
+        _ => Err(import_resolution_diagnostic(
+            span,
+            "verified import local generated export is ambiguous",
+        )),
+    }
+}
+
+fn verified_decl_primary_name(decl: &npa_cert::DeclPayload) -> npa_cert::NameId {
+    match decl {
+        npa_cert::DeclPayload::Axiom { name, .. }
+        | npa_cert::DeclPayload::AxiomConstrained { name, .. }
+        | npa_cert::DeclPayload::Def { name, .. }
+        | npa_cert::DeclPayload::DefConstrained { name, .. }
+        | npa_cert::DeclPayload::Theorem { name, .. }
+        | npa_cert::DeclPayload::TheoremConstrained { name, .. }
+        | npa_cert::DeclPayload::Inductive { name, .. }
+        | npa_cert::DeclPayload::InductiveConstrained { name, .. }
+        | npa_cert::DeclPayload::MutualInductiveBlock { name, .. } => *name,
+    }
+}
+
+fn verified_decl_export_name_ids(decl: &npa_cert::DeclPayload) -> Vec<npa_cert::NameId> {
+    let mut names = vec![verified_decl_primary_name(decl)];
+    match decl {
+        npa_cert::DeclPayload::Inductive {
+            constructors,
+            recursor,
+            ..
+        }
+        | npa_cert::DeclPayload::InductiveConstrained {
+            constructors,
+            recursor,
+            ..
+        } => {
+            names.extend(constructors.iter().map(|constructor| constructor.name));
+            if let Some(recursor) = recursor {
+                names.push(recursor.name);
+            }
+        }
+        npa_cert::DeclPayload::MutualInductiveBlock { inductives, .. } => {
+            for inductive in inductives {
+                names.push(inductive.name);
+                names.extend(
+                    inductive
+                        .constructors
+                        .iter()
+                        .map(|constructor| constructor.name),
+                );
+                if let Some(recursor) = &inductive.recursor {
+                    names.push(recursor.name);
+                }
+            }
+        }
+        _ => {}
+    }
+    names
+}
+
+fn verified_decl_term_ids(decl: &npa_cert::DeclPayload) -> Vec<npa_cert::TermId> {
+    match decl {
+        npa_cert::DeclPayload::Axiom { ty, .. }
+        | npa_cert::DeclPayload::AxiomConstrained { ty, .. } => vec![*ty],
+        npa_cert::DeclPayload::Def { ty, value, .. }
+        | npa_cert::DeclPayload::DefConstrained { ty, value, .. } => vec![*ty, *value],
+        npa_cert::DeclPayload::Theorem { ty, proof, .. }
+        | npa_cert::DeclPayload::TheoremConstrained { ty, proof, .. } => vec![*ty, *proof],
+        npa_cert::DeclPayload::Inductive {
+            params,
+            indices,
+            constructors,
+            recursor,
+            ..
+        }
+        | npa_cert::DeclPayload::InductiveConstrained {
+            params,
+            indices,
+            constructors,
+            recursor,
+            ..
+        } => params
+            .iter()
+            .map(|param| param.ty)
+            .chain(indices.iter().map(|index| index.ty))
+            .chain(constructors.iter().map(|constructor| constructor.ty))
+            .chain(recursor.iter().map(|recursor| recursor.ty))
+            .collect(),
+        npa_cert::DeclPayload::MutualInductiveBlock { inductives, .. } => inductives
+            .iter()
+            .flat_map(|inductive| {
+                inductive
+                    .params
+                    .iter()
+                    .map(|param| param.ty)
+                    .chain(inductive.indices.iter().map(|index| index.ty))
+                    .chain(
+                        inductive
+                            .constructors
+                            .iter()
+                            .map(|constructor| constructor.ty),
+                    )
+                    .chain(inductive.recursor.iter().map(|recursor| recursor.ty))
+            })
+            .collect(),
+    }
+}
+
+fn export_axiom_dependency_targets(
+    module: &npa_cert::VerifiedModule,
+    entry: &npa_cert::ExportEntry,
     span: crate::Span,
 ) -> Result<BTreeSet<ImportDependencyTarget>> {
     let mut dependencies = BTreeSet::new();
-    for entry in module.export_block() {
-        let Some(entry_name) = module.name_table().get(entry.name) else {
-            return Err(import_resolution_diagnostic(
-                span,
-                "verified import export name is missing",
-            ));
-        };
-        if !referenced_exports.contains(entry_name) {
+    for axiom in &entry.axiom_dependencies {
+        if matches!(axiom.global_ref, npa_cert::GlobalRef::Builtin { .. }) {
             continue;
         }
-
-        for axiom in &entry.axiom_dependencies {
-            if matches!(axiom.global_ref, npa_cert::GlobalRef::Builtin { .. }) {
-                continue;
+        let import = match &axiom.global_ref {
+            npa_cert::GlobalRef::Imported { import_index, .. } => {
+                let import = module.imports().get(*import_index).ok_or_else(|| {
+                    import_resolution_diagnostic(
+                        span,
+                        "verified import axiom dependency index is missing",
+                    )
+                })?;
+                Some(ImportDependencySource {
+                    module: import.module.clone(),
+                    export_hash: import.export_hash,
+                    certificate_hash: import.certificate_hash,
+                })
             }
-            dependencies.insert(ImportDependencyTarget {
-                name: module
-                    .name_table()
-                    .get(axiom.name)
-                    .ok_or_else(|| {
-                        import_resolution_diagnostic(span, "verified import axiom name is missing")
-                    })?
-                    .clone(),
-                hash: axiom.decl_interface_hash,
-            });
-        }
+            npa_cert::GlobalRef::Builtin { .. } => None,
+            npa_cert::GlobalRef::Local { .. } | npa_cert::GlobalRef::LocalGenerated { .. } => {
+                Some(ImportDependencySource {
+                    module: module.module().clone(),
+                    export_hash: module.export_hash(),
+                    certificate_hash: Some(module.certificate_hash()),
+                })
+            }
+        };
+        dependencies.insert(ImportDependencyTarget {
+            import,
+            name: module
+                .name_table()
+                .get(axiom.name)
+                .ok_or_else(|| {
+                    import_resolution_diagnostic(span, "verified import axiom name is missing")
+                })?
+                .clone(),
+            hash: axiom.decl_interface_hash,
+        });
     }
     Ok(dependencies)
 }
 
 fn find_verified_module_export_ref(
     verified_modules: &[&npa_cert::VerifiedModule],
-    name: &npa_cert::Name,
-    decl_interface_hash: npa_cert::Hash,
+    dependency: &ImportDependencyTarget,
     span: crate::Span,
 ) -> Result<usize> {
-    find_verified_module_export_by(verified_modules, name, decl_interface_hash, None, span)
+    find_verified_module_export_by(verified_modules, dependency, None, span)
 }
 
 fn find_verified_module_axiom_export_ref(
     verified_modules: &[&npa_cert::VerifiedModule],
-    name: &npa_cert::Name,
-    decl_interface_hash: npa_cert::Hash,
+    dependency: &ImportDependencyTarget,
     span: crate::Span,
 ) -> Result<usize> {
     find_verified_module_export_by(
         verified_modules,
-        name,
-        decl_interface_hash,
+        dependency,
         Some(npa_cert::ExportKind::Axiom),
         span,
     )
@@ -2447,37 +3042,63 @@ fn find_verified_module_axiom_export_ref(
 
 fn find_verified_module_export_by(
     verified_modules: &[&npa_cert::VerifiedModule],
-    name: &npa_cert::Name,
-    decl_interface_hash: npa_cert::Hash,
+    dependency: &ImportDependencyTarget,
     kind: Option<npa_cert::ExportKind>,
     span: crate::Span,
 ) -> Result<usize> {
-    verified_modules
+    let matches = verified_modules
         .iter()
         .enumerate()
-        .find_map(|(index, module)| {
+        .filter_map(|(index, module)| {
+            if !dependency_source_matches_module(dependency.import.as_ref(), module) {
+                return None;
+            }
             module
                 .export_block()
                 .iter()
                 .any(|entry| {
                     kind.is_none_or(|kind| entry.kind == kind)
-                        && entry.decl_interface_hash == decl_interface_hash
+                        && entry.decl_interface_hash == dependency.hash
                         && module
                             .name_table()
                             .get(entry.name)
-                            .is_some_and(|entry_name| entry_name == name)
+                            .is_some_and(|entry_name| entry_name == &dependency.name)
                 })
                 .then_some(index)
         })
-        .ok_or_else(|| {
-            import_resolution_diagnostic(
-                span,
-                format!(
-                    "verified dependency {} is not present in the verified import set",
-                    name.as_dotted()
-                ),
-            )
-        })
+        .collect::<Vec<_>>();
+
+    match matches.as_slice() {
+        [index] => Ok(*index),
+        [] => Err(import_resolution_diagnostic(
+            span,
+            format!(
+                "verified dependency {} is not present in the verified import set",
+                dependency.name.as_dotted()
+            ),
+        )),
+        _ => Err(import_resolution_diagnostic(
+            span,
+            format!(
+                "verified dependency {} has multiple matching providers in the verified import set",
+                dependency.name.as_dotted()
+            ),
+        )),
+    }
+}
+
+fn dependency_source_matches_module(
+    source: Option<&ImportDependencySource>,
+    module: &npa_cert::VerifiedModule,
+) -> bool {
+    let Some(source) = source else {
+        return true;
+    };
+    module.module() == &source.module
+        && module.export_hash() == source.export_hash
+        && source
+            .certificate_hash
+            .is_none_or(|hash| module.certificate_hash() == hash)
 }
 
 fn referenced_import_names(module: &npa_cert::CoreModule) -> BTreeSet<npa_cert::Name> {
@@ -2672,6 +3293,21 @@ struct PendingKernelDecl {
     loaded_decl_keys: BTreeSet<LoadedImportDeclKey>,
 }
 
+pub(crate) fn kernel_env_from_verified_imports<'a>(
+    active_imports: impl IntoIterator<Item = &'a VerifiedImport>,
+    available_imports: &'a [VerifiedImport],
+    allow_builtin_kernel_decls: bool,
+    span: crate::Span,
+) -> Result<Env> {
+    kernel_env_from_imports(
+        active_imports,
+        available_imports,
+        allow_builtin_kernel_decls,
+        span,
+    )
+    .map(|build| build.env)
+}
+
 fn kernel_env_from_imports<'a>(
     active_imports: impl IntoIterator<Item = &'a VerifiedImport>,
     available_imports: &'a [VerifiedImport],
@@ -2729,6 +3365,7 @@ fn kernel_env_from_imports<'a>(
             validate_dependencies_against_loaded_refs(
                 &dependencies,
                 &loaded_dependency_refs,
+                &env,
                 span,
             )?;
             if let Some(existing) = env.decl(decl.name()) {
@@ -2931,6 +3568,7 @@ impl AvailableDependencyMaterializer<'_> {
             validate_dependencies_against_loaded_refs(
                 &dependency.dependencies,
                 self.loaded_refs,
+                self.env,
                 self.span,
             )?;
             self.loaded_available_interfaces
@@ -3027,6 +3665,7 @@ fn kernel_decl_matches_export(decl: &Decl, export: &VerifiedExport) -> bool {
 fn validate_dependencies_against_loaded_refs(
     dependencies: &BTreeMap<String, BTreeSet<VerifiedDependency>>,
     loaded_refs: &BTreeMap<String, BTreeSet<VerifiedDependency>>,
+    env: &Env,
     span: crate::Span,
 ) -> Result<()> {
     for (name, dependencies) in dependencies {
@@ -3036,16 +3675,34 @@ fn validate_dependencies_against_loaded_refs(
         let Some(loaded) = loaded_refs.get(name) else {
             continue;
         };
-        if !loaded.contains(expected) {
+        if !loaded.contains(expected)
+            && !builtin_eq_dependency_is_backed_by_env(name, expected, env)
+        {
             return Err(import_resolution_diagnostic(
                 span,
                 format!(
-                    "verified dependency {name} is already loaded with a different declaration interface hash or import identity"
+                    "verified dependency {name} is already loaded with a different declaration interface hash or import identity: expected={expected:?}; loaded={loaded:?}"
                 ),
             ));
         }
     }
     Ok(())
+}
+
+fn builtin_eq_dependency_is_backed_by_env(
+    name: &str,
+    dependency: &VerifiedDependency,
+    env: &Env,
+) -> bool {
+    if !matches!(name, "Eq" | "Eq.refl" | "Eq.rec")
+        || dependency.module.is_some()
+        || dependency.export_hash.is_some()
+    {
+        return false;
+    }
+    let name = npa_cert::Name::from_dotted(name);
+    npa_cert::builtin_decl_interface_hash(&name) == Some(dependency.decl_interface_hash)
+        && env.decl(&name.as_dotted()).is_some()
 }
 
 fn single_dependency_for_name<'a>(
@@ -4226,6 +4883,72 @@ mod tests {
     }
 
     #[test]
+    fn imported_eq_satisfies_a_verified_builtin_eq_dependency() {
+        let name = npa_cert::Name::from_dotted("Eq");
+        let builtin_hash =
+            npa_cert::builtin_decl_interface_hash(&name).expect("Eq is a builtin declaration");
+        let expected = VerifiedDependency {
+            module: None,
+            export_hash: None,
+            name: name.clone(),
+            decl_interface_hash: builtin_hash,
+        };
+        let loaded = VerifiedDependency {
+            module: Some(npa_cert::Name::from_dotted("Std.Logic.Eq")),
+            export_hash: Some(hash(1)),
+            name,
+            decl_interface_hash: hash(2),
+        };
+        let dependencies = BTreeMap::from([("Eq".to_owned(), BTreeSet::from([expected]))]);
+        let loaded_refs = BTreeMap::from([("Eq".to_owned(), BTreeSet::from([loaded]))]);
+        let mut env = Env::new();
+        env.add_inductive(eq_inductive())
+            .expect("canonical Eq should load into the test environment");
+
+        validate_dependencies_against_loaded_refs(
+            &dependencies,
+            &loaded_refs,
+            &env,
+            crate::Span::empty(FileId(0)),
+        )
+        .expect("an imported global Eq should back a builtin Eq dependency");
+    }
+
+    #[test]
+    fn imported_non_eq_does_not_satisfy_a_verified_builtin_dependency() {
+        let name = npa_cert::Name::from_dotted("Nat");
+        let builtin_hash =
+            npa_cert::builtin_decl_interface_hash(&name).expect("Nat is a builtin declaration");
+        let expected = VerifiedDependency {
+            module: None,
+            export_hash: None,
+            name: name.clone(),
+            decl_interface_hash: builtin_hash,
+        };
+        let loaded = VerifiedDependency {
+            module: Some(npa_cert::Name::from_dotted("Std.Data.Nat")),
+            export_hash: Some(hash(1)),
+            name,
+            decl_interface_hash: hash(2),
+        };
+        let dependencies = BTreeMap::from([("Nat".to_owned(), BTreeSet::from([expected]))]);
+        let loaded_refs = BTreeMap::from([("Nat".to_owned(), BTreeSet::from([loaded]))]);
+        let mut env = Env::new();
+        env.add_inductive(nat_inductive())
+            .expect("canonical Nat should load into the test environment");
+
+        let error = validate_dependencies_against_loaded_refs(
+            &dependencies,
+            &loaded_refs,
+            &env,
+            crate::Span::empty(FileId(0)),
+        )
+        .expect_err("non-Eq builtin providers must retain exact import identity checks");
+
+        assert_eq!(error.kind, MachineDiagnosticKind::ImportResolutionError);
+    }
+
+    #[test]
     fn frontend_compile_boundary_stays_separate_from_certificate_producer_candidates() {
         let _: fn(
             FileId,
@@ -4851,7 +5574,7 @@ def Test.copy : UseRec.P := UseRec.w",
             &mut session,
         );
 
-        compile_machine_source_to_certificate(
+        let cert = compile_machine_source_to_certificate(
             FileId(0),
             npa_cert::Name::from_dotted("Test"),
             "\
@@ -4861,6 +5584,238 @@ def Test.copy : UseRec.P := UseRec.w",
             &MachineCompileOptions::default(),
         )
         .expect("certificate construction should receive transitive import dependencies");
+
+        assert!(cert
+            .imports
+            .iter()
+            .any(|import| import.module == npa_cert::Name::from_dotted("Test.UseRec")));
+        assert!(cert
+            .imports
+            .iter()
+            .any(|import| import.module == npa_cert::Name::from_dotted("Test.Unary")));
+    }
+
+    #[test]
+    fn certificate_import_closure_ignores_unused_export_dependencies() {
+        let mut session = npa_cert::VerifierSession::new();
+        let direct_unit = verified_core_module_in_session(
+            npa_cert::CoreModule {
+                name: npa_cert::Name::from_dotted("Test.DirectUnit"),
+                declarations: vec![Decl::Axiom {
+                    name: "Unit".to_owned(),
+                    universe_params: Vec::new(),
+                    ty: Expr::sort(type0()),
+                }],
+            },
+            &[],
+            &mut session,
+        );
+        let collision = verified_core_module_in_session(
+            npa_cert::CoreModule {
+                name: npa_cert::Name::from_dotted("Test.Collision"),
+                declarations: vec![Decl::Axiom {
+                    name: "Unit".to_owned(),
+                    universe_params: Vec::new(),
+                    ty: Expr::sort(type0()),
+                }],
+            },
+            &[],
+            &mut session,
+        );
+        let wide = verified_core_module_in_session(
+            npa_cert::CoreModule {
+                name: npa_cert::Name::from_dotted("Test.Wide"),
+                declarations: vec![
+                    Decl::Axiom {
+                        name: "Wide.Needed".to_owned(),
+                        universe_params: Vec::new(),
+                        ty: Expr::sort(type0()),
+                    },
+                    Decl::Axiom {
+                        name: "Wide.Unused".to_owned(),
+                        universe_params: Vec::new(),
+                        ty: Expr::konst("Unit", vec![]),
+                    },
+                ],
+            },
+            std::slice::from_ref(&collision),
+            &mut session,
+        );
+        let module = npa_cert::CoreModule {
+            name: npa_cert::Name::from_dotted("Test.UseWide"),
+            declarations: vec![
+                Decl::Axiom {
+                    name: "UseWide.uses_unit".to_owned(),
+                    universe_params: Vec::new(),
+                    ty: Expr::konst("Unit", vec![]),
+                },
+                Decl::Axiom {
+                    name: "UseWide.uses_needed".to_owned(),
+                    universe_params: Vec::new(),
+                    ty: Expr::konst("Wide.Needed", vec![]),
+                },
+            ],
+        };
+        let imports = [&direct_unit, &wide, &collision];
+
+        let certificate_imports =
+            certificate_import_refs_for_module_refs(&module, &[0, 1], &imports, FileId(0))
+                .expect("unused export dependencies should not enter the certificate closure");
+
+        assert_eq!(certificate_imports.len(), 2);
+        assert!(certificate_imports
+            .iter()
+            .any(|import| import.module() == direct_unit.module()));
+        assert!(certificate_imports
+            .iter()
+            .any(|import| import.module() == wide.module()));
+        assert!(!certificate_imports
+            .iter()
+            .any(|import| import.module() == collision.module()));
+        npa_cert::build_module_cert_from_import_refs(module, &certificate_imports)
+            .expect("filtered certificate imports should avoid duplicate imported names");
+    }
+
+    #[test]
+    fn certificate_provider_map_resolves_referenced_duplicate_export() {
+        let mut session = npa_cert::VerifierSession::new();
+        let direct_unit = verified_core_module_in_session(
+            npa_cert::CoreModule {
+                name: npa_cert::Name::from_dotted("Test.DirectUnit"),
+                declarations: vec![Decl::Axiom {
+                    name: "Unit".to_owned(),
+                    universe_params: Vec::new(),
+                    ty: Expr::sort(type0()),
+                }],
+            },
+            &[],
+            &mut session,
+        );
+        let collision = verified_core_module_in_session(
+            npa_cert::CoreModule {
+                name: npa_cert::Name::from_dotted("Test.Collision"),
+                declarations: vec![
+                    Decl::Axiom {
+                        name: "Unit".to_owned(),
+                        universe_params: Vec::new(),
+                        ty: Expr::sort(type0()),
+                    },
+                    Decl::Axiom {
+                        name: "Collision.Needed".to_owned(),
+                        universe_params: Vec::new(),
+                        ty: Expr::sort(type0()),
+                    },
+                ],
+            },
+            &[],
+            &mut session,
+        );
+        let wide = verified_core_module_in_session(
+            npa_cert::CoreModule {
+                name: npa_cert::Name::from_dotted("Test.Wide"),
+                declarations: vec![Decl::Def {
+                    name: "Wide.Needed".to_owned(),
+                    universe_params: Vec::new(),
+                    ty: Expr::sort(type0()),
+                    value: Expr::konst("Collision.Needed", vec![]),
+                    reducibility: Reducibility::Reducible,
+                }],
+            },
+            std::slice::from_ref(&collision),
+            &mut session,
+        );
+        let module = npa_cert::CoreModule {
+            name: npa_cert::Name::from_dotted("Test.UseWide"),
+            declarations: vec![
+                Decl::Axiom {
+                    name: "UseWide.uses_unit".to_owned(),
+                    universe_params: Vec::new(),
+                    ty: Expr::konst("Unit", vec![]),
+                },
+                Decl::Axiom {
+                    name: "UseWide.uses_needed".to_owned(),
+                    universe_params: Vec::new(),
+                    ty: Expr::konst("Wide.Needed", vec![]),
+                },
+            ],
+        };
+        let imports = [&direct_unit, &wide, &collision];
+
+        let (certificate_imports, preferred_imports) =
+            certificate_import_refs_and_providers_for_module_refs(
+                &module,
+                &[0, 1],
+                &imports,
+                FileId(0),
+            )
+            .expect("interface dependency should add the collision module");
+
+        assert_eq!(certificate_imports.len(), 3);
+        assert!(certificate_imports
+            .iter()
+            .any(|import| import.module() == collision.module()));
+        assert_eq!(
+            preferred_imports
+                .get(&npa_cert::Name::from_dotted("Unit"))
+                .map(|entry| &entry.module),
+            Some(direct_unit.module())
+        );
+        npa_cert::build_module_cert_from_import_refs_with_preferred_imports(
+            module,
+            &certificate_imports,
+            &preferred_imports,
+        )
+        .expect("preferred source provider should suppress duplicate exported names");
+    }
+
+    #[test]
+    fn certificate_import_closure_rejects_ambiguous_available_dependency_provider() {
+        let mut session = npa_cert::VerifierSession::new();
+        let a = verified_core_module_in_session(
+            npa_cert::CoreModule {
+                name: npa_cert::Name::from_dotted("Test.A"),
+                declarations: vec![Decl::Axiom {
+                    name: "A.Carrier".to_owned(),
+                    universe_params: Vec::new(),
+                    ty: Expr::sort(type0()),
+                }],
+            },
+            &[],
+            &mut session,
+        );
+        let b = verified_core_module_in_session(
+            npa_cert::CoreModule {
+                name: npa_cert::Name::from_dotted("Test.B"),
+                declarations: vec![Decl::Def {
+                    name: "B.Surface".to_owned(),
+                    universe_params: Vec::new(),
+                    ty: Expr::sort(type0()),
+                    value: Expr::konst("A.Carrier", vec![]),
+                    reducibility: Reducibility::Reducible,
+                }],
+            },
+            std::slice::from_ref(&a),
+            &mut session,
+        );
+        let c = npa_cert::CoreModule {
+            name: npa_cert::Name::from_dotted("Test.C"),
+            declarations: vec![Decl::Def {
+                name: "C.SurfaceAlias".to_owned(),
+                universe_params: Vec::new(),
+                ty: Expr::sort(type0()),
+                value: Expr::konst("B.Surface", vec![]),
+                reducibility: Reducibility::Reducible,
+            }],
+        };
+        let imports = [&b, &a, &a];
+
+        let err = certificate_import_refs_for_module_refs(&c, &[0], &imports, FileId(0))
+            .expect_err("duplicate available dependency providers must be rejected");
+
+        assert_eq!(err.kind, MachineDiagnosticKind::ImportResolutionError);
+        assert!(err
+            .message
+            .contains("multiple matching providers in the verified import set"));
     }
 
     #[test]

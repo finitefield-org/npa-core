@@ -109,12 +109,28 @@ pub(crate) fn build_module_cert_impl(
     imports: &[VerifiedModule],
 ) -> Result<ModuleCert> {
     let imports = imports.iter().collect::<Vec<_>>();
-    build_module_cert_from_import_refs_impl(module, &imports)
+    build_module_cert_from_import_refs_with_preferred_imports_impl(
+        module,
+        &imports,
+        &BTreeMap::new(),
+    )
 }
 
 pub(crate) fn build_module_cert_from_import_refs_impl(
     module: CoreModule,
     imports: &[&VerifiedModule],
+) -> Result<ModuleCert> {
+    build_module_cert_from_import_refs_with_preferred_imports_impl(
+        module,
+        imports,
+        &BTreeMap::new(),
+    )
+}
+
+pub(crate) fn build_module_cert_from_import_refs_with_preferred_imports_impl(
+    module: CoreModule,
+    imports: &[&VerifiedModule],
+    preferred_imports: &BTreeMap<Name, ImportEntry>,
 ) -> Result<ModuleCert> {
     let mut module = module;
     module.declarations = canonical_declaration_order(module.declarations)?;
@@ -215,12 +231,21 @@ pub(crate) fn build_module_cert_from_import_refs_impl(
             certificate_hash: Some(module.certificate_hash),
         })
         .collect();
-    let imported_decls = imported_decl_map(&imports, &name_index, &directly_referenced_names)?;
+    let imported_decls = imported_decl_map(
+        &imports,
+        &name_index,
+        &directly_referenced_names,
+        preferred_imports,
+    )?;
     let referenced_builtins =
         referenced_builtin_names(&module.declarations, &imports, &local_public_names)?;
+    let selected_import_exports = imported_decls
+        .iter()
+        .map(|(name, info)| (info.import_index, name.clone(), info.decl_interface_hash))
+        .collect::<Vec<_>>();
 
     let mut env = Env::new();
-    add_imports_to_env(&mut env, &imports)?;
+    add_selected_import_exports_to_env(&mut env, &imports, &selected_import_exports)?;
     add_referenced_builtins_to_env(&mut env, &referenced_builtins)?;
 
     let mut canon_decls = Vec::new();
@@ -2084,6 +2109,7 @@ fn imported_decl_map(
     imports: &[&VerifiedModule],
     name_index: &BTreeMap<Name, usize>,
     referenced_names: &BTreeSet<Name>,
+    preferred_imports: &BTreeMap<Name, ImportEntry>,
 ) -> Result<BTreeMap<Name, ImportedDeclInfo>> {
     let mut map = BTreeMap::new();
     for (import_index, import) in imports.iter().enumerate() {
@@ -2096,6 +2122,12 @@ fn imported_decl_map(
                 continue;
             }
             if !referenced_names.contains(name) || !name_index.contains_key(name) {
+                continue;
+            }
+            if preferred_imports
+                .get(name)
+                .is_some_and(|preferred| !verified_module_matches_import_entry(import, preferred))
+            {
                 continue;
             }
             let axiom_dependencies = entry
@@ -2118,6 +2150,14 @@ fn imported_decl_map(
         }
     }
     Ok(map)
+}
+
+fn verified_module_matches_import_entry(module: &VerifiedModule, entry: &ImportEntry) -> bool {
+    module.module == entry.module
+        && module.export_hash == entry.export_hash
+        && entry
+            .certificate_hash
+            .is_none_or(|hash| module.certificate_hash == hash)
 }
 
 fn producer_imported_decl_map(
@@ -2326,6 +2366,9 @@ fn referenced_builtin_names(
     let mut imported_exports = BTreeSet::new();
     for import in imports {
         for entry in &import.export_block {
+            if import_export_uses_builtin_eq_rec(import, entry)? {
+                continue;
+            }
             imported_exports.insert(
                 import
                     .name_table

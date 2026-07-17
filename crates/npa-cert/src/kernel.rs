@@ -647,7 +647,7 @@ fn universe_constraints_from_decl_payload<C: KernelCertView + ?Sized>(
     }
 }
 
-fn universe_constraints_from_specs<C: KernelCertView + ?Sized>(
+pub(crate) fn universe_constraints_from_specs<C: KernelCertView + ?Sized>(
     cert: &C,
     constraints: &[UniverseConstraintSpec],
 ) -> Result<Vec<UniverseConstraint>> {

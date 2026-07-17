@@ -1138,7 +1138,7 @@ inductive Gate : Type where
     }
 
     #[test]
-    fn pua_m02_derive_policy_rejects_eager_heavy_declarations_by_default() {
+    fn derive_policy_rejects_eager_heavy_declarations_by_default() {
         let plan = human_default_derived_declaration_plan(
             npa_cert::Name::from_dotted("UserInductive"),
             HumanDeriveBudget::default(),

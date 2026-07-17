@@ -3,8 +3,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use npa_cli::args::PackageCommonOptions;
 use npa_cli::diagnostic::{CommandExitCode, DiagnosticKind};
+use npa_cli::package_api::v1::common_options;
 use npa_cli::package_lock::{run_package_lock_check, run_package_lock_write};
 
 const LOCK_PATH: &str = "generated/package-lock.json";
@@ -85,7 +85,7 @@ fn package_lock_check_succeeds_on_proof_corpus_fixture_json() {
     assert!(output.stderr.is_empty());
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
-        "{\"schema\":\"npa.package.command_result.v0.1\",\"command\":\"package lock check\",\"root\":\"testdata/package/proofs\",\"status\":\"passed\",\"diagnostics\":[],\"artifacts\":[]}\n"
+        "{\"schema\":\"npa.package.command_result.v0.3\",\"command\":\"package lock check\",\"root\":\"testdata/package/proofs\",\"status\":\"passed\",\"diagnostics\":[],\"artifacts\":[]}\n"
     );
 }
 
@@ -159,23 +159,17 @@ fn package_lock_write_creates_missing_lock_and_reports_json() {
     assert!(output.stderr.is_empty());
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
-        "{\"schema\":\"npa.package.command_result.v0.1\",\"command\":\"package lock write\",\"root\":\"<absolute-root>\",\"status\":\"passed\",\"diagnostics\":[],\"artifacts\":[]}\n"
+        "{\"schema\":\"npa.package.command_result.v0.3\",\"command\":\"package lock write\",\"root\":\"<absolute-root>\",\"status\":\"passed\",\"diagnostics\":[],\"artifacts\":[]}\n"
     );
     assert_eq!(fs::read_to_string(lock_path).unwrap(), expected_lock);
 }
 
 fn run_check(package: &TestPackage) -> npa_cli::diagnostic::CommandResult {
-    run_package_lock_check(PackageCommonOptions {
-        root: package.path().to_path_buf(),
-        json: true,
-    })
+    run_package_lock_check(common_options(package.path(), true))
 }
 
 fn run_write(package: &TestPackage) -> npa_cli::diagnostic::CommandResult {
-    run_package_lock_write(PackageCommonOptions {
-        root: package.path().to_path_buf(),
-        json: true,
-    })
+    run_package_lock_write(common_options(package.path(), true))
 }
 
 fn copy_dir_all(source: &Path, target: &Path) {

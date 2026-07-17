@@ -1,6 +1,7 @@
 pub mod builtins;
 pub mod context;
 pub mod decl;
+pub mod diagnostic;
 pub mod env;
 pub mod error;
 pub mod expr;
@@ -18,6 +19,10 @@ pub use decl::{
     Binder, ConstructorDecl, Decl, InductiveDecl, MutualInductiveBlock, RecursorDecl,
     RecursorRules, Reducibility,
 };
+pub use diagnostic::{
+    DiagnosedKernelError, KernelComparisonOutcome, KernelConversionContext,
+    KernelDiagnosticContext, KernelDiagnosticPhase, KernelExprHead,
+};
 pub use env::Env;
 pub use error::{Error, ResourceLimitKind, Result};
 pub use expr::Expr;
@@ -31,6 +36,102 @@ pub use positivity::{approved_nested_functor, ApprovedNestedFunctor, APPROVED_NE
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn diagnosed_kernel_declaration_preserves_error_and_bounds_conversion_context() {
+        let mut ordinary = Env::with_builtins().unwrap();
+        let mut diagnosed = ordinary.clone();
+        let declaration = Decl::Def {
+            name: "Bad".to_owned(),
+            universe_params: vec![],
+            ty: nat(),
+            value: Expr::sort(Level::zero()),
+            reducibility: Reducibility::Reducible,
+        };
+        let ordinary_error = ordinary
+            .add_def(
+                "Bad",
+                vec![],
+                nat(),
+                Expr::sort(Level::zero()),
+                Reducibility::Reducible,
+            )
+            .unwrap_err();
+        let diagnosed_error = diagnosed.add_decl_diagnosed(declaration).unwrap_err();
+        assert!(matches!(ordinary_error, Error::TypeMismatch { .. }));
+        assert!(matches!(
+            diagnosed_error.error(),
+            Error::TypeMismatch { .. }
+        ));
+        let context = diagnosed_error.context().unwrap();
+        assert_eq!(context.phase().as_str(), "declaration_value");
+        let conversion = context.conversion().unwrap();
+        assert_eq!(conversion.outcome().as_str(), "not_defeq");
+        assert!(conversion.lhs_head().as_str().len() <= 265);
+        assert!(conversion.rhs_head().as_str().len() <= 265);
+    }
+
+    #[test]
+    fn diagnosed_kernel_conversion_fuel_exhaustion_records_active_heads() {
+        let env = Env::new();
+        let error = env
+            .is_defeq_diagnosed_with_fuel(
+                &Ctx::new(),
+                &[],
+                &Expr::app(Expr::konst("f", vec![]), Expr::bvar(0)),
+                &Expr::app(Expr::konst("g", vec![]), Expr::bvar(0)),
+                0,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error.error(),
+            Error::ResourceLimit {
+                kind: ResourceLimitKind::Conversion
+            }
+        ));
+        let conversion = error.context().unwrap().conversion().unwrap();
+        assert_eq!(conversion.outcome().as_str(), "fuel_exhausted");
+        assert_eq!(conversion.lhs_head().as_str(), "application");
+        assert_eq!(conversion.rhs_head().as_str(), "application");
+        assert_eq!(conversion.depth(), 0);
+    }
+
+    #[test]
+    fn diagnosed_kernel_declaration_records_nested_application_mismatch() {
+        let mut ordinary = Env::with_builtins().unwrap();
+        let mut diagnosed = ordinary.clone();
+        let value = Expr::app(Expr::konst("Nat.succ", vec![]), Expr::sort(Level::zero()));
+        let ordinary_error = ordinary
+            .add_def(
+                "BadNested",
+                vec![],
+                nat(),
+                value.clone(),
+                Reducibility::Reducible,
+            )
+            .unwrap_err();
+        let diagnosed_error = diagnosed
+            .add_decl_diagnosed(Decl::Def {
+                name: "BadNested".to_owned(),
+                universe_params: vec![],
+                ty: nat(),
+                value,
+                reducibility: Reducibility::Reducible,
+            })
+            .unwrap_err();
+
+        assert!(matches!(ordinary_error, Error::TypeMismatch { .. }));
+        assert!(matches!(
+            diagnosed_error.error(),
+            Error::TypeMismatch { .. }
+        ));
+        let context = diagnosed_error.context().unwrap();
+        assert_eq!(context.phase(), KernelDiagnosticPhase::DeclarationValue);
+        assert_eq!(
+            context.conversion().unwrap().outcome(),
+            KernelComparisonOutcome::NotDefEq
+        );
+    }
 
     fn id_type() -> Expr {
         let u = Level::param("u");
@@ -195,6 +296,7 @@ mod tests {
             )],
             None,
         )
+        .with_universe_constraints(vec![UniverseConstraint::le(type0(), u)])
     }
 
     fn vec_type(level: Level, a: Expr, n: Expr) -> Expr {
@@ -241,6 +343,7 @@ mod tests {
             ],
             None,
         )
+        .with_universe_constraints(vec![UniverseConstraint::le(type0(), u)])
     }
 
     fn fin_type(n: Expr) -> Expr {
@@ -1354,6 +1457,290 @@ mod tests {
     }
 
     #[test]
+    fn inductive_rejects_constructor_field_above_declared_sort() {
+        let family_sort = type0();
+        let mut env = Env::new();
+        let err = env
+            .add_inductive(InductiveDecl::new(
+                "Audit.Code",
+                vec![],
+                vec![],
+                vec![],
+                family_sort.clone(),
+                vec![ConstructorDecl::new(
+                    "Audit.Code.mk",
+                    Expr::pi(
+                        "A",
+                        Expr::sort(family_sort.clone()),
+                        Expr::konst("Audit.Code", vec![]),
+                    ),
+                )],
+                None,
+            ))
+            .unwrap_err();
+
+        assert_eq!(
+            err,
+            Error::ConstructorUniverseBoundViolation {
+                inductive: "Audit.Code".to_owned(),
+                constructor: "Audit.Code.mk".to_owned(),
+                field_index: 0,
+                field_level: Level::succ(family_sort.clone()),
+                inductive_sort: family_sort,
+            }
+        );
+        assert!(env.decl("Audit.Code").is_none());
+        assert!(env.decl("Audit.Code.mk").is_none());
+    }
+
+    #[test]
+    fn inductive_rejects_polymorphic_successor_field_bound() {
+        let u = Level::param("u");
+        let mut env = Env::new();
+        let err = env
+            .add_inductive(InductiveDecl::new(
+                "Audit.PolyCode",
+                vec!["u".to_owned()],
+                vec![],
+                vec![],
+                u.clone(),
+                vec![ConstructorDecl::new(
+                    "Audit.PolyCode.mk",
+                    Expr::pi(
+                        "A",
+                        Expr::sort(u.clone()),
+                        Expr::konst("Audit.PolyCode", vec![u.clone()]),
+                    ),
+                )],
+                None,
+            ))
+            .unwrap_err();
+
+        assert_eq!(
+            err,
+            Error::ConstructorUniverseBoundViolation {
+                inductive: "Audit.PolyCode".to_owned(),
+                constructor: "Audit.PolyCode.mk".to_owned(),
+                field_index: 0,
+                field_level: Level::succ(u.clone()),
+                inductive_sort: u,
+            }
+        );
+    }
+
+    #[test]
+    fn inductive_excludes_uniform_parameters_but_bounds_stored_values() {
+        let u = Level::param("u");
+        let v = Level::param("v");
+        let family_target = |name: &str, argument: Expr| {
+            Expr::app(Expr::konst(name, vec![u.clone(), v.clone()]), argument)
+        };
+        let phantom = InductiveDecl::new(
+            "Phantom",
+            vec!["u".to_owned(), "v".to_owned()],
+            vec![Binder::new("A", Expr::sort(u.clone()))],
+            vec![],
+            v.clone(),
+            vec![ConstructorDecl::new(
+                "Phantom.mk",
+                Expr::pi(
+                    "A",
+                    Expr::sort(u.clone()),
+                    family_target("Phantom", Expr::bvar(0)),
+                ),
+            )],
+            None,
+        );
+        let make_store = |constraints: Vec<UniverseConstraint>| {
+            InductiveDecl::new(
+                "Store",
+                vec!["u".to_owned(), "v".to_owned()],
+                vec![Binder::new("A", Expr::sort(u.clone()))],
+                vec![],
+                v.clone(),
+                vec![ConstructorDecl::new(
+                    "Store.mk",
+                    Expr::pi(
+                        "A",
+                        Expr::sort(u.clone()),
+                        Expr::pi(
+                            "value",
+                            Expr::bvar(0),
+                            family_target("Store", Expr::bvar(1)),
+                        ),
+                    ),
+                )],
+                None,
+            )
+            .with_universe_constraints(constraints)
+        };
+
+        let mut env = Env::new();
+        env.add_inductive(phantom).unwrap();
+        let err = env.add_inductive(make_store(vec![])).unwrap_err();
+        assert!(matches!(
+            err,
+            Error::ConstructorUniverseBoundViolation {
+                field_index: 0,
+                field_level,
+                inductive_sort,
+                ..
+            } if field_level == u && inductive_sort == v
+        ));
+        assert!(env.decl("Store").is_none());
+
+        env.add_inductive(make_store(vec![UniverseConstraint::le(
+            u.clone(),
+            v.clone(),
+        )]))
+        .unwrap();
+        assert!(env.decl("Store.mk").is_some());
+    }
+
+    #[test]
+    fn inductive_accepts_constructor_field_bounded_by_max_sort() {
+        let u = Level::param("u");
+        let v = Level::param("v");
+        let sort = Level::max(u.clone(), v.clone());
+        let target = Expr::app(
+            Expr::konst("MaxStore", vec![u.clone(), v.clone()]),
+            Expr::bvar(1),
+        );
+        let data = InductiveDecl::new(
+            "MaxStore",
+            vec!["u".to_owned(), "v".to_owned()],
+            vec![Binder::new("A", Expr::sort(u.clone()))],
+            vec![],
+            sort,
+            vec![ConstructorDecl::new(
+                "MaxStore.mk",
+                Expr::pi("A", Expr::sort(u), Expr::pi("value", Expr::bvar(0), target)),
+            )],
+            None,
+        );
+
+        let mut env = Env::new();
+        env.add_inductive(data).unwrap();
+        assert!(env.decl("MaxStore.mk").is_some());
+    }
+
+    #[test]
+    fn inductive_checks_dependent_fields_under_preceding_constructor_domains() {
+        let type0 = type0();
+        let type1 = Level::succ(type0.clone());
+        let data = InductiveDecl::new(
+            "DependentStore",
+            vec![],
+            vec![],
+            vec![],
+            type1,
+            vec![ConstructorDecl::new(
+                "DependentStore.mk",
+                Expr::pi(
+                    "A",
+                    Expr::sort(type0),
+                    Expr::pi(
+                        "value",
+                        Expr::bvar(0),
+                        Expr::konst("DependentStore", vec![]),
+                    ),
+                ),
+            )],
+            None,
+        );
+
+        let mut env = Env::new();
+        env.add_inductive(data).unwrap();
+        assert!(env.decl("DependentStore.mk").is_some());
+    }
+
+    #[test]
+    fn mutual_inductive_constructor_bounds_use_each_family_sort_atomically() {
+        let type0 = type0();
+        let type1 = Level::succ(type0.clone());
+        let mut env = Env::new();
+        env.add_mutual_inductive(MutualInductiveBlock::new(
+            "AllowedMixedSorts",
+            vec![],
+            vec![
+                InductiveDecl::new(
+                    "High",
+                    vec![],
+                    vec![],
+                    vec![],
+                    type1,
+                    vec![ConstructorDecl::new(
+                        "High.mk",
+                        Expr::pi("A", Expr::sort(type0.clone()), Expr::konst("High", vec![])),
+                    )],
+                    None,
+                ),
+                InductiveDecl::new(
+                    "Proof",
+                    vec![],
+                    vec![],
+                    vec![],
+                    Level::zero(),
+                    vec![ConstructorDecl::new(
+                        "Proof.mk",
+                        Expr::pi("A", Expr::sort(type0.clone()), Expr::konst("Proof", vec![])),
+                    )],
+                    None,
+                ),
+            ],
+        ))
+        .unwrap();
+        assert!(env.decl("High.mk").is_some());
+        assert!(env.decl("Proof.mk").is_some());
+
+        let err = env
+            .add_mutual_inductive(MutualInductiveBlock::new(
+                "RejectedBlock",
+                vec![],
+                vec![
+                    InductiveDecl::new(
+                        "Low",
+                        vec![],
+                        vec![],
+                        vec![],
+                        type0.clone(),
+                        vec![ConstructorDecl::new(
+                            "Low.mk",
+                            Expr::pi("A", Expr::sort(type0.clone()), Expr::konst("Low", vec![])),
+                        )],
+                        None,
+                    ),
+                    InductiveDecl::new(
+                        "Other",
+                        vec![],
+                        vec![],
+                        vec![],
+                        type0.clone(),
+                        vec![ConstructorDecl::new(
+                            "Other.mk",
+                            Expr::konst("Other", vec![]),
+                        )],
+                        None,
+                    ),
+                ],
+            ))
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            Error::ConstructorUniverseBoundViolation {
+                inductive,
+                constructor,
+                field_index: 0,
+                ..
+            } if inductive == "Low" && constructor == "Low.mk"
+        ));
+        assert!(env.decl("Low").is_none());
+        assert!(env.decl("Low.mk").is_none());
+        assert!(env.decl("Other").is_none());
+        assert!(env.decl("Other.mk").is_none());
+    }
+
+    #[test]
     fn mutual_inductive_rejects_unsatisfiable_universe_context() {
         let mut env = Env::new();
         let mut block = even_odd_mutual_block();
@@ -1640,7 +2027,11 @@ mod tests {
     fn positivity_rejects_name_only_fake_approved_functor() {
         let mut env = Env::with_builtins().unwrap();
         env.add_inductive(negative_param_list_inductive()).unwrap();
-        let err = env.add_inductive(rose_nested_list_inductive()).unwrap_err();
+        let err = env
+            .add_inductive(rose_nested_list_inductive().with_universe_constraints(vec![
+                UniverseConstraint::le(type0(), Level::param("u")),
+            ]))
+            .unwrap_err();
 
         assert!(matches!(err, Error::NonPositiveOccurrence { .. }));
     }

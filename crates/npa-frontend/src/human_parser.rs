@@ -15,6 +15,85 @@ pub fn parse_human_module(file_id: FileId, source: &str) -> HumanResult<HumanMod
     parse_human_module_with_source_interfaces(file_id, source, &[])
 }
 
+/// One top-level Human Surface import module-name span.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HumanImportSpan {
+    /// Parsed dotted module name.
+    pub module: String,
+    /// Exact UTF-8 byte span occupied by the module name, excluding `import`.
+    pub module_span: Span,
+}
+
+/// One maximal name from non-comment, non-string Human Surface tokens.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HumanNameSpan {
+    /// Parsed name.
+    pub name: String,
+    /// Exact UTF-8 byte span occupied by the name.
+    pub span: Span,
+}
+
+/// Parse a Human Surface module and return its exact top-level import-name spans.
+///
+/// Consumers can safely rewrite only these spans, from the end of the source
+/// toward the start, and then reparse the resulting module.
+pub fn parse_human_import_spans(
+    file_id: FileId,
+    source: &str,
+) -> HumanResult<Vec<HumanImportSpan>> {
+    let module = parse_human_module(file_id, source)?;
+    Ok(module
+        .items
+        .into_iter()
+        .filter_map(|item| match item {
+            HumanItem::Import { module, .. } => Some(HumanImportSpan {
+                module: module.as_dotted(),
+                module_span: module.span,
+            }),
+            _ => None,
+        })
+        .collect())
+}
+
+/// Return maximal name spans from the lexer token stream.
+///
+/// Line comments and string literals are deliberately excluded. Consumers use
+/// this alongside the parser-owned import spans when they need to distinguish
+/// semantic name occurrences from inert prose without implementing a second
+/// partial lexer.
+pub fn parse_human_name_spans(file_id: FileId, source: &str) -> HumanResult<Vec<HumanNameSpan>> {
+    let tokens = lex_human(file_id, source)?;
+    let mut spans = Vec::new();
+    let mut index = 0;
+    while index < tokens.len() {
+        let TokenKind::Ident(first) = &tokens[index].kind else {
+            index += 1;
+            continue;
+        };
+        let mut parts = vec![first.clone()];
+        let mut span = tokens[index].span;
+        let mut next = index + 1;
+        while next + 1 < tokens.len() && matches!(tokens[next].kind, TokenKind::Dot) {
+            let component = match &tokens[next + 1].kind {
+                TokenKind::Ident(component) => Some(component.as_str()),
+                kind => reserved_name_component_spelling(kind),
+            };
+            let Some(component) = component else {
+                break;
+            };
+            parts.push(component.to_owned());
+            span = span.join(tokens[next + 1].span);
+            next += 2;
+        }
+        spans.push(HumanNameSpan {
+            name: parts.join("."),
+            span,
+        });
+        index = next;
+    }
+    Ok(spans)
+}
+
 pub fn parse_human_module_with_source_interfaces(
     file_id: FileId,
     source: &str,
@@ -3175,5 +3254,32 @@ open B",
         );
 
         assert_eq!(err, HumanDiagnosticKind::NotationConflict);
+    }
+
+    #[test]
+    fn import_span_api_returns_only_exact_module_name_bytes() {
+        let source =
+            "import Std.Logic.Eq\nimport Proofs.Ai.Example.Basic\n\ndef keep : Type := Type\n";
+        let spans = parse_human_import_spans(FileId(7), source).unwrap();
+        assert_eq!(spans.len(), 2);
+        assert_eq!(spans[1].module, "Proofs.Ai.Example.Basic");
+        assert_eq!(
+            &source[spans[1].module_span.start.0 as usize..spans[1].module_span.end.0 as usize],
+            "Proofs.Ai.Example.Basic"
+        );
+    }
+
+    #[test]
+    fn name_span_api_excludes_comments_and_strings() {
+        let source =
+            "-- Hidden.Comment.Name\nVisible.Name \"Hidden.String.Name\" Other.Name Single\n";
+        let spans = parse_human_name_spans(FileId(9), source).unwrap();
+        assert_eq!(
+            spans
+                .iter()
+                .map(|span| span.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Visible.Name", "Other.Name", "Single"]
+        );
     }
 }

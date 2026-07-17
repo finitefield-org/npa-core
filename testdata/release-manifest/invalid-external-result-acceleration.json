@@ -1,0 +1,103 @@
+{
+  "schema": "npa.generated_artifact_release_manifest.v0.2",
+  "package": "npa-project-iut",
+  "package_root": "proofs",
+  "source_commit": "1111111111111111111111111111111111111111",
+  "tag": "v1.0.0",
+  "npa_core_ref": "2222222222222222222222222222222222222222",
+  "generated_at_utc": "2026-07-12T00:00:00Z",
+  "generator_commands": [
+    "generate"
+  ],
+  "check_commands": [
+    "check"
+  ],
+  "generated_files": [
+    {
+      "path": "proofs/generated/package-lock.json",
+      "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    }
+  ],
+  "omitted_files": [],
+  "archive": {
+    "path": "npa-project-iut-proofs-generated-v1.0.0.tar.gz",
+    "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  },
+  "verification": {
+    "package_lock_mode": "checked",
+    "package_lock_path": "proofs/generated/package-lock.json",
+    "package_lock_sha256": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "command": "cargo run --locked --offline --manifest-path npa-core/Cargo.toml -p npa-cli -- package verify-certs --root npa-project-iut/proofs --package-lock checked --checker external --audit-cache off --verifier-memo off --runner-policy ci/runner.release.json --runner-policy-hash sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee --checker-registry ci/checker-binaries.json --json",
+    "command_result": {
+      "schema": "npa.package.command_result.v0.1",
+      "command": "package verify-certs",
+      "root": "npa-project-iut/proofs",
+      "status": "passed",
+      "diagnostics": [
+        {
+          "kind": "ExternalVerifier",
+          "reason_code": "package_verified",
+          "severity": "info",
+          "path": "ci/runner.release.json",
+          "field": "verdict_source",
+          "actual_value": "mode=external;verdict_source=npa-checker-ext;reference_checker_verdict=false;modules=1",
+          "checker": "npa-checker-ext"
+        },
+        {
+          "kind": "PackageLock",
+          "reason_code": "package_lock_checked",
+          "severity": "info",
+          "field": "package_lock",
+          "actual_value": "mode=checked;hash=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        {
+          "kind": "ExternalVerifier",
+          "reason_code": "module_verified",
+          "severity": "info",
+          "module": "Proofs.Ai.Basic",
+          "path": "Proofs/Ai/Basic/certificate.npcert",
+          "field": "status",
+          "expected_value": "checked",
+          "actual_value": "checked",
+          "checker": "npa-checker-ext"
+        },
+        {
+          "kind": "ExternalVerifier",
+          "reason_code": "audit_cache_summary",
+          "severity": "info",
+          "actual_value": "mode=local-hit"
+        }
+      ],
+      "artifacts": [
+        {
+          "kind": "machine_check_result",
+          "path": "generated/checker-results/npa-project-iut/v1.0.0/Proofs.Ai.Basic/external/result.json"
+        }
+      ]
+    },
+    "checker_mode": "external",
+    "verdict_source": "npa-checker-ext",
+    "npa_core_source_kind": "aggregate",
+    "npa_core_checkout_revision": "2222222222222222222222222222222222222222",
+    "npa_core_tree_hash": "3333333333333333333333333333333333333333",
+    "npa_cli_crate_version": "0.3.0",
+    "cargo_manifest_path": "npa-core/Cargo.toml",
+    "cargo_lock_path": "npa-core/Cargo.lock",
+    "cargo_lock_sha256": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "rust_toolchain": "rustc 1.88.0 (6b00bc388 2025-06-23)",
+    "rust_target": "x86_64-unknown-linux-gnu",
+    "cargo_profile": "dev",
+    "host_executable_name": "npa",
+    "host_executable_sha256": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "external_checker": {
+      "runner_policy_path": "ci/runner.release.json",
+      "runner_policy_sha256": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "checker_registry_path": "ci/checker-binaries.json",
+      "checker_registry_sha256": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "checker_id": "npa-checker-ext",
+      "checker_version": "0.1.0",
+      "checker_binary_sha256": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+      "checker_build_hash": "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+    }
+  }
+}

@@ -1,0 +1,2 @@
+format = "npa.independent-checker.axiom_policy.v1"
+allowed_axioms = []

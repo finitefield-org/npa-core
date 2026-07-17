@@ -8,9 +8,16 @@ use crate::{
         ConstructorDecl, Decl, InductiveDecl, MutualInductiveBlock, RecursorDecl, RecursorRules,
         Reducibility,
     },
+    diagnostic::{
+        DiagnosedKernelError, KernelComparisonOutcome, KernelConversionContext,
+        KernelDiagnosticContext, KernelDiagnosticPhase, KernelExprHead,
+    },
     error::{Error, ResourceLimitKind, Result},
     expr::{collect_apps, quick_syntactic_eq, Expr},
-    level::{ensure_level_wf, level_eq, levels_eq, Level, UniverseConstraint, UniverseContext},
+    level::{
+        ensure_level_wf, level_eq, levels_eq, normalize_level, Level, UniverseConstraint,
+        UniverseContext,
+    },
     name::is_canonical_dotted_name,
     positivity::approved_nested_functor,
     subst::{instantiate, subst_levels_expr},
@@ -41,9 +48,37 @@ struct MutualRecursorResultCheck<'a> {
     index_start: usize,
 }
 
+#[derive(Default)]
+struct KernelConversionRecorder {
+    comparison: Option<KernelConversionContext>,
+}
+
+impl KernelConversionRecorder {
+    fn record(&mut self, outcome: KernelComparisonOutcome, lhs: &Expr, rhs: &Expr, depth: u32) {
+        let replace = self.comparison.as_ref().is_none_or(|current| {
+            depth > current.depth()
+                || (depth == current.depth()
+                    && outcome == KernelComparisonOutcome::FuelExhausted
+                    && current.outcome() == KernelComparisonOutcome::NotDefEq)
+        });
+        if replace {
+            self.comparison = Some(KernelConversionContext::new(
+                outcome,
+                KernelExprHead::from_expr(lhs),
+                KernelExprHead::from_expr(rhs),
+                depth,
+            ));
+        }
+    }
+}
+
 impl Env {
     const WHNF_FUEL: usize = 100_000;
-    const DEFEQ_FUEL: usize = 100_000;
+    // Keep the default conversion ceiling aligned with the independent
+    // reference checker. Human elaboration and certificate construction use
+    // this default path, so a lower fast-kernel ceiling can reject declarations
+    // that the source-free acceptance boundary is deliberately sized to check.
+    const DEFEQ_FUEL: usize = 5_000_000;
 
     pub fn new() -> Self {
         Self::default()
@@ -479,6 +514,339 @@ impl Env {
         }
     }
 
+    /// Check a term through the ordinary kernel path and retain one bounded
+    /// conversion comparison when checking fails.
+    pub fn check_diagnosed(
+        &self,
+        ctx: &Ctx,
+        delta: &[String],
+        term: &Expr,
+        expected: &Expr,
+    ) -> std::result::Result<(), DiagnosedKernelError> {
+        let universe_context =
+            UniverseContext::from_params(delta.to_vec()).map_err(DiagnosedKernelError::new)?;
+        self.check_in_universe_context_diagnosed(
+            ctx,
+            &universe_context,
+            term,
+            expected,
+            KernelDiagnosticPhase::TermCheck,
+        )
+    }
+
+    fn infer_in_universe_context_diagnosed(
+        &self,
+        ctx: &Ctx,
+        universe_context: &UniverseContext,
+        term: &Expr,
+        phase: KernelDiagnosticPhase,
+    ) -> std::result::Result<Expr, DiagnosedKernelError> {
+        match term {
+            Expr::Sort(level) => {
+                ensure_level_wf(&universe_context.params, level)
+                    .map_err(DiagnosedKernelError::new)?;
+                Ok(Expr::sort(Level::succ(level.clone())))
+            }
+            Expr::BVar(index) => ctx.lookup_type(*index).map_err(DiagnosedKernelError::new),
+            Expr::Const { name, levels } => self
+                .infer_const_type_in_universe_context(universe_context, name, levels)
+                .map_err(DiagnosedKernelError::new),
+            Expr::Pi { binder, ty, body } => {
+                let domain_sort = self.expect_sort_in_universe_context_diagnosed(
+                    ctx,
+                    universe_context,
+                    ty,
+                    phase,
+                )?;
+                let mut body_ctx = ctx.clone();
+                body_ctx.push_assumption(binder.clone(), (**ty).clone());
+                let body_sort = self.expect_sort_in_universe_context_diagnosed(
+                    &body_ctx,
+                    universe_context,
+                    body,
+                    phase,
+                )?;
+                Ok(Expr::sort(Level::imax(domain_sort, body_sort)))
+            }
+            Expr::Lam { binder, ty, body } => {
+                self.expect_sort_in_universe_context_diagnosed(ctx, universe_context, ty, phase)?;
+                let mut body_ctx = ctx.clone();
+                body_ctx.push_assumption(binder.clone(), (**ty).clone());
+                let body_ty = self.infer_in_universe_context_diagnosed(
+                    &body_ctx,
+                    universe_context,
+                    body,
+                    phase,
+                )?;
+                Ok(Expr::pi(binder.clone(), (**ty).clone(), body_ty))
+            }
+            Expr::App(fun, arg) => {
+                let fun_ty =
+                    self.infer_in_universe_context_diagnosed(ctx, universe_context, fun, phase)?;
+                match self
+                    .whnf(ctx, &universe_context.params, &fun_ty)
+                    .map_err(DiagnosedKernelError::new)?
+                {
+                    Expr::Pi { ty, body, .. } => {
+                        self.check_in_universe_context_diagnosed(
+                            ctx,
+                            universe_context,
+                            arg,
+                            &ty,
+                            phase,
+                        )?;
+                        instantiate(&body, arg).map_err(DiagnosedKernelError::new)
+                    }
+                    actual => Err(DiagnosedKernelError::new(Error::ExpectedPi { actual })),
+                }
+            }
+            Expr::Let {
+                binder,
+                ty,
+                value,
+                body,
+            } => {
+                self.expect_sort_in_universe_context_diagnosed(ctx, universe_context, ty, phase)?;
+                self.check_in_universe_context_diagnosed(ctx, universe_context, value, ty, phase)?;
+                let mut body_ctx = ctx.clone();
+                body_ctx.push_definition(binder.clone(), (**ty).clone(), (**value).clone());
+                let body_ty = self.infer_in_universe_context_diagnosed(
+                    &body_ctx,
+                    universe_context,
+                    body,
+                    phase,
+                )?;
+                instantiate(&body_ty, value).map_err(DiagnosedKernelError::new)
+            }
+        }
+    }
+
+    fn expect_sort_in_universe_context_diagnosed(
+        &self,
+        ctx: &Ctx,
+        universe_context: &UniverseContext,
+        term: &Expr,
+        phase: KernelDiagnosticPhase,
+    ) -> std::result::Result<Level, DiagnosedKernelError> {
+        let inferred =
+            self.infer_in_universe_context_diagnosed(ctx, universe_context, term, phase)?;
+        match self
+            .whnf(ctx, &universe_context.params, &inferred)
+            .map_err(DiagnosedKernelError::new)?
+        {
+            Expr::Sort(level) => Ok(level),
+            actual => Err(DiagnosedKernelError::new(Error::ExpectedSort { actual })),
+        }
+    }
+
+    fn check_in_universe_context_diagnosed(
+        &self,
+        ctx: &Ctx,
+        universe_context: &UniverseContext,
+        term: &Expr,
+        expected: &Expr,
+        phase: KernelDiagnosticPhase,
+    ) -> std::result::Result<(), DiagnosedKernelError> {
+        let actual =
+            self.infer_in_universe_context_diagnosed(ctx, universe_context, term, phase)?;
+        let mut recorder = KernelConversionRecorder::default();
+        let mut fuel = Self::DEFEQ_FUEL;
+        match self.is_defeq_with_remaining_fuel_diagnosed(
+            ctx,
+            &universe_context.params,
+            &actual,
+            expected,
+            &mut fuel,
+            &mut recorder,
+            0,
+        ) {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(DiagnosedKernelError::new(Error::TypeMismatch {
+                expected: expected.clone(),
+                actual,
+            })
+            .with_context(KernelDiagnosticContext::new(phase).with_conversion(
+                recorder.comparison.unwrap_or_else(|| {
+                    KernelConversionContext::new(
+                        KernelComparisonOutcome::NotDefEq,
+                        KernelExprHead::Unknown,
+                        KernelExprHead::Unknown,
+                        0,
+                    )
+                }),
+            ))),
+            Err(error) => {
+                let mut diagnosed = DiagnosedKernelError::new(error);
+                if let Some(comparison) = recorder.comparison {
+                    diagnosed = diagnosed.with_context(
+                        KernelDiagnosticContext::new(phase).with_conversion(comparison),
+                    );
+                }
+                Err(diagnosed)
+            }
+        }
+    }
+
+    /// Add one declaration with bounded authoring context on failure.
+    pub fn add_decl_diagnosed(
+        &mut self,
+        declaration: Decl,
+    ) -> std::result::Result<(), DiagnosedKernelError> {
+        match declaration {
+            Decl::Axiom {
+                name,
+                universe_params,
+                ty,
+            } => self
+                .add_axiom(name, universe_params, ty)
+                .map_err(DiagnosedKernelError::new),
+            Decl::AxiomConstrained {
+                name,
+                universe_params,
+                universe_constraints,
+                ty,
+            } => self
+                .add_axiom_with_universe_constraints(
+                    name,
+                    universe_params,
+                    universe_constraints,
+                    ty,
+                )
+                .map_err(DiagnosedKernelError::new),
+            Decl::Def {
+                name,
+                universe_params,
+                ty,
+                value,
+                reducibility,
+            } => self.add_def_diagnosed(name, universe_params, Vec::new(), ty, value, reducibility),
+            Decl::DefConstrained {
+                name,
+                universe_params,
+                universe_constraints,
+                ty,
+                value,
+                reducibility,
+            } => self.add_def_diagnosed(
+                name,
+                universe_params,
+                universe_constraints,
+                ty,
+                value,
+                reducibility,
+            ),
+            Decl::Theorem {
+                name,
+                universe_params,
+                ty,
+                proof,
+            } => self.add_theorem_diagnosed(name, universe_params, Vec::new(), ty, proof),
+            Decl::TheoremConstrained {
+                name,
+                universe_params,
+                universe_constraints,
+                ty,
+                proof,
+            } => self.add_theorem_diagnosed(name, universe_params, universe_constraints, ty, proof),
+            Decl::Inductive { data, .. } => {
+                self.add_inductive(*data).map_err(DiagnosedKernelError::new)
+            }
+            Decl::MutualInductiveBlock { data, .. } => self
+                .add_mutual_inductive(*data)
+                .map_err(DiagnosedKernelError::new),
+            Decl::Constructor { .. } | Decl::Recursor { .. } => Ok(()),
+        }
+    }
+
+    fn add_def_diagnosed(
+        &mut self,
+        name: String,
+        universe_params: Vec<String>,
+        universe_constraints: Vec<UniverseConstraint>,
+        ty: Expr,
+        value: Expr,
+        reducibility: Reducibility,
+    ) -> std::result::Result<(), DiagnosedKernelError> {
+        self.ensure_fresh(&name)
+            .map_err(DiagnosedKernelError::new)?;
+        let universe_context =
+            UniverseContext::new(universe_params.clone(), universe_constraints.clone())
+                .map_err(DiagnosedKernelError::new)?;
+        self.expect_sort_in_universe_context(&Ctx::new(), &universe_context, &ty)
+            .map_err(DiagnosedKernelError::new)?;
+        self.check_in_universe_context_diagnosed(
+            &Ctx::new(),
+            &universe_context,
+            &value,
+            &ty,
+            KernelDiagnosticPhase::DeclarationValue,
+        )?;
+        let declaration = if universe_constraints.is_empty() {
+            Decl::Def {
+                name,
+                universe_params,
+                ty,
+                value,
+                reducibility,
+            }
+        } else {
+            Decl::DefConstrained {
+                name,
+                universe_params,
+                universe_constraints,
+                ty,
+                value,
+                reducibility,
+            }
+        };
+        self.decls
+            .insert(declaration.name().to_owned(), declaration);
+        Ok(())
+    }
+
+    fn add_theorem_diagnosed(
+        &mut self,
+        name: String,
+        universe_params: Vec<String>,
+        universe_constraints: Vec<UniverseConstraint>,
+        ty: Expr,
+        proof: Expr,
+    ) -> std::result::Result<(), DiagnosedKernelError> {
+        self.ensure_fresh(&name)
+            .map_err(DiagnosedKernelError::new)?;
+        let universe_context =
+            UniverseContext::new(universe_params.clone(), universe_constraints.clone())
+                .map_err(DiagnosedKernelError::new)?;
+        self.expect_sort_in_universe_context(&Ctx::new(), &universe_context, &ty)
+            .map_err(DiagnosedKernelError::new)?;
+        self.check_in_universe_context_diagnosed(
+            &Ctx::new(),
+            &universe_context,
+            &proof,
+            &ty,
+            KernelDiagnosticPhase::DeclarationValue,
+        )?;
+        let declaration = if universe_constraints.is_empty() {
+            Decl::Theorem {
+                name,
+                universe_params,
+                ty,
+                proof,
+            }
+        } else {
+            Decl::TheoremConstrained {
+                name,
+                universe_params,
+                universe_constraints,
+                ty,
+                proof,
+            }
+        };
+        self.decls
+            .insert(declaration.name().to_owned(), declaration);
+        Ok(())
+    }
+
     pub fn infer_with_fuel_metered(
         &self,
         ctx: &Ctx,
@@ -553,6 +921,41 @@ impl Env {
 
     pub fn is_defeq(&self, ctx: &Ctx, delta: &[String], lhs: &Expr, rhs: &Expr) -> Result<bool> {
         self.is_defeq_with_fuel(ctx, delta, lhs, rhs, Self::DEFEQ_FUEL)
+    }
+
+    /// Compare expressions with explicit fuel and bounded failure context.
+    pub fn is_defeq_diagnosed_with_fuel(
+        &self,
+        ctx: &Ctx,
+        delta: &[String],
+        lhs: &Expr,
+        rhs: &Expr,
+        fuel: usize,
+    ) -> std::result::Result<bool, DiagnosedKernelError> {
+        let mut fuel = fuel;
+        let mut recorder = KernelConversionRecorder::default();
+        match self.is_defeq_with_remaining_fuel_diagnosed(
+            ctx,
+            delta,
+            lhs,
+            rhs,
+            &mut fuel,
+            &mut recorder,
+            0,
+        ) {
+            Ok(true) => Ok(true),
+            Ok(false) => Ok(false),
+            Err(error) => {
+                let mut diagnosed = DiagnosedKernelError::new(error);
+                if let Some(comparison) = recorder.comparison {
+                    diagnosed = diagnosed.with_context(
+                        KernelDiagnosticContext::new(KernelDiagnosticPhase::DefinitionalEquality)
+                            .with_conversion(comparison),
+                    );
+                }
+                Err(diagnosed)
+            }
+        }
     }
 
     pub fn whnf_with_fuel(
@@ -937,7 +1340,8 @@ impl Env {
         }
 
         let result = self.whnf(&Ctx::new(), &universe_context.params, &result)?;
-        self.check_constructor_result(data, constructor, domains.len(), result)
+        self.check_constructor_result(data, constructor, domains.len(), result)?;
+        self.check_constructor_universe_bounds(data, constructor, &domains, universe_context)
     }
 
     fn check_mutual_constructor_decl(
@@ -961,7 +1365,47 @@ impl Env {
         }
 
         let result = self.whnf(&Ctx::new(), &universe_context.params, &result)?;
-        self.check_constructor_result(data, constructor, domains.len(), result)
+        self.check_constructor_result(data, constructor, domains.len(), result)?;
+        self.check_constructor_universe_bounds(data, constructor, &domains, universe_context)
+    }
+
+    fn check_constructor_universe_bounds(
+        &self,
+        data: &InductiveDecl,
+        constructor: &ConstructorDecl,
+        domains: &[Expr],
+        universe_context: &UniverseContext,
+    ) -> Result<()> {
+        let inductive_sort = normalize_level(data.sort.clone());
+        if inductive_sort == Level::zero() {
+            return Ok(());
+        }
+
+        let mut ctx = Ctx::new();
+        let mut whnf_fuel = Self::WHNF_FUEL;
+        let mut conversion_fuel = Self::DEFEQ_FUEL;
+        for (domain_index, domain) in domains.iter().enumerate() {
+            let field_level = self.expect_sort_with_remaining_fuel(
+                &ctx,
+                universe_context,
+                domain,
+                &mut whnf_fuel,
+                &mut conversion_fuel,
+            )?;
+            if domain_index >= data.params.len()
+                && !universe_context.entails_level_le(&field_level, &inductive_sort)?
+            {
+                return Err(Error::ConstructorUniverseBoundViolation {
+                    inductive: data.name.clone(),
+                    constructor: constructor.name.clone(),
+                    field_index: domain_index - data.params.len(),
+                    field_level: normalize_level(field_level),
+                    inductive_sort,
+                });
+            }
+            ctx.push_assumption("_", domain.clone());
+        }
+        Ok(())
     }
 
     fn check_recursor_decl(
@@ -1725,6 +2169,150 @@ impl Env {
             }
             _ => Ok(false),
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn is_defeq_with_remaining_fuel_diagnosed(
+        &self,
+        ctx: &Ctx,
+        delta: &[String],
+        lhs: &Expr,
+        rhs: &Expr,
+        fuel: &mut usize,
+        recorder: &mut KernelConversionRecorder,
+        depth: u32,
+    ) -> Result<bool> {
+        if *fuel == 0 {
+            recorder.record(KernelComparisonOutcome::FuelExhausted, lhs, rhs, depth);
+            return Err(Error::ResourceLimit {
+                kind: ResourceLimitKind::Conversion,
+            });
+        }
+        *fuel -= 1;
+        if quick_syntactic_eq(lhs, rhs) {
+            return Ok(true);
+        }
+
+        let lhs = match self.whnf_with_remaining_fuel(
+            ctx,
+            delta,
+            lhs,
+            fuel,
+            ResourceLimitKind::Conversion,
+        ) {
+            Ok(lhs) => lhs,
+            Err(error) => {
+                if matches!(
+                    error,
+                    Error::ResourceLimit {
+                        kind: ResourceLimitKind::Conversion
+                    }
+                ) {
+                    recorder.record(KernelComparisonOutcome::FuelExhausted, lhs, rhs, depth);
+                }
+                return Err(error);
+            }
+        };
+        let rhs = match self.whnf_with_remaining_fuel(
+            ctx,
+            delta,
+            rhs,
+            fuel,
+            ResourceLimitKind::Conversion,
+        ) {
+            Ok(rhs) => rhs,
+            Err(error) => {
+                if matches!(
+                    error,
+                    Error::ResourceLimit {
+                        kind: ResourceLimitKind::Conversion
+                    }
+                ) {
+                    recorder.record(KernelComparisonOutcome::FuelExhausted, &lhs, rhs, depth);
+                }
+                return Err(error);
+            }
+        };
+
+        let next_depth = depth.saturating_add(1);
+        let result = match (&lhs, &rhs) {
+            (Expr::Sort(lhs), Expr::Sort(rhs)) => Ok(level_eq(lhs, rhs)),
+            (Expr::BVar(lhs), Expr::BVar(rhs)) => Ok(lhs == rhs),
+            (
+                Expr::Const {
+                    name: lhs_name,
+                    levels: lhs_levels,
+                },
+                Expr::Const {
+                    name: rhs_name,
+                    levels: rhs_levels,
+                },
+            ) => Ok(lhs_name == rhs_name && levels_eq(lhs_levels, rhs_levels)),
+            (Expr::App(lhs_f, lhs_a), Expr::App(rhs_f, rhs_a)) => {
+                if !self.is_defeq_with_remaining_fuel_diagnosed(
+                    ctx, delta, lhs_f, rhs_f, fuel, recorder, next_depth,
+                )? {
+                    Ok(false)
+                } else {
+                    self.is_defeq_with_remaining_fuel_diagnosed(
+                        ctx, delta, lhs_a, rhs_a, fuel, recorder, next_depth,
+                    )
+                }
+            }
+            (
+                Expr::Pi {
+                    binder,
+                    ty: lhs_ty,
+                    body: lhs_body,
+                },
+                Expr::Pi {
+                    ty: rhs_ty,
+                    body: rhs_body,
+                    ..
+                },
+            ) => {
+                if !self.is_defeq_with_remaining_fuel_diagnosed(
+                    ctx, delta, lhs_ty, rhs_ty, fuel, recorder, next_depth,
+                )? {
+                    Ok(false)
+                } else {
+                    let mut body_ctx = ctx.clone();
+                    body_ctx.push_assumption(binder.clone(), (**lhs_ty).clone());
+                    self.is_defeq_with_remaining_fuel_diagnosed(
+                        &body_ctx, delta, lhs_body, rhs_body, fuel, recorder, next_depth,
+                    )
+                }
+            }
+            (
+                Expr::Lam {
+                    binder,
+                    ty: lhs_ty,
+                    body: lhs_body,
+                },
+                Expr::Lam {
+                    ty: rhs_ty,
+                    body: rhs_body,
+                    ..
+                },
+            ) => {
+                if !self.is_defeq_with_remaining_fuel_diagnosed(
+                    ctx, delta, lhs_ty, rhs_ty, fuel, recorder, next_depth,
+                )? {
+                    Ok(false)
+                } else {
+                    let mut body_ctx = ctx.clone();
+                    body_ctx.push_assumption(binder.clone(), (**lhs_ty).clone());
+                    self.is_defeq_with_remaining_fuel_diagnosed(
+                        &body_ctx, delta, lhs_body, rhs_body, fuel, recorder, next_depth,
+                    )
+                }
+            }
+            _ => Ok(false),
+        };
+        if matches!(result, Ok(false)) {
+            recorder.record(KernelComparisonOutcome::NotDefEq, &lhs, &rhs, depth);
+        }
+        result
     }
 }
 

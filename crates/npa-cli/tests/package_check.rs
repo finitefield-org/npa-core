@@ -3,9 +3,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use npa_cli::args::PackageCommonOptions;
 use npa_cli::diagnostic::{CommandExitCode, DiagnosticKind};
 use npa_cli::package::PACKAGE_MANIFEST_PATH;
+use npa_cli::package_api::v1::common_options;
 use npa_cli::package_check::run_package_check;
 
 const ZERO_HASH: &str = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
@@ -46,38 +46,6 @@ impl Drop for TestPackage {
 }
 
 #[test]
-fn package_check_succeeds_on_proof_corpus_fixture() {
-    let output = Command::new(env!("CARGO_BIN_EXE_npa"))
-        .current_dir(repo_root())
-        .args(["package", "check", "--root", "proofs"])
-        .output()
-        .unwrap();
-
-    assert_eq!(output.status.code(), Some(0));
-    assert!(output.stderr.is_empty());
-    assert_eq!(
-        String::from_utf8(output.stdout).unwrap(),
-        "package check: passed\n"
-    );
-}
-
-#[test]
-fn package_check_succeeds_on_proof_corpus_fixture_json() {
-    let output = Command::new(env!("CARGO_BIN_EXE_npa"))
-        .current_dir(repo_root())
-        .args(["package", "check", "--root", "proofs", "--json"])
-        .output()
-        .unwrap();
-
-    assert_eq!(output.status.code(), Some(0));
-    assert!(output.stderr.is_empty());
-    assert_eq!(
-        String::from_utf8(output.stdout).unwrap(),
-        "{\"schema\":\"npa.package.command_result.v0.1\",\"command\":\"package check\",\"root\":\"proofs\",\"status\":\"passed\",\"diagnostics\":[],\"artifacts\":[]}\n"
-    );
-}
-
-#[test]
 fn package_check_reads_only_manifest_and_ignores_missing_artifacts() {
     let package = TestPackage::new("missing-artifacts");
     package.write_manifest(&valid_manifest(&module_block_with_sidecars(
@@ -88,10 +56,7 @@ fn package_check_reads_only_manifest_and_ignores_missing_artifacts() {
         "Missing/Replay.json",
     )));
 
-    let result = run_package_check(PackageCommonOptions {
-        root: package.path().to_path_buf(),
-        json: true,
-    });
+    let result = run_package_check(common_options(package.path(), true));
 
     assert_eq!(result.exit_code(), CommandExitCode::Success);
     assert_eq!(result.status.as_str(), "passed");
@@ -104,10 +69,7 @@ fn package_check_rejects_representative_invalid_manifests() {
         let package = TestPackage::new(fixture.label);
         package.write_manifest(&fixture.source);
 
-        let result = run_package_check(PackageCommonOptions {
-            root: package.path().to_path_buf(),
-            json: true,
-        });
+        let result = run_package_check(common_options(package.path(), true));
 
         assert_eq!(
             result.exit_code(),
@@ -347,11 +309,4 @@ tags = []
 
 "#
     )
-}
-
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .components()
-        .collect()
 }

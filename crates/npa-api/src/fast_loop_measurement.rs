@@ -126,7 +126,7 @@ pub struct FastLoopMeasurementCounter {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct FastLoopPuaM13HandoffItem {
+pub struct FastLoopPerformanceHandoffItem {
     pub need: &'static str,
     pub reason: &'static str,
 }
@@ -137,7 +137,7 @@ pub struct FastLoopMeasurementReport {
     pub mode: FastLoopMeasurementMode,
     pub counters: Vec<FastLoopMeasurementCounter>,
     pub authoring_cache_status: FastLoopAuthoringCacheStatus,
-    pub pua_m13_handoff: Vec<FastLoopPuaM13HandoffItem>,
+    pub performance_handoff: Vec<FastLoopPerformanceHandoffItem>,
     pub trust_boundary: &'static str,
 }
 
@@ -317,7 +317,7 @@ impl FastLoopMeasurementRecorder {
             mode: self.mode,
             counters,
             authoring_cache_status: self.authoring_cache_status,
-            pua_m13_handoff: fast_loop_pua_m13_handoff_items(),
+            performance_handoff: fast_loop_performance_handoff_items(),
             trust_boundary: FAST_LOOP_MEASUREMENT_TRUST_BOUNDARY,
         })
     }
@@ -335,27 +335,27 @@ impl FastLoopMeasurementRecorder {
     }
 }
 
-pub fn fast_loop_pua_m13_handoff_items() -> Vec<FastLoopPuaM13HandoffItem> {
+pub fn fast_loop_performance_handoff_items() -> Vec<FastLoopPerformanceHandoffItem> {
     vec![
-        FastLoopPuaM13HandoffItem {
+        FastLoopPerformanceHandoffItem {
             need: "true_batching",
             reason: "share parsing, local-context projection, and validation work across same-snapshot candidates",
         },
-        FastLoopPuaM13HandoffItem {
+        FastLoopPerformanceHandoffItem {
             need: "replay_prefix_cache",
             reason: "reuse verified replay prefixes without treating cache hits as proof evidence",
         },
-        FastLoopPuaM13HandoffItem {
+        FastLoopPerformanceHandoffItem {
             need: "verification_cache",
             reason: "extend authoring-only source-free cache policy without changing verifier authority",
         },
-        FastLoopPuaM13HandoffItem {
+        FastLoopPerformanceHandoffItem {
             need: "sharding",
             reason: "measure stable partition keys and deterministic merge reporting for larger changed sets",
         },
-        FastLoopPuaM13HandoffItem {
+        FastLoopPerformanceHandoffItem {
             need: "performance_gates",
-            reason: "turn repeated timing runs into release-blocking KPI checks outside PUA-M07",
+            reason: "turn repeated timing runs into release-blocking KPI checks outside the fast authoring loop",
         },
     ]
 }
@@ -380,7 +380,7 @@ pub fn fast_loop_measurement_report_json(report: &FastLoopMeasurementReport) -> 
         .collect::<Vec<_>>()
         .join(",");
     let handoff = report
-        .pua_m13_handoff
+        .performance_handoff
         .iter()
         .map(|item| {
             format!(
@@ -392,7 +392,7 @@ pub fn fast_loop_measurement_report_json(report: &FastLoopMeasurementReport) -> 
         .collect::<Vec<_>>()
         .join(",");
     format!(
-        "{{\"schema\":\"{}\",\"trusted\":false,\"mode\":\"{}\",\"counters\":[{}],\"authoring_cache_status\":\"{}\",\"pua_m13_handoff\":[{}],\"trust_boundary\":\"{}\"}}",
+        "{{\"schema\":\"{}\",\"trusted\":false,\"mode\":\"{}\",\"counters\":[{}],\"authoring_cache_status\":\"{}\",\"performance_handoff\":[{}],\"trust_boundary\":\"{}\"}}",
         json_escape(report.schema),
         json_escape(report.mode.as_str()),
         counters,
@@ -482,11 +482,11 @@ mod tests {
             && counter.stage == Some(FastLoopCandidateStage::Retrieved)
             && counter.value == 2));
         assert!(report
-            .pua_m13_handoff
+            .performance_handoff
             .iter()
             .any(|item| item.need == "true_batching"));
         assert!(report
-            .pua_m13_handoff
+            .performance_handoff
             .iter()
             .any(|item| item.need == "performance_gates"));
 

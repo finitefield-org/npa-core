@@ -92,7 +92,7 @@ checksum = "6b947ae49db0d222b1dbc6b113ce7248a3fc3a6ca21b696717bfc000ba4484d8"
 
 [[package]]
 name = "npa-api"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "libc",
  "npa-cert",
@@ -106,16 +106,18 @@ dependencies = [
 
 [[package]]
 name = "npa-cert"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
+ "libc",
  "npa-kernel",
  "sha2",
 ]
 
 [[package]]
 name = "npa-checker-ref"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
+ "libc",
  "npa-cert",
  "npa-kernel",
  "sha2",
@@ -123,19 +125,21 @@ dependencies = [
 
 [[package]]
 name = "npa-cli"
-version = "0.2.0"
+version = "0.7.0"
 dependencies = [
  "libc",
  "npa-api",
  "npa-cert",
+ "npa-checker-ref",
  "npa-frontend",
  "npa-package",
+ "sha2",
  "toml_edit",
 ]
 
 [[package]]
 name = "npa-frontend"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "npa-cert",
  "npa-kernel",
@@ -148,7 +152,7 @@ version = "0.2.0"
 
 [[package]]
 name = "npa-package"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "npa-cert",
  "sha2",

@@ -3,14 +3,13 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use npa_cert::Name;
-use npa_cli::args::{
-    PackageCommand, PackageCommonOptions, PackageRefactorPlanOptions, PackageRefactorPlanScope,
-};
+use npa_cli::args::{PackageCommand, PackageRefactorPlanOptions, PackageRefactorPlanScope};
 use npa_cli::diagnostic::{
     CommandExitCode, CommandStatus, DiagnosticKind, DiagnosticSeverity,
     PACKAGE_COMMAND_RESULT_SCHEMA,
 };
 use npa_cli::package::run_package_command;
+use npa_cli::package_api::v1::common_options;
 use npa_cli::package_artifacts::{PACKAGE_LOCK_PATH, PACKAGE_THEOREM_INDEX_PATH};
 use npa_cli::package_refactor_plan::{
     build_refactor_plan_module_candidates, build_refactor_plan_module_graph,
@@ -695,7 +694,7 @@ fn package_refactor_plan_public_command_outputs_filtered_both_scope_candidates()
 
     let json = result.render_json();
     assert!(!json.contains(&package.path().display().to_string()));
-    assert!(json.contains(r#""schema":"npa.package.command_result.v0.1""#));
+    assert!(json.contains(r#""schema":"npa.package.command_result.v0.3""#));
     assert!(json.contains(r#""artifacts":[]}"#));
 }
 
@@ -748,10 +747,7 @@ fn options_with_scope_top(
     top: usize,
 ) -> PackageRefactorPlanOptions {
     PackageRefactorPlanOptions {
-        common: PackageCommonOptions {
-            root: root.to_path_buf(),
-            json: true,
-        },
+        common: common_options(root, true),
         scope,
         module: module.map(name),
         top,

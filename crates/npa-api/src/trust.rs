@@ -6383,7 +6383,7 @@ mod tests {
         refresh_invented_candidate_witness_hash(&mut witness);
         let mut request = InventedCandidateTypecheckRequest {
             request_hash: [0; 32],
-            candidate_id: "pua-m14-generated-reflexivity".to_owned(),
+            candidate_id: "library-growth-generated-reflexivity".to_owned(),
             source_module: "Proofs.Ai.ParentGoal".to_owned(),
             target_proof_corpus_module: "Proofs.Ai.LibraryGrowth".to_owned(),
             declaration_name: "generated_reflexivity_library_growth".to_owned(),
@@ -6419,7 +6419,7 @@ mod tests {
         refresh_invented_candidate_witness_hash(&mut witness);
         let mut request = InventedCandidateTypecheckRequest {
             request_hash: [0; 32],
-            candidate_id: "pua-m14-generated-local-lemma-identity".to_owned(),
+            candidate_id: "library-growth-generated-local-lemma-identity".to_owned(),
             source_module: "Proofs.Ai.ParentGoal".to_owned(),
             target_proof_corpus_module: "Proofs.Ai.SketchLifecycle".to_owned(),
             declaration_name: "generated_local_lemma_identity".to_owned(),

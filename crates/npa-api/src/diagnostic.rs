@@ -3381,13 +3381,6 @@ mod tests {
             MachineApiRequestErrorReason::UnknownField { field }
                 if field == "trusted_evidence_claim"
         ));
-
-        let schema = include_str!(
-            "../../../testdata/proof-using-agents/schemas/diagnostic_tree.schema.json"
-        );
-        assert!(schema.contains("trusted_evidence_claim"));
-        assert!(schema.contains("proof_acceptance_state"));
-        assert!(schema.contains("verified_artifact"));
     }
 
     #[test]

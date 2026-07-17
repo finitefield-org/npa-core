@@ -595,13 +595,6 @@ fn load_package_publish_inputs_impl(
     load_package_publish_inputs_from_snapshot_impl(loaded, timings)
 }
 
-#[cfg(test)]
-pub(crate) fn load_package_publish_inputs_from_snapshot(
-    loaded: LoadedPackageAuditSnapshot,
-) -> Result<LoadedPackagePublishInputs, CommandResult> {
-    load_package_publish_inputs_from_snapshot_impl(loaded, None)
-}
-
 fn load_package_publish_inputs_from_snapshot_impl(
     loaded: LoadedPackageAuditSnapshot,
     mut timings: Option<&mut PackageTimingCollector>,

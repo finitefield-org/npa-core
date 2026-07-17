@@ -1,0 +1,26 @@
+{
+  "schema": "npa.generated_artifact_release_manifest.v0.1",
+  "package": "npa-project-iut",
+  "package_root": "proofs",
+  "source_commit": "1111111111111111111111111111111111111111",
+  "tag": "v1.0.0",
+  "npa_core_ref": "2222222222222222222222222222222222222222",
+  "generated_at_utc": "2026-07-12T00:00:00Z",
+  "generator_commands": [
+    "cargo run --locked --offline --manifest-path npa-core/Cargo.toml -p npa-cli -- package lock write --root npa-project-iut/proofs --json"
+  ],
+  "check_commands": [
+    "cargo run --locked --offline --manifest-path npa-core/Cargo.toml -p npa-cli -- package check-generated --root npa-project-iut/proofs --json"
+  ],
+  "generated_files": [
+    {
+      "path": "proofs/generated/package-lock.json",
+      "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    }
+  ],
+  "omitted_files": [],
+  "archive": {
+    "path": "npa-project-iut-proofs-generated-v1.0.0.tar.gz",
+    "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  }
+}

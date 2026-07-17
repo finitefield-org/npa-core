@@ -1,18 +1,16 @@
 use std::path::PathBuf;
 use std::{fs, process::Command};
 
-use npa_cli::args::{PackageCommonOptions, PackageGatePlanOptions};
+use npa_cli::args::PackageGatePlanOptions;
 use npa_cli::diagnostic::{CommandExitCode, DiagnosticKind};
+use npa_cli::package_api::v1::common_options;
 use npa_cli::package_gate_plan::run_package_gate_plan;
 use npa_package::{package_gate_plan_from_paths, PackageGateImpactClass};
 
 #[test]
 fn package_gate_plan_cli_renders_empty_head_diff_with_base_count_and_trust_boundary() {
     let result = run_package_gate_plan(PackageGatePlanOptions {
-        common: PackageCommonOptions {
-            root: PathBuf::from("proofs"),
-            json: true,
-        },
+        common: common_options("proofs", true),
         base: "HEAD".to_owned(),
     });
 
@@ -49,10 +47,7 @@ fn package_gate_plan_cli_renders_empty_head_diff_with_base_count_and_trust_bound
 #[test]
 fn package_gate_plan_cli_reports_bad_base_without_running_gates() {
     let result = run_package_gate_plan(PackageGatePlanOptions {
-        common: PackageCommonOptions {
-            root: PathBuf::from("proofs"),
-            json: true,
-        },
+        common: common_options("proofs", true),
         base: "refs/heads/npa-package-gate-plan-missing-base".to_owned(),
     });
 
@@ -98,6 +93,7 @@ fn package_gate_plan_policy_covers_pas16_impact_classes() {
         "crates/npa-cli/src/package_gate_plan.rs",
         "proofs/generated/package-lock.json",
         "proofs/generated/theorem-index.json",
+        "proofs/generated/theorem-premise-report.json",
     ] {
         let plan = package_gate_plan_from_paths([path]);
         assert_eq!(

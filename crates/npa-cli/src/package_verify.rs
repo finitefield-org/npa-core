@@ -10,12 +10,22 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
+use std::io::Write;
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+use std::os::fd::FromRawFd;
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
+
 use npa_api::{
     format_hash_string, independent_checker_file_hash, independent_checker_machine_check_run,
     independent_checker_npa_checker_ext_launch_plan,
     independent_checker_resolve_checker_executable, materialize_package_phase8_requests,
     package_verification_memo_key_inputs, parse_hash_string,
-    parse_independent_checker_binary_registry, parse_independent_checker_runner_policy,
+    parse_independent_checker_axiom_policy_toml, parse_independent_checker_binary_registry,
+    parse_independent_checker_runner_policy,
     verify_package_fast_source_free_with_cache_aware_disk_memo_hits,
     verify_package_fast_source_free_with_local_audit_cache_hits,
     verify_package_fast_source_free_with_options,
@@ -52,10 +62,13 @@ use npa_package::{
 };
 
 use crate::args::{
-    PackageAuditCacheMode, PackageChecker, PackageExternalCheckerOptions, PackageVerifierMemoMode,
-    PackageVerifyCertsOptions,
+    validate_package_verify_certs_options, PackageAuditCacheMode, PackageChecker,
+    PackageExternalCheckerOptions, PackageLockInputMode, PackageVerifierMemoMode,
+    PackageVerifyCertsOptions, PackageVerifyOptionsValidationError,
 };
-use crate::diagnostic::{CommandArtifact, CommandDiagnostic, CommandResult, DiagnosticKind};
+use crate::diagnostic::{
+    CommandArtifact, CommandDiagnostic, CommandResult, DiagnosticKind, DiagnosticSeverity,
+};
 use crate::fs::{join_package_path, render_package_path, render_package_root};
 use crate::package::{load_package_root, LoadedPackageRoot};
 use crate::package_artifacts::LoadedPackageAuditSnapshot;
@@ -77,6 +90,88 @@ static NEXT_AUDIT_CACHE_WRITE_TEMP: AtomicUsize = AtomicUsize::new(0);
 struct CertificateArtifactBuffer {
     path: PackagePath,
     bytes: Vec<u8>,
+}
+
+struct PackageLockAcquisition {
+    lock: PackageLockManifest,
+    artifacts: Vec<CertificateArtifactBuffer>,
+    canonical_json: String,
+    canonical_hash: PackageHash,
+    mode: PackageLockInputMode,
+}
+
+impl PackageLockAcquisition {
+    fn new(
+        lock: PackageLockManifest,
+        artifacts: Vec<CertificateArtifactBuffer>,
+        canonical_json: String,
+        mode: PackageLockInputMode,
+    ) -> Self {
+        let canonical_hash = package_file_hash(canonical_json.as_bytes());
+        Self {
+            lock,
+            artifacts,
+            canonical_json,
+            canonical_hash,
+            mode,
+        }
+    }
+}
+
+fn with_package_lock_provenance(
+    mut result: CommandResult,
+    mode: PackageLockInputMode,
+    canonical_hash: PackageHash,
+) -> CommandResult {
+    debug_assert!(result.diagnostics.iter().all(|diagnostic| {
+        !matches!(
+            diagnostic.reason_code.as_str(),
+            "package_lock_checked" | "package_lock_reconstructed"
+        )
+    }));
+    let reason_code = match mode {
+        PackageLockInputMode::CheckedFile => "package_lock_checked",
+        PackageLockInputMode::ReconstructedInMemory => "package_lock_reconstructed",
+    };
+    // Lock provenance records input selection only; it is not checker or proof evidence.
+    let diagnostic = CommandDiagnostic::info(DiagnosticKind::PackageLock, reason_code)
+        .with_field("package_lock")
+        .with_actual_value(format!(
+            "mode={};hash={}",
+            mode.as_str(),
+            format_package_hash(&canonical_hash)
+        ));
+    let insert_at = result
+        .diagnostics
+        .iter()
+        .position(|diagnostic| diagnostic.reason_code == "package_verified")
+        .map(|index| index + 1)
+        .unwrap_or_else(|| {
+            result
+                .diagnostics
+                .iter()
+                .position(|diagnostic| diagnostic.severity != DiagnosticSeverity::Error)
+                .unwrap_or(result.diagnostics.len())
+        });
+    result.diagnostics.insert(insert_at, diagnostic);
+    result
+}
+
+fn finish_result_with_package_lock_provenance(
+    timings: PackageTimingCollector,
+    result: CommandResult,
+    acquired: &PackageLockAcquisition,
+) -> CommandResult {
+    timings.finish_result(with_package_lock_provenance(
+        result,
+        acquired.mode,
+        acquired.canonical_hash,
+    ))
+}
+
+struct VerifiedExternalChecker {
+    resolved: IndependentCheckerResolvedCheckerExecutable,
+    executable: fs::File,
 }
 
 #[derive(Clone, Debug)]
@@ -142,16 +237,24 @@ enum PackageAuditVerificationRunError {
 
 /// Run source-free package certificate verification.
 ///
-/// This command reads the package manifest, `generated/package-lock.json`, and
-/// local/external certificate files. It intentionally does not read source,
-/// replay, metadata, theorem-index, AI trace, network registry, or
-/// checker-result sidecars. External checker mode additionally reads the
-/// explicitly supplied runner policy, checker binary registry, checker binary,
-/// and axiom policy.
+/// This command reads the package manifest and local/external certificate
+/// files. Checked mode additionally reads `generated/package-lock.json`;
+/// reconstructed mode builds the same validated snapshot in memory without
+/// opening that path. It intentionally does not read source, replay, metadata,
+/// theorem-index, AI trace, network registry, or checker-result sidecars.
+/// External checker mode additionally reads the explicitly supplied runner
+/// policy, checker binary registry, checker binary, and axiom policy.
 pub fn run_package_verify_certs(options: PackageVerifyCertsOptions) -> CommandResult {
     let root_display = render_package_root(&options.common.root);
     let timing_mode = options.timings;
     let outer_timings = PackageTimingCollector::new(timing_mode);
+    if let Err(error) = validate_package_verify_certs_options(&options) {
+        return outer_timings.finish_result(CommandResult::failed(
+            COMMAND,
+            root_display,
+            vec![package_verify_validation_diagnostic(&options, error)],
+        ));
+    }
     let cache_cwd =
         if options.audit_cache.uses_local_store() || options.verifier_memo.uses_local_store() {
             match std::env::current_dir() {
@@ -198,15 +301,83 @@ pub fn run_package_verify_certs(options: PackageVerifyCertsOptions) -> CommandRe
     }
 }
 
+fn package_verify_validation_diagnostic(
+    options: &PackageVerifyCertsOptions,
+    error: PackageVerifyOptionsValidationError,
+) -> CommandDiagnostic {
+    let unsupported = |field: &'static str, actual_value: String| {
+        CommandDiagnostic::error(DiagnosticKind::Usage, "unsupported_flag")
+            .with_field(field)
+            .with_actual_value(actual_value)
+    };
+    match error {
+        PackageVerifyOptionsValidationError::JobsZero => {
+            CommandDiagnostic::error(DiagnosticKind::Usage, "invalid_flag_value")
+                .with_field("--jobs")
+                .with_actual_value(options.jobs.to_string())
+        }
+        PackageVerifyOptionsValidationError::ChangedWithExternalChecker => {
+            unsupported("--changed", options.checker.as_str().to_owned())
+        }
+        PackageVerifyOptionsValidationError::ChangedWithAuditCache => {
+            unsupported("--audit-cache", options.audit_cache.as_str().to_owned())
+        }
+        PackageVerifyOptionsValidationError::ChangedWithVerifierMemo => {
+            unsupported("--verifier-memo", options.verifier_memo.as_str().to_owned())
+        }
+        PackageVerifyOptionsValidationError::ExternalCheckerWithParallelJobs => {
+            unsupported("--jobs", options.jobs.to_string())
+        }
+        PackageVerifyOptionsValidationError::ExternalCheckerWithAuditCache => {
+            unsupported("--audit-cache", options.audit_cache.as_str().to_owned())
+        }
+        PackageVerifyOptionsValidationError::ExternalCheckerWithVerifierMemo => {
+            unsupported("--verifier-memo", options.verifier_memo.as_str().to_owned())
+        }
+        PackageVerifyOptionsValidationError::ExternalCheckerWithReconstructedLock => unsupported(
+            "--package-lock",
+            format!(
+                "{};checker={}",
+                options.package_lock_mode.as_str(),
+                options.checker.as_str()
+            ),
+        ),
+        PackageVerifyOptionsValidationError::AuditCacheWithParallelJobs => unsupported(
+            "--jobs",
+            format!(
+                "jobs={};audit_cache={}",
+                options.jobs,
+                options.audit_cache.as_str()
+            ),
+        ),
+        PackageVerifyOptionsValidationError::AuditCacheWithVerifierMemo => {
+            unsupported("--verifier-memo", options.verifier_memo.as_str().to_owned())
+        }
+        PackageVerifyOptionsValidationError::MissingExternalCheckerOptions => {
+            CommandDiagnostic::error(DiagnosticKind::Usage, "missing_external_checker_options")
+                .with_checker(EXTERNAL_CHECKER_LABEL)
+        }
+        PackageVerifyOptionsValidationError::UnexpectedExternalCheckerOptions => {
+            CommandDiagnostic::error(DiagnosticKind::Usage, "unsupported_flag")
+                .with_field("--runner-policy")
+        }
+    }
+}
+
 pub(crate) fn run_package_verify_certs_fast_with_snapshot(
     loaded: &LoadedPackageAuditSnapshot,
     include_memo_summary: bool,
 ) -> CommandResult {
-    command_result_from_report(
+    let result = command_result_from_report(
         loaded.root_display.clone(),
         &loaded.snapshot.package_lock_manifest,
         loaded.snapshot.fast_verification_report.clone(),
         include_memo_summary,
+    );
+    with_package_lock_provenance(
+        result,
+        PackageLockInputMode::CheckedFile,
+        package_file_hash(loaded.package_lock_json.as_bytes()),
     )
 }
 
@@ -227,58 +398,8 @@ fn run_package_verify_certs_on_stack(
         Err(result) => return timings.finish_result(result),
     };
 
-    if changed && checker == PackageChecker::External {
-        return timings.finish_result(CommandResult::failed(
-            COMMAND,
-            loaded.root_display,
-            vec![
-                CommandDiagnostic::error(DiagnosticKind::Usage, "unsupported_flag")
-                    .with_field("--changed")
-                    .with_actual_value(checker.as_str()),
-            ],
-        ));
-    }
-
-    if changed && audit_cache.uses_local_store() {
-        return timings.finish_result(CommandResult::failed(
-            COMMAND,
-            loaded.root_display,
-            vec![
-                CommandDiagnostic::error(DiagnosticKind::Usage, "unsupported_flag")
-                    .with_field("--audit-cache")
-                    .with_actual_value(audit_cache.as_str()),
-            ],
-        ));
-    }
-
-    if changed && verifier_memo.uses_local_store() {
-        return timings.finish_result(CommandResult::failed(
-            COMMAND,
-            loaded.root_display,
-            vec![
-                CommandDiagnostic::error(DiagnosticKind::Usage, "unsupported_flag")
-                    .with_field("--verifier-memo")
-                    .with_actual_value(verifier_memo.as_str()),
-            ],
-        ));
-    }
-
-    let (lock_source, checked_lock) =
-        match timings.time_phase(TIMING_LOAD_LOCK_MS, || read_package_lock(&loaded)) {
-            Ok(lock) => lock,
-            Err(diagnostic) => {
-                return timings.finish_result(CommandResult::failed(
-                    COMMAND,
-                    loaded.root_display,
-                    vec![*diagnostic],
-                ));
-            }
-        };
-
-    let artifacts = match timings.time_phase(TIMING_DECODE_CERTIFICATES_MS, || {
-        read_certificate_artifacts(&loaded)
-    }) {
-        Ok(artifacts) => artifacts,
+    let acquired = match acquire_package_lock(&loaded, options.package_lock_mode, &mut timings) {
+        Ok(acquired) => acquired,
         Err(diagnostic) => {
             return timings.finish_result(CommandResult::failed(
                 COMMAND,
@@ -287,46 +408,23 @@ fn run_package_verify_certs_on_stack(
             ));
         }
     };
-
-    let regenerated_lock_json = match timings.time_phase(TIMING_BUILD_GRAPH_MS, || {
-        regenerated_package_lock_json(&loaded, &artifacts)
-    }) {
-        Ok(json) => json,
-        Err(diagnostic) => {
-            return timings.finish_result(CommandResult::failed(
-                COMMAND,
-                loaded.root_display,
-                vec![*diagnostic],
-            ));
-        }
-    };
-
-    if lock_source != regenerated_lock_json {
-        return timings.finish_result(CommandResult::failed(
-            COMMAND,
-            loaded.root_display,
-            vec![
-                CommandDiagnostic::error(DiagnosticKind::HashMismatch, "package_lock_stale")
-                    .with_path(PACKAGE_LOCK_PATH)
-                    .with_hashes(
-                        format_package_hash(&package_file_hash(regenerated_lock_json.as_bytes())),
-                        format_package_hash(&package_file_hash(lock_source.as_bytes())),
-                    ),
-            ],
-        ));
-    }
+    debug_assert_eq!(acquired.mode, options.package_lock_mode);
+    debug_assert_eq!(
+        acquired.canonical_hash,
+        package_file_hash(acquired.canonical_json.as_bytes())
+    );
+    let lock = &acquired.lock;
+    let artifacts = &acquired.artifacts;
+    let lock_hash = acquired.canonical_hash;
 
     let selected_modules = if changed {
         match timings.time_phase(TIMING_SELECTION_MS, || {
-            changed_certificate_modules(&loaded, &checked_lock)
+            changed_certificate_modules(&loaded, lock)
         }) {
             Ok(modules) => Some(modules),
             Err(diagnostic) => {
-                return timings.finish_result(CommandResult::failed(
-                    COMMAND,
-                    loaded.root_display,
-                    vec![*diagnostic],
-                ));
+                let result = CommandResult::failed(COMMAND, loaded.root_display, vec![*diagnostic]);
+                return finish_result_with_package_lock_provenance(timings, result, &acquired);
             }
         }
     } else {
@@ -334,102 +432,34 @@ fn run_package_verify_certs_on_stack(
     };
 
     if checker == PackageChecker::External {
-        if jobs > 1 {
-            return timings.finish_result(CommandResult::failed(
-                COMMAND,
-                loaded.root_display,
-                vec![
-                    CommandDiagnostic::error(DiagnosticKind::Usage, "unsupported_flag")
-                        .with_field("--jobs")
-                        .with_actual_value(jobs.to_string()),
-                ],
-            ));
-        }
-        if audit_cache.uses_local_store() {
-            return timings.finish_result(CommandResult::failed(
-                COMMAND,
-                loaded.root_display,
-                vec![
-                    CommandDiagnostic::error(DiagnosticKind::Usage, "unsupported_flag")
-                        .with_field("--audit-cache")
-                        .with_actual_value(audit_cache.as_str()),
-                ],
-            ));
-        }
-        if verifier_memo.uses_local_store() {
-            return timings.finish_result(CommandResult::failed(
-                COMMAND,
-                loaded.root_display,
-                vec![
-                    CommandDiagnostic::error(DiagnosticKind::Usage, "unsupported_flag")
-                        .with_field("--verifier-memo")
-                        .with_actual_value(verifier_memo.as_str()),
-                ],
-            ));
-        }
-        let Some(external_options) = options.external.as_ref() else {
-            return timings.finish_result(CommandResult::failed(
-                COMMAND,
-                loaded.root_display,
-                vec![CommandDiagnostic::error(
-                    DiagnosticKind::Usage,
-                    "missing_external_checker_options",
-                )
-                .with_checker(EXTERNAL_CHECKER_LABEL)],
-            ));
-        };
+        let external_options = options
+            .external
+            .as_ref()
+            .expect("external checker options validated before package I/O");
         let result = timings.time_phase(TIMING_CHECKER_MS, || {
-            run_package_verify_external(&loaded, &checked_lock, &artifacts, external_options)
+            run_package_verify_external(&loaded, lock, artifacts, external_options)
         });
-        return timings.finish_result(result);
-    }
-
-    if audit_cache.uses_local_store() && jobs > 1 {
-        return timings.finish_result(CommandResult::failed(
-            COMMAND,
-            loaded.root_display,
-            vec![
-                CommandDiagnostic::error(DiagnosticKind::Usage, "unsupported_flag")
-                    .with_field("--jobs")
-                    .with_actual_value(format!("jobs={jobs};audit_cache={}", audit_cache.as_str())),
-            ],
-        ));
-    }
-
-    if audit_cache.uses_local_store() && verifier_memo.uses_local_store() {
-        return timings.finish_result(CommandResult::failed(
-            COMMAND,
-            loaded.root_display,
-            vec![
-                CommandDiagnostic::error(DiagnosticKind::Usage, "unsupported_flag")
-                    .with_field("--verifier-memo")
-                    .with_actual_value(verifier_memo.as_str()),
-            ],
-        ));
+        return finish_result_with_package_lock_provenance(timings, result, &acquired);
     }
 
     if audit_cache == PackageAuditCacheMode::ReadThrough {
         let cache_cwd = cache_cwd.expect("read-through cache cwd captured before worker thread");
-        let lock_hash = package_file_hash(lock_source.as_bytes());
         let run = match verify_package_with_read_through_cache(
             checker,
             &loaded,
             lock_hash,
-            &checked_lock,
-            &artifacts,
+            lock,
+            artifacts,
             &cache_cwd,
             &mut timings,
         ) {
             Ok(run) => run,
             Err(PackageAuditVerificationRunError::Diagnostic(diagnostic)) => {
-                return timings.finish_result(CommandResult::failed(
-                    COMMAND,
-                    loaded.root_display,
-                    vec![*diagnostic],
-                ));
+                let result = CommandResult::failed(COMMAND, loaded.root_display, vec![*diagnostic]);
+                return finish_result_with_package_lock_provenance(timings, result, &acquired);
             }
             Err(PackageAuditVerificationRunError::Verification(error)) => {
-                return timings.finish_result(CommandResult::failed(
+                let result = CommandResult::failed(
                     COMMAND,
                     loaded.root_display,
                     vec![verification_error_diagnostic(
@@ -438,35 +468,32 @@ fn run_package_verify_certs_on_stack(
                         checker_diagnostic_kind(checker),
                         checker_label(checker),
                     )],
-                ));
+                );
+                return finish_result_with_package_lock_provenance(timings, result, &acquired);
             }
         };
-        let result = command_result_from_audit_run(loaded.root_display, &checked_lock, run);
-        return timings.finish_result(result);
+        let result = command_result_from_audit_run(loaded.root_display, lock, run);
+        return finish_result_with_package_lock_provenance(timings, result, &acquired);
     }
 
     if audit_cache == PackageAuditCacheMode::LocalHit {
         let cache_cwd = cache_cwd.expect("local-hit cache cwd captured before worker thread");
-        let lock_hash = package_file_hash(lock_source.as_bytes());
         let mut run = match verify_package_with_local_hit_cache(
             checker,
             &loaded,
             lock_hash,
-            &checked_lock,
-            &artifacts,
+            lock,
+            artifacts,
             &cache_cwd,
             &mut timings,
         ) {
             Ok(run) => run,
             Err(PackageAuditVerificationRunError::Diagnostic(diagnostic)) => {
-                return timings.finish_result(CommandResult::failed(
-                    COMMAND,
-                    loaded.root_display,
-                    vec![*diagnostic],
-                ));
+                let result = CommandResult::failed(COMMAND, loaded.root_display, vec![*diagnostic]);
+                return finish_result_with_package_lock_provenance(timings, result, &acquired);
             }
             Err(PackageAuditVerificationRunError::Verification(error)) => {
-                return timings.finish_result(CommandResult::failed(
+                let result = CommandResult::failed(
                     COMMAND,
                     loaded.root_display,
                     vec![verification_error_diagnostic(
@@ -475,7 +502,8 @@ fn run_package_verify_certs_on_stack(
                         checker_diagnostic_kind(checker),
                         checker_label(checker),
                     )],
-                ));
+                );
+                return finish_result_with_package_lock_provenance(timings, result, &acquired);
             }
         };
         if run.cache.cached > 0 {
@@ -485,8 +513,8 @@ fn run_package_verify_certs_on_stack(
                 options.common.json,
             ));
         }
-        let result = command_result_from_audit_run(loaded.root_display, &checked_lock, run);
-        return timings.finish_result(result);
+        let result = command_result_from_audit_run(loaded.root_display, lock, run);
+        return finish_result_with_package_lock_provenance(timings, result, &acquired);
     }
 
     if verifier_memo == PackageVerifierMemoMode::ReadThrough {
@@ -496,21 +524,18 @@ fn run_package_verify_certs_on_stack(
             checker,
             jobs,
             &loaded,
-            &checked_lock,
-            &artifacts,
+            lock,
+            artifacts,
             &cache_cwd,
             &mut timings,
         ) {
             Ok(run) => run,
             Err(PackageAuditVerificationRunError::Diagnostic(diagnostic)) => {
-                return timings.finish_result(CommandResult::failed(
-                    COMMAND,
-                    loaded.root_display,
-                    vec![*diagnostic],
-                ));
+                let result = CommandResult::failed(COMMAND, loaded.root_display, vec![*diagnostic]);
+                return finish_result_with_package_lock_provenance(timings, result, &acquired);
             }
             Err(PackageAuditVerificationRunError::Verification(error)) => {
-                return timings.finish_result(CommandResult::failed(
+                let result = CommandResult::failed(
                     COMMAND,
                     loaded.root_display,
                     vec![verification_error_diagnostic(
@@ -519,16 +544,13 @@ fn run_package_verify_certs_on_stack(
                         checker_diagnostic_kind(checker),
                         checker_label(checker),
                     )],
-                ));
+                );
+                return finish_result_with_package_lock_provenance(timings, result, &acquired);
             }
         };
-        let result = command_result_from_disk_memo_run(
-            loaded.root_display,
-            &checked_lock,
-            run,
-            timings.is_enabled(),
-        );
-        return timings.finish_result(result);
+        let result =
+            command_result_from_disk_memo_run(loaded.root_display, lock, run, timings.is_enabled());
+        return finish_result_with_package_lock_provenance(timings, result, &acquired);
     }
 
     if verifier_memo == PackageVerifierMemoMode::Disk {
@@ -536,21 +558,18 @@ fn run_package_verify_certs_on_stack(
         let run = match verify_package_with_disk_memo(
             checker,
             &loaded,
-            &checked_lock,
-            &artifacts,
+            lock,
+            artifacts,
             &cache_cwd,
             &mut timings,
         ) {
             Ok(run) => run,
             Err(PackageAuditVerificationRunError::Diagnostic(diagnostic)) => {
-                return timings.finish_result(CommandResult::failed(
-                    COMMAND,
-                    loaded.root_display,
-                    vec![*diagnostic],
-                ));
+                let result = CommandResult::failed(COMMAND, loaded.root_display, vec![*diagnostic]);
+                return finish_result_with_package_lock_provenance(timings, result, &acquired);
             }
             Err(PackageAuditVerificationRunError::Verification(error)) => {
-                return timings.finish_result(CommandResult::failed(
+                let result = CommandResult::failed(
                     COMMAND,
                     loaded.root_display,
                     vec![verification_error_diagnostic(
@@ -559,16 +578,13 @@ fn run_package_verify_certs_on_stack(
                         checker_diagnostic_kind(checker),
                         checker_label(checker),
                     )],
-                ));
+                );
+                return finish_result_with_package_lock_provenance(timings, result, &acquired);
             }
         };
-        let result = command_result_from_disk_memo_run(
-            loaded.root_display,
-            &checked_lock,
-            run,
-            timings.is_enabled(),
-        );
-        return timings.finish_result(result);
+        let result =
+            command_result_from_disk_memo_run(loaded.root_display, lock, run, timings.is_enabled());
+        return finish_result_with_package_lock_provenance(timings, result, &acquired);
     }
 
     let collect_decode_cache_counters = timings.is_enabled();
@@ -579,17 +595,11 @@ fn run_package_verify_certs_on_stack(
             memoization: PackageVerificationMemoMode::ProcessLocal,
             collect_decode_cache_counters,
         };
-        verify_package(
-            checker,
-            &loaded,
-            &checked_lock,
-            &artifacts,
-            execution_options,
-        )
+        verify_package(checker, &loaded, lock, artifacts, execution_options)
     }) {
         Ok(report) => report,
         Err(error) => {
-            return timings.finish_result(CommandResult::failed(
+            let result = CommandResult::failed(
                 COMMAND,
                 loaded.root_display,
                 vec![verification_error_diagnostic(
@@ -598,17 +608,14 @@ fn run_package_verify_certs_on_stack(
                     checker_diagnostic_kind(checker),
                     checker_label(checker),
                 )],
-            ));
+            );
+            return finish_result_with_package_lock_provenance(timings, result, &acquired);
         }
     };
 
-    let result = command_result_from_report(
-        loaded.root_display,
-        &checked_lock,
-        report,
-        timings.is_enabled(),
-    );
-    timings.finish_result(result)
+    let result =
+        command_result_from_report(loaded.root_display, lock, report, timings.is_enabled());
+    finish_result_with_package_lock_provenance(timings, result, &acquired)
 }
 
 fn run_package_verify_external(
@@ -758,6 +765,22 @@ fn validate_external_axiom_policy(
                 ),
         ));
     }
+    let source = std::str::from_utf8(&bytes).map_err(|_| {
+        Box::new(
+            CommandDiagnostic::error(DiagnosticKind::PackagePolicy, "axiom_policy_invalid")
+                .with_path(render_package_path(&path))
+                .with_field("axiom_policy")
+                .with_expected_value("valid_utf8")
+                .with_actual_value("invalid_utf8")
+                .with_checker(EXTERNAL_CHECKER_LABEL),
+        )
+    })?;
+    parse_independent_checker_axiom_policy_toml(source).map_err(|error| {
+        Box::new(
+            policy_validation_diagnostic("axiom_policy_invalid", error)
+                .with_path(render_package_path(&path)),
+        )
+    })?;
     Ok(())
 }
 
@@ -779,7 +802,7 @@ fn resolve_external_checker_binary(
     loaded: &LoadedPackageRoot,
     registry: &IndependentCheckerBinaryRegistry,
     selected: &IndependentCheckerAllowlistEntry,
-) -> Result<IndependentCheckerResolvedCheckerExecutable, Box<CommandDiagnostic>> {
+) -> Result<VerifiedExternalChecker, Box<CommandDiagnostic>> {
     let Some(entry) = registry
         .entries
         .iter()
@@ -798,14 +821,71 @@ fn resolve_external_checker_binary(
     let binary_path = PackagePath::new(entry.path.clone());
     let binary_bytes = read_package_bytes(loaded, &binary_path, "checker_binary_file_unreadable")?;
     let actual_binary_hash = independent_checker_file_hash(&binary_bytes);
-    independent_checker_resolve_checker_executable(registry, selected, actual_binary_hash).map_err(
-        |failure| {
-            Box::new(policy_failure_diagnostic(
-                failure,
-                Some(render_package_path(&binary_path)),
-            ))
-        },
-    )
+    let resolved =
+        independent_checker_resolve_checker_executable(registry, selected, actual_binary_hash)
+            .map_err(|failure| {
+                Box::new(policy_failure_diagnostic(
+                    failure,
+                    Some(render_package_path(&binary_path)),
+                ))
+            })?;
+    let executable = stage_external_checker(&binary_bytes)
+        .map_err(|error| Box::new(checker_binary_stage_diagnostic(&binary_path, &error)))?;
+    Ok(VerifiedExternalChecker {
+        resolved,
+        executable,
+    })
+}
+
+fn checker_binary_stage_diagnostic(
+    binary_path: &PackagePath,
+    error: &io::Error,
+) -> CommandDiagnostic {
+    let diagnostic = if error.kind() == io::ErrorKind::Unsupported {
+        CommandDiagnostic::error(
+            DiagnosticKind::ArtifactIo,
+            "checker_binary_immutable_snapshot_unsupported",
+        )
+        .with_field("checker.binary.snapshot")
+        .with_expected_value("kernel_sealed_immutable_descriptor")
+        .with_actual_value(std::env::consts::OS)
+    } else {
+        CommandDiagnostic::error(DiagnosticKind::ArtifactIo, "checker_binary_stage_failed")
+    };
+    diagnostic
+        .with_path(render_package_path(binary_path))
+        .with_checker(EXTERNAL_CHECKER_LABEL)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn stage_external_checker(bytes: &[u8]) -> io::Result<fs::File> {
+    let descriptor = unsafe {
+        libc::memfd_create(
+            c"npa-checker-ext".as_ptr(),
+            libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
+        )
+    };
+    if descriptor < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut executable = unsafe { fs::File::from_raw_fd(descriptor) };
+    executable.write_all(bytes)?;
+    if unsafe { libc::fchmod(descriptor, 0o500) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let seals = libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE;
+    if unsafe { libc::fcntl(descriptor, libc::F_ADD_SEALS, seals) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(executable)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn stage_external_checker(_bytes: &[u8]) -> io::Result<fs::File> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "external checker execution requires a kernel-sealed immutable descriptor",
+    ))
 }
 
 fn materialize_external_import_dir(
@@ -867,19 +947,21 @@ fn run_external_machine_check(
     loaded: &LoadedPackageRoot,
     lock: &PackageLockManifest,
     policy: &IndependentCheckerRunnerPolicy,
-    resolved: &IndependentCheckerResolvedCheckerExecutable,
+    checker: &VerifiedExternalChecker,
     module: &PackagePhase8RequestMaterialization,
 ) -> IndependentCheckerMachineCheckResult {
     let import_dir = external_import_dir_path(lock, &module.module);
     let launch = independent_checker_npa_checker_ext_launch_plan(
-        resolved,
+        &checker.resolved,
         &module.request,
         import_dir.clone(),
+        policy.axiom_policy.hash,
     );
-    let executable = loaded.root.join(&resolved.path);
+    let executable = loaded.root.join(&checker.resolved.path);
     let observation = external_run_observation(
         &loaded.root,
         &executable,
+        &checker.executable,
         &launch.argv,
         &launch.environment,
         module,
@@ -917,8 +999,8 @@ fn run_external_machine_check(
                 runner: external_runner_identity(),
                 checker: IndependentCheckerMachineCheckChecker {
                     profile: EXTERNAL_CHECKER_PROFILE.to_owned(),
-                    binary_id: Some(resolved.binary_id.clone()),
-                    binary_hash: Some(resolved.binary_hash),
+                    binary_id: Some(checker.resolved.binary_id.clone()),
+                    binary_hash: Some(checker.resolved.binary_hash),
                     id: None,
                     build_hash: None,
                     version: None,
@@ -943,13 +1025,36 @@ fn run_external_machine_check(
 
 fn external_run_observation(
     root: &Path,
-    executable: &Path,
+    _executable: &Path,
+    staged_executable: &fs::File,
     argv: &[String],
     environment: &[(String, String)],
     module: &PackagePhase8RequestMaterialization,
 ) -> IndependentCheckerRunObservation {
     let started = Instant::now();
-    let mut command = Command::new(executable);
+    #[cfg(unix)]
+    let mut command = {
+        let descriptor = staged_executable.as_raw_fd();
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let descriptor_path = format!("/proc/self/fd/{descriptor}");
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        let descriptor_path = format!("/dev/fd/{descriptor}");
+        let mut command = Command::new(descriptor_path);
+        unsafe {
+            command.pre_exec(move || {
+                let flags = libc::fcntl(descriptor, libc::F_GETFD);
+                if flags < 0
+                    || libc::fcntl(descriptor, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0
+                {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        command
+    };
+    #[cfg(not(unix))]
+    let mut command = Command::new(_executable);
     command
         .args(argv.iter().skip(1))
         .current_dir(root)
@@ -1425,6 +1530,70 @@ fn external_machine_result_path(lock: &PackageLockManifest, module: &Name) -> St
     )
 }
 
+fn acquire_package_lock(
+    loaded: &LoadedPackageRoot,
+    mode: PackageLockInputMode,
+    timings: &mut PackageTimingCollector,
+) -> Result<PackageLockAcquisition, Box<CommandDiagnostic>> {
+    match mode {
+        PackageLockInputMode::CheckedFile => acquire_checked_package_lock(loaded, timings),
+        PackageLockInputMode::ReconstructedInMemory => {
+            acquire_reconstructed_package_lock(loaded, timings)
+        }
+    }
+}
+
+fn acquire_checked_package_lock(
+    loaded: &LoadedPackageRoot,
+    timings: &mut PackageTimingCollector,
+) -> Result<PackageLockAcquisition, Box<CommandDiagnostic>> {
+    let (checked_source, checked_lock) =
+        timings.time_phase(TIMING_LOAD_LOCK_MS, || read_package_lock(loaded))?;
+    let artifacts = timings.time_phase(TIMING_DECODE_CERTIFICATES_MS, || {
+        read_certificate_artifacts(loaded)
+    })?;
+    let (_, reconstructed_json) = timings.time_phase(TIMING_BUILD_GRAPH_MS, || {
+        build_canonical_package_lock(loaded, &artifacts)
+    })?;
+
+    if checked_source != reconstructed_json {
+        return Err(Box::new(
+            CommandDiagnostic::error(DiagnosticKind::HashMismatch, "package_lock_stale")
+                .with_path(PACKAGE_LOCK_PATH)
+                .with_hashes(
+                    format_package_hash(&package_file_hash(reconstructed_json.as_bytes())),
+                    format_package_hash(&package_file_hash(checked_source.as_bytes())),
+                ),
+        ));
+    }
+
+    Ok(PackageLockAcquisition::new(
+        checked_lock,
+        artifacts,
+        checked_source,
+        PackageLockInputMode::CheckedFile,
+    ))
+}
+
+fn acquire_reconstructed_package_lock(
+    loaded: &LoadedPackageRoot,
+    timings: &mut PackageTimingCollector,
+) -> Result<PackageLockAcquisition, Box<CommandDiagnostic>> {
+    let artifacts = timings.time_phase(TIMING_DECODE_CERTIFICATES_MS, || {
+        read_certificate_artifacts(loaded)
+    })?;
+    let (lock, canonical_json) = timings.time_phase(TIMING_BUILD_GRAPH_MS, || {
+        build_canonical_package_lock(loaded, &artifacts)
+    })?;
+
+    Ok(PackageLockAcquisition::new(
+        lock,
+        artifacts,
+        canonical_json,
+        PackageLockInputMode::ReconstructedInMemory,
+    ))
+}
+
 fn read_package_lock(
     loaded: &LoadedPackageRoot,
 ) -> Result<(String, PackageLockManifest), Box<CommandDiagnostic>> {
@@ -1508,10 +1677,10 @@ fn read_certificate_bytes(
     })
 }
 
-fn regenerated_package_lock_json(
+fn build_canonical_package_lock(
     loaded: &LoadedPackageRoot,
     artifacts: &[CertificateArtifactBuffer],
-) -> Result<String, Box<CommandDiagnostic>> {
+) -> Result<(PackageLockManifest, String), Box<CommandDiagnostic>> {
     let lock = build_package_lock_from_artifacts(
         &loaded.validated,
         loaded.manifest_path.clone(),
@@ -1522,8 +1691,10 @@ fn regenerated_package_lock_json(
         }),
     )
     .map_err(|error| Box::new(CommandDiagnostic::from_package_lock_error(&error)))?;
-    lock.canonical_json()
-        .map_err(|error| Box::new(CommandDiagnostic::from_package_lock_error(&error)))
+    let canonical_json = lock
+        .canonical_json()
+        .map_err(|error| Box::new(CommandDiagnostic::from_package_lock_error(&error)))?;
+    Ok((lock, canonical_json))
 }
 
 fn verify_package(
@@ -1576,43 +1747,52 @@ fn changed_certificate_modules(
         .collect())
 }
 
-fn changed_package_paths(
+pub(crate) fn changed_package_paths(
     package_root: &Path,
     certificate_paths: &BTreeSet<String>,
 ) -> Result<Vec<String>, String> {
-    let worktree_root = git_worktree_root(package_root)?;
-    let package_prefix = package_status_prefix(package_root, &worktree_root)?;
-    let output = Command::new("git")
-        .args([
-            "status",
-            "--porcelain=v1",
-            "-z",
-            "--untracked-files=all",
-            "--",
-        ])
-        .arg(".")
-        .current_dir(package_root)
-        .output()
-        .map_err(|error| format!("failed to run git status: {error}"))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-        if stderr.is_empty() {
-            return Err(format!("git status exited with status {}", output.status));
-        }
-        return Err(stderr);
+    if certificate_paths.is_empty() {
+        return Ok(Vec::new());
     }
-    Ok(changed_paths_from_git_status_z(
-        &output.stdout,
-        &worktree_root,
-        &package_prefix,
-        certificate_paths,
-    )?
-    .into_iter()
-    .collect())
+    let worktree_root = git_worktree_root(package_root)?;
+    let has_head = git_worktree_has_head(&worktree_root)?;
+    let package_prefix = package_status_prefix(package_root, &worktree_root)?;
+    if !has_head {
+        return Ok(certificate_paths.iter().cloned().collect());
+    }
+    let certificate_by_worktree_path = certificate_paths
+        .iter()
+        .map(|certificate_path| {
+            let worktree_path = if package_prefix.is_empty() {
+                certificate_path.clone()
+            } else {
+                format!("{package_prefix}/{certificate_path}")
+            };
+            (worktree_path, certificate_path.clone())
+        })
+        .collect::<BTreeMap<_, _>>();
+    let pathspecs = certificate_by_worktree_path
+        .keys()
+        .map(|path| format!(":(top,literal){path}"))
+        .collect::<Vec<_>>();
+    let mut changed = BTreeSet::new();
+    // `git status` refreshes the complete index before applying pathspecs and
+    // can consequently open unrelated tracked source or sidecar files. Query
+    // validated certificate path batches directly so changed-only selection
+    // stays within its documented Git certificate-path boundary. Batching also
+    // avoids one Git process per certificate without risking an oversized
+    // command line for large package closures.
+    for pathspec_batch in pathspecs.chunks(128) {
+        let tracked = git_changed_tracked_paths(&worktree_root, pathspec_batch)?;
+        record_changed_certificate_paths(&tracked, &certificate_by_worktree_path, &mut changed)?;
+        let untracked = git_untracked_paths(&worktree_root, pathspec_batch)?;
+        record_changed_certificate_paths(&untracked, &certificate_by_worktree_path, &mut changed)?;
+    }
+    Ok(changed.into_iter().collect())
 }
 
 fn git_worktree_root(package_root: &Path) -> Result<PathBuf, String> {
-    let output = Command::new("git")
+    let output = Command::new("/usr/bin/git")
         .args(["rev-parse", "--show-toplevel"])
         .current_dir(package_root)
         .output()
@@ -1630,6 +1810,29 @@ fn git_worktree_root(package_root: &Path) -> Result<PathBuf, String> {
     Ok(PathBuf::from(
         String::from_utf8_lossy(&output.stdout).trim(),
     ))
+}
+
+fn git_worktree_has_head(worktree_root: &Path) -> Result<bool, String> {
+    let output = Command::new("/usr/bin/git")
+        .args(["rev-parse", "--verify", "--quiet", "HEAD"])
+        .current_dir(worktree_root)
+        .output()
+        .map_err(|error| format!("failed to run git rev-parse: {error}"))?;
+    match output.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        Some(_) | None => {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+            if stderr.is_empty() {
+                Err(format!(
+                    "git rev-parse exited with status {}",
+                    output.status
+                ))
+            } else {
+                Err(stderr)
+            }
+        }
+    }
 }
 
 fn package_status_prefix(package_root: &Path, worktree_root: &Path) -> Result<String, String> {
@@ -1659,89 +1862,72 @@ fn path_to_git_status_path(path: &Path) -> String {
         .join("/")
 }
 
-fn package_relative_changed_path(path: &str, package_prefix: &str) -> Option<String> {
-    let path = path.trim_start_matches("./");
-    if path.is_empty() {
-        return None;
-    }
-    if package_prefix.is_empty() {
-        return Some(path.to_owned());
-    }
-    if let Some(path) = path
-        .strip_prefix(package_prefix)
-        .and_then(|path| path.strip_prefix('/'))
-    {
-        return Some(path.to_owned());
-    }
-    Some(path.to_owned())
-}
-
-fn changed_paths_from_git_status_z(
-    stdout: &[u8],
+fn git_changed_tracked_paths(
     worktree_root: &Path,
-    package_prefix: &str,
-    certificate_paths: &BTreeSet<String>,
-) -> Result<Vec<String>, String> {
-    let mut fields = stdout
-        .split(|byte| *byte == 0)
-        .filter(|field| !field.is_empty());
-    let mut paths = Vec::new();
-    while let Some(entry) = fields.next() {
-        if entry.len() < 4 {
-            continue;
-        }
-        let status = &entry[..2];
-        let path = &entry[3..];
-        if !path.is_empty() {
-            let path = git_status_path_from_bytes(path);
-            let Some(package_path) = package_relative_changed_path(&path, package_prefix) else {
-                if status.iter().any(|byte| matches!(byte, b'R' | b'C')) {
-                    let _ = fields.next();
-                }
-                continue;
-            };
-            if certificate_paths.contains(&package_path)
-                && git_status_selects_worktree_path(status, worktree_root, &path)?
-            {
-                paths.push(package_path);
-            }
-        }
-        if status.iter().any(|byte| matches!(byte, b'R' | b'C')) {
-            let _ = fields.next();
-        }
-    }
-    Ok(paths)
-}
-
-fn git_status_selects_worktree_path(
-    status: &[u8],
-    worktree_root: &Path,
-    path: &str,
-) -> Result<bool, String> {
-    if status == b"??" {
-        return Ok(true);
-    }
-    git_worktree_path_differs_from_head(worktree_root, path)
-}
-
-fn git_worktree_path_differs_from_head(worktree_root: &Path, path: &str) -> Result<bool, String> {
-    let status = Command::new("git")
-        .args(["diff", "--quiet", "HEAD", "--"])
-        .arg(format!(":(top,literal){path}"))
+    pathspecs: &[String],
+) -> Result<Vec<u8>, String> {
+    let output = Command::new("/usr/bin/git")
+        .args([
+            "diff",
+            "--name-only",
+            "-z",
+            "--no-ext-diff",
+            "--no-renames",
+            "HEAD",
+            "--",
+        ])
+        .args(pathspecs)
         .current_dir(worktree_root)
-        .status()
+        .output()
         .map_err(|error| format!("failed to run git diff: {error}"))?;
-    match status.code() {
-        Some(0) => Ok(false),
-        Some(1) => Ok(true),
-        Some(_) | None => Err(format!("git diff exited with status {status}")),
+    if output.status.success() {
+        Ok(output.stdout)
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        if stderr.is_empty() {
+            Err(format!("git diff exited with status {}", output.status))
+        } else {
+            Err(stderr)
+        }
     }
 }
 
-fn git_status_path_from_bytes(path: &[u8]) -> String {
-    String::from_utf8_lossy(path)
-        .trim_start_matches("./")
-        .to_owned()
+fn git_untracked_paths(worktree_root: &Path, pathspecs: &[String]) -> Result<Vec<u8>, String> {
+    let output = Command::new("/usr/bin/git")
+        .args(["ls-files", "--others", "--exclude-standard", "-z", "--"])
+        .args(pathspecs)
+        .current_dir(worktree_root)
+        .output()
+        .map_err(|error| format!("failed to run git ls-files: {error}"))?;
+    if output.status.success() {
+        Ok(output.stdout)
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        if stderr.is_empty() {
+            Err(format!("git ls-files exited with status {}", output.status))
+        } else {
+            Err(stderr)
+        }
+    }
+}
+
+fn record_changed_certificate_paths(
+    stdout: &[u8],
+    certificate_by_worktree_path: &BTreeMap<String, String>,
+    changed: &mut BTreeSet<String>,
+) -> Result<(), String> {
+    for path in stdout
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+    {
+        let path = std::str::from_utf8(path)
+            .map_err(|_| "git returned a non-UTF-8 certificate path".to_owned())?
+            .trim_start_matches("./");
+        if let Some(certificate_path) = certificate_by_worktree_path.get(path) {
+            changed.insert(certificate_path.clone());
+        }
+    }
+    Ok(())
 }
 
 fn verify_package_with_read_through_cache(
@@ -3021,19 +3207,53 @@ fn lock_entries_by_module(lock: &PackageLockManifest) -> BTreeMap<Name, &Package
 mod tests {
     use super::*;
 
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
-    fn changed_paths_from_git_status_z_filters_non_certificates_before_diff() {
-        let mut certificate_paths = BTreeSet::new();
-        certificate_paths.insert("Proofs/Ai/Basic/certificate.npcert".to_owned());
+    fn staged_external_checker_is_an_immutable_byte_snapshot() {
+        use std::os::unix::fs::FileExt;
 
-        let changed_paths = changed_paths_from_git_status_z(
-            b" M packages/proofs/Proofs/Ai/Basic/source.npa\0",
-            Path::new("/path/that/does/not/exist"),
-            "packages/proofs",
-            &certificate_paths,
-        )
-        .unwrap();
+        let expected = b"#!/bin/sh\nexit 0\n";
+        let staged = stage_external_checker(expected).unwrap();
+        let mut actual = vec![0; expected.len()];
+        staged.read_exact_at(&mut actual, 0).unwrap();
+        assert_eq!(actual, expected);
 
-        assert!(changed_paths.is_empty());
+        let replacement = b'X';
+        let written =
+            unsafe { libc::pwrite(staged.as_raw_fd(), (&replacement as *const u8).cast(), 1, 0) };
+        assert_eq!(written, -1);
+        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EPERM));
+    }
+
+    #[test]
+    fn unsupported_immutable_snapshot_has_a_stable_diagnostic() {
+        let path = PackagePath::new("tools/checkers/npa-checker-ext".to_owned());
+        let error = io::Error::new(io::ErrorKind::Unsupported, "test unsupported platform");
+
+        let diagnostic = checker_binary_stage_diagnostic(&path, &error);
+
+        assert_eq!(diagnostic.kind, DiagnosticKind::ArtifactIo);
+        assert_eq!(
+            diagnostic.reason_code,
+            "checker_binary_immutable_snapshot_unsupported"
+        );
+        assert_eq!(diagnostic.field.as_deref(), Some("checker.binary.snapshot"));
+        assert_eq!(
+            diagnostic.expected_value.as_deref(),
+            Some("kernel_sealed_immutable_descriptor")
+        );
+        assert_eq!(
+            diagnostic.actual_value.as_deref(),
+            Some(std::env::consts::OS)
+        );
+        assert_eq!(diagnostic.checker.as_deref(), Some(EXTERNAL_CHECKER_LABEL));
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    #[test]
+    fn external_checker_staging_fails_closed_without_kernel_sealing() {
+        let error = stage_external_checker(b"#!/bin/sh\nexit 0\n").unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
     }
 }

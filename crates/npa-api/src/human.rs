@@ -6517,10 +6517,8 @@ fn human_tactic_goal_payload(
     goal: &npa_tactic::MachineGoal,
     span: npa_frontend::Span,
 ) -> npa_frontend::HumanDiagnosticPayload {
-    npa_frontend::HumanDiagnosticPayload {
-        hole_goals: vec![human_tactic_goal_display(goal, span)],
-        ..npa_frontend::HumanDiagnosticPayload::default()
-    }
+    npa_frontend::HumanDiagnosticPayload::default()
+        .with_hole_goals(vec![human_tactic_goal_display(goal, span)])
 }
 
 fn human_tactic_goal_display(
@@ -8159,14 +8157,16 @@ fn human_apply_global_head(
             span,
             format!("ambiguous apply head {}", name.as_dotted()),
         )
-        .with_payload(npa_frontend::HumanDiagnosticPayload {
-            candidates: candidates
-                .into_iter()
-                .map(|candidate| candidate.sort_key())
-                .collect(),
-            hole_goals: vec![human_tactic_goal_display(goal, span)],
-            ..npa_frontend::HumanDiagnosticPayload::default()
-        })
+        .with_payload(
+            npa_frontend::HumanDiagnosticPayload::default()
+                .with_candidates(
+                    candidates
+                        .into_iter()
+                        .map(|candidate| candidate.sort_key())
+                        .collect(),
+                )
+                .with_hole_goals(vec![human_tactic_goal_display(goal, span)]),
+        )
         .with_phase(npa_frontend::HumanDiagnosticPhase::TacticValidation)
         .into());
     }
@@ -8860,10 +8860,7 @@ fn human_script_unresolved_goal_diagnostic(
         format!("Human tactic script finished with {open_goal_count} open goal(s)"),
     )
     .with_phase(npa_frontend::HumanDiagnosticPhase::TacticUnresolvedGoal)
-    .with_payload(npa_frontend::HumanDiagnosticPayload {
-        hole_goals,
-        ..npa_frontend::HumanDiagnosticPayload::default()
-    })
+    .with_payload(npa_frontend::HumanDiagnosticPayload::default().with_hole_goals(hole_goals))
 }
 
 fn frontend_import_from_tactic_ref(
@@ -9648,6 +9645,46 @@ mod tests {
             Some(HumanInductiveCheckError::Kernel(
                 npa_kernel::Error::NonPositiveOccurrence { .. }
             ))
+        ));
+    }
+
+    #[test]
+    fn human_inductive_check_reports_constructor_universe_bound_without_positivity_blame() {
+        let type0 = npa_kernel::Level::succ(npa_kernel::Level::zero());
+        let data = npa_kernel::InductiveDecl::new(
+            "Audit.Code",
+            vec![],
+            vec![],
+            vec![],
+            type0.clone(),
+            vec![npa_kernel::ConstructorDecl::new(
+                "Audit.Code.mk",
+                npa_kernel::Expr::pi(
+                    "A",
+                    npa_kernel::Expr::sort(type0.clone()),
+                    npa_kernel::Expr::konst("Audit.Code", vec![]),
+                ),
+            )],
+            None,
+        );
+
+        let response = check_human_inductive(HumanInductiveCheckRequest { declaration: &data });
+
+        assert_eq!(response.status, HumanInductiveCheckStatus::Rejected);
+        assert_eq!(
+            response.positivity,
+            HumanInductivePositivityStatus::NotReached
+        );
+        assert!(matches!(
+            response.error,
+            Some(HumanInductiveCheckError::Kernel(
+                npa_kernel::Error::ConstructorUniverseBoundViolation {
+                    inductive,
+                    constructor,
+                    field_index: 0,
+                    ..
+                }
+            )) if inductive == "Audit.Code" && constructor == "Audit.Code.mk"
         ));
     }
 
@@ -16140,6 +16177,10 @@ axiom Eq.trans {A : Type} {x : A} {z : A} (h1 : Eq.{1} x z) (h2 : Eq.{1} x z) : 
             ],
             None,
         )
+        .with_universe_constraints(vec![npa_kernel::UniverseConstraint::le(
+            npa_kernel::type0(),
+            u,
+        )])
     }
 
     fn negative_indexed_inductive() -> npa_kernel::InductiveDecl {

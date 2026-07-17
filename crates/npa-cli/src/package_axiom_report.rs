@@ -44,6 +44,7 @@ fn run_package_axiom_report_check(
         PackageGeneratedArtifactReadMode {
             axiom_report: true,
             theorem_index: false,
+            theorem_premise_report: false,
         },
         PackageArtifactReferenceSummaryMode::Omit,
         timings,

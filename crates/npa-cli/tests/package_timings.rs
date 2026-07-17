@@ -1,10 +1,10 @@
 use std::path::{Path, PathBuf};
 
 use npa_cli::args::{
-    PackageAuditCacheMode, PackageAxiomReportOptions, PackageChecker, PackageCommonOptions,
-    PackageIndexOptions, PackageTimingMode, PackageVerifierMemoMode, PackageVerifyCertsOptions,
+    PackageAxiomReportOptions, PackageChecker, PackageIndexOptions, PackageTimingMode,
 };
 use npa_cli::diagnostic::{CommandExitCode, PACKAGE_TIMINGS_SCHEMA};
+use npa_cli::package_api::v1::{common_options, verify_certs_full};
 use npa_cli::package_axiom_report::run_package_axiom_report;
 use npa_cli::package_index::run_package_index;
 use npa_cli::package_verify::run_package_verify_certs;
@@ -81,10 +81,7 @@ fn package_timings_verify_certs_detailed_json_has_stable_phase_fields() {
 
 fn run_axiom_report(timings: PackageTimingMode) -> npa_cli::diagnostic::CommandResult {
     run_package_axiom_report(PackageAxiomReportOptions {
-        common: PackageCommonOptions {
-            root: fixture_root(),
-            json: true,
-        },
+        common: common_options(fixture_root(), true),
         check: true,
         timings,
     })
@@ -92,29 +89,17 @@ fn run_axiom_report(timings: PackageTimingMode) -> npa_cli::diagnostic::CommandR
 
 fn run_index(timings: PackageTimingMode) -> npa_cli::diagnostic::CommandResult {
     run_package_index(PackageIndexOptions {
-        common: PackageCommonOptions {
-            root: fixture_root(),
-            json: true,
-        },
+        common: common_options(fixture_root(), true),
         check: true,
         timings,
     })
 }
 
 fn run_verify_certs(timings: PackageTimingMode) -> npa_cli::diagnostic::CommandResult {
-    run_package_verify_certs(PackageVerifyCertsOptions {
-        common: PackageCommonOptions {
-            root: fixture_root(),
-            json: true,
-        },
-        checker: PackageChecker::Fast,
-        changed: false,
-        audit_cache: PackageAuditCacheMode::Off,
-        verifier_memo: PackageVerifierMemoMode::Off,
-        jobs: 1,
-        external: None,
-        timings,
-    })
+    run_package_verify_certs(
+        verify_certs_full(common_options(fixture_root(), true), PackageChecker::Fast)
+            .with_timings(timings),
+    )
 }
 
 fn assert_timing_header(json: &str, mode: &str) {

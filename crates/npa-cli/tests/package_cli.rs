@@ -119,6 +119,44 @@ fn package_cli_smoke_examples_cover_help_json_args_and_check_mode() {
 }
 
 #[test]
+fn package_cli_rejects_root_qualified_export_outputs_with_stable_json() {
+    let package = TestPackage::new("root-qualified-export-output");
+    let marker = package.path().file_name().unwrap().to_string_lossy();
+    let out = format!("npa-project-example/{marker}/generated/output.json");
+
+    let summary = Command::new(env!("CARGO_BIN_EXE_npa"))
+        .args(["package", "export-summary", "--root"])
+        .arg(package.path())
+        .args(["--out", &out, "--json"])
+        .output()
+        .unwrap();
+    assert_root_qualified_output_failure(summary, &package, "package export-summary", &out);
+
+    let candidate = Command::new(env!("CARGO_BIN_EXE_npa"))
+        .args(["package", "export-candidate-metadata", "--root"])
+        .arg(package.path())
+        .args([
+            "--module",
+            "Proofs.Example",
+            "--declaration",
+            "theorem_name",
+            "--out",
+            &out,
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_root_qualified_output_failure(
+        candidate,
+        &package,
+        "package export-candidate-metadata",
+        &out,
+    );
+
+    assert!(!package.path().join("npa-project-example").exists());
+}
+
+#[test]
 fn package_cli_full_corpus_examples_pass_on_proof_corpus() {
     let examples = [
         Example {
@@ -795,7 +833,7 @@ fn package_publish_plan_check_write_and_registry_mismatch_diagnostics() {
     )));
     assert!(stdout.contains("\"status\":\"passed\""));
     assert!(stdout.contains("\"artifacts\":[{\"kind\":\"package_publish_plan\""));
-    assert!(stdout.contains("\"schema\":\"npa.package.command_result.v0.1\""));
+    assert!(stdout.contains("\"schema\":\"npa.package.command_result.v0.3\""));
     assert_host_path_free(&stdout, &package);
     assert_eq!(package_file_hashes(package.path()), before_success_check);
 
@@ -1604,6 +1642,28 @@ fn assert_usage_failure(output: Output, command: &str, reason: &str) {
     assert_json_envelope(&stdout, command, "failed");
     assert!(stdout.contains("\"kind\":\"Usage\""));
     assert!(stdout.contains(&format!("\"reason_code\":\"{reason}\"")));
+}
+
+fn assert_root_qualified_output_failure(
+    output: Output,
+    package: &TestPackage,
+    command: &str,
+    out: &str,
+) {
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stderr.is_empty());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert_json_envelope(&stdout, command, "failed");
+    assert!(stdout.contains("\"root\":\"<absolute-root>\""));
+    assert!(stdout.contains("\"kind\":\"Usage\""));
+    assert!(stdout.contains("\"reason_code\":\"package_output_path_repeats_root\""));
+    assert!(stdout.contains(&format!("\"path\":\"{out}\"")));
+    assert!(stdout.contains("\"field\":\"--out\""));
+    assert!(stdout.contains(
+        "\"expected_value\":\"path relative to --root without the package-root directory\""
+    ));
+    assert!(stdout.contains("\"actual_value\":\"root-qualified path\""));
+    assert_host_path_free(&stdout, package);
 }
 
 fn assert_json_envelope(stdout: &str, command: &str, status: &str) {

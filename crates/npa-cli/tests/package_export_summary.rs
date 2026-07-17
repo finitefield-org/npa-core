@@ -3,9 +3,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use npa_cli::args::{PackageCommonOptions, PackageExportSummaryOptions, PackageTimingMode};
+use npa_cli::args::{PackageExportSummaryOptions, PackageTimingMode};
 use npa_cli::diagnostic::{CommandExitCode, DiagnosticKind, PACKAGE_COMMAND_RESULT_SCHEMA};
 use npa_cli::package::PACKAGE_MANIFEST_PATH;
+use npa_cli::package_api::v1::common_options;
 use npa_cli::package_artifacts::PACKAGE_LOCK_PATH;
 use npa_cli::package_export_summary::run_package_export_summary;
 use npa_package::{
@@ -168,6 +169,35 @@ fn package_export_summary_custom_out_is_package_relative() {
 }
 
 #[test]
+fn package_export_summary_rejects_root_qualified_outputs_in_write_and_check_modes() {
+    let package = source_free_fixture("root-qualified");
+    let marker = package.path().file_name().unwrap().to_string_lossy();
+    let outputs = [
+        PathBuf::from(format!("{marker}/generated/custom-export-summary.json")),
+        PathBuf::from(format!(
+            "npa-project-example/{marker}/generated/custom-export-summary.json"
+        )),
+    ];
+
+    for out in outputs {
+        let write_result = run_write(&package, Some(&out));
+        assert_repeated_root_failure(&write_result, &out);
+        assert!(!package.path().join(&out).exists());
+
+        let check_result = run_check(&package, Some(&out));
+        assert_repeated_root_failure(&check_result, &out);
+        assert!(!package.path().join(&out).exists());
+
+        for result in [write_result, check_result] {
+            assert_eq!(result.root, "<absolute-root>");
+            assert!(!result
+                .render_json()
+                .contains(&package.path().to_string_lossy().to_string()));
+        }
+    }
+}
+
+#[test]
 fn package_export_summary_proof_corpus_check_mode_succeeds_with_checked_in_artifact() {
     let root = repo_root().join("testdata/package/proofs");
     let summary_path = root.join(PACKAGE_VERIFIED_EXPORT_SUMMARY_PATH);
@@ -176,10 +206,7 @@ fn package_export_summary_proof_corpus_check_mode_succeeds_with_checked_in_artif
     let root_for_run = root.clone();
     let result = run_with_proof_corpus_stack(move || {
         run_package_export_summary(PackageExportSummaryOptions {
-            common: PackageCommonOptions {
-                root: root_for_run,
-                json: true,
-            },
+            common: common_options(root_for_run, true),
             out: None,
             check: true,
             timings: PackageTimingMode::Off,
@@ -218,10 +245,7 @@ fn run_export_summary(
     out: Option<&Path>,
 ) -> npa_cli::diagnostic::CommandResult {
     run_package_export_summary(PackageExportSummaryOptions {
-        common: PackageCommonOptions {
-            root: package.path().to_path_buf(),
-            json: true,
-        },
+        common: common_options(package.path(), true),
         out: out.map(Path::to_path_buf),
         check,
         timings: PackageTimingMode::Off,
@@ -236,6 +260,25 @@ fn assert_failure(result: &npa_cli::diagnostic::CommandResult, reason: &str) {
         DiagnosticKind::GeneratedArtifact
     );
     assert_eq!(result.diagnostics[0].reason_code, reason);
+}
+
+fn assert_repeated_root_failure(result: &npa_cli::diagnostic::CommandResult, out: &Path) {
+    assert_eq!(result.exit_code(), CommandExitCode::UsageOrInternal);
+    assert_eq!(result.diagnostics.len(), 1);
+    let diagnostic = &result.diagnostics[0];
+    assert_eq!(diagnostic.kind, DiagnosticKind::Usage);
+    assert_eq!(diagnostic.reason_code, "package_output_path_repeats_root");
+    assert_eq!(diagnostic.path.as_deref(), out.to_str());
+    assert_eq!(diagnostic.field.as_deref(), Some("--out"));
+    assert_eq!(
+        diagnostic.expected_value.as_deref(),
+        Some("path relative to --root without the package-root directory")
+    );
+    assert_eq!(
+        diagnostic.actual_value.as_deref(),
+        Some("root-qualified path")
+    );
+    assert!(result.artifacts.is_empty());
 }
 
 fn source_free_fixture(label: &str) -> TestPackage {

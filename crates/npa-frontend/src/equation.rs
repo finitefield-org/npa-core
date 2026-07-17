@@ -7490,7 +7490,7 @@ def partial (n : Nat) : Nat where
     }
 
     #[test]
-    fn pua_m03_negative_coverage_fixtures_are_structured_and_deterministic() {
+    fn negative_coverage_fixtures_are_structured_and_deterministic() {
         let non_exhaustive = || {
             coverage(
                 "\
@@ -8082,7 +8082,7 @@ def xor (left : Bit) (right : Bit) : Bit where
     }
 
     #[test]
-    fn pua_m03_negative_budget_fixtures_are_deterministic_and_rollback_safe() {
+    fn negative_budget_fixtures_are_deterministic_and_rollback_safe() {
         let matrix_source = "\
 inductive Nat : Type where
 | zero : Nat
@@ -9212,7 +9212,7 @@ def pred (n : Nat) : Nat where
     }
 
     #[test]
-    fn pua_m03_negative_lowering_fixtures_are_deterministic_and_artifact_free() {
+    fn negative_lowering_fixtures_are_deterministic_and_artifact_free() {
         let missing_recursor = || {
             let source = "\
 inductive Nat : Type where
@@ -9681,7 +9681,7 @@ termination_by n";
     }
 
     #[test]
-    fn pua_m03_negative_recursion_fixtures_are_structured_and_deterministic() {
+    fn negative_recursion_fixtures_are_structured_and_deterministic() {
         let same_argument = || {
             recursion(
                 "\

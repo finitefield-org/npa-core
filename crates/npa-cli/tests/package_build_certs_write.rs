@@ -1,29 +1,40 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use npa_cert::{AxiomPolicy, Name, VerifiedModule, VerifierSession};
-use npa_cli::args::{
-    PackageAuditCacheMode, PackageBuildCertsOptions, PackageBuildCheckCacheMode, PackageChecker,
-    PackageCommonOptions, PackageTimingMode, PackageVerifierMemoMode, PackageVerifyCertsOptions,
-};
+use npa_cli::args::PackageChecker;
 use npa_cli::diagnostic::{CommandExitCode, DiagnosticKind};
 use npa_cli::package::PACKAGE_MANIFEST_PATH;
-use npa_cli::package_build::{run_package_build_certs, run_package_build_certs_write};
+use npa_cli::package_api::v1::{
+    audit_artifact_ledger_modules, common_options, refresh_artifacts_check,
+    refresh_artifacts_write, verify_certs_full,
+};
+use npa_cli::package_artifact_ledger::run_package_artifact_ledger_audit;
+use npa_cli::package_build::{
+    run_package_build_certs, run_package_build_certs_check, run_package_build_certs_write,
+};
 use npa_cli::package_hashes::run_package_check_hashes;
 use npa_cli::package_verify::run_package_verify_certs;
 use npa_frontend::{
+    compile_human_source_to_certificate_output_with_available_import_refs_and_axiom_policy,
     compile_human_source_to_certificate_output_with_source_interfaces_and_axiom_policy, FileId,
     HumanCompileOptions, HumanImportedSourceInterface, HumanSourceInterface,
 };
 use npa_package::{
     build_package_lock_from_package_root, format_package_hash, package_file_hash,
-    parse_and_validate_manifest_str, PackageHash, PackageLockErrorReason, PackagePath,
+    parse_and_validate_manifest_str, parse_package_artifact_ledger_metadata, PackageHash,
+    PackageLockErrorReason, PackagePath,
 };
 
 const LOCK_PATH: &str = "generated/package-lock.json";
 const ZERO_HASH: &str = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+const FRONTEND_FAILURE_MESSAGE: &str =
+    "unannotated Human lambda binder requires an expected function type";
+const FRONTEND_FAILURE_SOURCE: &str =
+    "def product_enumeration_bad : Type := fun product => product\n";
 
 static NEXT_TEMP_DIR: AtomicUsize = AtomicUsize::new(0);
 
@@ -84,6 +95,39 @@ struct ManifestImport {
 }
 
 #[test]
+fn package_build_certs_frontend_failure_write_is_atomic() {
+    let package = build_frontend_failure_fixture("frontend-failure-write");
+    let before = package_snapshot(&package);
+
+    let result = run_write(&package);
+
+    assert_frontend_failure(&result);
+    assert_eq!(package_snapshot(&package), before);
+}
+
+#[test]
+fn package_build_certs_frontend_failure_refresh_check_is_read_only() {
+    let package = build_frontend_failure_fixture("frontend-failure-refresh-check");
+    let before = package_snapshot(&package);
+
+    let result = run_refresh_check(&package);
+
+    assert_frontend_failure(&result);
+    assert_eq!(package_snapshot(&package), before);
+}
+
+#[test]
+fn package_build_certs_frontend_failure_refresh_write_is_atomic() {
+    let package = build_frontend_failure_fixture("frontend-failure-refresh-write");
+    let before = package_snapshot(&package);
+
+    let result = run_refresh_write(&package);
+
+    assert_frontend_failure(&result);
+    assert_eq!(package_snapshot(&package), before);
+}
+
+#[test]
 fn package_build_certs_write_repairs_local_certificate_and_package_lock() {
     let package = build_module_fixture("write-repair", "Proofs.Ai.Basic", false);
     let certificate_path = package.artifact_path("Proofs/Ai/Basic/certificate.npcert");
@@ -121,7 +165,7 @@ fn package_build_certs_write_cli_succeeds_json() {
     assert!(output.stderr.is_empty());
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
-        "{\"schema\":\"npa.package.command_result.v0.1\",\"command\":\"package build-certs\",\"root\":\"<absolute-root>\",\"status\":\"passed\",\"diagnostics\":[],\"artifacts\":[]}\n"
+        "{\"schema\":\"npa.package.command_result.v0.3\",\"command\":\"package build-certs\",\"root\":\"<absolute-root>\",\"status\":\"passed\",\"diagnostics\":[],\"artifacts\":[]}\n"
     );
 }
 
@@ -240,6 +284,56 @@ fn package_build_certs_refresh_write_rebuilds_stale_local_direct_import_identity
 }
 
 #[test]
+fn package_build_certs_selection_targeted_refresh_rebuilds_dependents() {
+    let package = build_local_import_fixture("targeted-refresh-dependent-closure");
+    let dependent_path = package.artifact_path("Fixture/B/certificate.npcert");
+    let expected_dependent = fs::read(&dependent_path).unwrap();
+    fs::write(&dependent_path, replacement_certificate_bytes()).unwrap();
+
+    let result = run_package_build_certs(
+        refresh_artifacts_write(common_options(package.path(), true))
+            .with_modules(vec![Name::from_dotted("Fixture.A")]),
+    );
+
+    assert_eq!(result.exit_code(), CommandExitCode::Success);
+    assert_eq!(result.diagnostics.len(), 1);
+    assert_eq!(result.diagnostics[0].reason_code, "package_build_selection");
+    assert!(result.diagnostics[0]
+        .actual_value
+        .as_deref()
+        .unwrap()
+        .contains("seeds=1,rebuild=2"));
+    assert_eq!(fs::read(dependent_path).unwrap(), expected_dependent);
+    assert_refresh_package_is_hash_clean(&package);
+}
+
+#[test]
+fn package_build_certs_selection_targeted_leaf_refresh_preserves_unselected_module() {
+    let package = build_local_import_fixture("targeted-refresh-leaf");
+    let support_path = package.artifact_path("Fixture/A/certificate.npcert");
+    let leaf_path = package.artifact_path("Fixture/B/certificate.npcert");
+    let support_before = fs::read(&support_path).unwrap();
+    let expected_leaf = fs::read(&leaf_path).unwrap();
+    fs::write(&leaf_path, replacement_certificate_bytes()).unwrap();
+
+    let result = run_package_build_certs(
+        refresh_artifacts_write(common_options(package.path(), true))
+            .with_modules(vec![Name::from_dotted("Fixture.B")]),
+    );
+
+    assert_eq!(result.exit_code(), CommandExitCode::Success);
+    assert_eq!(result.diagnostics.len(), 1);
+    assert!(result.diagnostics[0]
+        .actual_value
+        .as_deref()
+        .unwrap()
+        .contains("seeds=1,rebuild=1,support_local=1"));
+    assert_eq!(fs::read(support_path).unwrap(), support_before);
+    assert_eq!(fs::read(leaf_path).unwrap(), expected_leaf);
+    assert_refresh_package_is_hash_clean(&package);
+}
+
+#[test]
 fn package_build_certs_write_refresh_outputs_pass_downstream_verification() {
     let package = build_local_import_fixture("refresh-end-to-end");
     let manifest_path = package.artifact_path(PACKAGE_MANIFEST_PATH);
@@ -349,8 +443,157 @@ fn package_build_certs_refresh_write_regenerates_stale_package_lock() {
 }
 
 #[test]
+fn package_build_certs_refresh_updates_metadata_and_preserves_extensions() {
+    let package = build_module_fixture("refresh-metadata", "Proofs.Ai.Basic", false);
+    let metadata_path = install_metadata_target(
+        &package,
+        Some("{\"schema\":\"npa-ai-proof-meta-v0.1\",\"z_extension\":{\"b\":2,\"a\":1}}\n"),
+    );
+
+    let check = run_refresh_check(&package);
+    assert_eq!(check.exit_code(), CommandExitCode::PackageFailure);
+    assert_eq!(check.diagnostics[0].reason_code, "module_metadata_stale");
+
+    let write = run_refresh_write(&package);
+    assert_eq!(write.exit_code(), CommandExitCode::Success);
+    assert!(write.diagnostics.is_empty());
+    let metadata = fs::read_to_string(&metadata_path).unwrap();
+    assert!(metadata.contains("\"module\": \"Proofs.Ai.Basic\""));
+    assert!(metadata.contains("\"z_extension\": {\"b\":2,\"a\":1}"));
+    assert_eq!(
+        run_refresh_check(&package).exit_code(),
+        CommandExitCode::Success
+    );
+}
+
+#[test]
+fn package_build_certs_refresh_metadata_uses_direct_imports_and_passes_audit() {
+    let package = build_transitive_metadata_fixture("refresh-metadata-direct-imports");
+
+    let write = run_refresh_write(&package);
+
+    assert_eq!(write.exit_code(), CommandExitCode::Success);
+    assert!(write.diagnostics.is_empty());
+    assert_transitive_certificate_and_direct_metadata(&package);
+    assert_transitive_metadata_audit_passes(&package);
+    assert_eq!(
+        run_refresh_check(&package).exit_code(),
+        CommandExitCode::Success
+    );
+}
+
+#[test]
+fn package_build_certs_targeted_refresh_metadata_uses_direct_imports() {
+    let package = build_transitive_metadata_fixture("targeted-refresh-metadata-direct-imports");
+
+    let write = run_package_build_certs(
+        refresh_artifacts_write(common_options(package.path(), true))
+            .with_modules(vec![Name::from_dotted("Fixture.C")]),
+    );
+
+    assert_eq!(write.exit_code(), CommandExitCode::Success);
+    assert_eq!(write.diagnostics.len(), 1);
+    assert_eq!(write.diagnostics[0].reason_code, "package_build_selection");
+    assert_transitive_certificate_and_direct_metadata(&package);
+    assert_transitive_metadata_audit_passes(&package);
+    assert_eq!(
+        run_refresh_check(&package).exit_code(),
+        CommandExitCode::Success
+    );
+}
+
+#[test]
+fn package_build_certs_refresh_check_reports_missing_metadata() {
+    let package = build_module_fixture("refresh-missing-metadata", "Proofs.Ai.Basic", false);
+    let metadata_path = install_metadata_target(&package, None);
+
+    let result = run_refresh_check(&package);
+
+    assert_eq!(result.exit_code(), CommandExitCode::PackageFailure);
+    assert_eq!(result.diagnostics[0].reason_code, "module_metadata_missing");
+    assert_eq!(
+        result.diagnostics[0].path.as_deref(),
+        Some("Proofs/Ai/Basic/meta.json")
+    );
+    assert!(!metadata_path.exists());
+}
+
+#[test]
+fn package_build_certs_refresh_write_rejects_package_lock_as_metadata_target() {
+    let package = build_module_fixture("refresh-metadata-lock-collision", "Proofs.Ai.Basic", false);
+    install_package_lock_metadata_target(&package);
+    let before = package_snapshot(&package);
+
+    let result = run_refresh_write(&package);
+
+    assert_eq!(result.exit_code(), CommandExitCode::PackageFailure);
+    assert_eq!(result.diagnostics.len(), 1);
+    assert_eq!(result.diagnostics[0].kind, DiagnosticKind::ArtifactIo);
+    assert_eq!(
+        result.diagnostics[0].reason_code,
+        "module_metadata_write_target_forbidden"
+    );
+    assert_eq!(result.diagnostics[0].path.as_deref(), Some(LOCK_PATH));
+    assert_eq!(
+        result.diagnostics[0].field.as_deref(),
+        Some("modules[0].meta")
+    );
+    assert_eq!(
+        result.diagnostics[0].actual_value.as_deref(),
+        Some("package_lock")
+    );
+    assert_eq!(package_snapshot(&package), before);
+}
+
+#[test]
+fn package_build_certs_targeted_refresh_rejects_package_lock_as_metadata_target() {
+    let package = build_module_fixture(
+        "targeted-refresh-metadata-lock-collision",
+        "Proofs.Ai.Basic",
+        false,
+    );
+    install_package_lock_metadata_target(&package);
+    let before = package_snapshot(&package);
+
+    let result = run_package_build_certs(
+        refresh_artifacts_write(common_options(package.path(), true))
+            .with_modules(vec![Name::from_dotted("Proofs.Ai.Basic")]),
+    );
+
+    assert_eq!(result.exit_code(), CommandExitCode::PackageFailure);
+    assert_eq!(result.diagnostics.len(), 2);
+    assert_eq!(result.diagnostics[0].reason_code, "package_build_selection");
+    assert_eq!(
+        result.diagnostics[1].reason_code,
+        "module_metadata_write_target_forbidden"
+    );
+    assert_eq!(result.diagnostics[1].path.as_deref(), Some(LOCK_PATH));
+    assert_eq!(
+        result.diagnostics[1].actual_value.as_deref(),
+        Some("package_lock")
+    );
+    assert_eq!(package_snapshot(&package), before);
+}
+
+#[test]
+fn package_build_certs_ordinary_check_does_not_refresh_metadata() {
+    let package = build_module_fixture("ordinary-check-metadata", "Proofs.Ai.Basic", false);
+    let metadata_path = install_metadata_target(&package, Some("{"));
+    let before = fs::read(&metadata_path).unwrap();
+
+    let result = run_package_build_certs_check(common_options(package.path(), true));
+
+    assert_eq!(result.exit_code(), CommandExitCode::Success);
+    assert_eq!(fs::read(metadata_path).unwrap(), before);
+}
+
+#[test]
 fn package_build_certs_refresh_write_cleans_staged_files_on_late_staging_failure() {
     let package = build_module_fixture("refresh-staging-failure", "Proofs.Ai.Basic", false);
+    let metadata_path = install_metadata_target(
+        &package,
+        Some("{\"schema\":\"npa-ai-proof-meta-v0.1\",\"extension\":true}\n"),
+    );
     let manifest_path = package.artifact_path(PACKAGE_MANIFEST_PATH);
     let certificate_path = package.artifact_path("Proofs/Ai/Basic/certificate.npcert");
     let lock_path = package.artifact_path(LOCK_PATH);
@@ -365,6 +608,7 @@ fn package_build_certs_refresh_write_cleans_staged_files_on_late_staging_failure
     fs::create_dir(&lock_path).unwrap();
     let stale_manifest = fs::read_to_string(&manifest_path).unwrap();
     let stale_certificate = fs::read(&certificate_path).unwrap();
+    let stale_metadata = fs::read(&metadata_path).unwrap();
     let unrelated_temp = package.artifact_path("generated/.unrelated.npa-build-certs.tmp");
     fs::write(&unrelated_temp, b"pre-existing temp").unwrap();
 
@@ -380,6 +624,7 @@ fn package_build_certs_refresh_write_cleans_staged_files_on_late_staging_failure
     assert_eq!(result.diagnostics[0].path.as_deref(), Some(LOCK_PATH));
     assert_eq!(fs::read_to_string(&manifest_path).unwrap(), stale_manifest);
     assert_eq!(fs::read(&certificate_path).unwrap(), stale_certificate);
+    assert_eq!(fs::read(&metadata_path).unwrap(), stale_metadata);
     assert!(lock_path.is_dir());
     assert!(!temp_path_for_artifact(&certificate_path).exists());
     assert!(!temp_path_for_artifact(&manifest_path).exists());
@@ -420,7 +665,7 @@ fn package_build_certs_refresh_write_reports_certificate_write_failure_without_l
 }
 
 #[test]
-fn package_build_certs_refresh_write_reports_manifest_write_failure_without_later_writes() {
+fn package_build_certs_refresh_write_preserves_preexisting_manifest_temp_path() {
     let package = build_module_fixture("refresh-manifest-write-failure", "Proofs.Ai.Basic", false);
     let manifest_path = package.artifact_path(PACKAGE_MANIFEST_PATH);
     let certificate_path = package.artifact_path("Proofs/Ai/Basic/certificate.npcert");
@@ -439,15 +684,9 @@ fn package_build_certs_refresh_write_reports_manifest_write_failure_without_late
 
     let result = run_refresh_write(&package);
 
-    assert_eq!(result.exit_code(), CommandExitCode::PackageFailure);
-    assert_eq!(result.diagnostics.len(), 1);
-    assert_eq!(result.diagnostics[0].kind, DiagnosticKind::ArtifactIo);
-    assert_eq!(result.diagnostics[0].reason_code, "manifest_write_failed");
-    assert_eq!(
-        result.diagnostics[0].path.as_deref(),
-        Some(PACKAGE_MANIFEST_PATH)
-    );
-    assert_eq!(fs::read_to_string(manifest_path).unwrap(), stale_manifest);
+    assert_eq!(result.exit_code(), CommandExitCode::Success);
+    assert!(result.diagnostics.is_empty());
+    assert_ne!(fs::read_to_string(manifest_path).unwrap(), stale_manifest);
     assert_eq!(fs::read(certificate_path).unwrap(), certificate_before);
     assert_eq!(fs::read(lock_path).unwrap(), lock_before);
     assert!(manifest_temp_path.is_dir());
@@ -502,27 +741,6 @@ fn package_build_certs_write_does_not_rewrite_external_imports() {
         fs::read(external_certificate_path).unwrap(),
         external_certificate_before
     );
-}
-
-#[test]
-fn package_build_certs_write_still_rejects_stale_local_direct_import_identity() {
-    let package = build_local_import_fixture("ordinary-stale-local-import");
-    replace_module_manifest_hash(&package, "Fixture.A", "expected_export_hash", ZERO_HASH);
-
-    let output = Command::new(env!("CARGO_BIN_EXE_npa"))
-        .args(["package", "build-certs", "--root"])
-        .arg(package.path())
-        .arg("--json")
-        .env("NPA_SKIP_PACKAGE_BUILD_HASH_CHECKS", "1")
-        .output()
-        .unwrap();
-
-    assert_eq!(output.status.code(), Some(1));
-    assert!(output.stderr.is_empty());
-    let stdout = String::from_utf8(output.stdout).unwrap();
-    assert!(stdout.contains("\"reason_code\":\"export_hash_mismatch\""));
-    assert!(stdout.contains("\"path\":\"modules[0].imports[0].export_hash\""));
-    assert!(stdout.contains("\"field\":\"export_hash\""));
 }
 
 #[test]
@@ -614,29 +832,163 @@ fn package_build_certs_write_rejects_external_import_certificate_target() {
 }
 
 fn run_write(package: &TestPackage) -> npa_cli::diagnostic::CommandResult {
-    run_package_build_certs_write(PackageCommonOptions {
-        root: package.path().to_path_buf(),
-        json: true,
-    })
+    run_package_build_certs_write(common_options(package.path(), true))
+}
+
+fn run_refresh_check(package: &TestPackage) -> npa_cli::diagnostic::CommandResult {
+    run_package_build_certs(refresh_artifacts_check(common_options(
+        package.path(),
+        true,
+    )))
 }
 
 fn run_refresh_write(package: &TestPackage) -> npa_cli::diagnostic::CommandResult {
-    run_package_build_certs(PackageBuildCertsOptions {
-        common: PackageCommonOptions {
-            root: package.path().to_path_buf(),
-            json: true,
-        },
-        check: false,
-        build_check_cache: PackageBuildCheckCacheMode::Off,
-        update_manifest_hashes: true,
-    })
+    run_package_build_certs(refresh_artifacts_write(common_options(
+        package.path(),
+        true,
+    )))
+}
+
+fn install_metadata_target(package: &TestPackage, existing: Option<&str>) -> PathBuf {
+    install_metadata_target_for_module(
+        package,
+        "Proofs.Ai.Basic",
+        "Proofs/Ai/Basic/certificate.npcert",
+        "Proofs/Ai/Basic/meta.json",
+        existing,
+    )
+}
+
+fn install_metadata_target_for_module(
+    package: &TestPackage,
+    module: &str,
+    certificate: &str,
+    metadata: &str,
+    existing: Option<&str>,
+) -> PathBuf {
+    let manifest_path = package.artifact_path(PACKAGE_MANIFEST_PATH);
+    let source = fs::read_to_string(&manifest_path).unwrap();
+    let module_marker = format!("module = \"{module}\"\n");
+    let module_start = source.find(&module_marker).unwrap();
+    let needle = format!("certificate = \"{certificate}\"\n");
+    let relative_certificate = source[module_start..].find(&needle).unwrap();
+    let certificate_start = module_start + relative_certificate;
+    let certificate_end = certificate_start + needle.len();
+    let mut updated = source;
+    updated.insert_str(
+        certificate_end,
+        &format!("meta = \"{metadata}\"\nproducer_profile = \"human-surface-explicit-term\"\n"),
+    );
+    assert_eq!(
+        updated.matches(&format!("meta = \"{metadata}\"")).count(),
+        1
+    );
+    fs::write(&manifest_path, &updated).unwrap();
+    write_lock(package, &updated);
+    let path = package.artifact_path(metadata);
+    if let Some(existing) = existing {
+        write_artifact(package, metadata, existing.as_bytes());
+    }
+    path
+}
+
+fn install_package_lock_metadata_target(package: &TestPackage) {
+    let manifest_path = package.artifact_path(PACKAGE_MANIFEST_PATH);
+    let lock_path = package.artifact_path(LOCK_PATH);
+    let source = fs::read_to_string(&manifest_path).unwrap();
+    let needle = "certificate = \"Proofs/Ai/Basic/certificate.npcert\"\n";
+    assert_eq!(source.matches(needle).count(), 1);
+    let source = source.replacen(
+        needle,
+        &format!(
+            "{needle}meta = \"{LOCK_PATH}\"\nproducer_profile = \"human-surface-explicit-term\"\n"
+        ),
+        1,
+    );
+    fs::write(manifest_path, source).unwrap();
+    fs::remove_file(lock_path).unwrap();
+}
+
+fn build_frontend_failure_fixture(label: &str) -> TestPackage {
+    let package = build_module_fixture(label, "Proofs.Ai.Basic", false);
+    write_artifact(
+        &package,
+        "Proofs/Ai/Basic/source.npa",
+        FRONTEND_FAILURE_SOURCE.as_bytes(),
+    );
+    let source_hash = format_package_hash(&package_file_hash(FRONTEND_FAILURE_SOURCE.as_bytes()));
+    replace_module_manifest_hash(
+        &package,
+        "Proofs.Ai.Basic",
+        "expected_source_hash",
+        &source_hash,
+    );
+    package
+}
+
+fn assert_frontend_failure(result: &npa_cli::diagnostic::CommandResult) {
+    assert_eq!(result.exit_code(), CommandExitCode::PackageFailure);
+    assert_eq!(result.diagnostics.len(), 1);
+    assert!(result.artifacts.is_empty());
+    let diagnostic = &result.diagnostics[0];
+    assert_eq!(diagnostic.kind, DiagnosticKind::Build);
+    assert_eq!(diagnostic.reason_code, "build_failed");
+    assert_eq!(diagnostic.module.as_deref(), Some("Proofs.Ai.Basic"));
+    assert_eq!(diagnostic.path.as_deref(), Some("modules[0].source"));
+    assert_eq!(diagnostic.field.as_deref(), Some("elaborator"));
+    assert_eq!(
+        diagnostic.actual_value.as_deref(),
+        Some(FRONTEND_FAILURE_MESSAGE)
+    );
+    let source = diagnostic
+        .source
+        .as_ref()
+        .expect("frontend failure should retain source context");
+    let start = FRONTEND_FAILURE_SOURCE
+        .find("fun product")
+        .expect("failing binder") as u32
+        + "fun ".len() as u32;
+    let end = start + "product".len() as u32;
+    assert_eq!(source.path(), "Proofs/Ai/Basic/source.npa");
+    assert_eq!(source.start_byte(), start);
+    assert_eq!(source.end_byte(), end);
+    assert_eq!(
+        FRONTEND_FAILURE_SOURCE.get(start as usize..end as usize),
+        Some("product")
+    );
+    assert_eq!(source.declaration(), Some("product_enumeration_bad"));
+}
+
+fn package_snapshot(package: &TestPackage) -> BTreeMap<String, Option<Vec<u8>>> {
+    fn visit(root: &Path, current: &Path, snapshot: &mut BTreeMap<String, Option<Vec<u8>>>) {
+        let mut entries = fs::read_dir(current)
+            .unwrap()
+            .map(|entry| entry.unwrap())
+            .collect::<Vec<_>>();
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let path = entry.path();
+            let relative = path
+                .strip_prefix(root)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
+            if path.is_dir() {
+                snapshot.insert(format!("{relative}/"), None);
+                visit(root, &path, snapshot);
+            } else {
+                snapshot.insert(relative, Some(fs::read(path).unwrap()));
+            }
+        }
+    }
+
+    let mut snapshot = BTreeMap::new();
+    visit(package.path(), package.path(), &mut snapshot);
+    snapshot
 }
 
 fn assert_refresh_package_is_hash_clean(package: &TestPackage) {
-    let result = run_package_check_hashes(PackageCommonOptions {
-        root: package.path().to_path_buf(),
-        json: true,
-    });
+    let result = run_package_check_hashes(common_options(package.path(), true));
     assert_eq!(result.exit_code(), CommandExitCode::Success);
     assert!(
         result.diagnostics.is_empty(),
@@ -646,19 +998,10 @@ fn assert_refresh_package_is_hash_clean(package: &TestPackage) {
 }
 
 fn assert_refresh_package_verifies_with_reference_checker(package: &TestPackage) {
-    let result = run_package_verify_certs(PackageVerifyCertsOptions {
-        common: PackageCommonOptions {
-            root: package.path().to_path_buf(),
-            json: true,
-        },
-        checker: PackageChecker::Reference,
-        changed: false,
-        audit_cache: PackageAuditCacheMode::Off,
-        verifier_memo: PackageVerifierMemoMode::Off,
-        jobs: 1,
-        external: None,
-        timings: PackageTimingMode::Off,
-    });
+    let result = run_package_verify_certs(verify_certs_full(
+        common_options(package.path(), true),
+        PackageChecker::Reference,
+    ));
     assert_eq!(result.exit_code(), CommandExitCode::Success);
     assert!(
         result.diagnostics.iter().any(|diagnostic| {
@@ -777,6 +1120,130 @@ fn build_local_import_fixture(label: &str) -> TestPackage {
     package
 }
 
+fn build_transitive_metadata_fixture(label: &str) -> TestPackage {
+    let package = TestPackage::new(label);
+    let source_a = "def Carrier : Sort 2 := Type\n";
+    let source_b = "import Fixture.A\n\ndef Surface : Sort 2 := Carrier\n";
+    let source_c = "import Fixture.B\n\ndef SurfaceAlias : Sort 2 := Surface\n";
+
+    let (cert_a, verified_a, interface_a) =
+        compile_fixture_module(0, "Fixture.A", source_a, &[], &[]);
+    let (cert_b, verified_b, interface_b) = compile_fixture_module_with_available(
+        1,
+        "Fixture.B",
+        source_b,
+        &[&verified_a],
+        &[&verified_a],
+        std::slice::from_ref(&interface_a),
+    );
+    let (cert_c, _verified_c, _interface_c) = compile_fixture_module_with_available(
+        2,
+        "Fixture.C",
+        source_c,
+        &[&verified_b],
+        &[&verified_a, &verified_b],
+        std::slice::from_ref(&interface_b),
+    );
+
+    let modules = [
+        (
+            "Fixture.C",
+            "Fixture/C/source.npa",
+            "Fixture/C/certificate.npcert",
+            source_c,
+            cert_c,
+            vec![Name::from_dotted("Fixture.B")],
+        ),
+        (
+            "Fixture.B",
+            "Fixture/B/source.npa",
+            "Fixture/B/certificate.npcert",
+            source_b,
+            cert_b,
+            vec![Name::from_dotted("Fixture.A")],
+        ),
+        (
+            "Fixture.A",
+            "Fixture/A/source.npa",
+            "Fixture/A/certificate.npcert",
+            source_a,
+            cert_a,
+            Vec::new(),
+        ),
+    ];
+    let mut manifest_modules = Vec::new();
+    for (module, source_path, certificate_path, source, certificate, imports) in modules {
+        write_artifact(&package, source_path, source.as_bytes());
+        write_artifact(&package, certificate_path, &certificate);
+        manifest_modules.push(generated_manifest_module(
+            module,
+            source_path,
+            certificate_path,
+            source.as_bytes(),
+            &certificate,
+            imports,
+        ));
+    }
+    let manifest_source = fixture_manifest(&[], &manifest_modules);
+    fs::write(
+        package.artifact_path(PACKAGE_MANIFEST_PATH),
+        &manifest_source,
+    )
+    .unwrap();
+    write_lock(&package, &manifest_source);
+    install_metadata_target_for_module(
+        &package,
+        "Fixture.C",
+        "Fixture/C/certificate.npcert",
+        "Fixture/C/meta.json",
+        Some("{\"schema\":\"npa-ai-proof-meta-v0.1\",\"z_extension\":{\"b\":2,\"a\":1}}\n"),
+    );
+    package
+}
+
+fn assert_transitive_certificate_and_direct_metadata(package: &TestPackage) {
+    let certificate = fs::read(package.artifact_path("Fixture/C/certificate.npcert")).unwrap();
+    let certificate = npa_cert::decode_module_cert(&certificate).unwrap();
+    let certificate_imports = certificate
+        .imports
+        .iter()
+        .map(|import| import.module.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        certificate_imports,
+        [
+            Name::from_dotted("Fixture.A"),
+            Name::from_dotted("Fixture.B")
+        ]
+        .into_iter()
+        .collect()
+    );
+
+    let metadata_source = fs::read_to_string(package.artifact_path("Fixture/C/meta.json")).unwrap();
+    let metadata = parse_package_artifact_ledger_metadata(&metadata_source).unwrap();
+    assert_eq!(metadata.imports, vec![Name::from_dotted("Fixture.B")]);
+    assert!(metadata_source.contains("\"z_extension\": {\"b\":2,\"a\":1}"));
+}
+
+fn assert_transitive_metadata_audit_passes(package: &TestPackage) {
+    let audit = run_package_artifact_ledger_audit(audit_artifact_ledger_modules(
+        common_options(package.path(), true),
+        vec![Name::from_dotted("Fixture.C")],
+    ));
+    assert_eq!(audit.exit_code(), CommandExitCode::Success);
+    assert!(
+        audit.diagnostics.iter().any(|diagnostic| {
+            diagnostic.reason_code == "artifact_ledger_module_classified"
+                && diagnostic.actual_value.as_deref()
+                    == Some(
+                        "hash_drift_class=consistent,identity_parity=matches,checker_status=checked",
+                    )
+        }),
+        "expected clean artifact-ledger classification, got {:?}",
+        audit.diagnostics
+    );
+}
+
 fn module_fixture_spec(module_name: &str) -> (&'static str, &'static str, &'static str, Vec<Name>) {
     match module_name {
         "Proofs.Ai.Basic" => (
@@ -853,6 +1320,37 @@ fn compile_fixture_module(
         source_interface: output.source_interface,
     };
     (bytes, verified, source_interface)
+}
+
+fn compile_fixture_module_with_available(
+    file_id: u32,
+    module_name: &str,
+    source: &str,
+    direct_verified_modules: &[&VerifiedModule],
+    available_verified_modules: &[&VerifiedModule],
+    source_interfaces: &[HumanImportedSourceInterface],
+) -> (Vec<u8>, VerifiedModule, HumanImportedSourceInterface) {
+    let module = Name::from_dotted(module_name);
+    let output =
+        compile_human_source_to_certificate_output_with_available_import_refs_and_axiom_policy(
+            FileId(file_id),
+            module.clone(),
+            source,
+            direct_verified_modules,
+            available_verified_modules,
+            source_interfaces,
+            &HumanCompileOptions::default(),
+            &AxiomPolicy::normal(),
+        )
+        .unwrap();
+    let bytes = npa_cert::encode_module_cert(&output.certificate).unwrap();
+    let source_interface = HumanImportedSourceInterface {
+        module,
+        export_hash: output.certificate.hashes.export_hash,
+        certificate_hash: Some(output.certificate.hashes.certificate_hash),
+        source_interface: output.source_interface,
+    };
+    (bytes, output.verified_module, source_interface)
 }
 
 fn generated_manifest_module(

@@ -20,6 +20,7 @@ use npa_package::{
     build_package_lock_graph, format_package_hash, package_audit_process_memo_key,
     package_file_hash, package_import_context_export_cache_entry_json,
     package_import_context_export_cache_key, parse_package_import_context_export_cache_entry_json,
+    validate_observed_package_lock_against_manifest_graph,
     validate_package_lock_against_manifest_graph, PackageArtifactErrorReason,
     PackageAuditCacheKeyInput, PackageAuditCheckerIdentity, PackageAuditImportIdentity,
     PackageHash, PackageImportContextExportCacheEntry, PackageImportContextExportCacheKeyInput,
@@ -656,7 +657,10 @@ impl PackageVerificationError {
         )
     }
 
-    fn certificate_artifact_missing(path: impl Into<String>, expected: impl Into<String>) -> Self {
+    pub(crate) fn certificate_artifact_missing(
+        path: impl Into<String>,
+        expected: impl Into<String>,
+    ) -> Self {
         Self::new(
             PackageVerificationErrorKind::Artifact,
             path,
@@ -2207,10 +2211,39 @@ fn verify_package_reference_source_free_execution<'a>(
     artifacts: impl IntoIterator<Item = PackageCertificateArtifact<'a>>,
     options: PackageVerificationExecutionOptions,
 ) -> PackageVerificationResult<PackageVerificationReport> {
+    verify_package_reference_source_free_execution_with_validation(
+        validated,
+        lock,
+        artifacts,
+        options,
+        PackageVerificationInputValidationMode::RequireManifestPins,
+    )
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PackageVerificationInputValidationMode {
+    RequireManifestPins,
+    ObserveLocalArtifacts,
+}
+
+pub(crate) fn verify_package_reference_source_free_execution_with_validation<'a>(
+    validated: &ValidatedPackageManifest,
+    lock: &PackageLockManifest,
+    artifacts: impl IntoIterator<Item = PackageCertificateArtifact<'a>>,
+    options: PackageVerificationExecutionOptions,
+    input_validation: PackageVerificationInputValidationMode,
+) -> PackageVerificationResult<PackageVerificationReport> {
     validate_execution_options(&options, PackageVerificationMode::Reference)?;
     validate_manifest_lock_identity(validated, lock)?;
-    let graph = validate_package_lock_against_manifest_graph(validated, lock)
-        .map_err(|error| PackageVerificationError::lock_graph_invalid(format!("{error:?}")))?;
+    let graph = match input_validation {
+        PackageVerificationInputValidationMode::RequireManifestPins => {
+            validate_package_lock_against_manifest_graph(validated, lock)
+        }
+        PackageVerificationInputValidationMode::ObserveLocalArtifacts => {
+            validate_observed_package_lock_against_manifest_graph(validated, lock)
+        }
+    }
+    .map_err(|error| PackageVerificationError::lock_graph_invalid(format!("{error:?}")))?;
     let artifact_bytes = artifact_byte_map(artifacts)?;
     let entries = canonical_lock_entries(lock);
     let execution_modules = execution_modules_for_options(&entries, &graph, &options)?;
@@ -4352,10 +4385,12 @@ fn reference_check_reason_code(reason: ReferenceCheckReason) -> &'static str {
         ReferenceCheckReason::DuplicateDeclarationName => "duplicate_declaration_name",
         ReferenceCheckReason::ReservedCorePrimitive => "reserved_core_primitive",
         ReferenceCheckReason::DuplicateImport => "duplicate_import",
+        ReferenceCheckReason::ImportCycle => "import_cycle",
         ReferenceCheckReason::NonNormalizedLevel => "non_normalized_level",
         ReferenceCheckReason::NonNormalizedTerm => "non_normalized_term",
         ReferenceCheckReason::UnusedTableEntry => "unused_table_entry",
         ReferenceCheckReason::TrailingBytes => "trailing_bytes",
+        ReferenceCheckReason::SourceInputForbidden => "source_input_forbidden",
         ReferenceCheckReason::MissingImport => "missing_import",
         ReferenceCheckReason::ImportExportHashMismatch => "import_export_hash_mismatch",
         ReferenceCheckReason::MissingImportCertificateHash => "missing_import_certificate_hash",
@@ -4381,6 +4416,9 @@ fn reference_check_reason_code(reason: ReferenceCheckReason) -> &'static str {
         ReferenceCheckReason::TypeMismatch => "type_mismatch",
         ReferenceCheckReason::ResourceLimit => "resource_limit",
         ReferenceCheckReason::BadConstructorResult => "bad_constructor_result",
+        ReferenceCheckReason::ConstructorUniverseBoundViolation => {
+            "constructor_universe_bound_violation"
+        }
         ReferenceCheckReason::NonPositiveOccurrence => "non_positive_occurrence",
         ReferenceCheckReason::BadRecursorRule => "bad_recursor_rule",
         ReferenceCheckReason::BadRecursorParam => "bad_recursor_param",
@@ -4533,13 +4571,20 @@ mod tests {
         sync::{Mutex, MutexGuard},
     };
 
-    use npa_package::{
-        package_audit_disk_memo_key, package_audit_disk_memo_key_input,
-        package_audit_process_memo_key, package_reference_summary_cache_key,
-        package_reference_summary_cache_key_input, parse_manifest_str, parse_package_lock_json,
-        validate_manifest, PackageId, PackageLockManifest, PackagePath, PackageVersion,
-        ValidatedPackageManifest,
+    use npa_cert::{
+        build_module_cert, encode_module_cert, term_hash, CoreModule, DeclPayload, TermNode,
     };
+    use npa_kernel::{Decl, Expr, Level};
+    use npa_package::{
+        build_package_lock_from_artifacts, package_audit_disk_memo_key,
+        package_audit_disk_memo_key_input, package_audit_process_memo_key,
+        package_reference_summary_cache_key, package_reference_summary_cache_key_input,
+        parse_manifest_str, parse_package_lock_json, validate_manifest, PackageId,
+        PackageLockArtifact, PackageLockManifest, PackageManifest, PackageModule, PackagePath,
+        PackagePolicy, PackageVersion, ValidatedPackageManifest, CERTIFICATE_FORMAT_CANONICAL_V0_1,
+        CORE_SPEC_V0_1, KERNEL_PROFILE_V0_1, PACKAGE_MANIFEST_SCHEMA,
+    };
+    use sha2::{Digest, Sha256};
 
     use crate::independent_checker::{
         independent_checker_machine_check_request_hash,
@@ -4563,6 +4608,36 @@ mod tests {
             .expect("package fast verifier test thread should spawn")
             .join()
             .expect("package fast verifier test thread should not panic");
+    }
+
+    #[test]
+    fn package_reference_diagnostic_keeps_unknown_reference_identity() {
+        let source = ReferenceCheckError {
+            kind: ReferenceCheckErrorKind::TypeCheck,
+            section: ReferenceCertificateSection::Declarations,
+            offset: 417,
+            reason: Some(ReferenceCheckReason::UnknownReference),
+            reference: Some(npa_checker_ref::ReferenceCheckReference::Builtin {
+                declaration: ReferenceModuleName::from_dotted("Std.Logic.Eq.rec").unwrap(),
+                decl_interface_hash: [0xab; 32],
+            }),
+        };
+
+        let error =
+            PackageVerificationError::reference_checker_rejected("modules[0].certificate", source);
+        assert_eq!(
+            error
+                .checker_error
+                .as_ref()
+                .and_then(|details| details.reason_code.as_deref()),
+            Some("unknown_reference")
+        );
+        let actual = error.actual_value.expect("debug diagnostic payload");
+        assert!(actual.contains("Builtin"), "{actual}");
+        assert!(
+            actual.contains("Std\", \"Logic\", \"Eq\", \"rec"),
+            "{actual}"
+        );
     }
 
     fn repo_root() -> PathBuf {
@@ -4698,6 +4773,128 @@ mod tests {
 
     fn test_hash(byte: u8) -> npa_cert::Hash {
         [byte; 32]
+    }
+
+    fn unchecked_import_id_type() -> Expr {
+        Expr::pi(
+            "A",
+            Expr::sort(Level::param("u")),
+            Expr::pi("x", Expr::bvar(0), Expr::bvar(1)),
+        )
+    }
+
+    fn unchecked_import_id_proof() -> Expr {
+        Expr::lam(
+            "A",
+            Expr::sort(Level::param("u")),
+            Expr::lam("x", Expr::bvar(0), Expr::bvar(0)),
+        )
+    }
+
+    fn unchecked_import_provider() -> CoreModule {
+        CoreModule {
+            name: Name::from_dotted("Boundary.Provider"),
+            declarations: vec![Decl::Theorem {
+                name: "Boundary.Provider.id".to_owned(),
+                universe_params: vec!["u".to_owned()],
+                ty: unchecked_import_id_type(),
+                proof: unchecked_import_id_proof(),
+            }],
+        }
+    }
+
+    fn unchecked_import_consumer() -> CoreModule {
+        CoreModule {
+            name: Name::from_dotted("Boundary.Consumer"),
+            declarations: vec![Decl::Theorem {
+                name: "Boundary.Consumer.id".to_owned(),
+                universe_params: vec!["u".to_owned()],
+                ty: unchecked_import_id_type(),
+                proof: Expr::konst("Boundary.Provider.id", vec![Level::param("u")]),
+            }],
+        }
+    }
+
+    fn unchecked_import_hash_with_domain(domain: &[u8], payload: &[u8]) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(domain);
+        hasher.update(payload);
+        hasher.finalize().into()
+    }
+
+    fn recompute_unchecked_import_module_hash(cert: &mut ModuleCert) {
+        let encoded = encode_module_cert(cert).unwrap();
+        let payload = &encoded[..encoded.len() - 32];
+        cert.hashes.certificate_hash =
+            unchecked_import_hash_with_domain(b"NPA-MODULE-CERT-0.2.0", payload);
+    }
+
+    fn semantically_invalid_unchecked_import_provider(mut cert: ModuleCert) -> ModuleCert {
+        let bvar_zero = cert
+            .term_table
+            .iter()
+            .position(|term| matches!(term, TermNode::BVar(0)))
+            .expect("identity certificate contains bvar 0");
+        let bvar_one = cert
+            .term_table
+            .iter()
+            .position(|term| matches!(term, TermNode::BVar(1)))
+            .expect("identity certificate contains bvar 1");
+        let inner_lambda = cert
+            .term_table
+            .iter()
+            .position(|term| {
+                matches!(
+                    term,
+                    TermNode::Lam { ty, body } if *ty == bvar_zero && *body == bvar_zero
+                )
+            })
+            .expect("identity certificate contains its inner lambda");
+        match &mut cert.term_table[inner_lambda] {
+            TermNode::Lam { body, .. } => *body = bvar_one,
+            term => panic!("expected inner identity lambda, got {term:?}"),
+        }
+        let proof = match cert.declarations[0].decl {
+            DeclPayload::Theorem { proof, .. } => proof,
+            ref decl => panic!("expected identity theorem, got {decl:?}"),
+        };
+        let mut payload = Vec::new();
+        payload.extend(cert.declarations[0].hashes.decl_interface_hash);
+        payload.extend(term_hash(&cert, proof).unwrap());
+        payload.push(0); // Empty dependency vector.
+        cert.declarations[0].hashes.decl_certificate_hash =
+            unchecked_import_hash_with_domain(b"NPA-DECL-CERT-0.1", &payload);
+        recompute_unchecked_import_module_hash(&mut cert);
+        cert
+    }
+
+    fn unchecked_import_package_module(
+        module: &str,
+        source: &str,
+        certificate: &str,
+        imports: Vec<Name>,
+        cert: &ModuleCert,
+        bytes: &[u8],
+    ) -> PackageModule {
+        PackageModule {
+            module: Name::from_dotted(module),
+            source: PackagePath::new(source),
+            certificate: PackagePath::new(certificate),
+            imports,
+            expected_source_hash: PackageHash::new([0; 32]),
+            expected_certificate_file_hash: package_file_hash(bytes),
+            expected_export_hash: PackageHash::new(cert.hashes.export_hash),
+            expected_axiom_report_hash: PackageHash::new(cert.hashes.axiom_report_hash),
+            expected_certificate_hash: PackageHash::new(cert.hashes.certificate_hash),
+            meta: None,
+            replay: None,
+            producer_profile: None,
+            inductives: None,
+            definitions: None,
+            theorems: None,
+            axioms: None,
+            tags: None,
+        }
     }
 
     fn phase8_reference_runner_policy() -> IndependentCheckerRunnerPolicy {
@@ -5947,10 +6144,20 @@ mod tests {
             .expect("artifact exists for target");
         bytes[0] ^= 0x01;
         target.certificate_file_hash = package_file_hash(bytes);
+        let target_module = target.module.clone();
+        let corrupt_certificate_file_hash = target.certificate_file_hash;
+        let mut corrupt_manifest = proof_manifest();
+        corrupt_manifest
+            .modules
+            .iter_mut()
+            .find(|module| module.module == target_module)
+            .expect("proof manifest contains corrupt target")
+            .expected_certificate_file_hash = corrupt_certificate_file_hash;
+        let corrupt_validated = validate_manifest(corrupt_manifest).unwrap();
 
         clear_package_verification_decode_cache();
         let uncached = verify_package_fast_source_free_with_options(
-            &validated,
+            &corrupt_validated,
             &corrupt_lock,
             package_certificate_artifacts(&corrupt_artifacts),
             PackageVerificationExecutionOptions {
@@ -5971,7 +6178,7 @@ mod tests {
         )
         .unwrap();
         let cached = verify_package_fast_source_free_with_options(
-            &validated,
+            &corrupt_validated,
             &corrupt_lock,
             package_certificate_artifacts(&corrupt_artifacts),
             PackageVerificationExecutionOptions {
@@ -6544,6 +6751,260 @@ mod tests {
                 .map(|module| module.module.as_dotted())
                 .collect::<Vec<_>>(),
             order
+        );
+    }
+
+    #[test]
+    fn package_reference_dag_rejects_semantically_unchecked_provider_before_leaf() {
+        let good_provider = build_module_cert(unchecked_import_provider(), &[]).unwrap();
+        let good_provider_bytes = encode_module_cert(&good_provider).unwrap();
+        let mut session = VerifierSession::new();
+        let verified_provider = npa_cert::verify_module_cert(
+            &good_provider_bytes,
+            &mut session,
+            &AxiomPolicy::normal(),
+        )
+        .unwrap();
+
+        let bad_provider = semantically_invalid_unchecked_import_provider(good_provider.clone());
+        let bad_provider_bytes = encode_module_cert(&bad_provider).unwrap();
+        let mut leaf =
+            build_module_cert(unchecked_import_consumer(), &[verified_provider]).unwrap();
+        leaf.imports[0].certificate_hash = Some(bad_provider.hashes.certificate_hash);
+        recompute_unchecked_import_module_hash(&mut leaf);
+        let leaf_bytes = encode_module_cert(&leaf).unwrap();
+
+        assert_eq!(
+            good_provider.hashes.export_hash,
+            bad_provider.hashes.export_hash
+        );
+        let unchecked_imports =
+            ReferenceImportStore::from_source_free_certificates([bad_provider_bytes.as_slice()])
+                .unwrap();
+        assert!(matches!(
+            check_certificate(
+                &leaf_bytes,
+                &unchecked_imports,
+                &ReferenceCheckerPolicy::default(),
+            ),
+            ReferenceCheckResult::Checked(_)
+        ));
+
+        let provider_path = PackagePath::new("Boundary/Provider/certificate.npcert");
+        let leaf_path = PackagePath::new("Boundary/Consumer/certificate.npcert");
+        let manifest = PackageManifest {
+            schema: PACKAGE_MANIFEST_SCHEMA.to_owned(),
+            package: PackageId::new("unchecked-import-boundary"),
+            version: PackageVersion::new("0.1.0"),
+            core_spec: CORE_SPEC_V0_1.to_owned(),
+            kernel_profile: KERNEL_PROFILE_V0_1.to_owned(),
+            certificate_format: CERTIFICATE_FORMAT_CANONICAL_V0_1.to_owned(),
+            checker_profile: CHECKER_PROFILE_REFERENCE_V0_1.to_owned(),
+            policy: PackagePolicy {
+                allow_custom_axioms: false,
+                allowed_axioms: Vec::new(),
+            },
+            modules: vec![
+                unchecked_import_package_module(
+                    "Boundary.Provider",
+                    "Boundary/Provider/source.npa",
+                    provider_path.as_str(),
+                    Vec::new(),
+                    &bad_provider,
+                    &bad_provider_bytes,
+                ),
+                unchecked_import_package_module(
+                    "Boundary.Consumer",
+                    "Boundary/Consumer/source.npa",
+                    leaf_path.as_str(),
+                    vec![Name::from_dotted("Boundary.Provider")],
+                    &leaf,
+                    &leaf_bytes,
+                ),
+            ],
+            license: None,
+            repository: None,
+            description: None,
+            imports: None,
+        };
+        let validated = validate_manifest(manifest).unwrap();
+        assert_eq!(
+            package_reference_checker_policy(&validated).trust_mode,
+            ReferenceTrustMode::HighTrust
+        );
+        let lock = build_package_lock_from_artifacts(
+            &validated,
+            PackagePath::new("npa-package.toml"),
+            b"unchecked import boundary fixture",
+            [
+                PackageLockArtifact {
+                    path: provider_path.clone(),
+                    bytes: &bad_provider_bytes,
+                },
+                PackageLockArtifact {
+                    path: leaf_path.clone(),
+                    bytes: &leaf_bytes,
+                },
+            ],
+        )
+        .unwrap();
+        let artifacts =
+            BTreeMap::from([(provider_path, bad_provider_bytes), (leaf_path, leaf_bytes)]);
+
+        let report = verify_package_reference_source_free(
+            &validated,
+            &lock,
+            package_certificate_artifacts(&artifacts),
+        )
+        .unwrap();
+
+        assert_eq!(report.status, PackageVerificationStatus::Failed);
+        let provider_result = report
+            .modules
+            .iter()
+            .find(|result| result.module.as_dotted() == "Boundary.Provider")
+            .unwrap();
+        assert_eq!(
+            provider_result.status,
+            PackageModuleVerificationStatus::Failed
+        );
+        let provider_error = provider_result.error.as_ref().unwrap();
+        assert_eq!(
+            provider_error.reason_code,
+            PackageVerificationErrorReason::ReferenceCheckerRejected
+        );
+        let checker_error = provider_error.checker_error.as_ref().unwrap();
+        assert_eq!(checker_error.kind, "type_check");
+        assert_eq!(checker_error.reason_code.as_deref(), Some("type_mismatch"));
+
+        let leaf_result = report
+            .modules
+            .iter()
+            .find(|result| result.module.as_dotted() == "Boundary.Consumer")
+            .unwrap();
+        assert_eq!(leaf_result.status, PackageModuleVerificationStatus::Skipped);
+        assert_eq!(
+            leaf_result.error.as_ref().unwrap().reason_code,
+            PackageVerificationErrorReason::EarlierModuleFailed
+        );
+    }
+
+    #[test]
+    fn package_reference_dag_rejects_inductive_universe_violation_before_leaf() {
+        let provider_bytes = read(repo_root().join(
+            "testdata/certificates/security/inductive-constructor-universe-bound-v0.1.npcert",
+        ));
+        let provider = decode_module_cert(&provider_bytes).unwrap();
+        let mut leaf = build_module_cert(
+            CoreModule {
+                name: Name::from_dotted("Audit.Leaf"),
+                declarations: Vec::new(),
+            },
+            &[],
+        )
+        .unwrap();
+        leaf.imports.push(npa_cert::ImportEntry {
+            module: provider.header.module.clone(),
+            export_hash: provider.hashes.export_hash,
+            certificate_hash: Some(provider.hashes.certificate_hash),
+        });
+        recompute_unchecked_import_module_hash(&mut leaf);
+        let leaf_bytes = encode_module_cert(&leaf).unwrap();
+
+        let provider_path = PackagePath::new("Audit/Universe/certificate.npcert");
+        let leaf_path = PackagePath::new("Audit/Leaf/certificate.npcert");
+        let manifest = PackageManifest {
+            schema: PACKAGE_MANIFEST_SCHEMA.to_owned(),
+            package: PackageId::new("inductive-universe-bound"),
+            version: PackageVersion::new("0.1.0"),
+            core_spec: CORE_SPEC_V0_1.to_owned(),
+            kernel_profile: KERNEL_PROFILE_V0_1.to_owned(),
+            certificate_format: CERTIFICATE_FORMAT_CANONICAL_V0_1.to_owned(),
+            checker_profile: CHECKER_PROFILE_REFERENCE_V0_1.to_owned(),
+            policy: PackagePolicy {
+                allow_custom_axioms: false,
+                allowed_axioms: Vec::new(),
+            },
+            modules: vec![
+                unchecked_import_package_module(
+                    "Audit.Universe",
+                    "Audit/Universe/source.npa",
+                    provider_path.as_str(),
+                    Vec::new(),
+                    &provider,
+                    &provider_bytes,
+                ),
+                unchecked_import_package_module(
+                    "Audit.Leaf",
+                    "Audit/Leaf/source.npa",
+                    leaf_path.as_str(),
+                    vec![Name::from_dotted("Audit.Universe")],
+                    &leaf,
+                    &leaf_bytes,
+                ),
+            ],
+            license: None,
+            repository: None,
+            description: None,
+            imports: None,
+        };
+        let validated = validate_manifest(manifest).unwrap();
+        let lock = build_package_lock_from_artifacts(
+            &validated,
+            PackagePath::new("npa-package.toml"),
+            b"inductive universe bound fixture",
+            [
+                PackageLockArtifact {
+                    path: provider_path.clone(),
+                    bytes: &provider_bytes,
+                },
+                PackageLockArtifact {
+                    path: leaf_path.clone(),
+                    bytes: &leaf_bytes,
+                },
+            ],
+        )
+        .unwrap();
+        let artifacts = BTreeMap::from([(provider_path, provider_bytes), (leaf_path, leaf_bytes)]);
+
+        let report = verify_package_reference_source_free(
+            &validated,
+            &lock,
+            package_certificate_artifacts(&artifacts),
+        )
+        .unwrap();
+
+        assert_eq!(report.status, PackageVerificationStatus::Failed);
+        let provider_result = report
+            .modules
+            .iter()
+            .find(|result| result.module.as_dotted() == "Audit.Universe")
+            .unwrap();
+        assert_eq!(
+            provider_result.status,
+            PackageModuleVerificationStatus::Failed
+        );
+        let provider_error = provider_result.error.as_ref().unwrap();
+        assert_eq!(
+            provider_error.reason_code,
+            PackageVerificationErrorReason::ReferenceCheckerRejected
+        );
+        let checker_error = provider_error.checker_error.as_ref().unwrap();
+        assert_eq!(checker_error.kind, "type_check");
+        assert_eq!(
+            checker_error.reason_code.as_deref(),
+            Some("constructor_universe_bound_violation")
+        );
+
+        let leaf_result = report
+            .modules
+            .iter()
+            .find(|result| result.module.as_dotted() == "Audit.Leaf")
+            .unwrap();
+        assert_eq!(leaf_result.status, PackageModuleVerificationStatus::Skipped);
+        assert_eq!(
+            leaf_result.error.as_ref().unwrap().reason_code,
+            PackageVerificationErrorReason::EarlierModuleFailed
         );
     }
 

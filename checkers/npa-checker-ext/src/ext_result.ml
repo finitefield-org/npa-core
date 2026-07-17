@@ -2,11 +2,11 @@ let schema = "npa.independent-checker.checker_raw_result.v1"
 
 let checker_id = "npa-checker-ext"
 
-let checker_version = "0.1.0"
+let checker_version = "0.2.0"
 
-let certificate_format = "NPA-CERT-0.1"
+let certificate_format = "NPA-CERT-0.2.0"
 
-let core_spec = "NPA-Core-0.1"
+let core_spec = "NPA-Core-0.2.0"
 
 let implementation_profile = "ocaml-clean-room"
 
@@ -60,9 +60,26 @@ let version_text =
 type checker_error = {
   kind : string;
   reason_code : string option;
+  declaration : string option;
+  core_path : string list option;
   section : string option;
   offset : int option;
+  expected_hash : string option;
+  actual_hash : string option;
 }
+
+let checker_error ?reason_code ?declaration ?core_path ?section ?offset
+    ?expected_hash ?actual_hash kind =
+  {
+    kind;
+    reason_code;
+    declaration;
+    core_path;
+    section;
+    offset;
+    expected_hash;
+    actual_hash;
+  }
 
 let json_escape text =
   let buffer = Buffer.create (String.length text) in
@@ -91,6 +108,18 @@ let render_error error =
     @ (match error.reason_code with
       | None -> []
       | Some reason -> [ "\"reason_code\": " ^ json_string reason ])
+    @ (match error.declaration with
+      | None -> []
+      | Some declaration ->
+          [ "\"declaration\": " ^ json_string declaration ])
+    @ (match error.core_path with
+      | None -> []
+      | Some path ->
+          [
+            "\"core_path\": ["
+            ^ String.concat ", " (List.map json_string path)
+            ^ "]";
+          ])
     @ (match error.section with
       | None -> []
       | Some section -> [ "\"section\": " ^ json_string section ])
@@ -98,81 +127,71 @@ let render_error error =
     (match error.offset with
     | None -> []
     | Some offset -> [ "\"offset\": " ^ string_of_int offset ])
+    @ (match error.expected_hash with
+      | None -> []
+      | Some hash -> [ "\"expected_hash\": " ^ json_string hash ])
+    @ (match error.actual_hash with
+      | None -> []
+      | Some hash -> [ "\"actual_hash\": " ^ json_string hash ])
   in
   "{\n    " ^ String.concat ",\n    " fields ^ "\n  }"
 
-let render_failed error =
-  "{\n"
-  ^ "  \"schema\": " ^ json_string schema ^ ",\n"
+let wire_hash hash = "sha256:" ^ Ext_sha256.to_hex (Bytes.of_string hash)
+
+let identity_fields status =
+  "  \"schema\": " ^ json_string schema ^ ",\n"
   ^ "  \"checker_id\": " ^ json_string checker_id ^ ",\n"
   ^ "  \"checker_version\": " ^ json_string checker_version ^ ",\n"
   ^ "  \"checker_build_hash\": " ^ json_string checker_build_hash ^ ",\n"
-  ^ "  \"status\": \"failed\",\n"
-  ^ "  \"error\": " ^ render_error error ^ "\n"
-  ^ "}\n"
+  ^ "  \"status\": " ^ json_string status
 
-let skeleton_failure () =
-  render_failed
-    {
-      kind = "checker_internal_error";
-      reason_code = Some "checker_reported_internal_error";
-      section = Some "skeleton";
-      offset = Some 0;
-    }
+let render_failed ?module_name ?certificate_hash error =
+  let context =
+    (match module_name with
+    | None -> ""
+    | Some name -> ",\n  \"module\": " ^ json_string name)
+    ^
+    match certificate_hash with
+    | None -> ""
+    | Some hash -> ",\n  \"certificate_hash\": " ^ json_string hash
+  in
+  "{\n" ^ identity_fields "failed" ^ context ^ ",\n"
+  ^ "  \"error\": " ^ render_error error ^ "\n}\n"
+
+let render_checked ~module_name ~certificate_hash ~export_hash
+    ~axiom_report_hash =
+  "{\n" ^ identity_fields "checked"
+  ^ ",\n  \"module\": " ^ json_string module_name
+  ^ ",\n  \"certificate_hash\": " ^ json_string certificate_hash
+  ^ ",\n  \"export_hash\": " ^ json_string export_hash
+  ^ ",\n  \"axiom_report_hash\": " ^ json_string axiom_report_hash
+  ^ "\n}\n"
 
 let unsupported_core_feature ?offset _feature =
   render_failed
-    {
-      kind = "unsupported_core_feature";
-      reason_code = Some "unsupported_core_feature";
-      section = Some "core_features";
-      offset;
-    }
+    (checker_error ~reason_code:"unsupported_core_feature"
+       ~section:"core_features" ?offset "unsupported_core_feature")
 
 let decode_failure ~kind ~reason_code ~section ~offset =
   render_failed
-    {
-      kind;
-      reason_code = Some reason_code;
-      section = Some section;
-      offset = Some offset;
-    }
+    (checker_error ~reason_code ~section ~offset kind)
 
 let hash_mismatch_failure ~kind ~reason_code ~section ~offset =
   render_failed
-    {
-      kind;
-      reason_code = Some reason_code;
-      section = Some section;
-      offset = Some offset;
-    }
+    (checker_error ~reason_code ~section ~offset kind)
 
 let import_failure ~kind ~reason_code ~section ~offset =
   render_failed
-    {
-      kind;
-      reason_code = Some reason_code;
-      section = Some section;
-      offset = Some offset;
-    }
+    (checker_error ~reason_code ~section ~offset kind)
 
 let axiom_report_failure ~section ~offset =
   render_failed
-    {
-      kind = "axiom_report_mismatch";
-      reason_code = Some "axiom_report_mismatch";
-      section = Some section;
-      offset = Some offset;
-    }
+    (checker_error ~reason_code:"axiom_report_mismatch" ~section ~offset
+       "axiom_report_mismatch")
 
 let axiom_policy_failure ~reason_code ~section ~offset =
   render_failed
-    {
-      kind = "forbidden_axiom";
-      reason_code = Some reason_code;
-      section = Some section;
-      offset = Some offset;
-    }
+    (checker_error ~reason_code ~section ~offset "forbidden_axiom")
 
 let decode_error_kind error =
   match error.Ext_bytes.reason with
@@ -189,6 +208,8 @@ let decode_error_kind error =
   | Ext_bytes.Noncanonical_order
   | Ext_bytes.Unused_table_entry ->
       "noncanonical_encoding"
+  | Ext_bytes.Constrained_export_requires_format_upgrade ->
+      "unsupported_schema_version"
   | Ext_bytes.Unexpected_eof
   | Ext_bytes.Uvar_overflow
   | Ext_bytes.Length_overflow
@@ -197,7 +218,8 @@ let decode_error_kind error =
   | Ext_bytes.Unknown_tag _
   | Ext_bytes.Dangling_reference
   | Ext_bytes.Trailing_bytes
-  | Ext_bytes.Unresolved_metavariable ->
+  | Ext_bytes.Unresolved_metavariable
+  | Ext_bytes.Resource_limit ->
       "certificate_decode_error"
 
 let decode_error error =

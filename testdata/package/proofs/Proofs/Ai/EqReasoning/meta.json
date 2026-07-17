@@ -12,18 +12,6 @@
   "certificate_hash": "sha256:b73e42bf01fc55ebd79309367d9b3661697b7b11bf97955742fb036711121aba",
   "imports": ["Std.Logic.Eq"],
   "axioms": ["Eq.rec"],
-  "declarations": [
-    { "name": "eq_symm", "kind": "theorem" },
-    { "name": "eq_trans", "kind": "theorem" },
-    { "name": "eq_congr_arg", "kind": "theorem" },
-    { "name": "eq_congr_fun", "kind": "theorem" },
-    { "name": "eq_congr2", "kind": "theorem" },
-    { "name": "eq_subst", "kind": "theorem" },
-    { "name": "eq_transport_const", "kind": "theorem" },
-    { "name": "eq_rewrite_left", "kind": "theorem" },
-    { "name": "eq_rewrite_right", "kind": "theorem" },
-    { "name": "eq_cast_trans", "kind": "theorem" },
-    { "name": "eq_calc3", "kind": "theorem" }
-  ],
+  "declarations": [{"name":"eq_symm","kind":"theorem"},{"name":"eq_trans","kind":"theorem"},{"name":"eq_congr_arg","kind":"theorem"},{"name":"eq_congr_fun","kind":"theorem"},{"name":"eq_congr2","kind":"theorem"},{"name":"eq_subst","kind":"theorem"},{"name":"eq_transport_const","kind":"theorem"},{"name":"eq_rewrite_left","kind":"theorem"},{"name":"eq_rewrite_right","kind":"theorem"},{"name":"eq_cast_trans","kind":"theorem"},{"name":"eq_calc3","kind":"theorem"}],
   "trust_boundary": "source, replay, and metadata are non-trusted sidecars; only the canonical certificate verified by npa-cert is accepted"
 }
