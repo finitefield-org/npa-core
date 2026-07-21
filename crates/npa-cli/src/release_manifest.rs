@@ -3,7 +3,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
-use npa_api::{JsonDocument, JsonValue, JsonValueKind};
+use npa_api::{
+    JsonDocument, JsonValue, JsonValueKind, PerformanceMeasurementLabel,
+    PERFORMANCE_CANDIDATE_DETAIL_LIMIT, PERFORMANCE_DECLARATION_DETAIL_LIMIT,
+    PERFORMANCE_MEASUREMENTS_SCHEMA_V0_1, PERFORMANCE_MEASUREMENTS_SCHEMA_V0_2,
+    PERFORMANCE_MODULE_DETAIL_LIMIT, PERFORMANCE_WORKER_DETAIL_LIMIT,
+};
 
 const V0_1_SCHEMA: &str = "npa.generated_artifact_release_manifest.v0.1";
 const V0_2_SCHEMA: &str = "npa.generated_artifact_release_manifest.v0.2";
@@ -11,7 +16,8 @@ const VALIDATION_SCHEMA: &str = "npa.generated_artifact_release_manifest.validat
 const COMMAND_RESULT_SCHEMA_V0_1: &str = "npa.package.command_result.v0.1";
 const COMMAND_RESULT_SCHEMA_V0_2: &str = "npa.package.command_result.v0.2";
 const COMMAND_RESULT_SCHEMA_V0_3: &str = "npa.package.command_result.v0.3";
-const TIMINGS_SCHEMA: &str = "npa.package.timings.v0.1";
+const TIMINGS_SCHEMA_V0_1: &str = "npa.package.timings.v0.1";
+const TIMINGS_SCHEMA_V0_2: &str = "npa.package.timings.v0.2";
 const PACKAGE_LOCK_RELATIVE_PATH: &str = "generated/package-lock.json";
 
 const BASE_FIELDS: &[&str] = &[
@@ -804,7 +810,24 @@ fn validate_command_result_shape<'value, 'source>(
             value(&result, "timings"),
             "verification.command_result.timings",
         )?;
-        let required = &["schema", "mode", "unit", "proof_evidence", "build_evidence"];
+        let schema = value(&timings, "schema").string_value();
+        if !matches!(schema, Some(TIMINGS_SCHEMA_V0_1 | TIMINGS_SCHEMA_V0_2)) {
+            return Err(ReleaseManifestValidationError::new(
+                "verification.command_result.timings has an invalid schema",
+            ));
+        }
+        let v0_2 = schema == Some(TIMINGS_SCHEMA_V0_2);
+        let required_v0_1 = ["schema", "mode", "unit", "proof_evidence", "build_evidence"];
+        let required_v0_2 = [
+            "schema",
+            "mode",
+            "unit",
+            "proof_evidence",
+            "build_evidence",
+            "trusted",
+            "measurements",
+        ];
+        let required: &[&str] = if v0_2 { &required_v0_2 } else { &required_v0_1 };
         let mut missing = required
             .iter()
             .copied()
@@ -816,14 +839,12 @@ fn validate_command_result_shape<'value, 'source>(
                 "verification.command_result.timings missing field '{field}'"
             )));
         }
-        if value(&timings, "schema").string_value() != Some(TIMINGS_SCHEMA)
-            || value(&timings, "unit").string_value() != Some("ms")
-        {
+        if value(&timings, "unit").string_value() != Some("ms") {
             return Err(ReleaseManifestValidationError::new(
                 "verification.command_result.timings has an invalid schema or unit",
             ));
         }
-        require_text(
+        let timing_mode = require_text(
             value(&timings, "mode"),
             "verification.command_result.timings.mode",
         )?;
@@ -834,6 +855,17 @@ fn validate_command_result_shape<'value, 'source>(
             return Err(ReleaseManifestValidationError::new(
                 "timings must not be proof evidence",
             ));
+        }
+        if v0_2 {
+            if require_bool(
+                value(&timings, "trusted"),
+                "verification.command_result.timings.trusted",
+            )? {
+                return Err(ReleaseManifestValidationError::new(
+                    "timings must be untrusted",
+                ));
+            }
+            validate_performance_measurements(value(&timings, "measurements"), timing_mode)?;
         }
         if require_bool(
             value(&timings, "build_evidence"),
@@ -859,6 +891,764 @@ fn validate_command_result_shape<'value, 'source>(
         }
     }
     Ok(result)
+}
+
+fn validate_performance_measurements(
+    raw: &JsonValue<'_>,
+    expected_mode: &str,
+) -> Result<(), ReleaseManifestValidationError> {
+    const WHERE: &str = "verification.command_result.timings.measurements";
+    let report = require_object(raw, WHERE)?;
+    let has_package_sharding_schema = match value(&report, "schema").string_value() {
+        Some(PERFORMANCE_MEASUREMENTS_SCHEMA_V0_1) => false,
+        Some(PERFORMANCE_MEASUREMENTS_SCHEMA_V0_2) => true,
+        _ => {
+            return Err(ReleaseManifestValidationError::new(format!(
+                "{WHERE}.schema is unsupported"
+            )))
+        }
+    };
+    let mut required_fields = vec![
+        "schema",
+        "trusted",
+        "proof_evidence",
+        "mode",
+        "input_identity",
+        "counters",
+        "modules",
+        "module_details",
+        "declarations",
+        "declaration_details",
+        "candidates",
+        "candidate_details",
+        "workers",
+        "worker_details",
+        "detail_truncated",
+        "overflowed",
+        "clock",
+    ];
+    if has_package_sharding_schema {
+        required_fields.extend_from_slice(&[
+            "package_sharding",
+            "package_layers",
+            "package_layer_details",
+            "package_shards",
+            "package_shard_details",
+        ]);
+    }
+    require_fields(&report, &required_fields, WHERE, &[])?;
+    if require_bool(value(&report, "trusted"), &format!("{WHERE}.trusted"))?
+        || require_bool(
+            value(&report, "proof_evidence"),
+            &format!("{WHERE}.proof_evidence"),
+        )?
+    {
+        return Err(ReleaseManifestValidationError::new(format!(
+            "{WHERE} must be untrusted and not proof evidence"
+        )));
+    }
+    let mode = value(&report, "mode").string_value();
+    if !matches!(mode, Some("summary" | "detailed")) {
+        return Err(ReleaseManifestValidationError::new(format!(
+            "{WHERE}.mode is invalid"
+        )));
+    }
+    if mode != Some(expected_mode) {
+        return Err(ReleaseManifestValidationError::new(format!(
+            "{WHERE}.mode disagrees with verification.command_result.timings.mode"
+        )));
+    }
+    if value(&report, "input_identity").kind() != JsonValueKind::Null {
+        verification_hash(
+            value(&report, "input_identity"),
+            &format!("{WHERE}.input_identity"),
+        )?;
+    }
+    require_bool(
+        value(&report, "detail_truncated"),
+        &format!("{WHERE}.detail_truncated"),
+    )?;
+    require_bool(value(&report, "overflowed"), &format!("{WHERE}.overflowed"))?;
+
+    let mut labels = BTreeSet::new();
+    let mut previous_label = None;
+    for (index, raw_counter) in
+        require_array(value(&report, "counters"), &format!("{WHERE}.counters"))?
+            .iter()
+            .enumerate()
+    {
+        let where_ = format!("{WHERE}.counters[{index}]");
+        let counter = require_object(raw_counter, &where_)?;
+        require_fields(&counter, &["label", "unit", "value"], &where_, &[])?;
+        let label = require_text(value(&counter, "label"), &format!("{where_}.label"))?;
+        if !labels.insert(label) {
+            return Err(ReleaseManifestValidationError::new(format!(
+                "{where_}.label is duplicated"
+            )));
+        }
+        if previous_label.is_some_and(|previous| previous >= label) {
+            return Err(ReleaseManifestValidationError::new(format!(
+                "{where_}.label is not in canonical order"
+            )));
+        }
+        previous_label = Some(label);
+        let Some(expected) = PerformanceMeasurementLabel::ALL
+            .iter()
+            .copied()
+            .find(|candidate| candidate.as_str() == label)
+        else {
+            return Err(ReleaseManifestValidationError::new(format!(
+                "{where_}.label is unknown"
+            )));
+        };
+        if !has_package_sharding_schema
+            && expected == PerformanceMeasurementLabel::PackageAvoidedBaseContextCloneBytes
+        {
+            return Err(ReleaseManifestValidationError::new(format!(
+                "{where_}.label is unavailable in {PERFORMANCE_MEASUREMENTS_SCHEMA_V0_1}"
+            )));
+        }
+        if value(&counter, "unit").string_value() != Some(expected.unit().as_str()) {
+            return Err(ReleaseManifestValidationError::new(format!(
+                "{where_}.unit disagrees with its label"
+            )));
+        }
+        require_measurement_u64(value(&counter, "value"), &format!("{where_}.value"))?;
+    }
+
+    let module_fields = [
+        "module",
+        "certificate_bytes",
+        "declaration_count",
+        "import_count",
+        "checker_elapsed_ns",
+    ];
+    if has_package_sharding_schema {
+        let mut fields = module_fields.to_vec();
+        fields.push("package_sharding");
+        validate_measurement_records_with_opaque(
+            value(&report, "modules"),
+            &format!("{WHERE}.modules"),
+            &fields,
+            &["module"],
+            &["package_sharding"],
+        )?;
+    } else {
+        validate_measurement_records(
+            value(&report, "modules"),
+            &format!("{WHERE}.modules"),
+            &module_fields,
+            &["module"],
+        )?;
+    }
+    let modules = require_array(value(&report, "modules"), &format!("{WHERE}.modules"))?;
+    let mut previous_module = None::<String>;
+    for (index, module) in modules.iter().enumerate() {
+        let object = require_object(module, &format!("{WHERE}.modules[{index}]"))?;
+        let key = require_text(
+            value(&object, "module"),
+            &format!("{WHERE}.modules[{index}].module"),
+        )?;
+        if previous_module
+            .as_deref()
+            .is_some_and(|previous| previous >= key)
+        {
+            return Err(ReleaseManifestValidationError::new(format!(
+                "{WHERE}.modules are not in canonical order"
+            )));
+        }
+        previous_module = Some(key.to_owned());
+        if has_package_sharding_schema {
+            validate_package_module_sharding(
+                value(&object, "package_sharding"),
+                &format!("{WHERE}.modules[{index}].package_sharding"),
+            )?;
+        }
+    }
+    validate_measurement_records(
+        value(&report, "declarations"),
+        &format!("{WHERE}.declarations"),
+        &[
+            "module",
+            "declaration_index",
+            "declaration",
+            "term_nodes",
+            "elaboration_elapsed_ns",
+        ],
+        &["module", "declaration"],
+    )?;
+    let declarations = require_array(
+        value(&report, "declarations"),
+        &format!("{WHERE}.declarations"),
+    )?;
+    let mut previous_declaration = None::<(String, u64, String)>;
+    for (index, declaration) in declarations.iter().enumerate() {
+        let where_ = format!("{WHERE}.declarations[{index}]");
+        let object = require_object(declaration, &where_)?;
+        let key = (
+            require_text(value(&object, "module"), &format!("{where_}.module"))?.to_owned(),
+            require_measurement_u64(
+                value(&object, "declaration_index"),
+                &format!("{where_}.declaration_index"),
+            )?,
+            require_text(
+                value(&object, "declaration"),
+                &format!("{where_}.declaration"),
+            )?
+            .to_owned(),
+        );
+        if previous_declaration
+            .as_ref()
+            .is_some_and(|previous| previous >= &key)
+        {
+            return Err(ReleaseManifestValidationError::new(format!(
+                "{WHERE}.declarations are not in canonical order"
+            )));
+        }
+        previous_declaration = Some(key);
+    }
+    validate_measurement_records(
+        value(&report, "candidates"),
+        &format!("{WHERE}.candidates"),
+        &[
+            "batch_index",
+            "candidate_index",
+            "validation_elapsed_ns",
+            "execution_elapsed_ns",
+            "outcome",
+        ],
+        &["outcome"],
+    )?;
+    let candidates = require_array(value(&report, "candidates"), &format!("{WHERE}.candidates"))?;
+    let mut previous_candidate = None::<(u64, u64)>;
+    for (index, candidate) in candidates.iter().enumerate() {
+        let object = require_object(candidate, &format!("{WHERE}.candidates[{index}]"))?;
+        if !matches!(
+            value(&object, "outcome").string_value(),
+            Some("accepted" | "rejected" | "not_evaluated")
+        ) {
+            return Err(ReleaseManifestValidationError::new(format!(
+                "{WHERE}.candidates[{index}].outcome is invalid"
+            )));
+        }
+        let key = (
+            require_measurement_u64(
+                value(&object, "batch_index"),
+                &format!("{WHERE}.candidates[{index}].batch_index"),
+            )?,
+            require_measurement_u64(
+                value(&object, "candidate_index"),
+                &format!("{WHERE}.candidates[{index}].candidate_index"),
+            )?,
+        );
+        if previous_candidate.is_some_and(|previous| previous >= key) {
+            return Err(ReleaseManifestValidationError::new(format!(
+                "{WHERE}.candidates are not in canonical order"
+            )));
+        }
+        previous_candidate = Some(key);
+    }
+    validate_measurement_records(
+        value(&report, "workers"),
+        &format!("{WHERE}.workers"),
+        &[
+            "worker_index",
+            "module_count",
+            "certificate_bytes",
+            "active_elapsed_ns",
+            "idle_elapsed_ns",
+        ],
+        &[],
+    )?;
+    let workers = require_array(value(&report, "workers"), &format!("{WHERE}.workers"))?;
+    let mut previous_worker = None;
+    for (index, worker) in workers.iter().enumerate() {
+        let object = require_object(worker, &format!("{WHERE}.workers[{index}]"))?;
+        let key = require_measurement_u64(
+            value(&object, "worker_index"),
+            &format!("{WHERE}.workers[{index}].worker_index"),
+        )?;
+        if previous_worker.is_some_and(|previous| previous >= key) {
+            return Err(ReleaseManifestValidationError::new(format!(
+                "{WHERE}.workers are not in canonical order"
+            )));
+        }
+        previous_worker = Some(key);
+    }
+    let (package_layer_len, package_shard_len) = if has_package_sharding_schema {
+        let has_package_sharding =
+            validate_package_sharding_summary(value(&report, "package_sharding"), WHERE)?;
+        let package_layers = require_array(
+            value(&report, "package_layers"),
+            &format!("{WHERE}.package_layers"),
+        )?;
+        let mut previous_layer = None;
+        for (index, raw_layer) in package_layers.iter().enumerate() {
+            let where_ = format!("{WHERE}.package_layers[{index}]");
+            let layer = require_object(raw_layer, &where_)?;
+            require_fields(
+                &layer,
+                &[
+                    "layer_index",
+                    "runnable_width",
+                    "estimated_total_cost",
+                    "estimated_max_shard_cost",
+                    "requested_jobs",
+                    "effective_jobs",
+                    "reduction_reason",
+                    "shared_base_context_bytes",
+                    "per_worker_bytes",
+                    "memory_budget_bytes",
+                    "estimate_overflowed",
+                    "elapsed_ns",
+                ],
+                &where_,
+                &[],
+            )?;
+            let layer_index = require_measurement_u64(
+                value(&layer, "layer_index"),
+                &format!("{where_}.layer_index"),
+            )?;
+            if previous_layer.is_some_and(|previous| previous >= layer_index) {
+                return Err(ReleaseManifestValidationError::new(format!(
+                    "{WHERE}.package_layers are not in canonical order"
+                )));
+            }
+            previous_layer = Some(layer_index);
+            for field in [
+                "runnable_width",
+                "estimated_total_cost",
+                "estimated_max_shard_cost",
+                "requested_jobs",
+                "effective_jobs",
+                "shared_base_context_bytes",
+                "per_worker_bytes",
+                "memory_budget_bytes",
+                "elapsed_ns",
+            ] {
+                require_measurement_u64(value(&layer, field), &format!("{where_}.{field}"))?;
+            }
+            if require_measurement_u64(
+                value(&layer, "memory_budget_bytes"),
+                &format!("{where_}.memory_budget_bytes"),
+            )? != 1_073_741_824
+            {
+                return Err(ReleaseManifestValidationError::new(format!(
+                    "{where_}.memory_budget_bytes disagrees with npa.fast-shard-memory.v1"
+                )));
+            }
+            validate_fast_shard_reduction_reason(
+                value(&layer, "reduction_reason"),
+                &format!("{where_}.reduction_reason"),
+            )?;
+            require_bool(
+                value(&layer, "estimate_overflowed"),
+                &format!("{where_}.estimate_overflowed"),
+            )?;
+        }
+        let package_shards = require_array(
+            value(&report, "package_shards"),
+            &format!("{WHERE}.package_shards"),
+        )?;
+        let mut previous_shard = None;
+        for (index, raw_shard) in package_shards.iter().enumerate() {
+            let where_ = format!("{WHERE}.package_shards[{index}]");
+            let shard = require_object(raw_shard, &where_)?;
+            require_fields(
+                &shard,
+                &[
+                    "layer_index",
+                    "shard_index",
+                    "estimated_cost",
+                    "artifact_bytes",
+                    "member_count",
+                    "active_elapsed_ns",
+                    "estimate_overflowed",
+                ],
+                &where_,
+                &[],
+            )?;
+            let key = (
+                require_measurement_u64(
+                    value(&shard, "layer_index"),
+                    &format!("{where_}.layer_index"),
+                )?,
+                require_measurement_u64(
+                    value(&shard, "shard_index"),
+                    &format!("{where_}.shard_index"),
+                )?,
+            );
+            if previous_shard.is_some_and(|previous| previous >= key) {
+                return Err(ReleaseManifestValidationError::new(format!(
+                    "{WHERE}.package_shards are not in canonical order"
+                )));
+            }
+            previous_shard = Some(key);
+            for field in [
+                "estimated_cost",
+                "artifact_bytes",
+                "member_count",
+                "active_elapsed_ns",
+            ] {
+                require_measurement_u64(value(&shard, field), &format!("{where_}.{field}"))?;
+            }
+            require_bool(
+                value(&shard, "estimate_overflowed"),
+                &format!("{where_}.estimate_overflowed"),
+            )?;
+        }
+        if !has_package_sharding && (!package_layers.is_empty() || !package_shards.is_empty()) {
+            return Err(ReleaseManifestValidationError::new(format!(
+                "{WHERE}.package_sharding is required when package shard details are present"
+            )));
+        }
+        (package_layers.len(), package_shards.len())
+    } else {
+        (0, 0)
+    };
+    let mut detail_families = vec![
+        (
+            "module_details",
+            modules.len(),
+            PERFORMANCE_MODULE_DETAIL_LIMIT,
+        ),
+        (
+            "declaration_details",
+            declarations.len(),
+            PERFORMANCE_DECLARATION_DETAIL_LIMIT,
+        ),
+        (
+            "candidate_details",
+            candidates.len(),
+            PERFORMANCE_CANDIDATE_DETAIL_LIMIT,
+        ),
+        (
+            "worker_details",
+            workers.len(),
+            PERFORMANCE_WORKER_DETAIL_LIMIT,
+        ),
+    ];
+    if has_package_sharding_schema {
+        detail_families.extend_from_slice(&[
+            (
+                "package_layer_details",
+                package_layer_len,
+                PERFORMANCE_MODULE_DETAIL_LIMIT,
+            ),
+            (
+                "package_shard_details",
+                package_shard_len,
+                PERFORMANCE_WORKER_DETAIL_LIMIT,
+            ),
+        ]);
+    }
+    let mut any_omitted = false;
+    for (family, actual_len, limit) in detail_families {
+        let omitted = validate_measurement_detail_counts(
+            value(&report, family),
+            &format!("{WHERE}.{family}"),
+            actual_len,
+            limit,
+        )?;
+        any_omitted |= omitted > 0;
+    }
+    if require_bool(
+        value(&report, "detail_truncated"),
+        &format!("{WHERE}.detail_truncated"),
+    )? != any_omitted
+    {
+        return Err(ReleaseManifestValidationError::new(format!(
+            "{WHERE}.detail_truncated disagrees with omitted detail counts"
+        )));
+    }
+    if mode == Some("summary")
+        && (!modules.is_empty()
+            || !declarations.is_empty()
+            || !candidates.is_empty()
+            || !workers.is_empty()
+            || package_layer_len != 0
+            || package_shard_len != 0
+            || any_omitted)
+    {
+        return Err(ReleaseManifestValidationError::new(format!(
+            "{WHERE} summary mode must not contain detail records"
+        )));
+    }
+    let clock_where = format!("{WHERE}.clock");
+    let clock = require_object(value(&report, "clock"), &clock_where)?;
+    require_fields(
+        &clock,
+        &["source", "resolution_ns", "coarse_stage_reads"],
+        &clock_where,
+        &[],
+    )?;
+    if value(&clock, "source").string_value() != Some("std.monotonic.instant") {
+        return Err(ReleaseManifestValidationError::new(format!(
+            "{clock_where}.source is invalid"
+        )));
+    }
+    for field in ["resolution_ns", "coarse_stage_reads"] {
+        require_measurement_u64(value(&clock, field), &format!("{clock_where}.{field}"))?;
+    }
+    Ok(())
+}
+
+fn validate_package_module_sharding(
+    raw: &JsonValue<'_>,
+    where_: &str,
+) -> Result<(), ReleaseManifestValidationError> {
+    if raw.kind() == JsonValueKind::Null {
+        return Ok(());
+    }
+    let measurement = require_object(raw, where_)?;
+    require_fields(
+        &measurement,
+        &[
+            "cost_model",
+            "artifact_bytes",
+            "direct_import_count",
+            "estimated_cost",
+            "layer_index",
+            "shard_index",
+            "cost_overflowed",
+            "critical_path",
+        ],
+        where_,
+        &[],
+    )?;
+    if value(&measurement, "cost_model").string_value() != Some("npa.fast-shard-cost.v1") {
+        return Err(ReleaseManifestValidationError::new(format!(
+            "{where_}.cost_model is unsupported"
+        )));
+    }
+    let artifact_bytes = require_measurement_u64(
+        value(&measurement, "artifact_bytes"),
+        &format!("{where_}.artifact_bytes"),
+    )?;
+    let direct_import_count = require_measurement_u64(
+        value(&measurement, "direct_import_count"),
+        &format!("{where_}.direct_import_count"),
+    )?;
+    let estimated_cost = require_measurement_u64(
+        value(&measurement, "estimated_cost"),
+        &format!("{where_}.estimated_cost"),
+    )?;
+    let layer_index = if value(&measurement, "layer_index").kind() == JsonValueKind::Null {
+        None
+    } else {
+        Some(require_measurement_u64(
+            value(&measurement, "layer_index"),
+            &format!("{where_}.layer_index"),
+        )?)
+    };
+    let shard_index = if value(&measurement, "shard_index").kind() == JsonValueKind::Null {
+        None
+    } else {
+        Some(require_measurement_u64(
+            value(&measurement, "shard_index"),
+            &format!("{where_}.shard_index"),
+        )?)
+    };
+    if shard_index.is_some() && layer_index.is_none() {
+        return Err(ReleaseManifestValidationError::new(format!(
+            "{where_}.shard_index requires layer_index"
+        )));
+    }
+    let cost_overflowed = require_bool(
+        value(&measurement, "cost_overflowed"),
+        &format!("{where_}.cost_overflowed"),
+    )?;
+    require_bool(
+        value(&measurement, "critical_path"),
+        &format!("{where_}.critical_path"),
+    )?;
+    let (import_cost, multiply_overflowed) = direct_import_count
+        .checked_mul(4_096)
+        .map_or((u64::MAX, true), |cost| (cost, false));
+    let (expected_cost, add_overflowed) = if multiply_overflowed {
+        (u64::MAX, false)
+    } else {
+        artifact_bytes
+            .checked_add(import_cost)
+            .map_or((u64::MAX, true), |cost| (cost.max(1), false))
+    };
+    if estimated_cost != expected_cost || cost_overflowed != (multiply_overflowed || add_overflowed)
+    {
+        return Err(ReleaseManifestValidationError::new(format!(
+            "{where_} disagrees with npa.fast-shard-cost.v1"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_package_sharding_summary(
+    raw: &JsonValue<'_>,
+    parent_where: &str,
+) -> Result<bool, ReleaseManifestValidationError> {
+    let where_ = format!("{parent_where}.package_sharding");
+    if raw.kind() == JsonValueKind::Null {
+        return Ok(false);
+    }
+    let measurement = require_object(raw, &where_)?;
+    require_fields(
+        &measurement,
+        &[
+            "cost_model",
+            "memory_model",
+            "import_weight",
+            "memory_budget_bytes",
+            "fixed_worker_bytes",
+            "scratch_multiplier",
+            "requested_jobs",
+            "effective_jobs",
+            "reduction_reason",
+            "shared_base_context_bytes",
+            "per_worker_bytes",
+            "avoided_base_context_clone_bytes",
+            "estimate_overflowed",
+            "critical_path_cost",
+            "critical_path_module_count",
+            "critical_path_identity",
+            "critical_path_checker_elapsed_ns",
+            "barrier_elapsed_ns",
+        ],
+        &where_,
+        &[],
+    )?;
+    if value(&measurement, "cost_model").string_value() != Some("npa.fast-shard-cost.v1")
+        || value(&measurement, "memory_model").string_value() != Some("npa.fast-shard-memory.v1")
+    {
+        return Err(ReleaseManifestValidationError::new(format!(
+            "{where_} has an unsupported model identifier"
+        )));
+    }
+    for (field, expected) in [
+        ("import_weight", 4_096),
+        ("memory_budget_bytes", 1_073_741_824),
+        ("fixed_worker_bytes", 8_388_608),
+        ("scratch_multiplier", 4),
+    ] {
+        if require_measurement_u64(value(&measurement, field), &format!("{where_}.{field}"))?
+            != expected
+        {
+            return Err(ReleaseManifestValidationError::new(format!(
+                "{where_}.{field} disagrees with the declared model identifier"
+            )));
+        }
+    }
+    for field in [
+        "import_weight",
+        "memory_budget_bytes",
+        "fixed_worker_bytes",
+        "scratch_multiplier",
+        "requested_jobs",
+        "effective_jobs",
+        "shared_base_context_bytes",
+        "per_worker_bytes",
+        "avoided_base_context_clone_bytes",
+        "critical_path_cost",
+        "critical_path_module_count",
+        "critical_path_checker_elapsed_ns",
+        "barrier_elapsed_ns",
+    ] {
+        require_measurement_u64(value(&measurement, field), &format!("{where_}.{field}"))?;
+    }
+    validate_fast_shard_reduction_reason(
+        value(&measurement, "reduction_reason"),
+        &format!("{where_}.reduction_reason"),
+    )?;
+    require_bool(
+        value(&measurement, "estimate_overflowed"),
+        &format!("{where_}.estimate_overflowed"),
+    )?;
+    verification_hash(
+        value(&measurement, "critical_path_identity"),
+        &format!("{where_}.critical_path_identity"),
+    )?;
+    Ok(true)
+}
+
+fn validate_fast_shard_reduction_reason(
+    raw: &JsonValue<'_>,
+    where_: &str,
+) -> Result<(), ReleaseManifestValidationError> {
+    if !matches!(
+        raw.string_value(),
+        Some("none" | "requested_one" | "runnable_width" | "memory_budget" | "estimate_overflow")
+    ) {
+        return Err(ReleaseManifestValidationError::new(format!(
+            "{where_} is invalid"
+        )));
+    }
+    Ok(())
+}
+
+fn require_measurement_u64(
+    raw: &JsonValue<'_>,
+    where_: &str,
+) -> Result<u64, ReleaseManifestValidationError> {
+    let value = DecimalNat::parse(raw, where_)?;
+    value.0.parse::<u64>().map_err(|_| {
+        ReleaseManifestValidationError::new(format!("{where_} exceeds the u64 schema limit"))
+    })
+}
+
+fn validate_measurement_detail_counts(
+    raw: &JsonValue<'_>,
+    where_: &str,
+    actual_len: usize,
+    limit: usize,
+) -> Result<u64, ReleaseManifestValidationError> {
+    let details = require_object(raw, where_)?;
+    require_fields(&details, &["attempted", "retained", "omitted"], where_, &[])?;
+    let attempted =
+        require_measurement_u64(value(&details, "attempted"), &format!("{where_}.attempted"))?;
+    let retained =
+        require_measurement_u64(value(&details, "retained"), &format!("{where_}.retained"))?;
+    let omitted =
+        require_measurement_u64(value(&details, "omitted"), &format!("{where_}.omitted"))?;
+    if retained != u64::try_from(actual_len).unwrap_or(u64::MAX)
+        || retained > u64::try_from(limit).unwrap_or(u64::MAX)
+        || retained.checked_add(omitted) != Some(attempted)
+    {
+        return Err(ReleaseManifestValidationError::new(format!(
+            "{where_} disagrees with retained records or its schema limit"
+        )));
+    }
+    Ok(omitted)
+}
+
+fn validate_measurement_records(
+    raw: &JsonValue<'_>,
+    where_: &str,
+    fields: &[&str],
+    text_fields: &[&str],
+) -> Result<(), ReleaseManifestValidationError> {
+    validate_measurement_records_with_opaque(raw, where_, fields, text_fields, &[])
+}
+
+fn validate_measurement_records_with_opaque(
+    raw: &JsonValue<'_>,
+    where_: &str,
+    fields: &[&str],
+    text_fields: &[&str],
+    opaque_fields: &[&str],
+) -> Result<(), ReleaseManifestValidationError> {
+    for (index, raw_record) in require_array(raw, where_)?.iter().enumerate() {
+        let item_where = format!("{where_}[{index}]");
+        let record = require_object(raw_record, &item_where)?;
+        require_fields(&record, fields, &item_where, &[])?;
+        for field in fields {
+            if opaque_fields.contains(field) {
+                continue;
+            } else if text_fields.contains(field) {
+                require_text(value(&record, field), &format!("{item_where}.{field}"))?;
+            } else {
+                require_measurement_u64(value(&record, field), &format!("{item_where}.{field}"))?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_external_identity<'value, 'source>(
@@ -1665,8 +2455,16 @@ fn validate_result_agreement(
         }
     }
 
-    let expected_telemetry_count =
-        usize::from(result.contains_key("timings") && external.is_none());
+    let legacy_timing_diagnostics = if result.contains_key("timings") {
+        let timings = require_object(
+            value(result, "timings"),
+            "verification.command_result.timings",
+        )?;
+        value(&timings, "schema").string_value() == Some(TIMINGS_SCHEMA_V0_1)
+    } else {
+        false
+    };
+    let expected_telemetry_count = usize::from(legacy_timing_diagnostics && external.is_none());
     if process_memo.len() != expected_telemetry_count {
         return Err(ReleaseManifestValidationError::new(
             "command_result process_memo_summary diagnostics disagree with timing mode",
@@ -1924,7 +2722,16 @@ fn validate_manifest(
 
 #[cfg(test)]
 mod tests {
-    use super::{shell_words, validate_timestamp, JsonDocument};
+    use super::{
+        shell_words, validate_command_result_shape, validate_performance_measurements,
+        validate_timestamp, JsonDocument,
+    };
+    use npa_api::{
+        performance_measurement_report_json, PerformanceMeasurementLabel,
+        PerformanceMeasurementMode, PerformanceMeasurementRecorder, PerformanceModuleMeasurement,
+        PerformancePackageShardCostModel, PerformancePackageShardMemoryModel,
+        PerformancePackageShardReductionReason, PerformancePackageShardingMeasurement,
+    };
 
     #[test]
     fn shell_words_support_quotes_and_escapes_without_evaluation() {
@@ -1953,5 +2760,172 @@ mod tests {
         validate_timestamp(valid.root(), "timestamp").expect("valid leap-day timestamp");
         let invalid = JsonDocument::parse("\"2023-02-29T00:00:00Z\"").expect("valid JSON");
         assert!(validate_timestamp(invalid.root(), "timestamp").is_err());
+    }
+
+    #[test]
+    fn common_measurement_validator_is_strict_and_rejects_evidence_claims() {
+        let mut recorder = PerformanceMeasurementRecorder::new(PerformanceMeasurementMode::Summary);
+        recorder.add_counter(PerformanceMeasurementLabel::PackageModulesChecked, 2);
+        let json = performance_measurement_report_json(&recorder.report().unwrap());
+        let valid = JsonDocument::parse(&json).unwrap();
+        validate_performance_measurements(valid.root(), "summary").unwrap();
+
+        let legacy_v0_1 = legacy_performance_measurements_v0_1(&json);
+        let legacy = JsonDocument::parse(&legacy_v0_1).unwrap();
+        validate_performance_measurements(legacy.root(), "summary").unwrap();
+
+        let legacy_with_v0_2_label = legacy_v0_1.replace(
+            "\"label\":\"package.modules_checked\",\"unit\":\"count\"",
+            "\"label\":\"package.avoided_base_context_clone_bytes\",\"unit\":\"bytes\"",
+        );
+        let legacy_with_v0_2_label = JsonDocument::parse(&legacy_with_v0_2_label).unwrap();
+        assert!(
+            validate_performance_measurements(legacy_with_v0_2_label.root(), "summary").is_err()
+        );
+
+        let old_schema_with_new_shape = json.replacen(
+            "\"schema\":\"npa.performance.measurements.v0.2\"",
+            "\"schema\":\"npa.performance.measurements.v0.1\"",
+            1,
+        );
+        let old_schema_with_new_shape = JsonDocument::parse(&old_schema_with_new_shape).unwrap();
+        assert!(
+            validate_performance_measurements(old_schema_with_new_shape.root(), "summary").is_err()
+        );
+
+        let new_schema_with_old_shape = legacy_v0_1.replacen(
+            "\"schema\":\"npa.performance.measurements.v0.1\"",
+            "\"schema\":\"npa.performance.measurements.v0.2\"",
+            1,
+        );
+        let new_schema_with_old_shape = JsonDocument::parse(&new_schema_with_old_shape).unwrap();
+        assert!(
+            validate_performance_measurements(new_schema_with_old_shape.root(), "summary").is_err()
+        );
+
+        let evidence = json.replacen("\"proof_evidence\":false", "\"proof_evidence\":true", 1);
+        let evidence = JsonDocument::parse(&evidence).unwrap();
+        assert!(validate_performance_measurements(evidence.root(), "summary").is_err());
+
+        let non_default_summary_details = json
+            .replace(
+                "\"module_details\":{\"attempted\":0,\"retained\":0,\"omitted\":0}",
+                "\"module_details\":{\"attempted\":1,\"retained\":0,\"omitted\":1}",
+            )
+            .replace("\"detail_truncated\":false", "\"detail_truncated\":true");
+        let non_default_summary_details =
+            JsonDocument::parse(&non_default_summary_details).unwrap();
+        assert!(
+            validate_performance_measurements(non_default_summary_details.root(), "summary")
+                .is_err()
+        );
+
+        let mut unknown = json;
+        unknown.pop();
+        unknown.push_str(",\"arbitrary_tag\":1}");
+        let unknown = JsonDocument::parse(&unknown).unwrap();
+        assert!(validate_performance_measurements(unknown.root(), "summary").is_err());
+    }
+
+    #[test]
+    fn common_measurement_validator_accepts_historical_detailed_v0_1_shape() {
+        let mut recorder =
+            PerformanceMeasurementRecorder::new(PerformanceMeasurementMode::Detailed);
+        recorder.record_module(PerformanceModuleMeasurement {
+            module: "Fixture.Module".to_owned(),
+            certificate_bytes: 10,
+            declaration_count: 1,
+            import_count: 0,
+            checker_elapsed_ns: 20,
+            package_sharding: None,
+        });
+        let current = performance_measurement_report_json(&recorder.report().unwrap());
+        let legacy = legacy_performance_measurements_v0_1(&current);
+        assert!(!legacy.contains("package_sharding"));
+        let legacy = JsonDocument::parse(&legacy).unwrap();
+        validate_performance_measurements(legacy.root(), "detailed").unwrap();
+    }
+
+    #[test]
+    fn common_measurement_validator_rejects_unknown_fast_sharding_models_and_reasons() {
+        let mut recorder = PerformanceMeasurementRecorder::new(PerformanceMeasurementMode::Summary);
+        recorder.set_package_sharding(PerformancePackageShardingMeasurement {
+            cost_model: PerformancePackageShardCostModel::FastShardCostV1,
+            memory_model: PerformancePackageShardMemoryModel::FastShardMemoryV1,
+            import_weight: 4_096,
+            memory_budget_bytes: 1_073_741_824,
+            fixed_worker_bytes: 8_388_608,
+            scratch_multiplier: 4,
+            requested_jobs: 4,
+            effective_jobs: 2,
+            reduction_reason: PerformancePackageShardReductionReason::RunnableWidth,
+            shared_base_context_bytes: 10,
+            per_worker_bytes: 20,
+            avoided_base_context_clone_bytes: 20,
+            estimate_overflowed: false,
+            critical_path_cost: 30,
+            critical_path_module_count: 2,
+            critical_path_identity: format!("sha256:{}", "00".repeat(32)),
+            critical_path_checker_elapsed_ns: 40,
+            barrier_elapsed_ns: 50,
+        });
+        let json = performance_measurement_report_json(&recorder.report().unwrap());
+        let valid = JsonDocument::parse(&json).unwrap();
+        validate_performance_measurements(valid.root(), "summary").unwrap();
+
+        let unknown_cost_model = json.replacen(
+            "\"cost_model\":\"npa.fast-shard-cost.v1\"",
+            "\"cost_model\":\"npa.fast-shard-cost.v2\"",
+            1,
+        );
+        let unknown_cost_model = JsonDocument::parse(&unknown_cost_model).unwrap();
+        assert!(validate_performance_measurements(unknown_cost_model.root(), "summary").is_err());
+
+        let unknown_reason = json.replacen(
+            "\"reduction_reason\":\"runnable_width\"",
+            "\"reduction_reason\":\"heuristic\"",
+            1,
+        );
+        let unknown_reason = JsonDocument::parse(&unknown_reason).unwrap();
+        assert!(validate_performance_measurements(unknown_reason.root(), "summary").is_err());
+
+        let inconsistent_weight = json.replacen("\"import_weight\":4096", "\"import_weight\":1", 1);
+        let inconsistent_weight = JsonDocument::parse(&inconsistent_weight).unwrap();
+        assert!(validate_performance_measurements(inconsistent_weight.root(), "summary").is_err());
+    }
+
+    #[test]
+    fn command_result_validator_accepts_integrated_timing_v0_2() {
+        let mut recorder = PerformanceMeasurementRecorder::new(PerformanceMeasurementMode::Summary);
+        recorder.add_counter(PerformanceMeasurementLabel::PackageModulesChecked, 2);
+        let measurements =
+            performance_measurement_report_json(&recorder.report().expect("enabled report"));
+        let source = format!(
+            "{{\"schema\":\"npa.package.command_result.v0.3\",\"command\":\"package verify-certs\",\"root\":\".\",\"status\":\"passed\",\"diagnostics\":[{{\"kind\":\"GeneratedArtifact\",\"reason_code\":\"package_verified\",\"severity\":\"info\"}}],\"artifacts\":[],\"timings\":{{\"schema\":\"npa.package.timings.v0.2\",\"mode\":\"summary\",\"unit\":\"ms\",\"proof_evidence\":false,\"build_evidence\":false,\"trusted\":false,\"total_ms\":1,\"measurements\":{measurements}}}}}"
+        );
+        let document = JsonDocument::parse(&source).unwrap();
+        validate_command_result_shape(document.root(), "0.7.0").unwrap();
+
+        let mismatched_measurements =
+            measurements.replacen("\"mode\":\"summary\"", "\"mode\":\"detailed\"", 1);
+        let mismatched_source = format!(
+            "{{\"schema\":\"npa.package.command_result.v0.3\",\"command\":\"package verify-certs\",\"root\":\".\",\"status\":\"passed\",\"diagnostics\":[{{\"kind\":\"GeneratedArtifact\",\"reason_code\":\"package_verified\",\"severity\":\"info\"}}],\"artifacts\":[],\"timings\":{{\"schema\":\"npa.package.timings.v0.2\",\"mode\":\"summary\",\"unit\":\"ms\",\"proof_evidence\":false,\"build_evidence\":false,\"trusted\":false,\"total_ms\":1,\"measurements\":{mismatched_measurements}}}}}"
+        );
+        let mismatched_document = JsonDocument::parse(&mismatched_source).unwrap();
+        assert!(validate_command_result_shape(mismatched_document.root(), "0.7.0").is_err());
+    }
+
+    fn legacy_performance_measurements_v0_1(current: &str) -> String {
+        current
+            .replace(
+                ",\"package_sharding\":null,\"package_layers\":[],\"package_layer_details\":{\"attempted\":0,\"retained\":0,\"omitted\":0},\"package_shards\":[],\"package_shard_details\":{\"attempted\":0,\"retained\":0,\"omitted\":0}",
+                "",
+            )
+            .replace(",\"package_sharding\":null}", "}")
+            .replacen(
+                "\"schema\":\"npa.performance.measurements.v0.2\"",
+                "\"schema\":\"npa.performance.measurements.v0.1\"",
+                1,
+            )
     }
 }

@@ -6,9 +6,11 @@ pub mod env;
 pub mod error;
 pub mod expr;
 pub mod level;
+mod memo;
 pub mod name;
 pub mod positivity;
 pub mod subst;
+pub mod work;
 
 pub use builtins::{
     eq, eq_inductive, eq_rec_type, eq_refl, eq_refl_type, eq_type, nat, nat_inductive,
@@ -30,8 +32,10 @@ pub use level::{
     Level, UniverseConstraint, UniverseConstraintRelation, UniverseContext,
     MAX_UNIVERSE_ATOM_INEQUALITIES, MAX_UNIVERSE_CONTEXT_NODES,
 };
+pub use memo::{KernelExecutionOptions, KernelMemoMode, KERNEL_MEMO_LIMITS_V1};
 pub use name::{is_canonical_dotted_name, is_canonical_name_component};
 pub use positivity::{approved_nested_functor, ApprovedNestedFunctor, APPROVED_NESTED_FUNCTORS};
+pub use work::{KernelWorkCounterSink, KernelWorkCounters};
 
 #[cfg(test)]
 mod tests {
@@ -94,6 +98,68 @@ mod tests {
         assert_eq!(conversion.lhs_head().as_str(), "application");
         assert_eq!(conversion.rhs_head().as_str(), "application");
         assert_eq!(conversion.depth(), 0);
+    }
+
+    #[test]
+    fn optional_work_meter_preserves_kernel_result() {
+        let mut env = Env::with_builtins().unwrap();
+        let term = nat_zero();
+        let ordinary = env.infer(&Ctx::new(), &[], &term).unwrap();
+        let mut counters = KernelWorkCounters::default();
+        let measured = env
+            .infer_with_work_counters(&Ctx::new(), &[], &term, Some(&mut counters))
+            .unwrap();
+        assert_eq!(measured, ordinary);
+        assert_eq!(counters.infer_calls, 1);
+        assert!(env
+            .is_defeq_with_work_counters(&Ctx::new(), &[], &term, &term, Some(&mut counters),)
+            .is_ok());
+        assert_eq!(counters.defeq_calls, 1);
+        assert!(counters.logical_fuel > 0);
+        assert_eq!(counters.successful_fuel, counters.logical_fuel);
+        assert_eq!(counters.exhausted_fuel, 0);
+
+        let beta = Expr::app(Expr::lam("x", nat(), Expr::bvar(0)), nat_zero());
+        env.whnf_with_work_counters(&Ctx::new(), &[], &beta, Some(&mut counters))
+            .unwrap();
+        let zeta = Expr::let_in("x", nat(), nat_zero(), Expr::bvar(0));
+        env.whnf_with_work_counters(&Ctx::new(), &[], &zeta, Some(&mut counters))
+            .unwrap();
+        env.add_def(
+            "Measured.zero",
+            vec![],
+            nat(),
+            nat_zero(),
+            Reducibility::Reducible,
+        )
+        .unwrap();
+        env.whnf_with_work_counters(
+            &Ctx::new(),
+            &[],
+            &Expr::konst("Measured.zero", vec![]),
+            Some(&mut counters),
+        )
+        .unwrap();
+        let motive = Expr::lam("_", nat(), nat());
+        let step = Expr::lam("_", nat(), Expr::lam("ih", nat(), nat_succ(Expr::bvar(0))));
+        let recursor = Expr::apps(
+            Expr::konst("Nat.rec", vec![type0()]),
+            vec![motive, nat_zero(), step, nat_zero()],
+        );
+        env.whnf_with_work_counters(&Ctx::new(), &[], &recursor, Some(&mut counters))
+            .unwrap();
+        let mut context = Ctx::new();
+        context.push_definition("x", nat(), nat_zero());
+        env.whnf_with_work_counters(&context, &[], &Expr::bvar(0), Some(&mut counters))
+            .unwrap();
+
+        assert_eq!(counters.beta_steps, 1);
+        assert_eq!(counters.delta_steps, 1);
+        assert_eq!(counters.iota_steps, 1);
+        assert_eq!(counters.zeta_steps, 2);
+        assert_eq!(counters.physical_reductions, 5);
+        assert_eq!(counters.context_lookups, 1);
+        assert_eq!(counters.context_shifts, 1);
     }
 
     #[test]

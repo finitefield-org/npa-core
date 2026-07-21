@@ -26,6 +26,7 @@ pub struct ResolvedHumanModule {
     pub state: HumanFrontendState,
     pub global_scope: HumanGlobalScope,
     pub resolved_names: Vec<HumanResolvedNameUse>,
+    pub resolved_opens: Vec<HumanResolvedOpenDirective>,
     pub notation_table: Vec<HumanResolvedNotationEntry>,
     pub resolved_notations: Vec<HumanResolvedNotationUse>,
     pub resolved_equations: Vec<HumanResolvedEquationItem>,
@@ -69,6 +70,13 @@ pub enum HumanGlobalRef {
 pub struct HumanResolvedNameUse {
     pub source: HumanName,
     pub resolved: HumanResolvedName,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HumanResolvedOpenDirective {
+    pub source: HumanName,
+    pub namespace: HumanName,
+    pub span: Span,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -172,6 +180,16 @@ pub fn resolve_human_module_with_source_interfaces(
         .map_err(|diagnostic| diagnostic.with_default_phase(HumanDiagnosticPhase::Resolver))
 }
 
+/// Fill a resolved source interface with the hashes authenticated by an import certificate.
+pub fn bind_human_source_interface_to_verified_import(
+    source_interface: HumanSourceInterface,
+    import: &VerifiedImport,
+    span: Span,
+) -> HumanResult<HumanSourceInterface> {
+    reconcile_source_interface_with_verified_import(source_interface, import, span)
+        .map_err(|diagnostic| diagnostic.with_default_phase(HumanDiagnosticPhase::Resolver))
+}
+
 struct HumanResolver<'a> {
     verified_imports: &'a [VerifiedImport],
     imported_source_interfaces: &'a [HumanImportedSourceInterface],
@@ -180,6 +198,7 @@ struct HumanResolver<'a> {
     state: HumanFrontendState,
     global_scope: HumanGlobalScope,
     resolved_names: Vec<HumanResolvedNameUse>,
+    resolved_opens: Vec<HumanResolvedOpenDirective>,
     notation_table: Vec<HumanResolvedNotationEntry>,
     resolved_notations: Vec<HumanResolvedNotationUse>,
     resolved_equations: Vec<HumanResolvedEquationItem>,
@@ -204,6 +223,7 @@ impl<'a> HumanResolver<'a> {
             state: HumanFrontendState::new(module_name),
             global_scope: HumanGlobalScope::default(),
             resolved_names: Vec::new(),
+            resolved_opens: Vec::new(),
             notation_table: Vec::new(),
             resolved_notations: Vec::new(),
             resolved_equations: Vec::new(),
@@ -241,6 +261,7 @@ impl<'a> HumanResolver<'a> {
             state: self.state,
             global_scope: self.global_scope,
             resolved_names: self.resolved_names,
+            resolved_opens: self.resolved_opens,
             notation_table: self.notation_table,
             resolved_notations: self.resolved_notations,
             resolved_equations: self.resolved_equations,
@@ -1707,7 +1728,13 @@ impl<'a> HumanResolver<'a> {
         match item {
             HumanItem::Import { .. } => {}
             HumanItem::Open { namespace, span } => {
+                let source = namespace.clone();
                 let namespace = self.resolve_namespace(namespace)?;
+                self.resolved_opens.push(HumanResolvedOpenDirective {
+                    source,
+                    namespace: namespace.clone(),
+                    span: *span,
+                });
                 let open = HumanOpenScope {
                     namespace: namespace.clone(),
                     span: *span,

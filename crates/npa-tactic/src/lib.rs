@@ -4049,6 +4049,164 @@ impl MachineProofState {
     }
 }
 
+/// Diagnostic counters for work performed or reused by one prepared snapshot.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MachineTacticPreparationCounters {
+    pub complete_input_state_validations: u64,
+    pub selected_goal_projections: u64,
+    pub selected_context_projections: u64,
+    pub candidate_local_validations: u64,
+    pub candidate_executions: u64,
+    pub input_state_validation_reuses: u64,
+    pub goal_projection_reuses: u64,
+    pub output_state_clones: u64,
+    pub output_state_validations: u64,
+}
+
+#[derive(Debug)]
+struct ValidatedBaseState<'a> {
+    state: &'a MachineProofState,
+}
+
+/// An opaque capability proving that one borrowed proof state and selected goal
+/// passed complete validation and stable projection.
+///
+/// The lifetime binds every prepared operation to the exact immutable state
+/// used during construction. Successful execution still validates its fully
+/// materialized output state.
+#[derive(Debug)]
+pub struct PreparedMachineTacticSnapshot<'a> {
+    validated_base: ValidatedBaseState<'a>,
+    state_fingerprint: Hash,
+    state_id: String,
+    env_fingerprint: Hash,
+    options_fingerprint: Hash,
+    goal: MachineGoal,
+    goal_index: usize,
+    local_name_indices: BTreeMap<String, Vec<usize>>,
+    complete_input_state_validations: Cell<u64>,
+    selected_goal_projections: Cell<u64>,
+    selected_context_projections: Cell<u64>,
+    candidate_local_validations: Cell<u64>,
+    candidate_executions: Cell<u64>,
+    input_state_validation_reuses: Cell<u64>,
+    goal_projection_reuses: Cell<u64>,
+    output_state_clones: Cell<u64>,
+    output_state_validations: Cell<u64>,
+}
+
+impl PreparedMachineTacticSnapshot<'_> {
+    pub fn state_fingerprint(&self) -> Hash {
+        self.state_fingerprint
+    }
+
+    fn goal_id(&self) -> GoalId {
+        self.goal.id
+    }
+
+    fn goal(&self) -> &MachineGoal {
+        &self.goal
+    }
+
+    pub fn counters(&self) -> MachineTacticPreparationCounters {
+        MachineTacticPreparationCounters {
+            complete_input_state_validations: self.complete_input_state_validations.get(),
+            selected_goal_projections: self.selected_goal_projections.get(),
+            selected_context_projections: self.selected_context_projections.get(),
+            candidate_local_validations: self.candidate_local_validations.get(),
+            candidate_executions: self.candidate_executions.get(),
+            input_state_validation_reuses: self.input_state_validation_reuses.get(),
+            goal_projection_reuses: self.goal_projection_reuses.get(),
+            output_state_clones: self.output_state_clones.get(),
+            output_state_validations: self.output_state_validations.get(),
+        }
+    }
+
+    fn state(&self) -> &MachineProofState {
+        let state = self.validated_base.state;
+        debug_assert_eq!(state.fingerprint, self.state_fingerprint);
+        debug_assert_eq!(state.state_id, self.state_id);
+        debug_assert_eq!(state.env.env_fingerprint, self.env_fingerprint);
+        debug_assert_eq!(state.env.options_fingerprint, self.options_fingerprint);
+        state
+    }
+
+    fn record_candidate_validation_reuse(&self) {
+        increment_counter(&self.candidate_local_validations);
+        increment_counter(&self.input_state_validation_reuses);
+        increment_counter(&self.goal_projection_reuses);
+    }
+
+    fn record_candidate_execution_reuse(&self) {
+        increment_counter(&self.candidate_executions);
+        increment_counter(&self.input_state_validation_reuses);
+        increment_counter(&self.goal_projection_reuses);
+    }
+
+    fn record_delta_builder_reuse(&self) {
+        increment_counter(&self.input_state_validation_reuses);
+        increment_counter(&self.goal_projection_reuses);
+    }
+
+    fn record_output_state_clone(&self) {
+        increment_counter(&self.output_state_clones);
+    }
+
+    fn record_output_state_validation(&self) {
+        increment_counter(&self.output_state_validations);
+    }
+}
+
+fn increment_counter(counter: &Cell<u64>) {
+    counter.set(counter.get().saturating_add(1));
+}
+
+/// Validates and projects one immutable proof-state/goal pair for reuse.
+pub fn prepare_machine_tactic_snapshot(
+    state: &MachineProofState,
+    goal_id: GoalId,
+) -> Result<PreparedMachineTacticSnapshot<'_>> {
+    validate_machine_proof_state(state)?;
+    let goal_index = state
+        .open_goals
+        .iter()
+        .position(|open_goal| *open_goal == goal_id)
+        .ok_or_else(|| {
+            MachineTacticDiagnostic::new(
+                MachineTacticDiagnosticKind::UnknownGoal,
+                format!("goal {} is not open", goal_id.0),
+            )
+            .with_goal(goal_id)
+        })?;
+    let goal = state.goal(goal_id)?;
+    let mut local_name_indices = BTreeMap::<String, Vec<usize>>::new();
+    for (index, local) in goal.context.iter().enumerate() {
+        local_name_indices
+            .entry(local.name.clone())
+            .or_default()
+            .push(index);
+    }
+    Ok(PreparedMachineTacticSnapshot {
+        validated_base: ValidatedBaseState { state },
+        state_fingerprint: state.fingerprint,
+        state_id: state.state_id.clone(),
+        env_fingerprint: state.env.env_fingerprint,
+        options_fingerprint: state.env.options_fingerprint,
+        goal,
+        goal_index,
+        local_name_indices,
+        complete_input_state_validations: Cell::new(1),
+        selected_goal_projections: Cell::new(1),
+        selected_context_projections: Cell::new(1),
+        candidate_local_validations: Cell::new(0),
+        candidate_executions: Cell::new(0),
+        input_state_validation_reuses: Cell::new(0),
+        goal_projection_reuses: Cell::new(0),
+        output_state_clones: Cell::new(0),
+        output_state_validations: Cell::new(0),
+    })
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[allow(clippy::large_enum_variant)]
 pub enum MachineTactic {
@@ -4209,6 +4367,7 @@ pub struct MachineTacticBatchResult {
     pub previous_state_fingerprint: Hash,
     pub deterministic_budget_hash: Hash,
     pub results: Vec<MachineTacticBatchItemResult>,
+    pub preparation_counters: MachineTacticPreparationCounters,
 }
 
 pub fn machine_tactic_goal_id(tactic: &MachineTactic) -> GoalId {
@@ -4464,19 +4623,64 @@ pub fn validate_machine_tactic_for_state(
     let goal_id = machine_tactic_goal_id(tactic);
     let tactic_kind = machine_tactic_kind(tactic);
     let result = (|| -> Result<()> {
-        validate_machine_proof_state(state)?;
-        let goal = state.goal(goal_id)?;
+        let prepared = prepare_machine_tactic_snapshot(state, goal_id)?;
+        validate_normalized_machine_tactic_for_prepared_snapshot(
+            &prepared,
+            tactic,
+            validation_budget,
+            profile_version,
+            required_features,
+        )
+    })();
+    result.map_err(|diag| attach_tactic_context(diag, goal_id, tactic_kind))
+}
+
+/// Performs candidate-local validation against a prepared state and goal.
+pub fn validate_normalized_machine_tactic_for_prepared_snapshot(
+    prepared: &PreparedMachineTacticSnapshot<'_>,
+    tactic: &MachineTactic,
+    validation_budget: MachineTacticValidationBudget,
+    profile_version: MachineTacticProfileVersion,
+    required_features: &[MachineTacticFeature],
+) -> Result<()> {
+    let goal_id = machine_tactic_goal_id(tactic);
+    let tactic_kind = machine_tactic_kind(tactic);
+    let result = (|| -> Result<()> {
+        ensure_tactic_uses_prepared_goal(prepared, tactic)?;
+        prepared.record_candidate_validation_reuse();
+        let state = prepared.state();
+        let goal = prepared.goal();
         validate_machine_tactic_profile_and_features(
             tactic,
             profile_version,
             required_features,
-            &goal,
+            goal,
         )?;
-        validate_machine_tactic_payload_budget(state, &goal, tactic, validation_budget)?;
-        validate_machine_tactic_state_refs(state, &goal, tactic)?;
+        validate_machine_tactic_payload_budget(state, goal, tactic, validation_budget)?;
+        validate_machine_tactic_state_refs_for_prepared_snapshot(prepared, tactic)?;
         Ok(())
     })();
     result.map_err(|diag| attach_tactic_context(diag, goal_id, tactic_kind))
+}
+
+fn ensure_tactic_uses_prepared_goal(
+    prepared: &PreparedMachineTacticSnapshot<'_>,
+    tactic: &MachineTactic,
+) -> Result<()> {
+    let actual = machine_tactic_goal_id(tactic);
+    if actual == prepared.goal_id() {
+        return Ok(());
+    }
+    Err(MachineTacticDiagnostic::new(
+        MachineTacticDiagnosticKind::UnknownGoal,
+        format!(
+            "prepared snapshot is for goal {}, not goal {}",
+            prepared.goal_id().0,
+            actual.0
+        ),
+    )
+    .with_goal(actual)
+    .with_meta(MetaVarId::from(actual)))
 }
 
 fn validate_machine_tactic_profile_and_features(
@@ -4890,11 +5094,12 @@ fn apply_arg_subgoal_count(args: &[ApplyArg]) -> u64 {
         .count() as u64
 }
 
-fn validate_machine_tactic_state_refs(
-    state: &MachineProofState,
-    goal: &MachineGoal,
+fn validate_machine_tactic_state_refs_for_prepared_snapshot(
+    prepared: &PreparedMachineTacticSnapshot<'_>,
     tactic: &MachineTactic,
 ) -> Result<()> {
+    let state = prepared.state();
+    let goal = prepared.goal();
     match tactic {
         MachineTactic::Exact { term, .. } => validate_machine_term_source(term),
         MachineTactic::Intro { name, .. } => {
@@ -4908,7 +5113,7 @@ fn validate_machine_tactic_state_refs(
             ..
         } => {
             validate_universe_args_wf("apply", &state.root.universe_params, universe_args, goal)?;
-            validate_apply_head_static(state, goal, head, universe_args)?;
+            validate_apply_head_static_for_prepared_snapshot(prepared, head, universe_args)?;
             validate_apply_args_for_state(args, goal)
         }
         MachineTactic::Rewrite { rule, .. } => {
@@ -4918,7 +5123,11 @@ fn validate_machine_tactic_state_refs(
                 &rule.universe_args,
                 goal,
             )?;
-            validate_apply_head_static(state, goal, &rule.head, &rule.universe_args)?;
+            validate_apply_head_static_for_prepared_snapshot(
+                prepared,
+                &rule.head,
+                &rule.universe_args,
+            )?;
             validate_apply_args_for_state(&rule.args, goal)
         }
         MachineTactic::SimpLite { rules, .. } => {
@@ -4932,12 +5141,16 @@ fn validate_machine_tactic_state_refs(
                     &lemma.universe_args,
                     goal,
                 )?;
-                validate_apply_head_static(state, goal, &lemma.head, &lemma.universe_args)?;
+                validate_apply_head_static_for_prepared_snapshot(
+                    prepared,
+                    &lemma.head,
+                    &lemma.universe_args,
+                )?;
             }
             Ok(())
         }
         MachineTactic::InductionNat { local_name, .. } => {
-            resolve_induction_nat_target(goal, local_name)?;
+            resolve_induction_nat_target(prepared, local_name)?;
             let family = state.env.nat_family.as_ref().ok_or_else(|| {
                 MachineTacticDiagnostic::new(
                     MachineTacticDiagnosticKind::TacticPrimitiveUnavailable,
@@ -4955,15 +5168,19 @@ fn validate_machine_tactic_state_refs(
             Ok(())
         }
         MachineTactic::Cases { payload, .. } => {
-            resolve_goal_local_reference(goal, &payload.major_local, "cases major local")?;
+            resolve_prepared_goal_local_reference(
+                prepared,
+                &payload.major_local,
+                "cases major local",
+            )?;
             if let Some(motive) = &payload.motive {
                 validate_machine_term_source(motive)?;
             }
             Ok(())
         }
         MachineTactic::GeneralInduction { payload, .. } => {
-            resolve_goal_local_reference(
-                goal,
+            resolve_prepared_goal_local_reference(
+                prepared,
                 &payload.major_local,
                 "general-induction major local",
             )?;
@@ -4972,7 +5189,11 @@ fn validate_machine_tactic_state_refs(
                 validate_machine_term_source(motive)?;
             }
             for local in &payload.generalized_locals {
-                resolve_goal_local_reference(goal, local, "general-induction generalized local")?;
+                resolve_prepared_goal_local_reference(
+                    prepared,
+                    local,
+                    "general-induction generalized local",
+                )?;
             }
             Ok(())
         }
@@ -4987,7 +5208,11 @@ fn validate_machine_tactic_state_refs(
             validate_local_lemma_proof_for_state(&payload.proof)
         }
         MachineTactic::Specialize { payload, .. } => {
-            resolve_goal_local_reference(goal, &payload.local_name, "specialize local")?;
+            resolve_prepared_goal_local_reference(
+                prepared,
+                &payload.local_name,
+                "specialize local",
+            )?;
             validate_universe_args_wf(
                 "specialize",
                 &state.root.universe_params,
@@ -5005,32 +5230,40 @@ fn validate_machine_tactic_state_refs(
         }
         MachineTactic::Revert { payload, .. } => {
             for local in &payload.locals {
-                resolve_goal_local_reference(goal, local, "revert local")?;
+                resolve_prepared_goal_local_reference(prepared, local, "revert local")?;
             }
             Ok(())
         }
         MachineTactic::Generalize { payload, .. } => {
-            validate_tactic_target_for_state(goal, &payload.target)?;
+            validate_tactic_target_for_prepared_snapshot(prepared, &payload.target)?;
             validate_machine_term_source(&payload.term)
         }
         MachineTactic::Change { payload, .. } => {
-            validate_tactic_target_for_state(goal, &payload.target)?;
+            validate_tactic_target_for_prepared_snapshot(prepared, &payload.target)?;
             validate_machine_term_source(&payload.replacement)
         }
         MachineTactic::Unfold { payload, .. } => {
-            validate_tactic_target_for_state(goal, &payload.target)?;
-            validate_tactic_head_reference(state, goal, &payload.constant)
+            validate_tactic_target_for_prepared_snapshot(prepared, &payload.target)?;
+            validate_tactic_head_reference_for_prepared_snapshot(prepared, &payload.constant)
         }
         MachineTactic::Congr { payload, .. } => {
-            validate_tactic_target_for_state(goal, &payload.target)
+            validate_tactic_target_for_prepared_snapshot(prepared, &payload.target)
         }
         MachineTactic::Subst { payload, .. } => {
-            resolve_goal_local_reference(goal, &payload.equality_local, "subst equality local")?;
-            validate_tactic_target_for_state(goal, &payload.target)
+            resolve_prepared_goal_local_reference(
+                prepared,
+                &payload.equality_local,
+                "subst equality local",
+            )?;
+            validate_tactic_target_for_prepared_snapshot(prepared, &payload.target)
         }
         MachineTactic::Contradiction { payload, .. } => {
             if let ContradictionMode::Local { major_local } = &payload.mode {
-                resolve_goal_local_reference(goal, major_local, "contradiction local")?;
+                resolve_prepared_goal_local_reference(
+                    prepared,
+                    major_local,
+                    "contradiction local",
+                )?;
             }
             Ok(())
         }
@@ -5074,25 +5307,92 @@ fn validate_local_lemma_proof_for_state(proof: &LocalLemmaProof<MachineTermSourc
     }
 }
 
-fn validate_tactic_target_for_state(goal: &MachineGoal, target: &TacticTarget) -> Result<()> {
+fn resolve_prepared_goal_local_reference<'prepared>(
+    prepared: &'prepared PreparedMachineTacticSnapshot<'_>,
+    name: &str,
+    label: &'static str,
+) -> Result<&'prepared MachineLocalDecl> {
+    let indices = prepared
+        .local_name_indices
+        .get(name)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let [index] = indices else {
+        return Err(if indices.is_empty() {
+            MachineTacticDiagnostic::new(
+                MachineTacticDiagnosticKind::UnknownLocalName,
+                format!("{label} {name:?} is not in the goal context"),
+            )
+        } else {
+            MachineTacticDiagnostic::new(
+                MachineTacticDiagnosticKind::AmbiguousLocalName,
+                format!("{label} {name:?} resolves to multiple locals"),
+            )
+        }
+        .with_goal(prepared.goal.id)
+        .with_meta(prepared.goal.meta_id));
+    };
+    Ok(&prepared.goal.context[*index])
+}
+
+fn prepared_local_index(
+    prepared: &PreparedMachineTacticSnapshot<'_>,
+    name: &str,
+    label: &'static str,
+) -> Result<usize> {
+    resolve_prepared_goal_local_reference(prepared, name, label)?;
+    Ok(prepared.local_name_indices[name][0])
+}
+
+fn resolve_prepared_local_apply_head_index(
+    prepared: &PreparedMachineTacticSnapshot<'_>,
+    name: &str,
+    universe_args: &[Level],
+) -> Result<usize> {
+    let goal = prepared.goal();
+    if !universe_args.is_empty() {
+        return Err(universe_argument_mismatch_diag(
+            &[],
+            universe_args,
+            goal.id,
+            goal.meta_id,
+        ));
+    }
+    let index = prepared_local_index(prepared, name, "apply local head")?;
+    if goal.context[index].value.is_some() {
+        return Err(MachineTacticDiagnostic::new(
+            MachineTacticDiagnosticKind::InvalidLocalHead,
+            format!("apply local head {name:?} resolves to a let declaration"),
+        )
+        .with_goal(goal.id)
+        .with_meta(goal.meta_id));
+    }
+    Ok(index)
+}
+
+fn validate_tactic_target_for_prepared_snapshot(
+    prepared: &PreparedMachineTacticSnapshot<'_>,
+    target: &TacticTarget,
+) -> Result<()> {
     match target {
         TacticTarget::Goal => Ok(()),
         TacticTarget::Local { name } => {
-            resolve_goal_local_reference(goal, name, "tactic target local").map(|_| ())
+            resolve_prepared_goal_local_reference(prepared, name, "tactic target local").map(|_| ())
         }
     }
 }
 
-fn validate_tactic_head_reference(
-    state: &MachineProofState,
-    goal: &MachineGoal,
+fn validate_tactic_head_reference_for_prepared_snapshot(
+    prepared: &PreparedMachineTacticSnapshot<'_>,
     head: &TacticHead,
 ) -> Result<()> {
+    let state = prepared.state();
+    let goal = prepared.goal();
     validate_tactic_head_shape(head)
         .map_err(|diag| attach_goal_meta(diag, goal.id, goal.meta_id))?;
     match head {
         TacticHead::Local { name } => {
-            resolve_goal_local_reference(goal, name, "local tactic head").map(|_| ())
+            resolve_prepared_goal_local_reference(prepared, name, "local tactic head").map(|_| ())
         }
         TacticHead::Imported {
             name,
@@ -5169,34 +5469,6 @@ fn validate_general_induction_recursor_head_reference(
             }
         }
     }
-}
-
-fn resolve_goal_local_reference<'a>(
-    goal: &'a MachineGoal,
-    name: &str,
-    label: &'static str,
-) -> Result<&'a MachineLocalDecl> {
-    let matches = goal
-        .context
-        .iter()
-        .filter(|local| local.name == name)
-        .collect::<Vec<_>>();
-    let [local] = matches.as_slice() else {
-        return Err(if matches.is_empty() {
-            MachineTacticDiagnostic::new(
-                MachineTacticDiagnosticKind::UnknownLocalName,
-                format!("{label} {name:?} is not in the goal context"),
-            )
-        } else {
-            MachineTacticDiagnostic::new(
-                MachineTacticDiagnosticKind::AmbiguousLocalName,
-                format!("{label} {name:?} resolves to multiple locals"),
-            )
-        }
-        .with_goal(goal.id)
-        .with_meta(goal.meta_id));
-    };
-    Ok(local)
 }
 
 fn resolve_imported_tactic_head_reference<'a>(
@@ -5548,87 +5820,111 @@ pub fn run_machine_tactic_with_budget(
     budget: TacticBudget,
 ) -> Result<(MachineProofState, MachineProofDelta)> {
     let goal_id = machine_tactic_goal_id(&tactic);
+    if matches!(&tactic, MachineTactic::Bitblast { .. }) {
+        let tactic_kind = machine_tactic_kind(&tactic);
+        let result = (|| -> Result<(MachineProofState, MachineProofDelta)> {
+            validate_machine_proof_state(state)?;
+            Err(unsupported_machine_tactic(
+                tactic_kind.expect("extended machine tactic has a kind"),
+            ))
+        })();
+        return result.map_err(|diag| attach_tactic_context(diag, goal_id, tactic_kind));
+    }
+    let prepared = prepare_machine_tactic_snapshot(state, goal_id)?;
+    run_machine_tactic_for_prepared_snapshot(&prepared, tactic, budget)
+}
+
+/// Executes one candidate with independent fuel against a prepared base state.
+pub fn run_machine_tactic_for_prepared_snapshot(
+    prepared: &PreparedMachineTacticSnapshot<'_>,
+    tactic: MachineTactic,
+    budget: TacticBudget,
+) -> Result<(MachineProofState, MachineProofDelta)> {
+    let goal_id = machine_tactic_goal_id(&tactic);
     let tactic_kind = machine_tactic_kind(&tactic);
     let result = (|| -> Result<(MachineProofState, MachineProofDelta)> {
-        validate_machine_proof_state(state)?;
+        ensure_tactic_uses_prepared_goal(prepared, &tactic)?;
+        prepared.record_candidate_execution_reuse();
         match tactic {
             MachineTactic::Exact { goal_id, term } => {
-                run_exact_tactic_with_budget(state, goal_id, term, budget)
+                run_exact_tactic_with_budget(prepared, goal_id, term, budget)
             }
             MachineTactic::Intro { goal_id, name } => {
-                run_intro_tactic_with_budget(state, goal_id, name, budget)
+                run_intro_tactic_with_budget(prepared, goal_id, name, budget)
             }
             MachineTactic::Apply {
                 goal_id,
                 head,
                 universe_args,
                 args,
-            } => run_apply_tactic_with_budget(state, goal_id, head, universe_args, args, budget),
+            } => run_apply_tactic_with_budget(prepared, goal_id, head, universe_args, args, budget),
             MachineTactic::Rewrite {
                 goal_id,
                 rule,
                 direction,
                 site,
-            } => run_rewrite_tactic_with_budget(state, goal_id, rule, direction, site, budget),
+            } => run_rewrite_tactic_with_budget(prepared, goal_id, rule, direction, site, budget),
             MachineTactic::SimpLite { goal_id, rules } => {
-                run_simp_lite_tactic_with_budget(state, goal_id, rules, budget)
+                run_simp_lite_tactic_with_budget(prepared, goal_id, rules, budget)
             }
             MachineTactic::Smt { goal_id, lemmas } => {
-                run_smt_tactic_with_budget(state, goal_id, lemmas, budget)
+                run_smt_tactic_with_budget(prepared, goal_id, lemmas, budget)
             }
             MachineTactic::InductionNat {
                 goal_id,
                 local_name,
-            } => run_induction_nat_tactic_with_budget(state, goal_id, local_name, budget),
+            } => run_induction_nat_tactic_with_budget(prepared, goal_id, local_name, budget),
             MachineTactic::Constructor { goal_id, payload } => {
-                run_constructor_tactic_with_budget(state, goal_id, payload, budget)
+                run_constructor_tactic_with_budget(prepared, goal_id, payload, budget)
             }
             MachineTactic::Cases { goal_id, payload } => {
-                run_cases_tactic_with_budget(state, goal_id, payload, budget)
+                run_cases_tactic_with_budget(prepared, goal_id, payload, budget)
             }
             MachineTactic::GeneralInduction { goal_id, payload } => {
-                run_general_induction_tactic_with_budget(state, goal_id, payload, budget)
+                run_general_induction_tactic_with_budget(prepared, goal_id, payload, budget)
             }
             MachineTactic::Refine { goal_id, payload } => {
-                run_refine_tactic_with_budget(state, goal_id, payload, budget)
+                run_refine_tactic_with_budget(prepared, goal_id, payload, budget)
             }
             MachineTactic::Have { goal_id, payload } => {
-                run_have_tactic_with_budget(state, goal_id, payload, budget)
+                run_have_tactic_with_budget(prepared, goal_id, payload, budget)
             }
             MachineTactic::Suffices { goal_id, payload } => {
-                run_suffices_tactic_with_budget(state, goal_id, payload, budget)
+                run_suffices_tactic_with_budget(prepared, goal_id, payload, budget)
             }
             MachineTactic::Specialize { goal_id, payload } => {
-                run_specialize_tactic_with_budget(state, goal_id, payload, budget)
+                run_specialize_tactic_with_budget(prepared, goal_id, payload, budget)
             }
             MachineTactic::Revert { goal_id, payload } => {
-                run_revert_tactic_with_budget(state, goal_id, payload, budget)
+                run_revert_tactic_with_budget(prepared, goal_id, payload, budget)
             }
             MachineTactic::Generalize { goal_id, payload } => {
-                run_generalize_tactic_with_budget(state, goal_id, payload, budget)
+                run_generalize_tactic_with_budget(prepared, goal_id, payload, budget)
             }
             MachineTactic::Change { goal_id, payload } => {
-                run_change_tactic_with_budget(state, goal_id, payload, budget)
+                run_change_tactic_with_budget(prepared, goal_id, payload, budget)
             }
             MachineTactic::Unfold { goal_id, payload } => {
-                run_unfold_tactic_with_budget(state, goal_id, payload, budget)
+                run_unfold_tactic_with_budget(prepared, goal_id, payload, budget)
             }
             MachineTactic::Congr { goal_id, payload } => {
-                run_congr_tactic_with_budget(state, goal_id, payload, budget)
+                run_congr_tactic_with_budget(prepared, goal_id, payload, budget)
             }
             MachineTactic::Subst { goal_id, payload } => {
-                run_subst_tactic_with_budget(state, goal_id, payload, budget)
+                run_subst_tactic_with_budget(prepared, goal_id, payload, budget)
             }
             MachineTactic::Contradiction { goal_id, payload } => {
-                run_contradiction_tactic_with_budget(state, goal_id, payload, budget)
+                run_contradiction_tactic_with_budget(prepared, goal_id, payload, budget)
             }
             MachineTactic::FiniteDecide { goal_id } => {
-                run_finite_decide_tactic_with_budget(state, goal_id, budget)
+                run_finite_decide_tactic_with_budget(prepared, goal_id, budget)
             }
             MachineTactic::Omega { goal_id } => {
-                run_omega_tactic_with_budget(state, goal_id, budget)
+                run_omega_tactic_with_budget(prepared, goal_id, budget)
             }
-            MachineTactic::Ring { goal_id } => run_ring_tactic_with_budget(state, goal_id, budget),
+            MachineTactic::Ring { goal_id } => {
+                run_ring_tactic_with_budget(prepared, goal_id, budget)
+            }
             MachineTactic::Bitblast { .. } => Err(unsupported_machine_tactic(
                 tactic_kind.expect("extended machine tactic has a kind"),
             )),
@@ -5663,8 +5959,7 @@ pub fn run_machine_tactic_candidates_batch(
     policy: MachineTacticBatchPolicy,
 ) -> Result<MachineTacticBatchResult> {
     validate_machine_tactic_batch_request(&candidates, policy)?;
-    validate_machine_proof_state(state)?;
-    state.goal(goal_id)?;
+    let prepared = prepare_machine_tactic_snapshot(state, goal_id)?;
 
     let mut results = Vec::new();
     let mut successes = 0usize;
@@ -5697,8 +5992,8 @@ pub fn run_machine_tactic_candidates_batch(
             }
         };
         let candidate_hash = machine_tactic_hash(&tactic);
-        if let Err(diagnostic) = validate_machine_tactic_for_state(
-            state,
+        if let Err(diagnostic) = validate_normalized_machine_tactic_for_prepared_snapshot(
+            &prepared,
             &tactic,
             MachineTacticValidationBudget::from(budget),
             MachineTacticProfileVersion::StructuralV2,
@@ -5715,8 +6010,8 @@ pub fn run_machine_tactic_candidates_batch(
             continue;
         }
 
-        match run_machine_tactic_transactional(state, tactic, budget) {
-            MachineTacticResult::Success { state, delta } => {
+        match run_machine_tactic_for_prepared_snapshot(&prepared, tactic, budget) {
+            Ok((state, delta)) => {
                 successes += 1;
                 results.push(MachineTacticBatchItemResult::Success {
                     candidate_id,
@@ -5725,7 +6020,7 @@ pub fn run_machine_tactic_candidates_batch(
                     delta,
                 });
             }
-            MachineTacticResult::Error { diagnostic } => {
+            Err(diagnostic) => {
                 failures += 1;
                 results.push(MachineTacticBatchItemResult::Error {
                     candidate_id,
@@ -5742,6 +6037,7 @@ pub fn run_machine_tactic_candidates_batch(
         previous_state_fingerprint: state.fingerprint,
         deterministic_budget_hash: tactic_budget_hash(budget),
         results,
+        preparation_counters: prepared.counters(),
     })
 }
 
@@ -5795,12 +6091,13 @@ fn invalid_batch_policy(message: impl Into<String>) -> MachineTacticDiagnostic {
 }
 
 fn run_exact_tactic_with_budget(
-    state: &MachineProofState,
+    prepared: &PreparedMachineTacticSnapshot<'_>,
     goal_id: GoalId,
     term: MachineTermSource,
     budget: TacticBudget,
 ) -> Result<(MachineProofState, MachineProofDelta)> {
-    let goal = state.goal(goal_id)?;
+    let state = prepared.state();
+    let goal = prepared.goal();
     validate_machine_term_source(&term)
         .map_err(|diag| attach_goal_meta(diag, goal_id, goal.meta_id))?;
     let context = machine_term_elab_context(state, &goal.context)?;
@@ -5814,7 +6111,7 @@ fn run_exact_tactic_with_budget(
     ensure_tactic_step_fuel(budget, 2, goal_id, goal.meta_id)?;
     let fuel = TacticRunFuel::new(budget);
     assign_goal_with_budget_and_steps(
-        state,
+        prepared,
         goal_id,
         ProofExpr::Core(checked.expr),
         Vec::new(),
@@ -5825,11 +6122,12 @@ fn run_exact_tactic_with_budget(
 }
 
 fn run_finite_decide_tactic_with_budget(
-    state: &MachineProofState,
+    prepared: &PreparedMachineTacticSnapshot<'_>,
     goal_id: GoalId,
     budget: TacticBudget,
 ) -> Result<(MachineProofState, MachineProofDelta)> {
-    let goal = state.goal(goal_id)?;
+    let state = prepared.state();
+    let goal = prepared.goal();
     let family = state.env.eq_family.as_ref().ok_or_else(|| {
         MachineTacticDiagnostic::new(
             MachineTacticDiagnosticKind::TacticPrimitiveUnavailable,
@@ -5842,7 +6140,7 @@ fn run_finite_decide_tactic_with_budget(
     let mut required_tactic_steps = 0;
     let proof = finite_decide_proof_for_target(
         state,
-        &goal,
+        goal,
         &goal.context,
         &goal.target,
         family,
@@ -5851,7 +6149,7 @@ fn run_finite_decide_tactic_with_budget(
         &mut required_tactic_steps,
     )?;
     assign_goal_with_budget_and_steps(
-        state,
+        prepared,
         goal_id,
         proof,
         Vec::new(),
@@ -5862,11 +6160,12 @@ fn run_finite_decide_tactic_with_budget(
 }
 
 fn run_omega_tactic_with_budget(
-    state: &MachineProofState,
+    prepared: &PreparedMachineTacticSnapshot<'_>,
     goal_id: GoalId,
     budget: TacticBudget,
 ) -> Result<(MachineProofState, MachineProofDelta)> {
-    let goal = state.goal(goal_id)?;
+    let state = prepared.state();
+    let goal = prepared.goal();
     let family = state.env.eq_family.as_ref().ok_or_else(|| {
         MachineTacticDiagnostic::new(
             MachineTacticDiagnosticKind::TacticPrimitiveUnavailable,
@@ -5879,7 +6178,7 @@ fn run_omega_tactic_with_budget(
     let mut required_tactic_steps = 0;
     let proof = omega_proof_for_target(
         state,
-        &goal,
+        goal,
         &goal.context,
         &goal.target,
         family,
@@ -5888,7 +6187,7 @@ fn run_omega_tactic_with_budget(
         &mut required_tactic_steps,
     )?;
     assign_goal_with_budget_and_steps(
-        state,
+        prepared,
         goal_id,
         proof,
         Vec::new(),
@@ -5899,11 +6198,12 @@ fn run_omega_tactic_with_budget(
 }
 
 fn run_ring_tactic_with_budget(
-    state: &MachineProofState,
+    prepared: &PreparedMachineTacticSnapshot<'_>,
     goal_id: GoalId,
     budget: TacticBudget,
 ) -> Result<(MachineProofState, MachineProofDelta)> {
-    let goal = state.goal(goal_id)?;
+    let state = prepared.state();
+    let goal = prepared.goal();
     let family = state.env.eq_family.as_ref().ok_or_else(|| {
         MachineTacticDiagnostic::new(
             MachineTacticDiagnosticKind::TacticPrimitiveUnavailable,
@@ -5916,7 +6216,7 @@ fn run_ring_tactic_with_budget(
     let mut required_tactic_steps = 0;
     let proof = ring_proof_for_target(
         state,
-        &goal,
+        goal,
         &goal.context,
         &goal.target,
         family,
@@ -5925,7 +6225,7 @@ fn run_ring_tactic_with_budget(
         &mut required_tactic_steps,
     )?;
     assign_goal_with_budget_and_steps(
-        state,
+        prepared,
         goal_id,
         proof,
         Vec::new(),
@@ -6308,12 +6608,13 @@ fn finite_decide_unsupported_goal(goal: &MachineGoal, actual: &Expr) -> MachineT
 }
 
 fn run_refine_tactic_with_budget(
-    state: &MachineProofState,
+    prepared: &PreparedMachineTacticSnapshot<'_>,
     goal_id: GoalId,
     payload: RefinePayload<RefineTermSource>,
     budget: TacticBudget,
 ) -> Result<(MachineProofState, MachineProofDelta)> {
-    let goal = state.goal(goal_id)?;
+    let state = prepared.state();
+    let goal = prepared.goal();
     validate_refine_term_source(&payload.term)
         .map_err(|diag| attach_goal_meta(diag, goal_id, goal.meta_id))?;
     let ast = parse_refine_term_source(payload.term.source())
@@ -6323,20 +6624,20 @@ fn run_refine_tactic_with_budget(
         ast.hole_count,
         payload.max_holes.unwrap_or_default(),
         TacticFuelKind::MetaAllocation,
-        &goal,
+        goal,
     )?;
     ensure_count_budget(
         "refine meta allocation",
         ast.hole_count,
         budget.max_meta_allocations,
         TacticFuelKind::MetaAllocation,
-        &goal,
+        goal,
     )?;
 
     let fuel = TacticRunFuel::new(budget);
     let mut checker = RefineTermChecker {
         state,
-        goal: &goal,
+        goal,
         source: payload.term.source(),
         fuel: &fuel,
         new_goal_specs: Vec::new(),
@@ -6344,7 +6645,7 @@ fn run_refine_tactic_with_budget(
     let checked = checker.check_against(&ast, &goal.context, &goal.target)?;
     let required_steps = 2_u64.saturating_add(ast.hole_count);
     assign_goal_with_budget_and_steps(
-        state,
+        prepared,
         goal_id,
         checked.proof,
         checker.new_goal_specs,
@@ -6766,15 +7067,16 @@ impl RefineTermChecker<'_, '_> {
 }
 
 fn run_have_tactic_with_budget(
-    state: &MachineProofState,
+    prepared: &PreparedMachineTacticSnapshot<'_>,
     goal_id: GoalId,
     payload: HavePayload<MachineTermSource>,
     budget: TacticBudget,
 ) -> Result<(MachineProofState, MachineProofDelta)> {
-    let goal = state.goal(goal_id)?;
-    validate_local_lemma_name_available(state, &goal, &payload.name)?;
+    let state = prepared.state();
+    let goal = prepared.goal();
+    validate_local_lemma_name_available(state, goal, &payload.name)?;
     let fuel = TacticRunFuel::new(budget);
-    let lemma_ty = elaborate_local_lemma_type_with_budget(state, &goal, &payload.ty, &fuel)?;
+    let lemma_ty = elaborate_local_lemma_type_with_budget(state, goal, &payload.ty, &fuel)?;
     let HavePayload {
         name,
         proof,
@@ -6793,19 +7095,19 @@ fn run_have_tactic_with_budget(
             ProofExpr::Meta(lemma_meta)
         }
         LocalLemmaProof::Term(term) => {
-            checked_local_lemma_term_proof(state, &goal, &term, &lemma_ty)?
+            checked_local_lemma_term_proof(state, goal, &term, &lemma_ty)?
         }
     };
     let continuation_meta = MetaVarId(first_new_meta.saturating_add(new_goal_specs.len() as u64));
     let continuation_context = extend_machine_local_context_assumption_with_budget(
         state,
-        &goal,
+        goal,
         &goal.context,
         name.clone(),
         lemma_ty.clone(),
         &fuel,
     )?;
-    let continuation_target = shifted_goal_target_for_local_lemma(&goal)?;
+    let continuation_target = shifted_goal_target_for_local_lemma(goal)?;
     new_goal_specs.push(MachineNewGoalSpec::new(
         continuation_context,
         continuation_target,
@@ -6813,7 +7115,7 @@ fn run_have_tactic_with_budget(
     let proof = local_lemma_parent_skeleton(name, lemma_ty, lemma_proof, continuation_meta);
     let required_steps = 3_u64.saturating_add(new_goal_specs.len() as u64);
     assign_goal_with_budget_and_steps(
-        state,
+        prepared,
         goal_id,
         proof,
         new_goal_specs,
@@ -6824,14 +7126,15 @@ fn run_have_tactic_with_budget(
 }
 
 fn run_suffices_tactic_with_budget(
-    state: &MachineProofState,
+    prepared: &PreparedMachineTacticSnapshot<'_>,
     goal_id: GoalId,
     payload: SufficesPayload<MachineTermSource>,
     budget: TacticBudget,
 ) -> Result<(MachineProofState, MachineProofDelta)> {
-    let goal = state.goal(goal_id)?;
+    let state = prepared.state();
+    let goal = prepared.goal();
     let fuel = TacticRunFuel::new(budget);
-    let lemma_ty = elaborate_local_lemma_type_with_budget(state, &goal, &payload.target, &fuel)?;
+    let lemma_ty = elaborate_local_lemma_type_with_budget(state, goal, &payload.target, &fuel)?;
     let local_name = deterministic_available_local_name_for_state(
         state,
         &goal.context,
@@ -6840,13 +7143,13 @@ fn run_suffices_tactic_with_budget(
     );
     let continuation_context = extend_machine_local_context_assumption_with_budget(
         state,
-        &goal,
+        goal,
         &goal.context,
         local_name.clone(),
         lemma_ty.clone(),
         &fuel,
     )?;
-    let continuation_target = shifted_goal_target_for_local_lemma(&goal)?;
+    let continuation_target = shifted_goal_target_for_local_lemma(goal)?;
     let first_new_meta = state.metas.next_id;
     let mut new_goal_specs = Vec::new();
     let (lemma_proof, continuation_meta) = match payload.proof {
@@ -6885,7 +7188,7 @@ fn run_suffices_tactic_with_budget(
                 continuation_target,
             ));
             (
-                checked_local_lemma_term_proof(state, &goal, &term, &lemma_ty)?,
+                checked_local_lemma_term_proof(state, goal, &term, &lemma_ty)?,
                 continuation_meta,
             )
         }
@@ -6893,7 +7196,7 @@ fn run_suffices_tactic_with_budget(
     let proof = local_lemma_parent_skeleton(local_name, lemma_ty, lemma_proof, continuation_meta);
     let required_steps = 3_u64.saturating_add(new_goal_specs.len() as u64);
     assign_goal_with_budget_and_steps(
-        state,
+        prepared,
         goal_id,
         proof,
         new_goal_specs,
@@ -7018,12 +7321,13 @@ fn local_lemma_parent_skeleton(
 }
 
 fn run_specialize_tactic_with_budget(
-    state: &MachineProofState,
+    prepared: &PreparedMachineTacticSnapshot<'_>,
     goal_id: GoalId,
     payload: SpecializePayload<ApplyArg>,
     budget: TacticBudget,
 ) -> Result<(MachineProofState, MachineProofDelta)> {
-    let goal = state.goal(goal_id)?;
+    let state = prepared.state();
+    let goal = prepared.goal();
     validate_intro_name_shape(&payload.local_name)
         .map_err(|diag| attach_goal_meta(diag, goal.id, goal.meta_id))?;
     for level in &payload.universe_args {
@@ -7048,8 +7352,11 @@ fn run_specialize_tactic_with_budget(
         goal.id,
         goal.meta_id,
     )?;
-    let local_index =
-        resolve_local_apply_head_index(&goal, &payload.local_name, &payload.universe_args)?;
+    let local_index = resolve_prepared_local_apply_head_index(
+        prepared,
+        &payload.local_name,
+        &payload.universe_args,
+    )?;
     let local = &goal.context[local_index];
     if local.value.is_some() {
         return Err(MachineTacticDiagnostic::new(
@@ -7075,7 +7382,7 @@ fn run_specialize_tactic_with_budget(
     let elab_context = machine_term_elab_context(state, &goal.context)?;
     let specialized = specialize_local_with_args(
         state,
-        &goal,
+        goal,
         &ctx,
         &elab_context,
         proof,
@@ -7088,7 +7395,7 @@ fn run_specialize_tactic_with_budget(
         SpecializeResultPolicy::AddLocal => {
             let result_name = match payload.result_name {
                 Some(name) => {
-                    validate_local_lemma_name_available(state, &goal, &name)?;
+                    validate_local_lemma_name_available(state, goal, &name)?;
                     name
                 }
                 None => {
@@ -7104,13 +7411,13 @@ fn run_specialize_tactic_with_budget(
             let continuation_meta = MetaVarId(state.metas.next_id);
             let continuation_context = extend_machine_local_context_assumption_with_budget(
                 state,
-                &goal,
+                goal,
                 &goal.context,
                 result_name.clone(),
                 specialized.ty.clone(),
                 &fuel,
             )?;
-            let continuation_target = shifted_goal_target_for_local_lemma(&goal)?;
+            let continuation_target = shifted_goal_target_for_local_lemma(goal)?;
             let proof = local_lemma_parent_skeleton(
                 result_name,
                 specialized.ty,
@@ -7119,7 +7426,7 @@ fn run_specialize_tactic_with_budget(
             );
             let required_steps = specialized.required_tactic_steps.saturating_add(2);
             assign_goal_with_budget_and_steps(
-                state,
+                prepared,
                 goal_id,
                 proof,
                 vec![MachineNewGoalSpec::new(
@@ -7132,8 +7439,8 @@ fn run_specialize_tactic_with_budget(
             )
         }
         SpecializeResultPolicy::ReplaceOriginal => run_specialize_replace_original_with_budget(
-            state,
-            &goal,
+            prepared,
+            goal,
             local_index,
             payload.local_name,
             payload.result_name,
@@ -7239,7 +7546,7 @@ fn specialize_local_with_args(
 
 #[allow(clippy::too_many_arguments)]
 fn run_specialize_replace_original_with_budget(
-    state: &MachineProofState,
+    prepared: &PreparedMachineTacticSnapshot<'_>,
     goal: &MachineGoal,
     local_index: usize,
     original_name: String,
@@ -7248,6 +7555,7 @@ fn run_specialize_replace_original_with_budget(
     budget: TacticBudget,
     fuel: &TacticRunFuel,
 ) -> Result<(MachineProofState, MachineProofDelta)> {
+    let state = prepared.state();
     ensure_specialize_replacement_suffix_independent(goal, local_index)?;
     let replacement_name = result_name.unwrap_or(original_name);
     validate_specialize_replacement_name(goal, local_index, &replacement_name)?;
@@ -7277,7 +7585,7 @@ fn run_specialize_replace_original_with_budget(
         .saturating_add(2)
         .saturating_add(suffix.len() as u64);
     assign_goal_with_budget_and_steps(
-        state,
+        prepared,
         goal.id,
         proof,
         vec![MachineNewGoalSpec::new(
@@ -7569,32 +7877,33 @@ fn expr_mentions_context_abs(
 }
 
 fn run_revert_tactic_with_budget(
-    state: &MachineProofState,
+    prepared: &PreparedMachineTacticSnapshot<'_>,
     goal_id: GoalId,
     payload: RevertPayload,
     budget: TacticBudget,
 ) -> Result<(MachineProofState, MachineProofDelta)> {
-    let goal = state.goal(goal_id)?;
+    let state = prepared.state();
+    let goal = prepared.goal();
     validate_revert_payload(&payload)
         .map_err(|diag| attach_goal_meta(diag, goal.id, goal.meta_id))?;
-    let requested = resolve_revert_local_indices(&goal, &payload.locals)?;
+    let requested = resolve_revert_local_indices(prepared, &payload.locals)?;
     let earliest = *requested
         .iter()
         .min()
         .expect("revert payload validation rejected empty local list");
     let revert_indices = match payload.dependency_policy {
-        RevertDependencyPolicy::Exact => exact_revert_suffix_indices(&goal, &requested)?,
+        RevertDependencyPolicy::Exact => exact_revert_suffix_indices(goal, &requested)?,
         RevertDependencyPolicy::Closure => (earliest..goal.context.len()).collect::<Vec<_>>(),
     };
-    ensure_revert_suffix_supported(&goal, &revert_indices)?;
+    ensure_revert_suffix_supported(goal, &revert_indices)?;
     let new_context = goal.context[..earliest].to_vec();
     let suffix = goal.context[earliest..].to_vec();
     let target = revert_target_for_suffix(&suffix, goal.target.clone());
-    let proof = revert_parent_skeleton(&goal, earliest, MetaVarId(state.metas.next_id));
+    let proof = revert_parent_skeleton(goal, earliest, MetaVarId(state.metas.next_id));
     let fuel = TacticRunFuel::new(budget);
     let required_steps = 2_u64.saturating_add(suffix.len() as u64);
     assign_goal_with_budget_and_steps(
-        state,
+        prepared,
         goal_id,
         proof,
         vec![MachineNewGoalSpec::new(new_context, target)],
@@ -7604,31 +7913,13 @@ fn run_revert_tactic_with_budget(
     )
 }
 
-fn resolve_revert_local_indices(goal: &MachineGoal, locals: &[String]) -> Result<Vec<usize>> {
+fn resolve_revert_local_indices(
+    prepared: &PreparedMachineTacticSnapshot<'_>,
+    locals: &[String],
+) -> Result<Vec<usize>> {
     let mut indices = Vec::new();
     for name in locals {
-        let matches = goal
-            .context
-            .iter()
-            .enumerate()
-            .filter(|(_, local)| &local.name == name)
-            .collect::<Vec<_>>();
-        let [(index, _)] = matches.as_slice() else {
-            return Err(if matches.is_empty() {
-                MachineTacticDiagnostic::new(
-                    MachineTacticDiagnosticKind::UnknownLocalName,
-                    format!("revert local {name:?} is not in the goal context"),
-                )
-            } else {
-                MachineTacticDiagnostic::new(
-                    MachineTacticDiagnosticKind::AmbiguousLocalName,
-                    format!("revert local {name:?} resolves to multiple locals"),
-                )
-            }
-            .with_goal(goal.id)
-            .with_meta(goal.meta_id));
-        };
-        indices.push(*index);
+        indices.push(prepared_local_index(prepared, name, "revert local")?);
     }
     Ok(indices)
 }
@@ -7748,12 +8039,13 @@ fn normalized_occurrence_paths(paths: &[OccurrencePath]) -> Result<Vec<Occurrenc
 }
 
 fn run_generalize_tactic_with_budget(
-    state: &MachineProofState,
+    prepared: &PreparedMachineTacticSnapshot<'_>,
     goal_id: GoalId,
     payload: GeneralizePayload<MachineTermSource>,
     budget: TacticBudget,
 ) -> Result<(MachineProofState, MachineProofDelta)> {
-    let goal = state.goal(goal_id)?;
+    let state = prepared.state();
+    let goal = prepared.goal();
     let paths = normalized_occurrence_paths(&payload.occurrences)
         .map_err(|diag| attach_goal_meta(diag, goal.id, goal.meta_id))?;
     ensure_rewrite_fuel(budget, paths.len() as u64, goal.id, goal.meta_id)?;
@@ -7783,7 +8075,7 @@ fn run_generalize_tactic_with_budget(
             let name = generalize_local_name(state, &goal.context, payload.name_hint);
             let shifted_target = shift(&goal.target, 1, 0).map_err(kernel_diag)?;
             let generalized_target =
-                replace_occurrences_with_outer_local(&shifted_target, &paths, 0, &goal)?;
+                replace_occurrences_with_outer_local(&shifted_target, &paths, 0, goal)?;
             ensure_expr_node_fuel(
                 budget,
                 core_expr_node_count(&generalized_target),
@@ -7792,7 +8084,7 @@ fn run_generalize_tactic_with_budget(
             )?;
             let new_context = extend_machine_local_context_assumption_with_budget(
                 state,
-                &goal,
+                goal,
                 &goal.context,
                 name.clone(),
                 term_ty.clone(),
@@ -7807,7 +8099,7 @@ fn run_generalize_tactic_with_budget(
                 ProofExpr::Core(term),
             );
             assign_goal_with_budget_and_steps(
-                state,
+                prepared,
                 goal_id,
                 proof,
                 vec![MachineNewGoalSpec::new(new_context, generalized_target)],
@@ -7817,7 +8109,7 @@ fn run_generalize_tactic_with_budget(
             )
         }
         TacticTarget::Local { name } => {
-            let local_index = resolve_unique_local_index(&goal, &name, "generalize target local")?;
+            let local_index = prepared_local_index(prepared, &name, "generalize target local")?;
             let prefix = goal.context[..local_index].to_vec();
             let local = goal.context[local_index].clone();
             let elab_context = machine_term_elab_context(state, &prefix)?;
@@ -7841,11 +8133,11 @@ fn run_generalize_tactic_with_budget(
                 goal.meta_id,
             )?;
             let generalized_name = generalize_local_name(state, &goal.context, payload.name_hint);
-            ensure_generalize_local_transport_supported(&goal, local_index)?;
+            ensure_generalize_local_transport_supported(goal, local_index)?;
             let rebased_local_ty =
-                insert_context_local_at(&local.ty, local_index, local_index, &goal)?;
+                insert_context_local_at(&local.ty, local_index, local_index, goal)?;
             let generalized_local_ty =
-                replace_occurrences_with_outer_local(&rebased_local_ty, &paths, 0, &goal)?;
+                replace_occurrences_with_outer_local(&rebased_local_ty, &paths, 0, goal)?;
             ensure_expr_node_fuel(
                 budget,
                 core_expr_node_count(&generalized_local_ty),
@@ -7853,7 +8145,7 @@ fn run_generalize_tactic_with_budget(
                 goal.meta_id,
             )?;
             let new_target = rebind_target_with_extra_prefix_local(
-                &goal,
+                goal,
                 local_index,
                 generalized_name.clone(),
                 term_ty.clone(),
@@ -7863,13 +8155,13 @@ fn run_generalize_tactic_with_budget(
             let proof_term =
                 shift(&term, (goal.context.len() - prefix.len()) as i32, 0).map_err(kernel_diag)?;
             let proof = local_rebind_parent_skeleton(
-                &goal,
+                goal,
                 local_index,
                 ProofExpr::Core(proof_term),
                 MetaVarId(state.metas.next_id),
             );
             assign_goal_with_budget_and_steps(
-                state,
+                prepared,
                 goal_id,
                 proof,
                 vec![MachineNewGoalSpec::new(prefix, new_target)],
@@ -7884,12 +8176,13 @@ fn run_generalize_tactic_with_budget(
 }
 
 fn run_change_tactic_with_budget(
-    state: &MachineProofState,
+    prepared: &PreparedMachineTacticSnapshot<'_>,
     goal_id: GoalId,
     payload: ChangePayload<MachineTermSource>,
     budget: TacticBudget,
 ) -> Result<(MachineProofState, MachineProofDelta)> {
-    let goal = state.goal(goal_id)?;
+    let state = prepared.state();
+    let goal = prepared.goal();
     let paths = normalized_occurrence_paths(&payload.occurrences)
         .map_err(|diag| attach_goal_meta(diag, goal.id, goal.meta_id))?;
     ensure_rewrite_fuel(budget, paths.len() as u64, goal.id, goal.meta_id)?;
@@ -7900,7 +8193,7 @@ fn run_change_tactic_with_budget(
             let (replacement, _) = elaborate_apply_term_infer(&payload.replacement, &elab_context)
                 .map_err(|diag| attach_goal_meta(diag, goal.id, goal.meta_id))?;
             let changed_target =
-                replace_occurrences_with_expr(&goal.target, &paths, &replacement, 0, &goal)?;
+                replace_occurrences_with_expr(&goal.target, &paths, &replacement, 0, goal)?;
             let ctx = local_context_to_ctx_with_budget(
                 state.env.kernel_env(),
                 &goal.context,
@@ -7909,10 +8202,10 @@ fn run_change_tactic_with_budget(
                 goal.id,
                 goal.meta_id,
             )?;
-            ensure_change_defeq(state, &goal, &ctx, &goal.target, &changed_target, &fuel)?;
+            ensure_change_defeq(state, goal, &ctx, &goal.target, &changed_target, &fuel)?;
             let proof = ProofExpr::Meta(MetaVarId(state.metas.next_id));
             assign_goal_with_budget_and_steps(
-                state,
+                prepared,
                 goal_id,
                 proof,
                 vec![MachineNewGoalSpec::new(
@@ -7925,14 +8218,14 @@ fn run_change_tactic_with_budget(
             )
         }
         TacticTarget::Local { name } => {
-            let local_index = resolve_unique_local_index(&goal, &name, "change target local")?;
+            let local_index = prepared_local_index(prepared, &name, "change target local")?;
             let prefix = goal.context[..local_index].to_vec();
             let local = goal.context[local_index].clone();
             let elab_context = machine_term_elab_context(state, &prefix)?;
             let (replacement, _) = elaborate_apply_term_infer(&payload.replacement, &elab_context)
                 .map_err(|diag| attach_goal_meta(diag, goal.id, goal.meta_id))?;
             let changed_local_ty =
-                replace_occurrences_with_expr(&local.ty, &paths, &replacement, 0, &goal)?;
+                replace_occurrences_with_expr(&local.ty, &paths, &replacement, 0, goal)?;
             let prefix_ctx = local_context_to_ctx_with_budget(
                 state.env.kernel_env(),
                 &prefix,
@@ -7943,7 +8236,7 @@ fn run_change_tactic_with_budget(
             )?;
             ensure_change_defeq(
                 state,
-                &goal,
+                goal,
                 &prefix_ctx,
                 &local.ty,
                 &changed_local_ty,
@@ -7956,12 +8249,12 @@ fn run_change_tactic_with_budget(
                 goal.target.clone(),
             );
             let proof = local_rebind_parent_skeleton_no_extra(
-                &goal,
+                goal,
                 local_index,
                 MetaVarId(state.metas.next_id),
             );
             assign_goal_with_budget_and_steps(
-                state,
+                prepared,
                 goal_id,
                 proof,
                 vec![MachineNewGoalSpec::new(prefix, new_target)],
@@ -7976,12 +8269,13 @@ fn run_change_tactic_with_budget(
 }
 
 fn run_unfold_tactic_with_budget(
-    state: &MachineProofState,
+    prepared: &PreparedMachineTacticSnapshot<'_>,
     goal_id: GoalId,
     payload: UnfoldPayload,
     budget: TacticBudget,
 ) -> Result<(MachineProofState, MachineProofDelta)> {
-    let goal = state.goal(goal_id)?;
+    let state = prepared.state();
+    let goal = prepared.goal();
     let paths = normalized_occurrence_paths(&payload.occurrences)
         .map_err(|diag| attach_goal_meta(diag, goal.id, goal.meta_id))?;
     let requested_delta = payload.max_delta_steps.unwrap_or(paths.len() as u64);
@@ -8000,10 +8294,10 @@ fn run_unfold_tactic_with_budget(
         .with_meta(goal.meta_id));
     }
     let fuel = TacticRunFuel::new(budget);
-    let def = resolve_unfold_definition(state, &goal, &payload.constant)?;
+    let def = resolve_unfold_definition(state, goal, &payload.constant)?;
     match payload.target {
         TacticTarget::Goal => {
-            let unfolded_target = unfold_occurrences(&goal.target, &paths, &def, &goal)?;
+            let unfolded_target = unfold_occurrences(&goal.target, &paths, &def, goal)?;
             let ctx = local_context_to_ctx_with_budget(
                 state.env.kernel_env(),
                 &goal.context,
@@ -8012,10 +8306,10 @@ fn run_unfold_tactic_with_budget(
                 goal.id,
                 goal.meta_id,
             )?;
-            ensure_change_defeq(state, &goal, &ctx, &goal.target, &unfolded_target, &fuel)?;
+            ensure_change_defeq(state, goal, &ctx, &goal.target, &unfolded_target, &fuel)?;
             let proof = ProofExpr::Meta(MetaVarId(state.metas.next_id));
             assign_goal_with_budget_and_steps(
-                state,
+                prepared,
                 goal_id,
                 proof,
                 vec![MachineNewGoalSpec::new(
@@ -8028,10 +8322,10 @@ fn run_unfold_tactic_with_budget(
             )
         }
         TacticTarget::Local { name } => {
-            let local_index = resolve_unique_local_index(&goal, &name, "unfold target local")?;
+            let local_index = prepared_local_index(prepared, &name, "unfold target local")?;
             let prefix = goal.context[..local_index].to_vec();
             let local = goal.context[local_index].clone();
-            let unfolded_local_ty = unfold_occurrences(&local.ty, &paths, &def, &goal)?;
+            let unfolded_local_ty = unfold_occurrences(&local.ty, &paths, &def, goal)?;
             let prefix_ctx = local_context_to_ctx_with_budget(
                 state.env.kernel_env(),
                 &prefix,
@@ -8042,7 +8336,7 @@ fn run_unfold_tactic_with_budget(
             )?;
             ensure_change_defeq(
                 state,
-                &goal,
+                goal,
                 &prefix_ctx,
                 &local.ty,
                 &unfolded_local_ty,
@@ -8055,12 +8349,12 @@ fn run_unfold_tactic_with_budget(
                 goal.target.clone(),
             );
             let proof = local_rebind_parent_skeleton_no_extra(
-                &goal,
+                goal,
                 local_index,
                 MetaVarId(state.metas.next_id),
             );
             assign_goal_with_budget_and_steps(
-                state,
+                prepared,
                 goal_id,
                 proof,
                 vec![MachineNewGoalSpec::new(prefix, new_target)],
@@ -8382,35 +8676,6 @@ fn local_rebind_parent_skeleton_no_extra(
         );
     }
     proof
-}
-
-fn resolve_unique_local_index(
-    goal: &MachineGoal,
-    name: &str,
-    label: &'static str,
-) -> Result<usize> {
-    let matches = goal
-        .context
-        .iter()
-        .enumerate()
-        .filter(|(_, local)| local.name == name)
-        .collect::<Vec<_>>();
-    let [(index, _)] = matches.as_slice() else {
-        return Err(if matches.is_empty() {
-            MachineTacticDiagnostic::new(
-                MachineTacticDiagnosticKind::UnknownLocalName,
-                format!("{label} {name:?} is not in the goal context"),
-            )
-        } else {
-            MachineTacticDiagnostic::new(
-                MachineTacticDiagnosticKind::AmbiguousLocalName,
-                format!("{label} {name:?} resolves to multiple locals"),
-            )
-        }
-        .with_goal(goal.id)
-        .with_meta(goal.meta_id));
-    };
-    Ok(*index)
 }
 
 #[derive(Clone, Debug)]
@@ -8742,12 +9007,13 @@ fn ensure_no_unknown_occurrence_child(paths: &[&[u64]], child_count: u64) -> Res
 }
 
 fn run_intro_tactic_with_budget(
-    state: &MachineProofState,
+    prepared: &PreparedMachineTacticSnapshot<'_>,
     goal_id: GoalId,
     name: String,
     budget: TacticBudget,
 ) -> Result<(MachineProofState, MachineProofDelta)> {
-    let goal = state.goal(goal_id)?;
+    let state = prepared.state();
+    let goal = prepared.goal();
     validate_intro_name_shape(&name)
         .map_err(|diag| attach_goal_meta(diag, goal_id, goal.meta_id))?;
     validate_intro_name_available(state, &goal.context, &name)
@@ -8789,7 +9055,7 @@ fn run_intro_tactic_with_budget(
     let new_meta_id = MetaVarId(state.metas.next_id);
     let body_context = extend_machine_local_context_assumption_with_budget(
         state,
-        &goal,
+        goal,
         &goal.context,
         name.clone(),
         binder_ty.clone(),
@@ -8797,7 +9063,7 @@ fn run_intro_tactic_with_budget(
     )?;
     let proof = ProofExpr::lam(name, binder_ty, ProofExpr::Meta(new_meta_id));
     assign_goal_with_budget_and_steps(
-        state,
+        prepared,
         goal_id,
         proof,
         vec![MachineNewGoalSpec::new(body_context, body_target)],
@@ -8947,12 +9213,13 @@ struct RewriteStep {
 }
 
 fn run_constructor_tactic_with_budget(
-    state: &MachineProofState,
+    prepared: &PreparedMachineTacticSnapshot<'_>,
     goal_id: GoalId,
     payload: ConstructorPayload,
     budget: TacticBudget,
 ) -> Result<(MachineProofState, MachineProofDelta)> {
-    let goal = state.goal(goal_id)?;
+    let state = prepared.state();
+    let goal = prepared.goal();
     validate_constructor_payload(&payload)
         .map_err(|diag| attach_goal_meta(diag, goal_id, goal.meta_id))?;
 
@@ -8965,10 +9232,10 @@ fn run_constructor_tactic_with_budget(
         goal_id,
         goal.meta_id,
     )?;
-    let target = resolve_constructor_target(state, &goal, &ctx, &fuel)?;
+    let target = resolve_constructor_target(state, goal, &ctx, &fuel)?;
     let selected = match &payload.selection {
         ConstructorSelection::Explicit { constructor } => {
-            let candidate = resolve_explicit_constructor_candidate(state, &goal, constructor)?;
+            let candidate = resolve_explicit_constructor_candidate(state, goal, constructor)?;
             if candidate.inductive != target.inductive {
                 return Err(MachineTacticDiagnostic::new(
                     MachineTacticDiagnosticKind::TypeMismatch,
@@ -8985,7 +9252,7 @@ fn run_constructor_tactic_with_budget(
             }
             let assembly = assemble_constructor_candidate(
                 state,
-                &goal,
+                goal,
                 &ctx,
                 &target,
                 &candidate,
@@ -9002,7 +9269,7 @@ fn run_constructor_tactic_with_budget(
             for candidate in candidates {
                 match assemble_constructor_candidate(
                     state,
-                    &goal,
+                    goal,
                     &ctx,
                     &target,
                     &candidate,
@@ -9057,7 +9324,7 @@ fn run_constructor_tactic_with_budget(
 
     let (_, assembly) = selected;
     assign_goal_with_budget_and_steps(
-        state,
+        prepared,
         goal_id,
         assembly.proof,
         assembly.new_goal_specs,
@@ -9584,14 +9851,15 @@ fn constructor_candidate_summary(candidate: &ConstructorCandidate) -> String {
 }
 
 fn run_apply_tactic_with_budget(
-    state: &MachineProofState,
+    prepared: &PreparedMachineTacticSnapshot<'_>,
     goal_id: GoalId,
     head: TacticHead,
     universe_args: Vec<Level>,
     args: Vec<ApplyArg>,
     budget: TacticBudget,
 ) -> Result<(MachineProofState, MachineProofDelta)> {
-    let goal = state.goal(goal_id)?;
+    let state = prepared.state();
+    let goal = prepared.goal();
     validate_tactic_head_shape(&head)
         .map_err(|diag| attach_goal_meta(diag, goal_id, goal.meta_id))?;
     for arg in &args {
@@ -9607,7 +9875,7 @@ fn run_apply_tactic_with_budget(
             .with_meta(goal.meta_id)
         })?;
     }
-    validate_apply_head_static(state, &goal, &head, &universe_args)?;
+    validate_apply_head_static_for_prepared_snapshot(prepared, &head, &universe_args)?;
 
     let fuel = TacticRunFuel::new(budget);
     let ctx = local_context_to_ctx_with_budget(
@@ -9618,11 +9886,12 @@ fn run_apply_tactic_with_budget(
         goal_id,
         goal.meta_id,
     )?;
-    let resolved = resolve_apply_head(state, &goal, &ctx, &head, &universe_args, &fuel)?;
+    let resolved =
+        resolve_apply_head_for_prepared_snapshot(prepared, &ctx, &head, &universe_args, &fuel)?;
     let elab_context = machine_term_elab_context(state, &goal.context)?;
     let assembly = assemble_apply(
         state,
-        &goal,
+        goal,
         &ctx,
         &elab_context,
         resolved,
@@ -9631,7 +9900,7 @@ fn run_apply_tactic_with_budget(
         &fuel,
     )?;
     assign_goal_with_budget_and_steps(
-        state,
+        prepared,
         goal_id,
         assembly.proof,
         assembly.new_goal_specs,
@@ -9641,17 +9910,19 @@ fn run_apply_tactic_with_budget(
     )
 }
 
-fn resolve_apply_head(
-    state: &MachineProofState,
-    goal: &MachineGoal,
+fn resolve_apply_head_for_prepared_snapshot(
+    prepared: &PreparedMachineTacticSnapshot<'_>,
     ctx: &Ctx,
     head: &TacticHead,
     universe_args: &[Level],
     fuel: &TacticRunFuel,
 ) -> Result<ResolvedApplyHead> {
+    let state = prepared.state();
+    let goal = prepared.goal();
     match head {
         TacticHead::Local { name } => {
-            resolve_local_apply_head(state, goal, ctx, name, universe_args, fuel)
+            let index = resolve_prepared_local_apply_head_index(prepared, name, universe_args)?;
+            resolve_local_apply_head_at_index(state, goal, ctx, index, fuel)
         }
         TacticHead::Imported {
             name,
@@ -9672,15 +9943,16 @@ fn resolve_apply_head(
     }
 }
 
-fn validate_apply_head_static(
-    state: &MachineProofState,
-    goal: &MachineGoal,
+fn validate_apply_head_static_for_prepared_snapshot(
+    prepared: &PreparedMachineTacticSnapshot<'_>,
     head: &TacticHead,
     universe_args: &[Level],
 ) -> Result<()> {
+    let state = prepared.state();
+    let goal = prepared.goal();
     match head {
         TacticHead::Local { name } => {
-            resolve_local_apply_head_index(goal, name, universe_args)?;
+            resolve_prepared_local_apply_head_index(prepared, name, universe_args)?;
         }
         TacticHead::Imported {
             name,
@@ -9702,15 +9974,13 @@ fn validate_apply_head_static(
     Ok(())
 }
 
-fn resolve_local_apply_head(
+fn resolve_local_apply_head_at_index(
     state: &MachineProofState,
     goal: &MachineGoal,
     ctx: &Ctx,
-    name: &str,
-    universe_args: &[Level],
+    index: usize,
     fuel: &TacticRunFuel,
 ) -> Result<ResolvedApplyHead> {
-    let index = resolve_local_apply_head_index(goal, name, universe_args)?;
     let bvar = Expr::bvar((goal.context.len() - 1 - index) as u32);
     let ty = kernel_infer_with_budget(
         state.env.kernel_env(),
@@ -9725,51 +9995,6 @@ fn resolve_local_apply_head(
         proof: ProofExpr::Core(bvar),
         ty,
     })
-}
-
-fn resolve_local_apply_head_index(
-    goal: &MachineGoal,
-    name: &str,
-    universe_args: &[Level],
-) -> Result<usize> {
-    if !universe_args.is_empty() {
-        return Err(universe_argument_mismatch_diag(
-            &[],
-            universe_args,
-            goal.id,
-            goal.meta_id,
-        ));
-    }
-    let matches = goal
-        .context
-        .iter()
-        .enumerate()
-        .filter(|(_, local)| local.name == name)
-        .collect::<Vec<_>>();
-    let [(index, local)] = matches.as_slice() else {
-        return Err(if matches.is_empty() {
-            MachineTacticDiagnostic::new(
-                MachineTacticDiagnosticKind::UnknownLocalName,
-                format!("apply local head {name:?} is not in the goal context"),
-            )
-        } else {
-            MachineTacticDiagnostic::new(
-                MachineTacticDiagnosticKind::AmbiguousLocalName,
-                format!("apply local head {name:?} resolves to multiple locals"),
-            )
-        }
-        .with_goal(goal.id)
-        .with_meta(goal.meta_id));
-    };
-    if local.value.is_some() {
-        return Err(MachineTacticDiagnostic::new(
-            MachineTacticDiagnosticKind::InvalidLocalHead,
-            format!("apply local head {name:?} resolves to a let declaration"),
-        )
-        .with_goal(goal.id)
-        .with_meta(goal.meta_id));
-    }
-    Ok(*index)
 }
 
 fn resolve_imported_apply_signature<'a>(
@@ -10207,14 +10432,15 @@ fn assemble_apply(
 }
 
 fn run_rewrite_tactic_with_budget(
-    state: &MachineProofState,
+    prepared: &PreparedMachineTacticSnapshot<'_>,
     goal_id: GoalId,
     rule: RewriteRuleRef,
     direction: RewriteDirection,
     site: RewriteSite,
     budget: TacticBudget,
 ) -> Result<(MachineProofState, MachineProofDelta)> {
-    let goal = state.goal(goal_id)?;
+    let state = prepared.state();
+    let goal = prepared.goal();
     validate_rewrite_rule_ref(&rule)
         .map_err(|diag| attach_goal_meta(diag, goal_id, goal.meta_id))?;
     for level in &rule.universe_args {
@@ -10227,7 +10453,7 @@ fn run_rewrite_tactic_with_budget(
             .with_meta(goal.meta_id)
         })?;
     }
-    validate_apply_head_static(state, &goal, &rule.head, &rule.universe_args)?;
+    validate_apply_head_static_for_prepared_snapshot(prepared, &rule.head, &rule.universe_args)?;
     let family = state.env.eq_family.as_ref().ok_or_else(|| {
         MachineTacticDiagnostic::new(
             MachineTacticDiagnosticKind::TacticPrimitiveUnavailable,
@@ -10246,12 +10472,18 @@ fn run_rewrite_tactic_with_budget(
         goal_id,
         goal.meta_id,
     )?;
-    let resolved = resolve_apply_head(state, &goal, &ctx, &rule.head, &rule.universe_args, &fuel)?;
-    let old_eq_target = whnf_eq_target(state, &goal, &ctx, family, &fuel)?;
+    let resolved = resolve_apply_head_for_prepared_snapshot(
+        prepared,
+        &ctx,
+        &rule.head,
+        &rule.universe_args,
+        &fuel,
+    )?;
+    let old_eq_target = whnf_eq_target(state, goal, &ctx, family, &fuel)?;
     let elab_context = machine_term_elab_context(state, &goal.context)?;
     let assembly = assemble_rewrite(
         state,
-        &goal,
+        goal,
         &ctx,
         &elab_context,
         family,
@@ -10264,7 +10496,7 @@ fn run_rewrite_tactic_with_budget(
         &fuel,
     )?;
     assign_goal_with_budget_and_steps(
-        state,
+        prepared,
         goal_id,
         assembly.proof,
         assembly.new_goal_specs,
@@ -10873,12 +11105,13 @@ fn rewrite_motive_expr(
 }
 
 fn run_subst_tactic_with_budget(
-    state: &MachineProofState,
+    prepared: &PreparedMachineTacticSnapshot<'_>,
     goal_id: GoalId,
     payload: SubstPayload,
     budget: TacticBudget,
 ) -> Result<(MachineProofState, MachineProofDelta)> {
-    let goal = state.goal(goal_id)?;
+    let state = prepared.state();
+    let goal = prepared.goal();
     let family = state.env.eq_family.as_ref().ok_or_else(|| {
         MachineTacticDiagnostic::new(
             MachineTacticDiagnosticKind::TacticPrimitiveUnavailable,
@@ -10892,7 +11125,7 @@ fn run_subst_tactic_with_budget(
     ensure_rewrite_fuel(budget, paths.len() as u64, goal.id, goal.meta_id)?;
 
     let equality_index =
-        resolve_unique_local_index(&goal, &payload.equality_local, "subst equality local")?;
+        prepared_local_index(prepared, &payload.equality_local, "subst equality local")?;
     let fuel = TacticRunFuel::new(budget);
     match payload.target {
         TacticTarget::Goal => {
@@ -10906,7 +11139,7 @@ fn run_subst_tactic_with_budget(
             )?;
             let rule = local_eq_target_with_proof(
                 state,
-                &goal,
+                goal,
                 &ctx,
                 goal.context.len(),
                 equality_index,
@@ -10914,10 +11147,10 @@ fn run_subst_tactic_with_budget(
                 &fuel,
                 "subst equality local",
             )?;
-            let old_eq_target = whnf_eq_target(state, &goal, &ctx, family, &fuel)?;
+            let old_eq_target = whnf_eq_target(state, goal, &ctx, family, &fuel)?;
             let sites = subst_sites_for_paths(
                 state,
-                &goal,
+                goal,
                 &ctx,
                 family,
                 &old_eq_target,
@@ -10928,7 +11161,7 @@ fn run_subst_tactic_with_budget(
             )?;
             let (new_eq_target, steps) = build_subst_rewrite_steps(
                 state,
-                &goal,
+                goal,
                 &ctx,
                 family,
                 old_eq_target,
@@ -10940,7 +11173,7 @@ fn run_subst_tactic_with_budget(
             let final_meta = MetaVarId(state.metas.next_id);
             let proof = mk_nested_rewrite_proof_from_meta(family, final_meta, steps)?;
             assign_goal_with_budget_and_steps(
-                state,
+                prepared,
                 goal_id,
                 proof,
                 vec![MachineNewGoalSpec::new(
@@ -10953,7 +11186,7 @@ fn run_subst_tactic_with_budget(
             )
         }
         TacticTarget::Local { name } => {
-            let target_index = resolve_unique_local_index(&goal, &name, "subst target local")?;
+            let target_index = prepared_local_index(prepared, &name, "subst target local")?;
             if target_index == equality_index {
                 return Err(MachineTacticDiagnostic::new(
                     MachineTacticDiagnosticKind::InvalidMetaDependency,
@@ -10970,7 +11203,7 @@ fn run_subst_tactic_with_budget(
                 .with_goal(goal.id)
                 .with_meta(goal.meta_id));
             }
-            ensure_generalize_local_transport_supported(&goal, target_index)?;
+            ensure_generalize_local_transport_supported(goal, target_index)?;
 
             let prefix = goal.context[..target_index].to_vec();
             let prefix_ctx = local_context_to_ctx_with_budget(
@@ -10984,7 +11217,7 @@ fn run_subst_tactic_with_budget(
             let target_local = goal.context[target_index].clone();
             let old_prefix_eq = eq_target_from_type_with_ctx(
                 state,
-                &goal,
+                goal,
                 &prefix_ctx,
                 family,
                 &target_local.ty,
@@ -10993,7 +11226,7 @@ fn run_subst_tactic_with_budget(
             )?;
             let prefix_rule = local_eq_target_with_proof(
                 state,
-                &goal,
+                goal,
                 &prefix_ctx,
                 prefix.len(),
                 equality_index,
@@ -11003,7 +11236,7 @@ fn run_subst_tactic_with_budget(
             )?;
             let sites = subst_sites_for_paths(
                 state,
-                &goal,
+                goal,
                 &prefix_ctx,
                 family,
                 &old_prefix_eq,
@@ -11014,7 +11247,7 @@ fn run_subst_tactic_with_budget(
             )?;
             let (new_prefix_eq, _) = build_subst_rewrite_steps(
                 state,
-                &goal,
+                goal,
                 &prefix_ctx,
                 family,
                 old_prefix_eq,
@@ -11034,7 +11267,7 @@ fn run_subst_tactic_with_budget(
             )?;
             let old_full_eq = local_type_eq_target_with_ctx(
                 state,
-                &goal,
+                goal,
                 &full_ctx,
                 goal.context.len(),
                 target_index,
@@ -11044,7 +11277,7 @@ fn run_subst_tactic_with_budget(
             )?;
             let full_rule = local_eq_target_with_proof(
                 state,
-                &goal,
+                goal,
                 &full_ctx,
                 goal.context.len(),
                 equality_index,
@@ -11054,7 +11287,7 @@ fn run_subst_tactic_with_budget(
             )?;
             let (_, full_steps) = build_subst_rewrite_steps(
                 state,
-                &goal,
+                goal,
                 &full_ctx,
                 family,
                 old_full_eq,
@@ -11069,7 +11302,7 @@ fn run_subst_tactic_with_budget(
                 full_steps,
             )?;
             let proof = local_rebind_parent_skeleton_with_replacement(
-                &goal,
+                goal,
                 target_index,
                 transformed_local,
                 MetaVarId(state.metas.next_id),
@@ -11081,7 +11314,7 @@ fn run_subst_tactic_with_budget(
                 goal.target.clone(),
             );
             assign_goal_with_budget_and_steps(
-                state,
+                prepared,
                 goal_id,
                 proof,
                 vec![MachineNewGoalSpec::new(prefix, new_target)],
@@ -11444,12 +11677,13 @@ fn local_rebind_parent_skeleton_with_replacement(
 }
 
 fn run_congr_tactic_with_budget(
-    state: &MachineProofState,
+    prepared: &PreparedMachineTacticSnapshot<'_>,
     goal_id: GoalId,
     payload: CongrPayload,
     budget: TacticBudget,
 ) -> Result<(MachineProofState, MachineProofDelta)> {
-    let goal = state.goal(goal_id)?;
+    let state = prepared.state();
+    let goal = prepared.goal();
     if !matches!(payload.target, TacticTarget::Goal) {
         return Err(MachineTacticDiagnostic::new(
             MachineTacticDiagnosticKind::UnsupportedTacticOption,
@@ -11474,7 +11708,7 @@ fn run_congr_tactic_with_budget(
         1,
         payload.max_new_goals.unwrap_or_default(),
         TacticFuelKind::MetaAllocation,
-        &goal,
+        goal,
     )?;
     let family = state.env.eq_family.as_ref().ok_or_else(|| {
         MachineTacticDiagnostic::new(
@@ -11493,10 +11727,10 @@ fn run_congr_tactic_with_budget(
         goal.id,
         goal.meta_id,
     )?;
-    let eq_target = whnf_eq_target(state, &goal, &ctx, family, &fuel)?;
-    let assembly = assemble_congr_tactic(state, &goal, &ctx, family, eq_target, &fuel)?;
+    let eq_target = whnf_eq_target(state, goal, &ctx, family, &fuel)?;
+    let assembly = assemble_congr_tactic(state, goal, &ctx, family, eq_target, &fuel)?;
     assign_goal_with_budget_and_steps(
-        state,
+        prepared,
         goal_id,
         assembly.proof,
         assembly.new_goal_specs,
@@ -11808,23 +12042,23 @@ fn mk_congr_arg_proof(
 }
 
 fn run_contradiction_tactic_with_budget(
-    state: &MachineProofState,
+    prepared: &PreparedMachineTacticSnapshot<'_>,
     goal_id: GoalId,
     payload: ContradictionPayload,
     budget: TacticBudget,
 ) -> Result<(MachineProofState, MachineProofDelta)> {
-    let goal = state.goal(goal_id)?;
+    let goal = prepared.goal();
     match payload.mode {
         ContradictionMode::Local { major_local } => {
             let result = run_cases_tactic_with_budget(
-                state,
+                prepared,
                 goal_id,
                 contradiction_cases_payload(&major_local),
                 budget,
             );
             result.map_err(|diag| {
                 if contradiction_candidate_rejection(&diag) {
-                    no_supported_contradiction_diag(&goal, Some(&major_local))
+                    no_supported_contradiction_diag(goal, Some(&major_local))
                 } else {
                     diag
                 }
@@ -11836,7 +12070,7 @@ fn run_contradiction_tactic_with_budget(
                     continue;
                 }
                 match run_cases_tactic_with_budget(
-                    state,
+                    prepared,
                     goal_id,
                     contradiction_cases_payload(&local.name),
                     budget,
@@ -11846,7 +12080,7 @@ fn run_contradiction_tactic_with_budget(
                     Err(diag) => return Err(diag),
                 }
             }
-            Err(no_supported_contradiction_diag(&goal, None))
+            Err(no_supported_contradiction_diag(goal, None))
         }
     }
 }
@@ -12094,15 +12328,16 @@ fn fuel_to_usize(value: u64) -> usize {
 }
 
 fn run_simp_lite_tactic_with_budget(
-    state: &MachineProofState,
+    prepared: &PreparedMachineTacticSnapshot<'_>,
     goal_id: GoalId,
     rules: Vec<SimpRuleRef>,
     budget: TacticBudget,
 ) -> Result<(MachineProofState, MachineProofDelta)> {
-    let goal = state.goal(goal_id)?;
+    let state = prepared.state();
+    let goal = prepared.goal();
     validate_simp_rule_refs(&rules)
         .map_err(|diag| attach_goal_meta(diag, goal_id, goal.meta_id))?;
-    let selected_rules = resolve_simp_lite_allowlist(state, &goal, rules)?;
+    let selected_rules = resolve_simp_lite_allowlist(state, goal, rules)?;
     let family = state.env.eq_family.as_ref().ok_or_else(|| {
         MachineTacticDiagnostic::new(
             MachineTacticDiagnosticKind::TacticPrimitiveUnavailable,
@@ -12120,10 +12355,10 @@ fn run_simp_lite_tactic_with_budget(
         goal_id,
         goal.meta_id,
     )?;
-    let initial_eq_target = whnf_eq_target(state, &goal, &ctx, family, &fuel)?;
+    let initial_eq_target = whnf_eq_target(state, goal, &ctx, family, &fuel)?;
     let simp = assemble_simp_lite(
         state,
-        &goal,
+        goal,
         &ctx,
         family,
         initial_eq_target,
@@ -12132,7 +12367,7 @@ fn run_simp_lite_tactic_with_budget(
         &fuel,
     )?;
     assign_goal_with_budget_and_steps(
-        state,
+        prepared,
         goal_id,
         simp.proof,
         simp.new_goal_specs,
@@ -12143,12 +12378,13 @@ fn run_simp_lite_tactic_with_budget(
 }
 
 fn run_smt_tactic_with_budget(
-    state: &MachineProofState,
+    prepared: &PreparedMachineTacticSnapshot<'_>,
     goal_id: GoalId,
     lemmas: Vec<SmtLemmaRef>,
     budget: TacticBudget,
 ) -> Result<(MachineProofState, MachineProofDelta)> {
-    let goal = state.goal(goal_id)?;
+    let state = prepared.state();
+    let goal = prepared.goal();
     validate_smt_lemma_refs(&lemmas)
         .map_err(|diag| attach_goal_meta(diag, goal_id, goal.meta_id))?;
     for lemma in &lemmas {
@@ -12174,10 +12410,10 @@ fn run_smt_tactic_with_budget(
     )?;
 
     if lemmas.is_empty() {
-        if let Some(proof) = resolve_smt_local_exact(state, &goal, &ctx, &fuel)? {
+        if let Some(proof) = resolve_smt_local_exact(state, goal, &ctx, &fuel)? {
             ensure_tactic_step_fuel(budget, 1, goal_id, goal.meta_id)?;
             return assign_goal_with_budget_and_steps(
-                state,
+                prepared,
                 goal_id,
                 proof,
                 Vec::new(),
@@ -12188,9 +12424,18 @@ fn run_smt_tactic_with_budget(
         }
     } else {
         for lemma in &lemmas {
-            validate_apply_head_static(state, &goal, &lemma.head, &lemma.universe_args)?;
-            let resolved =
-                resolve_apply_head(state, &goal, &ctx, &lemma.head, &lemma.universe_args, &fuel)?;
+            validate_apply_head_static_for_prepared_snapshot(
+                prepared,
+                &lemma.head,
+                &lemma.universe_args,
+            )?;
+            let resolved = resolve_apply_head_for_prepared_snapshot(
+                prepared,
+                &ctx,
+                &lemma.head,
+                &lemma.universe_args,
+                &fuel,
+            )?;
             if kernel_is_defeq_with_budget(
                 state.env.kernel_env(),
                 &ctx,
@@ -12203,7 +12448,7 @@ fn run_smt_tactic_with_budget(
             )? {
                 ensure_tactic_step_fuel(budget, 1, goal_id, goal.meta_id)?;
                 return assign_goal_with_budget_and_steps(
-                    state,
+                    prepared,
                     goal_id,
                     resolved.proof,
                     Vec::new(),
@@ -12506,15 +12751,16 @@ struct CasesIndexEq {
 }
 
 fn run_induction_nat_tactic_with_budget(
-    state: &MachineProofState,
+    prepared: &PreparedMachineTacticSnapshot<'_>,
     goal_id: GoalId,
     local_name: String,
     budget: TacticBudget,
 ) -> Result<(MachineProofState, MachineProofDelta)> {
-    let goal = state.goal(goal_id)?;
+    let state = prepared.state();
+    let goal = prepared.goal();
     validate_intro_name_shape(&local_name)
         .map_err(|diag| attach_goal_meta(diag, goal_id, goal.meta_id))?;
-    let target = resolve_induction_nat_target(&goal, &local_name)?;
+    let target = resolve_induction_nat_target(prepared, &local_name)?;
     let family = state.env.nat_family.as_ref().ok_or_else(|| {
         MachineTacticDiagnostic::new(
             MachineTacticDiagnosticKind::TacticPrimitiveUnavailable,
@@ -12523,7 +12769,7 @@ fn run_induction_nat_tactic_with_budget(
         .with_goal(goal_id)
         .with_meta(goal.meta_id)
     })?;
-    ensure_resolved_nat_family_heads(state, &goal, family)?;
+    ensure_resolved_nat_family_heads(state, goal, family)?;
 
     let fuel = TacticRunFuel::new(budget);
     let prefix_ctx = local_context_to_ctx_with_budget(
@@ -12565,9 +12811,9 @@ fn run_induction_nat_tactic_with_budget(
         goal_id,
         goal.meta_id,
     )?;
-    let assembly = assemble_induction_nat(state, &goal, &ctx, family, target.index, budget, &fuel)?;
+    let assembly = assemble_induction_nat(state, goal, &ctx, family, target.index, budget, &fuel)?;
     assign_goal_with_budget_and_steps(
-        state,
+        prepared,
         goal_id,
         assembly.proof,
         assembly.new_goal_specs,
@@ -12578,12 +12824,13 @@ fn run_induction_nat_tactic_with_budget(
 }
 
 fn run_cases_tactic_with_budget(
-    state: &MachineProofState,
+    prepared: &PreparedMachineTacticSnapshot<'_>,
     goal_id: GoalId,
     payload: CasesPayload<MachineTermSource>,
     budget: TacticBudget,
 ) -> Result<(MachineProofState, MachineProofDelta)> {
-    let goal = state.goal(goal_id)?;
+    let state = prepared.state();
+    let goal = prepared.goal();
     validate_intro_name_shape(&payload.major_local)
         .map_err(|diag| attach_goal_meta(diag, goal_id, goal.meta_id))?;
     validate_branch_names(&payload.branch_names)
@@ -12598,8 +12845,8 @@ fn run_cases_tactic_with_budget(
     }
 
     let fuel = TacticRunFuel::new(budget);
-    let target = resolve_cases_major_target(state, &goal, &payload.major_local, &fuel)?;
-    let recursor = resolve_checked_cases_recursor(state, &goal, &target)?;
+    let target = resolve_cases_major_target(state, prepared, &payload.major_local, &fuel)?;
+    let recursor = resolve_checked_cases_recursor(state, goal, &target)?;
     let ctx = local_context_to_ctx_with_budget(
         state.env.kernel_env(),
         &goal.context,
@@ -12610,7 +12857,7 @@ fn run_cases_tactic_with_budget(
     )?;
     let assembly = assemble_cases_tactic(
         state,
-        &goal,
+        goal,
         &ctx,
         &target,
         &recursor,
@@ -12620,7 +12867,7 @@ fn run_cases_tactic_with_budget(
         &fuel,
     )?;
     assign_goal_with_budget_and_steps(
-        state,
+        prepared,
         goal_id,
         assembly.proof,
         assembly.new_goal_specs,
@@ -12631,12 +12878,13 @@ fn run_cases_tactic_with_budget(
 }
 
 fn run_general_induction_tactic_with_budget(
-    state: &MachineProofState,
+    prepared: &PreparedMachineTacticSnapshot<'_>,
     goal_id: GoalId,
     payload: GeneralInductionPayload<MachineTermSource>,
     budget: TacticBudget,
 ) -> Result<(MachineProofState, MachineProofDelta)> {
-    let goal = state.goal(goal_id)?;
+    let state = prepared.state();
+    let goal = prepared.goal();
     validate_intro_name_shape(&payload.major_local)
         .map_err(|diag| attach_goal_meta(diag, goal_id, goal.meta_id))?;
     validate_tactic_head_shape(&payload.recursor)
@@ -12655,9 +12903,9 @@ fn run_general_induction_tactic_with_budget(
     }
 
     let fuel = TacticRunFuel::new(budget);
-    let target = resolve_cases_major_target(state, &goal, &payload.major_local, &fuel)?;
+    let target = resolve_cases_major_target(state, prepared, &payload.major_local, &fuel)?;
     let generalized =
-        resolve_generalized_induction_locals(&goal, target.index, &payload.generalized_locals)?;
+        resolve_generalized_induction_locals(prepared, target.index, &payload.generalized_locals)?;
     if !target.indices.is_empty() && !generalized.is_empty() {
         return Err(MachineTacticDiagnostic::new(
             MachineTacticDiagnosticKind::UnsupportedTacticOption,
@@ -12668,7 +12916,7 @@ fn run_general_induction_tactic_with_budget(
         .with_meta(goal.meta_id));
     }
     let recursor =
-        resolve_checked_general_induction_recursor(state, &goal, &target, &payload.recursor)?;
+        resolve_checked_general_induction_recursor(state, goal, &target, &payload.recursor)?;
     let ctx = local_context_to_ctx_with_budget(
         state.env.kernel_env(),
         &goal.context,
@@ -12679,7 +12927,7 @@ fn run_general_induction_tactic_with_budget(
     )?;
     let assembly = assemble_general_induction_tactic(
         state,
-        &goal,
+        goal,
         &ctx,
         &target,
         &recursor,
@@ -12690,7 +12938,7 @@ fn run_general_induction_tactic_with_budget(
         &fuel,
     )?;
     assign_goal_with_budget_and_steps(
-        state,
+        prepared,
         goal_id,
         assembly.proof,
         assembly.new_goal_specs,
@@ -12701,10 +12949,11 @@ fn run_general_induction_tactic_with_budget(
 }
 
 fn resolve_generalized_induction_locals(
-    goal: &MachineGoal,
+    prepared: &PreparedMachineTacticSnapshot<'_>,
     major_index: usize,
     local_names: &[String],
 ) -> Result<Vec<GeneralizedInductionLocal>> {
+    let goal = prepared.goal();
     let mut seen = BTreeSet::new();
     let mut resolved = Vec::new();
     for name in local_names {
@@ -12724,31 +12973,8 @@ fn resolve_generalized_induction_locals(
             .with_goal(goal.id)
             .with_meta(goal.meta_id));
         }
-        let matches = goal
-            .context
-            .iter()
-            .enumerate()
-            .filter(|(_, local)| local.name == *name)
-            .collect::<Vec<_>>();
-        let [(index, local)] = matches.as_slice() else {
-            return Err(if matches.is_empty() {
-                MachineTacticDiagnostic::new(
-                    MachineTacticDiagnosticKind::UnknownLocalName,
-                    format!(
-                        "general-induction generalized local {name:?} is not in the goal context"
-                    ),
-                )
-            } else {
-                MachineTacticDiagnostic::new(
-                    MachineTacticDiagnosticKind::AmbiguousLocalName,
-                    format!(
-                        "general-induction generalized local {name:?} resolves to multiple locals"
-                    ),
-                )
-            }
-            .with_goal(goal.id)
-            .with_meta(goal.meta_id));
-        };
+        let index = prepared_local_index(prepared, name, "general-induction generalized local")?;
+        let local = &goal.context[index];
         if local.value.is_some() {
             return Err(MachineTacticDiagnostic::new(
                 MachineTacticDiagnosticKind::InvalidInductionTarget,
@@ -12759,7 +12985,7 @@ fn resolve_generalized_induction_locals(
             .with_goal(goal.id)
             .with_meta(goal.meta_id));
         }
-        if *index <= major_index {
+        if index <= major_index {
             return Err(MachineTacticDiagnostic::new(
                 MachineTacticDiagnosticKind::InvalidInductionTarget,
                 "general-induction generalized locals must be later than the major local",
@@ -12768,8 +12994,8 @@ fn resolve_generalized_induction_locals(
             .with_meta(goal.meta_id));
         }
         resolved.push(GeneralizedInductionLocal {
-            index: *index,
-            local: (*local).clone(),
+            index,
+            local: local.clone(),
         });
     }
 
@@ -12991,31 +13217,13 @@ fn general_induction_recursor_metadata_matches(
 
 fn resolve_cases_major_target(
     state: &MachineProofState,
-    goal: &MachineGoal,
+    prepared: &PreparedMachineTacticSnapshot<'_>,
     local_name: &str,
     fuel: &TacticRunFuel,
 ) -> Result<CasesTarget> {
-    let matches = goal
-        .context
-        .iter()
-        .enumerate()
-        .filter(|(_, local)| local.name == local_name)
-        .collect::<Vec<_>>();
-    let [(index, local)] = matches.as_slice() else {
-        return Err(if matches.is_empty() {
-            MachineTacticDiagnostic::new(
-                MachineTacticDiagnosticKind::UnknownLocalName,
-                format!("cases major premise {local_name:?} is not in the goal context"),
-            )
-        } else {
-            MachineTacticDiagnostic::new(
-                MachineTacticDiagnosticKind::AmbiguousLocalName,
-                format!("cases major premise {local_name:?} resolves to multiple locals"),
-            )
-        }
-        .with_goal(goal.id)
-        .with_meta(goal.meta_id));
-    };
+    let goal = prepared.goal();
+    let index = prepared_local_index(prepared, local_name, "cases major premise")?;
+    let local = &goal.context[index];
     if local.value.is_some() {
         return Err(MachineTacticDiagnostic::new(
             MachineTacticDiagnosticKind::InvalidLocalHead,
@@ -13026,7 +13234,7 @@ fn resolve_cases_major_target(
     }
     let prefix_ctx = local_context_to_ctx_with_budget(
         state.env.kernel_env(),
-        &goal.context[..*index],
+        &goal.context[..index],
         &state.root.universe_params,
         fuel,
         goal.id,
@@ -13073,8 +13281,8 @@ fn resolve_cases_major_target(
         .with_meta(goal.meta_id));
     }
     Ok(CasesTarget {
-        index: *index,
-        local: (*local).clone(),
+        index,
+        local: local.clone(),
         inductive: name,
         levels,
         params: args[..data.params.len()].to_vec(),
@@ -14262,30 +14470,12 @@ struct InductionNatTarget {
 }
 
 fn resolve_induction_nat_target(
-    goal: &MachineGoal,
+    prepared: &PreparedMachineTacticSnapshot<'_>,
     local_name: &str,
 ) -> Result<InductionNatTarget> {
-    let matches = goal
-        .context
-        .iter()
-        .enumerate()
-        .filter(|(_, local)| local.name == local_name)
-        .collect::<Vec<_>>();
-    let [(index, local)] = matches.as_slice() else {
-        return Err(if matches.is_empty() {
-            MachineTacticDiagnostic::new(
-                MachineTacticDiagnosticKind::UnknownLocalName,
-                format!("induction-nat target {local_name:?} is not in the goal context"),
-            )
-        } else {
-            MachineTacticDiagnostic::new(
-                MachineTacticDiagnosticKind::AmbiguousLocalName,
-                format!("induction-nat target {local_name:?} resolves to multiple locals"),
-            )
-        }
-        .with_goal(goal.id)
-        .with_meta(goal.meta_id));
-    };
+    let goal = prepared.goal();
+    let index = prepared_local_index(prepared, local_name, "induction-nat target")?;
+    let local = &goal.context[index];
     if local.value.is_some() {
         return Err(MachineTacticDiagnostic::new(
             MachineTacticDiagnosticKind::InvalidInductionTarget,
@@ -14294,7 +14484,7 @@ fn resolve_induction_nat_target(
         .with_goal(goal.id)
         .with_meta(goal.meta_id));
     }
-    if *index + 1 != goal.context.len() {
+    if index + 1 != goal.context.len() {
         return Err(MachineTacticDiagnostic::new(
             MachineTacticDiagnosticKind::InvalidInductionTarget,
             "induction-nat MVP requires the target local to be the last local declaration",
@@ -14303,8 +14493,8 @@ fn resolve_induction_nat_target(
         .with_meta(goal.meta_id));
     }
     Ok(InductionNatTarget {
-        index: *index,
-        local: (*local).clone(),
+        index,
+        local: local.clone(),
     })
 }
 
@@ -15205,8 +15395,8 @@ fn typed_subgoal_spec_with_budget(
     Ok(MachineNewGoalSpec::new(context, target))
 }
 
-struct MachineProofDeltaBuilder<'a, 'fuel> {
-    state: &'a MachineProofState,
+struct MachineProofDeltaBuilder<'prepared, 'state, 'fuel> {
+    prepared: &'prepared PreparedMachineTacticSnapshot<'state>,
     goal_id: GoalId,
     proof_expr: ProofExpr,
     new_goal_specs: Vec<MachineNewGoalSpec>,
@@ -15215,9 +15405,9 @@ struct MachineProofDeltaBuilder<'a, 'fuel> {
     fuel: &'fuel TacticRunFuel,
 }
 
-impl<'a, 'fuel> MachineProofDeltaBuilder<'a, 'fuel> {
+impl<'prepared, 'state, 'fuel> MachineProofDeltaBuilder<'prepared, 'state, 'fuel> {
     fn new(
-        state: &'a MachineProofState,
+        prepared: &'prepared PreparedMachineTacticSnapshot<'state>,
         goal_id: GoalId,
         proof_expr: ProofExpr,
         budget: TacticBudget,
@@ -15225,7 +15415,7 @@ impl<'a, 'fuel> MachineProofDeltaBuilder<'a, 'fuel> {
         fuel: &'fuel TacticRunFuel,
     ) -> Self {
         Self {
-            state,
+            prepared,
             goal_id,
             proof_expr,
             new_goal_specs: Vec::new(),
@@ -15241,21 +15431,12 @@ impl<'a, 'fuel> MachineProofDeltaBuilder<'a, 'fuel> {
     }
 
     fn build(self) -> Result<(MachineProofState, MachineProofDelta)> {
-        validate_machine_proof_state(self.state)?;
-        let goal_index = self
-            .state
-            .open_goals
-            .iter()
-            .position(|open_goal| *open_goal == self.goal_id)
-            .ok_or_else(|| {
-                MachineTacticDiagnostic::new(
-                    MachineTacticDiagnosticKind::UnknownGoal,
-                    format!("goal {} is not open", self.goal_id.0),
-                )
-                .with_goal(self.goal_id)
-            })?;
-        let assigned_meta_id = MetaVarId::from(self.goal_id);
-        let assigned_meta = self.state.metas.get(assigned_meta_id).ok_or_else(|| {
+        self.prepared.record_delta_builder_reuse();
+        let state = self.prepared.state();
+        let goal = self.prepared.goal();
+        let goal_index = self.prepared.goal_index;
+        let assigned_meta_id = goal.meta_id;
+        let assigned_meta = state.metas.get(assigned_meta_id).ok_or_else(|| {
             MachineTacticDiagnostic::new(
                 MachineTacticDiagnosticKind::UnknownGoal,
                 format!(
@@ -15288,44 +15469,36 @@ impl<'a, 'fuel> MachineProofDeltaBuilder<'a, 'fuel> {
             .with_goal(self.goal_id)
             .with_meta(assigned_meta_id));
         }
-        let resulting_open_goals = self.state.open_goals.len() - 1 + self.new_goal_specs.len();
-        if resulting_open_goals > self.state.env.options.max_open_goals {
+        let resulting_open_goals = state.open_goals.len() - 1 + self.new_goal_specs.len();
+        if resulting_open_goals > state.env.options.max_open_goals {
             return Err(MachineTacticDiagnostic::new(
                 MachineTacticDiagnosticKind::GoalLimitExceeded,
                 format!(
                     "assign_goal would leave {} open goals, limit is {}",
-                    resulting_open_goals, self.state.env.options.max_open_goals
+                    resulting_open_goals, state.env.options.max_open_goals
                 ),
             )
             .with_goal(self.goal_id)
             .with_meta(assigned_meta_id));
         }
-        if self.state.metas.len() + self.new_goal_specs.len() > self.state.env.options.max_metas {
+        if state.metas.len() + self.new_goal_specs.len() > state.env.options.max_metas {
             return Err(MachineTacticDiagnostic::new(
                 MachineTacticDiagnosticKind::MetaLimitExceeded,
                 format!(
                     "assign_goal would create {} metas total, limit is {}",
-                    self.state.metas.len() + self.new_goal_specs.len(),
-                    self.state.env.options.max_metas
+                    state.metas.len() + self.new_goal_specs.len(),
+                    state.env.options.max_metas
                 ),
             )
             .with_goal(self.goal_id)
             .with_meta(assigned_meta_id));
         }
 
-        let goal = MachineGoal {
-            id: self.goal_id,
-            meta_id: assigned_meta_id,
-            context: assigned_meta.context.clone(),
-            context_hash: machine_local_context_hash(&assigned_meta.context),
-            target: assigned_meta.target.clone(),
-            target_hash: core_expr_hash(&assigned_meta.target),
-        };
         let mut new_goal_expr_nodes = 0;
         for spec in &self.new_goal_specs {
             typed_subgoal_spec_with_budget(
-                self.state,
-                &goal,
+                state,
+                goal,
                 spec.context.clone(),
                 spec.target.clone(),
                 self.fuel,
@@ -15340,7 +15513,8 @@ impl<'a, 'fuel> MachineProofDeltaBuilder<'a, 'fuel> {
             assigned_meta_id,
         )?;
 
-        let mut candidate = self.state.clone();
+        self.prepared.record_output_state_clone();
+        let mut candidate = state.clone();
         let mut new_meta_ids = BTreeSet::new();
         let mut added_goals = Vec::new();
         let mut new_metas_delta = Vec::new();
@@ -15397,11 +15571,12 @@ impl<'a, 'fuel> MachineProofDeltaBuilder<'a, 'fuel> {
             .open_goals
             .splice(goal_index..goal_index + 1, added_goals.iter().copied());
         refresh_state_identity(&mut candidate);
+        self.prepared.record_output_state_validation();
         validate_machine_proof_state(&candidate)?;
 
         let proof_expr_hash = proof_expr_hash(&self.proof_expr);
         let mut delta = MachineProofDelta {
-            from_state_fingerprint: self.state.fingerprint,
+            from_state_fingerprint: state.fingerprint,
             to_state_fingerprint: candidate.fingerprint,
             assigned_goal: self.goal_id,
             assigned_meta: assigned_meta_id,
@@ -15438,11 +15613,20 @@ pub fn assign_goal_with_budget(
     budget: TacticBudget,
 ) -> Result<(MachineProofState, MachineProofDelta)> {
     let fuel = TacticRunFuel::new(budget);
-    assign_goal_with_budget_and_steps(state, goal_id, proof_expr, new_goal_specs, budget, 1, &fuel)
+    let prepared = prepare_machine_tactic_snapshot(state, goal_id)?;
+    assign_goal_with_budget_and_steps(
+        &prepared,
+        goal_id,
+        proof_expr,
+        new_goal_specs,
+        budget,
+        1,
+        &fuel,
+    )
 }
 
 fn assign_goal_with_budget_and_steps(
-    state: &MachineProofState,
+    prepared: &PreparedMachineTacticSnapshot<'_>,
     goal_id: GoalId,
     proof_expr: ProofExpr,
     new_goal_specs: Vec<MachineNewGoalSpec>,
@@ -15451,7 +15635,7 @@ fn assign_goal_with_budget_and_steps(
     fuel: &TacticRunFuel,
 ) -> Result<(MachineProofState, MachineProofDelta)> {
     MachineProofDeltaBuilder::new(
-        state,
+        prepared,
         goal_id,
         proof_expr,
         budget,
@@ -26046,6 +26230,26 @@ mod tests {
     }
 
     #[test]
+    fn unsupported_bitblast_precedes_goal_lookup_in_state_taking_wrapper() {
+        let state = start_trivial();
+
+        let err = run_machine_tactic(
+            &state,
+            MachineTactic::Bitblast {
+                goal_id: GoalId(99),
+            },
+        )
+        .expect_err("unsupported bitblast must be reported before goal lookup");
+
+        assert_eq!(
+            err.kind,
+            MachineTacticDiagnosticKind::UnsupportedMachineTactic
+        );
+        assert_eq!(err.goal_id, Some(GoalId(99)));
+        assert_eq!(err.tactic_kind.as_deref(), Some("bitblast"));
+    }
+
+    #[test]
     fn validation_transaction_rejects_v2_missing_local_without_mutating_state() {
         let state = start_trivial();
         let before = state.clone();
@@ -26590,6 +26794,20 @@ mod tests {
         assert_eq!(batch.deterministic_budget_hash, tactic_budget_hash(budget));
         assert_eq!(batch.results.len(), 2);
         assert_eq!(state.open_goals, vec![GoalId(0)]);
+        assert_eq!(
+            batch.preparation_counters,
+            MachineTacticPreparationCounters {
+                complete_input_state_validations: 1,
+                selected_goal_projections: 1,
+                selected_context_projections: 1,
+                candidate_local_validations: 2,
+                candidate_executions: 2,
+                input_state_validation_reuses: 5,
+                goal_projection_reuses: 5,
+                output_state_clones: 1,
+                output_state_validations: 1,
+            }
+        );
 
         match &batch.results[0] {
             MachineTacticBatchItemResult::Success {
@@ -26621,6 +26839,96 @@ mod tests {
             }
             other => panic!("second candidate should fail independently: {other:?}"),
         }
+    }
+
+    #[test]
+    fn prepared_tactic_path_matches_state_taking_wrapper_and_reuses_projection() {
+        let state = start_trivial();
+        let budget = TacticBudget::default();
+        let tactic = validate_machine_tactic_candidate(
+            GoalId(0),
+            MachineTacticCandidate::Exact {
+                term: RawMachineTerm::new("Prop"),
+            },
+        )
+        .unwrap();
+        let prepared = prepare_machine_tactic_snapshot(&state, GoalId(0)).unwrap();
+
+        validate_normalized_machine_tactic_for_prepared_snapshot(
+            &prepared,
+            &tactic,
+            MachineTacticValidationBudget::from(budget),
+            MachineTacticProfileVersion::StructuralV2,
+            &[],
+        )
+        .unwrap();
+        let prepared_result =
+            run_machine_tactic_for_prepared_snapshot(&prepared, tactic.clone(), budget).unwrap();
+        let wrapper_result = run_machine_tactic_with_budget(&state, tactic, budget).unwrap();
+
+        assert_eq!(prepared_result.0.fingerprint, wrapper_result.0.fingerprint);
+        assert_eq!(prepared_result.0.open_goals, wrapper_result.0.open_goals);
+        assert_eq!(prepared_result.1, wrapper_result.1);
+        assert_eq!(
+            prepared.counters(),
+            MachineTacticPreparationCounters {
+                complete_input_state_validations: 1,
+                selected_goal_projections: 1,
+                selected_context_projections: 1,
+                candidate_local_validations: 1,
+                candidate_executions: 1,
+                input_state_validation_reuses: 3,
+                goal_projection_reuses: 3,
+                output_state_clones: 1,
+                output_state_validations: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn prepared_tactic_snapshot_rejects_a_different_goal() {
+        let state = start_trivial();
+        let (state, _) = assign_goal(
+            &state,
+            GoalId(0),
+            ProofExpr::Meta(MetaVarId(1)),
+            vec![
+                MachineNewGoalSpec::new(Vec::new(), type0()),
+                MachineNewGoalSpec::new(Vec::new(), type0()),
+            ],
+        )
+        .unwrap();
+        let prepared = prepare_machine_tactic_snapshot(&state, GoalId(1)).unwrap();
+        let tactic = validate_machine_tactic_candidate(
+            GoalId(2),
+            MachineTacticCandidate::Exact {
+                term: RawMachineTerm::new("Prop"),
+            },
+        )
+        .unwrap();
+
+        let validation_error = validate_normalized_machine_tactic_for_prepared_snapshot(
+            &prepared,
+            &tactic,
+            MachineTacticValidationBudget::from(TacticBudget::default()),
+            MachineTacticProfileVersion::StructuralV2,
+            &[],
+        )
+        .unwrap_err();
+        let execution_error =
+            run_machine_tactic_for_prepared_snapshot(&prepared, tactic, TacticBudget::default())
+                .unwrap_err();
+
+        assert_eq!(
+            validation_error.kind,
+            MachineTacticDiagnosticKind::UnknownGoal
+        );
+        assert_eq!(
+            execution_error.kind,
+            MachineTacticDiagnosticKind::UnknownGoal
+        );
+        assert_eq!(prepared.counters().candidate_local_validations, 0);
+        assert_eq!(prepared.counters().candidate_executions, 0);
     }
 
     #[test]
@@ -30711,6 +31019,7 @@ mod tests {
     #[test]
     fn proof_delta_builder_generated_goal_order_is_deterministic() {
         let state = start_trivial();
+        let prepared = prepare_machine_tactic_snapshot(&state, GoalId(0)).unwrap();
         let fuel = TacticRunFuel::new(TacticBudget::default());
         let goal = state.goal(GoalId(0)).unwrap();
         let specs = vec![
@@ -30718,7 +31027,7 @@ mod tests {
             typed_subgoal_spec_with_budget(&state, &goal, Vec::new(), type0(), &fuel).unwrap(),
         ];
         let first = MachineProofDeltaBuilder::new(
-            &state,
+            &prepared,
             GoalId(0),
             ProofExpr::Meta(MetaVarId(1)),
             TacticBudget::default(),
@@ -30734,7 +31043,7 @@ mod tests {
             typed_subgoal_spec_with_budget(&state, &goal, Vec::new(), type0(), &fuel).unwrap(),
         ];
         let second = MachineProofDeltaBuilder::new(
-            &state,
+            &prepared,
             GoalId(0),
             ProofExpr::Meta(MetaVarId(1)),
             TacticBudget::default(),

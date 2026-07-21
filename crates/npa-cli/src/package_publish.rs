@@ -1057,6 +1057,7 @@ fn reference_report_from_cached_summaries(
         modules,
         memo_counters: PackageVerificationMemoCounters::default(),
         decode_cache_counters: None,
+        measurements: None,
     }
 }
 

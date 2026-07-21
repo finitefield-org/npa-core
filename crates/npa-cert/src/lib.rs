@@ -8,14 +8,17 @@
 
 mod binary;
 mod canonical;
+mod declaration_closure;
 mod hash;
 mod inductive;
 mod kernel;
 mod producer;
+mod rebind;
 mod theorem_premise_analysis;
 mod types;
 mod verify;
 
+pub use declaration_closure::*;
 pub use inductive::{
     classify_inductive_artifact_profile_v1, generate_inductive_artifacts_v1,
     generate_mutual_inductive_artifacts_v1, inductive_generated_artifact_hashes_v1,
@@ -24,6 +27,7 @@ pub use inductive::{
 };
 pub use kernel::{builtin_decl_interface_hash, verified_module_to_kernel_decls};
 pub use producer::*;
+pub use rebind::*;
 pub use theorem_premise_analysis::*;
 pub use types::*;
 
@@ -188,6 +192,45 @@ pub fn verify_module_cert_with_import_refs(
     verify::verify_module_cert_with_import_refs_impl(bytes, imports, policy)
 }
 
+/// Verify a canonical module certificate with explicit out-of-band kernel
+/// execution options.
+///
+/// Memo selection is not serialized and does not alter certificate, module,
+/// import, or policy identities. [`npa_kernel::KernelExecutionOptions::default`]
+/// retains the behavior of [`verify_module_cert_with_import_refs`].
+pub fn verify_module_cert_with_import_refs_and_kernel_options(
+    bytes: &[u8],
+    imports: &[&VerifiedModule],
+    policy: &AxiomPolicy,
+    kernel_options: npa_kernel::KernelExecutionOptions,
+) -> Result<VerifiedModule> {
+    verify::verify_module_cert_with_import_refs_and_options_impl(
+        bytes,
+        imports,
+        policy,
+        kernel_options,
+    )
+}
+
+/// Verify a canonical module certificate with explicit kernel options while
+/// aggregating deterministic work and memo/probe counters from the real
+/// declaration-verification path.
+pub fn verify_module_cert_with_import_refs_and_kernel_options_and_work_counters(
+    bytes: &[u8],
+    imports: &[&VerifiedModule],
+    policy: &AxiomPolicy,
+    kernel_options: npa_kernel::KernelExecutionOptions,
+    work_counters: &mut npa_kernel::KernelWorkCounters,
+) -> Result<VerifiedModule> {
+    verify::verify_module_cert_with_import_refs_and_options_and_work_counters_impl(
+        bytes,
+        imports,
+        policy,
+        kernel_options,
+        work_counters,
+    )
+}
+
 /// Verify an already decoded module certificate against borrowed verified imports.
 ///
 /// This performs the same canonical byte round-trip, hash recomputation, import
@@ -204,6 +247,28 @@ pub fn verify_decoded_module_cert_with_import_refs(
     verify::verify_decoded_module_cert_with_import_refs_impl(cert, bytes, imports, policy)
 }
 
+/// Verify an already decoded certificate with explicit out-of-band kernel
+/// execution options.
+///
+/// This preserves the canonical byte comparison and all policy checks of
+/// [`verify_decoded_module_cert_with_import_refs`]. Memo state is created and
+/// dropped independently for each kernel declaration operation.
+pub fn verify_decoded_module_cert_with_import_refs_and_kernel_options(
+    cert: &ModuleCert,
+    bytes: &[u8],
+    imports: &[&VerifiedModule],
+    policy: &AxiomPolicy,
+    kernel_options: npa_kernel::KernelExecutionOptions,
+) -> Result<VerifiedModule> {
+    verify::verify_decoded_module_cert_with_import_refs_and_options_impl(
+        cert,
+        bytes,
+        imports,
+        policy,
+        kernel_options,
+    )
+}
+
 /// Verify a freshly built module certificate against borrowed verified imports.
 ///
 /// This is for callers that just obtained a `ModuleCert` from this crate's canonical
@@ -216,6 +281,26 @@ pub fn verify_built_module_cert_with_import_refs(
     policy: &AxiomPolicy,
 ) -> Result<VerifiedModule> {
     verify::verify_built_module_cert_with_import_refs_impl(cert, imports, policy)
+}
+
+/// Verify a freshly built certificate with explicit out-of-band kernel
+/// execution options.
+///
+/// Persisted bytes must continue to use a byte-verifying entry point. The
+/// options select only operation-local execution behavior and never enter the
+/// certificate identity.
+pub fn verify_built_module_cert_with_import_refs_and_kernel_options(
+    cert: &ModuleCert,
+    imports: &[&VerifiedModule],
+    policy: &AxiomPolicy,
+    kernel_options: npa_kernel::KernelExecutionOptions,
+) -> Result<VerifiedModule> {
+    verify::verify_built_module_cert_with_import_refs_and_options_impl(
+        cert,
+        imports,
+        policy,
+        kernel_options,
+    )
 }
 
 /// Verify an already decoded module certificate against its canonical byte source.

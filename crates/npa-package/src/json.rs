@@ -2,6 +2,8 @@
 
 use std::fmt;
 
+const MAX_JSON_NESTING_DEPTH: usize = 512;
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum JsonValue {
     Null,
@@ -121,11 +123,12 @@ pub(crate) enum JsonParseErrorKind {
     InvalidEscape,
     InvalidUnicodeEscape,
     ControlCharacterInString,
+    NestingDepthExceeded { max_depth: usize },
 }
 
 pub(crate) fn parse_json(source: &str) -> Result<JsonValue, JsonParseError> {
     let mut parser = Parser::new(source);
-    let value = parser.parse_value()?;
+    let value = parser.parse_value(0)?;
     parser.skip_ws();
     if parser.is_done() {
         Ok(value)
@@ -149,7 +152,12 @@ impl<'src> Parser<'src> {
         }
     }
 
-    fn parse_value(&mut self) -> Result<JsonValue, JsonParseError> {
+    fn parse_value(&mut self, depth: usize) -> Result<JsonValue, JsonParseError> {
+        if depth > MAX_JSON_NESTING_DEPTH {
+            return Err(self.error(JsonParseErrorKind::NestingDepthExceeded {
+                max_depth: MAX_JSON_NESTING_DEPTH,
+            }));
+        }
         self.skip_ws();
         let Some(byte) = self.peek() else {
             return Err(self.error(JsonParseErrorKind::ExpectedValue));
@@ -160,8 +168,8 @@ impl<'src> Parser<'src> {
             b't' => self.parse_literal(b"true", JsonValue::Bool(true)),
             b'f' => self.parse_literal(b"false", JsonValue::Bool(false)),
             b'"' => self.parse_string().map(JsonValue::String),
-            b'[' => self.parse_array(),
-            b'{' => self.parse_object(),
+            b'[' => self.parse_array(depth),
+            b'{' => self.parse_object(depth),
             b'-' | b'0'..=b'9' => self.parse_number().map(JsonValue::Number),
             _ => Err(self.error(JsonParseErrorKind::ExpectedValue)),
         }
@@ -266,7 +274,7 @@ impl<'src> Parser<'src> {
         Ok(value)
     }
 
-    fn parse_array(&mut self) -> Result<JsonValue, JsonParseError> {
+    fn parse_array(&mut self, depth: usize) -> Result<JsonValue, JsonParseError> {
         self.consume_expected_byte(b'[', "array")?;
         let mut values = Vec::new();
         self.skip_ws();
@@ -276,7 +284,7 @@ impl<'src> Parser<'src> {
         }
 
         loop {
-            values.push(self.parse_value()?);
+            values.push(self.parse_value(depth + 1)?);
             self.skip_ws();
             match self.take_byte() {
                 Some(b',') => {}
@@ -295,7 +303,7 @@ impl<'src> Parser<'src> {
         }
     }
 
-    fn parse_object(&mut self) -> Result<JsonValue, JsonParseError> {
+    fn parse_object(&mut self, depth: usize) -> Result<JsonValue, JsonParseError> {
         self.consume_expected_byte(b'{', "object")?;
         let mut members = Vec::new();
         self.skip_ws();
@@ -315,7 +323,7 @@ impl<'src> Parser<'src> {
             let key = self.parse_string()?;
             self.skip_ws();
             self.consume_expected_byte(b':', "object colon")?;
-            let value = self.parse_value()?;
+            let value = self.parse_value(depth + 1)?;
             members.push(JsonMember { key, value });
             self.skip_ws();
             match self.take_byte() {
@@ -433,5 +441,29 @@ fn hex_nibble(byte: u8) -> Option<u8> {
         b'a'..=b'f' => Some(byte - b'a' + 10),
         b'A'..=b'F' => Some(byte - b'A' + 10),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn json_nesting_limit_accepts_boundary_and_rejects_next_level() {
+        let mut boundary = "[".repeat(MAX_JSON_NESTING_DEPTH);
+        boundary.push('0');
+        boundary.push_str(&"]".repeat(MAX_JSON_NESTING_DEPTH));
+        assert!(parse_json(&boundary).is_ok());
+
+        let mut over_limit = "[".repeat(MAX_JSON_NESTING_DEPTH + 1);
+        over_limit.push('0');
+        over_limit.push_str(&"]".repeat(MAX_JSON_NESTING_DEPTH + 1));
+        let error = parse_json(&over_limit).expect_err("excessive nesting must fail closed");
+        assert_eq!(
+            error.kind,
+            JsonParseErrorKind::NestingDepthExceeded {
+                max_depth: MAX_JSON_NESTING_DEPTH,
+            }
+        );
     }
 }

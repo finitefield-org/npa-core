@@ -164,6 +164,26 @@ remove those certificate dependencies. A successful full or targeted refresh
 therefore remains immediately compatible with `package audit-artifact-ledger`,
 which compares metadata import identity with the manifest direct-import set.
 
+Targeted `package build-certs --update-manifest-hashes` keeps the complete
+local dependent closure as a conservative candidate set but no longer
+unconditionally elaborates every dependent. Seeds, stale sources or checked
+baselines, changed imported exports, unsupported formats/profiles, and
+inexact source-interface projections retain the ordinary source-rebuild path.
+An export-stable dependent with a qualified source and checked certificate may
+instead update every changed local strict certificate pin in its complete
+certificate import table. The format-owned operation structurally masks all
+other fields, canonically re-encodes the certificate, and live source-free
+verifies it against the newly verified exact imports. Exact-identity
+dependents are also live verified before unchanged reuse.
+
+Classification and execution proceed in package topological order, so rebound
+certificate hashes propagate through chains and diamonds. Full refresh,
+ordinary checks, external pins, staged writes, rollback, and reference
+verification are unchanged. The additive `package_build_refresh_plan`
+informational diagnostic reports candidate, source-rebuild, certificate-rebind,
+unchanged, source-scan, source-interface, and bounded fallback counts for both
+`--module` and `--changed` targeted refresh.
+
 ### Targeted external prerequisite closure
 
 Targeted ordinary `package build-certs --check` expands directly selected

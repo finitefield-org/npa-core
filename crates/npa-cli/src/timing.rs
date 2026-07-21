@@ -5,6 +5,8 @@ use std::time::Instant;
 
 use crate::args::PackageTimingMode;
 use crate::diagnostic::{CommandResult, CommandTimingMetric, CommandTimings};
+use crate::diagnostic::{PACKAGE_TIMINGS_SCHEMA_V0_1, PACKAGE_TIMINGS_SCHEMA_V0_2};
+use npa_api::{PerformanceMeasurementMode, PerformanceMeasurementReport};
 
 pub(crate) const TIMING_LOAD_ROOT_MS: &str = "load_root_ms";
 pub(crate) const TIMING_LOAD_LOCK_MS: &str = "load_lock_ms";
@@ -34,21 +36,40 @@ const TIMING_FIELD_ORDER: &[&str] = &[
 
 pub(crate) struct PackageTimingCollector {
     mode: PackageTimingMode,
-    started: Instant,
+    started: Option<Instant>,
     metrics: BTreeMap<&'static str, u128>,
+    measurements: Option<PerformanceMeasurementReport>,
 }
 
 impl PackageTimingCollector {
     pub(crate) fn new(mode: PackageTimingMode) -> Self {
         Self {
             mode,
-            started: Instant::now(),
+            started: mode.is_enabled().then(Instant::now),
             metrics: BTreeMap::new(),
+            measurements: None,
         }
     }
 
     pub(crate) fn is_enabled(&self) -> bool {
         self.mode.is_enabled()
+    }
+
+    pub(crate) fn measurement_mode(&self) -> PerformanceMeasurementMode {
+        match self.mode {
+            PackageTimingMode::Off => PerformanceMeasurementMode::Off,
+            PackageTimingMode::Summary => PerformanceMeasurementMode::Summary,
+            PackageTimingMode::Detailed => PerformanceMeasurementMode::Detailed,
+        }
+    }
+
+    pub(crate) fn observe_measurements(
+        &mut self,
+        measurements: Option<PerformanceMeasurementReport>,
+    ) {
+        if self.is_enabled() {
+            self.measurements = measurements;
+        }
     }
 
     pub(crate) fn time_phase<T>(&mut self, field: &'static str, run: impl FnOnce() -> T) -> T {
@@ -76,8 +97,11 @@ impl PackageTimingCollector {
         if !self.mode.is_enabled() {
             return None;
         }
+        let started = self
+            .started
+            .expect("enabled timing collector has a start instant");
         self.metrics
-            .insert(TIMING_TOTAL_MS, self.started.elapsed().as_millis());
+            .insert(TIMING_TOTAL_MS, started.elapsed().as_millis());
         let metrics = TIMING_FIELD_ORDER
             .iter()
             .filter_map(|field| {
@@ -90,8 +114,32 @@ impl PackageTimingCollector {
             })
             .collect();
         Some(CommandTimings {
+            schema: if self.measurements.is_some() {
+                PACKAGE_TIMINGS_SCHEMA_V0_2
+            } else {
+                PACKAGE_TIMINGS_SCHEMA_V0_1
+            },
             mode: self.mode.as_str().to_owned(),
             metrics,
+            measurements: self.measurements.clone(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn off_mode_has_no_start_clock_or_measurement_state() {
+        let mut collector = PackageTimingCollector::new(PackageTimingMode::Off);
+        assert!(collector.started.is_none());
+        assert_eq!(
+            collector.measurement_mode(),
+            PerformanceMeasurementMode::Off
+        );
+        assert_eq!(collector.time_phase(TIMING_CHECKER_MS, || 7), 7);
+        assert!(collector.metrics.is_empty());
+        assert!(collector.finish().is_none());
     }
 }

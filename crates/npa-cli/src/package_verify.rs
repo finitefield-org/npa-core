@@ -42,10 +42,10 @@ use npa_api::{
     IndependentCheckerRunnerPolicy, PackageCertificateArtifact, PackageModuleVerificationEvidence,
     PackageModuleVerificationResult, PackageModuleVerificationStatus,
     PackagePhase8RequestMaterialization, PackageVerificationDecodeCacheCounters,
-    PackageVerificationError, PackageVerificationErrorKind, PackageVerificationErrorReason,
-    PackageVerificationExecutionOptions, PackageVerificationMemoCounters,
-    PackageVerificationMemoMode, PackageVerificationMode, PackageVerificationReport,
-    PackageVerificationStatus, PackageVerificationVerdictSource,
+    PackageVerificationDecodeCacheMode, PackageVerificationError, PackageVerificationErrorKind,
+    PackageVerificationErrorReason, PackageVerificationExecutionOptions,
+    PackageVerificationMemoCounters, PackageVerificationMemoMode, PackageVerificationMode,
+    PackageVerificationReport, PackageVerificationStatus, PackageVerificationVerdictSource,
 };
 use npa_cert::{decode_module_cert, Hash, Name};
 use npa_package::{
@@ -588,12 +588,15 @@ fn run_package_verify_certs_on_stack(
     }
 
     let collect_decode_cache_counters = timings.is_enabled();
+    let measurement_mode = timings.measurement_mode();
     let report = match timings.time_phase(TIMING_CHECKER_MS, || {
         let execution_options = PackageVerificationExecutionOptions {
             jobs,
             selected_modules,
             memoization: PackageVerificationMemoMode::ProcessLocal,
+            decode_cache: PackageVerificationDecodeCacheMode::Disabled,
             collect_decode_cache_counters,
+            measurement_mode,
         };
         verify_package(checker, &loaded, lock, artifacts, execution_options)
     }) {
@@ -613,8 +616,9 @@ fn run_package_verify_certs_on_stack(
         }
     };
 
-    let result =
-        command_result_from_report(loaded.root_display, lock, report, timings.is_enabled());
+    timings.observe_measurements(report.measurements.clone());
+
+    let result = command_result_from_report(loaded.root_display, lock, report, false);
     finish_result_with_package_lock_provenance(timings, result, &acquired)
 }
 
@@ -1975,6 +1979,7 @@ fn verify_package_with_read_through_cache(
                     selected_modules: None,
                     memoization: PackageVerificationMemoMode::Disabled,
                     collect_decode_cache_counters: false,
+                    ..PackageVerificationExecutionOptions::default()
                 },
             )
         })
@@ -2176,6 +2181,7 @@ fn verify_package_with_read_through_disk_memo(
                     selected_modules: None,
                     memoization: PackageVerificationMemoMode::Disabled,
                     collect_decode_cache_counters: false,
+                    ..PackageVerificationExecutionOptions::default()
                 },
             )
         })

@@ -108,6 +108,7 @@ pub fn observe_package_artifacts_with_reference_checker<'a>(
             selected_modules: Some(selected_modules.clone()),
             memoization: PackageVerificationMemoMode::Disabled,
             collect_decode_cache_counters: false,
+            ..PackageVerificationExecutionOptions::default()
         },
         PackageVerificationInputValidationMode::ObserveLocalArtifacts,
     )?;

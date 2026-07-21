@@ -181,6 +181,15 @@ impl UniverseContext {
         if lhs == rhs {
             return Ok(true);
         }
+        // `imax(a, b)` is zero when `b` is zero. When `b` is positive,
+        // `b >= 1`, so `a <= 1` is sufficient for `imax(a, b) <= b`.
+        // Recognizing this exact impredicative case avoids replacing `imax`
+        // by the strictly stronger (and here unprovable) `max` obligation.
+        if let Level::IMax(imax_lhs, imax_rhs) = &lhs {
+            if **imax_rhs == rhs && self.entails_level_le(imax_lhs, &Level::succ(Level::zero()))? {
+                return Ok(true);
+            }
+        }
         let lhs_atoms = decompose_lhs_level_expr(&lhs)?;
         let rhs_atoms = decompose_level_expr(&rhs)?;
         let comparison_count =
@@ -695,6 +704,21 @@ mod tests {
 
         assert!(context
             .entails_level_le(&Level::imax(one.clone(), u.clone()), &Level::max(one, u),)
+            .unwrap());
+    }
+
+    #[test]
+    fn universe_context_proves_small_imax_bounded_by_its_symbolic_rhs() {
+        let context = UniverseContext::from_params(vec!["u".to_owned()]).unwrap();
+        let one = Level::succ(Level::zero());
+        let two = Level::succ(one.clone());
+        let u = Level::param("u");
+
+        assert!(context
+            .entails_level_le(&Level::imax(one, u.clone()), &u)
+            .unwrap());
+        assert!(!context
+            .entails_level_le(&Level::imax(two, u.clone()), &u)
             .unwrap());
     }
 

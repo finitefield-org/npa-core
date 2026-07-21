@@ -1,0 +1,1 @@
+{"schema":"npa.performance.fixtures.v0.1","scenarios":[{"id":"compact-package-fast","kind":"warmed-checked-artifact-verifier","package_root":"testdata/package/npa-std","verifier":"fast","cache_policy":"disabled","warmup":1,"samples":3,"notes":"Compact two-module checked-artifact fixture; process is warm after one unmeasured run, OS filesystem pages are not claimed cold."}]}

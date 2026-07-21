@@ -95,6 +95,7 @@ pub mod audit_cache;
 pub mod audit_selection;
 pub mod axiom_report;
 pub mod build_check_cache;
+pub mod declaration_promotion_request;
 pub mod error;
 pub mod export_summary;
 pub mod gate_plan;
@@ -110,8 +111,11 @@ pub mod lock;
 pub mod manifest;
 pub mod name;
 pub mod path;
+pub mod promotion_materialization_attestation;
 pub mod promotion_plan;
+pub mod promotion_plan_v2;
 pub mod promotion_registry;
+pub mod promotion_registry_v2;
 pub mod promotion_transaction;
 pub mod proof_replay;
 pub mod publish_plan;
@@ -181,6 +185,11 @@ pub use build_check_cache::{
     PackageBuildCheckCachedStatus, PackageBuildCheckImportIdentity, PackageBuildCheckResultEntry,
     PACKAGE_BUILD_CHECK_CACHE_LAYOUT_DIR, PACKAGE_BUILD_CHECK_CACHE_SCHEMA,
     PACKAGE_BUILD_CHECK_RESULT_SCHEMA,
+};
+pub use declaration_promotion_request::{
+    parse_declaration_promotion_request_json, validate_declaration_promotion_request,
+    DeclarationPromotionDependencyMapping, DeclarationPromotionRequest, DeclarationPromotionRoot,
+    DeclarationPromotionRootKind, DeclarationPromotionSource, DeclarationPromotionTarget,
 };
 pub use error::{
     PackageArtifactError, PackageArtifactErrorKind, PackageArtifactErrorReason,
@@ -258,12 +267,27 @@ pub use name::{
     validate_canonical_module_name, validate_package_id, PackageId,
 };
 pub use path::{validate_package_path, PackagePath};
+pub use promotion_materialization_attestation::{
+    parse_verified_materialization_attestation_json, validate_verified_materialization_attestation,
+    verified_materialization_attestation_hash, PromotionAttestationArtifactRef,
+    PromotionCheckerVerdict, PromotionGateResult, PromotionMaterializedTarget,
+    PromotionReplayOmission, VerifiedMaterializationAttestation,
+    PROMOTION_REPLAY_OMISSION_UNSUPPORTED_REWRITE_REASON,
+};
 pub use promotion_plan::{
     mathlib_promotion_plan_hash, mathlib_promotion_route_id, parse_mathlib_promotion_plan_json,
     validate_mathlib_promotion_plan, MathlibPromotionPlan, PromotionGovernance,
     PromotionPackageSnapshot, PromotionPlanDependencyMapping, PromotionPlanEndpoint,
     PromotionPlanExport, PromotionPlanRename, PromotionPlanSelectedModule, PromotionPlanTheorem,
     PromotionTargetSnapshot,
+};
+pub use promotion_plan_v2::{
+    mathlib_declaration_promotion_route_id_v2, mathlib_promotion_plan_hash_v2,
+    mathlib_promotion_route_id_v2, parse_mathlib_promotion_plan_v2_json,
+    promotion_plan_v2_dependency_edge_hash, validate_mathlib_promotion_plan_v2,
+    MathlibPromotionPlanV2, PromotionGovernanceV2, PromotionPlanV2Declaration,
+    PromotionPlanV2DependencyMapping, PromotionPlanV2EquivalentSource, PromotionPlanV2Identity,
+    PromotionPlanV2Root, PromotionSelectionV2, PromotionSourceSpan, PromotionTargetSnapshotV2,
 };
 pub use promotion_registry::{
     lookup_promotion_origin, parse_promotion_origin_registry_json,
@@ -274,6 +298,16 @@ pub use promotion_registry::{
     PromotionOriginEntry, PromotionOriginLookup, PromotionOriginRegistry, PromotionReservedTheorem,
     PromotionRouteTheorem, PromotionSourceModule, PromotionSourceOrigin, PromotionTargetRevision,
     PromotionTransportEvidence, MATHLIB_PROMOTION_REGISTRY_ID, MATHLIB_PROMOTION_REGISTRY_PATH,
+};
+pub use promotion_registry_v2::{
+    lookup_promotion_origin_v2, migrate_promotion_origin_registry_v1_to_v2,
+    parse_promotion_origin_registry_v2_json, promotion_origin_registry_v2_hash,
+    validate_declaration_registry_entry_admission,
+    validate_promotion_origin_registry_v1_to_v2_transition, validate_promotion_origin_registry_v2,
+    validate_promotion_origin_registry_v2_transition, DeclarationClosureRegistryEntry,
+    PromotionDeclarationEvidence, PromotionDeclarationTargetRevision,
+    PromotionDeclarationTargetTheorem, PromotionMaturityEvent, PromotionOriginEntryV2,
+    PromotionOriginRegistryV2,
 };
 pub use promotion_transaction::{
     parse_promotion_transaction_json, promotion_transaction_hash, promotion_transaction_path_hash,
@@ -303,10 +337,12 @@ pub use registry::{
 pub use schema::{
     CERTIFICATE_FORMAT_CANONICAL_V0_1, CHECKER_PROFILE_REFERENCE_V0_1, CORE_SPEC_V0_1,
     KERNEL_PROFILE_V0_1, L2_ACCEPTANCE_POLICY_SCHEMA, L2_ACCEPTANCE_SCHEMA,
-    MATHLIB_PROMOTION_ORIGIN_REGISTRY_SCHEMA, MATHLIB_PROMOTION_PLAN_SCHEMA,
-    MATHLIB_PROMOTION_TRANSACTION_SCHEMA, PACKAGE_AXIOM_REPORT_SCHEMA, PACKAGE_LOCK_SCHEMA,
-    PACKAGE_MANIFEST_SCHEMA, PACKAGE_PUBLISH_PLAN_SCHEMA, PACKAGE_THEOREM_INDEX_SCHEMA,
-    PACKAGE_VERIFIED_HIGH_TRUST_SCHEMA, REGISTRY_MODULE_SCHEMA,
+    MATHLIB_DECLARATION_PROMOTION_REQUEST_SCHEMA, MATHLIB_PROMOTION_ORIGIN_REGISTRY_SCHEMA,
+    MATHLIB_PROMOTION_ORIGIN_REGISTRY_V2_SCHEMA, MATHLIB_PROMOTION_PLAN_SCHEMA,
+    MATHLIB_PROMOTION_PLAN_V2_SCHEMA, MATHLIB_PROMOTION_TRANSACTION_SCHEMA,
+    MATHLIB_VERIFIED_MATERIALIZATION_ATTESTATION_SCHEMA, PACKAGE_AXIOM_REPORT_SCHEMA,
+    PACKAGE_LOCK_SCHEMA, PACKAGE_MANIFEST_SCHEMA, PACKAGE_PUBLISH_PLAN_SCHEMA,
+    PACKAGE_THEOREM_INDEX_SCHEMA, PACKAGE_VERIFIED_HIGH_TRUST_SCHEMA, REGISTRY_MODULE_SCHEMA,
 };
 pub use theorem_index::{
     compute_package_theorem_index_hash, package_theorem_index_incremental_projection_plan,

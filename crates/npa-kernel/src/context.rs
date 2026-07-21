@@ -12,9 +12,15 @@ pub struct Ctx {
 }
 
 #[derive(Debug)]
-struct LocalDecl {
+pub(crate) struct LocalDecl {
     ty: Expr,
     value: Option<Expr>,
+}
+
+impl LocalDecl {
+    pub(crate) fn memo_expressions(&self) -> impl Iterator<Item = &Expr> {
+        std::iter::once(&self.ty).chain(self.value.iter())
+    }
 }
 
 impl Ctx {
@@ -51,5 +57,9 @@ impl Ctx {
             .as_ref()
             .map(|value| shift(value, index as i32 + 1, 0))
             .transpose()
+    }
+
+    pub(crate) fn memo_locals(&self) -> &[Arc<LocalDecl>] {
+        &self.locals
     }
 }

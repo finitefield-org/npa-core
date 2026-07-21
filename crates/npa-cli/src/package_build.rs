@@ -13,7 +13,11 @@ use std::{
 };
 
 use npa_api::{build_legacy_std_package_module_cert, LEGACY_STD_PACKAGE_PRODUCER_PROFILE};
-use npa_cert::{AxiomPolicy, ModuleCert, Name, VerifiedModule, VerifierSession};
+use npa_cert::{
+    AxiomPolicy, ModuleCert, ModuleCertImportRebindError, ModuleCertImportRebindOutcome,
+    ModuleCertRebindExpectedIdentity, ModuleCertRebindImport, ModuleCertRebindImportOrigin, Name,
+    VerifiedModule, VerifierSession,
+};
 use npa_frontend::{
     compile_human_source_to_built_certificate_only_with_available_import_refs,
     compile_human_source_to_built_certificate_output_with_available_import_refs,
@@ -101,6 +105,7 @@ struct PackageCertificateRefreshBuild {
     unchanged_artifacts: Vec<CertificateArtifactBuffer>,
     refreshed_manifest_source: String,
     package_lock_json: String,
+    targeted_refresh_stats: Option<TargetedRefreshStats>,
 }
 
 #[allow(dead_code)]
@@ -250,6 +255,65 @@ struct PackageBuildSelectionPlan {
     lock_selected: bool,
 }
 
+#[derive(Clone, Debug, Default)]
+struct TargetedRefreshStats {
+    candidates: usize,
+    source_rebuilds: usize,
+    certificate_rebinds: usize,
+    unchanged: usize,
+    source_scans: usize,
+    source_interface_reconstructions: usize,
+    fallbacks: BTreeMap<&'static str, usize>,
+}
+
+impl TargetedRefreshStats {
+    fn record_fallback(&mut self, reason: &'static str) {
+        *self.fallbacks.entry(reason).or_default() += 1;
+    }
+
+    fn diagnostic(&self, seeds: usize) -> CommandDiagnostic {
+        let fallbacks = if self.fallbacks.is_empty() {
+            "none".to_owned()
+        } else {
+            self.fallbacks
+                .iter()
+                .map(|(reason, count)| format!("{reason}:{count}"))
+                .collect::<Vec<_>>()
+                .join("|")
+        };
+        CommandDiagnostic::info(DiagnosticKind::Build, "package_build_refresh_plan")
+            .with_field("refresh_plan")
+            .with_actual_value(format!(
+                "seeds={seeds},candidates={},source_rebuild={},certificate_rebind={},unchanged={},source_scans={},source_interfaces={},fallbacks={fallbacks}",
+                self.candidates,
+                self.source_rebuilds,
+                self.certificate_rebinds,
+                self.unchanged,
+                self.source_scans,
+                self.source_interface_reconstructions,
+            ))
+    }
+}
+
+#[derive(Debug)]
+enum QualifiedDependentRefresh {
+    Fallback(&'static str),
+    Unchanged {
+        certificate: ModuleCert,
+        bytes: Vec<u8>,
+        verified: VerifiedModule,
+        source_interface: HumanSourceInterface,
+        source_imports: Vec<Name>,
+    },
+    Rebound {
+        certificate: ModuleCert,
+        bytes: Vec<u8>,
+        verified: VerifiedModule,
+        source_interface: HumanSourceInterface,
+        source_imports: Vec<Name>,
+    },
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ExternalImportVisitState {
     Unvisited,
@@ -363,12 +427,18 @@ fn run_targeted_package_build_certs(options: PackageBuildCertsOptions) -> Comman
         }
     };
     let selection_diagnostic = plan.diagnostic();
+    let mut refresh_plan_diagnostic = None;
 
     if plan.rebuild.is_empty() && (!options.update_manifest_hashes || !plan.lock_selected) {
         let selected_external = plan.changed_external.clone();
-        if let Err(diagnostic) =
-            build_targeted_refresh_inputs(&loaded, &plan, false, false, Some(&selected_external))
-        {
+        if let Err(diagnostic) = build_targeted_refresh_inputs(
+            &loaded,
+            &plan,
+            false,
+            false,
+            false,
+            Some(&selected_external),
+        ) {
             return targeted_failed(&loaded, selection_diagnostic, *diagnostic);
         }
         let mut result = CommandResult::passed(COMMAND, loaded.root_display);
@@ -386,13 +456,22 @@ fn run_targeted_package_build_certs(options: PackageBuildCertsOptions) -> Comman
                 return targeted_failed(&loaded, selection_diagnostic, *diagnostic);
             }
         };
+        refresh_plan_diagnostic = build
+            .targeted_refresh_stats
+            .as_ref()
+            .map(|stats| stats.diagnostic(plan.seeds.len()));
         let diagnostic = if options.check {
             check_refreshed_package_build(&loaded, &build)
         } else {
             write_refreshed_package_build(&loaded, &build)
         };
         if let Some(diagnostic) = diagnostic {
-            return targeted_failed(&loaded, selection_diagnostic, diagnostic);
+            return targeted_failed_after_plan(
+                &loaded,
+                selection_diagnostic,
+                refresh_plan_diagnostic,
+                diagnostic,
+            );
         }
     } else {
         let build = match build_package_certificates_targeted_check(&loaded, &plan) {
@@ -408,6 +487,9 @@ fn run_targeted_package_build_certs(options: PackageBuildCertsOptions) -> Comman
 
     let mut result = CommandResult::passed(COMMAND, loaded.root_display);
     result.diagnostics.push(selection_diagnostic);
+    if let Some(diagnostic) = refresh_plan_diagnostic {
+        result.diagnostics.push(diagnostic);
+    }
     result
 }
 
@@ -421,6 +503,20 @@ fn targeted_failed(
         loaded.root_display.clone(),
         vec![selection, diagnostic],
     )
+}
+
+fn targeted_failed_after_plan(
+    loaded: &LoadedPackageRoot,
+    selection: CommandDiagnostic,
+    refresh_plan: Option<CommandDiagnostic>,
+    diagnostic: CommandDiagnostic,
+) -> CommandResult {
+    let mut diagnostics = vec![selection];
+    if let Some(refresh_plan) = refresh_plan {
+        diagnostics.push(refresh_plan);
+    }
+    diagnostics.push(diagnostic);
+    CommandResult::failed(COMMAND, loaded.root_display.clone(), diagnostics)
 }
 
 fn resolve_package_build_selection(
@@ -622,8 +718,8 @@ fn build_package_certificates_targeted_check(
         .union(&plan.changed_external)
         .copied()
         .collect::<BTreeSet<_>>();
-    let (local_modules, _artifacts) =
-        build_targeted_refresh_inputs(loaded, plan, false, false, Some(&selected_external))?;
+    let (local_modules, _artifacts, _stats) =
+        build_targeted_refresh_inputs(loaded, plan, false, false, false, Some(&selected_external))?;
     let mut local_certificates = Vec::new();
     for identity in &local_modules {
         let module = &loaded.validated.manifest().modules[identity.module_index];
@@ -708,8 +804,8 @@ fn build_package_certificates_targeted_refresh(
     loaded: &LoadedPackageRoot,
     plan: &PackageBuildSelectionPlan,
 ) -> Result<PackageCertificateRefreshBuild, Box<CommandDiagnostic>> {
-    let (local_modules, unchanged_artifacts) =
-        build_targeted_refresh_inputs(loaded, plan, true, true, None)?;
+    let (local_modules, unchanged_artifacts, targeted_refresh_stats) =
+        build_targeted_refresh_inputs(loaded, plan, true, true, true, None)?;
     let refreshed_manifest_source =
         refresh_manifest_hash_fields(&loaded.manifest_source, &local_modules)?;
     let refreshed_validated = parse_and_validate_refreshed_manifest(&refreshed_manifest_source)?;
@@ -726,6 +822,7 @@ fn build_package_certificates_targeted_refresh(
         unchanged_artifacts,
         refreshed_manifest_source,
         package_lock_json,
+        targeted_refresh_stats: Some(targeted_refresh_stats),
     })
 }
 
@@ -734,11 +831,13 @@ fn build_targeted_refresh_inputs(
     plan: &PackageBuildSelectionPlan,
     snapshot_unrelated: bool,
     refresh_metadata: bool,
+    interface_aware: bool,
     selected_external: Option<&BTreeSet<usize>>,
 ) -> Result<
     (
         Vec<LocalModuleRefreshIdentity>,
         Vec<CertificateArtifactBuffer>,
+        TargetedRefreshStats,
     ),
     Box<CommandDiagnostic>,
 > {
@@ -777,6 +876,10 @@ fn build_targeted_refresh_inputs(
         .collect::<BTreeMap<_, _>>();
     let rebuild = plan.rebuild.iter().copied().collect::<BTreeSet<_>>();
     let mut local_modules = Vec::new();
+    let mut targeted_refresh_stats = TargetedRefreshStats {
+        candidates: plan.rebuild.len(),
+        ..TargetedRefreshStats::default()
+    };
     if let Some(diagnostic) = build_local_modules_for_refresh(
         loaded,
         &policy,
@@ -789,10 +892,13 @@ fn build_targeted_refresh_inputs(
         snapshot_unrelated,
         refresh_metadata,
         &mut artifacts,
+        Some(&plan.seeds),
+        interface_aware,
+        &mut targeted_refresh_stats,
     ) {
         return Err(Box::new(diagnostic));
     }
-    Ok((local_modules, artifacts))
+    Ok((local_modules, artifacts, targeted_refresh_stats))
 }
 
 fn run_package_build_certs_refresh_write(options: PackageCommonOptions) -> CommandResult {
@@ -856,6 +962,7 @@ fn build_package_certificates_refresh(
         .collect();
     let mut refresh_available_modules = refresh_available_modules;
     let mut local_modules = Vec::new();
+    let mut ignored_targeted_stats = TargetedRefreshStats::default();
     if let Some(diagnostic) = build_local_modules_for_refresh(
         loaded,
         &policy,
@@ -868,6 +975,9 @@ fn build_package_certificates_refresh(
         false,
         true,
         &mut artifacts,
+        None,
+        false,
+        &mut ignored_targeted_stats,
     ) {
         return Err(Box::new(diagnostic));
     }
@@ -889,6 +999,7 @@ fn build_package_certificates_refresh(
         unchanged_artifacts: artifacts,
         refreshed_manifest_source,
         package_lock_json,
+        targeted_refresh_stats: None,
     })
 }
 
@@ -3035,6 +3146,270 @@ fn checked_local_legacy_support_source_interface(
     Ok(fallback_imported_source_interface(verified))
 }
 
+type RefreshModuleBuildOutput = (
+    ModuleCert,
+    Vec<u8>,
+    VerifiedModule,
+    HumanSourceInterface,
+    Option<Vec<Name>>,
+);
+
+#[allow(clippy::too_many_arguments)]
+fn build_refresh_module_from_source(
+    module_index: usize,
+    module: &PackageModule,
+    source: &str,
+    file_id: FileId,
+    direct_verified_module_refs: &[&VerifiedModule],
+    available_verified_module_refs: &[&VerifiedModule],
+    direct_source_interfaces: &[HumanImportedSourceInterface],
+    policy: &AxiomPolicy,
+) -> Result<RefreshModuleBuildOutput, Box<CommandDiagnostic>> {
+    let (certificate, generated_bytes, verified, source_interface) = if module
+        .producer_profile
+        .as_deref()
+        == Some(LEGACY_STD_PACKAGE_PRODUCER_PROFILE)
+    {
+        build_legacy_std_package_certificate(
+            module_index,
+            module,
+            source,
+            direct_verified_module_refs,
+            policy,
+        )?
+    } else {
+        let output =
+            compile_human_source_to_certificate_output_with_available_import_refs_and_axiom_policy(
+                file_id,
+                module.module.clone(),
+                source,
+                direct_verified_module_refs,
+                available_verified_module_refs,
+                direct_source_interfaces,
+                &HumanCompileOptions::default(),
+                policy,
+            )
+            .map_err(|error| {
+                Box::new(frontend_build_failed(
+                    module_index,
+                    module,
+                    file_id,
+                    source,
+                    direct_source_interfaces,
+                    error,
+                ))
+            })?;
+        let generated_bytes =
+            npa_cert::encode_module_cert(&output.certificate).map_err(|error| {
+                Box::new(
+                    CommandDiagnostic::error(DiagnosticKind::Build, "certificate_encode_failed")
+                        .with_module(module.module.as_dotted())
+                        .with_path(format!("modules[{module_index}].certificate"))
+                        .with_actual_value(format!("{error:?}")),
+                )
+            })?;
+        (
+            output.certificate,
+            generated_bytes,
+            output.verified_module,
+            output.source_interface,
+        )
+    };
+    let source_imports = human_source_imports(file_id, source, direct_source_interfaces);
+    Ok((
+        certificate,
+        generated_bytes,
+        verified,
+        source_interface,
+        source_imports,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn qualify_dependent_refresh(
+    loaded: &LoadedPackageRoot,
+    policy: &AxiomPolicy,
+    module_index: usize,
+    module: &PackageModule,
+    source: &str,
+    source_hash: PackageHash,
+    file_id: FileId,
+    direct_verified_modules: &[Arc<VerifiedModule>],
+    direct_source_interfaces: &[HumanImportedSourceInterface],
+    verified_modules_by_module: &BTreeMap<Name, Arc<VerifiedModule>>,
+    local_module_names: &BTreeSet<Name>,
+    stats: &mut TargetedRefreshStats,
+) -> Result<QualifiedDependentRefresh, Box<CommandDiagnostic>> {
+    if source_hash != module.expected_source_hash {
+        return Ok(QualifiedDependentRefresh::Fallback("source_hash"));
+    }
+    let previous_bytes = match read_certificate_bytes(
+        loaded,
+        &module.certificate,
+        format!("modules[{module_index}].certificate"),
+    ) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return Ok(QualifiedDependentRefresh::Fallback(
+                "certificate_unavailable",
+            ))
+        }
+    };
+    if package_file_hash(&previous_bytes) != module.expected_certificate_file_hash {
+        return Ok(QualifiedDependentRefresh::Fallback("certificate_file_hash"));
+    }
+    let previous = match npa_cert::verify_module_cert_hashes(&previous_bytes) {
+        Ok(certificate) => certificate,
+        Err(_) => return Ok(QualifiedDependentRefresh::Fallback("certificate_structure")),
+    };
+    if previous.header.module != module.module
+        || PackageHash::from(previous.hashes.export_hash) != module.expected_export_hash
+        || PackageHash::from(previous.hashes.axiom_report_hash) != module.expected_axiom_report_hash
+        || PackageHash::from(previous.hashes.certificate_hash) != module.expected_certificate_hash
+    {
+        return Ok(QualifiedDependentRefresh::Fallback("certificate_identity"));
+    }
+    if check_generated_axiom_policy(loaded, module_index, module, &previous).is_some() {
+        return Ok(QualifiedDependentRefresh::Fallback("axiom_policy"));
+    }
+    let Some((source_imports, source_interface)) = reconstruct_qualified_source_interface(
+        module,
+        source,
+        file_id,
+        direct_verified_modules,
+        direct_source_interfaces,
+        &previous,
+    ) else {
+        return Ok(QualifiedDependentRefresh::Fallback("source_interface"));
+    };
+    stats.source_interface_reconstructions += 1;
+
+    let mut mapped_imports = Vec::with_capacity(previous.imports.len());
+    for import in &previous.imports {
+        let Some(verified) = verified_modules_by_module.get(&import.module) else {
+            return Ok(QualifiedDependentRefresh::Fallback("certificate_imports"));
+        };
+        mapped_imports.push(ModuleCertRebindImport {
+            verified: verified.as_ref(),
+            origin: if local_module_names.contains(&import.module) {
+                ModuleCertRebindImportOrigin::Local
+            } else {
+                ModuleCertRebindImportOrigin::External
+            },
+        });
+    }
+    let expected = ModuleCertRebindExpectedIdentity {
+        module: module.module.clone(),
+        export_hash: module.expected_export_hash.into_bytes(),
+        axiom_report_hash: module.expected_axiom_report_hash.into_bytes(),
+        certificate_hash: module.expected_certificate_hash.into_bytes(),
+    };
+    let outcome = match npa_cert::rebind_module_cert_import_certificate_hashes(
+        &previous_bytes,
+        &expected,
+        &mapped_imports,
+        policy,
+    ) {
+        Ok(outcome) => outcome,
+        Err(
+            ModuleCertImportRebindError::DuplicateCertificateImport { .. }
+            | ModuleCertImportRebindError::MissingMappedImport { .. }
+            | ModuleCertImportRebindError::MissingStrictCertificateHash { .. }
+            | ModuleCertImportRebindError::ModuleMismatch { .. }
+            | ModuleCertImportRebindError::IdentityHashMismatch { .. },
+        ) => return Ok(QualifiedDependentRefresh::Fallback("certificate_imports")),
+        Err(error) => {
+            return Err(Box::new(
+                CommandDiagnostic::error(DiagnosticKind::Build, "certificate_rebind_failed")
+                    .with_module(module.module.as_dotted())
+                    .with_path(render_package_path(&module.certificate))
+                    .with_actual_value(format!("{error:?}")),
+            ));
+        }
+    };
+    match outcome {
+        ModuleCertImportRebindOutcome::IneligibleFormat { .. } => {
+            Ok(QualifiedDependentRefresh::Fallback("certificate_format"))
+        }
+        ModuleCertImportRebindOutcome::ExportChanged { .. } => {
+            Ok(QualifiedDependentRefresh::Fallback("import_export_changed"))
+        }
+        ModuleCertImportRebindOutcome::Unchanged {
+            certificate,
+            verified,
+        } => Ok(QualifiedDependentRefresh::Unchanged {
+            certificate,
+            bytes: previous_bytes,
+            verified,
+            source_interface,
+            source_imports,
+        }),
+        ModuleCertImportRebindOutcome::Rebound {
+            certificate,
+            bytes,
+            verified,
+            ..
+        } => Ok(QualifiedDependentRefresh::Rebound {
+            certificate,
+            bytes,
+            verified,
+            source_interface,
+            source_imports,
+        }),
+    }
+}
+
+fn reconstruct_qualified_source_interface(
+    module: &PackageModule,
+    source: &str,
+    file_id: FileId,
+    direct_verified_modules: &[Arc<VerifiedModule>],
+    direct_source_interfaces: &[HumanImportedSourceInterface],
+    certificate: &ModuleCert,
+) -> Option<(Vec<Name>, HumanSourceInterface)> {
+    let parsed =
+        parse_human_module_with_source_interfaces(file_id, source, direct_source_interfaces)
+            .ok()?;
+    let source_imports = parsed
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            HumanItem::Import { module, .. } => Some(Name::from_dotted(module.as_dotted())),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if module.imports.iter().cloned().collect::<BTreeSet<_>>()
+        != source_imports.iter().cloned().collect::<BTreeSet<_>>()
+    {
+        return None;
+    }
+    let certificate_imports = certificate
+        .imports
+        .iter()
+        .map(|import| (&import.module, import))
+        .collect::<BTreeMap<_, _>>();
+    if module.imports.iter().any(|module| {
+        certificate_imports
+            .get(module)
+            .is_none_or(|import| import.certificate_hash.is_none())
+    }) {
+        return None;
+    }
+    let verified_imports = direct_verified_modules
+        .iter()
+        .map(|verified| VerifiedImport::from(verified.as_ref()))
+        .collect::<Vec<_>>();
+    let resolved = resolve_human_module_with_source_interfaces(
+        module.module.clone(),
+        parsed,
+        &verified_imports,
+        direct_source_interfaces,
+        &HumanCompileOptions::default(),
+    )
+    .ok()?;
+    Some((source_imports, resolved.state.source_interfaces.current))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_local_modules_for_refresh(
     loaded: &LoadedPackageRoot,
@@ -3048,8 +3423,17 @@ fn build_local_modules_for_refresh(
     snapshot_unrelated: bool,
     refresh_metadata: bool,
     unchanged_artifacts: &mut Vec<CertificateArtifactBuffer>,
+    targeted_seeds: Option<&BTreeSet<usize>>,
+    interface_aware: bool,
+    targeted_stats: &mut TargetedRefreshStats,
 ) -> Option<CommandDiagnostic> {
-    let compile_options = HumanCompileOptions::default();
+    let local_module_names = loaded
+        .validated
+        .manifest()
+        .modules
+        .iter()
+        .map(|module| module.module.clone())
+        .collect::<BTreeSet<_>>();
     for &module_index in &loaded.validated.graph().topological_order {
         let module = &loaded.validated.manifest().modules[module_index];
         if rebuild.is_some_and(|rebuild| !rebuild.contains(&module_index)) {
@@ -3075,6 +3459,9 @@ fn build_local_modules_for_refresh(
             Ok(source) => source,
             Err(diagnostic) => return Some(*diagnostic),
         };
+        if interface_aware {
+            targeted_stats.source_scans += 1;
+        }
         let source_hash = package_file_hash(source.as_bytes());
         let file_id = match u32::try_from(module_index) {
             Ok(index) => FileId(index),
@@ -3106,67 +3493,89 @@ fn build_local_modules_for_refresh(
             .values()
             .map(Arc::as_ref)
             .collect::<Vec<_>>();
-
-        let (certificate, generated_bytes, verified, source_interface) = if module
-            .producer_profile
-            .as_deref()
-            == Some(LEGACY_STD_PACKAGE_PRODUCER_PROFILE)
-        {
-            match build_legacy_std_package_certificate(
+        let is_nonseed = targeted_seeds.is_some_and(|seeds| !seeds.contains(&module_index));
+        let may_reuse = interface_aware
+            && is_nonseed
+            && module.producer_profile.as_deref() != Some(LEGACY_STD_PACKAGE_PRODUCER_PROFILE);
+        let qualified = if may_reuse {
+            match qualify_dependent_refresh(
+                loaded,
+                policy,
                 module_index,
                 module,
                 &source,
-                &direct_verified_module_refs,
-                policy,
+                source_hash,
+                file_id,
+                &direct_verified_modules,
+                &direct_source_interfaces,
+                verified_modules_by_module,
+                &local_module_names,
+                targeted_stats,
             ) {
-                Ok(output) => output,
+                Ok(qualified) => Some(qualified),
                 Err(diagnostic) => return Some(*diagnostic),
             }
+        } else if interface_aware && is_nonseed {
+            Some(QualifiedDependentRefresh::Fallback("producer_profile"))
         } else {
-            let output =
-                    match compile_human_source_to_certificate_output_with_available_import_refs_and_axiom_policy(
-                        file_id,
-                        module.module.clone(),
+            None
+        };
+        let (certificate, generated_bytes, verified, source_interface, source_imports) =
+            match qualified {
+                Some(QualifiedDependentRefresh::Unchanged {
+                    certificate,
+                    bytes,
+                    verified,
+                    source_interface,
+                    source_imports,
+                }) => {
+                    targeted_stats.unchanged += 1;
+                    (
+                        certificate,
+                        bytes,
+                        verified,
+                        source_interface,
+                        Some(source_imports),
+                    )
+                }
+                Some(QualifiedDependentRefresh::Rebound {
+                    certificate,
+                    bytes,
+                    verified,
+                    source_interface,
+                    source_imports,
+                }) => {
+                    targeted_stats.certificate_rebinds += 1;
+                    (
+                        certificate,
+                        bytes,
+                        verified,
+                        source_interface,
+                        Some(source_imports),
+                    )
+                }
+                fallback => {
+                    if interface_aware {
+                        targeted_stats.source_rebuilds += 1;
+                    }
+                    if let Some(QualifiedDependentRefresh::Fallback(reason)) = fallback {
+                        targeted_stats.record_fallback(reason);
+                    }
+                    match build_refresh_module_from_source(
+                        module_index,
+                        module,
                         &source,
+                        file_id,
                         &direct_verified_module_refs,
                         &available_verified_module_refs,
                         &direct_source_interfaces,
-                        &compile_options,
                         policy,
                     ) {
                         Ok(output) => output,
-                        Err(error) => {
-                            return Some(frontend_build_failed(
-                                module_index,
-                                module,
-                                file_id,
-                                &source,
-                                &direct_source_interfaces,
-                                error,
-                            ));
-                        }
-                    };
-            let generated_bytes = match npa_cert::encode_module_cert(&output.certificate) {
-                Ok(bytes) => bytes,
-                Err(error) => {
-                    return Some(
-                        CommandDiagnostic::error(
-                            DiagnosticKind::Build,
-                            "certificate_encode_failed",
-                        )
-                        .with_module(module.module.as_dotted())
-                        .with_path(format!("modules[{module_index}].certificate"))
-                        .with_actual_value(format!("{error:?}")),
-                    );
+                        Err(diagnostic) => return Some(*diagnostic),
+                    }
                 }
             };
-            (
-                output.certificate,
-                generated_bytes,
-                output.verified_module,
-                output.source_interface,
-            )
-        };
         if let Some(diagnostic) =
             check_generated_axiom_policy(loaded, module_index, module, &certificate)
         {
@@ -3182,7 +3591,6 @@ fn build_local_modules_for_refresh(
                     .with_actual_value(verified.module().as_dotted()),
             );
         }
-        let source_imports = human_source_imports(file_id, &source, &direct_source_interfaces);
         if let Some(source_imports) = source_imports.as_deref() {
             if let Some(diagnostic) = check_observable_import_drift(
                 module_index,
@@ -5208,7 +5616,9 @@ fn write_artifact_diagnostic(
     }
 }
 
-fn fallback_imported_source_interface(verified: &VerifiedModule) -> HumanImportedSourceInterface {
+pub(crate) fn fallback_imported_source_interface(
+    verified: &VerifiedModule,
+) -> HumanImportedSourceInterface {
     let import = VerifiedImport::from(verified);
     let empty_span = Span::empty(FileId(0));
     let mut source_interface = HumanSourceInterface::new(import.module.clone());

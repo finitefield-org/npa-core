@@ -8,20 +8,39 @@ use std::{
 };
 
 use npa_api::PackageArtifactReferenceSummaryMode;
-use npa_frontend::{parse_human_import_spans, parse_human_name_spans, FileId};
+use npa_cert::{
+    declaration_dependency_closure, resolve_verified_declaration_export, DeclarationClosureLimits,
+    GlobalDeclarationIdentity, Name,
+};
+use npa_frontend::{
+    collect_human_source_declaration_families, extract_human_declaration_source,
+    parse_human_import_spans, parse_human_name_spans, FileId, HumanDeclarationFamilyMemberKind,
+    HumanDeclarationSelection, HumanGlobalIdentity, HumanGlobalMapping, HumanGlobalMappingRow,
+    HumanSelectedDeclaration, Span,
+};
 use npa_package::{
-    format_package_hash, package_file_hash, parse_and_validate_manifest_str,
+    format_package_hash, migrate_promotion_origin_registry_v1_to_v2, package_file_hash,
+    parse_and_validate_manifest_str, parse_declaration_promotion_request_json,
     parse_l2_acceptance_policy_json, parse_l2_acceptance_v2_json,
     parse_l2_namespace_transport_attestation_json, parse_l2_namespace_transport_policy_json,
     parse_l2_namespace_transport_request_json, parse_mathlib_promotion_plan_json,
-    parse_package_proof_replay, parse_promotion_transaction_json, promotion_transaction_path_hash,
-    validate_promotion_origin_registry_transition, MathlibPromotionPlan, PackageHash, PackagePath,
-    PackageProofReplay, PromotionAcceptanceEvidence, PromotionEvidence, PromotionLifecycle,
-    PromotionModuleRoute, PromotionOldFile, PromotionOriginEntry, PromotionReplacementState,
+    parse_mathlib_promotion_plan_v2_json, parse_package_proof_replay,
+    parse_promotion_transaction_json, parse_verified_materialization_attestation_json,
+    promotion_plan_v2_dependency_edge_hash, promotion_transaction_path_hash,
+    validate_declaration_registry_entry_admission, validate_package_path,
+    validate_promotion_origin_registry_v1_to_v2_transition,
+    validate_promotion_origin_registry_v2_transition, DeclarationClosureRegistryEntry,
+    MathlibPromotionPlan, MathlibPromotionPlanV2, PackageArtifactOrigin, PackageHash, PackagePath,
+    PackageProofReplay, PromotionAcceptanceEvidence, PromotionDeclarationEvidence,
+    PromotionDeclarationTargetRevision, PromotionDeclarationTargetTheorem, PromotionEvidence,
+    PromotionLifecycle, PromotionModuleRoute, PromotionOldFile, PromotionOriginEntry,
+    PromotionOriginEntryV2, PromotionReplacementState, PromotionReplayOmission,
     PromotionRouteTheorem, PromotionSourceModule, PromotionSourceOrigin, PromotionTargetRevision,
     PromotionTransactionJournal, PromotionTransactionPhase, PromotionTransactionRow,
     PromotionTransactionState, PromotionTransportEvidence, MATHLIB_PROMOTION_PLAN_SCHEMA,
     MATHLIB_PROMOTION_REGISTRY_PATH, MATHLIB_PROMOTION_TRANSACTION_SCHEMA,
+    PACKAGE_PUBLISH_PLAN_PATH, PACKAGE_VERIFIED_EXPORT_SUMMARY_PATH,
+    PROMOTION_REPLAY_OMISSION_UNSUPPORTED_REWRITE_REASON,
 };
 use toml_edit::{Array, ArrayOfTables, DocumentMut, Item, Table};
 
@@ -31,7 +50,9 @@ use crate::{
         PackageBuildSelection, PackageCommonOptions, PackageExportSummaryOptions,
         PackageIndexOptions, PackageL2NamespaceTransportOptions, PackageLockCommand,
         PackageMaterializePromotionOptions, PackagePromotionPhase, PackagePublishPlanOptions,
-        PackageTimingMode, PackageValidatePromotionOriginRegistryOptions,
+        PackageTheoremPremiseReportOptions, PackageTimingMode,
+        PackageValidatePromotionMaterializationOptions,
+        PackageValidatePromotionOriginRegistryOptions,
     },
     diagnostic::{
         CommandArtifact, CommandDiagnostic, CommandResult, CommandStatus, DiagnosticKind,
@@ -40,7 +61,7 @@ use crate::{
     governance_writer::confined_governance_path,
     package_artifacts::{
         load_package_audit_snapshot, PackageGeneratedArtifactReadMode, PACKAGE_AXIOM_REPORT_PATH,
-        PACKAGE_LOCK_PATH, PACKAGE_THEOREM_INDEX_PATH,
+        PACKAGE_LOCK_PATH, PACKAGE_THEOREM_INDEX_PATH, PACKAGE_THEOREM_PREMISE_REPORT_PATH,
     },
     package_axiom_report::run_package_axiom_report,
     package_build::run_package_build_certs,
@@ -49,15 +70,24 @@ use crate::{
     package_l2_acceptance_aggregate::validate_l2_acceptance_v2_current,
     package_l2_namespace_transport::run_package_validate_l2_namespace_transport,
     package_lock::run_package_lock_command,
+    package_promotion_materialization_validate::run_package_validate_promotion_materialization,
     package_promotion_prepare::{
         project_equivalent_source, promotion_mapping_source_is_current,
         promotion_selected_target_artifact_paths,
     },
+    package_promotion_prepare_declaration::{
+        direct_import_interfaces, endpoint_record, plan_declarations, plan_roots,
+        read_declaration_source, reconcile_families, registry_owns_active_target, resolve_roots,
+        DeclarationSourceExtractionError,
+    },
     package_promotion_registry::{
-        load_registry, run_package_validate_promotion_origin_registry, validate_checked_generated,
+        parse_promotion_origin_registry_versioned, promotion_plan_generated_read_mode,
+        run_package_validate_promotion_origin_registry, validate_checked_generated,
+        ParsedPromotionOriginRegistry,
     },
     package_promotion_transaction::TargetLock,
     package_publish::run_package_publish_plan,
+    package_theorem_premise_report::run_package_theorem_premise_report,
 };
 
 const COMMAND: &str = "package materialize-promotion";
@@ -92,6 +122,10 @@ pub fn run_package_materialize_promotion(
         return recover_transaction(&options.target_root, journal);
     }
     materialize_normal(options)
+}
+
+fn is_declaration_promotion_plan(source: &str) -> bool {
+    parse_mathlib_promotion_plan_v2_json(source).is_ok()
 }
 
 fn materialize_normal(options: PackageMaterializePromotionOptions) -> CommandResult {
@@ -139,6 +173,9 @@ fn materialize_normal(options: PackageMaterializePromotionOptions) -> CommandRes
             )
         }
     };
+    if is_declaration_promotion_plan(&plan_source) {
+        return materialize_declaration_normal(options, plan_path, plan_bytes, plan_source);
+    }
     let plan = match parse_mathlib_promotion_plan_json(&plan_source) {
         Ok(plan) => plan,
         Err(_) => {
@@ -159,7 +196,7 @@ fn materialize_normal(options: PackageMaterializePromotionOptions) -> CommandRes
     let source = match load_package_audit_snapshot(
         &options.common.root,
         COMMAND,
-        PackageGeneratedArtifactReadMode::all(),
+        promotion_plan_generated_read_mode(),
         PackageArtifactReferenceSummaryMode::Include,
     ) {
         Ok(snapshot) => snapshot,
@@ -168,7 +205,7 @@ fn materialize_normal(options: PackageMaterializePromotionOptions) -> CommandRes
     let baseline = match load_package_audit_snapshot(
         baseline_root,
         COMMAND,
-        PackageGeneratedArtifactReadMode::all(),
+        promotion_plan_generated_read_mode(),
         PackageArtifactReferenceSummaryMode::Include,
     ) {
         Ok(snapshot) => snapshot,
@@ -847,12 +884,7 @@ fn externalize_preserved_dependencies(
         }
     }
     document["modules"] = Item::ArrayOfTables(build_tables);
-    if !document.as_table().contains_key("imports") {
-        document["imports"] = Item::ArrayOfTables(ArrayOfTables::new());
-    }
-    let imports = document["imports"]
-        .as_array_of_tables_mut()
-        .ok_or("promotion_materialize_target_identity_mismatch")?;
+    let imports = import_tables_mut(&mut document)?;
     for module in dependency_modules {
         let mut table = Table::new();
         table["module"] = toml_edit::value(module.module.as_dotted());
@@ -910,7 +942,11 @@ fn edit_manifest(
         .parse::<DocumentMut>()
         .map_err(|_| "promotion_materialize_target_identity_mismatch")?;
     document["version"] = toml_edit::value(plan.target_baseline.planned_version.as_str());
-    if !document.as_table().contains_key("modules") {
+    if !document.as_table().contains_key("modules")
+        || document["modules"]
+            .as_array()
+            .is_some_and(|modules| modules.is_empty())
+    {
         document["modules"] = Item::ArrayOfTables(ArrayOfTables::new());
     }
     let tables = document["modules"]
@@ -1154,7 +1190,7 @@ fn validate_equivalent_origins(roots: &[PathBuf], plan: &MathlibPromotionPlan) -
         let loaded = match load_package_audit_snapshot(
             root,
             COMMAND,
-            PackageGeneratedArtifactReadMode::all(),
+            promotion_plan_generated_read_mode(),
             PackageArtifactReferenceSummaryMode::Include,
         ) {
             Ok(loaded) => loaded,
@@ -1667,8 +1703,23 @@ fn update_stage_registry(
     plan: &MathlibPromotionPlan,
     attestation: &npa_package::L2NamespaceTransportAttestation,
 ) -> Result<(), ()> {
-    let mut registry = load_registry(stage, COMMAND).map_err(|_| ())?;
-    let previous = registry.clone();
+    enum PreviousRegistry {
+        V1(npa_package::PromotionOriginRegistry),
+        V2(npa_package::PromotionOriginRegistryV2),
+    }
+    let registry_path = stage.join(MATHLIB_PROMOTION_REGISTRY_PATH);
+    let registry_source = fs::read_to_string(&registry_path).map_err(|_| ())?;
+    let (previous, mut registry) = match parse_promotion_origin_registry_versioned(&registry_source)
+        .map_err(|_| ())?
+    {
+        ParsedPromotionOriginRegistry::V2(previous) => {
+            (PreviousRegistry::V2(previous.clone()), previous)
+        }
+        ParsedPromotionOriginRegistry::V1(previous) => {
+            let migrated = migrate_promotion_origin_registry_v1_to_v2(&previous).map_err(|_| ())?;
+            (PreviousRegistry::V1(previous), migrated)
+        }
+    };
     let loaded = crate::package::load_package_root(stage, COMMAND).map_err(|_| ())?;
     let audit = load_package_audit_snapshot(
         stage,
@@ -1731,7 +1782,7 @@ fn update_stage_registry(
         (&left.source_module, &left.target_module)
             .cmp(&(&right.source_module, &right.target_module))
     });
-    registry.entries.push(PromotionOriginEntry {
+    let entry = PromotionOriginEntry {
         promotion_id: plan.promotion_id,
         lifecycle: PromotionLifecycle::Active,
         introduced_version: plan.target_baseline.planned_version.clone(),
@@ -1777,16 +1828,26 @@ fn update_stage_registry(
                 normalized_closure_hash: attestation.normalized_closure_hash,
             }),
         },
-    });
-    registry.entries.sort_by_key(|entry| entry.promotion_id);
-    registry.generation += 1;
+    };
+    registry
+        .entries
+        .push(PromotionOriginEntryV2::WholeModuleV1(Box::new(entry)));
+    registry
+        .entries
+        .sort_by_key(PromotionOriginEntryV2::promotion_id);
+    registry.generation = registry.generation.checked_add(1).ok_or(())?;
     registry.refresh_hash().map_err(|_| ())?;
-    validate_promotion_origin_registry_transition(&previous, &registry).map_err(|_| ())?;
-    fs::write(
-        stage.join(MATHLIB_PROMOTION_REGISTRY_PATH),
-        registry.canonical_json().map_err(|_| ())?,
-    )
-    .map_err(|_| ())
+    match previous {
+        PreviousRegistry::V1(previous) => {
+            validate_promotion_origin_registry_v1_to_v2_transition(&previous, &registry)
+                .map_err(|_| ())?;
+        }
+        PreviousRegistry::V2(previous) => {
+            validate_promotion_origin_registry_v2_transition(&previous, &registry)
+                .map_err(|_| ())?;
+        }
+    }
+    fs::write(registry_path, registry.canonical_json().map_err(|_| ())?).map_err(|_| ())
 }
 
 fn change_is_scoped(
@@ -1809,7 +1870,25 @@ fn change_is_scoped(
     ) || (phase == PackagePromotionPhase::Tracked && path == MATHLIB_PROMOTION_REGISTRY_PATH)
 }
 
-fn tree_snapshot(root: &Path) -> io::Result<BTreeMap<PackagePath, Vec<u8>>> {
+pub(crate) fn tree_snapshot(root: &Path) -> io::Result<BTreeMap<PackagePath, Vec<u8>>> {
+    fn snapshot_path(relative: &Path) -> io::Result<PackagePath> {
+        let mut components = Vec::new();
+        for component in relative.components() {
+            let std::path::Component::Normal(component) = component else {
+                return Err(io::Error::other("snapshot path"));
+            };
+            components.push(
+                component
+                    .to_str()
+                    .ok_or_else(|| io::Error::other("snapshot path encoding"))?,
+            );
+        }
+        let path = PackagePath::new(components.join("/"));
+        validate_package_path(&path, "snapshot.path")
+            .map_err(|_| io::Error::other("snapshot path"))?;
+        Ok(path)
+    }
+
     fn walk(
         root: &Path,
         current: &Path,
@@ -1819,7 +1898,7 @@ fn tree_snapshot(root: &Path) -> io::Result<BTreeMap<PackagePath, Vec<u8>>> {
         entries.sort_by_key(|entry| entry.file_name());
         for entry in entries {
             let name = entry.file_name();
-            if name == ".git" || name.to_string_lossy().starts_with(".npa-promotion-") {
+            if current == root && name == ".git" {
                 continue;
             }
             let path = entry.path();
@@ -1833,10 +1912,10 @@ fn tree_snapshot(root: &Path) -> io::Result<BTreeMap<PackagePath, Vec<u8>>> {
                 let relative = path
                     .strip_prefix(root)
                     .map_err(|_| io::Error::other("path"))?;
-                out.insert(
-                    PackagePath::new(relative.to_string_lossy().replace('\\', "/")),
-                    fs::read(path)?,
-                );
+                let package_path = snapshot_path(relative)?;
+                if out.insert(package_path, fs::read(path)?).is_some() {
+                    return Err(io::Error::other("duplicate snapshot path"));
+                }
             }
         }
         Ok(())
@@ -1846,11 +1925,22 @@ fn tree_snapshot(root: &Path) -> io::Result<BTreeMap<PackagePath, Vec<u8>>> {
     Ok(out)
 }
 
-fn write_tree_snapshot(snapshot: &BTreeMap<PackagePath, Vec<u8>>, target: &Path) -> io::Result<()> {
+pub(crate) fn write_tree_snapshot(
+    snapshot: &BTreeMap<PackagePath, Vec<u8>>,
+    target: &Path,
+) -> io::Result<()> {
     fs::create_dir(target)?;
     let write_result = (|| {
         for (path, bytes) in snapshot {
-            let destination = target.join(path.as_str());
+            validate_package_path(path, "snapshot.path")
+                .map_err(|_| io::Error::other("snapshot path"))?;
+            let destination = confined_governance_path(
+                target,
+                path,
+                path.as_str(),
+                "promotion_materialize_unscoped_path",
+            )
+            .map_err(|_| io::Error::other("snapshot path"))?;
             let parent = destination
                 .parent()
                 .ok_or_else(|| io::Error::other("snapshot path parent"))?;
@@ -2450,6 +2540,1564 @@ fn failure(root: &str, reason: &str, path: &str) -> CommandResult {
     )
 }
 
+fn materialize_declaration_normal(
+    options: PackageMaterializePromotionOptions,
+    plan_path: PackagePath,
+    plan_bytes: Vec<u8>,
+    plan_source: String,
+) -> CommandResult {
+    let root_display = render_package_root(&options.target_root);
+    let Some(baseline_root) = options.target_baseline_root.as_ref() else {
+        return failure(
+            &root_display,
+            "promotion_materialize_plan_stale",
+            "--target-baseline-root",
+        );
+    };
+    let Some(phase) = options.phase else {
+        return failure(&root_display, "promotion_materialize_plan_stale", "--phase");
+    };
+    if options.transport_attestation.is_some()
+        || (phase == PackagePromotionPhase::Tracked && options.verification_attestation.is_none())
+        || (phase == PackagePromotionPhase::Temporary && options.verification_attestation.is_some())
+    {
+        return failure(
+            &root_display,
+            "promotion_verification_attestation_stale",
+            "--verification-attestation",
+        );
+    }
+    let plan = match parse_mathlib_promotion_plan_v2_json(&plan_source) {
+        Ok(plan) => plan,
+        Err(_) => {
+            return failure(
+                &root_display,
+                "promotion_materialize_plan_stale",
+                plan_path.as_str(),
+            )
+        }
+    };
+    if options.apply && pending_transaction_exists(&options.target_root) {
+        return failure(
+            &root_display,
+            "promotion_recovery_required",
+            "--target-root",
+        );
+    }
+    let source = match load_package_audit_snapshot(
+        &options.common.root,
+        COMMAND,
+        promotion_plan_generated_read_mode(),
+        PackageArtifactReferenceSummaryMode::Include,
+    ) {
+        Ok(snapshot) => snapshot,
+        Err(result) => return result,
+    };
+    let baseline = match load_package_audit_snapshot(
+        baseline_root,
+        COMMAND,
+        promotion_plan_generated_read_mode(),
+        PackageArtifactReferenceSummaryMode::Include,
+    ) {
+        Ok(snapshot) => snapshot,
+        Err(result) => return result,
+    };
+    for snapshot in [&source, &baseline] {
+        if let Err(diagnostic) = validate_checked_generated(snapshot) {
+            return CommandResult::failed(COMMAND, root_display, vec![*diagnostic]);
+        }
+    }
+    if !declaration_plan_inputs_current(
+        &options.common.root,
+        baseline_root,
+        &source,
+        &baseline,
+        &plan,
+    ) || !declaration_equivalent_origins_current(&options.equivalent_origin_roots, &plan)
+    {
+        return failure(
+            &root_display,
+            "promotion_materialize_plan_stale",
+            plan_path.as_str(),
+        );
+    }
+    let captured_target = match tree_snapshot(&options.target_root) {
+        Ok(files) => files,
+        Err(_) => {
+            return failure(
+                &root_display,
+                "promotion_materialize_target_not_clean",
+                "--target-root",
+            )
+        }
+    };
+    let baseline_files = match tree_snapshot(baseline_root) {
+        Ok(files) => files,
+        Err(_) => {
+            return failure(
+                &root_display,
+                "promotion_materialize_baseline_mismatch",
+                "--target-baseline-root",
+            )
+        }
+    };
+    if captured_target != baseline_files {
+        return failure(
+            &root_display,
+            "promotion_materialize_target_not_clean",
+            "--target-root",
+        );
+    }
+    if let Some(collision) = declaration_target_artifact_collision(baseline_root, &plan)
+        .or_else(|| declaration_target_artifact_collision(&options.target_root, &plan))
+    {
+        return failure(
+            &root_display,
+            "promotion_declaration_target_collision",
+            collision.as_str(),
+        );
+    }
+    let parent = options
+        .target_root
+        .parent()
+        .unwrap_or_else(|| Path::new("."));
+    let stage = parent.join(format!(
+        ".npa-promotion-stage-{}-{}",
+        std::process::id(),
+        short_hash(plan.promotion_id)
+    ));
+    if write_tree_snapshot(&captured_target, &stage).is_err() {
+        return failure(
+            &root_display,
+            "promotion_concurrent_update",
+            "--target-root",
+        );
+    }
+    if let Err(reason) =
+        build_declaration_materialization_candidate(&options.common.root, &stage, &plan)
+    {
+        let _ = fs::remove_dir_all(&stage);
+        return failure(&root_display, reason, "--plan");
+    }
+    if phase == PackagePromotionPhase::Tracked {
+        let attestation_arg = options
+            .verification_attestation
+            .as_ref()
+            .expect("checked above");
+        let attestation_path = PackagePath::new(attestation_arg.to_string_lossy());
+        let attestation_bytes = match read_confined(&options.common.root, &attestation_path) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                let _ = fs::remove_dir_all(&stage);
+                return failure(
+                    &root_display,
+                    "promotion_verification_attestation_stale",
+                    attestation_path.as_str(),
+                );
+            }
+        };
+        let attestation_source = match String::from_utf8(attestation_bytes.clone()) {
+            Ok(source) => source,
+            Err(_) => {
+                let _ = fs::remove_dir_all(&stage);
+                return failure(
+                    &root_display,
+                    "promotion_verification_attestation_stale",
+                    attestation_path.as_str(),
+                );
+            }
+        };
+        let attestation = match parse_verified_materialization_attestation_json(&attestation_source)
+        {
+            Ok(attestation) => attestation,
+            Err(_) => {
+                let _ = fs::remove_dir_all(&stage);
+                return failure(
+                    &root_display,
+                    "promotion_verification_attestation_stale",
+                    attestation_path.as_str(),
+                );
+            }
+        };
+        let validation = run_package_validate_promotion_materialization(
+            PackageValidatePromotionMaterializationOptions {
+                common: PackageCommonOptions {
+                    root: options.common.root.clone(),
+                    json: false,
+                },
+                target_baseline_root: baseline_root.clone(),
+                target_root: stage.clone(),
+                plan: PathBuf::from(plan_path.as_str()),
+                out: PathBuf::from(attestation_path.as_str()),
+                check: true,
+            },
+        );
+        if validation.status != CommandStatus::Passed
+            || attestation.promotion_id != plan.promotion_id
+            || attestation.plan.file_hash != package_file_hash(&plan_bytes)
+            || update_stage_registry_v2(
+                &stage,
+                &plan_path,
+                &plan_bytes,
+                &attestation_path,
+                &attestation_bytes,
+                &plan,
+                &attestation,
+            )
+            .is_err()
+        {
+            let _ = fs::remove_dir_all(&stage);
+            return failure(
+                &root_display,
+                "promotion_verification_attestation_stale",
+                attestation_path.as_str(),
+            );
+        }
+    }
+    let staged_files = match tree_snapshot(&stage) {
+        Ok(files) => files,
+        Err(_) => {
+            let _ = fs::remove_dir_all(&stage);
+            return failure(
+                &root_display,
+                "promotion_materialize_target_identity_mismatch",
+                "--target-root",
+            );
+        }
+    };
+    let mut changes = diff_snapshots(&captured_target, &staged_files);
+    changes.sort_by_key(change_order);
+    if let Some(unscoped) = changes
+        .iter()
+        .find(|change| !declaration_change_is_scoped(change, &plan, phase))
+    {
+        let _ = fs::remove_dir_all(&stage);
+        return failure(
+            &root_display,
+            "promotion_materialize_unscoped_path",
+            unscoped.path.as_str(),
+        );
+    }
+    if !options.apply {
+        let _ = fs::remove_dir_all(&stage);
+        return change_result(root_display, changes);
+    }
+    apply_declaration_stage(
+        &options,
+        phase,
+        plan.promotion_id,
+        &captured_target,
+        &staged_files,
+        &changes,
+        &stage,
+    )
+}
+
+/// Build the deterministic declaration target into an exact baseline copy.
+pub(crate) fn build_declaration_materialization_candidate(
+    source_root: &Path,
+    stage: &Path,
+    plan: &MathlibPromotionPlanV2,
+) -> Result<Vec<PromotionReplayOmission>, &'static str> {
+    let source = load_package_audit_snapshot(
+        source_root,
+        COMMAND,
+        promotion_plan_generated_read_mode(),
+        PackageArtifactReferenceSummaryMode::Include,
+    )
+    .map_err(|_| "promotion_materialize_plan_stale")?;
+    let manifest = source.snapshot.validated.manifest();
+    let module = manifest
+        .modules
+        .iter()
+        .find(|module| module.module == plan.selection.source_module)
+        .ok_or("promotion_materialize_plan_stale")?;
+    let mut extraction_source_bytes = 0;
+    let source_bytes =
+        read_declaration_source(source_root, &module.source, &mut extraction_source_bytes)
+            .map_err(materialization_source_extraction_reason)?;
+    if package_file_hash(&source_bytes) != plan.selection.source_file_hash {
+        return Err("promotion_materialize_plan_stale");
+    }
+    let source_text = String::from_utf8(source_bytes)
+        .map_err(|_| "promotion_materialize_source_rewrite_failed")?;
+    let imported_interfaces = direct_import_interfaces(
+        source_root,
+        &source,
+        &module.imports,
+        extraction_source_bytes,
+    )
+    .map_err(materialization_source_extraction_reason)?;
+    let declarations = plan
+        .selection
+        .materialized_declarations
+        .iter()
+        .map(|row| {
+            Ok(HumanSelectedDeclaration {
+                name: row.source_name.clone(),
+                kind: parse_human_kind(&row.human_kind)?,
+                item_span: Span::new(
+                    FileId(0),
+                    u32::try_from(row.item_span.start)
+                        .map_err(|_| "promotion_materialize_source_rewrite_failed")?,
+                    u32::try_from(row.item_span.end)
+                        .map_err(|_| "promotion_materialize_source_rewrite_failed")?,
+                ),
+                decl_interface_hash: row.decl_interface_hash.into_bytes(),
+            })
+        })
+        .collect::<Result<Vec<_>, &'static str>>()?;
+    let mut mapping = plan
+        .selection
+        .materialized_declarations
+        .iter()
+        .map(|row| HumanGlobalMappingRow {
+            source: HumanGlobalIdentity {
+                module: plan.selection.source_module.clone(),
+                name: row.source_name.clone(),
+                decl_interface_hash: row.decl_interface_hash.into_bytes(),
+            },
+            target: HumanGlobalIdentity {
+                module: plan.selection.target_module.clone(),
+                name: row.target_name.clone(),
+                decl_interface_hash: row.decl_interface_hash.into_bytes(),
+            },
+        })
+        .collect::<Vec<_>>();
+    mapping.extend(
+        plan.dependency_mappings
+            .iter()
+            .map(|row| HumanGlobalMappingRow {
+                source: HumanGlobalIdentity {
+                    module: row.source.module.clone(),
+                    name: row.declaration_name.clone(),
+                    decl_interface_hash: row.source_decl_interface_hash.into_bytes(),
+                },
+                target: HumanGlobalIdentity {
+                    module: row.target.module.clone(),
+                    name: row.declaration_name.clone(),
+                    decl_interface_hash: row.target_decl_interface_hash.into_bytes(),
+                },
+            }),
+    );
+    mapping.sort();
+    let extracted = extract_human_declaration_source(
+        FileId(0),
+        &source_text,
+        &imported_interfaces,
+        &HumanDeclarationSelection {
+            source_module: plan.selection.source_module.clone(),
+            target_module: plan.selection.target_module.clone(),
+            declarations,
+        },
+        &HumanGlobalMapping { rows: mapping },
+    )
+    .map_err(|_| "promotion_materialize_source_rewrite_failed")?;
+    let target_base = plan.selection.target_module.as_dotted().replace('.', "/");
+    let target_dir = stage.join(&target_base);
+    fs::create_dir_all(&target_dir).map_err(|_| "promotion_materialize_source_rewrite_failed")?;
+    fs::write(target_dir.join("source.npa"), extracted.source)
+        .map_err(|_| "promotion_materialize_source_rewrite_failed")?;
+    let replay_bytes = read_confined(source_root, &plan.selection.replay_path)
+        .map_err(|_| "promotion_materialize_source_rewrite_failed")?;
+    if package_file_hash(&replay_bytes) != plan.selection.replay_file_hash {
+        return Err("promotion_materialize_plan_stale");
+    }
+    let replay_source = std::str::from_utf8(&replay_bytes)
+        .map_err(|_| "promotion_materialize_source_rewrite_failed")?;
+    let (replay, omissions) = filtered_declaration_replay(replay_source, plan)?;
+    fs::write(target_dir.join("replay.json"), replay)
+        .map_err(|_| "promotion_materialize_source_rewrite_failed")?;
+
+    let preserved = capture_existing_module_artifacts(stage)?;
+    edit_manifest_v2(stage, plan)?;
+    externalize_preserved_dependencies_v2(stage, plan, &preserved)?;
+    let common = PackageCommonOptions {
+        root: stage.to_path_buf(),
+        json: false,
+    };
+    if run_package_build_certs(PackageBuildCertsOptions {
+        common: common.clone(),
+        check: false,
+        build_check_cache: PackageBuildCheckCacheMode::Off,
+        update_manifest_hashes: true,
+        selection: PackageBuildSelection::Full,
+    })
+    .status
+        != CommandStatus::Passed
+    {
+        return Err("promotion_materialize_compile_failed");
+    }
+    restore_existing_module_artifacts_v2(stage, plan, &preserved)?;
+    if run_package_lock_command(PackageLockCommand::Write(common.clone())).status
+        != CommandStatus::Passed
+        || run_package_axiom_report(PackageAxiomReportOptions {
+            common: common.clone(),
+            check: false,
+            timings: PackageTimingMode::Off,
+        })
+        .status
+            != CommandStatus::Passed
+        || run_package_index(PackageIndexOptions {
+            common: common.clone(),
+            check: false,
+            timings: PackageTimingMode::Off,
+        })
+        .status
+            != CommandStatus::Passed
+        || run_package_theorem_premise_report(PackageTheoremPremiseReportOptions {
+            common: common.clone(),
+            check: false,
+            timings: PackageTimingMode::Off,
+        })
+        .status
+            != CommandStatus::Passed
+    {
+        return Err("promotion_materialize_target_identity_mismatch");
+    }
+    write_meta_sidecar_v2(stage, plan)?;
+    if run_package_export_summary(PackageExportSummaryOptions {
+        common: common.clone(),
+        out: None,
+        check: false,
+        timings: PackageTimingMode::Off,
+    })
+    .status
+        != CommandStatus::Passed
+        || run_package_publish_plan(PackagePublishPlanOptions {
+            common,
+            check: false,
+            timings: PackageTimingMode::Off,
+        })
+        .status
+            != CommandStatus::Passed
+    {
+        return Err("promotion_materialize_target_identity_mismatch");
+    }
+    validate_materialized_declaration_inventory(stage, plan)?;
+    Ok(omissions)
+}
+
+fn materialization_source_extraction_reason(
+    error: DeclarationSourceExtractionError,
+) -> &'static str {
+    match error {
+        DeclarationSourceExtractionError::Unsupported => {
+            "promotion_materialize_source_rewrite_failed"
+        }
+        DeclarationSourceExtractionError::SourceBytesLimitExceeded { .. } => {
+            "promotion_declaration_closure_limit_exceeded"
+        }
+    }
+}
+
+fn parse_human_kind(value: &str) -> Result<HumanDeclarationFamilyMemberKind, &'static str> {
+    match value {
+        "theorem" => Ok(HumanDeclarationFamilyMemberKind::Theorem),
+        "definition" => Ok(HumanDeclarationFamilyMemberKind::Definition),
+        "inductive" => Ok(HumanDeclarationFamilyMemberKind::Inductive),
+        "class" => Ok(HumanDeclarationFamilyMemberKind::Class),
+        "class_field" => Ok(HumanDeclarationFamilyMemberKind::ClassField),
+        "instance" => Ok(HumanDeclarationFamilyMemberKind::Instance),
+        _ => Err("promotion_materialize_source_rewrite_failed"),
+    }
+}
+
+/// Rebuild the exact filtered replay and its deterministic omission inventory.
+pub(crate) fn filtered_declaration_replay(
+    source: &str,
+    plan: &MathlibPromotionPlanV2,
+) -> Result<(String, Vec<PromotionReplayOmission>), &'static str> {
+    let mut replay = parse_package_proof_replay(source)
+        .map_err(|_| "promotion_materialize_source_rewrite_failed")?;
+    if replay.module != plan.selection.source_module {
+        return Err("promotion_materialize_source_rewrite_failed");
+    }
+    let selected = plan
+        .selection
+        .materialized_declarations
+        .iter()
+        .map(|row| row.source_name.as_dotted())
+        .collect::<BTreeSet<_>>();
+    let mapped_modules = std::iter::once(plan.selection.source_module.as_dotted())
+        .chain(
+            plan.dependency_mappings
+                .iter()
+                .map(|row| row.source.module.as_dotted()),
+        )
+        .collect::<BTreeSet<_>>();
+    let source_hash = package_file_hash(source.as_bytes());
+    let mut omissions = Vec::new();
+    let mut retained = Vec::new();
+    for (index, step) in replay.steps.into_iter().enumerate() {
+        if !selected.contains(&step.declaration) {
+            continue;
+        }
+        let unsafe_rewrite = step
+            .term
+            .as_ref()
+            .into_iter()
+            .chain(step.note.as_ref())
+            .any(|text| mapped_modules.iter().any(|module| text.contains(module)));
+        if unsafe_rewrite {
+            omissions.push(PromotionReplayOmission {
+                source_replay_file_hash: source_hash,
+                declaration: Name::from_dotted(&step.declaration),
+                row_index: index as u64,
+                reason: PROMOTION_REPLAY_OMISSION_UNSUPPORTED_REWRITE_REASON.to_owned(),
+            });
+        } else {
+            retained.push(step);
+        }
+    }
+    replay.module = plan.selection.target_module.clone();
+    replay.steps = retained;
+    replay.accepted_artifact = Some(PackagePath::new(format!(
+        "{}/certificate.npcert",
+        plan.selection.target_module.as_dotted().replace('.', "/")
+    )));
+    omissions.sort();
+    Ok((replay.canonical_json(), omissions))
+}
+
+fn edit_manifest_v2(stage: &Path, plan: &MathlibPromotionPlanV2) -> Result<(), &'static str> {
+    let path = stage.join("npa-package.toml");
+    let mut document = fs::read_to_string(&path)
+        .map_err(|_| "promotion_materialize_target_identity_mismatch")?
+        .parse::<DocumentMut>()
+        .map_err(|_| "promotion_materialize_target_identity_mismatch")?;
+    document["version"] = toml_edit::value(plan.target_baseline.planned_version.as_str());
+    let base = plan.selection.target_module.as_dotted().replace('.', "/");
+    let mut table = Table::new();
+    table["module"] = toml_edit::value(plan.selection.target_module.as_dotted());
+    table["source"] = toml_edit::value(format!("{base}/source.npa"));
+    table["certificate"] = toml_edit::value(format!("{base}/certificate.npcert"));
+    table["meta"] = toml_edit::value(format!("{base}/meta.json"));
+    table["replay"] = toml_edit::value(format!("{base}/replay.json"));
+    table["producer_profile"] = toml_edit::value("human-surface-explicit-term");
+    for field in [
+        "expected_source_hash",
+        "expected_certificate_file_hash",
+        "expected_export_hash",
+        "expected_axiom_report_hash",
+        "expected_certificate_hash",
+    ] {
+        table[field] = toml_edit::value(format_package_hash(&PackageHash::new([0; 32])));
+    }
+    let mut imports = Array::new();
+    for module in plan
+        .dependency_mappings
+        .iter()
+        .map(|row| row.target.module.clone())
+        .collect::<BTreeSet<_>>()
+    {
+        imports.push(module.as_dotted());
+    }
+    table["imports"] = Item::Value(imports.into());
+    for (field, kind) in [
+        ("theorems", "theorem"),
+        ("definitions", "definition"),
+        ("inductives", "inductive"),
+    ] {
+        let mut values = Array::new();
+        for row in &plan.selection.materialized_declarations {
+            if row.certificate_kind == kind {
+                values.push(row.target_name.as_dotted());
+            }
+        }
+        if field != "inductives" || !values.is_empty() {
+            table[field] = Item::Value(values.into());
+        }
+    }
+    table["axioms"] = Item::Value(Array::new().into());
+    append_module_table(&mut document, table)?;
+    fs::write(path, document.to_string())
+        .map_err(|_| "promotion_materialize_target_identity_mismatch")
+}
+
+fn append_module_table(document: &mut DocumentMut, table: Table) -> Result<(), &'static str> {
+    let replace_empty = !document.as_table().contains_key("modules")
+        || document["modules"]
+            .as_array()
+            .is_some_and(|modules| modules.is_empty());
+    if replace_empty {
+        let mut tables = ArrayOfTables::new();
+        tables.push(table);
+        document.as_table_mut().remove("modules");
+        document["modules"] = Item::ArrayOfTables(tables);
+        return Ok(());
+    }
+    document["modules"]
+        .as_array_of_tables_mut()
+        .ok_or("promotion_materialize_target_identity_mismatch")?
+        .push(table);
+    Ok(())
+}
+
+fn import_tables_mut(document: &mut DocumentMut) -> Result<&mut ArrayOfTables, &'static str> {
+    let replace_empty = !document.as_table().contains_key("imports")
+        || document["imports"]
+            .as_array()
+            .is_some_and(|imports| imports.is_empty());
+    if replace_empty {
+        document.as_table_mut().remove("imports");
+        document["imports"] = Item::ArrayOfTables(ArrayOfTables::new());
+    }
+    document["imports"]
+        .as_array_of_tables_mut()
+        .ok_or("promotion_materialize_target_identity_mismatch")
+}
+
+fn restore_existing_module_artifacts_v2(
+    stage: &Path,
+    plan: &MathlibPromotionPlanV2,
+    preserved: &PreservedTargetModules,
+) -> Result<(), &'static str> {
+    for (path, bytes) in &preserved.artifacts {
+        let full = stage.join(path.as_str());
+        if let Some(parent) = full.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|_| "promotion_materialize_target_identity_mismatch")?;
+        }
+        fs::write(full, bytes).map_err(|_| "promotion_materialize_target_identity_mismatch")?;
+    }
+    let manifest_path = stage.join("npa-package.toml");
+    let built = fs::read_to_string(&manifest_path)
+        .map_err(|_| "promotion_materialize_target_identity_mismatch")?
+        .parse::<DocumentMut>()
+        .map_err(|_| "promotion_materialize_target_identity_mismatch")?;
+    let selected = built["modules"]
+        .as_array_of_tables()
+        .and_then(|tables| {
+            tables.iter().find(|table| {
+                table.get("module").and_then(Item::as_str)
+                    == Some(plan.selection.target_module.as_dotted().as_str())
+            })
+        })
+        .cloned()
+        .ok_or("promotion_materialize_target_identity_mismatch")?;
+    let mut document = preserved
+        .manifest_source
+        .parse::<DocumentMut>()
+        .map_err(|_| "promotion_materialize_target_identity_mismatch")?;
+    document["version"] = toml_edit::value(plan.target_baseline.planned_version.as_str());
+    append_module_table(&mut document, selected)
+        .map_err(|_| "promotion_materialize_target_identity_mismatch")?;
+    fs::write(manifest_path, document.to_string())
+        .map_err(|_| "promotion_materialize_target_identity_mismatch")
+}
+
+fn externalize_preserved_dependencies_v2(
+    stage: &Path,
+    plan: &MathlibPromotionPlanV2,
+    preserved: &PreservedTargetModules,
+) -> Result<(), &'static str> {
+    let local_names = plan
+        .dependency_mappings
+        .iter()
+        .filter(|row| row.target.origin == PackageArtifactOrigin::Local)
+        .map(|row| row.target.module.as_dotted())
+        .collect::<BTreeSet<_>>();
+    if local_names.is_empty() {
+        return Ok(());
+    }
+    let preserved_manifest = parse_and_validate_manifest_str(&preserved.manifest_source)
+        .map_err(|_| "promotion_materialize_target_identity_mismatch")?
+        .into_manifest();
+    let local_modules = local_names
+        .iter()
+        .map(|name| {
+            preserved_manifest
+                .modules
+                .iter()
+                .find(|module| module.module.as_dotted() == *name)
+                .ok_or("promotion_materialize_target_identity_mismatch")
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let manifest_path = stage.join("npa-package.toml");
+    let mut document = fs::read_to_string(&manifest_path)
+        .map_err(|_| "promotion_materialize_target_identity_mismatch")?
+        .parse::<DocumentMut>()
+        .map_err(|_| "promotion_materialize_target_identity_mismatch")?;
+    let tables = document["modules"]
+        .as_array_of_tables()
+        .ok_or("promotion_materialize_target_identity_mismatch")?;
+    let mut retained = ArrayOfTables::new();
+    for table in tables {
+        if !table
+            .get("module")
+            .and_then(Item::as_str)
+            .is_some_and(|name| local_names.contains(name))
+        {
+            retained.push(table.clone());
+        }
+    }
+    document["modules"] = Item::ArrayOfTables(retained);
+    let imports = import_tables_mut(&mut document)?;
+    for module in local_modules {
+        let mut table = Table::new();
+        table["module"] = toml_edit::value(module.module.as_dotted());
+        table["package"] = toml_edit::value(plan.target_baseline.package.as_str());
+        table["version"] = toml_edit::value(plan.target_baseline.version.as_str());
+        table["certificate"] = toml_edit::value(module.certificate.as_str());
+        table["export_hash"] = toml_edit::value(format_package_hash(&module.expected_export_hash));
+        table["certificate_hash"] =
+            toml_edit::value(format_package_hash(&module.expected_certificate_hash));
+        imports.push(table);
+    }
+    fs::write(manifest_path, document.to_string())
+        .map_err(|_| "promotion_materialize_target_identity_mismatch")
+}
+
+fn write_meta_sidecar_v2(stage: &Path, plan: &MathlibPromotionPlanV2) -> Result<(), &'static str> {
+    let loaded = crate::package::load_package_root(stage, COMMAND)
+        .map_err(|_| "promotion_materialize_target_identity_mismatch")?;
+    let module = loaded
+        .validated
+        .manifest()
+        .modules
+        .iter()
+        .find(|module| module.module == plan.selection.target_module)
+        .ok_or("promotion_materialize_target_identity_mismatch")?;
+    let declarations = plan
+        .selection
+        .materialized_declarations
+        .iter()
+        .map(|row| {
+            format!(
+                "    {{\n      \"name\": \"{}\",\n      \"kind\": \"{}\"\n    }}",
+                row.target_name.as_dotted(),
+                if row.certificate_kind == "definition" {
+                    "def"
+                } else {
+                    row.certificate_kind.as_str()
+                }
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",\n");
+    let imports = module
+        .imports
+        .iter()
+        .map(|name| format!("\"{}\"", name.as_dotted()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let json = format!(
+        "{{\n  \"schema\": \"npa-ai-proof-meta-v0.1\",\n  \"module\": \"{}\",\n  \"source\": \"{}\",\n  \"certificate\": \"{}\",\n  \"producer_profile\": \"human-surface-explicit-term\",\n  \"trusted_status\": \"verified_by_certificate\",\n  \"source_sha256\": \"{}\",\n  \"certificate_file_sha256\": \"{}\",\n  \"export_hash\": \"{}\",\n  \"axiom_report_hash\": \"{}\",\n  \"certificate_hash\": \"{}\",\n  \"imports\": [{}],\n  \"axioms\": [],\n  \"declarations\": [\n{}\n  ],\n  \"trust_boundary\": \"source, replay, and metadata are non-trusted sidecars; only the canonical certificate verified by npa-cert is accepted\"\n}}\n",
+        module.module.as_dotted(), module.source.as_str(), module.certificate.as_str(),
+        format_package_hash(&module.expected_source_hash), format_package_hash(&module.expected_certificate_file_hash),
+        format_package_hash(&module.expected_export_hash), format_package_hash(&module.expected_axiom_report_hash),
+        format_package_hash(&module.expected_certificate_hash), imports, declarations,
+    );
+    fs::write(
+        stage.join(
+            module
+                .meta
+                .as_ref()
+                .ok_or("promotion_materialize_target_identity_mismatch")?
+                .as_str(),
+        ),
+        json,
+    )
+    .map_err(|_| "promotion_materialize_target_identity_mismatch")
+}
+
+pub(crate) fn validate_materialized_declaration_inventory(
+    stage: &Path,
+    plan: &MathlibPromotionPlanV2,
+) -> Result<(), &'static str> {
+    let snapshot = load_package_audit_snapshot(
+        stage,
+        COMMAND,
+        PackageGeneratedArtifactReadMode::all(),
+        PackageArtifactReferenceSummaryMode::Include,
+    )
+    .map_err(|_| "promotion_materialize_target_identity_mismatch")?;
+    validate_checked_generated(&snapshot)
+        .map_err(|_| "promotion_materialize_target_identity_mismatch")?;
+    let record = snapshot
+        .snapshot
+        .decoded_module_records
+        .values()
+        .find(|record| record.key.module == plan.selection.target_module)
+        .ok_or("promotion_declaration_export_mismatch")?;
+    let actual = record
+        .verified_module
+        .export_block()
+        .iter()
+        .map(|export| {
+            let name = record
+                .verified_module
+                .name_table()
+                .get(export.name)
+                .ok_or("promotion_declaration_export_mismatch")?
+                .clone();
+            Ok(name)
+        })
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    let expected = plan
+        .selection
+        .materialized_declarations
+        .iter()
+        .map(|row| row.target_name.clone())
+        .chain(
+            plan.selection
+                .generated_exports
+                .iter()
+                .map(|row| row.name.clone()),
+        )
+        .collect::<BTreeSet<_>>();
+    if actual != expected {
+        return Err("promotion_declaration_export_mismatch");
+    }
+    let imports = record
+        .verified_module
+        .imports()
+        .iter()
+        .map(|entry| entry.module.clone())
+        .collect::<BTreeSet<_>>();
+    let expected_imports = plan
+        .dependency_mappings
+        .iter()
+        .map(|row| row.target.module.clone())
+        .collect::<BTreeSet<_>>();
+    if imports != expected_imports {
+        return Err("promotion_declaration_import_mismatch");
+    }
+    Ok(())
+}
+
+pub(crate) fn declaration_plan_inputs_current(
+    source_root: &Path,
+    baseline_root: &Path,
+    source: &crate::package_artifacts::LoadedPackageAuditSnapshot,
+    baseline: &crate::package_artifacts::LoadedPackageAuditSnapshot,
+    plan: &MathlibPromotionPlanV2,
+) -> bool {
+    let source_manifest = source.snapshot.validated.manifest();
+    let baseline_manifest = baseline.snapshot.validated.manifest();
+    if run_package_validate_promotion_origin_registry(
+        PackageValidatePromotionOriginRegistryOptions {
+            common: PackageCommonOptions {
+                root: baseline_root.to_path_buf(),
+                json: false,
+            },
+            source_roots: Vec::new(),
+            previous_registry: None,
+        },
+    )
+    .status
+        != CommandStatus::Passed
+    {
+        return false;
+    }
+    let registry_bytes = match read_confined(
+        baseline_root,
+        &PackagePath::new(MATHLIB_PROMOTION_REGISTRY_PATH),
+    ) {
+        Ok(bytes) => bytes,
+        Err(_) => return false,
+    };
+    if package_file_hash(&registry_bytes) != plan.target_baseline.registry_file_hash {
+        return false;
+    }
+    let registry = match std::str::from_utf8(&registry_bytes)
+        .ok()
+        .and_then(|source| parse_promotion_origin_registry_versioned(source).ok())
+    {
+        Some(registry) => registry,
+        None => return false,
+    };
+    let mut source_external = BTreeMap::new();
+    for mapping in &plan.dependency_mappings {
+        if mapping.target.origin == PackageArtifactOrigin::Local
+            && !registry_owns_active_target(&registry, &mapping.target.module)
+        {
+            return false;
+        }
+        let Some(source_record) = endpoint_record(source, &mapping.source) else {
+            return false;
+        };
+        let Some(target_record) = endpoint_record(baseline, &mapping.target) else {
+            return false;
+        };
+        let Ok(source_identity) = resolve_verified_declaration_export(
+            &source_record.verified_module,
+            &mapping.declaration_name,
+        ) else {
+            return false;
+        };
+        let Ok(target_identity) = resolve_verified_declaration_export(
+            &target_record.verified_module,
+            &mapping.declaration_name,
+        ) else {
+            return false;
+        };
+        if source_external
+            .insert(
+                source_identity.identity.clone(),
+                target_identity.identity.clone(),
+            )
+            .is_some()
+            || PackageHash::from(source_identity.identity.decl_interface_hash)
+                != mapping.source_decl_interface_hash
+            || PackageHash::from(target_identity.identity.decl_interface_hash)
+                != mapping.target_decl_interface_hash
+            || source_identity.identity.kind != target_identity.identity.kind
+            || target_record.certificate.file_hash != mapping.target_certificate_file_hash
+            || target_record.key.certificate_hash != mapping.target_certificate_hash
+            || target_record.key.export_hash != mapping.target_export_hash
+        {
+            return false;
+        }
+    }
+    let request = read_confined(source_root, &plan.governance.request_path)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .and_then(|source| parse_declaration_promotion_request_json(&source).ok());
+    let Some(request) = request else {
+        return false;
+    };
+    let request_roots = request
+        .roots
+        .iter()
+        .map(|root| {
+            (
+                root.source_name.clone(),
+                root.target_name.clone(),
+                root.kind.as_str().to_owned(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let plan_roots = plan
+        .selection
+        .roots
+        .iter()
+        .map(|root| {
+            (
+                root.requested_name.clone(),
+                root.requested_name.clone(),
+                root.kind.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let request_mappings = request
+        .dependency_mappings
+        .iter()
+        .map(|row| (row.source.clone(), row.target.clone()))
+        .collect::<BTreeSet<_>>();
+    let plan_mappings = plan
+        .dependency_mappings
+        .iter()
+        .map(|row| (row.source.clone(), row.target.clone()))
+        .collect::<BTreeSet<_>>();
+    if request.source.package != plan.source.package
+        || request.source.version != plan.source.version
+        || request.target.package != plan.target_baseline.package
+        || request.target.baseline_version != plan.target_baseline.version
+        || request.target.planned_version != plan.target_baseline.planned_version
+        || request.source_module != plan.selection.source_module
+        || request.target_module != plan.selection.target_module
+        || request.requested_maturity != plan.requested_maturity
+        || request_roots != plan_roots
+        || request_mappings != plan_mappings
+    {
+        return false;
+    }
+    let generated_match =
+        |snapshot: &crate::package_artifacts::LoadedPackageAuditSnapshot,
+         expected: &npa_package::PromotionPackageSnapshot| {
+            snapshot.snapshot.manifest.file_hash == expected.manifest_file_hash
+                && package_file_hash(snapshot.package_lock_json.as_bytes())
+                    == expected.lock_file_hash
+                && snapshot
+                    .checked_generated
+                    .axiom_report_json
+                    .as_deref()
+                    .is_some_and(|value| {
+                        package_file_hash(value.as_bytes()) == expected.axiom_report_file_hash
+                    })
+                && snapshot
+                    .checked_generated
+                    .theorem_index_json
+                    .as_deref()
+                    .is_some_and(|value| {
+                        package_file_hash(value.as_bytes()) == expected.theorem_index_file_hash
+                    })
+        };
+    if source_manifest.package != plan.source.package
+        || source_manifest.version != plan.source.version
+        || baseline_manifest.package != plan.target_baseline.package
+        || baseline_manifest.version != plan.target_baseline.version
+        || !generated_match(source, &plan.source)
+    {
+        return false;
+    }
+    let baseline_projection = npa_package::PromotionPackageSnapshot {
+        package: plan.target_baseline.package.clone(),
+        version: plan.target_baseline.version.clone(),
+        manifest_file_hash: plan.target_baseline.manifest_file_hash,
+        lock_file_hash: plan.target_baseline.lock_file_hash,
+        axiom_report_file_hash: plan.target_baseline.axiom_report_file_hash,
+        theorem_index_file_hash: plan.target_baseline.theorem_index_file_hash,
+    };
+    if !generated_match(baseline, &baseline_projection) {
+        return false;
+    }
+    let source_module = match source_manifest
+        .modules
+        .iter()
+        .find(|module| module.module == plan.selection.source_module)
+    {
+        Some(module) => module,
+        None => return false,
+    };
+    let files = [
+        (&plan.selection.source_path, plan.selection.source_file_hash),
+        (&plan.selection.meta_path, plan.selection.meta_file_hash),
+        (&plan.selection.replay_path, plan.selection.replay_file_hash),
+        (
+            &plan.selection.certificate_path,
+            plan.selection.certificate_file_hash,
+        ),
+        (
+            &plan.governance.request_path,
+            plan.governance.request_file_hash,
+        ),
+    ];
+    let artifact_inputs_current = source_module.source == plan.selection.source_path
+        && source_module.meta.as_ref() == Some(&plan.selection.meta_path)
+        && source_module.replay.as_ref() == Some(&plan.selection.replay_path)
+        && source_module.certificate == plan.selection.certificate_path
+        && source_module.expected_certificate_hash == plan.selection.certificate_hash
+        && source_module.expected_export_hash == plan.selection.export_hash
+        && source_module.expected_axiom_report_hash == plan.selection.axiom_report_hash
+        && files.iter().all(|(path, hash)| {
+            read_confined(source_root, path)
+                .ok()
+                .is_some_and(|bytes| package_file_hash(&bytes) == *hash)
+        })
+        && [
+            (
+                "docs/catalog-policy.md",
+                plan.governance.catalog_policy_file_hash,
+            ),
+            (
+                "docs/namespace-policy.md",
+                plan.governance.namespace_policy_file_hash,
+            ),
+            (
+                PACKAGE_VERIFIED_EXPORT_SUMMARY_PATH,
+                plan.target_baseline.verified_export_summary_file_hash,
+            ),
+            (
+                PACKAGE_PUBLISH_PLAN_PATH,
+                plan.target_baseline.publish_plan_file_hash,
+            ),
+        ]
+        .iter()
+        .all(|(path, hash)| {
+            read_confined(baseline_root, &PackagePath::new(*path))
+                .ok()
+                .is_some_and(|bytes| package_file_hash(&bytes) == *hash)
+        });
+    artifact_inputs_current
+        && declaration_plan_selection_current(source_root, source, &request, plan, &source_external)
+}
+
+pub(crate) fn declaration_plan_selection_current(
+    source_root: &Path,
+    source: &crate::package_artifacts::LoadedPackageAuditSnapshot,
+    request: &npa_package::DeclarationPromotionRequest,
+    plan: &MathlibPromotionPlanV2,
+    source_external: &BTreeMap<GlobalDeclarationIdentity, GlobalDeclarationIdentity>,
+) -> bool {
+    let manifest = source.snapshot.validated.manifest();
+    let Some(module) = manifest
+        .modules
+        .iter()
+        .find(|module| module.module == request.source_module)
+    else {
+        return false;
+    };
+    let mut extraction_source_bytes = 0;
+    let Some(source_text) =
+        read_declaration_source(source_root, &module.source, &mut extraction_source_bytes)
+            .ok()
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+    else {
+        return false;
+    };
+    let Ok(imported_interfaces) = direct_import_interfaces(
+        source_root,
+        source,
+        &module.imports,
+        extraction_source_bytes,
+    ) else {
+        return false;
+    };
+    let Ok(human_families) =
+        collect_human_source_declaration_families(FileId(0), &source_text, &imported_interfaces)
+    else {
+        return false;
+    };
+    let Some(verified) = source
+        .snapshot
+        .decoded_module_records
+        .values()
+        .find(|record| record.key.module == request.source_module)
+        .map(|record| &record.verified_module)
+    else {
+        return false;
+    };
+    let Ok((families, human_members)) = reconcile_families(verified, &human_families) else {
+        return false;
+    };
+    let Ok(roots) = resolve_roots(request, verified, &human_families) else {
+        return false;
+    };
+    let modules = source
+        .snapshot
+        .decoded_module_records
+        .values()
+        .map(|record| (record.key.module.clone(), record.verified_module.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let Ok(closure) = declaration_dependency_closure(
+        &modules,
+        &roots,
+        &families,
+        source_external,
+        DeclarationClosureLimits::default(),
+    ) else {
+        return false;
+    };
+    let Ok(declarations) = plan_declarations(&closure, &human_members) else {
+        return false;
+    };
+    let generated_exports = declarations
+        .iter()
+        .flat_map(|row| row.generated_exports.iter().cloned())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let actual_externalized = closure
+        .externalized
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let planned_externalized = source_external
+        .iter()
+        .map(|(source, target)| (source.clone(), target.clone()))
+        .collect::<BTreeSet<_>>();
+
+    plan.selection.roots == plan_roots(request, &human_families)
+        && plan.selection.materialized_declarations == declarations
+        && plan.selection.generated_exports == generated_exports
+        && plan.selection.declaration_closure_hash
+            == PackageHash::from(closure.declaration_closure_hash)
+        && actual_externalized == planned_externalized
+}
+
+fn declaration_equivalent_origins_current(
+    roots: &[PathBuf],
+    plan: &MathlibPromotionPlanV2,
+) -> bool {
+    if roots.len() != plan.equivalent_sources.len() {
+        return false;
+    }
+    let mut rows = Vec::new();
+    for root in roots {
+        let Ok(snapshot) = load_package_audit_snapshot(
+            root,
+            COMMAND,
+            promotion_plan_generated_read_mode(),
+            PackageArtifactReferenceSummaryMode::Include,
+        ) else {
+            return false;
+        };
+        if validate_checked_generated(&snapshot).is_err() {
+            return false;
+        }
+        let manifest = snapshot.snapshot.validated.manifest();
+        let Some(module) = manifest
+            .modules
+            .iter()
+            .find(|module| module.module == plan.selection.source_module)
+        else {
+            return false;
+        };
+        let Ok(source) = read_confined(root, &module.source) else {
+            return false;
+        };
+        let Some(expected) = plan
+            .equivalent_sources
+            .iter()
+            .find(|row| row.package == manifest.package && row.version == manifest.version)
+        else {
+            return false;
+        };
+        if expected.source_file_hash != package_file_hash(&source)
+            || expected.certificate_file_hash != module.expected_certificate_file_hash
+            || expected.certificate_hash != module.expected_certificate_hash
+            || expected.export_hash != module.expected_export_hash
+        {
+            return false;
+        }
+        rows.push(expected.clone());
+    }
+    rows.sort();
+    rows == plan.equivalent_sources
+}
+
+fn declaration_change_is_scoped(
+    change: &Change,
+    plan: &MathlibPromotionPlanV2,
+    phase: PackagePromotionPhase,
+) -> bool {
+    if declaration_target_artifact_paths(plan).contains(&change.path) {
+        return change.old.is_none();
+    }
+    matches!(
+        change.path.as_str(),
+        "npa-package.toml"
+            | PACKAGE_LOCK_PATH
+            | PACKAGE_AXIOM_REPORT_PATH
+            | PACKAGE_THEOREM_INDEX_PATH
+            | PACKAGE_THEOREM_PREMISE_REPORT_PATH
+            | PACKAGE_VERIFIED_EXPORT_SUMMARY_PATH
+            | PACKAGE_PUBLISH_PLAN_PATH
+    ) || (phase == PackagePromotionPhase::Tracked
+        && change.path.as_str() == MATHLIB_PROMOTION_REGISTRY_PATH)
+}
+
+fn declaration_target_artifact_paths(plan: &MathlibPromotionPlanV2) -> [PackagePath; 4] {
+    let base = plan.selection.target_module.as_dotted().replace('.', "/");
+    [
+        PackagePath::new(format!("{base}/source.npa")),
+        PackagePath::new(format!("{base}/certificate.npcert")),
+        PackagePath::new(format!("{base}/meta.json")),
+        PackagePath::new(format!("{base}/replay.json")),
+    ]
+}
+
+pub(crate) fn declaration_target_artifact_collision(
+    root: &Path,
+    plan: &MathlibPromotionPlanV2,
+) -> Option<PackagePath> {
+    declaration_target_artifact_paths(plan)
+        .into_iter()
+        .find(|path| !target_path_is_absent(root, path))
+}
+
+pub(crate) fn declaration_target_diff_is_scoped(
+    baseline: &BTreeMap<PackagePath, Vec<u8>>,
+    target: &BTreeMap<PackagePath, Vec<u8>>,
+    plan: &MathlibPromotionPlanV2,
+) -> bool {
+    baseline.keys().all(|path| target.contains_key(path))
+        && diff_snapshots(baseline, target).iter().all(|change| {
+            declaration_change_is_scoped(change, plan, PackagePromotionPhase::Temporary)
+        })
+}
+
+fn change_result(root_display: String, changes: Vec<Change>) -> CommandResult {
+    let mut result = CommandResult::passed(COMMAND, root_display);
+    for change in changes {
+        result.artifacts.push(CommandArtifact {
+            kind: if change.old.is_some() {
+                "promotion_replace"
+            } else {
+                "promotion_create"
+            }
+            .to_owned(),
+            path: change.path.as_str().to_owned(),
+        });
+    }
+    result
+}
+
+fn apply_declaration_stage(
+    options: &PackageMaterializePromotionOptions,
+    phase: PackagePromotionPhase,
+    promotion_id: PackageHash,
+    captured: &BTreeMap<PackagePath, Vec<u8>>,
+    staged: &BTreeMap<PackagePath, Vec<u8>>,
+    changes: &[Change],
+    stage: &Path,
+) -> CommandResult {
+    let root_display = render_package_root(&options.target_root);
+    let mut lock = match TargetLock::acquire(&options.target_root) {
+        Ok(lock) => lock,
+        Err(_) => {
+            let _ = fs::remove_dir_all(stage);
+            return failure(
+                &root_display,
+                "promotion_concurrent_update",
+                TARGET_LOCK_PREFIX,
+            );
+        }
+    };
+    if let Err(reason) = locked_apply_preflight(&options.target_root, captured) {
+        drop(lock);
+        let _ = fs::remove_dir_all(stage);
+        return failure(&root_display, reason, "--target-root");
+    }
+    let transaction = match transaction_path(&options.target_root, promotion_id) {
+        Ok(path) => path,
+        Err(_) => {
+            drop(lock);
+            let _ = fs::remove_dir_all(stage);
+            return failure(
+                &root_display,
+                "promotion_materialize_unscoped_path",
+                "--target-root",
+            );
+        }
+    };
+    let journal = transaction
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_owned);
+    if lock
+        .record(Some(promotion_id), "materialize", journal.as_deref())
+        .is_err()
+    {
+        drop(lock);
+        let _ = fs::remove_dir_all(stage);
+        return failure(
+            &root_display,
+            "promotion_concurrent_update",
+            TARGET_LOCK_PREFIX,
+        );
+    }
+    let mut visible = false;
+    if apply_transaction(
+        &options.target_root,
+        phase,
+        promotion_id,
+        changes,
+        &mut visible,
+    )
+    .is_err()
+    {
+        let rolled_back =
+            !visible || rollback_transaction(&options.target_root, &transaction).is_ok();
+        drop(lock);
+        let _ = fs::remove_dir_all(stage);
+        return failure(
+            &root_display,
+            if rolled_back {
+                "promotion_concurrent_update"
+            } else {
+                "promotion_recovery_required"
+            },
+            "--target-root",
+        );
+    }
+    if tree_snapshot(&options.target_root).ok().as_ref() != Some(staged) {
+        let rolled_back = rollback_transaction(&options.target_root, &transaction).is_ok();
+        drop(lock);
+        let _ = fs::remove_dir_all(stage);
+        return failure(
+            &root_display,
+            if rolled_back {
+                "promotion_materialize_target_identity_mismatch"
+            } else {
+                "promotion_recovery_required"
+            },
+            "--target-root",
+        );
+    }
+    let valid = load_package_audit_snapshot(
+        &options.target_root,
+        COMMAND,
+        PackageGeneratedArtifactReadMode::all(),
+        PackageArtifactReferenceSummaryMode::Include,
+    )
+    .ok()
+    .is_some_and(|snapshot| validate_checked_generated(&snapshot).is_ok());
+    if !valid {
+        let rolled_back = rollback_transaction(&options.target_root, &transaction).is_ok();
+        drop(lock);
+        let _ = fs::remove_dir_all(stage);
+        return failure(
+            &root_display,
+            if rolled_back {
+                "promotion_materialize_target_identity_mismatch"
+            } else {
+                "promotion_recovery_required"
+            },
+            "--target-root",
+        );
+    }
+    if phase == PackagePromotionPhase::Tracked
+        && run_package_validate_promotion_origin_registry(
+            PackageValidatePromotionOriginRegistryOptions {
+                common: PackageCommonOptions {
+                    root: options.target_root.clone(),
+                    json: false,
+                },
+                source_roots: std::iter::once(options.common.root.clone())
+                    .chain(options.equivalent_origin_roots.iter().cloned())
+                    .collect(),
+                previous_registry: None,
+            },
+        )
+        .status
+            != CommandStatus::Passed
+    {
+        let rolled_back = rollback_transaction(&options.target_root, &transaction).is_ok();
+        drop(lock);
+        let _ = fs::remove_dir_all(stage);
+        return failure(
+            &root_display,
+            if rolled_back {
+                "promotion_registry_target_identity_mismatch"
+            } else {
+                "promotion_recovery_required"
+            },
+            MATHLIB_PROMOTION_REGISTRY_PATH,
+        );
+    }
+    if finalize_transaction(&transaction).is_err() {
+        drop(lock);
+        let _ = fs::remove_dir_all(stage);
+        return failure(
+            &root_display,
+            "promotion_recovery_required",
+            "--target-root",
+        );
+    }
+    let _ = lock.record(Some(promotion_id), "materialize", None);
+    drop(lock);
+    let _ = fs::remove_dir_all(stage);
+    change_result(root_display, changes.to_vec())
+}
+
+fn update_stage_registry_v2(
+    stage: &Path,
+    plan_path: &PackagePath,
+    plan_bytes: &[u8],
+    attestation_path: &PackagePath,
+    attestation_bytes: &[u8],
+    plan: &MathlibPromotionPlanV2,
+    attestation: &npa_package::VerifiedMaterializationAttestation,
+) -> Result<(), ()> {
+    let registry_path = stage.join(MATHLIB_PROMOTION_REGISTRY_PATH);
+    let registry_source = fs::read_to_string(&registry_path).map_err(|_| ())?;
+    enum Previous {
+        V1(npa_package::PromotionOriginRegistry),
+        V2(npa_package::PromotionOriginRegistryV2),
+    }
+    let (previous, mut registry) = match parse_promotion_origin_registry_versioned(&registry_source)
+        .map_err(|_| ())?
+    {
+        ParsedPromotionOriginRegistry::V2(previous) => (Previous::V2(previous.clone()), previous),
+        ParsedPromotionOriginRegistry::V1(previous) => {
+            let migrated = migrate_promotion_origin_registry_v1_to_v2(&previous).map_err(|_| ())?;
+            (Previous::V1(previous), migrated)
+        }
+    };
+    let snapshot = load_package_audit_snapshot(
+        stage,
+        COMMAND,
+        PackageGeneratedArtifactReadMode::all(),
+        PackageArtifactReferenceSummaryMode::Include,
+    )
+    .map_err(|_| ())?;
+    let index = snapshot.snapshot.project_theorem_index().map_err(|_| ())?;
+    let mut theorems = index
+        .entries
+        .iter()
+        .filter(|entry| {
+            entry.global_ref.module == plan.selection.target_module
+                && entry.kind == npa_package::PackageTheoremIndexKind::Theorem
+        })
+        .map(|entry| PromotionDeclarationTargetTheorem {
+            target_name: entry.global_ref.name.clone(),
+            statement_hash: entry.statement.core_hash,
+        })
+        .collect::<Vec<_>>();
+    theorems.sort();
+    let edge_hash = promotion_plan_v2_dependency_edge_hash(
+        &plan.selection.materialized_declarations,
+        &plan.dependency_mappings,
+    )
+    .map_err(|_| ())?;
+    let canonical_source = npa_package::PromotionPlanV2EquivalentSource {
+        package: plan.source.package.clone(),
+        version: plan.source.version.clone(),
+        source_module: plan.selection.source_module.clone(),
+        source_file_hash: plan.selection.source_file_hash,
+        certificate_file_hash: plan.selection.certificate_file_hash,
+        certificate_hash: plan.selection.certificate_hash,
+        export_hash: plan.selection.export_hash,
+        declaration_closure_hash: plan.selection.declaration_closure_hash,
+        dependency_edge_hash: edge_hash,
+    };
+    let entry = DeclarationClosureRegistryEntry {
+        promotion_id: plan.promotion_id,
+        lifecycle: "active".to_owned(),
+        introduced_version: plan.target_baseline.planned_version.clone(),
+        canonical_source,
+        equivalent_sources: plan.equivalent_sources.clone(),
+        source_module: plan.selection.source_module.clone(),
+        target_module: plan.selection.target_module.clone(),
+        roots: plan.selection.roots.clone(),
+        closure: plan.selection.materialized_declarations.clone(),
+        dependency_mappings: plan.dependency_mappings.clone(),
+        target_revisions: vec![PromotionDeclarationTargetRevision {
+            target_version: plan.target_baseline.planned_version.clone(),
+            target_source_file_hash: attestation.target.source_file_hash,
+            target_meta_file_hash: attestation.target.meta_file_hash,
+            target_replay_file_hash: attestation.target.replay_file_hash,
+            target_certificate_file_hash: attestation.target.certificate_file_hash,
+            target_certificate_hash: attestation.target.certificate_hash,
+            target_export_hash: attestation.target.export_hash,
+            target_axiom_report_hash: attestation.target.axiom_report_hash,
+            theorems,
+        }],
+        evidence: PromotionDeclarationEvidence {
+            kind: "verified_declaration_materialization_v1".to_owned(),
+            plan_schema: plan.schema.clone(),
+            plan_path: plan_path.clone(),
+            plan_file_hash: package_file_hash(plan_bytes),
+            attestation_schema: attestation.schema.clone(),
+            attestation_path: attestation_path.clone(),
+            attestation_file_hash: package_file_hash(attestation_bytes),
+            declaration_closure_hash: plan.selection.declaration_closure_hash,
+            normalized_closure_hash: attestation.normalized_closure_hash,
+            catalog_policy_file_hash: plan.governance.catalog_policy_file_hash,
+            namespace_policy_file_hash: plan.governance.namespace_policy_file_hash,
+        },
+        // Verified maturity is the admission evidence itself. This array is
+        // reserved for later exact-target review events.
+        maturity_events: Vec::new(),
+    };
+    validate_declaration_registry_entry_admission(&entry, plan, attestation).map_err(|_| ())?;
+    registry
+        .entries
+        .push(PromotionOriginEntryV2::DeclarationClosureV1(Box::new(
+            entry,
+        )));
+    registry
+        .entries
+        .sort_by_key(PromotionOriginEntryV2::promotion_id);
+    registry.generation = registry.generation.checked_add(1).ok_or(())?;
+    registry.refresh_hash().map_err(|_| ())?;
+    match previous {
+        Previous::V1(previous) => {
+            validate_promotion_origin_registry_v1_to_v2_transition(&previous, &registry)
+                .map_err(|_| ())?;
+        }
+        Previous::V2(previous) => {
+            validate_promotion_origin_registry_v2_transition(&previous, &registry)
+                .map_err(|_| ())?;
+        }
+    }
+    fs::write(registry_path, registry.canonical_json().map_err(|_| ())?).map_err(|_| ())
+}
+
 #[cfg(test)]
 mod tests {
     #[cfg(unix)]
@@ -2457,7 +4105,11 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use npa_cert::Name;
-    use npa_package::{PromotionPlanSelectedModule, PromotionPlanTheorem};
+    use npa_package::{
+        PackageId, PackageVersion, PromotionGovernance, PromotionPackageSnapshot,
+        PromotionPlanSelectedModule, PromotionPlanTheorem, PromotionTargetSnapshot,
+        MATHLIB_PROMOTION_PLAN_V2_SCHEMA,
+    };
 
     use super::*;
 
@@ -2496,6 +4148,64 @@ mod tests {
     }
 
     #[test]
+    fn legacy_plan_dispatch_ignores_embedded_v2_schema_text() {
+        let hash = |value: &str| package_file_hash(value.as_bytes());
+        let mut plan = MathlibPromotionPlan {
+            schema: MATHLIB_PROMOTION_PLAN_SCHEMA.to_owned(),
+            promotion_id: PackageHash::new([0; 32]),
+            source: PromotionPackageSnapshot {
+                package: PackageId::new("npa-project-example-proofs"),
+                version: PackageVersion::new("0.1.0"),
+                manifest_file_hash: hash("source-manifest"),
+                lock_file_hash: hash("source-lock"),
+                axiom_report_file_hash: hash("source-axioms"),
+                theorem_index_file_hash: hash("source-index"),
+            },
+            target_baseline: PromotionTargetSnapshot {
+                package: PackageId::new("npa-mathlib"),
+                version: PackageVersion::new("0.2.1"),
+                planned_version: PackageVersion::new("0.2.2"),
+                manifest_file_hash: hash("target-manifest"),
+                lock_file_hash: hash("target-lock"),
+                axiom_report_file_hash: hash("target-axioms"),
+                theorem_index_file_hash: hash("target-index"),
+            },
+            governance: PromotionGovernance {
+                acceptance_policy_id: "finitefield-org.npa-mathlib.l2".to_owned(),
+                acceptance_policy_version: 2,
+                acceptance_policy_file_hash: hash("acceptance-policy"),
+                source_acceptance_path: PackagePath::new("l2-acceptance.json"),
+                source_acceptance_schema: "npa.l2_acceptance.v2".to_owned(),
+                source_acceptance_file_hash: hash("acceptance"),
+                transport_policy_id: "finitefield-org.npa-mathlib.l2-namespace-transport"
+                    .to_owned(),
+                transport_policy_version: 1,
+                transport_policy_file_hash: hash("transport-policy"),
+                mapping_path: PackagePath::new(MATHLIB_PROMOTION_PLAN_V2_SCHEMA),
+                mapping_schema: "npa.l2_namespace_transport_request.v1".to_owned(),
+                mapping_file_hash: hash("mapping"),
+                registry_file_hash: hash("registry"),
+            },
+            selected_modules: vec![selected(
+                "Proofs.Ai.Example.Basic",
+                "Mathlib.Example.Basic",
+                &[],
+            )],
+            dependency_mappings: Vec::new(),
+            equivalent_sources: Vec::new(),
+            compatibility_alias: "none".to_owned(),
+            plan_hash: PackageHash::new([0; 32]),
+            proof_evidence: false,
+        };
+        plan.finalize().unwrap();
+        let source = plan.canonical_json().unwrap();
+
+        assert!(source.contains(MATHLIB_PROMOTION_PLAN_V2_SCHEMA));
+        assert!(parse_mathlib_promotion_plan_json(&source).is_ok());
+        assert!(!is_declaration_promotion_plan(&source));
+    }
+
+    #[test]
     fn import_rewrite_changes_only_import_name_spans() {
         let source = "-- Proofs.Ai.Dependency remains documentation\nimport Proofs.Ai.Dependency\nnotation \"Proofs.Ai.Dependency\" => Nat.zero\n\ndef keep : Type := Type\n";
         let mapping = BTreeMap::from([(
@@ -2512,6 +4222,64 @@ mod tests {
             rewrite_imports(leaked, &mapping),
             Err("promotion_materialize_source_rewrite_failed")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tree_snapshot_rejects_literal_backslash_paths() {
+        let serial = NEXT_TEST_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "npa-promotion-snapshot-backslash-{}-{serial}",
+            std::process::id()
+        ));
+        fs::create_dir(&root).unwrap();
+        let hostile_name = format!("{}tmp{}npa-promotion-victim", '\\', '\\');
+        fs::write(root.join(hostile_name), b"controlled").unwrap();
+
+        assert!(tree_snapshot(&root).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn tree_snapshot_only_hides_root_git_metadata() {
+        let serial = NEXT_TEST_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "npa-promotion-snapshot-prefixed-{}-{serial}",
+            std::process::id()
+        ));
+        fs::create_dir(&root).unwrap();
+        fs::create_dir_all(root.join(".git")).unwrap();
+        fs::write(root.join(".git/root-marker"), b"ignored root metadata").unwrap();
+        fs::create_dir_all(root.join("nested/.git")).unwrap();
+        let prefixed_path = PackagePath::new(".npa-promotion-unscoped");
+        let nested_git_path = PackagePath::new("nested/.git/marker");
+        fs::write(root.join(prefixed_path.as_str()), b"unscoped").unwrap();
+        fs::write(root.join(nested_git_path.as_str()), b"nested content").unwrap();
+
+        let snapshot = tree_snapshot(&root).unwrap();
+        assert_eq!(
+            snapshot.get(&prefixed_path).map(Vec::as_slice),
+            Some(&b"unscoped"[..])
+        );
+        assert_eq!(
+            snapshot.get(&nested_git_path).map(Vec::as_slice),
+            Some(&b"nested content"[..])
+        );
+        assert!(!snapshot.contains_key(&PackagePath::new(".git/root-marker")));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn write_tree_snapshot_rejects_absolute_package_paths() {
+        let serial = NEXT_TEST_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+        let target = std::env::temp_dir().join(format!(
+            "npa-promotion-snapshot-target-{}-{serial}",
+            std::process::id()
+        ));
+        let snapshot = BTreeMap::from([(PackagePath::new("/tmp/npa-victim"), b"x".to_vec())]);
+
+        assert!(write_tree_snapshot(&snapshot, &target).is_err());
+        assert!(!target.exists());
     }
 
     #[test]

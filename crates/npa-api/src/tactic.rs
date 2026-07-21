@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 use std::time::{Duration, Instant};
 
 use npa_cert::{ExportKind, Hash, Name};
@@ -11,25 +12,30 @@ use npa_tactic::{
     DiagnosticRequestPath, GeneralInductionPayload, GeneralizePayload, GoalId, HavePayload,
     LocalLemmaInsertionPolicy, LocalLemmaProof, MachineProofState, MachineTacticBatchPolicy,
     MachineTacticCandidate, MachineTacticDiagnostic, MachineTacticDiagnosticKind,
-    MachineTacticFeature, MachineTacticProfileVersion, OccurrencePath, RawMachineTerm,
-    RefinePayload, RevertDependencyPolicy, RevertPayload, RewriteDirection, RewriteSite,
-    SimpRuleRef, SpecializePayload, SpecializeResultPolicy, SubstPayload,
-    SufficesContinuationPolicy, SufficesPayload, TacticBudget, TacticHead, TacticTarget,
-    UnfoldPayload,
+    MachineTacticFeature, MachineTacticPreparationCounters, MachineTacticProfileVersion,
+    OccurrencePath, RawMachineTerm, RefinePayload, RevertDependencyPolicy, RevertPayload,
+    RewriteDirection, RewriteSite, SimpRuleRef, SpecializePayload, SpecializeResultPolicy,
+    SubstPayload, SufficesContinuationPolicy, SufficesPayload, TacticBudget, TacticHead,
+    TacticTarget, UnfoldPayload,
 };
 use sha2::{Digest, Sha256};
 
 use crate::adapter::{
+    machine_tactic_prepare_machine_tactic_snapshot,
+    machine_tactic_run_machine_tactic_for_prepared_snapshot,
     machine_tactic_run_machine_tactic_with_budget,
-    machine_tactic_validate_machine_tactic_candidate_for_state, MachineApiDiagnosticPhase,
-    MachineApiDiagnosticProjection, MachineApiTacticKind, MachineTacticAdapterError,
-    ValidatedMachineTactic,
+    machine_tactic_validate_machine_tactic_candidate,
+    machine_tactic_validate_machine_tactic_candidate_for_state,
+    machine_tactic_validate_normalized_machine_tactic_for_prepared_snapshot,
+    MachineApiDiagnosticPhase, MachineApiDiagnosticProjection, MachineApiTacticKind,
+    MachineTacticAdapterError, ValidatedMachineTactic,
 };
 use crate::current::{encode_machine_axiom_ref_wire, MachineAxiomRefWire};
 use crate::diagnostic::{
     machine_api_projection_diagnostic_tree, MachineDiagnosticTree,
     MachineDiagnosticTreeAdapterContext, MachineDiagnosticTreeAdapterError,
 };
+use crate::fast_loop_measurement::FastLoopMeasurementRecorder;
 use crate::json::{JsonDocument, JsonMember, JsonValue, JsonValueKind};
 use crate::snapshot::{
     MachineSnapshotLookupError, MachineSnapshotMaterializationContext,
@@ -55,7 +61,7 @@ use crate::validation::{
 };
 use crate::{
     MachineApiDiagnosticCanonicalizationError, MachineApiResponseEnvelope,
-    MachineApiUpstreamDiagnostic,
+    MachineApiUpstreamDiagnostic, PerformanceCandidateOutcome,
 };
 
 const BUDGET_FIELDS: &[FieldSpec] = &[
@@ -564,6 +570,302 @@ pub struct MachineTacticBatchSchedulerFields {
     pub results: Vec<MachineTacticBatchItemResponse>,
     pub success_count: u32,
     pub failure_count: u32,
+}
+
+/// Serializes a tactic-batch response into the stable public JSON projection.
+///
+/// Field order and explicit `null` values are part of this projection so
+/// compatibility tests can compare legacy and prepared implementations byte
+/// for byte without depending on Rust's `Debug` representation.
+pub fn machine_tactic_batch_response_canonical_json(
+    response: &MachineTacticBatchResponse,
+) -> String {
+    let mut out = String::new();
+    out.push('{');
+    match response {
+        MachineApiResponseEnvelope::Ok(response) => {
+            batch_json_field_string(&mut out, "status", response.status.as_str());
+            batch_json_ok_fields(&mut out, &response.endpoint_fields);
+        }
+        MachineApiResponseEnvelope::Error(response) => {
+            batch_json_field_string(&mut out, "status", response.status.as_str());
+            out.push_str(",\"error\":");
+            batch_json_error(&mut out, &response.error);
+        }
+        MachineApiResponseEnvelope::SchedulerStopped(response) => {
+            batch_json_field_string(&mut out, "status", response.status.as_str());
+            out.push_str(",\"scheduler_artifact\":{");
+            batch_json_field_string(&mut out, "kind", response.scheduler_artifact.kind.as_str());
+            out.push(',');
+            batch_json_field_string(
+                &mut out,
+                "scope",
+                response.scheduler_artifact.scope.as_str(),
+            );
+            write!(
+                out,
+                ",\"retryable\":{}",
+                response.scheduler_artifact.retryable
+            )
+            .expect("writing JSON to String cannot fail");
+            out.push('}');
+            batch_json_scheduler_fields(&mut out, &response.endpoint_fields);
+        }
+    }
+    out.push('}');
+    out
+}
+
+fn batch_json_ok_fields(out: &mut String, fields: &MachineTacticBatchOkFields) {
+    batch_json_field_hash(
+        out,
+        "previous_state_fingerprint",
+        &fields.previous_state_fingerprint,
+    );
+    batch_json_field_hash(
+        out,
+        "deterministic_budget_hash",
+        &fields.deterministic_budget_hash,
+    );
+    batch_json_results(out, &fields.results);
+    write!(
+        out,
+        ",\"success_count\":{},\"failure_count\":{}",
+        fields.success_count, fields.failure_count
+    )
+    .expect("writing JSON to String cannot fail");
+}
+
+fn batch_json_scheduler_fields(out: &mut String, fields: &MachineTacticBatchSchedulerFields) {
+    batch_json_field_hash(
+        out,
+        "previous_state_fingerprint",
+        &fields.previous_state_fingerprint,
+    );
+    batch_json_field_hash(
+        out,
+        "deterministic_budget_hash",
+        &fields.deterministic_budget_hash,
+    );
+    write!(
+        out,
+        ",\"completed_prefix_len\":{}",
+        fields.completed_prefix_len
+    )
+    .expect("writing JSON to String cannot fail");
+    batch_json_results(out, &fields.results);
+    write!(
+        out,
+        ",\"success_count\":{},\"failure_count\":{}",
+        fields.success_count, fields.failure_count
+    )
+    .expect("writing JSON to String cannot fail");
+}
+
+fn batch_json_results(out: &mut String, results: &[MachineTacticBatchItemResponse]) {
+    out.push_str(",\"results\":[");
+    for (index, result) in results.iter().enumerate() {
+        if index != 0 {
+            out.push(',');
+        }
+        batch_json_item(out, result);
+    }
+    out.push(']');
+}
+
+fn batch_json_item(out: &mut String, item: &MachineTacticBatchItemResponse) {
+    out.push('{');
+    match item {
+        MachineTacticBatchItemResponse::Success {
+            candidate_id,
+            candidate_hash,
+            next_snapshot_id,
+            next_state_fingerprint,
+            proof_delta_hash,
+        } => {
+            batch_json_field_string(out, "status", MachineApiResponseStatus::Success.as_str());
+            out.push(',');
+            batch_json_field_string(out, "candidate_id", candidate_id);
+            batch_json_field_hash(out, "candidate_hash", candidate_hash);
+            out.push_str(",\"next_snapshot_id\":");
+            batch_json_string(out, &next_snapshot_id.wire());
+            batch_json_field_hash(out, "next_state_fingerprint", next_state_fingerprint);
+            batch_json_field_hash(out, "proof_delta_hash", proof_delta_hash);
+        }
+        MachineTacticBatchItemResponse::Error {
+            candidate_id,
+            candidate_hash,
+            diagnostic,
+        } => {
+            batch_json_field_string(out, "status", MachineApiResponseStatus::Error.as_str());
+            out.push(',');
+            batch_json_field_string(out, "candidate_id", candidate_id);
+            out.push_str(",\"candidate_hash\":");
+            batch_json_optional_hash(out, candidate_hash.as_ref());
+            out.push_str(",\"diagnostic\":");
+            batch_json_compact_error(out, diagnostic);
+        }
+    }
+    out.push('}');
+}
+
+fn batch_json_error(out: &mut String, error: &MachineApiErrorWire) {
+    out.push('{');
+    batch_json_field_string(out, "kind", error.kind.as_str());
+    out.push(',');
+    batch_json_field_string(out, "phase", error.phase.as_str());
+    batch_json_field_hash(out, "diagnostic_hash", &error.diagnostic_hash);
+    write!(out, ",\"retryable\":{}", error.retryable).expect("writing JSON to String cannot fail");
+    batch_json_optional_diagnostic_fields(
+        out,
+        error.goal_id,
+        error.tactic_kind,
+        error.primary_name.as_ref(),
+        error.primary_axiom_ref.as_ref(),
+        error.expected_hash.as_ref(),
+        error.actual_hash.as_ref(),
+    );
+    out.push('}');
+}
+
+fn batch_json_compact_error(out: &mut String, error: &MachineApiCompactErrorWire) {
+    out.push('{');
+    batch_json_field_string(out, "error_kind", error.error_kind.as_str());
+    out.push(',');
+    batch_json_field_string(out, "phase", error.phase.as_str());
+    batch_json_field_hash(out, "diagnostic_hash", &error.diagnostic_hash);
+    write!(out, ",\"retryable\":{}", error.retryable).expect("writing JSON to String cannot fail");
+    batch_json_optional_diagnostic_fields(
+        out,
+        error.goal_id,
+        error.tactic_kind,
+        error.primary_name.as_ref(),
+        error.primary_axiom_ref.as_ref(),
+        error.expected_hash.as_ref(),
+        error.actual_hash.as_ref(),
+    );
+    out.push('}');
+}
+
+fn batch_json_optional_diagnostic_fields(
+    out: &mut String,
+    goal_id: Option<GoalId>,
+    tactic_kind: Option<MachineApiTacticKind>,
+    primary_name: Option<&Name>,
+    primary_axiom_ref: Option<&MachineAxiomRefWire>,
+    expected_hash: Option<&Hash>,
+    actual_hash: Option<&Hash>,
+) {
+    out.push_str(",\"goal_id\":");
+    match goal_id {
+        Some(goal_id) => batch_json_string(out, &crate::types::format_goal_id_wire(goal_id)),
+        None => out.push_str("null"),
+    }
+    out.push_str(",\"tactic_kind\":");
+    match tactic_kind {
+        Some(tactic_kind) => batch_json_string(out, tactic_kind.as_str()),
+        None => out.push_str("null"),
+    }
+    out.push_str(",\"primary_name\":");
+    match primary_name {
+        Some(name) => batch_json_string(out, &name.as_dotted()),
+        None => out.push_str("null"),
+    }
+    out.push_str(",\"primary_axiom_ref\":");
+    match primary_axiom_ref {
+        Some(reference) => batch_json_axiom_ref(out, reference),
+        None => out.push_str("null"),
+    }
+    out.push_str(",\"expected_hash\":");
+    batch_json_optional_hash(out, expected_hash);
+    out.push_str(",\"actual_hash\":");
+    batch_json_optional_hash(out, actual_hash);
+}
+
+fn batch_json_axiom_ref(out: &mut String, reference: &MachineAxiomRefWire) {
+    out.push('{');
+    match reference {
+        MachineAxiomRefWire::Imported {
+            module,
+            name,
+            export_hash,
+            decl_interface_hash,
+        } => {
+            batch_json_field_string(out, "kind", "imported");
+            out.push(',');
+            batch_json_field_string(out, "module", &module.as_dotted());
+            out.push(',');
+            batch_json_field_string(out, "name", &name.as_dotted());
+            batch_json_field_hash(out, "export_hash", export_hash);
+            batch_json_field_hash(out, "decl_interface_hash", decl_interface_hash);
+        }
+        MachineAxiomRefWire::CurrentModule {
+            module,
+            name,
+            source_index,
+            decl_interface_hash,
+        } => {
+            batch_json_field_string(out, "kind", "current_module");
+            out.push(',');
+            batch_json_field_string(out, "module", &module.as_dotted());
+            out.push(',');
+            batch_json_field_string(out, "name", &name.as_dotted());
+            write!(out, ",\"source_index\":{source_index}")
+                .expect("writing JSON to String cannot fail");
+            batch_json_field_hash(out, "decl_interface_hash", decl_interface_hash);
+        }
+        MachineAxiomRefWire::Builtin {
+            name,
+            decl_interface_hash,
+        } => {
+            batch_json_field_string(out, "kind", "builtin");
+            out.push(',');
+            batch_json_field_string(out, "name", &name.as_dotted());
+            batch_json_field_hash(out, "decl_interface_hash", decl_interface_hash);
+        }
+    }
+    out.push('}');
+}
+
+fn batch_json_field_string(out: &mut String, field: &str, value: &str) {
+    batch_json_string(out, field);
+    out.push(':');
+    batch_json_string(out, value);
+}
+
+fn batch_json_field_hash(out: &mut String, field: &str, value: &Hash) {
+    out.push(',');
+    batch_json_string(out, field);
+    out.push(':');
+    batch_json_string(out, &crate::types::format_hash_string(value));
+}
+
+fn batch_json_optional_hash(out: &mut String, value: Option<&Hash>) {
+    match value {
+        Some(value) => batch_json_string(out, &crate::types::format_hash_string(value)),
+        None => out.push_str("null"),
+    }
+}
+
+fn batch_json_string(out: &mut String, value: &str) {
+    out.push('"');
+    for character in value.chars() {
+        match character {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\u{08}' => out.push_str("\\b"),
+            '\u{0c}' => out.push_str("\\f"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            character if character.is_control() => {
+                write!(out, "\\u{:04x}", character as u32)
+                    .expect("writing JSON to String cannot fail");
+            }
+            character => out.push(character),
+        }
+    }
+    out.push('"');
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -4741,6 +5043,154 @@ struct RunErrorCorrelation {
     tactic_kind: Option<MachineApiTacticKind>,
 }
 
+struct TrueBatchingMeasurementScope<'a> {
+    recorder: Option<&'a mut FastLoopMeasurementRecorder>,
+    batch_index: u64,
+    requested_candidates: u64,
+    parsed_candidates: u64,
+    scheduling_finished: bool,
+}
+
+impl<'a> TrueBatchingMeasurementScope<'a> {
+    fn new(
+        recorder: Option<&'a mut FastLoopMeasurementRecorder>,
+        batch_index: u64,
+        requested_candidates: usize,
+    ) -> Self {
+        Self {
+            recorder,
+            batch_index,
+            requested_candidates: u64::try_from(requested_candidates).unwrap_or(u64::MAX),
+            parsed_candidates: 0,
+            scheduling_finished: false,
+        }
+    }
+
+    fn is_enabled(&self) -> bool {
+        self.recorder
+            .as_ref()
+            .is_some_and(|recorder| recorder.is_enabled())
+    }
+
+    fn timer(&mut self) -> Option<Instant> {
+        self.recorder
+            .as_deref_mut()
+            .and_then(FastLoopMeasurementRecorder::start_timer)
+    }
+
+    fn record_input_state_clone(&mut self) {
+        if let Some(recorder) = self.recorder.as_deref_mut() {
+            recorder.observe_executable_input_state_clone();
+        }
+    }
+
+    fn record_input_validation(&mut self) {
+        if let Some(recorder) = self.recorder.as_deref_mut() {
+            recorder.observe_candidate_input_validation();
+        }
+    }
+
+    fn record_delayed_candidate_parse(&mut self) {
+        if !self.is_enabled() {
+            return;
+        }
+        self.parsed_candidates = self.parsed_candidates.saturating_add(1);
+        if let Some(recorder) = self.recorder.as_deref_mut() {
+            recorder.observe_delayed_candidate_parsed();
+        }
+    }
+
+    fn record_preparation(
+        &mut self,
+        started: Option<Instant>,
+        counters: MachineTacticPreparationCounters,
+    ) {
+        if let Some(recorder) = self.recorder.as_deref_mut() {
+            recorder.observe_prepared_snapshot(elapsed_nanos(started));
+            recorder.observe_machine_tactic_preparation_counter_delta(
+                MachineTacticPreparationCounters::default(),
+                counters,
+            );
+        }
+    }
+
+    fn record_candidate_validation_elapsed(
+        &mut self,
+        candidate_index: usize,
+        started: Option<Instant>,
+    ) {
+        let elapsed_ns = elapsed_nanos(started);
+        if let Some(recorder) = self.recorder.as_deref_mut() {
+            recorder.observe_candidate_local_validation_elapsed_ns(elapsed_ns);
+            recorder.observe_candidate_detail(
+                self.batch_index,
+                u64::try_from(candidate_index).unwrap_or(u64::MAX),
+                elapsed_ns,
+                0,
+                PerformanceCandidateOutcome::NotEvaluated,
+            );
+        }
+    }
+
+    fn record_candidate_execution_elapsed(
+        &mut self,
+        candidate_index: usize,
+        started: Option<Instant>,
+    ) {
+        let elapsed_ns = elapsed_nanos(started);
+        if let Some(recorder) = self.recorder.as_deref_mut() {
+            recorder.observe_candidate_execution_elapsed_ns(elapsed_ns);
+            recorder.observe_candidate_detail(
+                self.batch_index,
+                u64::try_from(candidate_index).unwrap_or(u64::MAX),
+                0,
+                elapsed_ns,
+                PerformanceCandidateOutcome::NotEvaluated,
+            );
+        }
+    }
+
+    fn finish_scheduling(&mut self) {
+        self.scheduling_finished = true;
+    }
+
+    fn record_counter_delta(
+        &mut self,
+        before: MachineTacticPreparationCounters,
+        after: MachineTacticPreparationCounters,
+    ) {
+        if let Some(recorder) = self.recorder.as_deref_mut() {
+            recorder.observe_machine_tactic_preparation_counter_delta(before, after);
+        }
+    }
+}
+
+impl Drop for TrueBatchingMeasurementScope<'_> {
+    fn drop(&mut self) {
+        if !self.scheduling_finished || !self.is_enabled() {
+            return;
+        }
+        if let Some(recorder) = self.recorder.as_deref_mut() {
+            recorder.observe_delayed_candidates_skipped(
+                self.requested_candidates
+                    .saturating_sub(self.parsed_candidates),
+            );
+        }
+    }
+}
+
+fn elapsed_millis(started: Option<Instant>) -> u64 {
+    started
+        .map(|started| u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
+fn elapsed_nanos(started: Option<Instant>) -> u64 {
+    started
+        .map(|started| u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
 pub fn run_machine_tactic_request(
     source: &str,
     session: &mut MachineProofSession,
@@ -4779,6 +5229,26 @@ pub fn run_machine_tactic_batch_request_in_sessions<'session>(
     source: &str,
     sessions: impl IntoIterator<Item = &'session mut MachineProofSession>,
 ) -> Result<MachineTacticBatchResponse, Box<MachineTacticBatchError>> {
+    run_machine_tactic_batch_request_in_sessions_with_measurement(source, sessions, None)
+}
+
+pub fn run_machine_tactic_batch_request_with_measurement(
+    source: &str,
+    session: &mut MachineProofSession,
+    measurement: &mut FastLoopMeasurementRecorder,
+) -> Result<MachineTacticBatchResponse, Box<MachineTacticBatchError>> {
+    run_machine_tactic_batch_request_in_sessions_with_measurement(
+        source,
+        std::iter::once(session),
+        Some(measurement),
+    )
+}
+
+fn run_machine_tactic_batch_request_in_sessions_with_measurement<'session>(
+    source: &str,
+    sessions: impl IntoIterator<Item = &'session mut MachineProofSession>,
+    mut measurement: Option<&mut FastLoopMeasurementRecorder>,
+) -> Result<MachineTacticBatchResponse, Box<MachineTacticBatchError>> {
     let request = parse_machine_tactic_batch_request(source).map_err(batch_request_error)?;
     let Some(session) = sessions
         .into_iter()
@@ -4792,7 +5262,61 @@ pub fn run_machine_tactic_batch_request_in_sessions<'session>(
         ));
     };
 
-    run_machine_tactic_batch_request_parsed(session, request)
+    let requested_candidate_count = request.candidates.len();
+    let batch_index = measurement
+        .as_deref_mut()
+        .filter(|recorder| recorder.is_enabled())
+        .map(FastLoopMeasurementRecorder::begin_candidate_batch)
+        .unwrap_or(0);
+    let started = measurement
+        .as_deref_mut()
+        .and_then(FastLoopMeasurementRecorder::start_timer);
+    let response = run_machine_tactic_batch_request_parsed(
+        session,
+        request,
+        measurement.as_deref_mut(),
+        batch_index,
+    );
+    if let Some(recorder) = measurement {
+        recorder.observe_candidate_batch_elapsed_ms(elapsed_millis(started));
+        match response.as_ref() {
+            Ok(MachineApiResponseEnvelope::Ok(ok)) => {
+                recorder.observe_tactic_batch_ok(requested_candidate_count, &ok.endpoint_fields);
+            }
+            Ok(MachineApiResponseEnvelope::SchedulerStopped(stopped)) => recorder
+                .observe_tactic_batch_scheduler_stop(
+                    requested_candidate_count,
+                    &stopped.endpoint_fields,
+                ),
+            Ok(MachineApiResponseEnvelope::Error(_)) | Err(_) => {}
+        }
+        if let Ok(MachineApiResponseEnvelope::SchedulerStopped(stopped)) = response.as_ref() {
+            recorder.observe_tactic_batch_scheduler_stop_reason(stopped.scheduler_artifact.kind);
+        }
+        let results = match response.as_ref() {
+            Ok(MachineApiResponseEnvelope::Ok(ok)) => Some(&ok.endpoint_fields.results),
+            Ok(MachineApiResponseEnvelope::SchedulerStopped(stopped)) => {
+                Some(&stopped.endpoint_fields.results)
+            }
+            Ok(MachineApiResponseEnvelope::Error(_)) | Err(_) => None,
+        };
+        if let Some(results) = results {
+            for (index, result) in results.iter().enumerate() {
+                recorder.observe_candidate_detail(
+                    batch_index,
+                    u64::try_from(index).unwrap_or(u64::MAX),
+                    0,
+                    0,
+                    if result.is_success() {
+                        PerformanceCandidateOutcome::Accepted
+                    } else {
+                        PerformanceCandidateOutcome::Rejected
+                    },
+                );
+            }
+        }
+    }
+    response
 }
 
 pub fn run_machine_lazy_diagnostic_request(
@@ -5818,7 +6342,11 @@ fn run_machine_tactic_request_parsed(
 fn run_machine_tactic_batch_request_parsed(
     session: &mut MachineProofSession,
     request: MachineTacticBatchRequest<'_>,
+    measurement: Option<&mut FastLoopMeasurementRecorder>,
+    batch_index: u64,
 ) -> Result<MachineTacticBatchResponse, Box<MachineTacticBatchError>> {
+    let mut batching_measurement =
+        TrueBatchingMeasurementScope::new(measurement, batch_index, request.candidates.len());
     if session.snapshots.session_id() != &session.session_id {
         return Err(batch_plain_error(
             MachineApiErrorKind::InvalidMachineProofState,
@@ -5839,6 +6367,7 @@ fn run_machine_tactic_batch_request_parsed(
             .snapshots
             .lookup_checked(&context, request.snapshot_id, request.state_fingerprint)
             .map_err(batch_snapshot_lookup_error)?;
+        batching_measurement.record_input_validation();
         if !entry
             .materialized_view_payload
             .open_goals
@@ -5853,6 +6382,7 @@ fn run_machine_tactic_batch_request_parsed(
         }
         entry.executable_state_payload.clone()
     };
+    batching_measurement.record_input_state_clone();
 
     let deterministic_budget_hash = tactic_budget_hash(request.deterministic_budget);
     let candidate_count = request.candidates.len();
@@ -5860,8 +6390,10 @@ fn run_machine_tactic_batch_request_parsed(
     let mut success_count = 0u32;
     let mut failure_count = 0u32;
     let mut evaluated_count = 0u32;
+    let mut prepared = None;
 
     if let Some(stop) = scheduler_observation.observe(request.scheduler_limits) {
+        batching_measurement.finish_scheduling();
         return Ok(batch_scheduler_stop(
             request.state_fingerprint,
             deterministic_budget_hash,
@@ -5885,6 +6417,7 @@ fn run_machine_tactic_batch_request_parsed(
 
         scheduler_observation.begin_candidate();
         if let Some(stop) = scheduler_observation.observe(request.scheduler_limits) {
+            batching_measurement.finish_scheduling();
             return Ok(batch_scheduler_stop(
                 request.state_fingerprint,
                 deterministic_budget_hash,
@@ -5901,6 +6434,7 @@ fn run_machine_tactic_batch_request_parsed(
             .field("candidates")
             .index(index)
             .field("candidate");
+        batching_measurement.record_delayed_candidate_parse();
         let candidate = match parse_candidate_payload_at(
             item.candidate.raw,
             &session.root.universe_params,
@@ -5927,6 +6461,7 @@ fn run_machine_tactic_batch_request_parsed(
                     break;
                 }
                 if let Some(stop) = scheduler_observation.observe(request.scheduler_limits) {
+                    batching_measurement.finish_scheduling();
                     return Ok(batch_scheduler_stop(
                         request.state_fingerprint,
                         deterministic_budget_hash,
@@ -5941,6 +6476,7 @@ fn run_machine_tactic_batch_request_parsed(
         };
 
         if let Some(stop) = scheduler_observation.observe(request.scheduler_limits) {
+            batching_measurement.finish_scheduling();
             return Ok(batch_scheduler_stop(
                 request.state_fingerprint,
                 deterministic_budget_hash,
@@ -5951,14 +6487,51 @@ fn run_machine_tactic_batch_request_parsed(
             ));
         }
 
-        let validated = match machine_tactic_validate_machine_tactic_candidate_for_state(
-            &input_state,
-            request.goal_id,
-            candidate,
-            request.deterministic_budget,
-            MachineTacticProfileVersion::StructuralV2,
-            STRUCTURAL_V2_REQUIRED_FEATURES,
-        ) {
+        let validation = (|| {
+            let normalized =
+                machine_tactic_validate_machine_tactic_candidate(request.goal_id, candidate)?;
+            if prepared.is_none() {
+                let started = batching_measurement.timer();
+                let preparation = machine_tactic_prepare_machine_tactic_snapshot(
+                    &input_state,
+                    request.goal_id,
+                    normalized.tactic_kind,
+                    normalized.candidate_hash,
+                    request.deterministic_budget,
+                );
+                if batching_measurement.is_enabled() {
+                    if let Ok(prepared_snapshot) = &preparation {
+                        batching_measurement
+                            .record_preparation(started, prepared_snapshot.counters());
+                    }
+                }
+                prepared = Some(preparation?);
+            }
+            let prepared_snapshot = prepared
+                .as_ref()
+                .expect("prepared snapshot was initialized above");
+            let counters_before = batching_measurement
+                .is_enabled()
+                .then(|| prepared_snapshot.counters());
+            let started = batching_measurement.timer();
+            let validation =
+                machine_tactic_validate_normalized_machine_tactic_for_prepared_snapshot(
+                    prepared
+                        .as_ref()
+                        .expect("prepared snapshot was initialized above"),
+                    normalized,
+                    request.deterministic_budget,
+                    MachineTacticProfileVersion::StructuralV2,
+                    STRUCTURAL_V2_REQUIRED_FEATURES,
+                );
+            batching_measurement.record_candidate_validation_elapsed(index, started);
+            if let Some(counters_before) = counters_before {
+                batching_measurement
+                    .record_counter_delta(counters_before, prepared_snapshot.counters());
+            }
+            validation
+        })();
+        let validated = match validation {
             Ok(validated) => validated,
             Err(error) => {
                 let candidate_hash = error.candidate_hash.map(|candidate_payload_hash| {
@@ -5987,6 +6560,7 @@ fn run_machine_tactic_batch_request_parsed(
                     break;
                 }
                 if let Some(stop) = scheduler_observation.observe(request.scheduler_limits) {
+                    batching_measurement.finish_scheduling();
                     return Ok(batch_scheduler_stop(
                         request.state_fingerprint,
                         deterministic_budget_hash,
@@ -6001,6 +6575,7 @@ fn run_machine_tactic_batch_request_parsed(
         };
 
         if let Some(stop) = scheduler_observation.observe(request.scheduler_limits) {
+            batching_measurement.finish_scheduling();
             return Ok(batch_scheduler_stop(
                 request.state_fingerprint,
                 deterministic_budget_hash,
@@ -6020,11 +6595,33 @@ fn run_machine_tactic_batch_request_parsed(
             candidate_payload_hash,
             deterministic_budget_hash,
         );
-        let run = match machine_tactic_run_machine_tactic_with_budget(
-            &input_state,
+        let counters_before = if batching_measurement.is_enabled() {
+            Some(
+                prepared
+                    .as_ref()
+                    .expect("validated candidate requires a prepared snapshot")
+                    .counters(),
+            )
+        } else {
+            None
+        };
+        let started = batching_measurement.timer();
+        let run = machine_tactic_run_machine_tactic_for_prepared_snapshot(
+            prepared
+                .as_ref()
+                .expect("validated candidate requires a prepared snapshot"),
             validated.tactic,
             request.deterministic_budget,
-        ) {
+        );
+        batching_measurement.record_candidate_execution_elapsed(index, started);
+        if let Some(counters_before) = counters_before {
+            let prepared_snapshot = prepared
+                .as_ref()
+                .expect("measured execution requires a prepared snapshot");
+            batching_measurement
+                .record_counter_delta(counters_before, prepared_snapshot.counters());
+        }
+        let run = match run {
             Ok(run) => run,
             Err(error) => {
                 results.push(batch_adapter_error_item(
@@ -6044,6 +6641,7 @@ fn run_machine_tactic_batch_request_parsed(
                     break;
                 }
                 if let Some(stop) = scheduler_observation.observe(request.scheduler_limits) {
+                    batching_measurement.finish_scheduling();
                     return Ok(batch_scheduler_stop(
                         request.state_fingerprint,
                         deterministic_budget_hash,
@@ -6058,6 +6656,7 @@ fn run_machine_tactic_batch_request_parsed(
         };
 
         if let Some(stop) = scheduler_observation.observe(request.scheduler_limits) {
+            batching_measurement.finish_scheduling();
             return Ok(batch_scheduler_stop(
                 request.state_fingerprint,
                 deterministic_budget_hash,
@@ -6081,6 +6680,7 @@ fn run_machine_tactic_batch_request_parsed(
                 success_count += 1;
             }
             Err(MachineSnapshotStoreError::SnapshotQuotaExceeded { .. }) => {
+                batching_measurement.finish_scheduling();
                 return Ok(batch_scheduler_stop(
                     request.state_fingerprint,
                     deterministic_budget_hash,
@@ -6116,6 +6716,7 @@ fn run_machine_tactic_batch_request_parsed(
             break;
         }
         if let Some(stop) = scheduler_observation.observe(request.scheduler_limits) {
+            batching_measurement.finish_scheduling();
             return Ok(batch_scheduler_stop(
                 request.state_fingerprint,
                 deterministic_budget_hash,
@@ -6127,6 +6728,7 @@ fn run_machine_tactic_batch_request_parsed(
         }
     }
 
+    batching_measurement.finish_scheduling();
     Ok(MachineApiResponseEnvelope::Ok(
         crate::MachineApiOkResponse {
             status: MachineApiResponseStatus::Ok,
@@ -12867,6 +13469,18 @@ mod tests {
         )
     }
 
+    fn measurement_counter_value(
+        report: &crate::FastLoopMeasurementReport,
+        label: crate::FastLoopMeasurementLabel,
+        stage: Option<crate::FastLoopCandidateStage>,
+    ) -> u64 {
+        report
+            .counters
+            .iter()
+            .find(|counter| counter.label == label && counter.stage == stage)
+            .map_or(0, |counter| counter.value)
+    }
+
     #[test]
     fn tactic_run_exact_success_stores_next_snapshot() {
         let mut session = create_machine_session(&minimal_session_json("Type 0"))
@@ -13019,6 +13633,858 @@ mod tests {
         );
         assert_eq!(diagnostic.goal_id, Some(npa_tactic::GoalId(0)));
         assert_eq!(diagnostic.tactic_kind, Some(MachineApiTacticKind::Intro));
+    }
+
+    #[derive(Clone, Copy)]
+    struct LegacyBatchOracleFixture {
+        name: &'static str,
+        theorem_type: &'static str,
+        candidates: &'static [(&'static str, &'static str)],
+        policy: MachineTacticBatchPolicy,
+    }
+
+    fn legacy_batch_oracle_fixtures() -> [LegacyBatchOracleFixture; 6] {
+        const DEFAULT: MachineTacticBatchPolicy = MachineTacticBatchPolicy {
+            max_evaluated_candidates: 256,
+            stop_after_successes: 256,
+            stop_after_failures: 256,
+        };
+        [
+            LegacyBatchOracleFixture {
+                name: "mixed_representative_tactics",
+                theorem_type: "Type 0",
+                candidates: &[
+                    (
+                        "exact_success",
+                        r#"{"kind":"exact","term":{"source":"Prop"}}"#,
+                    ),
+                    ("intro_failure", r#"{"kind":"intro","name":"p"}"#),
+                    (
+                        "refine_success",
+                        r#"{"kind":"refine","term":{"source":"Prop"},"max_holes":0}"#,
+                    ),
+                    (
+                        "constructor_failure",
+                        r#"{"kind":"constructor","selection":{"mode":"auto"},"max_new_goals":0}"#,
+                    ),
+                ],
+                policy: DEFAULT,
+            },
+            LegacyBatchOracleFixture {
+                name: "pi_goal_expansion",
+                theorem_type: "forall (p : Prop), p",
+                candidates: &[
+                    ("intro_expands", r#"{"kind":"intro","name":"p"}"#),
+                    (
+                        "exact_failure",
+                        r#"{"kind":"exact","term":{"source":"Prop"}}"#,
+                    ),
+                ],
+                policy: DEFAULT,
+            },
+            LegacyBatchOracleFixture {
+                name: "failure_then_success",
+                theorem_type: "Type 0",
+                candidates: &[
+                    ("first_failure", r#"{"kind":"intro","name":"p"}"#),
+                    (
+                        "later_success",
+                        r#"{"kind":"exact","term":{"source":"Prop"}}"#,
+                    ),
+                ],
+                policy: DEFAULT,
+            },
+            LegacyBatchOracleFixture {
+                name: "max_evaluated_stop",
+                theorem_type: "Type 0",
+                candidates: &[
+                    (
+                        "first_success",
+                        r#"{"kind":"exact","term":{"source":"Prop"}}"#,
+                    ),
+                    ("must_stay_delayed", "null"),
+                ],
+                policy: MachineTacticBatchPolicy {
+                    max_evaluated_candidates: 1,
+                    ..DEFAULT
+                },
+            },
+            LegacyBatchOracleFixture {
+                name: "success_count_stop",
+                theorem_type: "Type 0",
+                candidates: &[
+                    (
+                        "first_success",
+                        r#"{"kind":"exact","term":{"source":"Prop"}}"#,
+                    ),
+                    ("must_stay_delayed", "null"),
+                ],
+                policy: MachineTacticBatchPolicy {
+                    stop_after_successes: 1,
+                    ..DEFAULT
+                },
+            },
+            LegacyBatchOracleFixture {
+                name: "failure_count_stop",
+                theorem_type: "Type 0",
+                candidates: &[
+                    ("first_failure", r#"{"kind":"intro","name":"p"}"#),
+                    ("must_stay_delayed", "null"),
+                ],
+                policy: MachineTacticBatchPolicy {
+                    stop_after_failures: 1,
+                    ..DEFAULT
+                },
+            },
+        ]
+    }
+
+    fn batch_policy_json(policy: MachineTacticBatchPolicy) -> String {
+        format!(
+            r#"{{"max_evaluated_candidates":{},"stop_after_successes":{},"stop_after_failures":{}}}"#,
+            policy.max_evaluated_candidates,
+            policy.stop_after_successes,
+            policy.stop_after_failures
+        )
+    }
+
+    fn batch_candidates_json(candidates: &[(&str, &str)]) -> String {
+        format!(
+            "[{}]",
+            candidates
+                .iter()
+                .map(|(candidate_id, candidate)| format!(
+                    r#"{{"candidate_id":"{candidate_id}","candidate":{candidate}}}"#
+                ))
+                .collect::<Vec<_>>()
+                .join(",")
+        )
+    }
+
+    fn legacy_single_response_item(
+        candidate_id: &str,
+        response: MachineTacticRunResponse,
+    ) -> MachineTacticBatchItemResponse {
+        match response {
+            MachineApiResponseEnvelope::Ok(response) => {
+                let result = response.endpoint_fields.result;
+                MachineTacticBatchItemResponse::Success {
+                    candidate_id: candidate_id.to_owned(),
+                    candidate_hash: result.candidate_hash,
+                    next_snapshot_id: result.next_snapshot_id,
+                    next_state_fingerprint: result.next_state_fingerprint,
+                    proof_delta_hash: result.delta.proof_delta_hash,
+                }
+            }
+            MachineApiResponseEnvelope::Error(response) => MachineTacticBatchItemResponse::Error {
+                candidate_id: candidate_id.to_owned(),
+                candidate_hash: response.error.candidate_hash,
+                diagnostic: response.error.diagnostic.into(),
+            },
+            MachineApiResponseEnvelope::SchedulerStopped(response) => {
+                panic!(
+                    "legacy non-scheduler fixture stopped unexpectedly: {:?}",
+                    response.scheduler_artifact
+                )
+            }
+        }
+    }
+
+    fn repeated_legacy_single_candidate_batch(
+        session: &mut MachineProofSession,
+        candidates: &[(&str, &str)],
+        policy: MachineTacticBatchPolicy,
+    ) -> MachineTacticBatchResponse {
+        let previous_state_fingerprint = session.initial_snapshot.state_fingerprint;
+        let deterministic_budget_hash = tactic_budget_hash(TacticBudget {
+            max_tactic_steps: 64,
+            max_whnf_steps: 10_000,
+            max_conversion_steps: 10_000,
+            max_rewrite_steps: 100,
+            max_meta_allocations: 8,
+            max_expr_nodes: 20_000,
+        });
+        let mut results = Vec::new();
+        let mut success_count = 0;
+        let mut failure_count = 0;
+
+        for (index, (candidate_id, candidate)) in candidates.iter().enumerate() {
+            let evaluated_count =
+                u32::try_from(index).expect("batch fixture count satisfies the protocol cap");
+            if batch_policy_stop(
+                evaluated_count,
+                success_count,
+                failure_count,
+                candidates.len(),
+                policy,
+            ) {
+                break;
+            }
+            let request = run_json(session, previous_state_fingerprint, candidate);
+            let response = match run_machine_tactic_request(&request, session) {
+                Ok(response) => response,
+                Err(error) => error.response,
+            };
+            let item = legacy_single_response_item(candidate_id, response);
+            if item.is_success() {
+                success_count += 1;
+            } else {
+                failure_count += 1;
+            }
+            results.push(item);
+        }
+
+        MachineApiResponseEnvelope::Ok(crate::MachineApiOkResponse {
+            status: MachineApiResponseStatus::Ok,
+            endpoint_fields: MachineTacticBatchOkFields {
+                previous_state_fingerprint,
+                deterministic_budget_hash,
+                results,
+                success_count,
+                failure_count,
+            },
+        })
+    }
+
+    fn frozen_legacy_batch_oracle_json(fixture_name: &str) -> &'static str {
+        include_str!("../tests/true_batching_legacy_oracle.tsv")
+            .lines()
+            .filter(|line| !line.starts_with('#'))
+            .filter_map(|line| line.split_once('\t'))
+            .find_map(|(name, json)| (name == fixture_name).then_some(json))
+            .unwrap_or_else(|| panic!("missing frozen legacy oracle for {fixture_name}"))
+    }
+
+    #[test]
+    fn tactic_batch_prepared_path_matches_repeated_legacy_single_candidate_matrix() {
+        // The checked-in bytes were produced at commit 2a38c722c by this same
+        // repeated public single-candidate construction, before prepared
+        // snapshots existed. The live construction catches projection drift;
+        // the frozen bytes keep the reference independent of this code path.
+        for fixture in legacy_batch_oracle_fixtures() {
+            let session = create_machine_session(&minimal_session_json(fixture.theorem_type))
+                .unwrap()
+                .session;
+            let mut legacy_session = session.clone();
+            let mut prepared_session = session;
+            let legacy_response = repeated_legacy_single_candidate_batch(
+                &mut legacy_session,
+                fixture.candidates,
+                fixture.policy,
+            );
+            let request = batch_json_with_policy(
+                &prepared_session,
+                prepared_session.initial_snapshot.state_fingerprint,
+                &batch_candidates_json(fixture.candidates),
+                &batch_policy_json(fixture.policy),
+            );
+            let prepared_response =
+                run_machine_tactic_batch_request(&request, &mut prepared_session).unwrap();
+            let legacy_json = machine_tactic_batch_response_canonical_json(&legacy_response);
+            let prepared_json = machine_tactic_batch_response_canonical_json(&prepared_response);
+            let frozen_json = frozen_legacy_batch_oracle_json(fixture.name);
+            JsonDocument::parse(frozen_json).unwrap_or_else(|error| {
+                panic!("invalid JSON oracle for {}: {error:?}", fixture.name)
+            });
+
+            assert_eq!(legacy_json, frozen_json, "legacy fixture {}", fixture.name);
+            assert_eq!(
+                prepared_json, frozen_json,
+                "prepared fixture {}",
+                fixture.name
+            );
+            assert_eq!(
+                prepared_session.snapshots.len(),
+                legacy_session.snapshots.len(),
+                "snapshot-store length for fixture {}",
+                fixture.name
+            );
+        }
+    }
+
+    fn session_with_snapshot_quota(
+        theorem_type: &str,
+        max_snapshots: usize,
+    ) -> MachineProofSession {
+        let mut session = create_machine_session(&minimal_session_json(theorem_type))
+            .unwrap()
+            .session;
+        let initial_state = {
+            let context = MachineSnapshotMaterializationContext {
+                session_id: &session.session_id,
+                display_scope: &session.machine_display_render_scope,
+                callable_interface_table: &session.machine_surface_callable_interface_table,
+            };
+            session
+                .snapshots
+                .lookup_checked(
+                    &context,
+                    session.initial_snapshot.snapshot_id,
+                    session.initial_snapshot.state_fingerprint,
+                )
+                .unwrap()
+                .executable_state_payload
+                .clone()
+        };
+        let mut limited_store = crate::MachineSnapshotStore::with_max_snapshots(
+            session.session_id.clone(),
+            max_snapshots,
+        );
+        let initial_snapshot = {
+            let context = MachineSnapshotMaterializationContext {
+                session_id: &session.session_id,
+                display_scope: &session.machine_display_render_scope,
+                callable_interface_table: &session.machine_surface_callable_interface_table,
+            };
+            limited_store.insert_state(&context, initial_state).unwrap()
+        };
+        assert_eq!(initial_snapshot, session.initial_snapshot);
+        session.snapshots = limited_store;
+        session
+    }
+
+    #[test]
+    fn tactic_batch_scheduler_quota_and_precedence_fixture_matrix() {
+        let timeout_cases = [
+            (
+                "batch_timeout",
+                MachineBatchSchedulerLimits {
+                    per_candidate_timeout_ms: None,
+                    batch_timeout_ms: Some(5),
+                    max_memory_mb: None,
+                },
+                Duration::from_millis(5),
+                None,
+                MachineSchedulerArtifactScope::Batch,
+            ),
+            (
+                "per_candidate_timeout",
+                MachineBatchSchedulerLimits {
+                    per_candidate_timeout_ms: Some(5),
+                    batch_timeout_ms: None,
+                    max_memory_mb: None,
+                },
+                Duration::from_millis(1),
+                Some(Duration::from_millis(5)),
+                MachineSchedulerArtifactScope::Candidate,
+            ),
+        ];
+        for (fixture, limits, batch_elapsed, candidate_elapsed, expected_scope) in timeout_cases {
+            let stop =
+                observe_batch_scheduler_limits(limits, batch_elapsed, candidate_elapsed, None)
+                    .unwrap_or_else(|| panic!("{fixture} should stop"));
+            assert_eq!(
+                stop.kind,
+                MachineSchedulerArtifactKind::Timeout,
+                "{fixture}"
+            );
+            assert_eq!(stop.scope, expected_scope, "{fixture}");
+
+            let response = batch_scheduler_stop([1; 32], [2; 32], Vec::new(), 0, 0, stop);
+            let scheduler_json = machine_tactic_batch_response_canonical_json(&response);
+            JsonDocument::parse(&scheduler_json)
+                .unwrap_or_else(|error| panic!("invalid scheduler JSON for {fixture}: {error:?}"));
+            assert_eq!(
+                scheduler_json,
+                format!(
+                    concat!(
+                        "{{\"status\":\"partial_timeout\",",
+                        "\"scheduler_artifact\":{{\"kind\":\"timeout\",\"scope\":\"{}\",\"retryable\":true}},",
+                        "\"previous_state_fingerprint\":\"sha256:{}\",",
+                        "\"deterministic_budget_hash\":\"sha256:{}\",",
+                        "\"completed_prefix_len\":0,\"results\":[],\"success_count\":0,\"failure_count\":0}}"
+                    ),
+                    expected_scope.as_str(),
+                    "01".repeat(32),
+                    "02".repeat(32),
+                ),
+                "canonical scheduler JSON for {fixture}"
+            );
+            let MachineApiResponseEnvelope::SchedulerStopped(response) = response else {
+                panic!("{fixture} should project a partial scheduler response");
+            };
+            assert_eq!(response.status, MachineApiResponseStatus::PartialTimeout);
+            assert_eq!(response.endpoint_fields.completed_prefix_len, 0);
+            assert!(response.scheduler_artifact.retryable);
+        }
+
+        let resource_precedes_timeout = observe_batch_scheduler_limits(
+            MachineBatchSchedulerLimits {
+                per_candidate_timeout_ms: Some(5),
+                batch_timeout_ms: Some(5),
+                max_memory_mb: Some(1),
+            },
+            Duration::from_millis(5),
+            Some(Duration::from_millis(5)),
+            Some(memory_limit_bytes(1) + 1),
+        )
+        .expect("resource fixture should stop");
+        assert_eq!(
+            resource_precedes_timeout,
+            BatchSchedulerStop {
+                kind: MachineSchedulerArtifactKind::ResourceLimitExceeded,
+                scope: MachineSchedulerArtifactScope::Batch,
+            }
+        );
+
+        let mut quota_session = session_with_snapshot_quota("Type 0", 1);
+        let quota_request = batch_json(
+            &quota_session,
+            quota_session.initial_snapshot.state_fingerprint,
+            r#"[{"candidate_id":"quota_success","candidate":{"kind":"exact","term":{"source":"Prop"}}}]"#,
+        );
+        let quota_response =
+            run_machine_tactic_batch_request(&quota_request, &mut quota_session).unwrap();
+        let MachineApiResponseEnvelope::SchedulerStopped(quota_response) = quota_response else {
+            panic!("snapshot quota should become a partial resource-limit response");
+        };
+        assert_eq!(
+            quota_response.status,
+            MachineApiResponseStatus::PartialResourceLimit
+        );
+        assert_eq!(
+            quota_response.scheduler_artifact.kind,
+            MachineSchedulerArtifactKind::ResourceLimitExceeded
+        );
+        assert_eq!(
+            quota_response.scheduler_artifact.scope,
+            MachineSchedulerArtifactScope::Batch
+        );
+        assert_eq!(quota_response.endpoint_fields.completed_prefix_len, 0);
+        assert!(quota_response.endpoint_fields.results.is_empty());
+        assert_eq!(quota_session.snapshots.len(), 1);
+
+        let mut lookup_precedence_session = create_machine_session(&minimal_session_json("Type 0"))
+            .unwrap()
+            .session;
+        let lookup_precedence_request = batch_json(
+            &lookup_precedence_session,
+            [0x7f; 32],
+            r#"[{"candidate_id":"malformed_but_delayed","candidate":null}]"#,
+        );
+        let lookup_error = run_machine_tactic_batch_request(
+            &lookup_precedence_request,
+            &mut lookup_precedence_session,
+        )
+        .expect_err("snapshot lookup must precede delayed candidate validation");
+        assert_eq!(
+            lookup_error.diagnostic.kind,
+            MachineApiErrorKind::StateFingerprintMismatch
+        );
+        assert_eq!(
+            lookup_error.diagnostic.phase,
+            MachineApiDiagnosticPhase::SnapshotLookup
+        );
+        let lookup_error_json =
+            machine_tactic_batch_response_canonical_json(&lookup_error.response);
+        JsonDocument::parse(&lookup_error_json)
+            .unwrap_or_else(|error| panic!("invalid top-level error JSON: {error:?}"));
+        assert!(lookup_error_json.starts_with(
+            r#"{"status":"error","error":{"kind":"state_fingerprint_mismatch","phase":"snapshot_lookup","#
+        ));
+
+        let mut prepass_precedence_session =
+            create_machine_session(&minimal_session_json("Type 0"))
+                .unwrap()
+                .session;
+        let prepass_request = batch_json(
+            &prepass_precedence_session,
+            prepass_precedence_session
+                .initial_snapshot
+                .state_fingerprint,
+            r#"[{"candidate_id":"term_parse_failure","candidate":{"kind":"exact","term":{"source":"("}}}]"#,
+        );
+        let mut recorder = FastLoopMeasurementRecorder::enabled();
+        let prepass_response = run_machine_tactic_batch_request_with_measurement(
+            &prepass_request,
+            &mut prepass_precedence_session,
+            &mut recorder,
+        )
+        .unwrap();
+        let MachineApiResponseEnvelope::Ok(prepass_response) = prepass_response else {
+            panic!("term prepass failure should be a per-candidate response");
+        };
+        let MachineTacticBatchItemResponse::Error { diagnostic, .. } =
+            &prepass_response.endpoint_fields.results[0]
+        else {
+            panic!("term prepass fixture should fail");
+        };
+        assert_eq!(
+            diagnostic.phase,
+            MachineApiDiagnosticPhase::MachineTermParse
+        );
+        let report = recorder.report().unwrap();
+        assert_eq!(
+            measurement_counter_value(
+                &report,
+                crate::FastLoopMeasurementLabel::PreparedSnapshotCount,
+                None,
+            ),
+            0
+        );
+
+        let mut validation_session = create_machine_session(&minimal_session_json("Type 0"))
+            .unwrap()
+            .session;
+        let validation_request = batch_json(
+            &validation_session,
+            validation_session.initial_snapshot.state_fingerprint,
+            r#"[
+              {"candidate_id":"validation_failure","candidate":{"kind":"intro","name":"bad-name"}},
+              {"candidate_id":"success_after_validation_failure","candidate":{"kind":"exact","term":{"source":"Prop"}}}
+            ]"#,
+        );
+        let validation_response =
+            run_machine_tactic_batch_request(&validation_request, &mut validation_session).unwrap();
+        let MachineApiResponseEnvelope::Ok(validation_response) = validation_response else {
+            panic!("candidate validation fixture should remain a batch response");
+        };
+        let MachineTacticBatchItemResponse::Error {
+            candidate_hash,
+            diagnostic,
+            ..
+        } = &validation_response.endpoint_fields.results[0]
+        else {
+            panic!("invalid intro name should fail candidate validation");
+        };
+        assert!(candidate_hash.is_none());
+        assert_eq!(
+            diagnostic.phase,
+            MachineApiDiagnosticPhase::CandidateValidation
+        );
+        assert!(validation_response.endpoint_fields.results[1].is_success());
+        assert_eq!(validation_response.endpoint_fields.success_count, 1);
+        assert_eq!(validation_response.endpoint_fields.failure_count, 1);
+    }
+
+    #[test]
+    fn tactic_batch_measurement_preserves_response_and_reports_shared_work() {
+        let session = create_machine_session(&minimal_session_json("Type 0"))
+            .unwrap()
+            .session;
+        let mut unmeasured_session = session.clone();
+        let mut measured_session = session;
+        let request = batch_json(
+            &unmeasured_session,
+            unmeasured_session.initial_snapshot.state_fingerprint,
+            r#"[
+              {"candidate_id":"c0","candidate":{"kind":"exact","term":{"source":"Prop"}}},
+              {"candidate_id":"c1","candidate":{"kind":"intro","name":"p"}}
+            ]"#,
+        );
+
+        let unmeasured =
+            run_machine_tactic_batch_request(&request, &mut unmeasured_session).unwrap();
+        let mut recorder = FastLoopMeasurementRecorder::detailed();
+        let measured = run_machine_tactic_batch_request_with_measurement(
+            &request,
+            &mut measured_session,
+            &mut recorder,
+        )
+        .unwrap();
+
+        assert_eq!(measured, unmeasured);
+        let report = recorder
+            .report()
+            .expect("enabled measurement should report");
+        let count = |label| measurement_counter_value(&report, label, None);
+        assert_eq!(
+            count(crate::FastLoopMeasurementLabel::DelayedCandidateParsedCount),
+            2
+        );
+        assert_eq!(
+            count(crate::FastLoopMeasurementLabel::PreparedSnapshotCount),
+            1
+        );
+        assert_eq!(
+            count(crate::FastLoopMeasurementLabel::CompleteInputStateValidationCount),
+            1
+        );
+        assert_eq!(
+            count(crate::FastLoopMeasurementLabel::GoalProjectionCount),
+            1
+        );
+        assert_eq!(
+            count(crate::FastLoopMeasurementLabel::ContextProjectionCount),
+            1
+        );
+        assert_eq!(
+            count(crate::FastLoopMeasurementLabel::CandidateLocalValidationCount),
+            2
+        );
+        assert_eq!(
+            count(crate::FastLoopMeasurementLabel::CandidateExecutionCount),
+            2
+        );
+        assert_eq!(
+            count(crate::FastLoopMeasurementLabel::ExecutableInputStateCloneCount),
+            1
+        );
+        assert_eq!(
+            count(crate::FastLoopMeasurementLabel::OutputStateCloneCount),
+            1
+        );
+        assert_eq!(
+            count(crate::FastLoopMeasurementLabel::OutputStateValidationCount),
+            1
+        );
+        assert_eq!(
+            measurement_counter_value(
+                &report,
+                crate::FastLoopMeasurementLabel::CandidateStageCount,
+                Some(crate::FastLoopCandidateStage::Accepted),
+            ),
+            1
+        );
+        assert_eq!(
+            measurement_counter_value(
+                &report,
+                crate::FastLoopMeasurementLabel::CandidateStageCount,
+                Some(crate::FastLoopCandidateStage::Rejected),
+            ),
+            1
+        );
+        for label in [
+            crate::FastLoopMeasurementLabel::PreparedSnapshotElapsed,
+            crate::FastLoopMeasurementLabel::CandidateLocalValidationElapsed,
+            crate::FastLoopMeasurementLabel::CandidateExecutionElapsed,
+        ] {
+            let counter = report
+                .counters
+                .iter()
+                .find(|counter| counter.label == label)
+                .expect("true-batching phase duration should be reported");
+            assert_eq!(counter.unit, crate::FastLoopMeasurementUnit::Nanoseconds);
+        }
+        assert_eq!(report.measurements.candidate_details.attempted, 2);
+        assert_eq!(report.measurements.candidate_details.retained, 2);
+        assert_eq!(report.measurements.candidates.len(), 2);
+        assert_eq!(report.measurements.clock.coarse_stage_reads, 6);
+        let common_count = |label| {
+            report
+                .measurements
+                .counters
+                .iter()
+                .find(|counter| counter.label == label)
+                .map(|counter| counter.value)
+                .unwrap_or(0)
+        };
+        assert_eq!(
+            common_count(crate::PerformanceMeasurementLabel::CandidateInputValidations),
+            1
+        );
+        assert_eq!(
+            common_count(crate::PerformanceMeasurementLabel::CandidateBaseValidations),
+            1
+        );
+        assert!(
+            common_count(crate::PerformanceMeasurementLabel::CandidateBaseValidationsReused) >= 2
+        );
+        assert_eq!(
+            report
+                .measurements
+                .candidates
+                .iter()
+                .filter(|candidate| {
+                    candidate.outcome == crate::PerformanceCandidateOutcome::Accepted
+                })
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn tactic_batch_deterministic_counter_gate_covers_required_candidate_counts() {
+        for candidate_count in [1_usize, 8, 32, 256] {
+            let mut session = create_machine_session(&minimal_session_json("Type 0"))
+                .unwrap()
+                .session;
+            let candidates = (0..candidate_count)
+                .map(|index| {
+                    format!(
+                        r#"{{"candidate_id":"c{index}","candidate":{{"kind":"exact","term":{{"source":"Prop"}}}}}}"#
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            let request = batch_json(
+                &session,
+                session.initial_snapshot.state_fingerprint,
+                &format!("[{candidates}]"),
+            );
+            let mut recorder = FastLoopMeasurementRecorder::enabled();
+
+            let response = run_machine_tactic_batch_request_with_measurement(
+                &request,
+                &mut session,
+                &mut recorder,
+            )
+            .unwrap();
+
+            let MachineApiResponseEnvelope::Ok(ok) = response else {
+                panic!("candidate-count fixture {candidate_count} should complete");
+            };
+            assert_eq!(ok.endpoint_fields.results.len(), candidate_count);
+            assert_eq!(ok.endpoint_fields.success_count, candidate_count as u32);
+            assert_eq!(ok.endpoint_fields.failure_count, 0);
+            let report = recorder
+                .report()
+                .expect("enabled measurement should report");
+            let count = |label| measurement_counter_value(&report, label, None);
+            assert_eq!(
+                count(crate::FastLoopMeasurementLabel::DelayedCandidateParsedCount),
+                candidate_count as u64
+            );
+            assert_eq!(
+                count(crate::FastLoopMeasurementLabel::PreparedSnapshotCount),
+                1
+            );
+            assert_eq!(
+                count(crate::FastLoopMeasurementLabel::CompleteInputStateValidationCount),
+                1
+            );
+            assert_eq!(
+                count(crate::FastLoopMeasurementLabel::CandidateLocalValidationCount),
+                candidate_count as u64
+            );
+            assert_eq!(
+                count(crate::FastLoopMeasurementLabel::CandidateExecutionCount),
+                candidate_count as u64
+            );
+            assert_eq!(
+                count(crate::FastLoopMeasurementLabel::OutputStateCloneCount),
+                candidate_count as u64
+            );
+            assert_eq!(
+                count(crate::FastLoopMeasurementLabel::OutputStateValidationCount),
+                candidate_count as u64
+            );
+        }
+    }
+
+    #[test]
+    fn tactic_batch_measurement_does_not_prepare_for_prepass_failure() {
+        let mut session = create_machine_session(&minimal_session_json("Type 0"))
+            .unwrap()
+            .session;
+        let request = batch_json(
+            &session,
+            session.initial_snapshot.state_fingerprint,
+            r#"[{"candidate_id":"c0","candidate":{"kind":"exact","term":{"source":"("}}}]"#,
+        );
+        let mut recorder = FastLoopMeasurementRecorder::enabled();
+
+        let response = run_machine_tactic_batch_request_with_measurement(
+            &request,
+            &mut session,
+            &mut recorder,
+        )
+        .unwrap();
+
+        assert!(matches!(response, MachineApiResponseEnvelope::Ok(_)));
+        let report = recorder
+            .report()
+            .expect("enabled measurement should report");
+        assert_eq!(
+            measurement_counter_value(
+                &report,
+                crate::FastLoopMeasurementLabel::DelayedCandidateParsedCount,
+                None,
+            ),
+            1
+        );
+        assert_eq!(
+            measurement_counter_value(
+                &report,
+                crate::FastLoopMeasurementLabel::PreparedSnapshotCount,
+                None,
+            ),
+            0
+        );
+        assert_eq!(
+            measurement_counter_value(
+                &report,
+                crate::FastLoopMeasurementLabel::CompleteInputStateValidationCount,
+                None,
+            ),
+            0
+        );
+    }
+
+    #[test]
+    fn tactic_batch_measurement_counts_payloads_skipped_by_policy() {
+        let mut session = create_machine_session(&minimal_session_json("Type 0"))
+            .unwrap()
+            .session;
+        let request = batch_json_with_policy(
+            &session,
+            session.initial_snapshot.state_fingerprint,
+            r#"[
+              {"candidate_id":"c0","candidate":{"kind":"exact","term":{"source":"Prop"}}},
+              {"candidate_id":"c1","candidate":null}
+            ]"#,
+            r#"{
+              "max_evaluated_candidates":1,
+              "stop_after_successes":256,
+              "stop_after_failures":256
+            }"#,
+        );
+        let mut recorder = FastLoopMeasurementRecorder::enabled();
+
+        run_machine_tactic_batch_request_with_measurement(&request, &mut session, &mut recorder)
+            .unwrap();
+
+        let report = recorder
+            .report()
+            .expect("enabled measurement should report");
+        assert_eq!(
+            measurement_counter_value(
+                &report,
+                crate::FastLoopMeasurementLabel::DelayedCandidateParsedCount,
+                None,
+            ),
+            1
+        );
+        assert_eq!(
+            measurement_counter_value(
+                &report,
+                crate::FastLoopMeasurementLabel::DelayedCandidateSkippedCount,
+                None,
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn tactic_batch_measurement_does_not_count_snapshot_errors_as_scheduler_skips() {
+        let mut session = create_machine_session(&minimal_session_json("Type 0"))
+            .unwrap()
+            .session;
+        let request = batch_json(
+            &session,
+            [0x7f; 32],
+            r#"[
+              {"candidate_id":"c0","candidate":{"kind":"exact","term":{"source":"Prop"}}},
+              {"candidate_id":"c1","candidate":null}
+            ]"#,
+        );
+        let mut recorder = FastLoopMeasurementRecorder::enabled();
+
+        run_machine_tactic_batch_request_with_measurement(&request, &mut session, &mut recorder)
+            .expect_err("snapshot fingerprint mismatch should fail before scheduling");
+
+        let report = recorder
+            .report()
+            .expect("enabled measurement should report");
+        assert!(!report.counters.iter().any(|counter| {
+            counter.label == crate::FastLoopMeasurementLabel::DelayedCandidateSkippedCount
+        }));
+        assert!(!report.counters.iter().any(|counter| {
+            counter.label == crate::FastLoopMeasurementLabel::DelayedCandidateParsedCount
+        }));
+        assert!(report.counters.iter().any(|counter| {
+            counter.label == crate::FastLoopMeasurementLabel::CandidateBatchElapsed
+        }));
     }
 
     #[test]

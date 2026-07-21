@@ -17,7 +17,9 @@ use std::thread;
 use npa_api::{
     clear_package_import_context_export_disk_cache, clear_package_verification_decode_cache,
     clear_package_verification_process_memo, format_hash_string, independent_checker_file_hash,
-    parse_independent_checker_runner_policy,
+    package_import_context_export_disk_cache_entry_count,
+    package_verification_decode_cache_entry_count, parse_independent_checker_runner_policy,
+    PerformanceMeasurementLabel,
 };
 use npa_cert::Name;
 use npa_cli::args::{
@@ -3037,7 +3039,7 @@ fn package_verify_certs_jobs_audit_cache_parallel_is_rejected() {
 }
 
 #[test]
-fn package_verify_certs_memo_counters_are_timing_opt_in_and_normalized() {
+fn package_verify_certs_memo_counters_are_projected_into_measurements() {
     let _guard = process_memo_test_lock();
     clear_package_verification_process_memo();
     let package = build_source_free_fixture(
@@ -3058,32 +3060,31 @@ fn package_verify_certs_memo_counters_are_timing_opt_in_and_normalized() {
     assert!(!off.render_json().contains("process_memo_summary"));
     assert!(off.timings.is_none());
 
-    let first_summary = process_memo_summary(&first);
-    assert!(first_summary.contains("mode=process-local"));
-    assert!(first_summary.contains("hits=0"));
-    assert!(first_summary.contains("misses=1"));
-    assert!(first_summary.contains("inserted=1"));
-    assert!(first_summary.contains("trusted=false"));
-
-    let second_summary = process_memo_summary(&second);
-    assert!(second_summary.contains("hits="));
-    assert!(!second_summary.contains("hits=0"));
-    assert!(second_summary.contains("misses=0"));
-    assert!(second_summary.contains("inserted=0"));
+    assert!(!first.render_json().contains("process_memo_summary"));
+    assert!(!second.render_json().contains("process_memo_summary"));
+    assert_eq!(
+        measurement_counter(&first, PerformanceMeasurementLabel::PackageMemoResults),
+        0
+    );
+    assert!(measurement_counter(&second, PerformanceMeasurementLabel::PackageMemoResults) > 0);
+    assert_eq!(
+        measurement_counter(&second, PerformanceMeasurementLabel::PackageLiveResults),
+        0
+    );
+    assert_eq!(
+        measurement_counter(&second, PerformanceMeasurementLabel::PackageModulesChecked),
+        0
+    );
     assert_lock_provenance(
         &second.diagnostics[1],
         PackageLockInputMode::CheckedFile,
         lock_hash,
     );
     assert_eq!(second.diagnostics[2].reason_code, "module_verified");
-    assert!(
-        second
-            .diagnostics
-            .iter()
-            .position(|diagnostic| diagnostic.reason_code == "process_memo_summary")
-            .unwrap()
-            > 2
-    );
+    assert!(second
+        .diagnostics
+        .iter()
+        .all(|diagnostic| diagnostic.reason_code != "process_memo_summary"));
     assert_eq!(lock_provenance_count(&second), 1);
     assert!(second.timings.is_some());
 
@@ -3092,10 +3093,11 @@ fn package_verify_certs_memo_counters_are_timing_opt_in_and_normalized() {
 }
 
 #[test]
-fn package_verify_certs_decode_cache_counters_are_timing_opt_in_and_normalized() {
+fn package_verify_certs_timings_do_not_enable_process_local_decode_cache() {
     let _guard = decode_cache_test_lock();
     clear_package_verification_process_memo();
     clear_package_verification_decode_cache();
+    assert_eq!(package_verification_decode_cache_entry_count(), 0);
     let package = build_source_free_fixture(
         "decode-cache-timing",
         "Proofs.Ai.Basic",
@@ -3115,30 +3117,34 @@ fn package_verify_certs_decode_cache_counters_are_timing_opt_in_and_normalized()
     let second =
         run_verify_with_timings(&package, PackageChecker::Fast, PackageTimingMode::Summary);
 
-    let first_summary = decode_cache_summary(&first);
-    assert!(first_summary.contains("mode=process-local"));
-    assert!(first_summary.contains("certificate_hits="));
-    assert!(first_summary.contains("certificate_misses="));
-    assert!(first_summary.contains("certificate_inserted="));
-    assert!(first_summary.contains("trusted=false"));
-    assert!(first_summary.contains("proof_evidence=false"));
-
-    let second_summary = decode_cache_summary(&second);
-    assert!(second_summary.contains("certificate_hits="));
-    assert!(!second_summary.contains("certificate_hits=0"));
-    assert!(second_summary.contains("certificate_misses=0"));
-    assert!(second_summary.contains("certificate_inserted=0"));
+    assert_eq!(package_verification_decode_cache_entry_count(), 0);
+    assert!(!first.render_json().contains("decode_cache_summary"));
+    assert!(!second.render_json().contains("decode_cache_summary"));
+    for result in [&first, &second] {
+        assert_eq!(
+            measurement_counter(result, PerformanceMeasurementLabel::PackageDecodeCacheHits),
+            0
+        );
+        assert_eq!(
+            measurement_counter(
+                result,
+                PerformanceMeasurementLabel::PackageDecodeCacheMisses
+            ),
+            0
+        );
+    }
 
     assert_eq!(without_process_memo_decode_cache_and_timings(first), off);
     assert_eq!(without_process_memo_decode_cache_and_timings(second), off);
 }
 
 #[test]
-fn package_verify_certs_import_context_cache_hits_are_timing_opt_in_and_normalized() {
+fn package_verify_certs_timings_do_not_enable_persistent_import_context_cache() {
     let _guard = decode_cache_test_lock();
     clear_package_verification_process_memo();
     clear_package_verification_decode_cache();
     clear_package_import_context_export_disk_cache();
+    assert_eq!(package_import_context_export_disk_cache_entry_count(), 0);
     let package = build_source_free_fixture(
         "import-context-export-cache",
         "Proofs.Ai.Basic",
@@ -3166,22 +3172,23 @@ fn package_verify_certs_import_context_cache_hits_are_timing_opt_in_and_normaliz
         PackageTimingMode::Summary,
     );
 
-    let first_summary = decode_cache_summary(&first);
-    assert!(first_summary.contains("mode=process-local"));
-    assert!(first_summary.contains("import_context_disk_hits=0"));
-    assert!(first_summary.contains("import_context_disk_misses="));
-    assert!(!first_summary.contains("import_context_disk_misses=0"));
-    assert!(first_summary.contains("import_context_disk_inserted="));
-    assert!(first_summary.contains("trusted=false"));
-    assert!(first_summary.contains("proof_evidence=false"));
-
-    let second_summary = decode_cache_summary(&second);
-    assert!(second_summary.contains("import_context_disk_hits="));
-    assert!(!second_summary.contains("import_context_disk_hits=0"));
-    assert!(second_summary.contains("import_context_disk_misses=0"));
-    assert!(second_summary.contains("import_context_disk_stale=0"));
-    assert!(second_summary.contains("import_context_disk_schema_misses=0"));
-    assert!(second_summary.contains("import_context_disk_inserted=0"));
+    assert_eq!(package_import_context_export_disk_cache_entry_count(), 0);
+    assert_eq!(package_verification_decode_cache_entry_count(), 0);
+    assert!(!first.render_json().contains("decode_cache_summary"));
+    assert!(!second.render_json().contains("decode_cache_summary"));
+    for result in [&first, &second] {
+        assert_eq!(
+            measurement_counter(result, PerformanceMeasurementLabel::PackageDecodeCacheHits),
+            0
+        );
+        assert_eq!(
+            measurement_counter(
+                result,
+                PerformanceMeasurementLabel::PackageDecodeCacheMisses
+            ),
+            0
+        );
+    }
 
     assert_eq!(without_process_memo_decode_cache_and_timings(first), off);
     assert_eq!(without_process_memo_decode_cache_and_timings(second), off);
@@ -3609,22 +3616,22 @@ fn run_verify_with_audit_cache(
     )
 }
 
-fn process_memo_summary(result: &npa_cli::diagnostic::CommandResult) -> &str {
+fn measurement_counter(
+    result: &npa_cli::diagnostic::CommandResult,
+    label: PerformanceMeasurementLabel,
+) -> u64 {
     result
-        .diagnostics
-        .iter()
-        .find(|diagnostic| diagnostic.reason_code == "process_memo_summary")
-        .and_then(|diagnostic| diagnostic.actual_value.as_deref())
-        .expect("process memo summary diagnostic")
-}
-
-fn decode_cache_summary(result: &npa_cli::diagnostic::CommandResult) -> &str {
-    result
-        .diagnostics
-        .iter()
-        .find(|diagnostic| diagnostic.reason_code == "decode_cache_summary")
-        .and_then(|diagnostic| diagnostic.actual_value.as_deref())
-        .expect("decode cache summary diagnostic")
+        .timings
+        .as_ref()
+        .and_then(|timings| timings.measurements.as_ref())
+        .and_then(|measurements| {
+            measurements
+                .counters
+                .iter()
+                .find(|counter| counter.label == label)
+        })
+        .map(|counter| counter.value)
+        .expect("measurement counter")
 }
 
 fn disk_memo_summary(result: &npa_cli::diagnostic::CommandResult) -> &str {

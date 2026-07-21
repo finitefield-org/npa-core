@@ -24,6 +24,7 @@ use crate::package_l2_acceptance_aggregate::run_package_aggregate_l2_acceptance;
 use crate::package_l2_namespace_transport::run_package_validate_l2_namespace_transport;
 use crate::package_l2_review_input::run_package_prepare_l2_review_input;
 use crate::package_lock::run_package_lock_command;
+use crate::package_promotion_materialization_validate::run_package_validate_promotion_materialization;
 use crate::package_promotion_materialize::run_package_materialize_promotion;
 use crate::package_promotion_prepare::run_package_prepare_promotion;
 use crate::package_promotion_registry::{
@@ -153,6 +154,9 @@ pub fn run_package_command(command: PackageCommand) -> CommandResult {
         PackageCommand::PreparePromotion(options) => run_package_prepare_promotion(*options),
         PackageCommand::MaterializePromotion(options) => {
             run_package_materialize_promotion(*options)
+        }
+        PackageCommand::ValidatePromotionMaterialization(options) => {
+            run_package_validate_promotion_materialization(*options)
         }
         PackageCommand::RegisterEquivalentPromotionOrigin(options) => {
             run_package_register_equivalent_promotion_origin(options)

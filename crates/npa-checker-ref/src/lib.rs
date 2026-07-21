@@ -716,6 +716,7 @@ pub struct ReferenceCheckedModule {
     export_hash: ReferenceHash,
     axiom_report_hash: ReferenceHash,
     certificate_hash: ReferenceHash,
+    declaration_count: usize,
     public_environment: Arc<ReferencePublicEnvironment>,
     checked_by_reference_checker: bool,
 }
@@ -726,6 +727,7 @@ impl ReferenceCheckedModule {
         export_hash: ReferenceHash,
         axiom_report_hash: ReferenceHash,
         certificate_hash: ReferenceHash,
+        declaration_count: usize,
         public_environment: Arc<ReferencePublicEnvironment>,
     ) -> Self {
         Self {
@@ -733,6 +735,7 @@ impl ReferenceCheckedModule {
             export_hash,
             axiom_report_hash,
             certificate_hash,
+            declaration_count,
             public_environment,
             checked_by_reference_checker: true,
         }
@@ -745,6 +748,7 @@ impl ReferenceCheckedModule {
             entry.export_hash,
             entry.axiom_report_hash,
             entry.certificate_hash,
+            0,
             entry.public_environment,
         )
     }
@@ -778,6 +782,11 @@ impl ReferenceCheckedModule {
     /// Returns the checked module certificate hash.
     pub const fn certificate_hash(&self) -> &ReferenceHash {
         &self.certificate_hash
+    }
+
+    /// Returns the number of declarations decoded and checked for this module.
+    pub const fn declaration_count(&self) -> usize {
+        self.declaration_count
     }
 
     /// Returns the checked module public environment.
@@ -1261,6 +1270,67 @@ pub fn check_certificate(
     }
 }
 
+/// Diagnostic observation captured at the independent checker's decode boundary.
+///
+/// This value is not proof evidence and does not influence checker policy or
+/// acceptance. It is returned even when a later verification stage rejects the
+/// certificate.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ReferenceCheckObservation {
+    /// Whether canonical certificate decoding and structural validation completed.
+    pub certificate_decoded: bool,
+    /// Number of declarations in the decoded certificate, or zero before decode.
+    pub declaration_count: usize,
+    /// Canonical first-N declaration details requested by the caller.
+    pub declarations: Vec<ReferenceCheckDeclarationObservation>,
+}
+
+/// Bounded declaration metadata captured at the reference-checker decode boundary.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReferenceCheckDeclarationObservation {
+    /// Declaration index in canonical certificate order.
+    pub declaration_index: usize,
+    /// Canonical declaration name.
+    pub declaration: ReferenceModuleName,
+    /// Number of distinct certificate term-table nodes reachable from the declaration.
+    pub term_nodes: usize,
+}
+
+/// Hard cap for declaration details returned by one observed reference check.
+pub const REFERENCE_CHECK_DECLARATION_DETAIL_LIMIT: usize = 2_048;
+
+/// Check a canonical certificate and return diagnostic decode-boundary data.
+///
+/// The observation is untrusted performance metadata. The verdict is identical
+/// to [`check_certificate`] for the same inputs. Requested detail is clamped to
+/// [`REFERENCE_CHECK_DECLARATION_DETAIL_LIMIT`].
+pub fn check_certificate_with_observation(
+    cert_bytes: &[u8],
+    import_store: &ReferenceImportStore,
+    policy: &ReferenceCheckerPolicy,
+    declaration_detail_limit: usize,
+) -> (ReferenceCheckResult, ReferenceCheckObservation) {
+    let mut observation = ReferenceCheckObservation::default();
+    if cert_bytes.is_empty() {
+        return (
+            ReferenceCheckResult::Rejected(ReferenceCheckError::empty()),
+            observation,
+        );
+    }
+
+    let result = match decode::check_certificate_impl_with_observation(
+        cert_bytes,
+        import_store,
+        policy,
+        declaration_detail_limit.min(REFERENCE_CHECK_DECLARATION_DETAIL_LIMIT),
+        &mut observation,
+    ) {
+        Ok(module) => ReferenceCheckResult::Checked(module),
+        Err(error) => ReferenceCheckResult::Rejected(error),
+    };
+    (result, observation)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1268,13 +1338,16 @@ mod tests {
     use crate::decode::{ReferenceUniverseConstraint, ReferenceUniverseContext};
     use npa_cert::{
         build_module_cert, encode_module_cert, generate_inductive_artifacts_v1,
-        generate_mutual_inductive_artifacts_v1, verify_module_cert, AxiomPolicy, CertError,
-        CoreModule, Name, VerifierSession,
+        generate_mutual_inductive_artifacts_v1, verify_module_cert,
+        verify_module_cert_with_import_refs,
+        verify_module_cert_with_import_refs_and_kernel_options, AxiomPolicy, CertError, CoreModule,
+        Name, VerifierSession,
     };
     use npa_kernel::{
         eq, eq_inductive, eq_refl, nat, nat_inductive, nat_succ, nat_zero, prop, type0, Binder,
-        ConstructorDecl, Ctx, Decl, Env, Error, Expr, InductiveDecl, Level, MutualInductiveBlock,
-        ResourceLimitKind, UniverseConstraint, UniverseContext, MAX_UNIVERSE_CONTEXT_NODES,
+        ConstructorDecl, Ctx, Decl, Env, Error, Expr, InductiveDecl, KernelExecutionOptions, Level,
+        MutualInductiveBlock, Reducibility, ResourceLimitKind, UniverseConstraint, UniverseContext,
+        MAX_UNIVERSE_CONTEXT_NODES,
     };
     use sha2::{Digest, Sha256};
 
@@ -1435,6 +1508,55 @@ mod tests {
         )
         .unwrap();
         encode_module_cert(&cert).unwrap()
+    }
+
+    #[test]
+    fn memoized_fast_certificate_agrees_with_off_and_reference_checkers() {
+        let level = Level::param("u");
+        let cert = build_module_cert(
+            CoreModule {
+                name: Name::from_dotted("Test.KernelMemo"),
+                declarations: vec![Decl::Def {
+                    name: "Memo.id".to_owned(),
+                    universe_params: vec!["u".to_owned()],
+                    ty: Expr::pi(
+                        "A",
+                        Expr::sort(level.clone()),
+                        Expr::pi("x", Expr::bvar(0), Expr::bvar(1)),
+                    ),
+                    value: Expr::lam(
+                        "A",
+                        Expr::sort(level),
+                        Expr::lam("x", Expr::bvar(0), Expr::bvar(0)),
+                    ),
+                    reducibility: Reducibility::Reducible,
+                }],
+            },
+            &[],
+        )
+        .unwrap();
+        let bytes = encode_module_cert(&cert).unwrap();
+        let fast_off =
+            verify_module_cert_with_import_refs(&bytes, &[], &AxiomPolicy::normal()).unwrap();
+        let fast_memo = verify_module_cert_with_import_refs_and_kernel_options(
+            &bytes,
+            &[],
+            &AxiomPolicy::normal(),
+            KernelExecutionOptions::ephemeral_memo(),
+        )
+        .unwrap();
+        assert_eq!(fast_memo, fast_off);
+
+        let reference = check_certificate(
+            &bytes,
+            &ReferenceImportStore::default(),
+            &ReferenceCheckerPolicy::default(),
+        );
+        let ReferenceCheckResult::Checked(reference) = reference else {
+            panic!("reference checker rejected memo differential fixture");
+        };
+        assert_eq!(reference.export_hash(), &fast_memo.export_hash());
+        assert_eq!(reference.certificate_hash(), &fast_memo.certificate_hash());
     }
 
     fn std_logic_eq_certificate() -> Vec<u8> {
@@ -3878,6 +4000,40 @@ mod tests {
     }
 
     #[test]
+    fn check_observation_survives_rejection_after_decode() {
+        let imports = ReferenceImportStore::default();
+        let policy = ReferenceCheckerPolicy {
+            trust_mode: ReferenceTrustMode::HighTrust,
+            ..ReferenceCheckerPolicy::default()
+        };
+        let fixture = axiom_certificate_fixture_with_axiom_dependencies(true);
+
+        let (result, observation) =
+            check_certificate_with_observation(&fixture.bytes, &imports, &policy, 1);
+
+        assert_eq!(result, check_certificate(&fixture.bytes, &imports, &policy));
+        assert!(!result.is_checked());
+        assert!(observation.certificate_decoded);
+        assert_eq!(observation.declaration_count, 1);
+        assert_eq!(observation.declarations.len(), 1);
+        assert_eq!(observation.declarations[0].declaration_index, 0);
+        assert!(observation.declarations[0].term_nodes > 0);
+
+        let (_, count_only) =
+            check_certificate_with_observation(&fixture.bytes, &imports, &policy, 0);
+        assert!(count_only.certificate_decoded);
+        assert_eq!(count_only.declaration_count, 1);
+        assert!(count_only.declarations.is_empty());
+
+        let (empty, empty_observation) =
+            check_certificate_with_observation(&[], &imports, &policy, 1);
+        assert!(!empty.is_checked());
+        assert!(!empty_observation.certificate_decoded);
+        assert_eq!(empty_observation.declaration_count, 0);
+        assert!(empty_observation.declarations.is_empty());
+    }
+
+    #[test]
     fn axiom_policy_rechecks_checked_import_axioms_at_checker_boundary() {
         let fixture = axiom_certificate_fixture_with_axiom_dependencies(true);
         let unchecked_store =
@@ -5385,6 +5541,26 @@ mod tests {
             .unwrap());
         assert!(reference_context
             .entails_level_le(&rimax(rs(rz()), rp("u")), &rmax(rs(rz()), rp("u")), 0,)
+            .unwrap());
+
+        assert!(kernel_context
+            .entails_level_le(
+                &Level::imax(Level::succ(Level::zero()), Level::param("u")),
+                &Level::param("u"),
+            )
+            .unwrap());
+        assert!(reference_context
+            .entails_level_le(&rimax(rs(rz()), rp("u")), &rp("u"), 0)
+            .unwrap());
+
+        assert!(!kernel_context
+            .entails_level_le(
+                &Level::imax(Level::succ(Level::succ(Level::zero())), Level::param("u"),),
+                &Level::param("u"),
+            )
+            .unwrap());
+        assert!(!reference_context
+            .entails_level_le(&rimax(rs(rs(rz())), rp("u")), &rp("u"), 0)
             .unwrap());
     }
 

@@ -14,9 +14,12 @@ npa package build-certs --root . --update-manifest-hashes --json
 npa package build-certs --root . --update-manifest-hashes --check --json
 ```
 
-The mode rebuilds local certificates, updates local module hash pins in
-`npa-package.toml`, refreshes declared module `meta.json` ledgers, and
-regenerates `generated/package-lock.json` as one reviewable refresh operation.
+Full refresh rebuilds local certificates. Targeted `--module` and `--changed`
+refresh dynamically rebuild seeds and ineligible dependents, while
+export-stable qualified dependents may receive a source-free strict import-pin
+rebind or live-verified unchanged reuse. Both modes update local module hash
+pins in `npa-package.toml`, refresh declared module `meta.json` ledgers, and
+regenerate `generated/package-lock.json` as one reviewable refresh operation.
 
 The feature exists to replace ad hoc local edits that weaken import identity
 checks while refreshing artifacts. It must preserve the certificate-first trust
@@ -55,7 +58,11 @@ Implement a new `package build-certs` mode in `npa-cli` that:
 
 - uses the current package manifest for package shape, import names, policy,
   source paths, certificate paths, declarations, tags, and topological order;
-- rebuilds all local module certificates from source;
+- rebuilds all local module certificates from source in full refresh mode;
+- walks the complete dependent candidate closure topologically in targeted
+  refresh mode, rebuilding sources when exports or qualified baselines differ
+  and otherwise live-verifying a format-owned certificate rebind or unchanged
+  certificate;
 - computes replacement local module hash pins from the rebuilt certificate and
   source bytes;
 - compiles downstream modules against the freshly verified upstream identities
@@ -660,9 +667,10 @@ Generated metadata commands
   leave new temporary files; check mode should pass.
 - Source hash changed but certificate identity did not: refresh mode should
   update `expected_source_hash` and preserve other hash fields if unchanged.
-- Upstream local export/certificate identity changed: refresh mode should
-  rebuild downstream certificates against the new identity and update every
-  affected local module hash field.
+- Upstream local export identity changed: refresh mode rebuilds downstream
+  certificates against the new identity. If only the upstream certificate
+  identity changed, targeted refresh may rebind every affected strict local
+  import pin after source/baseline qualification and live verification.
 - External import certificate changed without manifest pin update: refresh mode
   should fail with the existing external import hash mismatch.
 - Missing existing local certificate: refresh write mode may recreate it after

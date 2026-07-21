@@ -43,6 +43,7 @@ fn main() {
                 selected_modules: Some(BTreeSet::from([module.clone()])),
                 memoization: PackageVerificationMemoMode::ProcessLocal,
                 collect_decode_cache_counters: false,
+                ..PackageVerificationExecutionOptions::default()
             },
         )
         .expect("reference verification runs");

@@ -296,13 +296,22 @@ fn package_build_certs_selection_targeted_refresh_rebuilds_dependents() {
     );
 
     assert_eq!(result.exit_code(), CommandExitCode::Success);
-    assert_eq!(result.diagnostics.len(), 1);
+    assert_eq!(result.diagnostics.len(), 2);
     assert_eq!(result.diagnostics[0].reason_code, "package_build_selection");
     assert!(result.diagnostics[0]
         .actual_value
         .as_deref()
         .unwrap()
         .contains("seeds=1,rebuild=2"));
+    assert_eq!(
+        result.diagnostics[1].reason_code,
+        "package_build_refresh_plan"
+    );
+    assert!(result.diagnostics[1]
+        .actual_value
+        .as_deref()
+        .unwrap()
+        .contains("source_rebuild=2,certificate_rebind=0,unchanged=0"));
     assert_eq!(fs::read(dependent_path).unwrap(), expected_dependent);
     assert_refresh_package_is_hash_clean(&package);
 }
@@ -322,15 +331,268 @@ fn package_build_certs_selection_targeted_leaf_refresh_preserves_unselected_modu
     );
 
     assert_eq!(result.exit_code(), CommandExitCode::Success);
-    assert_eq!(result.diagnostics.len(), 1);
+    assert_eq!(result.diagnostics.len(), 2);
     assert!(result.diagnostics[0]
         .actual_value
         .as_deref()
         .unwrap()
         .contains("seeds=1,rebuild=1,support_local=1"));
+    assert_eq!(
+        result.diagnostics[1].reason_code,
+        "package_build_refresh_plan"
+    );
     assert_eq!(fs::read(support_path).unwrap(), support_before);
     assert_eq!(fs::read(leaf_path).unwrap(), expected_leaf);
     assert_refresh_package_is_hash_clean(&package);
+}
+
+#[test]
+fn package_build_certs_targeted_refresh_rebinds_export_stable_dependent() {
+    let targeted = build_local_import_fixture("targeted-refresh-rebind-dependent");
+    let rebuilt = build_local_import_fixture("full-refresh-rebuild-dependent");
+    let metadata_extension =
+        Some("{\"schema\":\"npa-ai-proof-meta-v0.1\",\"extension\":{\"kept\":true}}\n");
+    install_metadata_target_for_module(
+        &targeted,
+        "Fixture.B",
+        "Fixture/B/certificate.npcert",
+        "Fixture/B/meta.json",
+        metadata_extension,
+    );
+    install_metadata_target_for_module(
+        &rebuilt,
+        "Fixture.B",
+        "Fixture/B/certificate.npcert",
+        "Fixture/B/meta.json",
+        metadata_extension,
+    );
+    let replacement_source =
+        "theorem a_id :\n  forall (P : Prop), forall (p : P), P :=\n  fun P => fun p => (fun (q : P) => q) p\n";
+    fs::write(
+        targeted.artifact_path("Fixture/A/source.npa"),
+        replacement_source,
+    )
+    .unwrap();
+    fs::write(
+        rebuilt.artifact_path("Fixture/A/source.npa"),
+        replacement_source,
+    )
+    .unwrap();
+    let old_dependent = fs::read(targeted.artifact_path("Fixture/B/certificate.npcert")).unwrap();
+
+    let targeted_result = run_package_build_certs(
+        refresh_artifacts_write(common_options(targeted.path(), true))
+            .with_modules(vec![Name::from_dotted("Fixture.A")]),
+    );
+    let rebuilt_result = run_refresh_write(&rebuilt);
+
+    assert_eq!(
+        targeted_result.exit_code(),
+        CommandExitCode::Success,
+        "{:?}",
+        targeted_result.diagnostics
+    );
+    assert_eq!(targeted_result.diagnostics.len(), 2);
+    assert_eq!(
+        targeted_result.diagnostics[1].reason_code,
+        "package_build_refresh_plan"
+    );
+    let plan = targeted_result.diagnostics[1]
+        .actual_value
+        .as_deref()
+        .unwrap();
+    assert!(plan.contains("seeds=1,candidates=2,source_rebuild=1,certificate_rebind=1,unchanged=0"));
+    assert!(plan.contains("source_scans=2,source_interfaces=1,fallbacks=none"));
+    assert_eq!(rebuilt_result.exit_code(), CommandExitCode::Success);
+    assert!(rebuilt_result.diagnostics.is_empty());
+    let rebound_dependent =
+        fs::read(targeted.artifact_path("Fixture/B/certificate.npcert")).unwrap();
+    assert_ne!(rebound_dependent, old_dependent);
+    for path in [
+        PACKAGE_MANIFEST_PATH,
+        "Fixture/A/certificate.npcert",
+        "Fixture/B/certificate.npcert",
+        "Fixture/B/meta.json",
+        LOCK_PATH,
+    ] {
+        assert_eq!(
+            fs::read(targeted.artifact_path(path)).unwrap(),
+            fs::read(rebuilt.artifact_path(path)).unwrap(),
+            "targeted rebind must equal ordinary rebuild for {path}"
+        );
+    }
+    assert_refresh_package_is_hash_clean(&targeted);
+    assert_refresh_package_verifies_with_reference_checker(&targeted);
+}
+
+#[test]
+fn package_build_certs_targeted_refresh_propagates_rebind_through_diamond() {
+    let targeted = build_rebind_diamond_fixture("targeted-refresh-rebind-diamond");
+    let rebuilt = build_rebind_diamond_fixture("full-refresh-rebuild-diamond");
+    let replacement_source =
+        "theorem a_id :\n  forall (P : Prop), forall (p : P), P :=\n  fun P => fun p => (fun (q : P) => q) p\n";
+    for package in [&targeted, &rebuilt] {
+        fs::write(
+            package.artifact_path("Fixture/A/source.npa"),
+            replacement_source,
+        )
+        .unwrap();
+    }
+    let old_d = npa_cert::decode_module_cert(
+        &fs::read(targeted.artifact_path("Fixture/D/certificate.npcert")).unwrap(),
+    )
+    .unwrap();
+
+    let targeted_result = run_package_build_certs(
+        refresh_artifacts_write(common_options(targeted.path(), true))
+            .with_modules(vec![Name::from_dotted("Fixture.A")]),
+    );
+    let rebuilt_result = run_refresh_write(&rebuilt);
+
+    assert_eq!(
+        targeted_result.exit_code(),
+        CommandExitCode::Success,
+        "{:?}",
+        targeted_result.diagnostics
+    );
+    let plan = targeted_result.diagnostics[1]
+        .actual_value
+        .as_deref()
+        .unwrap();
+    assert!(plan.contains("seeds=1,candidates=4,source_rebuild=1,certificate_rebind=3,unchanged=0"));
+    assert_eq!(rebuilt_result.exit_code(), CommandExitCode::Success);
+    let new_d_bytes = fs::read(targeted.artifact_path("Fixture/D/certificate.npcert")).unwrap();
+    let new_d = npa_cert::decode_module_cert(&new_d_bytes).unwrap();
+    let old_imports = old_d
+        .imports
+        .iter()
+        .map(|import| (import.module.clone(), import.certificate_hash))
+        .collect::<BTreeMap<_, _>>();
+    let new_imports = new_d
+        .imports
+        .iter()
+        .map(|import| (import.module.clone(), import.certificate_hash))
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(
+        new_imports.keys().cloned().collect::<Vec<_>>(),
+        vec![
+            Name::from_dotted("Fixture.A"),
+            Name::from_dotted("Fixture.B"),
+            Name::from_dotted("Fixture.C"),
+        ]
+    );
+    for module in new_imports.keys() {
+        assert_ne!(new_imports[module], old_imports[module]);
+    }
+    for path in [
+        PACKAGE_MANIFEST_PATH,
+        "Fixture/A/certificate.npcert",
+        "Fixture/B/certificate.npcert",
+        "Fixture/C/certificate.npcert",
+        "Fixture/D/certificate.npcert",
+        LOCK_PATH,
+    ] {
+        assert_eq!(
+            fs::read(targeted.artifact_path(path)).unwrap(),
+            fs::read(rebuilt.artifact_path(path)).unwrap(),
+            "diamond rebind must equal ordinary rebuild for {path}"
+        );
+    }
+    assert_refresh_package_verifies_with_reference_checker(&targeted);
+}
+
+#[test]
+fn package_build_certs_targeted_refresh_live_verifies_unchanged_dependent() {
+    let package = build_local_import_fixture("targeted-refresh-unchanged-dependent");
+    let result = run_package_build_certs(
+        refresh_artifacts_write(common_options(package.path(), true))
+            .with_modules(vec![Name::from_dotted("Fixture.A")]),
+    );
+
+    assert_eq!(result.exit_code(), CommandExitCode::Success);
+    let plan = result.diagnostics[1].actual_value.as_deref().unwrap();
+    assert!(plan.contains("seeds=1,candidates=2,source_rebuild=1,certificate_rebind=0,unchanged=1"));
+    assert!(plan.contains("source_scans=2,source_interfaces=1,fallbacks=none"));
+    assert_refresh_package_verifies_with_reference_checker(&package);
+}
+
+#[test]
+fn package_build_certs_targeted_refresh_rebuilds_stale_nonseed_source() {
+    let package = build_local_import_fixture("targeted-refresh-stale-nonseed-source");
+    fs::write(
+        package.artifact_path("Fixture/B/source.npa"),
+        "import Fixture.A\n\ntheorem b_use :\n  forall (P : Prop), forall (p : P), P :=\n  fun P => fun p => (fun (q : P) => @a_id P q) p\n",
+    )
+    .unwrap();
+
+    let result = run_package_build_certs(
+        refresh_artifacts_write(common_options(package.path(), true))
+            .with_modules(vec![Name::from_dotted("Fixture.A")]),
+    );
+
+    assert_eq!(result.exit_code(), CommandExitCode::Success);
+    let plan = result.diagnostics[1].actual_value.as_deref().unwrap();
+    assert!(plan.contains("source_rebuild=2,certificate_rebind=0,unchanged=0"));
+    assert!(plan.contains("fallbacks=source_hash:1"));
+    assert_refresh_package_is_hash_clean(&package);
+}
+
+#[test]
+fn package_build_certs_targeted_refresh_rebuilds_on_import_export_change() {
+    let package = build_local_import_fixture("targeted-refresh-import-export-change");
+    fs::write(
+        package.artifact_path("Fixture/A/source.npa"),
+        "def a_id :\n  forall (P : Prop), forall (p : P), P :=\n  fun P => fun p => p\n",
+    )
+    .unwrap();
+
+    let result = run_package_build_certs(
+        refresh_artifacts_write(common_options(package.path(), true))
+            .with_modules(vec![Name::from_dotted("Fixture.A")]),
+    );
+
+    assert_eq!(
+        result.exit_code(),
+        CommandExitCode::Success,
+        "{:?}",
+        result.diagnostics
+    );
+    let plan = result.diagnostics[1].actual_value.as_deref().unwrap();
+    assert!(plan.contains("source_rebuild=2,certificate_rebind=0,unchanged=0"));
+    assert!(plan.contains("fallbacks=import_export_changed:1"));
+    assert_refresh_package_is_hash_clean(&package);
+    assert_refresh_package_verifies_with_reference_checker(&package);
+}
+
+#[test]
+fn package_build_certs_targeted_refresh_check_reports_rebind_plan_without_writes() {
+    let package = build_local_import_fixture("targeted-refresh-check-rebind-plan");
+    fs::write(
+        package.artifact_path("Fixture/A/source.npa"),
+        "theorem a_id :\n  forall (P : Prop), forall (p : P), P :=\n  fun P => fun p => (fun (q : P) => q) p\n",
+    )
+    .unwrap();
+    let before = package_snapshot(&package);
+
+    let result = run_package_build_certs(
+        refresh_artifacts_check(common_options(package.path(), true))
+            .with_modules(vec![Name::from_dotted("Fixture.A")]),
+    );
+
+    assert_eq!(result.exit_code(), CommandExitCode::PackageFailure);
+    assert_eq!(result.diagnostics.len(), 3);
+    assert_eq!(result.diagnostics[0].reason_code, "package_build_selection");
+    assert_eq!(
+        result.diagnostics[1].reason_code,
+        "package_build_refresh_plan"
+    );
+    assert!(result.diagnostics[1]
+        .actual_value
+        .as_deref()
+        .unwrap()
+        .contains("source_rebuild=1,certificate_rebind=1,unchanged=0"));
+    assert_eq!(result.diagnostics[2].reason_code, "manifest_hashes_stale");
+    assert_eq!(package_snapshot(&package), before);
 }
 
 #[test]
@@ -492,8 +754,12 @@ fn package_build_certs_targeted_refresh_metadata_uses_direct_imports() {
     );
 
     assert_eq!(write.exit_code(), CommandExitCode::Success);
-    assert_eq!(write.diagnostics.len(), 1);
+    assert_eq!(write.diagnostics.len(), 2);
     assert_eq!(write.diagnostics[0].reason_code, "package_build_selection");
+    assert_eq!(
+        write.diagnostics[1].reason_code,
+        "package_build_refresh_plan"
+    );
     assert_transitive_certificate_and_direct_metadata(&package);
     assert_transitive_metadata_audit_passes(&package);
     assert_eq!(
@@ -1111,6 +1377,102 @@ fn build_local_import_fixture(label: &str) -> TestPackage {
     );
 
     let manifest_source = fixture_manifest(&[], &[module_b, module_a]);
+    fs::write(
+        package.artifact_path(PACKAGE_MANIFEST_PATH),
+        &manifest_source,
+    )
+    .unwrap();
+    write_lock(&package, &manifest_source);
+    package
+}
+
+fn build_rebind_diamond_fixture(label: &str) -> TestPackage {
+    let package = TestPackage::new(label);
+    let source_a =
+        "theorem a_id :\n  forall (P : Prop), forall (p : P), P :=\n  fun P => fun p => p\n";
+    let source_b = "import Fixture.A\n\ndef b_id :\n  forall (P : Prop), forall (p : P), P :=\n  fun P => fun p => @a_id P p\n";
+    let source_c = "import Fixture.A\n\ndef c_id :\n  forall (P : Prop), forall (p : P), P :=\n  fun P => fun p => @a_id P p\n";
+    let source_d = "import Fixture.B\nimport Fixture.C\n\ntheorem d_use :\n  forall (P : Prop), forall (p : P), P :=\n  fun P => fun p => @b_id P (@c_id P p)\n";
+
+    let (cert_a, verified_a, interface_a) =
+        compile_fixture_module(0, "Fixture.A", source_a, &[], &[]);
+    let (cert_b, verified_b, interface_b) = compile_fixture_module_with_available(
+        1,
+        "Fixture.B",
+        source_b,
+        &[&verified_a],
+        &[&verified_a],
+        std::slice::from_ref(&interface_a),
+    );
+    let (cert_c, verified_c, interface_c) = compile_fixture_module_with_available(
+        2,
+        "Fixture.C",
+        source_c,
+        &[&verified_a],
+        &[&verified_a],
+        std::slice::from_ref(&interface_a),
+    );
+    let (cert_d, _verified_d, _interface_d) = compile_fixture_module_with_available(
+        3,
+        "Fixture.D",
+        source_d,
+        &[&verified_b, &verified_c],
+        &[&verified_a, &verified_b, &verified_c],
+        &[interface_b, interface_c],
+    );
+
+    let modules = [
+        (
+            "Fixture.A",
+            "Fixture/A/source.npa",
+            "Fixture/A/certificate.npcert",
+            source_a,
+            &cert_a,
+            vec![],
+        ),
+        (
+            "Fixture.B",
+            "Fixture/B/source.npa",
+            "Fixture/B/certificate.npcert",
+            source_b,
+            &cert_b,
+            vec![Name::from_dotted("Fixture.A")],
+        ),
+        (
+            "Fixture.C",
+            "Fixture/C/source.npa",
+            "Fixture/C/certificate.npcert",
+            source_c,
+            &cert_c,
+            vec![Name::from_dotted("Fixture.A")],
+        ),
+        (
+            "Fixture.D",
+            "Fixture/D/source.npa",
+            "Fixture/D/certificate.npcert",
+            source_d,
+            &cert_d,
+            vec![
+                Name::from_dotted("Fixture.B"),
+                Name::from_dotted("Fixture.C"),
+            ],
+        ),
+    ];
+    let mut manifest_modules = Vec::new();
+    for (module, source_path, certificate_path, source, certificate, imports) in modules {
+        write_artifact(&package, source_path, source.as_bytes());
+        write_artifact(&package, certificate_path, certificate);
+        manifest_modules.push(generated_manifest_module(
+            module,
+            source_path,
+            certificate_path,
+            source.as_bytes(),
+            certificate,
+            imports,
+        ));
+    }
+    manifest_modules.reverse();
+    let manifest_source = fixture_manifest(&[], &manifest_modules);
     fs::write(
         package.artifact_path(PACKAGE_MANIFEST_PATH),
         &manifest_source,

@@ -2,12 +2,18 @@
 
 use std::fmt::Write as _;
 
+use npa_api::{performance_measurement_report_json, PerformanceMeasurementReport};
+
 use crate::args::CliUsageError;
 
 /// Stable schema string for package command results.
 pub const PACKAGE_COMMAND_RESULT_SCHEMA: &str = "npa.package.command_result.v0.3";
 /// Stable schema string for optional package timing telemetry.
-pub const PACKAGE_TIMINGS_SCHEMA: &str = "npa.package.timings.v0.1";
+pub const PACKAGE_TIMINGS_SCHEMA_V0_1: &str = "npa.package.timings.v0.1";
+/// Timing schema for commands embedding the common measurement block.
+pub const PACKAGE_TIMINGS_SCHEMA_V0_2: &str = "npa.package.timings.v0.2";
+/// Current integrated timing schema.
+pub const PACKAGE_TIMINGS_SCHEMA: &str = PACKAGE_TIMINGS_SCHEMA_V0_2;
 
 /// Process exit class for a command result.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -634,10 +640,14 @@ pub struct CommandTimingMetric {
 /// build evidence, and it must not influence command pass/fail behavior.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CommandTimings {
+    /// Explicit schema selected by the producing command.
+    pub schema: &'static str,
     /// Requested timing mode label.
     pub mode: String,
     /// Stable timing metrics in render order.
     pub metrics: Vec<CommandTimingMetric>,
+    /// Common diagnostic measurement block in v0.2.
+    pub measurements: Option<PerformanceMeasurementReport>,
 }
 
 /// Deterministic command result.
@@ -756,6 +766,39 @@ impl CommandResult {
     pub fn render_human(&self) -> String {
         let mut lines = vec![format!("{}: {}", self.command, self.status.as_str())];
         lines.extend(self.diagnostics.iter().map(CommandDiagnostic::render_human));
+        if let Some(timings) = &self.timings {
+            let summary = timings
+                .metrics
+                .iter()
+                .filter(|metric| matches!(metric.field.as_str(), "total_ms" | "checker_ms"))
+                .map(|metric| format!("{}={}", metric.field, metric.milliseconds))
+                .collect::<Vec<_>>()
+                .join(" ");
+            lines.push(if summary.is_empty() {
+                format!("timings: mode={}", timings.mode)
+            } else {
+                format!("timings: mode={} {summary}", timings.mode)
+            });
+            if let Some(measurements) = timings
+                .measurements
+                .as_ref()
+                .filter(|measurements| measurements.mode.is_detailed())
+            {
+                let mut modules = measurements.modules.iter().collect::<Vec<_>>();
+                modules.sort_by(|left, right| {
+                    right
+                        .checker_elapsed_ns
+                        .cmp(&left.checker_elapsed_ns)
+                        .then_with(|| left.module.cmp(&right.module))
+                });
+                lines.extend(modules.into_iter().take(5).map(|module| {
+                    format!(
+                        "timing module: {} checker_elapsed_ns={} scope=retained",
+                        module.module, module.checker_elapsed_ns
+                    )
+                }));
+            }
+        }
         lines.join("\n")
     }
 }
@@ -916,16 +959,14 @@ fn push_artifacts_json(output: &mut String, artifacts: &[CommandArtifact]) {
 
 fn push_timings_json(output: &mut String, timings: &CommandTimings) {
     output.push('{');
-    push_json_pair(
-        output,
-        "schema",
-        &JsonValue::String(PACKAGE_TIMINGS_SCHEMA),
-        true,
-    );
+    push_json_pair(output, "schema", &JsonValue::String(timings.schema), true);
     push_json_pair(output, "mode", &JsonValue::String(&timings.mode), false);
     push_json_pair(output, "unit", &JsonValue::String("ms"), false);
     push_json_pair(output, "proof_evidence", &JsonValue::Bool(false), false);
     push_json_pair(output, "build_evidence", &JsonValue::Bool(false), false);
+    if timings.schema == PACKAGE_TIMINGS_SCHEMA_V0_2 {
+        push_json_pair(output, "trusted", &JsonValue::Bool(false), false);
+    }
     for metric in &timings.metrics {
         push_json_pair(
             output,
@@ -933,6 +974,10 @@ fn push_timings_json(output: &mut String, timings: &CommandTimings) {
             &JsonValue::U128(metric.milliseconds),
             false,
         );
+    }
+    if let Some(measurements) = &timings.measurements {
+        output.push_str(",\"measurements\":");
+        output.push_str(&performance_measurement_report_json(measurements));
     }
     output.push('}');
 }
@@ -968,7 +1013,11 @@ fn push_json_string(output: &mut String, value: &str) {
 mod tests {
     use super::{
         CommandDiagnostic, CommandDiagnosticConversionContext, CommandDiagnosticSourceContext,
-        CommandResult, DiagnosticKind,
+        CommandResult, CommandTimingMetric, CommandTimings, DiagnosticKind,
+        PACKAGE_TIMINGS_SCHEMA_V0_2,
+    };
+    use npa_api::{
+        PerformanceMeasurementMode, PerformanceMeasurementRecorder, PerformanceModuleMeasurement,
     };
 
     #[test]
@@ -1018,6 +1067,43 @@ mod tests {
         assert_eq!(
             result.render_human(),
             "package build-certs: failed\nerror Build build_failed field=elaborator source=Proofs/A/source.npa:byte[10..11] line=3 column=5 declaration=A.term token=\"x\" conversion=phase:definitional_equality,outcome:not_defeq,lhs:application,rhs:constant:A.expected,depth:7 actual=failure"
+        );
+    }
+
+    #[test]
+    fn command_result_human_timings_show_summary_and_slowest_modules() {
+        let mut recorder =
+            PerformanceMeasurementRecorder::new(PerformanceMeasurementMode::Detailed);
+        for (module, checker_elapsed_ns) in [("A", 7), ("B", 19), ("C", 19)] {
+            recorder.record_module(PerformanceModuleMeasurement {
+                module: module.to_owned(),
+                certificate_bytes: 1,
+                declaration_count: 1,
+                import_count: 0,
+                checker_elapsed_ns,
+                package_sharding: None,
+            });
+        }
+        let result =
+            CommandResult::passed("package verify-certs", ".").with_timings(CommandTimings {
+                schema: PACKAGE_TIMINGS_SCHEMA_V0_2,
+                mode: "detailed".to_owned(),
+                metrics: vec![
+                    CommandTimingMetric {
+                        field: "checker_ms".to_owned(),
+                        milliseconds: 2,
+                    },
+                    CommandTimingMetric {
+                        field: "total_ms".to_owned(),
+                        milliseconds: 3,
+                    },
+                ],
+                measurements: recorder.report(),
+            });
+
+        assert_eq!(
+            result.render_human(),
+            "package verify-certs: passed\ntimings: mode=detailed checker_ms=2 total_ms=3\ntiming module: B checker_elapsed_ns=19 scope=retained\ntiming module: C checker_elapsed_ns=19 scope=retained\ntiming module: A checker_elapsed_ns=7 scope=retained"
         );
     }
 }

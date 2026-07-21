@@ -3,13 +3,15 @@ use npa_kernel::Decl;
 use npa_tactic::{
     extract_closed_machine_theorem_decl, machine_tactic_cache_key, machine_tactic_cache_key_hash,
     machine_tactic_candidate_kind, machine_tactic_goal_id, machine_tactic_hash,
+    prepare_machine_tactic_snapshot, run_machine_tactic_for_prepared_snapshot,
     run_machine_tactic_with_budget, start_machine_proof_with_kernel_profile, tactic_budget_hash,
     validate_machine_proof_state, validate_machine_tactic_candidate,
-    validate_machine_tactic_for_state, CandidateApplyArg, CandidateRewriteRuleRef,
-    CheckedCurrentDecl, GoalId, MachineKernelProfile, MachineProofDelta, MachineProofSpec,
-    MachineProofState, MachineTactic, MachineTacticCandidate, MachineTacticDiagnostic,
-    MachineTacticDiagnosticKind, MachineTacticFeature, MachineTacticOptions,
-    MachineTacticProfileVersion, MachineTacticValidationBudget, RawMachineTerm, ResolvedEqFamily,
+    validate_machine_tactic_for_state, validate_normalized_machine_tactic_for_prepared_snapshot,
+    CandidateApplyArg, CandidateRewriteRuleRef, CheckedCurrentDecl, GoalId, MachineKernelProfile,
+    MachineProofDelta, MachineProofSpec, MachineProofState, MachineTactic, MachineTacticCacheKey,
+    MachineTacticCandidate, MachineTacticDiagnostic, MachineTacticDiagnosticKind,
+    MachineTacticFeature, MachineTacticOptions, MachineTacticProfileVersion,
+    MachineTacticValidationBudget, PreparedMachineTacticSnapshot, RawMachineTerm, ResolvedEqFamily,
     ResolvedNatFamily, TacticBudget, TacticFuelKind, VerifiedImportRef,
 };
 
@@ -354,6 +356,47 @@ pub fn machine_tactic_validate_machine_tactic_candidate_for_state(
     })
 }
 
+pub fn machine_tactic_prepare_machine_tactic_snapshot(
+    state: &MachineProofState,
+    goal_id: GoalId,
+    tactic_kind: MachineApiTacticKind,
+    candidate_hash: Hash,
+    deterministic_budget: TacticBudget,
+) -> MachineTacticAdapterResult<PreparedMachineTacticSnapshot<'_>> {
+    prepare_machine_tactic_snapshot(state, goal_id).map_err(|diagnostic| {
+        let mut error = machine_tactic_candidate_validation_error(diagnostic, goal_id, tactic_kind);
+        error.candidate_hash = Some(candidate_hash);
+        error.deterministic_budget_hash = Some(tactic_budget_hash(deterministic_budget));
+        error
+    })
+}
+
+pub fn machine_tactic_validate_normalized_machine_tactic_for_prepared_snapshot(
+    prepared: &PreparedMachineTacticSnapshot<'_>,
+    validated: ValidatedMachineTactic,
+    deterministic_budget: TacticBudget,
+    profile_version: MachineTacticProfileVersion,
+    required_features: &[MachineTacticFeature],
+) -> MachineTacticAdapterResult<ValidatedMachineTactic> {
+    if let Err(diagnostic) = validate_normalized_machine_tactic_for_prepared_snapshot(
+        prepared,
+        &validated.tactic,
+        MachineTacticValidationBudget::from(deterministic_budget),
+        profile_version,
+        required_features,
+    ) {
+        let mut error = machine_tactic_candidate_validation_error(
+            diagnostic,
+            validated.goal_id,
+            validated.tactic_kind,
+        );
+        error.candidate_hash = Some(validated.candidate_hash);
+        error.deterministic_budget_hash = Some(tactic_budget_hash(deterministic_budget));
+        return Err(error);
+    }
+    Ok(validated)
+}
+
 pub fn machine_tactic_run_machine_tactic(
     state: &MachineProofState,
     tactic: MachineTactic,
@@ -366,20 +409,53 @@ pub fn machine_tactic_run_machine_tactic_with_budget(
     tactic: MachineTactic,
     budget: TacticBudget,
 ) -> MachineTacticAdapterResult<MachineTacticRunOutput> {
-    if let Err(diagnostic) = validate_machine_proof_state(state) {
-        return Err(machine_tactic_error(
-            diagnostic,
-            MachineApiDiagnosticPhase::SnapshotLookup,
-        ));
+    if matches!(&tactic, MachineTactic::Bitblast { .. }) {
+        if let Err(diagnostic) = validate_machine_proof_state(state) {
+            return Err(machine_tactic_error(
+                diagnostic,
+                MachineApiDiagnosticPhase::SnapshotLookup,
+            ));
+        }
+        return machine_tactic_run_with_projection(state.fingerprint, tactic, budget, |tactic| {
+            run_machine_tactic_with_budget(state, tactic, budget)
+        });
     }
+    let goal_id = machine_tactic_goal_id(&tactic);
+    let prepared = prepare_machine_tactic_snapshot(state, goal_id).map_err(|diagnostic| {
+        machine_tactic_error(diagnostic, MachineApiDiagnosticPhase::SnapshotLookup)
+    })?;
+    machine_tactic_run_machine_tactic_for_prepared_snapshot(&prepared, tactic, budget)
+}
 
+pub fn machine_tactic_run_machine_tactic_for_prepared_snapshot(
+    prepared: &PreparedMachineTacticSnapshot<'_>,
+    tactic: MachineTactic,
+    budget: TacticBudget,
+) -> MachineTacticAdapterResult<MachineTacticRunOutput> {
+    machine_tactic_run_with_projection(prepared.state_fingerprint(), tactic, budget, |tactic| {
+        run_machine_tactic_for_prepared_snapshot(prepared, tactic, budget)
+    })
+}
+
+fn machine_tactic_run_with_projection(
+    state_fingerprint: Hash,
+    tactic: MachineTactic,
+    budget: TacticBudget,
+    execute: impl FnOnce(
+        MachineTactic,
+    ) -> Result<(MachineProofState, MachineProofDelta), MachineTacticDiagnostic>,
+) -> MachineTacticAdapterResult<MachineTacticRunOutput> {
     let goal_id = machine_tactic_goal_id(&tactic);
     let tactic_kind = MachineApiTacticKind::from_tactic(&tactic);
     let candidate_hash = machine_tactic_hash(&tactic);
     let deterministic_budget_hash = tactic_budget_hash(budget);
-    let cache_key_hash =
-        machine_tactic_cache_key_hash(&machine_tactic_cache_key(state, &tactic, budget));
-    run_machine_tactic_with_budget(state, tactic, budget)
+    let cache_key_hash = machine_tactic_cache_key_hash(&MachineTacticCacheKey {
+        state_fingerprint,
+        goal_id,
+        tactic_hash: candidate_hash,
+        deterministic_budget_hash,
+    });
+    execute(tactic)
         .map(|(state, delta)| MachineTacticRunOutput {
             next_state_fingerprint: state.fingerprint,
             proof_delta_hash: delta.delta_hash,
@@ -1107,6 +1183,33 @@ mod tests {
         assert_eq!(err.candidate_hash, None);
         assert_eq!(err.deterministic_budget_hash, None);
         assert_eq!(err.cache_key_hash, None);
+    }
+
+    #[test]
+    fn unsupported_bitblast_precedes_goal_lookup_in_state_taking_adapter() {
+        let state = start_state(type0());
+        let tactic = MachineTactic::Bitblast {
+            goal_id: GoalId(99),
+        };
+
+        let err = machine_tactic_run_machine_tactic(&state, tactic).unwrap_err();
+
+        assert_eq!(err.diagnostic.kind, MachineApiErrorKind::UnsupportedTactic);
+        assert_eq!(
+            err.diagnostic.phase,
+            MachineApiDiagnosticPhase::TacticExecution
+        );
+        assert_eq!(err.diagnostic.goal_id, Some(GoalId(99)));
+        assert_eq!(
+            err.diagnostic.tactic_kind,
+            Some(MachineApiTacticKind::Bitblast)
+        );
+        assert!(err.candidate_hash.is_some());
+        assert_eq!(
+            err.deterministic_budget_hash,
+            Some(tactic_budget_hash(TacticBudget::default()))
+        );
+        assert!(err.cache_key_hash.is_some());
     }
 
     #[test]

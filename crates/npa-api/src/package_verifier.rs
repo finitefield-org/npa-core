@@ -5,16 +5,19 @@ use std::{
     sync::atomic::{AtomicUsize, Ordering},
     sync::{Mutex, OnceLock},
     thread,
+    time::Instant,
 };
 
 use npa_cert::{
-    decode_module_cert, verify_decoded_module_cert, AxiomPolicy, CertError, CoreFeature,
-    ModuleCert, Name, VerifiedModule, VerifierSession,
+    decode_module_cert, verify_decoded_module_cert, verify_decoded_module_cert_with_import_refs,
+    AxiomPolicy, CertError, CoreFeature, DeclCert, DeclPayload, ModuleCert, Name, TermNode,
+    VerifiedModule, VerifierSession,
 };
 use npa_checker_ref::{
-    check_certificate, ReferenceCertificateSection, ReferenceCheckError, ReferenceCheckErrorKind,
-    ReferenceCheckReason, ReferenceCheckResult, ReferenceCheckedModule, ReferenceCheckerPolicy,
-    ReferenceCoreFeature, ReferenceImportStore, ReferenceModuleName, ReferenceTrustMode,
+    check_certificate, check_certificate_with_observation, ReferenceCertificateSection,
+    ReferenceCheckError, ReferenceCheckErrorKind, ReferenceCheckObservation, ReferenceCheckReason,
+    ReferenceCheckResult, ReferenceCheckedModule, ReferenceCheckerPolicy, ReferenceCoreFeature,
+    ReferenceImportStore, ReferenceModuleName, ReferenceTrustMode,
 };
 use npa_package::{
     build_package_lock_graph, format_package_hash, package_audit_process_memo_key,
@@ -39,8 +42,22 @@ use crate::independent_checker::{
     IndependentCheckerRequestStoreManifest, IndependentCheckerRunnerPolicy,
 };
 use crate::types::{machine_api_name_canonical_bytes, parse_module_name_wire};
+use crate::{
+    PerformanceDeclarationMeasurement, PerformanceMeasurementLabel, PerformanceMeasurementMode,
+    PerformanceMeasurementRecorder, PerformanceMeasurementReport, PerformanceModuleMeasurement,
+    PerformancePackageLayerMeasurement, PerformancePackageModuleShardingMeasurement,
+    PerformancePackageShardCostModel, PerformancePackageShardMeasurement,
+    PerformancePackageShardMemoryModel, PerformancePackageShardReductionReason,
+    PerformancePackageShardingMeasurement, PerformanceWorkerMeasurement,
+    PERFORMANCE_DECLARATION_DETAIL_LIMIT, PERFORMANCE_MODULE_DETAIL_LIMIT,
+    PERFORMANCE_WORKER_DETAIL_LIMIT,
+};
 
 const PACKAGE_FAST_VERIFIER_WORKER_STACK_BYTES: usize = 64 * 1024 * 1024;
+const PACKAGE_FAST_SHARD_IMPORT_WEIGHT_V1: u64 = 4_096;
+const PACKAGE_FAST_SHARD_MEMORY_BUDGET_BYTES_V1: u64 = 1024 * 1024 * 1024;
+const PACKAGE_FAST_SHARD_FIXED_WORKER_BYTES_V1: u64 = 8 * 1024 * 1024;
+const PACKAGE_FAST_SHARD_SCRATCH_MULTIPLIER_V1: u64 = 4;
 static NEXT_IMPORT_CONTEXT_EXPORT_CACHE_WRITE_TEMP: AtomicUsize = AtomicUsize::new(0);
 
 /// Result type for source-free package verification.
@@ -83,9 +100,13 @@ pub struct PackageVerificationExecutionOptions {
     pub selected_modules: Option<BTreeSet<Name>>,
     /// Optional process-local memoization mode.
     pub memoization: PackageVerificationMemoMode,
-    /// Enable the process-local decode/import cache and collect its counters in
-    /// the report.
+    /// Decode/import cache policy. This is independent of observation mode.
+    pub decode_cache: PackageVerificationDecodeCacheMode,
+    /// Collect counters for the selected decode-cache policy. This option does
+    /// not enable a cache or permit persistent cache I/O.
     pub collect_decode_cache_counters: bool,
+    /// Diagnostic measurement mode. This never changes verifier policy.
+    pub measurement_mode: PerformanceMeasurementMode,
 }
 
 impl Default for PackageVerificationExecutionOptions {
@@ -94,8 +115,32 @@ impl Default for PackageVerificationExecutionOptions {
             jobs: 1,
             selected_modules: None,
             memoization: PackageVerificationMemoMode::Disabled,
+            decode_cache: PackageVerificationDecodeCacheMode::Disabled,
             collect_decode_cache_counters: false,
+            measurement_mode: PerformanceMeasurementMode::Off,
         }
+    }
+}
+
+/// Decode/import caching policy for one verifier operation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PackageVerificationDecodeCacheMode {
+    /// Do not read or write process-local or persistent decode caches.
+    #[default]
+    Disabled,
+    /// Reuse certificate and import-context decoding within this process.
+    ProcessLocal,
+    /// Also reuse and write the persistent import-context export cache.
+    ProcessLocalAndPersistent,
+}
+
+impl PackageVerificationDecodeCacheMode {
+    const fn process_local(self) -> bool {
+        !matches!(self, Self::Disabled)
+    }
+
+    const fn persistent(self) -> bool {
+        matches!(self, Self::ProcessLocalAndPersistent)
     }
 }
 
@@ -173,17 +218,37 @@ impl PackageVerificationDecodeCacheCounters {
     }
 
     fn add(&mut self, other: Self) {
-        self.certificate_hits += other.certificate_hits;
-        self.certificate_misses += other.certificate_misses;
-        self.certificate_inserted += other.certificate_inserted;
-        self.import_context_hits += other.import_context_hits;
-        self.import_context_misses += other.import_context_misses;
-        self.import_context_inserted += other.import_context_inserted;
-        self.import_context_disk_hits += other.import_context_disk_hits;
-        self.import_context_disk_misses += other.import_context_disk_misses;
-        self.import_context_disk_stale += other.import_context_disk_stale;
-        self.import_context_disk_schema_misses += other.import_context_disk_schema_misses;
-        self.import_context_disk_inserted += other.import_context_disk_inserted;
+        self.certificate_hits = self.certificate_hits.saturating_add(other.certificate_hits);
+        self.certificate_misses = self
+            .certificate_misses
+            .saturating_add(other.certificate_misses);
+        self.certificate_inserted = self
+            .certificate_inserted
+            .saturating_add(other.certificate_inserted);
+        self.import_context_hits = self
+            .import_context_hits
+            .saturating_add(other.import_context_hits);
+        self.import_context_misses = self
+            .import_context_misses
+            .saturating_add(other.import_context_misses);
+        self.import_context_inserted = self
+            .import_context_inserted
+            .saturating_add(other.import_context_inserted);
+        self.import_context_disk_hits = self
+            .import_context_disk_hits
+            .saturating_add(other.import_context_disk_hits);
+        self.import_context_disk_misses = self
+            .import_context_disk_misses
+            .saturating_add(other.import_context_disk_misses);
+        self.import_context_disk_stale = self
+            .import_context_disk_stale
+            .saturating_add(other.import_context_disk_stale);
+        self.import_context_disk_schema_misses = self
+            .import_context_disk_schema_misses
+            .saturating_add(other.import_context_disk_schema_misses);
+        self.import_context_disk_inserted = self
+            .import_context_disk_inserted
+            .saturating_add(other.import_context_disk_inserted);
     }
 }
 
@@ -328,6 +393,8 @@ pub struct PackageVerificationReport {
     pub memo_counters: PackageVerificationMemoCounters,
     /// Optional process-local decode/import cache counters for this verifier run.
     pub decode_cache_counters: Option<PackageVerificationDecodeCacheCounters>,
+    /// Diagnostic-only measurements. These never contribute proof evidence.
+    pub measurements: Option<PerformanceMeasurementReport>,
 }
 
 /// Per-module source-free verification result.
@@ -633,6 +700,31 @@ impl PackageVerificationError {
             Some("disabled memoization for path-backed lazy artifact verification".to_owned()),
             Some("process-local memoization requested".to_owned()),
         )
+    }
+
+    fn fast_worker_infrastructure_failed(
+        layer_index: usize,
+        shard_index: usize,
+        first_module: &Name,
+        reason_code: PackageVerificationErrorReason,
+    ) -> Self {
+        let failure_kind = match reason_code {
+            PackageVerificationErrorReason::FastWorkerSpawnFailed => "spawn",
+            PackageVerificationErrorReason::FastWorkerJoinFailed => "join",
+            _ => unreachable!("worker infrastructure constructor requires a worker reason"),
+        };
+        Self::new(
+            PackageVerificationErrorKind::Kernel,
+            format!("execution.layers[{layer_index}].shards[{shard_index}]"),
+            Some("worker".to_owned()),
+            reason_code,
+            Some("worker thread spawned and joined successfully".to_owned()),
+            Some(format!(
+                "{failure_kind}_failed;first_module={}",
+                first_module.as_dotted()
+            )),
+        )
+        .with_module(first_module.as_dotted())
     }
 
     fn selected_module_missing(module: &Name) -> Self {
@@ -953,6 +1045,10 @@ pub enum PackageVerificationErrorReason {
     UnsupportedParallelChecker,
     /// Process-local verifier memoization is not supported by lazy artifact verification.
     UnsupportedLazyMemoization,
+    /// A fast verifier shard worker could not be spawned.
+    FastWorkerSpawnFailed,
+    /// A fast verifier shard worker unwound before returning its result.
+    FastWorkerJoinFailed,
     /// A selected module is not present in the package lock.
     SelectedModuleMissing,
     /// Caller supplied duplicate artifact bytes for one certificate path.
@@ -997,6 +1093,8 @@ impl PackageVerificationErrorReason {
             Self::InvalidJobCount => "invalid_job_count",
             Self::UnsupportedParallelChecker => "unsupported_parallel_checker",
             Self::UnsupportedLazyMemoization => "unsupported_lazy_memoization",
+            Self::FastWorkerSpawnFailed => "fast_worker_spawn_failed",
+            Self::FastWorkerJoinFailed => "fast_worker_join_failed",
             Self::SelectedModuleMissing => "selected_module_missing",
             Self::DuplicateCertificateArtifact => "duplicate_certificate_artifact",
             Self::CertificateArtifactMissing => "certificate_artifact_missing",
@@ -1098,7 +1196,9 @@ pub fn verify_package_fast_source_free_with_options<'a>(
     if options.jobs == 1
         && options.selected_modules.is_none()
         && !options.memoization.is_enabled()
+        && options.decode_cache == PackageVerificationDecodeCacheMode::Disabled
         && !options.collect_decode_cache_counters
+        && options.measurement_mode == PerformanceMeasurementMode::Off
     {
         return verify_package_fast_source_free_report(validated, lock, artifacts);
     }
@@ -1235,6 +1335,7 @@ fn verify_package_fast_source_free_serial<'a>(
         modules: results,
         memo_counters: PackageVerificationMemoCounters::default(),
         decode_cache_counters: None,
+        measurements: None,
     };
 
     Ok(PackageFastSourceFreeVerification {
@@ -1264,12 +1365,13 @@ fn verify_package_fast_source_free_from_root_serial(
         validated,
         PackageVerificationMode::FastKernel,
     )
-    .with_process_local_cache(options.collect_decode_cache_counters)
-    .with_persistent_import_context_export_cache(options.collect_decode_cache_counters);
+    .with_process_local_cache(options.decode_cache.process_local())
+    .with_persistent_import_context_export_cache(options.decode_cache.persistent());
     let mut session = VerifierSession::new();
     let mut results = Vec::with_capacity(execution_modules.len());
     let mut failed_module = None::<Name>;
     let mut decode_cache_counters = PackageVerificationDecodeCacheCounters::default();
+    let mut measurement_state = PackageVerifierMeasurementState::new(options.measurement_mode);
 
     for module in graph
         .topological_order
@@ -1306,16 +1408,38 @@ fn verify_package_fast_source_free_from_root_serial(
             }
         };
 
-        match verify_lock_entry_bytes(
+        let checker_started = options.measurement_mode.is_enabled().then(Instant::now);
+        let mut observation = PackageEntryCheckObservation::new(options.measurement_mode);
+        let verification = verify_lock_entry_bytes_observed(
             *entry_index,
             entry,
             &bytes,
-            &mut session,
+            PackageFastWorkerImportContext::Session(&mut session),
             &policy,
             &decode_cache_config,
-        ) {
-            Ok((_verified_module, counters)) => {
-                decode_cache_counters.add(counters);
+            &mut observation,
+        );
+        let checker_elapsed_ns = elapsed_nanos_if_started(checker_started);
+        decode_cache_counters.add(observation.decode_cache_counters);
+        if let Some(measurements) = measurement_state.as_mut() {
+            measurements.record_module(
+                entry,
+                &observation,
+                checker_elapsed_ns,
+                Some(0),
+                observation.checker_reached,
+            );
+            measurements.record_worker_timing(
+                PackageFastWorkerTiming {
+                    worker_index: 0,
+                    active_elapsed_ns: checker_elapsed_ns,
+                    idle_elapsed_ns: 0,
+                },
+                false,
+            );
+        }
+        match verification {
+            Ok(_verified_module) => {
                 results.push(module_result(
                     entry,
                     PackageModuleVerificationStatus::Passed,
@@ -1347,6 +1471,19 @@ fn verify_package_fast_source_free_from_root_serial(
         PackageVerificationStatus::Passed
     };
     let verdict_source = PackageVerificationVerdictSource::FastKernelCertificateVerifier;
+    let measured_decode_counters = options
+        .collect_decode_cache_counters
+        .then_some(decode_cache_counters);
+    let measurements = package_measurement_report(PackageMeasurementReportInput {
+        options: &options,
+        lock,
+        entries: &entries,
+        artifact_bytes: None,
+        modules: &results,
+        measurements: measurement_state.as_ref(),
+        memo_counters: PackageVerificationMemoCounters::default(),
+        decode_cache_counters,
+    });
 
     Ok(PackageFastSourceFreeVerification {
         report: PackageVerificationReport {
@@ -1362,9 +1499,8 @@ fn verify_package_fast_source_free_from_root_serial(
             topological_order,
             modules: results,
             memo_counters: PackageVerificationMemoCounters::default(),
-            decode_cache_counters: options
-                .collect_decode_cache_counters
-                .then_some(decode_cache_counters),
+            decode_cache_counters: measured_decode_counters,
+            measurements,
         },
         verified_modules: Vec::new(),
     })
@@ -1443,8 +1579,8 @@ fn verify_package_fast_source_free_execution_with_strategy<'a>(
         validated,
         PackageVerificationMode::FastKernel,
     )
-    .with_process_local_cache(options.collect_decode_cache_counters)
-    .with_persistent_import_context_export_cache(options.collect_decode_cache_counters);
+    .with_process_local_cache(options.decode_cache.process_local())
+    .with_persistent_import_context_export_cache(options.decode_cache.persistent());
     let mut memo_run = PackageVerificationMemoRun::for_run(
         &options,
         validated,
@@ -1459,8 +1595,20 @@ fn verify_package_fast_source_free_execution_with_strategy<'a>(
     let mut results_by_module = BTreeMap::<Name, PackageModuleVerificationResult>::new();
     let mut verified_modules_by_module = BTreeMap::<Name, PackageVerifiedModuleRecord>::new();
     let mut decode_cache_counters = PackageVerificationDecodeCacheCounters::default();
+    let mut measurement_state = PackageVerifierMeasurementState::new(options.measurement_mode);
+    if let Some(measurements) = measurement_state.as_mut() {
+        if let Some(observation) = package_fast_execution_cost_observation(
+            &entries,
+            &graph,
+            &execution_modules,
+            &execution_layers,
+            &artifact_bytes,
+        ) {
+            measurements.configure_fast_sharding(options.jobs, observation);
+        }
+    }
 
-    for layer in execution_layers {
+    for (layer_index, layer) in execution_layers.into_iter().enumerate() {
         let mut runnable = Vec::<(usize, &PackageLockEntry)>::new();
         for module in &layer {
             let (entry_index, entry) = entries_by_module
@@ -1486,6 +1634,15 @@ fn verify_package_fast_source_free_execution_with_strategy<'a>(
             }
             match memo_run.lookup(&entry.module) {
                 Some(PackageVerificationMemoEntry::FastPassed { result, record }) => {
+                    if let Some(measurements) = measurement_state.as_mut() {
+                        let mut observation =
+                            PackageEntryCheckObservation::new(options.measurement_mode);
+                        if let Some(bytes) = artifact_bytes.get(&entry.certificate).copied() {
+                            observation.observe_certificate_bytes(bytes);
+                        }
+                        observation.observe_verified_module(&entry.module, &record.verified_module);
+                        measurements.record_module(entry, &observation, 0, None, false);
+                    }
                     session.register_verified_module_with_trust(
                         record.verified_module.clone(),
                         policy.mode,
@@ -1504,27 +1661,71 @@ fn verify_package_fast_source_free_execution_with_strategy<'a>(
             runnable.push((*entry_index, *entry));
         }
 
-        let worker_results = verify_fast_layer(
+        let layer_execution = verify_fast_layer(
             &runnable,
             PackageFastLayerContext {
+                layer_index,
                 graph: &graph,
                 verified_modules_by_module: &verified_modules_by_module,
                 artifact_bytes: &artifact_bytes,
                 session: &session,
                 policy: &policy,
                 decode_cache_config: &decode_cache_config,
+                measurement_mode: options.measurement_mode,
             },
             options.jobs,
             parallel_strategy,
-        );
-        for worker_result in worker_results {
+        )?;
+        if layer_execution.layer_clock_read {
+            measurement_state
+                .as_mut()
+                .expect("enabled layer clock has measurement state")
+                .record_layer_clock();
+        }
+        if let (Some(measurements), Some(plan)) = (
+            measurement_state.as_mut(),
+            layer_execution.shard_plan.as_ref(),
+        ) {
+            measurements.record_fast_layer(
+                layer_index,
+                &runnable,
+                plan,
+                layer_execution.layer_elapsed_ns,
+                &layer_execution.results,
+            );
+        }
+        let coordinator_started =
+            (!layer_execution.results.is_empty() && measurement_state.is_some()).then(Instant::now);
+        for mut worker_result in layer_execution.results {
             decode_cache_counters.add(worker_result.decode_cache_counters());
+            let worker_declaration_details = worker_result.take_worker_declaration_details();
+            if let Some(measurements) = measurement_state.as_mut() {
+                measurements.record_module(
+                    worker_result.entry(),
+                    worker_result.measurement_observation(),
+                    worker_result.checker_elapsed_ns(),
+                    Some(worker_result.worker_index()),
+                    worker_result.measurement_observation().checker_reached,
+                );
+                if let Some(declarations) = worker_declaration_details {
+                    measurements.record_declaration_details(declarations);
+                }
+                if let Some(timing) = worker_result.worker_timing() {
+                    measurements.record_worker_timing(timing, true);
+                }
+            }
             match worker_result {
                 PackageFastLayerWorkerResult::Passed {
+                    entry_index: _,
                     entry,
                     result,
                     record,
                     decode_cache_counters: _,
+                    measurement_observation: _,
+                    checker_elapsed_ns: _,
+                    worker_index: _,
+                    worker_timing: _,
+                    worker_declaration_details: _,
                 } => {
                     session.register_verified_module_with_trust(
                         record.verified_module.clone(),
@@ -1541,9 +1742,15 @@ fn verify_package_fast_source_free_execution_with_strategy<'a>(
                     verified_modules_by_module.insert(entry.module.clone(), *record);
                 }
                 PackageFastLayerWorkerResult::Failed {
+                    entry_index: _,
                     entry,
                     result,
                     decode_cache_counters: _,
+                    measurement_observation: _,
+                    checker_elapsed_ns: _,
+                    worker_index: _,
+                    worker_timing: _,
+                    worker_declaration_details: _,
                 } => {
                     memo_run.insert(
                         &entry.module,
@@ -1555,6 +1762,12 @@ fn verify_package_fast_source_free_execution_with_strategy<'a>(
                     results_by_module.insert(entry.module.clone(), result);
                 }
             }
+        }
+        if let Some(started) = coordinator_started {
+            measurement_state
+                .as_mut()
+                .expect("coordinator clock has measurement state")
+                .record_coordinator_merge(elapsed_nanos_if_started(Some(started)));
         }
     }
 
@@ -1585,6 +1798,19 @@ fn verify_package_fast_source_free_execution_with_strategy<'a>(
         PackageVerificationStatus::Passed
     };
     let verdict_source = PackageVerificationVerdictSource::FastKernelCertificateVerifier;
+    let measured_decode_counters = options
+        .collect_decode_cache_counters
+        .then_some(decode_cache_counters);
+    let measurements = package_measurement_report(PackageMeasurementReportInput {
+        options: &options,
+        lock,
+        entries: &entries,
+        artifact_bytes: Some(&artifact_bytes),
+        modules: &modules,
+        measurements: measurement_state.as_ref(),
+        memo_counters: memo_run.counters(),
+        decode_cache_counters,
+    });
 
     Ok(PackageFastSourceFreeVerification {
         report: PackageVerificationReport {
@@ -1600,9 +1826,8 @@ fn verify_package_fast_source_free_execution_with_strategy<'a>(
             topological_order,
             modules,
             memo_counters: memo_run.counters(),
-            decode_cache_counters: options
-                .collect_decode_cache_counters
-                .then_some(decode_cache_counters),
+            decode_cache_counters: measured_decode_counters,
+            measurements,
         },
         verified_modules,
     })
@@ -1610,19 +1835,60 @@ fn verify_package_fast_source_free_execution_with_strategy<'a>(
 
 enum PackageFastLayerWorkerResult<'a> {
     Passed {
+        entry_index: usize,
         entry: &'a PackageLockEntry,
         result: PackageModuleVerificationResult,
         record: Box<PackageVerifiedModuleRecord>,
         decode_cache_counters: PackageVerificationDecodeCacheCounters,
+        measurement_observation: PackageEntryCheckObservation,
+        checker_elapsed_ns: u64,
+        worker_index: usize,
+        worker_timing: Option<PackageFastWorkerTiming>,
+        worker_declaration_details: Option<Vec<PerformanceDeclarationMeasurement>>,
     },
     Failed {
+        entry_index: usize,
         entry: &'a PackageLockEntry,
         result: PackageModuleVerificationResult,
         decode_cache_counters: PackageVerificationDecodeCacheCounters,
+        measurement_observation: PackageEntryCheckObservation,
+        checker_elapsed_ns: u64,
+        worker_index: usize,
+        worker_timing: Option<PackageFastWorkerTiming>,
+        worker_declaration_details: Option<Vec<PerformanceDeclarationMeasurement>>,
     },
 }
 
 impl PackageFastLayerWorkerResult<'_> {
+    fn entry_index(&self) -> usize {
+        match self {
+            Self::Passed { entry_index, .. } | Self::Failed { entry_index, .. } => *entry_index,
+        }
+    }
+
+    fn entry(&self) -> &PackageLockEntry {
+        match self {
+            Self::Passed { entry, .. } | Self::Failed { entry, .. } => entry,
+        }
+    }
+
+    fn checker_elapsed_ns(&self) -> u64 {
+        match self {
+            Self::Passed {
+                checker_elapsed_ns, ..
+            }
+            | Self::Failed {
+                checker_elapsed_ns, ..
+            } => *checker_elapsed_ns,
+        }
+    }
+
+    fn worker_index(&self) -> usize {
+        match self {
+            Self::Passed { worker_index, .. } | Self::Failed { worker_index, .. } => *worker_index,
+        }
+    }
+
     fn decode_cache_counters(&self) -> PackageVerificationDecodeCacheCounters {
         match self {
             Self::Passed {
@@ -1635,16 +1901,104 @@ impl PackageFastLayerWorkerResult<'_> {
             } => *decode_cache_counters,
         }
     }
+
+    fn measurement_observation(&self) -> &PackageEntryCheckObservation {
+        match self {
+            Self::Passed {
+                measurement_observation,
+                ..
+            }
+            | Self::Failed {
+                measurement_observation,
+                ..
+            } => measurement_observation,
+        }
+    }
+
+    fn measurement_observation_mut(&mut self) -> &mut PackageEntryCheckObservation {
+        match self {
+            Self::Passed {
+                measurement_observation,
+                ..
+            }
+            | Self::Failed {
+                measurement_observation,
+                ..
+            } => measurement_observation,
+        }
+    }
+
+    fn worker_timing(&self) -> Option<PackageFastWorkerTiming> {
+        match self {
+            Self::Passed { worker_timing, .. } | Self::Failed { worker_timing, .. } => {
+                *worker_timing
+            }
+        }
+    }
+
+    fn set_worker_timing(&mut self, timing: PackageFastWorkerTiming) {
+        match self {
+            Self::Passed { worker_timing, .. } | Self::Failed { worker_timing, .. } => {
+                *worker_timing = Some(timing);
+            }
+        }
+    }
+
+    fn take_worker_declaration_details(
+        &mut self,
+    ) -> Option<Vec<PerformanceDeclarationMeasurement>> {
+        match self {
+            Self::Passed {
+                worker_declaration_details,
+                ..
+            }
+            | Self::Failed {
+                worker_declaration_details,
+                ..
+            } => worker_declaration_details.take(),
+        }
+    }
+
+    fn set_worker_declaration_details(
+        &mut self,
+        declarations: Vec<PerformanceDeclarationMeasurement>,
+    ) {
+        match self {
+            Self::Passed {
+                worker_declaration_details,
+                ..
+            }
+            | Self::Failed {
+                worker_declaration_details,
+                ..
+            } => *worker_declaration_details = Some(declarations),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct PackageFastWorkerObservation {
+    measurement_mode: PerformanceMeasurementMode,
+    worker_index: usize,
 }
 
 #[derive(Clone, Copy)]
 struct PackageFastLayerContext<'a> {
+    layer_index: usize,
     graph: &'a PackageLockGraph,
     verified_modules_by_module: &'a BTreeMap<Name, PackageVerifiedModuleRecord>,
     artifact_bytes: &'a BTreeMap<PackagePath, &'a [u8]>,
     session: &'a VerifierSession,
     policy: &'a AxiomPolicy,
     decode_cache_config: &'a PackageVerificationDecodeCacheConfig,
+    measurement_mode: PerformanceMeasurementMode,
+}
+
+struct PackageFastLayerExecution<'a> {
+    results: Vec<PackageFastLayerWorkerResult<'a>>,
+    layer_clock_read: bool,
+    layer_elapsed_ns: u64,
+    shard_plan: Option<PackageFastShardPlan>,
 }
 
 fn verify_fast_layer<'a>(
@@ -1652,22 +2006,61 @@ fn verify_fast_layer<'a>(
     context: PackageFastLayerContext<'_>,
     jobs: usize,
     parallel_strategy: PackageFastParallelStrategy,
-) -> Vec<PackageFastLayerWorkerResult<'a>> {
-    #[cfg(test)]
-    if parallel_strategy == PackageFastParallelStrategy::LegacyLayer {
-        return verify_fast_layer_legacy(
-            runnable,
-            context.artifact_bytes,
-            context.session,
-            context.policy,
-            context.decode_cache_config,
-            jobs,
-        );
+) -> PackageVerificationResult<PackageFastLayerExecution<'a>> {
+    if runnable.is_empty() {
+        return Ok(PackageFastLayerExecution {
+            results: Vec::new(),
+            layer_clock_read: false,
+            layer_elapsed_ns: 0,
+            shard_plan: None,
+        });
     }
+    let layer_started = context.measurement_mode.is_enabled().then(Instant::now);
+    #[cfg(test)]
+    let (mut results, shard_plan) = if parallel_strategy == PackageFastParallelStrategy::LegacyLayer
+    {
+        (
+            verify_fast_layer_legacy(
+                runnable,
+                context.artifact_bytes,
+                context.session,
+                context.policy,
+                context.decode_cache_config,
+                context.measurement_mode,
+                jobs,
+            ),
+            None,
+        )
+    } else {
+        let execution = verify_fast_layer_shards(runnable, context, jobs)?;
+        (execution.results, execution.plan)
+    };
     #[cfg(not(test))]
-    let _ = parallel_strategy;
-
-    verify_fast_layer_shards(runnable, context, jobs)
+    let (mut results, shard_plan) = {
+        let _ = parallel_strategy;
+        let execution = verify_fast_layer_shards(runnable, context, jobs)?;
+        (execution.results, execution.plan)
+    };
+    let layer_elapsed_ns = elapsed_nanos_if_started(layer_started);
+    results.sort_by(|left, right| {
+        left.entry_index()
+            .cmp(&right.entry_index())
+            .then_with(|| left.entry().module.cmp(&right.entry().module))
+    });
+    if context.measurement_mode.is_enabled() {
+        for result in &mut results {
+            if let Some(mut timing) = result.worker_timing() {
+                timing.idle_elapsed_ns = layer_elapsed_ns.saturating_sub(timing.active_elapsed_ns);
+                result.set_worker_timing(timing);
+            }
+        }
+    }
+    Ok(PackageFastLayerExecution {
+        results,
+        layer_clock_read: context.measurement_mode.is_enabled(),
+        layer_elapsed_ns,
+        shard_plan,
+    })
 }
 
 #[cfg(test)]
@@ -1677,25 +2070,43 @@ fn verify_fast_layer_legacy<'a>(
     session: &VerifierSession,
     policy: &AxiomPolicy,
     decode_cache_config: &PackageVerificationDecodeCacheConfig,
+    measurement_mode: PerformanceMeasurementMode,
     jobs: usize,
 ) -> Vec<PackageFastLayerWorkerResult<'a>> {
     if jobs == 1 {
+        let worker_started = measurement_mode.is_enabled().then(Instant::now);
         let mut serial_results = Vec::with_capacity(runnable.len());
         let mut serial_session = session.clone();
+        let mut declaration_details =
+            PackageFastWorkerDeclarationDetailCollector::new(PERFORMANCE_DECLARATION_DETAIL_LIMIT);
         for (entry_index, entry) in runnable {
-            serial_results.push(verify_fast_worker(
+            let mut result = verify_fast_worker(
                 *entry_index,
                 entry,
                 artifact_bytes,
-                &mut serial_session,
+                PackageFastWorkerImportContext::Session(&mut serial_session),
                 policy,
                 decode_cache_config,
-            ));
+                PackageFastWorkerObservation {
+                    measurement_mode,
+                    worker_index: 0,
+                },
+            );
+            collect_worker_declaration_details(
+                &mut declaration_details,
+                &mut result,
+                measurement_mode,
+            );
+            serial_results.push(result);
         }
+        attach_collected_worker_declaration_details(&mut serial_results, declaration_details);
+        attach_worker_timing(&mut serial_results, 0, worker_started);
         return serial_results;
     }
 
     let mut results = Vec::with_capacity(runnable.len());
+    let mut declaration_details_by_worker =
+        BTreeMap::<usize, PackageFastWorkerDeclarationDetailCollector>::new();
     for chunk in runnable.chunks(jobs) {
         thread::scope(|scope| {
             let handles = chunk
@@ -1707,120 +2118,302 @@ fn verify_fast_layer_legacy<'a>(
                         .name(format!("npa-package-fast-layer-worker-{worker_index}"))
                         .stack_size(PACKAGE_FAST_VERIFIER_WORKER_STACK_BYTES)
                         .spawn_scoped(scope, move || {
-                            verify_fast_worker(
+                            let worker_started = measurement_mode.is_enabled().then(Instant::now);
+                            let mut result = verify_fast_worker(
                                 *entry_index,
                                 entry,
                                 artifact_bytes,
-                                &mut worker_session,
+                                PackageFastWorkerImportContext::Session(&mut worker_session),
                                 policy,
                                 decode_cache_config,
-                            )
+                                PackageFastWorkerObservation {
+                                    measurement_mode,
+                                    worker_index,
+                                },
+                            );
+                            let mut declaration_details =
+                                PackageFastWorkerDeclarationDetailCollector::new(
+                                    PERFORMANCE_DECLARATION_DETAIL_LIMIT,
+                                );
+                            collect_worker_declaration_details(
+                                &mut declaration_details,
+                                &mut result,
+                                measurement_mode,
+                            );
+                            attach_collected_worker_declaration_details(
+                                std::slice::from_mut(&mut result),
+                                declaration_details,
+                            );
+                            attach_worker_timing(
+                                std::slice::from_mut(&mut result),
+                                worker_index,
+                                worker_started,
+                            );
+                            result
                         })
                         .expect("package fast verifier layer worker should spawn")
                 })
                 .collect::<Vec<_>>();
 
             for handle in handles {
-                results.push(
-                    handle
-                        .join()
-                        .expect("package fast verifier worker should not panic"),
-                );
+                let mut result = handle
+                    .join()
+                    .expect("package fast verifier worker should not panic");
+                if let Some(declarations) = result.take_worker_declaration_details() {
+                    declaration_details_by_worker
+                        .entry(result.worker_index())
+                        .or_insert_with(|| {
+                            PackageFastWorkerDeclarationDetailCollector::new(
+                                PERFORMANCE_DECLARATION_DETAIL_LIMIT,
+                            )
+                        })
+                        .record_details(declarations);
+                }
+                results.push(result);
             }
         });
     }
+    for (worker_index, collector) in declaration_details_by_worker {
+        let declarations = collector.into_details();
+        if let Some(result) = results
+            .iter_mut()
+            .find(|result| result.worker_index() == worker_index)
+        {
+            result.set_worker_declaration_details(declarations);
+        }
+    }
     results
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PackageModuleCostEstimateV1 {
+    artifact_bytes: u64,
+    direct_import_count: u64,
+    estimated_cost: u64,
+    overflowed: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PackageFastShardReductionReason {
+    None,
+    RequestedOne,
+    RunnableWidth,
+    MemoryBudget,
+    EstimateOverflow,
+}
+
+impl PackageFastShardReductionReason {
+    const fn measurement(self) -> PerformancePackageShardReductionReason {
+        match self {
+            Self::None => PerformancePackageShardReductionReason::None,
+            Self::RequestedOne => PerformancePackageShardReductionReason::RequestedOne,
+            Self::RunnableWidth => PerformancePackageShardReductionReason::RunnableWidth,
+            Self::MemoryBudget => PerformancePackageShardReductionReason::MemoryBudget,
+            Self::EstimateOverflow => PerformancePackageShardReductionReason::EstimateOverflow,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PackageFastShardMemoryEstimateV1 {
+    effective_jobs: usize,
+    shared_base_context_bytes: u64,
+    per_worker_bytes: u64,
+    reduction_reason: PackageFastShardReductionReason,
+    overflowed: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct PackageFastShard {
     member_indexes: Vec<usize>,
+    estimated_cost: u64,
+    artifact_bytes: u64,
+    overflowed: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct PackageFastShardPlan {
+    requested_jobs: usize,
+    effective_jobs: usize,
+    reduction_reason: PackageFastShardReductionReason,
+    shared_base_context_bytes: u64,
+    per_worker_bytes: u64,
+    estimated_total_cost: u64,
+    overflowed: bool,
+    module_costs: BTreeMap<usize, PackageModuleCostEstimateV1>,
     shards: Vec<PackageFastShard>,
+}
+
+impl PackageFastShardPlan {
+    fn estimated_max_shard_cost(&self) -> u64 {
+        self.shards
+            .iter()
+            .map(|shard| shard.estimated_cost)
+            .max()
+            .unwrap_or(0)
+    }
+
+    fn avoided_base_context_clone_bytes(&self) -> (u64, bool) {
+        saturating_mul_u64(
+            self.shared_base_context_bytes,
+            u64::try_from(self.effective_jobs).unwrap_or(u64::MAX),
+        )
+    }
+}
+
+struct PackageFastShardedLayerExecution<'a> {
+    results: Vec<PackageFastLayerWorkerResult<'a>>,
+    plan: Option<PackageFastShardPlan>,
 }
 
 fn verify_fast_layer_shards<'a>(
     runnable: &[(usize, &'a PackageLockEntry)],
     context: PackageFastLayerContext<'_>,
     jobs: usize,
-) -> Vec<PackageFastLayerWorkerResult<'a>> {
+) -> PackageVerificationResult<PackageFastShardedLayerExecution<'a>> {
     let context_modules = context
         .verified_modules_by_module
         .keys()
         .cloned()
         .collect::<BTreeSet<_>>();
-    let Some(plan) = plan_fast_verifier_shards(runnable, context.graph, &context_modules, jobs)
-    else {
-        return verify_fast_layer_independent_serial(
-            runnable,
-            context.artifact_bytes,
-            context.session,
-            context.policy,
-            context.decode_cache_config,
-        );
+    let Some(plan) = plan_fast_verifier_shards(
+        runnable,
+        context.graph,
+        &context_modules,
+        context.verified_modules_by_module,
+        context.artifact_bytes,
+        jobs,
+    ) else {
+        return Ok(PackageFastShardedLayerExecution {
+            results: verify_fast_layer_independent_serial(
+                runnable,
+                context.artifact_bytes,
+                context.session,
+                context.policy,
+                context.decode_cache_config,
+                context.measurement_mode,
+            ),
+            plan: None,
+        });
     };
     if plan.shards.len() <= 1 {
-        return plan
+        let results = plan
             .shards
             .first()
-            .map(|shard| {
-                verify_fast_shard(
-                    runnable,
-                    shard,
-                    context.artifact_bytes,
-                    context.session.clone(),
-                    context.policy,
-                    context.decode_cache_config,
-                )
-            })
+            .map(|shard| verify_fast_shard(runnable, shard, context, 0))
             .unwrap_or_default();
+        return Ok(PackageFastShardedLayerExecution {
+            results,
+            plan: Some(plan),
+        });
     }
 
     let mut shard_results = Vec::with_capacity(plan.shards.len());
-    thread::scope(|scope| {
-        let handles = plan
-            .shards
-            .iter()
-            .enumerate()
-            .map(|(shard_index, shard)| {
-                let worker_session = context.session.clone();
-                thread::Builder::new()
-                    .name(format!("npa-package-fast-shard-{shard_index}"))
-                    .stack_size(PACKAGE_FAST_VERIFIER_WORKER_STACK_BYTES)
-                    .spawn_scoped(scope, move || {
-                        verify_fast_shard(
-                            runnable,
-                            shard,
-                            context.artifact_bytes,
-                            worker_session,
-                            context.policy,
-                            context.decode_cache_config,
-                        )
-                    })
-                    .expect("package fast verifier shard worker should spawn")
-            })
-            .collect::<Vec<_>>();
-
-        for handle in handles {
-            shard_results.push(
-                handle
-                    .join()
-                    .expect("package fast verifier shard worker should not panic"),
-            );
+    let infrastructure_result = thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(plan.shards.len());
+        let mut failures = Vec::new();
+        for (shard_index, shard) in plan.shards.iter().enumerate() {
+            let first_module = shard
+                .member_indexes
+                .first()
+                .map(|member_index| runnable[*member_index].1.module.clone())
+                .expect("non-empty LPT shard has a first module");
+            match thread::Builder::new()
+                .name(format!("npa-package-fast-shard-{shard_index}"))
+                .stack_size(PACKAGE_FAST_VERIFIER_WORKER_STACK_BYTES)
+                .spawn_scoped(scope, move || {
+                    verify_fast_shard(runnable, shard, context, shard_index)
+                }) {
+                Ok(handle) => handles.push((shard_index, first_module, handle)),
+                Err(_) => failures.push(PackageFastWorkerInfrastructureFailure {
+                    shard_index,
+                    first_module,
+                    kind: PackageFastWorkerInfrastructureFailureKind::Spawn,
+                }),
+            }
         }
+
+        for (shard_index, first_module, handle) in handles {
+            match handle.join() {
+                Ok(results) => shard_results.push(results),
+                Err(_) => failures.push(PackageFastWorkerInfrastructureFailure {
+                    shard_index,
+                    first_module,
+                    kind: PackageFastWorkerInfrastructureFailureKind::Join,
+                }),
+            }
+        }
+        select_package_fast_worker_infrastructure_failure(failures)
     });
-    shard_results.into_iter().flatten().collect()
+    if let Some(failure) = infrastructure_result {
+        return Err(PackageVerificationError::fast_worker_infrastructure_failed(
+            context.layer_index,
+            failure.shard_index,
+            &failure.first_module,
+            match failure.kind {
+                PackageFastWorkerInfrastructureFailureKind::Spawn => {
+                    PackageVerificationErrorReason::FastWorkerSpawnFailed
+                }
+                PackageFastWorkerInfrastructureFailureKind::Join => {
+                    PackageVerificationErrorReason::FastWorkerJoinFailed
+                }
+            },
+        ));
+    }
+    Ok(PackageFastShardedLayerExecution {
+        results: shard_results.into_iter().flatten().collect(),
+        plan: Some(plan),
+    })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PackageFastWorkerInfrastructureFailureKind {
+    Spawn,
+    Join,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PackageFastWorkerInfrastructureFailure {
+    shard_index: usize,
+    first_module: Name,
+    kind: PackageFastWorkerInfrastructureFailureKind,
+}
+
+fn select_package_fast_worker_infrastructure_failure(
+    failures: impl IntoIterator<Item = PackageFastWorkerInfrastructureFailure>,
+) -> Option<PackageFastWorkerInfrastructureFailure> {
+    failures.into_iter().min_by_key(|failure| {
+        (
+            failure.shard_index,
+            match failure.kind {
+                PackageFastWorkerInfrastructureFailureKind::Spawn => 0usize,
+                PackageFastWorkerInfrastructureFailureKind::Join => 1usize,
+            },
+        )
+    })
 }
 
 fn plan_fast_verifier_shards(
     runnable: &[(usize, &PackageLockEntry)],
     graph: &PackageLockGraph,
     context_modules: &BTreeSet<Name>,
+    verified_modules_by_module: &BTreeMap<Name, PackageVerifiedModuleRecord>,
+    artifact_bytes: &BTreeMap<PackagePath, &[u8]>,
     jobs: usize,
 ) -> Option<PackageFastShardPlan> {
+    if runnable.is_empty() {
+        return Some(PackageFastShardPlan {
+            requested_jobs: jobs,
+            effective_jobs: 0,
+            reduction_reason: PackageFastShardReductionReason::RunnableWidth,
+            shared_base_context_bytes: 0,
+            per_worker_bytes: 0,
+            estimated_total_cost: 0,
+            overflowed: false,
+            module_costs: BTreeMap::new(),
+            shards: Vec::new(),
+        });
+    }
     let runnable_modules = runnable
         .iter()
         .map(|(_, entry)| entry.module.clone())
@@ -1837,38 +2430,248 @@ fn plan_fast_verifier_shards(
         }
     }
 
-    let shard_count = jobs.max(1).min(runnable.len().max(1));
-    let shard_size = runnable.len().div_ceil(shard_count).max(1);
-    let shards = (0..runnable.len())
-        .collect::<Vec<_>>()
-        .chunks(shard_size)
-        .map(|chunk| PackageFastShard {
-            member_indexes: chunk.to_vec(),
+    let mut module_costs = BTreeMap::new();
+    let mut members = Vec::with_capacity(runnable.len());
+    let mut largest_artifact_bytes = 0u64;
+    let mut estimated_total_cost = 0u64;
+    let mut overflowed = false;
+    for (member_index, (entry_index, entry)) in runnable.iter().enumerate() {
+        let bytes = artifact_bytes.get(&entry.certificate).copied()?;
+        let artifact_len = match u64::try_from(bytes.len()) {
+            Ok(value) => value,
+            Err(_) => {
+                overflowed = true;
+                u64::MAX
+            }
+        };
+        let direct_import_count =
+            match u64::try_from(graph.resolved_entry_imports[*entry_index].len()) {
+                Ok(value) => value,
+                Err(_) => {
+                    overflowed = true;
+                    u64::MAX
+                }
+            };
+        let estimate = package_module_cost_estimate_v1(artifact_len, direct_import_count);
+        overflowed |= estimate.overflowed;
+        largest_artifact_bytes = largest_artifact_bytes.max(artifact_len);
+        let (next_total, total_overflowed) =
+            saturating_add_u64(estimated_total_cost, estimate.estimated_cost);
+        estimated_total_cost = next_total;
+        overflowed |= total_overflowed;
+        module_costs.insert(member_index, estimate);
+        members.push((member_index, *entry_index, entry.module.clone(), estimate));
+    }
+
+    let mut shared_base_context_bytes = 0u64;
+    for record in verified_modules_by_module.values() {
+        let bytes = artifact_bytes
+            .get(&record.certificate)
+            .copied()
+            .expect("verified pre-layer module retains its supplied artifact");
+        let (artifact_len, conversion_overflowed) = match u64::try_from(bytes.len()) {
+            Ok(value) => (value, false),
+            Err(_) => (u64::MAX, true),
+        };
+        let (next, did_overflow) = saturating_add_u64(shared_base_context_bytes, artifact_len);
+        shared_base_context_bytes = next;
+        overflowed |= conversion_overflowed || did_overflow;
+    }
+
+    let memory = package_fast_shard_memory_estimate_v1(
+        jobs,
+        runnable.len(),
+        shared_base_context_bytes,
+        largest_artifact_bytes,
+        overflowed,
+    );
+    overflowed |= memory.overflowed;
+    let (shards, lpt_overflowed) = package_fast_lpt_shards(members, memory.effective_jobs);
+    overflowed |= lpt_overflowed;
+    Some(PackageFastShardPlan {
+        requested_jobs: jobs,
+        effective_jobs: memory.effective_jobs,
+        reduction_reason: memory.reduction_reason,
+        shared_base_context_bytes: memory.shared_base_context_bytes,
+        per_worker_bytes: memory.per_worker_bytes,
+        estimated_total_cost,
+        overflowed,
+        module_costs,
+        shards,
+    })
+}
+
+fn package_fast_lpt_shards(
+    mut members: Vec<(usize, usize, Name, PackageModuleCostEstimateV1)>,
+    effective_jobs: usize,
+) -> (Vec<PackageFastShard>, bool) {
+    let canonical_keys = members
+        .iter()
+        .map(|(member_index, entry_index, module, _)| {
+            (*member_index, (*entry_index, module.clone()))
+        })
+        .collect::<BTreeMap<_, _>>();
+    members.sort_by(|left, right| {
+        right
+            .3
+            .estimated_cost
+            .cmp(&left.3.estimated_cost)
+            .then_with(|| left.2.cmp(&right.2))
+            .then_with(|| left.1.cmp(&right.1))
+    });
+    let mut overflowed = false;
+    let mut shards = (0..effective_jobs)
+        .map(|_| PackageFastShard {
+            member_indexes: Vec::new(),
+            estimated_cost: 0,
+            artifact_bytes: 0,
+            overflowed: false,
         })
         .collect::<Vec<_>>();
-    Some(PackageFastShardPlan { shards })
+    for (member_index, _, _, estimate) in members {
+        let shard_index = shards
+            .iter()
+            .enumerate()
+            .min_by_key(|(shard_index, shard)| (shard.estimated_cost, *shard_index))
+            .map(|(shard_index, _)| shard_index)
+            .expect("non-empty layer has at least one effective shard");
+        let shard = &mut shards[shard_index];
+        shard.member_indexes.push(member_index);
+        let (estimated_cost, cost_overflowed) =
+            saturating_add_u64(shard.estimated_cost, estimate.estimated_cost);
+        shard.estimated_cost = estimated_cost;
+        let (artifact_total, artifact_overflowed) =
+            saturating_add_u64(shard.artifact_bytes, estimate.artifact_bytes);
+        shard.artifact_bytes = artifact_total;
+        shard.overflowed |= estimate.overflowed || cost_overflowed || artifact_overflowed;
+        overflowed |= shard.overflowed;
+    }
+    for shard in &mut shards {
+        shard
+            .member_indexes
+            .sort_by(|left, right| canonical_keys[left].cmp(&canonical_keys[right]));
+    }
+    (shards, overflowed)
+}
+
+fn package_module_cost_estimate_v1(
+    artifact_bytes: u64,
+    direct_import_count: u64,
+) -> PackageModuleCostEstimateV1 {
+    let (import_cost, multiply_overflowed) =
+        saturating_mul_u64(direct_import_count, PACKAGE_FAST_SHARD_IMPORT_WEIGHT_V1);
+    let (estimated_cost, add_overflowed) = saturating_add_u64(artifact_bytes, import_cost);
+    PackageModuleCostEstimateV1 {
+        artifact_bytes,
+        direct_import_count,
+        estimated_cost: estimated_cost.max(1),
+        overflowed: multiply_overflowed || add_overflowed,
+    }
+}
+
+fn package_fast_shard_memory_estimate_v1(
+    requested_jobs: usize,
+    runnable_width: usize,
+    shared_base_context_bytes: u64,
+    largest_runnable_artifact_bytes: u64,
+    prior_overflowed: bool,
+) -> PackageFastShardMemoryEstimateV1 {
+    let (scratch_bytes, scratch_overflowed) = saturating_mul_u64(
+        largest_runnable_artifact_bytes,
+        PACKAGE_FAST_SHARD_SCRATCH_MULTIPLIER_V1,
+    );
+    let worker_stack_bytes =
+        u64::try_from(PACKAGE_FAST_VERIFIER_WORKER_STACK_BYTES).unwrap_or(u64::MAX);
+    let (stack_and_fixed, fixed_overflowed) =
+        saturating_add_u64(worker_stack_bytes, PACKAGE_FAST_SHARD_FIXED_WORKER_BYTES_V1);
+    let (per_worker_bytes, worker_overflowed) = saturating_add_u64(stack_and_fixed, scratch_bytes);
+    let overflowed =
+        prior_overflowed || scratch_overflowed || fixed_overflowed || worker_overflowed;
+    let available_for_workers =
+        PACKAGE_FAST_SHARD_MEMORY_BUDGET_BYTES_V1.saturating_sub(shared_base_context_bytes);
+    let memory_jobs_u64 = if overflowed {
+        1
+    } else {
+        (available_for_workers / per_worker_bytes.max(1)).max(1)
+    };
+    let memory_jobs = usize::try_from(memory_jobs_u64).unwrap_or(usize::MAX);
+    let requested_jobs = requested_jobs.max(1);
+    let runnable_width = runnable_width.max(1);
+    let effective_jobs = requested_jobs.min(runnable_width).min(memory_jobs).max(1);
+    let memory_limited = shared_base_context_bytes >= PACKAGE_FAST_SHARD_MEMORY_BUDGET_BYTES_V1
+        || available_for_workers < per_worker_bytes
+        || effective_jobs < requested_jobs.min(runnable_width);
+    let reduction_reason = if overflowed {
+        PackageFastShardReductionReason::EstimateOverflow
+    } else if memory_limited {
+        PackageFastShardReductionReason::MemoryBudget
+    } else if requested_jobs == 1 {
+        PackageFastShardReductionReason::RequestedOne
+    } else if runnable_width < requested_jobs {
+        PackageFastShardReductionReason::RunnableWidth
+    } else {
+        PackageFastShardReductionReason::None
+    };
+    PackageFastShardMemoryEstimateV1 {
+        effective_jobs,
+        shared_base_context_bytes,
+        per_worker_bytes,
+        reduction_reason,
+        overflowed,
+    }
+}
+
+fn saturating_add_u64(left: u64, right: u64) -> (u64, bool) {
+    match left.checked_add(right) {
+        Some(value) => (value, false),
+        None => (u64::MAX, true),
+    }
+}
+
+fn saturating_mul_u64(left: u64, right: u64) -> (u64, bool) {
+    match left.checked_mul(right) {
+        Some(value) => (value, false),
+        None => (u64::MAX, true),
+    }
 }
 
 fn verify_fast_shard<'a>(
     runnable: &[(usize, &'a PackageLockEntry)],
     shard: &PackageFastShard,
-    artifact_bytes: &BTreeMap<PackagePath, &[u8]>,
-    mut session: VerifierSession,
-    policy: &AxiomPolicy,
-    decode_cache_config: &PackageVerificationDecodeCacheConfig,
+    context: PackageFastLayerContext<'_>,
+    worker_index: usize,
 ) -> Vec<PackageFastLayerWorkerResult<'a>> {
+    let observation = PackageFastWorkerObservation {
+        measurement_mode: context.measurement_mode,
+        worker_index,
+    };
+    let worker_started = observation.measurement_mode.is_enabled().then(Instant::now);
     let mut results = Vec::with_capacity(shard.member_indexes.len());
+    let mut declaration_details =
+        PackageFastWorkerDeclarationDetailCollector::new(PERFORMANCE_DECLARATION_DETAIL_LIMIT);
     for member_index in &shard.member_indexes {
         let (entry_index, entry) = runnable[*member_index];
-        results.push(verify_fast_worker(
+        let mut result = verify_fast_worker(
             entry_index,
             entry,
-            artifact_bytes,
-            &mut session,
-            policy,
-            decode_cache_config,
-        ));
+            context.artifact_bytes,
+            PackageFastWorkerImportContext::Borrowed {
+                resolved_imports: &context.graph.resolved_entry_imports[entry_index],
+                verified_modules_by_module: context.verified_modules_by_module,
+            },
+            context.policy,
+            context.decode_cache_config,
+            observation,
+        );
+        collect_worker_declaration_details(
+            &mut declaration_details,
+            &mut result,
+            observation.measurement_mode,
+        );
+        results.push(result);
     }
+    attach_collected_worker_declaration_details(&mut results, declaration_details);
+    attach_worker_timing(&mut results, observation.worker_index, worker_started);
     results
 }
 
@@ -1878,40 +2681,123 @@ fn verify_fast_layer_independent_serial<'a>(
     session: &VerifierSession,
     policy: &AxiomPolicy,
     decode_cache_config: &PackageVerificationDecodeCacheConfig,
+    measurement_mode: PerformanceMeasurementMode,
 ) -> Vec<PackageFastLayerWorkerResult<'a>> {
-    runnable
-        .iter()
-        .map(|(entry_index, entry)| {
-            let mut worker_session = session.clone();
-            verify_fast_worker(
-                *entry_index,
-                entry,
-                artifact_bytes,
-                &mut worker_session,
-                policy,
-                decode_cache_config,
-            )
-        })
-        .collect()
+    let worker_started = measurement_mode.is_enabled().then(Instant::now);
+    let mut results = Vec::with_capacity(runnable.len());
+    let mut declaration_details =
+        PackageFastWorkerDeclarationDetailCollector::new(PERFORMANCE_DECLARATION_DETAIL_LIMIT);
+    for (entry_index, entry) in runnable {
+        let mut worker_session = session.clone();
+        let mut result = verify_fast_worker(
+            *entry_index,
+            entry,
+            artifact_bytes,
+            PackageFastWorkerImportContext::Session(&mut worker_session),
+            policy,
+            decode_cache_config,
+            PackageFastWorkerObservation {
+                measurement_mode,
+                worker_index: 0,
+            },
+        );
+        collect_worker_declaration_details(&mut declaration_details, &mut result, measurement_mode);
+        results.push(result);
+    }
+    attach_collected_worker_declaration_details(&mut results, declaration_details);
+    attach_worker_timing(&mut results, 0, worker_started);
+    results
+}
+
+fn collect_worker_declaration_details(
+    collector: &mut PackageFastWorkerDeclarationDetailCollector,
+    result: &mut PackageFastLayerWorkerResult<'_>,
+    measurement_mode: PerformanceMeasurementMode,
+) {
+    if measurement_mode.is_detailed() {
+        collector.record_observation(result.measurement_observation_mut());
+    }
+}
+
+fn attach_collected_worker_declaration_details(
+    results: &mut [PackageFastLayerWorkerResult<'_>],
+    collector: PackageFastWorkerDeclarationDetailCollector,
+) {
+    let declarations = collector.into_details();
+    if declarations.is_empty() {
+        return;
+    }
+    results
+        .first_mut()
+        .expect("non-empty details come from a worker result")
+        .set_worker_declaration_details(declarations);
+}
+
+fn attach_worker_timing(
+    results: &mut [PackageFastLayerWorkerResult<'_>],
+    worker_index: usize,
+    started: Option<Instant>,
+) {
+    let Some(first) = results.first_mut() else {
+        return;
+    };
+    first.set_worker_timing(PackageFastWorkerTiming {
+        worker_index,
+        active_elapsed_ns: elapsed_nanos_if_started(started),
+        idle_elapsed_ns: 0,
+    });
+}
+
+enum PackageFastWorkerImportContext<'a> {
+    Session(&'a mut VerifierSession),
+    Borrowed {
+        resolved_imports: &'a [PackageLockResolvedImport],
+        verified_modules_by_module: &'a BTreeMap<Name, PackageVerifiedModuleRecord>,
+    },
 }
 
 fn verify_fast_worker<'a>(
     entry_index: usize,
     entry: &'a PackageLockEntry,
     artifact_bytes: &BTreeMap<PackagePath, &[u8]>,
-    session: &mut VerifierSession,
+    import_context: PackageFastWorkerImportContext<'_>,
     policy: &AxiomPolicy,
     decode_cache_config: &PackageVerificationDecodeCacheConfig,
+    observation: PackageFastWorkerObservation,
 ) -> PackageFastLayerWorkerResult<'a> {
-    match verify_lock_entry(
-        entry_index,
-        entry,
-        artifact_bytes,
-        session,
-        policy,
-        decode_cache_config,
-    ) {
-        Ok((verified_module, decode_cache_counters)) => {
+    let checker_started = observation.measurement_mode.is_enabled().then(Instant::now);
+    let mut measurement_observation =
+        PackageEntryCheckObservation::new(observation.measurement_mode);
+    let verification = match import_context {
+        PackageFastWorkerImportContext::Session(session) => verify_lock_entry_observed(
+            entry_index,
+            entry,
+            artifact_bytes,
+            session,
+            policy,
+            decode_cache_config,
+            &mut measurement_observation,
+        ),
+        PackageFastWorkerImportContext::Borrowed {
+            resolved_imports,
+            verified_modules_by_module,
+        } => verify_lock_entry_with_context_observed(
+            entry_index,
+            entry,
+            artifact_bytes,
+            PackageFastWorkerImportContext::Borrowed {
+                resolved_imports,
+                verified_modules_by_module,
+            },
+            policy,
+            decode_cache_config,
+            &mut measurement_observation,
+        ),
+    };
+    let checker_elapsed_ns = elapsed_nanos_if_started(checker_started);
+    match verification {
+        Ok(verified_module) => {
+            let decode_cache_counters = measurement_observation.decode_cache_counters;
             let record = PackageVerifiedModuleRecord {
                 module: entry.module.clone(),
                 origin: entry.origin,
@@ -1923,6 +2809,7 @@ fn verify_fast_worker<'a>(
                 verified_module,
             };
             PackageFastLayerWorkerResult::Passed {
+                entry_index,
                 entry,
                 result: module_result(
                     entry,
@@ -1932,18 +2819,32 @@ fn verify_fast_worker<'a>(
                 ),
                 record: Box::new(record),
                 decode_cache_counters,
+                measurement_observation,
+                checker_elapsed_ns,
+                worker_index: observation.worker_index,
+                worker_timing: None,
+                worker_declaration_details: None,
             }
         }
-        Err(error) => PackageFastLayerWorkerResult::Failed {
-            entry,
-            result: module_result(
+        Err(error) => {
+            let decode_cache_counters = measurement_observation.decode_cache_counters;
+            PackageFastLayerWorkerResult::Failed {
+                entry_index,
                 entry,
-                PackageModuleVerificationStatus::Failed,
-                Some(error),
-                PackageVerificationMode::FastKernel,
-            ),
-            decode_cache_counters: PackageVerificationDecodeCacheCounters::default(),
-        },
+                result: module_result(
+                    entry,
+                    PackageModuleVerificationStatus::Failed,
+                    Some(error),
+                    PackageVerificationMode::FastKernel,
+                ),
+                decode_cache_counters,
+                measurement_observation,
+                checker_elapsed_ns,
+                worker_index: observation.worker_index,
+                worker_timing: None,
+                worker_declaration_details: None,
+            }
+        }
     }
 }
 
@@ -2118,6 +3019,7 @@ fn verify_package_fast_source_free_with_cached_hits<'a>(
         modules: results,
         memo_counters: PackageVerificationMemoCounters::default(),
         decode_cache_counters: None,
+        measurements: None,
     })
 }
 
@@ -2256,8 +3158,8 @@ pub(crate) fn verify_package_reference_source_free_execution_with_validation<'a>
         validated,
         PackageVerificationMode::Reference,
     )
-    .with_process_local_cache(options.collect_decode_cache_counters)
-    .with_persistent_import_context_export_cache(options.collect_decode_cache_counters);
+    .with_process_local_cache(options.decode_cache.process_local())
+    .with_persistent_import_context_export_cache(options.decode_cache.persistent());
     let mut memo_run = PackageVerificationMemoRun::for_run(
         &options,
         validated,
@@ -2273,6 +3175,7 @@ pub(crate) fn verify_package_reference_source_free_execution_with_validation<'a>
     let mut results = Vec::with_capacity(graph.topological_order.len());
     let mut failed_module = None::<Name>;
     let mut decode_cache_counters = PackageVerificationDecodeCacheCounters::default();
+    let mut measurement_state = PackageVerifierMeasurementState::new(options.measurement_mode);
 
     for module in graph
         .topological_order
@@ -2297,6 +3200,15 @@ pub(crate) fn verify_package_reference_source_free_execution_with_validation<'a>
 
         match memo_run.lookup(&entry.module) {
             Some(PackageVerificationMemoEntry::ReferencePassed { result, checked }) => {
+                if let Some(measurements) = measurement_state.as_mut() {
+                    let mut observation =
+                        PackageEntryCheckObservation::new(options.measurement_mode);
+                    if let Some(bytes) = artifact_bytes.get(&entry.certificate).copied() {
+                        observation.observe_certificate_bytes(bytes);
+                    }
+                    observation.observe_reference_declaration_count(checked.declaration_count());
+                    measurements.record_module(entry, &observation, 0, None, false);
+                }
                 record_reference_checked_module_for_dependents(
                     &mut checked_by_module,
                     &remaining_import_uses,
@@ -2323,7 +3235,9 @@ pub(crate) fn verify_package_reference_source_free_execution_with_validation<'a>
         }
 
         let resolved_imports = &graph.resolved_entry_imports[*entry_index];
-        match verify_reference_lock_entry(
+        let checker_started = options.measurement_mode.is_enabled().then(Instant::now);
+        let mut observation = PackageEntryCheckObservation::new(options.measurement_mode);
+        let verification = verify_reference_lock_entry_observed(
             *entry_index,
             entry,
             resolved_imports,
@@ -2335,9 +3249,29 @@ pub(crate) fn verify_package_reference_source_free_execution_with_validation<'a>
                 policy: &policy,
                 decode_cache_config: &decode_cache_config,
             },
-        ) {
-            Ok((checked, counters)) => {
-                decode_cache_counters.add(counters);
+            &mut observation,
+        );
+        let checker_elapsed_ns = elapsed_nanos_if_started(checker_started);
+        decode_cache_counters.add(observation.decode_cache_counters);
+        if let Some(measurements) = measurement_state.as_mut() {
+            measurements.record_module(
+                entry,
+                &observation,
+                checker_elapsed_ns,
+                Some(0),
+                observation.checker_reached,
+            );
+            measurements.record_worker_timing(
+                PackageFastWorkerTiming {
+                    worker_index: 0,
+                    active_elapsed_ns: checker_elapsed_ns,
+                    idle_elapsed_ns: 0,
+                },
+                false,
+            );
+        }
+        match verification {
+            Ok(checked) => {
                 let result = module_result(
                     entry,
                     PackageModuleVerificationStatus::Passed,
@@ -2398,6 +3332,19 @@ pub(crate) fn verify_package_reference_source_free_execution_with_validation<'a>
         PackageVerificationStatus::Passed
     };
     let verdict_source = PackageVerificationVerdictSource::ReferenceChecker;
+    let measured_decode_counters = options
+        .collect_decode_cache_counters
+        .then_some(decode_cache_counters);
+    let measurements = package_measurement_report(PackageMeasurementReportInput {
+        options: &options,
+        lock,
+        entries: &entries,
+        artifact_bytes: Some(&artifact_bytes),
+        modules: &results,
+        measurements: measurement_state.as_ref(),
+        memo_counters: memo_run.counters(),
+        decode_cache_counters,
+    });
 
     Ok(PackageVerificationReport {
         mode: PackageVerificationMode::Reference,
@@ -2412,9 +3359,8 @@ pub(crate) fn verify_package_reference_source_free_execution_with_validation<'a>
         topological_order,
         modules: results,
         memo_counters: memo_run.counters(),
-        decode_cache_counters: options
-            .collect_decode_cache_counters
-            .then_some(decode_cache_counters),
+        decode_cache_counters: measured_decode_counters,
+        measurements,
     })
 }
 
@@ -2439,14 +3385,15 @@ fn verify_package_reference_source_free_from_root_execution(
         validated,
         PackageVerificationMode::Reference,
     )
-    .with_process_local_cache(options.collect_decode_cache_counters)
-    .with_persistent_import_context_export_cache(options.collect_decode_cache_counters);
+    .with_process_local_cache(options.decode_cache.process_local())
+    .with_persistent_import_context_export_cache(options.decode_cache.persistent());
     let mut checked_by_module = BTreeMap::<Name, ReferenceCheckedModule>::new();
     let mut remaining_import_uses =
         reference_import_use_counts(&entries, &graph, &execution_modules);
     let mut results = Vec::with_capacity(execution_modules.len());
     let mut failed_module = None::<Name>;
     let mut decode_cache_counters = PackageVerificationDecodeCacheCounters::default();
+    let mut measurement_state = PackageVerifierMeasurementState::new(options.measurement_mode);
 
     for module in graph
         .topological_order
@@ -2486,7 +3433,9 @@ fn verify_package_reference_source_free_from_root_execution(
         };
 
         let resolved_imports = &graph.resolved_entry_imports[*entry_index];
-        match verify_reference_lock_entry_bytes(
+        let checker_started = options.measurement_mode.is_enabled().then(Instant::now);
+        let mut observation = PackageEntryCheckObservation::new(options.measurement_mode);
+        let verification = verify_reference_lock_entry_bytes_observed(
             *entry_index,
             entry,
             resolved_imports,
@@ -2498,9 +3447,29 @@ fn verify_package_reference_source_free_from_root_execution(
                 policy: &policy,
                 decode_cache_config: &decode_cache_config,
             },
-        ) {
-            Ok((checked, counters)) => {
-                decode_cache_counters.add(counters);
+            &mut observation,
+        );
+        let checker_elapsed_ns = elapsed_nanos_if_started(checker_started);
+        decode_cache_counters.add(observation.decode_cache_counters);
+        if let Some(measurements) = measurement_state.as_mut() {
+            measurements.record_module(
+                entry,
+                &observation,
+                checker_elapsed_ns,
+                Some(0),
+                observation.checker_reached,
+            );
+            measurements.record_worker_timing(
+                PackageFastWorkerTiming {
+                    worker_index: 0,
+                    active_elapsed_ns: checker_elapsed_ns,
+                    idle_elapsed_ns: 0,
+                },
+                false,
+            );
+        }
+        match verification {
+            Ok(checked) => {
                 let result = module_result(
                     entry,
                     PackageModuleVerificationStatus::Passed,
@@ -2548,6 +3517,19 @@ fn verify_package_reference_source_free_from_root_execution(
         PackageVerificationStatus::Passed
     };
     let verdict_source = PackageVerificationVerdictSource::ReferenceChecker;
+    let measured_decode_counters = options
+        .collect_decode_cache_counters
+        .then_some(decode_cache_counters);
+    let measurements = package_measurement_report(PackageMeasurementReportInput {
+        options: &options,
+        lock,
+        entries: &entries,
+        artifact_bytes: None,
+        modules: &results,
+        measurements: measurement_state.as_ref(),
+        memo_counters: PackageVerificationMemoCounters::default(),
+        decode_cache_counters,
+    });
 
     Ok(PackageVerificationReport {
         mode: PackageVerificationMode::Reference,
@@ -2562,9 +3544,8 @@ fn verify_package_reference_source_free_from_root_execution(
         topological_order,
         modules: results,
         memo_counters: PackageVerificationMemoCounters::default(),
-        decode_cache_counters: options
-            .collect_decode_cache_counters
-            .then_some(decode_cache_counters),
+        decode_cache_counters: measured_decode_counters,
+        measurements,
     })
 }
 
@@ -2762,6 +3743,7 @@ fn verify_package_reference_source_free_with_cached_hits<'a>(
         modules: results,
         memo_counters: PackageVerificationMemoCounters::default(),
         decode_cache_counters: None,
+        measurements: None,
     })
 }
 
@@ -3071,6 +4053,1062 @@ fn artifact_byte_map<'a>(
     Ok(artifact_bytes)
 }
 
+#[derive(Debug, Default)]
+struct PackageEntryCheckObservation {
+    measurement_mode: PerformanceMeasurementMode,
+    checker_reached: bool,
+    decode_cache_counters: PackageVerificationDecodeCacheCounters,
+    physical_certificate_decodes: u64,
+    certificate_bytes: u64,
+    declaration_count: u64,
+    declaration_attempted: u64,
+    declarations: Vec<PerformanceDeclarationMeasurement>,
+}
+
+impl PackageEntryCheckObservation {
+    fn new(measurement_mode: PerformanceMeasurementMode) -> Self {
+        Self {
+            measurement_mode,
+            ..Self::default()
+        }
+    }
+
+    fn observe_certificate_bytes(&mut self, bytes: &[u8]) {
+        if self.measurement_mode.is_enabled() {
+            self.checker_reached = true;
+            self.certificate_bytes = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        }
+    }
+
+    fn observe_fast_certificate(&mut self, module: &Name, certificate: &ModuleCert) {
+        self.observe_certificate_parts(
+            module,
+            &certificate.name_table,
+            &certificate.term_table,
+            &certificate.declarations,
+        );
+    }
+
+    fn observe_verified_module(&mut self, module: &Name, verified: &VerifiedModule) {
+        self.observe_certificate_parts(
+            module,
+            verified.name_table(),
+            verified.term_table(),
+            verified.declarations(),
+        );
+    }
+
+    fn observe_reference_declaration_count(&mut self, declaration_count: usize) {
+        if !self.measurement_mode.is_enabled() {
+            return;
+        }
+        self.declaration_count = u64::try_from(declaration_count).unwrap_or(u64::MAX);
+    }
+
+    fn observe_reference_certificate(
+        &mut self,
+        module: &Name,
+        observation: &ReferenceCheckObservation,
+    ) {
+        if !self.measurement_mode.is_enabled() {
+            return;
+        }
+        self.declaration_count = u64::try_from(observation.declaration_count).unwrap_or(u64::MAX);
+        self.declaration_attempted = self.declaration_count;
+        if !self.measurement_mode.is_detailed() {
+            return;
+        }
+        self.declarations = observation
+            .declarations
+            .iter()
+            .take(PERFORMANCE_DECLARATION_DETAIL_LIMIT)
+            .map(|declaration| PerformanceDeclarationMeasurement {
+                module: module.as_dotted(),
+                declaration_index: u64::try_from(declaration.declaration_index).unwrap_or(u64::MAX),
+                declaration: declaration.declaration.dotted(),
+                term_nodes: u64::try_from(declaration.term_nodes).unwrap_or(u64::MAX),
+                elaboration_elapsed_ns: 0,
+            })
+            .collect();
+    }
+
+    fn observe_certificate_parts(
+        &mut self,
+        module: &Name,
+        name_table: &[Name],
+        term_table: &[TermNode],
+        declarations: &[DeclCert],
+    ) {
+        if !self.measurement_mode.is_enabled() {
+            return;
+        }
+        self.declaration_count = u64::try_from(declarations.len()).unwrap_or(u64::MAX);
+        self.declaration_attempted = self.declaration_count;
+        if !self.measurement_mode.is_detailed() {
+            return;
+        }
+        self.declarations = declarations
+            .iter()
+            .take(PERFORMANCE_DECLARATION_DETAIL_LIMIT)
+            .enumerate()
+            .map(
+                |(declaration_index, declaration)| PerformanceDeclarationMeasurement {
+                    module: module.as_dotted(),
+                    declaration_index: u64::try_from(declaration_index).unwrap_or(u64::MAX),
+                    declaration: certificate_declaration_name(
+                        name_table,
+                        declaration,
+                        declaration_index,
+                    ),
+                    term_nodes: certificate_declaration_term_nodes(term_table, declaration),
+                    elaboration_elapsed_ns: 0,
+                },
+            )
+            .collect();
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct PackageFastWorkerTiming {
+    worker_index: usize,
+    active_elapsed_ns: u64,
+    idle_elapsed_ns: u64,
+}
+
+struct PackageFastWorkerDeclarationDetailCollector {
+    limit: usize,
+    retained: BTreeMap<(String, u64, String), PerformanceDeclarationMeasurement>,
+}
+
+impl PackageFastWorkerDeclarationDetailCollector {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            retained: BTreeMap::new(),
+        }
+    }
+
+    fn record_observation(&mut self, observation: &mut PackageEntryCheckObservation) {
+        self.record_details(observation.declarations.drain(..));
+    }
+
+    fn record_details(
+        &mut self,
+        declarations: impl IntoIterator<Item = PerformanceDeclarationMeasurement>,
+    ) {
+        for declaration in declarations {
+            self.retained.insert(
+                (
+                    declaration.module.clone(),
+                    declaration.declaration_index,
+                    declaration.declaration.clone(),
+                ),
+                declaration,
+            );
+            while self.retained.len() > self.limit {
+                self.retained.pop_last();
+            }
+        }
+    }
+
+    fn into_details(self) -> Vec<PerformanceDeclarationMeasurement> {
+        self.retained.into_values().collect()
+    }
+}
+
+struct PackageFastExecutionCostObservation {
+    modules: BTreeMap<Name, PerformancePackageModuleShardingMeasurement>,
+    critical_path_cost: u64,
+    critical_path_module_count: u64,
+    critical_path_identity: String,
+    overflowed: bool,
+}
+
+#[derive(Clone)]
+struct PackageFastCriticalPathState {
+    cost: u64,
+    modules: Vec<Name>,
+    overflowed: bool,
+}
+
+fn package_fast_execution_cost_observation(
+    entries: &[(usize, &PackageLockEntry)],
+    graph: &PackageLockGraph,
+    execution_modules: &BTreeSet<Name>,
+    execution_layers: &[Vec<Name>],
+    artifact_bytes: &BTreeMap<PackagePath, &[u8]>,
+) -> Option<PackageFastExecutionCostObservation> {
+    let entries_by_module = entries
+        .iter()
+        .map(|(entry_index, entry)| (entry.module.clone(), (*entry_index, *entry)))
+        .collect::<BTreeMap<_, _>>();
+    let layer_by_module = execution_layers
+        .iter()
+        .enumerate()
+        .flat_map(|(layer_index, layer)| {
+            layer
+                .iter()
+                .cloned()
+                .map(move |module| (module, layer_index))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut modules = BTreeMap::new();
+    let mut paths = BTreeMap::<Name, PackageFastCriticalPathState>::new();
+    let mut overflowed = false;
+    for module in graph
+        .topological_order
+        .iter()
+        .filter(|module| execution_modules.contains(*module))
+    {
+        let (entry_index, entry) = entries_by_module.get(module).copied()?;
+        let bytes = artifact_bytes.get(&entry.certificate).copied()?;
+        let artifact_bytes = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        let direct_import_count =
+            u64::try_from(graph.resolved_entry_imports[entry_index].len()).unwrap_or(u64::MAX);
+        let estimate = package_module_cost_estimate_v1(artifact_bytes, direct_import_count);
+        overflowed |= estimate.overflowed;
+        modules.insert(
+            module.clone(),
+            PerformancePackageModuleShardingMeasurement {
+                cost_model: PerformancePackageShardCostModel::FastShardCostV1,
+                artifact_bytes: estimate.artifact_bytes,
+                direct_import_count: estimate.direct_import_count,
+                estimated_cost: estimate.estimated_cost,
+                layer_index: layer_by_module
+                    .get(module)
+                    .and_then(|index| u64::try_from(*index).ok()),
+                shard_index: None,
+                cost_overflowed: estimate.overflowed,
+                critical_path: false,
+            },
+        );
+        let mut best_prefix = graph.resolved_entry_imports[entry_index]
+            .iter()
+            .filter(|import| execution_modules.contains(&import.module))
+            .filter_map(|import| paths.get(&import.module).cloned())
+            .max_by(|left, right| {
+                left.cost
+                    .cmp(&right.cost)
+                    .then_with(|| right.modules.cmp(&left.modules))
+            })
+            .unwrap_or(PackageFastCriticalPathState {
+                cost: 0,
+                modules: Vec::new(),
+                overflowed: false,
+            });
+        let (cost, cost_overflowed) = saturating_add_u64(best_prefix.cost, estimate.estimated_cost);
+        best_prefix.cost = cost;
+        best_prefix.modules.push(module.clone());
+        best_prefix.overflowed |= estimate.overflowed || cost_overflowed;
+        overflowed |= best_prefix.overflowed;
+        paths.insert(module.clone(), best_prefix);
+    }
+    let critical_path = paths
+        .into_values()
+        .max_by(|left, right| {
+            left.cost
+                .cmp(&right.cost)
+                .then_with(|| right.modules.cmp(&left.modules))
+        })
+        .unwrap_or(PackageFastCriticalPathState {
+            cost: 0,
+            modules: Vec::new(),
+            overflowed: false,
+        });
+    for module in &critical_path.modules {
+        if let Some(measurement) = modules.get_mut(module) {
+            measurement.critical_path = true;
+        }
+    }
+    let mut identity_bytes = Vec::new();
+    identity_bytes.extend_from_slice(
+        PerformancePackageShardCostModel::FastShardCostV1
+            .as_str()
+            .as_bytes(),
+    );
+    identity_bytes.push(0);
+    for module in &critical_path.modules {
+        let dotted = module.as_dotted();
+        identity_bytes.extend_from_slice(
+            &u64::try_from(dotted.len())
+                .unwrap_or(u64::MAX)
+                .to_be_bytes(),
+        );
+        identity_bytes.extend_from_slice(dotted.as_bytes());
+        identity_bytes.extend_from_slice(
+            &modules
+                .get(module)
+                .expect("critical path module has a cost measurement")
+                .estimated_cost
+                .to_be_bytes(),
+        );
+    }
+    Some(PackageFastExecutionCostObservation {
+        modules,
+        critical_path_cost: critical_path.cost,
+        critical_path_module_count: u64::try_from(critical_path.modules.len()).unwrap_or(u64::MAX),
+        critical_path_identity: format_package_hash(&package_file_hash(&identity_bytes)),
+        overflowed: overflowed || critical_path.overflowed,
+    })
+}
+
+#[derive(Debug)]
+struct PackageVerifierMeasurementState {
+    mode: PerformanceMeasurementMode,
+    modules_checked: u64,
+    modules_decoded: u64,
+    certificate_bytes: u64,
+    declarations: u64,
+    coarse_stage_clock_reads: u64,
+    worker_active_elapsed_ns: u64,
+    worker_idle_elapsed_ns: u64,
+    coordinator_merge_elapsed_ns: u64,
+    effective_jobs: usize,
+    module_details: BTreeMap<String, PerformanceModuleMeasurement>,
+    declaration_details: BTreeMap<(String, u64, String), PerformanceDeclarationMeasurement>,
+    declaration_attempted: u64,
+    workers: BTreeMap<usize, PerformanceWorkerMeasurement>,
+    package_sharding: Option<PerformancePackageShardingMeasurement>,
+    package_module_sharding: BTreeMap<Name, PerformancePackageModuleShardingMeasurement>,
+    package_layers: BTreeMap<u64, PerformancePackageLayerMeasurement>,
+    package_layer_attempted: u64,
+    package_shards: BTreeMap<(u64, u64), PerformancePackageShardMeasurement>,
+    package_shard_attempted: u64,
+    package_shard_estimated_cost: u64,
+    package_shard_elapsed_ns: u64,
+    package_shard_modules: u64,
+    package_shard_bytes: u64,
+    package_max_layer_width: u64,
+    package_avoided_base_context_clones: u64,
+    package_avoided_base_context_clone_bytes: u64,
+    package_estimate_overflowed: bool,
+}
+
+impl PackageVerifierMeasurementState {
+    fn new(mode: PerformanceMeasurementMode) -> Option<Self> {
+        mode.is_enabled().then(|| Self {
+            mode,
+            modules_checked: 0,
+            modules_decoded: 0,
+            certificate_bytes: 0,
+            declarations: 0,
+            coarse_stage_clock_reads: 0,
+            worker_active_elapsed_ns: 0,
+            worker_idle_elapsed_ns: 0,
+            coordinator_merge_elapsed_ns: 0,
+            effective_jobs: 0,
+            module_details: BTreeMap::new(),
+            declaration_details: BTreeMap::new(),
+            declaration_attempted: 0,
+            workers: BTreeMap::new(),
+            package_sharding: None,
+            package_module_sharding: BTreeMap::new(),
+            package_layers: BTreeMap::new(),
+            package_layer_attempted: 0,
+            package_shards: BTreeMap::new(),
+            package_shard_attempted: 0,
+            package_shard_estimated_cost: 0,
+            package_shard_elapsed_ns: 0,
+            package_shard_modules: 0,
+            package_shard_bytes: 0,
+            package_max_layer_width: 0,
+            package_avoided_base_context_clones: 0,
+            package_avoided_base_context_clone_bytes: 0,
+            package_estimate_overflowed: false,
+        })
+    }
+
+    fn configure_fast_sharding(
+        &mut self,
+        requested_jobs: usize,
+        observation: PackageFastExecutionCostObservation,
+    ) {
+        self.package_estimate_overflowed |= observation.overflowed;
+        self.package_module_sharding = observation.modules;
+        self.package_sharding = Some(PerformancePackageShardingMeasurement {
+            cost_model: PerformancePackageShardCostModel::FastShardCostV1,
+            memory_model: PerformancePackageShardMemoryModel::FastShardMemoryV1,
+            import_weight: PACKAGE_FAST_SHARD_IMPORT_WEIGHT_V1,
+            memory_budget_bytes: PACKAGE_FAST_SHARD_MEMORY_BUDGET_BYTES_V1,
+            fixed_worker_bytes: PACKAGE_FAST_SHARD_FIXED_WORKER_BYTES_V1,
+            scratch_multiplier: PACKAGE_FAST_SHARD_SCRATCH_MULTIPLIER_V1,
+            requested_jobs: u64::try_from(requested_jobs).unwrap_or(u64::MAX),
+            effective_jobs: 0,
+            reduction_reason: PerformancePackageShardReductionReason::None,
+            shared_base_context_bytes: 0,
+            per_worker_bytes: 0,
+            avoided_base_context_clone_bytes: 0,
+            estimate_overflowed: observation.overflowed,
+            critical_path_cost: observation.critical_path_cost,
+            critical_path_module_count: observation.critical_path_module_count,
+            critical_path_identity: observation.critical_path_identity,
+            critical_path_checker_elapsed_ns: 0,
+            barrier_elapsed_ns: 0,
+        });
+    }
+
+    fn record_fast_layer(
+        &mut self,
+        layer_index: usize,
+        runnable: &[(usize, &PackageLockEntry)],
+        plan: &PackageFastShardPlan,
+        layer_elapsed_ns: u64,
+        results: &[PackageFastLayerWorkerResult<'_>],
+    ) {
+        self.effective_jobs = self.effective_jobs.max(plan.effective_jobs);
+        self.package_max_layer_width = self
+            .package_max_layer_width
+            .max(u64::try_from(runnable.len()).unwrap_or(u64::MAX));
+        self.package_estimate_overflowed |= plan.overflowed;
+        let avoided_clones = u64::try_from(plan.effective_jobs).unwrap_or(u64::MAX);
+        let (avoided_base_context_clones, avoided_clones_overflowed) =
+            saturating_add_u64(self.package_avoided_base_context_clones, avoided_clones);
+        self.package_avoided_base_context_clones = avoided_base_context_clones;
+        let (avoided_clone_bytes, clone_bytes_overflowed) = plan.avoided_base_context_clone_bytes();
+        let (avoided_base_context_clone_bytes, clone_sum_overflowed) = saturating_add_u64(
+            self.package_avoided_base_context_clone_bytes,
+            avoided_clone_bytes,
+        );
+        self.package_avoided_base_context_clone_bytes = avoided_base_context_clone_bytes;
+        self.package_estimate_overflowed |=
+            avoided_clones_overflowed || clone_bytes_overflowed || clone_sum_overflowed;
+        let (barrier_elapsed_ns, barrier_elapsed_overflowed) = saturating_add_u64(
+            self.package_sharding
+                .as_ref()
+                .map(|summary| summary.barrier_elapsed_ns)
+                .unwrap_or(0),
+            layer_elapsed_ns,
+        );
+        self.package_estimate_overflowed |= barrier_elapsed_overflowed;
+        if let Some(summary) = self.package_sharding.as_mut() {
+            summary.effective_jobs = summary
+                .effective_jobs
+                .max(u64::try_from(plan.effective_jobs).unwrap_or(u64::MAX));
+            let reduction_reason = plan.reduction_reason.measurement();
+            if reduction_reason > summary.reduction_reason {
+                summary.reduction_reason = reduction_reason;
+            }
+            summary.shared_base_context_bytes = summary
+                .shared_base_context_bytes
+                .max(plan.shared_base_context_bytes);
+            summary.per_worker_bytes = summary.per_worker_bytes.max(plan.per_worker_bytes);
+            summary.avoided_base_context_clone_bytes =
+                self.package_avoided_base_context_clone_bytes;
+            summary.estimate_overflowed |= plan.overflowed
+                || avoided_clones_overflowed
+                || clone_bytes_overflowed
+                || clone_sum_overflowed
+                || barrier_elapsed_overflowed;
+            summary.barrier_elapsed_ns = barrier_elapsed_ns;
+        }
+        let layer_index_u64 = u64::try_from(layer_index).unwrap_or(u64::MAX);
+        if self.mode.is_detailed() {
+            self.package_layer_attempted = self.package_layer_attempted.saturating_add(1);
+            self.package_layers.insert(
+                layer_index_u64,
+                PerformancePackageLayerMeasurement {
+                    layer_index: layer_index_u64,
+                    runnable_width: u64::try_from(runnable.len()).unwrap_or(u64::MAX),
+                    estimated_total_cost: plan.estimated_total_cost,
+                    estimated_max_shard_cost: plan.estimated_max_shard_cost(),
+                    requested_jobs: u64::try_from(plan.requested_jobs).unwrap_or(u64::MAX),
+                    effective_jobs: u64::try_from(plan.effective_jobs).unwrap_or(u64::MAX),
+                    reduction_reason: plan.reduction_reason.measurement(),
+                    shared_base_context_bytes: plan.shared_base_context_bytes,
+                    per_worker_bytes: plan.per_worker_bytes,
+                    memory_budget_bytes: PACKAGE_FAST_SHARD_MEMORY_BUDGET_BYTES_V1,
+                    estimate_overflowed: plan.overflowed,
+                    elapsed_ns: layer_elapsed_ns,
+                },
+            );
+            while self.package_layers.len() > PERFORMANCE_MODULE_DETAIL_LIMIT {
+                self.package_layers.pop_last();
+            }
+        }
+        for (shard_index, shard) in plan.shards.iter().enumerate() {
+            let active_elapsed_ns = results
+                .iter()
+                .filter(|result| result.worker_index() == shard_index)
+                .filter_map(PackageFastLayerWorkerResult::worker_timing)
+                .map(|timing| timing.active_elapsed_ns)
+                .next()
+                .unwrap_or(0);
+            let (shard_estimated_cost, shard_cost_overflowed) =
+                saturating_add_u64(self.package_shard_estimated_cost, shard.estimated_cost);
+            self.package_shard_estimated_cost = shard_estimated_cost;
+            let (shard_elapsed_ns, shard_elapsed_overflowed) =
+                saturating_add_u64(self.package_shard_elapsed_ns, active_elapsed_ns);
+            self.package_shard_elapsed_ns = shard_elapsed_ns;
+            let (shard_modules, shard_modules_overflowed) = saturating_add_u64(
+                self.package_shard_modules,
+                u64::try_from(shard.member_indexes.len()).unwrap_or(u64::MAX),
+            );
+            self.package_shard_modules = shard_modules;
+            let (shard_bytes, shard_bytes_overflowed) =
+                saturating_add_u64(self.package_shard_bytes, shard.artifact_bytes);
+            self.package_shard_bytes = shard_bytes;
+            self.package_estimate_overflowed |= shard.overflowed
+                || shard_cost_overflowed
+                || shard_elapsed_overflowed
+                || shard_modules_overflowed
+                || shard_bytes_overflowed;
+            let shard_index_u64 = u64::try_from(shard_index).unwrap_or(u64::MAX);
+            for member_index in &shard.member_indexes {
+                let entry = runnable[*member_index].1;
+                if let Some(module) = self.package_module_sharding.get_mut(&entry.module) {
+                    module.layer_index = Some(layer_index_u64);
+                    module.shard_index = Some(shard_index_u64);
+                }
+            }
+            if self.mode.is_detailed() {
+                self.package_shard_attempted = self.package_shard_attempted.saturating_add(1);
+                self.package_shards.insert(
+                    (layer_index_u64, shard_index_u64),
+                    PerformancePackageShardMeasurement {
+                        layer_index: layer_index_u64,
+                        shard_index: shard_index_u64,
+                        estimated_cost: shard.estimated_cost,
+                        artifact_bytes: shard.artifact_bytes,
+                        member_count: u64::try_from(shard.member_indexes.len()).unwrap_or(u64::MAX),
+                        active_elapsed_ns,
+                        estimate_overflowed: shard.overflowed,
+                    },
+                );
+                while self.package_shards.len() > PERFORMANCE_WORKER_DETAIL_LIMIT {
+                    self.package_shards.pop_last();
+                }
+            }
+        }
+    }
+
+    fn record_module(
+        &mut self,
+        entry: &PackageLockEntry,
+        observation: &PackageEntryCheckObservation,
+        checker_elapsed_ns: u64,
+        worker_index: Option<usize>,
+        checker_reached: bool,
+    ) {
+        if checker_reached {
+            self.modules_checked = self.modules_checked.saturating_add(1);
+        }
+        if worker_index.is_some() {
+            self.coarse_stage_clock_reads = self.coarse_stage_clock_reads.saturating_add(1);
+        }
+        self.modules_decoded = self
+            .modules_decoded
+            .saturating_add(observation.physical_certificate_decodes);
+        self.certificate_bytes = self
+            .certificate_bytes
+            .saturating_add(observation.certificate_bytes);
+        self.declarations = self
+            .declarations
+            .saturating_add(observation.declaration_count);
+        let module = entry.module.as_dotted();
+        if self.mode.is_detailed() {
+            let package_sharding = self.package_module_sharding.get(&entry.module).cloned();
+            self.module_details.insert(
+                module.clone(),
+                PerformanceModuleMeasurement {
+                    module: module.clone(),
+                    certificate_bytes: observation.certificate_bytes,
+                    declaration_count: observation.declaration_count,
+                    import_count: u64::try_from(entry.imports.len()).unwrap_or(u64::MAX),
+                    checker_elapsed_ns,
+                    package_sharding,
+                },
+            );
+            while self.module_details.len() > PERFORMANCE_MODULE_DETAIL_LIMIT {
+                self.module_details.pop_last();
+            }
+            self.declaration_attempted = self
+                .declaration_attempted
+                .saturating_add(observation.declaration_attempted);
+            for declaration in &observation.declarations {
+                self.record_declaration_detail(declaration.clone());
+            }
+        }
+        if self
+            .package_module_sharding
+            .get(&entry.module)
+            .is_some_and(|module| module.critical_path)
+        {
+            let current_elapsed_ns = self
+                .package_sharding
+                .as_ref()
+                .map(|summary| summary.critical_path_checker_elapsed_ns)
+                .unwrap_or(0);
+            let (critical_path_checker_elapsed_ns, overflowed) =
+                saturating_add_u64(current_elapsed_ns, checker_elapsed_ns);
+            self.package_estimate_overflowed |= overflowed;
+            if let Some(summary) = self.package_sharding.as_mut() {
+                summary.critical_path_checker_elapsed_ns = critical_path_checker_elapsed_ns;
+                summary.estimate_overflowed |= overflowed;
+            }
+        }
+        if let Some(worker_index) = worker_index {
+            self.effective_jobs = self.effective_jobs.max(worker_index.saturating_add(1));
+            if self.mode.is_detailed() {
+                let worker = self.workers.entry(worker_index).or_insert_with(|| {
+                    PerformanceWorkerMeasurement {
+                        worker_index: u64::try_from(worker_index).unwrap_or(u64::MAX),
+                        module_count: 0,
+                        certificate_bytes: 0,
+                        active_elapsed_ns: 0,
+                        idle_elapsed_ns: 0,
+                    }
+                });
+                worker.module_count = worker.module_count.saturating_add(1);
+                worker.certificate_bytes = worker
+                    .certificate_bytes
+                    .saturating_add(observation.certificate_bytes);
+                while self.workers.len() > PERFORMANCE_WORKER_DETAIL_LIMIT {
+                    self.workers.pop_last();
+                }
+            }
+        }
+    }
+
+    fn record_declaration_details(&mut self, declarations: Vec<PerformanceDeclarationMeasurement>) {
+        if !self.mode.is_detailed() {
+            return;
+        }
+        for declaration in declarations {
+            self.record_declaration_detail(declaration);
+        }
+    }
+
+    fn record_declaration_detail(&mut self, declaration: PerformanceDeclarationMeasurement) {
+        self.declaration_details.insert(
+            (
+                declaration.module.clone(),
+                declaration.declaration_index,
+                declaration.declaration.clone(),
+            ),
+            declaration,
+        );
+        while self.declaration_details.len() > PERFORMANCE_DECLARATION_DETAIL_LIMIT {
+            self.declaration_details.pop_last();
+        }
+    }
+
+    fn record_worker_timing(&mut self, timing: PackageFastWorkerTiming, clock_read: bool) {
+        self.effective_jobs = self
+            .effective_jobs
+            .max(timing.worker_index.saturating_add(1));
+        self.worker_active_elapsed_ns = self
+            .worker_active_elapsed_ns
+            .saturating_add(timing.active_elapsed_ns);
+        self.worker_idle_elapsed_ns = self
+            .worker_idle_elapsed_ns
+            .saturating_add(timing.idle_elapsed_ns);
+        if clock_read {
+            self.coarse_stage_clock_reads = self.coarse_stage_clock_reads.saturating_add(1);
+        }
+        if let Some(worker) = self.workers.get_mut(&timing.worker_index) {
+            worker.active_elapsed_ns = worker
+                .active_elapsed_ns
+                .saturating_add(timing.active_elapsed_ns);
+            worker.idle_elapsed_ns = worker
+                .idle_elapsed_ns
+                .saturating_add(timing.idle_elapsed_ns);
+        }
+    }
+
+    fn record_layer_clock(&mut self) {
+        self.coarse_stage_clock_reads = self.coarse_stage_clock_reads.saturating_add(1);
+    }
+
+    fn record_coordinator_merge(&mut self, elapsed_ns: u64) {
+        self.coordinator_merge_elapsed_ns =
+            self.coordinator_merge_elapsed_ns.saturating_add(elapsed_ns);
+        self.coarse_stage_clock_reads = self.coarse_stage_clock_reads.saturating_add(1);
+    }
+}
+
+struct PackageMeasurementReportInput<'input, 'bytes> {
+    options: &'input PackageVerificationExecutionOptions,
+    lock: &'input PackageLockManifest,
+    entries: &'input [(usize, &'input PackageLockEntry)],
+    artifact_bytes: Option<&'input BTreeMap<PackagePath, &'bytes [u8]>>,
+    modules: &'input [PackageModuleVerificationResult],
+    measurements: Option<&'input PackageVerifierMeasurementState>,
+    memo_counters: PackageVerificationMemoCounters,
+    decode_cache_counters: PackageVerificationDecodeCacheCounters,
+}
+
+fn package_measurement_report(
+    input: PackageMeasurementReportInput<'_, '_>,
+) -> Option<PerformanceMeasurementReport> {
+    let PackageMeasurementReportInput {
+        options,
+        lock,
+        entries,
+        artifact_bytes,
+        modules,
+        measurements,
+        memo_counters,
+        decode_cache_counters,
+    } = input;
+    let measurements = measurements?;
+    let mut recorder = PerformanceMeasurementRecorder::new(options.measurement_mode);
+    if let Ok(canonical_lock) = lock.canonical_json() {
+        recorder = recorder.with_input_identity(format_package_hash(&package_file_hash(
+            canonical_lock.as_bytes(),
+        )));
+    }
+    recorder.add_counter(
+        PerformanceMeasurementLabel::PackageRequestedJobs,
+        u64::try_from(options.jobs).unwrap_or(u64::MAX),
+    );
+    recorder.add_counter(
+        PerformanceMeasurementLabel::PackageEffectiveJobs,
+        u64::try_from(measurements.effective_jobs).unwrap_or(u64::MAX),
+    );
+    recorder.observe_coarse_stage_clock_reads(measurements.coarse_stage_clock_reads);
+    recorder.add_counter(
+        PerformanceMeasurementLabel::PackageWorkerActiveElapsed,
+        measurements.worker_active_elapsed_ns,
+    );
+    recorder.add_counter(
+        PerformanceMeasurementLabel::PackageWorkerIdleElapsed,
+        measurements.worker_idle_elapsed_ns,
+    );
+    recorder.add_counter(
+        PerformanceMeasurementLabel::PackageCoordinatorMergeElapsed,
+        measurements.coordinator_merge_elapsed_ns,
+    );
+    recorder.add_counter(
+        PerformanceMeasurementLabel::PackageSharedBaseContextBytes,
+        measurements
+            .package_sharding
+            .as_ref()
+            .map(|summary| summary.shared_base_context_bytes)
+            .unwrap_or(0),
+    );
+    recorder.add_counter(
+        PerformanceMeasurementLabel::PackageAvoidedBaseContextClones,
+        measurements.package_avoided_base_context_clones,
+    );
+    recorder.add_counter(
+        PerformanceMeasurementLabel::PackageAvoidedBaseContextCloneBytes,
+        measurements.package_avoided_base_context_clone_bytes,
+    );
+    recorder.add_counter(
+        PerformanceMeasurementLabel::PackageShardEstimatedCost,
+        measurements.package_shard_estimated_cost,
+    );
+    recorder.add_counter(
+        PerformanceMeasurementLabel::PackageShardElapsed,
+        measurements.package_shard_elapsed_ns,
+    );
+    recorder.add_counter(
+        PerformanceMeasurementLabel::PackageShardModules,
+        measurements.package_shard_modules,
+    );
+    recorder.add_counter(
+        PerformanceMeasurementLabel::PackageShardBytes,
+        measurements.package_shard_bytes,
+    );
+    recorder.add_counter(
+        PerformanceMeasurementLabel::PackageDagCriticalPathLayers,
+        measurements
+            .package_sharding
+            .as_ref()
+            .map(|summary| summary.critical_path_module_count)
+            .unwrap_or(0),
+    );
+    recorder.add_counter(
+        PerformanceMeasurementLabel::PackageDagLayerWidth,
+        measurements.package_max_layer_width,
+    );
+    recorder.add_counter(
+        PerformanceMeasurementLabel::PackageDagLayerElapsed,
+        measurements
+            .package_sharding
+            .as_ref()
+            .map(|summary| summary.barrier_elapsed_ns)
+            .unwrap_or(0),
+    );
+    if measurements.package_estimate_overflowed {
+        recorder.mark_overflowed();
+    }
+
+    let non_skipped_results = modules
+        .iter()
+        .filter(|module| module.status != PackageModuleVerificationStatus::Skipped)
+        .count();
+    let cache_results = modules
+        .iter()
+        .filter(|module| {
+            matches!(
+                module.evidence,
+                PackageModuleVerificationEvidence::LocalAuditCache
+                    | PackageModuleVerificationEvidence::ReferenceSummaryCache
+            )
+        })
+        .count();
+    let disk_memo_results = modules
+        .iter()
+        .filter(|module| module.evidence == PackageModuleVerificationEvidence::DiskVerifierMemo)
+        .count();
+    let memo_results = disk_memo_results.saturating_add(memo_counters.hits);
+    let live_results = non_skipped_results
+        .saturating_sub(cache_results)
+        .saturating_sub(memo_results);
+    for (label, count) in [
+        (
+            PerformanceMeasurementLabel::PackageLiveResults,
+            live_results,
+        ),
+        (
+            PerformanceMeasurementLabel::PackageCacheResults,
+            cache_results,
+        ),
+        (
+            PerformanceMeasurementLabel::PackageMemoResults,
+            memo_results,
+        ),
+        (
+            PerformanceMeasurementLabel::PackageModulesChecked,
+            usize::try_from(measurements.modules_checked).unwrap_or(usize::MAX),
+        ),
+    ] {
+        recorder.add_counter(label, u64::try_from(count).unwrap_or(u64::MAX));
+    }
+
+    let entries_by_module = entries
+        .iter()
+        .map(|(_, entry)| (&entry.module, *entry))
+        .collect::<BTreeMap<_, _>>();
+    let mut observed_certificate_bytes = 0u64;
+    let mut observed_imports = 0u64;
+    for result in modules {
+        let Some(entry) = entries_by_module.get(&result.module).copied() else {
+            continue;
+        };
+        let observed = measurements.module_details.get(&result.module.as_dotted());
+        let certificate_bytes = observed
+            .map(|module| module.certificate_bytes)
+            .or_else(|| {
+                artifact_bytes
+                    .and_then(|artifacts| artifacts.get(&entry.certificate).copied())
+                    .map(|bytes| u64::try_from(bytes.len()).unwrap_or(u64::MAX))
+            })
+            .unwrap_or(0);
+        let declaration_count = observed.map(|module| module.declaration_count).unwrap_or(0);
+        let import_count = u64::try_from(entry.imports.len()).unwrap_or(u64::MAX);
+        observed_certificate_bytes = observed_certificate_bytes.saturating_add(certificate_bytes);
+        observed_imports = observed_imports.saturating_add(import_count);
+        recorder.record_module(PerformanceModuleMeasurement {
+            module: result.module.as_dotted(),
+            certificate_bytes,
+            declaration_count,
+            import_count,
+            checker_elapsed_ns: observed
+                .map(|module| module.checker_elapsed_ns)
+                .unwrap_or(0),
+            package_sharding: observed
+                .and_then(|module| module.package_sharding.clone())
+                .or_else(|| {
+                    measurements
+                        .package_module_sharding
+                        .get(&result.module)
+                        .cloned()
+                }),
+        });
+    }
+    recorder.add_counter(
+        PerformanceMeasurementLabel::PackageCertificateBytes,
+        if artifact_bytes.is_some() {
+            observed_certificate_bytes
+        } else {
+            measurements.certificate_bytes
+        },
+    );
+    recorder.add_counter(
+        PerformanceMeasurementLabel::PackageDeclarations,
+        measurements.declarations,
+    );
+    recorder.add_counter(
+        PerformanceMeasurementLabel::PackageImports,
+        observed_imports,
+    );
+    for declaration in measurements.declaration_details.values() {
+        recorder.record_declaration(declaration.clone());
+    }
+    recorder.observe_declaration_attempts(
+        measurements.declaration_attempted.saturating_sub(
+            u64::try_from(measurements.declaration_details.len()).unwrap_or(u64::MAX),
+        ),
+    );
+    recorder.add_counter(
+        PerformanceMeasurementLabel::PackageDecodeCacheHits,
+        u64::try_from(
+            decode_cache_counters
+                .certificate_hits
+                .saturating_add(decode_cache_counters.import_context_hits)
+                .saturating_add(decode_cache_counters.import_context_disk_hits),
+        )
+        .unwrap_or(u64::MAX),
+    );
+    recorder.add_counter(
+        PerformanceMeasurementLabel::PackageDecodeCacheMisses,
+        u64::try_from(
+            decode_cache_counters
+                .certificate_misses
+                .saturating_add(decode_cache_counters.import_context_misses)
+                .saturating_add(decode_cache_counters.import_context_disk_misses)
+                .saturating_add(decode_cache_counters.import_context_disk_stale)
+                .saturating_add(decode_cache_counters.import_context_disk_schema_misses),
+        )
+        .unwrap_or(u64::MAX),
+    );
+    recorder.add_counter(
+        PerformanceMeasurementLabel::PackageModulesDecoded,
+        measurements.modules_decoded,
+    );
+    for worker in measurements.workers.values() {
+        recorder.record_worker(worker.clone());
+    }
+    recorder.observe_worker_attempts(
+        u64::try_from(
+            measurements
+                .effective_jobs
+                .saturating_sub(measurements.workers.len()),
+        )
+        .unwrap_or(u64::MAX),
+    );
+    if let Some(package_sharding) = &measurements.package_sharding {
+        let mut package_sharding = package_sharding.clone();
+        package_sharding.estimate_overflowed |= measurements.package_estimate_overflowed;
+        recorder.set_package_sharding(package_sharding);
+    }
+    for layer in measurements.package_layers.values() {
+        recorder.record_package_layer(layer.clone());
+    }
+    recorder.observe_package_layer_attempts(
+        measurements
+            .package_layer_attempted
+            .saturating_sub(u64::try_from(measurements.package_layers.len()).unwrap_or(u64::MAX)),
+    );
+    for shard in measurements.package_shards.values() {
+        recorder.record_package_shard(shard.clone());
+    }
+    recorder.observe_package_shard_attempts(
+        measurements
+            .package_shard_attempted
+            .saturating_sub(u64::try_from(measurements.package_shards.len()).unwrap_or(u64::MAX)),
+    );
+    recorder.report()
+}
+
+fn certificate_declaration_name(
+    name_table: &[Name],
+    declaration: &DeclCert,
+    declaration_index: usize,
+) -> String {
+    let name = match &declaration.decl {
+        DeclPayload::Axiom { name, .. }
+        | DeclPayload::AxiomConstrained { name, .. }
+        | DeclPayload::Def { name, .. }
+        | DeclPayload::DefConstrained { name, .. }
+        | DeclPayload::Theorem { name, .. }
+        | DeclPayload::TheoremConstrained { name, .. }
+        | DeclPayload::Inductive { name, .. }
+        | DeclPayload::InductiveConstrained { name, .. }
+        | DeclPayload::MutualInductiveBlock { name, .. } => *name,
+    };
+    name_table
+        .get(name)
+        .map(Name::as_dotted)
+        .unwrap_or_else(|| format!("declaration[{declaration_index}]"))
+}
+
+fn certificate_declaration_term_nodes(term_table: &[TermNode], declaration: &DeclCert) -> u64 {
+    let mut pending = declaration_term_roots(&declaration.decl);
+    let mut visited = BTreeSet::new();
+    while let Some(term_id) = pending.pop() {
+        if !visited.insert(term_id) {
+            continue;
+        }
+        let Some(node) = term_table.get(term_id) else {
+            continue;
+        };
+        match node {
+            TermNode::App(function, argument) => {
+                pending.push(*function);
+                pending.push(*argument);
+            }
+            TermNode::Lam { ty, body } | TermNode::Pi { ty, body } => {
+                pending.push(*ty);
+                pending.push(*body);
+            }
+            TermNode::Let { ty, value, body } => {
+                pending.push(*ty);
+                pending.push(*value);
+                pending.push(*body);
+            }
+            TermNode::Sort(_) | TermNode::BVar(_) | TermNode::Const { .. } => {}
+        }
+    }
+    u64::try_from(visited.len()).unwrap_or(u64::MAX)
+}
+
+fn declaration_term_roots(declaration: &DeclPayload) -> Vec<usize> {
+    match declaration {
+        DeclPayload::Axiom { ty, .. } | DeclPayload::AxiomConstrained { ty, .. } => vec![*ty],
+        DeclPayload::Def { ty, value, .. } | DeclPayload::DefConstrained { ty, value, .. } => {
+            vec![*ty, *value]
+        }
+        DeclPayload::Theorem { ty, proof, .. }
+        | DeclPayload::TheoremConstrained { ty, proof, .. } => vec![*ty, *proof],
+        DeclPayload::Inductive {
+            params,
+            indices,
+            constructors,
+            recursor,
+            ..
+        }
+        | DeclPayload::InductiveConstrained {
+            params,
+            indices,
+            constructors,
+            recursor,
+            ..
+        } => params
+            .iter()
+            .chain(indices)
+            .map(|binder| binder.ty)
+            .chain(constructors.iter().map(|constructor| constructor.ty))
+            .chain(recursor.iter().map(|recursor| recursor.ty))
+            .collect(),
+        DeclPayload::MutualInductiveBlock { inductives, .. } => inductives
+            .iter()
+            .flat_map(|inductive| {
+                inductive
+                    .params
+                    .iter()
+                    .chain(&inductive.indices)
+                    .map(|binder| binder.ty)
+                    .chain(
+                        inductive
+                            .constructors
+                            .iter()
+                            .map(|constructor| constructor.ty),
+                    )
+                    .chain(inductive.recursor.iter().map(|recursor| recursor.ty))
+            })
+            .collect(),
+    }
+}
+
+fn elapsed_nanos_if_started(started: Option<Instant>) -> u64 {
+    started
+        .map(|started| u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
 fn read_certificate_artifact_from_root(
     package_root: &Path,
     entry_index: usize,
@@ -3152,9 +5190,18 @@ impl PackageVerificationDecodeCacheConfig {
     }
 }
 
+#[cfg(test)]
 struct PackageDecodeCacheLookup<T> {
     value: T,
     counters: PackageVerificationDecodeCacheCounters,
+}
+
+#[derive(Clone, Copy)]
+struct PackageReferenceImportContext<'a> {
+    lock: &'a PackageLockManifest,
+    entries: &'a [(usize, &'a PackageLockEntry)],
+    checked_by_module: &'a BTreeMap<Name, ReferenceCheckedModule>,
+    config: &'a PackageVerificationDecodeCacheConfig,
 }
 
 fn decode_fast_certificate_with_cache(
@@ -3163,7 +5210,8 @@ fn decode_fast_certificate_with_cache(
     bytes: &[u8],
     actual_file_hash: PackageHash,
     config: &PackageVerificationDecodeCacheConfig,
-) -> PackageVerificationResult<PackageDecodeCacheLookup<ModuleCert>> {
+    observation: &mut PackageEntryCheckObservation,
+) -> PackageVerificationResult<ModuleCert> {
     if !config.process_local_cache {
         let cert = decode_module_cert(bytes).map_err(|source| {
             PackageVerificationError::certificate_decode_failed(
@@ -3171,10 +5219,11 @@ fn decode_fast_certificate_with_cache(
                 format!("{source:?}"),
             )
         })?;
-        return Ok(PackageDecodeCacheLookup {
-            value: cert,
-            counters: PackageVerificationDecodeCacheCounters::default(),
-        });
+        if observation.measurement_mode.is_enabled() {
+            observation.physical_certificate_decodes =
+                observation.physical_certificate_decodes.saturating_add(1);
+        }
+        return Ok(cert);
     }
 
     let key = package_decode_cache_certificate_key(entry, actual_file_hash, config);
@@ -3185,36 +5234,40 @@ fn decode_fast_certificate_with_cache(
         .get(&key)
         .cloned()
     {
-        return Ok(PackageDecodeCacheLookup {
-            value: cert,
-            counters: PackageVerificationDecodeCacheCounters {
-                certificate_hits: 1,
-                ..PackageVerificationDecodeCacheCounters::default()
-            },
-        });
+        observation.decode_cache_counters.certificate_hits = observation
+            .decode_cache_counters
+            .certificate_hits
+            .saturating_add(1);
+        return Ok(cert);
     }
 
+    observation.decode_cache_counters.certificate_misses = observation
+        .decode_cache_counters
+        .certificate_misses
+        .saturating_add(1);
     let cert = decode_module_cert(bytes).map_err(|source| {
         PackageVerificationError::certificate_decode_failed(
             format!("entries[{entry_index}].certificate"),
             format!("{source:?}"),
         )
     })?;
+    if observation.measurement_mode.is_enabled() {
+        observation.physical_certificate_decodes =
+            observation.physical_certificate_decodes.saturating_add(1);
+    }
     package_verification_decode_cache()
         .lock()
         .expect("package verification decode cache mutex should not be poisoned")
         .fast_certificates
         .insert(key, cert.clone());
-    Ok(PackageDecodeCacheLookup {
-        value: cert,
-        counters: PackageVerificationDecodeCacheCounters {
-            certificate_misses: 1,
-            certificate_inserted: 1,
-            ..PackageVerificationDecodeCacheCounters::default()
-        },
-    })
+    observation.decode_cache_counters.certificate_inserted = observation
+        .decode_cache_counters
+        .certificate_inserted
+        .saturating_add(1);
+    Ok(cert)
 }
 
+#[cfg(test)]
 fn reference_import_store_with_cache(
     entry_index: usize,
     entry: &PackageLockEntry,
@@ -3224,6 +5277,35 @@ fn reference_import_store_with_cache(
     checked_by_module: &BTreeMap<Name, ReferenceCheckedModule>,
     config: &PackageVerificationDecodeCacheConfig,
 ) -> PackageVerificationResult<PackageDecodeCacheLookup<ReferenceImportStore>> {
+    let mut counters = PackageVerificationDecodeCacheCounters::default();
+    let value = reference_import_store_with_cache_observed(
+        entry_index,
+        entry,
+        resolved_imports,
+        PackageReferenceImportContext {
+            lock,
+            entries,
+            checked_by_module,
+            config,
+        },
+        &mut counters,
+    )?;
+    Ok(PackageDecodeCacheLookup { value, counters })
+}
+
+fn reference_import_store_with_cache_observed(
+    entry_index: usize,
+    entry: &PackageLockEntry,
+    resolved_imports: &[PackageLockResolvedImport],
+    context: PackageReferenceImportContext<'_>,
+    counters: &mut PackageVerificationDecodeCacheCounters,
+) -> PackageVerificationResult<ReferenceImportStore> {
+    let PackageReferenceImportContext {
+        lock,
+        entries,
+        checked_by_module,
+        config,
+    } = context;
     let key = config
         .process_local_cache
         .then(|| package_decode_cache_import_context_key(resolved_imports, config));
@@ -3235,25 +5317,18 @@ fn reference_import_store_with_cache(
             .get(key)
             .cloned()
         {
+            counters.import_context_hits = counters.import_context_hits.saturating_add(1);
             validate_reference_import_context_hit(
                 entry_index,
                 resolved_imports,
                 checked_by_module,
             )?;
-            return Ok(PackageDecodeCacheLookup {
-                value: imports,
-                counters: PackageVerificationDecodeCacheCounters {
-                    import_context_hits: 1,
-                    ..PackageVerificationDecodeCacheCounters::default()
-                },
-            });
+            return Ok(imports);
         }
     }
 
-    let mut counters = PackageVerificationDecodeCacheCounters::default();
     if config.process_local_cache {
-        counters.import_context_misses = 1;
-        counters.import_context_inserted = 1;
+        counters.import_context_misses = counters.import_context_misses.saturating_add(1);
     }
     let mut pending_import_context_export_cache_write = None;
     if config.persistent_import_context_export_cache {
@@ -3268,25 +5343,29 @@ fn reference_import_store_with_cache(
         match read_import_context_export_cache_lookup(&disk_cache_dir, entry, &expected_disk_entry)
         {
             ImportContextExportCacheLookup::Hit => {
+                counters.import_context_disk_hits =
+                    counters.import_context_disk_hits.saturating_add(1);
                 validate_reference_import_context_hit(
                     entry_index,
                     resolved_imports,
                     checked_by_module,
                 )?;
-                counters.import_context_disk_hits += 1;
             }
             ImportContextExportCacheLookup::Missing => {
-                counters.import_context_disk_misses += 1;
+                counters.import_context_disk_misses =
+                    counters.import_context_disk_misses.saturating_add(1);
                 pending_import_context_export_cache_write =
                     Some((disk_cache_dir, expected_disk_entry));
             }
             ImportContextExportCacheLookup::Stale => {
-                counters.import_context_disk_stale += 1;
+                counters.import_context_disk_stale =
+                    counters.import_context_disk_stale.saturating_add(1);
                 pending_import_context_export_cache_write =
                     Some((disk_cache_dir, expected_disk_entry));
             }
             ImportContextExportCacheLookup::SchemaMiss => {
-                counters.import_context_disk_schema_misses += 1;
+                counters.import_context_disk_schema_misses =
+                    counters.import_context_disk_schema_misses.saturating_add(1);
                 pending_import_context_export_cache_write =
                     Some((disk_cache_dir, expected_disk_entry));
             }
@@ -3315,7 +5394,8 @@ fn reference_import_store_with_cache(
     })?;
     if let Some((disk_cache_dir, expected_disk_entry)) = pending_import_context_export_cache_write {
         if write_import_context_export_cache_entry(&disk_cache_dir, entry, &expected_disk_entry) {
-            counters.import_context_disk_inserted += 1;
+            counters.import_context_disk_inserted =
+                counters.import_context_disk_inserted.saturating_add(1);
         }
     }
     if let Some(key) = key {
@@ -3324,11 +5404,9 @@ fn reference_import_store_with_cache(
             .expect("package verification decode cache mutex should not be poisoned")
             .reference_import_contexts
             .insert(key, imports.clone());
+        counters.import_context_inserted = counters.import_context_inserted.saturating_add(1);
     }
-    Ok(PackageDecodeCacheLookup {
-        value: imports,
-        counters,
-    })
+    Ok(imports)
 }
 
 enum ImportContextExportCacheLookup {
@@ -3622,9 +5700,9 @@ impl PackageVerificationMemoRun {
             .get(key)
             .cloned();
         if hit.is_some() {
-            self.counters.hits += 1;
+            self.counters.hits = self.counters.hits.saturating_add(1);
         } else {
-            self.counters.misses += 1;
+            self.counters.misses = self.counters.misses.saturating_add(1);
         }
         hit
     }
@@ -3641,7 +5719,7 @@ impl PackageVerificationMemoRun {
             .expect("package verification process memo mutex should not be poisoned")
             .entries
             .insert(key, entry);
-        self.counters.inserted += 1;
+        self.counters.inserted = self.counters.inserted.saturating_add(1);
     }
 
     fn counters(&self) -> PackageVerificationMemoCounters {
@@ -4043,6 +6121,48 @@ fn verify_lock_entry(
     policy: &AxiomPolicy,
     decode_cache_config: &PackageVerificationDecodeCacheConfig,
 ) -> PackageVerificationResult<(VerifiedModule, PackageVerificationDecodeCacheCounters)> {
+    let mut observation = PackageEntryCheckObservation::default();
+    let verified = verify_lock_entry_observed(
+        entry_index,
+        entry,
+        artifact_bytes,
+        session,
+        policy,
+        decode_cache_config,
+        &mut observation,
+    )?;
+    Ok((verified, observation.decode_cache_counters))
+}
+
+fn verify_lock_entry_observed(
+    entry_index: usize,
+    entry: &PackageLockEntry,
+    artifact_bytes: &BTreeMap<PackagePath, &[u8]>,
+    session: &mut VerifierSession,
+    policy: &AxiomPolicy,
+    decode_cache_config: &PackageVerificationDecodeCacheConfig,
+    observation: &mut PackageEntryCheckObservation,
+) -> PackageVerificationResult<VerifiedModule> {
+    verify_lock_entry_with_context_observed(
+        entry_index,
+        entry,
+        artifact_bytes,
+        PackageFastWorkerImportContext::Session(session),
+        policy,
+        decode_cache_config,
+        observation,
+    )
+}
+
+fn verify_lock_entry_with_context_observed(
+    entry_index: usize,
+    entry: &PackageLockEntry,
+    artifact_bytes: &BTreeMap<PackagePath, &[u8]>,
+    import_context: PackageFastWorkerImportContext<'_>,
+    policy: &AxiomPolicy,
+    decode_cache_config: &PackageVerificationDecodeCacheConfig,
+    observation: &mut PackageEntryCheckObservation,
+) -> PackageVerificationResult<VerifiedModule> {
     let entry_path = format!("entries[{entry_index}]");
     let bytes = artifact_bytes
         .get(&entry.certificate)
@@ -4053,25 +6173,28 @@ fn verify_lock_entry(
                 entry.certificate.as_str(),
             )
         })?;
-    verify_lock_entry_bytes(
+    verify_lock_entry_bytes_observed(
         entry_index,
         entry,
         bytes,
-        session,
+        import_context,
         policy,
         decode_cache_config,
+        observation,
     )
 }
 
-fn verify_lock_entry_bytes(
+fn verify_lock_entry_bytes_observed(
     entry_index: usize,
     entry: &PackageLockEntry,
     bytes: &[u8],
-    session: &mut VerifierSession,
+    import_context: PackageFastWorkerImportContext<'_>,
     policy: &AxiomPolicy,
     decode_cache_config: &PackageVerificationDecodeCacheConfig,
-) -> PackageVerificationResult<(VerifiedModule, PackageVerificationDecodeCacheCounters)> {
+    observation: &mut PackageEntryCheckObservation,
+) -> PackageVerificationResult<VerifiedModule> {
     let entry_path = format!("entries[{entry_index}]");
+    observation.observe_certificate_bytes(bytes);
     let actual_file_hash = package_file_hash(bytes);
     if entry.certificate_file_hash != actual_file_hash {
         return Err(PackageVerificationError::certificate_file_hash_mismatch(
@@ -4087,8 +6210,10 @@ fn verify_lock_entry_bytes(
         bytes,
         actual_file_hash,
         decode_cache_config,
+        observation,
     )?;
-    let cert = decoded.value;
+    let cert = decoded;
+    observation.observe_fast_certificate(&entry.module, &cert);
     if cert.header.module != entry.module {
         return Err(PackageVerificationError::certificate_module_mismatch(
             format!("{entry_path}.certificate"),
@@ -4098,7 +6223,19 @@ fn verify_lock_entry_bytes(
     }
     check_entry_hashes(entry_index, entry, &cert)?;
 
-    let verified = verify_decoded_module_cert(&cert, bytes, session, policy).map_err(|source| {
+    let verified = match import_context {
+        PackageFastWorkerImportContext::Session(session) => {
+            verify_decoded_module_cert(&cert, bytes, session, policy)
+        }
+        PackageFastWorkerImportContext::Borrowed {
+            resolved_imports,
+            verified_modules_by_module,
+        } => {
+            let imports = exact_fast_import_refs(resolved_imports, verified_modules_by_module);
+            verify_decoded_module_cert_with_import_refs(&cert, bytes, &imports, policy)
+        }
+    }
+    .map_err(|source| {
         PackageVerificationError::verify_failed(format!("{entry_path}.certificate"), source)
     })?;
     if verified.module() != &entry.module {
@@ -4125,7 +6262,26 @@ fn verify_lock_entry_bytes(
         ));
     }
 
-    Ok((verified, decoded.counters))
+    Ok(verified)
+}
+
+fn exact_fast_import_refs<'a>(
+    resolved_imports: &[PackageLockResolvedImport],
+    verified_modules_by_module: &'a BTreeMap<Name, PackageVerifiedModuleRecord>,
+) -> Vec<&'a VerifiedModule> {
+    resolved_imports
+        .iter()
+        .filter_map(|resolved| {
+            verified_modules_by_module
+                .get(&resolved.module)
+                .filter(|record| {
+                    record.module == resolved.module
+                        && record.export_hash == resolved.export_hash
+                        && record.certificate_hash == resolved.certificate_hash
+                })
+                .map(|record| &record.verified_module)
+        })
+        .collect()
 }
 
 #[derive(Clone, Copy)]
@@ -4156,6 +6312,24 @@ fn verify_reference_lock_entry(
     ReferenceCheckedModule,
     PackageVerificationDecodeCacheCounters,
 )> {
+    let mut observation = PackageEntryCheckObservation::default();
+    let checked = verify_reference_lock_entry_observed(
+        entry_index,
+        entry,
+        resolved_imports,
+        context,
+        &mut observation,
+    )?;
+    Ok((checked, observation.decode_cache_counters))
+}
+
+fn verify_reference_lock_entry_observed(
+    entry_index: usize,
+    entry: &PackageLockEntry,
+    resolved_imports: &[PackageLockResolvedImport],
+    context: PackageReferenceEntryContext<'_>,
+    observation: &mut PackageEntryCheckObservation,
+) -> PackageVerificationResult<ReferenceCheckedModule> {
     let entry_path = format!("entries[{entry_index}]");
     let bytes = context
         .artifact_bytes
@@ -4167,7 +6341,7 @@ fn verify_reference_lock_entry(
                 entry.certificate.as_str(),
             )
         })?;
-    verify_reference_lock_entry_bytes(
+    verify_reference_lock_entry_bytes_observed(
         entry_index,
         entry,
         resolved_imports,
@@ -4179,20 +6353,20 @@ fn verify_reference_lock_entry(
             policy: context.policy,
             decode_cache_config: context.decode_cache_config,
         },
+        observation,
     )
 }
 
-fn verify_reference_lock_entry_bytes(
+fn verify_reference_lock_entry_bytes_observed(
     entry_index: usize,
     entry: &PackageLockEntry,
     resolved_imports: &[PackageLockResolvedImport],
     bytes: &[u8],
     context: PackageReferenceEntryBytesContext<'_>,
-) -> PackageVerificationResult<(
-    ReferenceCheckedModule,
-    PackageVerificationDecodeCacheCounters,
-)> {
+    observation: &mut PackageEntryCheckObservation,
+) -> PackageVerificationResult<ReferenceCheckedModule> {
     let entry_path = format!("entries[{entry_index}]");
+    observation.observe_certificate_bytes(bytes);
     let actual_file_hash = package_file_hash(bytes);
     if entry.certificate_file_hash != actual_file_hash {
         return Err(PackageVerificationError::certificate_file_hash_mismatch(
@@ -4202,19 +6376,40 @@ fn verify_reference_lock_entry_bytes(
         ));
     }
 
-    let imports = reference_import_store_with_cache(
+    let imports = reference_import_store_with_cache_observed(
         entry_index,
         entry,
         resolved_imports,
-        context.lock,
-        context.entries,
-        context.checked_by_module,
-        context.decode_cache_config,
+        PackageReferenceImportContext {
+            lock: context.lock,
+            entries: context.entries,
+            checked_by_module: context.checked_by_module,
+            config: context.decode_cache_config,
+        },
+        &mut observation.decode_cache_counters,
     )?;
-    let mut counters = PackageVerificationDecodeCacheCounters::default();
-    counters.add(imports.counters);
-    let imports = imports.value;
-    let checked = match check_certificate(bytes, &imports, context.policy) {
+    let check_result = if observation.measurement_mode.is_enabled() {
+        let declaration_detail_limit = if observation.measurement_mode.is_detailed() {
+            PERFORMANCE_DECLARATION_DETAIL_LIMIT
+        } else {
+            0
+        };
+        let (result, check_observation) = check_certificate_with_observation(
+            bytes,
+            &imports,
+            context.policy,
+            declaration_detail_limit,
+        );
+        if check_observation.certificate_decoded {
+            observation.physical_certificate_decodes =
+                observation.physical_certificate_decodes.saturating_add(1);
+            observation.observe_reference_certificate(&entry.module, &check_observation);
+        }
+        result
+    } else {
+        check_certificate(bytes, &imports, context.policy)
+    };
+    let checked = match check_result {
         ReferenceCheckResult::Checked(checked) => checked,
         ReferenceCheckResult::Rejected(error) => {
             return Err(PackageVerificationError::reference_checker_rejected(
@@ -4257,7 +6452,7 @@ fn verify_reference_lock_entry_bytes(
         ));
     }
 
-    Ok((checked, counters))
+    Ok(checked)
 }
 
 fn check_entry_hashes(
@@ -4769,6 +6964,164 @@ mod tests {
                 bytes: bytes.as_slice(),
             })
             .collect()
+    }
+
+    #[test]
+    fn package_measurements_count_actual_checker_and_decode_boundaries() {
+        fn counter(
+            report: &PerformanceMeasurementReport,
+            label: PerformanceMeasurementLabel,
+        ) -> u64 {
+            report
+                .counters
+                .iter()
+                .find(|counter| counter.label == label)
+                .map(|counter| counter.value)
+                .expect("measurement counter is present")
+        }
+
+        let lock = proof_lock();
+        let entries = canonical_lock_entries(&lock);
+        let entry = entries.first().expect("proof fixture has a lock entry").1;
+        let corrupt_certificate = b"not a certificate".to_vec();
+        let artifact_bytes =
+            BTreeMap::from([(entry.certificate.clone(), corrupt_certificate.as_slice())]);
+        let modules = vec![module_result(
+            entry,
+            PackageModuleVerificationStatus::Failed,
+            Some(PackageVerificationError::certificate_decode_failed(
+                "entries[0].certificate",
+                "invalid certificate",
+            )),
+            PackageVerificationMode::FastKernel,
+        )];
+        let options = PackageVerificationExecutionOptions {
+            measurement_mode: PerformanceMeasurementMode::Detailed,
+            ..PackageVerificationExecutionOptions::default()
+        };
+        let mut measurement_state =
+            PackageVerifierMeasurementState::new(options.measurement_mode).unwrap();
+        let mut observation = PackageEntryCheckObservation::new(options.measurement_mode);
+        observation.observe_certificate_bytes(&corrupt_certificate);
+        measurement_state.record_module(entry, &observation, 7, Some(0), true);
+        measurement_state.record_worker_timing(
+            PackageFastWorkerTiming {
+                worker_index: 0,
+                active_elapsed_ns: 11,
+                idle_elapsed_ns: 4,
+            },
+            true,
+        );
+        measurement_state.record_coordinator_merge(5);
+
+        let report = package_measurement_report(PackageMeasurementReportInput {
+            options: &options,
+            lock: &lock,
+            entries: &entries,
+            artifact_bytes: Some(&artifact_bytes),
+            modules: &modules,
+            measurements: Some(&measurement_state),
+            memo_counters: PackageVerificationMemoCounters::default(),
+            decode_cache_counters: PackageVerificationDecodeCacheCounters::default(),
+        })
+        .expect("measurements enabled");
+
+        assert_eq!(
+            counter(&report, PerformanceMeasurementLabel::PackageModulesChecked),
+            1
+        );
+        assert_eq!(
+            counter(&report, PerformanceMeasurementLabel::PackageModulesDecoded),
+            0
+        );
+        assert_eq!(report.workers.len(), 1);
+        assert_eq!(report.workers[0].module_count, 1);
+        assert_eq!(report.workers[0].active_elapsed_ns, 11);
+        assert_eq!(report.workers[0].idle_elapsed_ns, 4);
+        assert_eq!(
+            counter(
+                &report,
+                PerformanceMeasurementLabel::PackageCoordinatorMergeElapsed
+            ),
+            5
+        );
+
+        let missing_modules = vec![module_result(
+            entry,
+            PackageModuleVerificationStatus::Failed,
+            Some(PackageVerificationError::certificate_artifact_missing(
+                "entries[0].certificate",
+                entry.certificate.as_str(),
+            )),
+            PackageVerificationMode::FastKernel,
+        )];
+        let empty_artifacts = BTreeMap::new();
+        let empty_measurements =
+            PackageVerifierMeasurementState::new(options.measurement_mode).unwrap();
+        let report = package_measurement_report(PackageMeasurementReportInput {
+            options: &options,
+            lock: &lock,
+            entries: &entries,
+            artifact_bytes: Some(&empty_artifacts),
+            modules: &missing_modules,
+            measurements: Some(&empty_measurements),
+            memo_counters: PackageVerificationMemoCounters::default(),
+            decode_cache_counters: PackageVerificationDecodeCacheCounters::default(),
+        })
+        .expect("measurements enabled");
+
+        assert_eq!(
+            counter(&report, PerformanceMeasurementLabel::PackageModulesChecked),
+            0
+        );
+        assert_eq!(
+            counter(&report, PerformanceMeasurementLabel::PackageModulesDecoded),
+            0
+        );
+        assert_eq!(
+            counter(&report, PerformanceMeasurementLabel::PackageEffectiveJobs),
+            0
+        );
+        assert!(report.workers.is_empty());
+    }
+
+    #[test]
+    fn package_verifier_off_mode_has_no_measurement_state_or_detail_storage() {
+        assert!(PackageVerifierMeasurementState::new(PerformanceMeasurementMode::Off).is_none());
+        let observation = PackageEntryCheckObservation::new(PerformanceMeasurementMode::Off);
+        assert!(observation.declarations.is_empty());
+        assert_eq!(observation.certificate_bytes, 0);
+        assert_eq!(observation.declaration_count, 0);
+    }
+
+    #[test]
+    fn package_worker_declaration_details_keep_one_canonical_bounded_sample() {
+        fn detail(module: &str, declaration_index: u64) -> PerformanceDeclarationMeasurement {
+            PerformanceDeclarationMeasurement {
+                module: module.to_owned(),
+                declaration_index,
+                declaration: format!("{module}.d{declaration_index}"),
+                term_nodes: 1,
+                elaboration_elapsed_ns: 0,
+            }
+        }
+
+        let mut later = PackageEntryCheckObservation::new(PerformanceMeasurementMode::Detailed);
+        later.declarations = vec![detail("Z", 0), detail("Z", 1)];
+        let mut earlier = PackageEntryCheckObservation::new(PerformanceMeasurementMode::Detailed);
+        earlier.declarations = vec![detail("A", 0)];
+        let mut collector = PackageFastWorkerDeclarationDetailCollector::new(2);
+
+        collector.record_observation(&mut later);
+        collector.record_observation(&mut earlier);
+        let retained = collector.into_details();
+
+        assert!(later.declarations.is_empty());
+        assert!(earlier.declarations.is_empty());
+        assert_eq!(retained.len(), 2);
+        assert_eq!(retained[0].module, "A");
+        assert_eq!(retained[1].module, "Z");
+        assert_eq!(retained[1].declaration_index, 0);
     }
 
     fn test_hash(byte: u8) -> npa_cert::Hash {
@@ -5414,6 +7767,8 @@ mod tests {
     fn package_verifier_shards_plan_is_deterministic_and_context_complete() {
         let validated = validated_proof_manifest();
         let lock = proof_lock();
+        let artifacts = proof_certificate_artifacts(&lock);
+        let artifact_bytes = artifact_byte_map(package_certificate_artifacts(&artifacts)).unwrap();
         let graph = validate_package_lock_against_manifest_graph(&validated, &lock).unwrap();
         let entries = canonical_lock_entries(&lock);
         let selected_options = PackageVerificationExecutionOptions {
@@ -5440,20 +7795,40 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        let plan = plan_fast_verifier_shards(&runnable, &graph, &BTreeSet::new(), 4)
-            .expect("first layer has complete import context");
-        let planned_indexes = plan
+        let plan = plan_fast_verifier_shards(
+            &runnable,
+            &graph,
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            &artifact_bytes,
+            4,
+        )
+        .expect("first layer has complete import context");
+        let mut planned_indexes = plan
             .shards
             .iter()
             .flat_map(|shard| shard.member_indexes.iter().copied())
             .collect::<Vec<_>>();
+        planned_indexes.sort_unstable();
 
         assert!(plan.shards.len() <= 4);
         assert_eq!(planned_indexes, (0..runnable.len()).collect::<Vec<_>>());
+        assert_eq!(plan.effective_jobs, plan.shards.len());
+        assert!(plan
+            .module_costs
+            .values()
+            .all(|cost| cost.estimated_cost >= cost.artifact_bytes.max(1)));
         assert_eq!(
             plan,
-            plan_fast_verifier_shards(&runnable, &graph, &BTreeSet::new(), 4)
-                .expect("first layer has complete import context")
+            plan_fast_verifier_shards(
+                &runnable,
+                &graph,
+                &BTreeSet::new(),
+                &BTreeMap::new(),
+                &artifact_bytes,
+                4,
+            )
+            .expect("first layer has complete import context")
         );
         let dependent_layer = layers
             .iter()
@@ -5471,8 +7846,240 @@ mod tests {
                     .expect("layer module is a lock entry")
             })
             .collect::<Vec<_>>();
-        assert!(
-            plan_fast_verifier_shards(&dependent_runnable, &graph, &BTreeSet::new(), 4).is_none()
+        assert!(plan_fast_verifier_shards(
+            &dependent_runnable,
+            &graph,
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            &artifact_bytes,
+            4,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn package_fast_cost_and_memory_models_saturate_and_cap_jobs_deterministically() {
+        let ordinary = package_module_cost_estimate_v1(10, 2);
+        assert_eq!(ordinary.artifact_bytes, 10);
+        assert_eq!(ordinary.direct_import_count, 2);
+        assert_eq!(ordinary.estimated_cost, 10 + 2 * 4_096);
+        assert!(!ordinary.overflowed);
+
+        let overflowed = package_module_cost_estimate_v1(u64::MAX, u64::MAX);
+        assert_eq!(overflowed.estimated_cost, u64::MAX);
+        assert!(overflowed.overflowed);
+
+        let width_limited = package_fast_shard_memory_estimate_v1(8, 3, 0, 1, false);
+        assert_eq!(width_limited.effective_jobs, 3);
+        assert_eq!(
+            width_limited.reduction_reason,
+            PackageFastShardReductionReason::RunnableWidth
+        );
+
+        let memory_limited = package_fast_shard_memory_estimate_v1(16, 16, 0, 1, false);
+        assert!(memory_limited.effective_jobs < 16);
+        assert_eq!(
+            memory_limited.reduction_reason,
+            PackageFastShardReductionReason::MemoryBudget
+        );
+
+        let context_over_budget = package_fast_shard_memory_estimate_v1(
+            4,
+            4,
+            PACKAGE_FAST_SHARD_MEMORY_BUDGET_BYTES_V1,
+            1,
+            false,
+        );
+        assert_eq!(context_over_budget.effective_jobs, 1);
+        assert_eq!(
+            context_over_budget.reduction_reason,
+            PackageFastShardReductionReason::MemoryBudget
+        );
+
+        let estimate_overflow = package_fast_shard_memory_estimate_v1(4, 4, 0, u64::MAX, false);
+        assert_eq!(estimate_overflow.effective_jobs, 1);
+        assert_eq!(
+            estimate_overflow.reduction_reason,
+            PackageFastShardReductionReason::EstimateOverflow
+        );
+    }
+
+    #[test]
+    fn package_fast_lpt_reduces_heterogeneous_max_cost_and_is_canonical() {
+        fn estimate(cost: u64) -> PackageModuleCostEstimateV1 {
+            PackageModuleCostEstimateV1 {
+                artifact_bytes: cost,
+                direct_import_count: 0,
+                estimated_cost: cost,
+                overflowed: false,
+            }
+        }
+
+        let members = vec![
+            (0, 0, Name::from_dotted("A"), estimate(100)),
+            (1, 1, Name::from_dotted("B"), estimate(90)),
+            (2, 2, Name::from_dotted("C"), estimate(10)),
+            (3, 3, Name::from_dotted("D"), estimate(10)),
+        ];
+        let (shards, overflowed) = package_fast_lpt_shards(members.clone(), 2);
+        let lpt_max = shards
+            .iter()
+            .map(|shard| shard.estimated_cost)
+            .max()
+            .unwrap();
+        let equal_count_max = members[..2]
+            .iter()
+            .map(|member| member.3.estimated_cost)
+            .sum::<u64>()
+            .max(
+                members[2..]
+                    .iter()
+                    .map(|member| member.3.estimated_cost)
+                    .sum::<u64>(),
+            );
+
+        assert!(!overflowed);
+        assert_eq!(lpt_max, 110);
+        assert!(lpt_max < equal_count_max);
+        assert_eq!(shards[0].member_indexes, vec![0, 3]);
+        assert_eq!(shards[1].member_indexes, vec![1, 2]);
+        assert!(shards.iter().all(|shard| shard
+            .member_indexes
+            .windows(2)
+            .all(|pair| pair[0] < pair[1])));
+    }
+
+    #[test]
+    fn package_fast_worker_failure_selection_is_stable_and_spawn_precedes_join() {
+        let selected = select_package_fast_worker_infrastructure_failure(vec![
+            PackageFastWorkerInfrastructureFailure {
+                shard_index: 2,
+                first_module: Name::from_dotted("C"),
+                kind: PackageFastWorkerInfrastructureFailureKind::Spawn,
+            },
+            PackageFastWorkerInfrastructureFailure {
+                shard_index: 0,
+                first_module: Name::from_dotted("A"),
+                kind: PackageFastWorkerInfrastructureFailureKind::Join,
+            },
+            PackageFastWorkerInfrastructureFailure {
+                shard_index: 0,
+                first_module: Name::from_dotted("A"),
+                kind: PackageFastWorkerInfrastructureFailureKind::Spawn,
+            },
+        ])
+        .unwrap();
+
+        assert_eq!(selected.shard_index, 0);
+        assert_eq!(
+            selected.kind,
+            PackageFastWorkerInfrastructureFailureKind::Spawn
+        );
+        let error = PackageVerificationError::fast_worker_infrastructure_failed(
+            3,
+            selected.shard_index,
+            &selected.first_module,
+            PackageVerificationErrorReason::FastWorkerSpawnFailed,
+        );
+        assert_eq!(
+            error.reason_code,
+            PackageVerificationErrorReason::FastWorkerSpawnFailed
+        );
+        assert_eq!(error.path, "execution.layers[3].shards[0]");
+        assert_eq!(error.module.as_deref().map(String::as_str), Some("A"));
+        assert_eq!(
+            error.actual_value.as_deref(),
+            Some("spawn_failed;first_module=A")
+        );
+    }
+
+    #[test]
+    fn package_fast_planner_uses_opaque_artifact_lengths_without_decoding() {
+        let validated = validated_proof_manifest();
+        let lock = proof_lock();
+        let graph = validate_package_lock_against_manifest_graph(&validated, &lock).unwrap();
+        let entries = canonical_lock_entries(&lock);
+        let execution_modules = entries
+            .iter()
+            .map(|(_, entry)| entry.module.clone())
+            .collect::<BTreeSet<_>>();
+        let layers = execution_layers_for_modules(&entries, &graph, &execution_modules);
+        let first_layer = &layers[0];
+        let entries_by_module = entries
+            .iter()
+            .map(|(index, entry)| (entry.module.clone(), (*index, *entry)))
+            .collect::<BTreeMap<_, _>>();
+        let runnable = first_layer
+            .iter()
+            .map(|module| *entries_by_module.get(module).unwrap())
+            .collect::<Vec<_>>();
+        let opaque_bytes = b"not a certificate".as_slice();
+        let artifacts = runnable
+            .iter()
+            .map(|(_, entry)| (entry.certificate.clone(), opaque_bytes))
+            .collect::<BTreeMap<_, _>>();
+
+        let plan = plan_fast_verifier_shards(
+            &runnable,
+            &graph,
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            &artifacts,
+            4,
+        )
+        .expect("planning treats certificate bytes as opaque cost input");
+
+        assert!(plan
+            .module_costs
+            .values()
+            .all(|cost| cost.artifact_bytes == u64::try_from(opaque_bytes.len()).unwrap()));
+    }
+
+    #[test]
+    fn package_fast_borrowed_imports_require_exact_export_and_certificate_hashes() {
+        let validated = validated_proof_manifest();
+        let lock = proof_lock();
+        let artifacts = proof_certificate_artifacts(&lock);
+        let verification = verify_package_fast_source_free_with_modules(
+            &validated,
+            &lock,
+            package_certificate_artifacts(&artifacts),
+        )
+        .unwrap();
+        let graph = validate_package_lock_against_manifest_graph(&validated, &lock).unwrap();
+        let resolved_imports = graph
+            .resolved_entry_imports
+            .iter()
+            .find(|imports| !imports.is_empty())
+            .expect("proof fixture has a dependent module");
+        let verified_modules = verification
+            .verified_modules
+            .into_iter()
+            .map(|record| (record.module.clone(), record))
+            .collect::<BTreeMap<_, _>>();
+
+        assert_eq!(
+            exact_fast_import_refs(resolved_imports, &verified_modules).len(),
+            resolved_imports.len()
+        );
+
+        let imported_module = &resolved_imports[0].module;
+        let mut stale_export = verified_modules.clone();
+        stale_export.get_mut(imported_module).unwrap().export_hash =
+            PackageHash::new(test_hash(0x51));
+        assert_eq!(
+            exact_fast_import_refs(resolved_imports, &stale_export).len(),
+            resolved_imports.len() - 1
+        );
+
+        let mut stale_certificate = verified_modules;
+        stale_certificate
+            .get_mut(imported_module)
+            .unwrap()
+            .certificate_hash = PackageHash::new(test_hash(0x52));
+        assert_eq!(
+            exact_fast_import_refs(resolved_imports, &stale_certificate).len(),
+            resolved_imports.len() - 1
         );
     }
 
@@ -5528,6 +8135,83 @@ mod tests {
 
         assert_eq!(legacy_parallel, serial);
         assert_eq!(sharded, serial);
+    }
+
+    #[test]
+    fn package_verifier_cost_aware_shards_emit_canonical_bounded_measurements() {
+        run_on_large_stack(
+            "package_verifier_cost_aware_shards_emit_canonical_bounded_measurements",
+            package_verifier_cost_aware_shards_emit_canonical_bounded_measurements_on_large_stack,
+        );
+    }
+
+    fn package_verifier_cost_aware_shards_emit_canonical_bounded_measurements_on_large_stack() {
+        let validated = validated_proof_manifest();
+        let lock = proof_lock();
+        let artifacts = proof_certificate_artifacts(&lock);
+        let report = verify_package_fast_source_free_with_options(
+            &validated,
+            &lock,
+            package_certificate_artifacts(&artifacts),
+            PackageVerificationExecutionOptions {
+                jobs: 4,
+                selected_modules: Some(BTreeSet::from([Name::from_dotted("Proofs.Ai.Basic")])),
+                memoization: PackageVerificationMemoMode::Disabled,
+                decode_cache: PackageVerificationDecodeCacheMode::Disabled,
+                collect_decode_cache_counters: false,
+                measurement_mode: PerformanceMeasurementMode::Detailed,
+            },
+        )
+        .unwrap();
+        let measurements = report.measurements.as_ref().unwrap();
+        let sharding = measurements.package_sharding.as_ref().unwrap();
+
+        assert_eq!(
+            sharding.cost_model,
+            PerformancePackageShardCostModel::FastShardCostV1
+        );
+        assert_eq!(
+            sharding.memory_model,
+            PerformancePackageShardMemoryModel::FastShardMemoryV1
+        );
+        assert_eq!(sharding.requested_jobs, 4);
+        assert!(sharding.effective_jobs >= 1 && sharding.effective_jobs <= 4);
+        assert_eq!(
+            sharding.memory_budget_bytes,
+            PACKAGE_FAST_SHARD_MEMORY_BUDGET_BYTES_V1
+        );
+        assert!(sharding.critical_path_module_count > 0);
+        assert!(sharding.critical_path_identity.starts_with("sha256:"));
+        assert_eq!(sharding.critical_path_identity.len(), 71);
+        assert!(!measurements.package_layers.is_empty());
+        assert!(!measurements.package_shards.is_empty());
+        assert!(measurements
+            .package_layers
+            .windows(2)
+            .all(|layers| layers[0].layer_index < layers[1].layer_index));
+        assert!(measurements.package_shards.windows(2).all(|shards| {
+            (shards[0].layer_index, shards[0].shard_index)
+                < (shards[1].layer_index, shards[1].shard_index)
+        }));
+        assert!(measurements.modules.iter().all(|module| {
+            module.package_sharding.as_ref().is_some_and(|detail| {
+                detail.cost_model == PerformancePackageShardCostModel::FastShardCostV1
+                    && detail.estimated_cost >= 1
+                    && detail.layer_index.is_some()
+                    && detail.shard_index.is_some()
+            })
+        }));
+        assert_eq!(
+            measurements
+                .modules
+                .iter()
+                .filter(|module| module
+                    .package_sharding
+                    .as_ref()
+                    .is_some_and(|detail| detail.critical_path))
+                .count() as u64,
+            sharding.critical_path_module_count
+        );
     }
 
     #[test]
@@ -6070,6 +8754,7 @@ mod tests {
             package_certificate_artifacts(&artifacts),
             PackageVerificationExecutionOptions {
                 selected_modules: selected.clone(),
+                decode_cache: PackageVerificationDecodeCacheMode::ProcessLocal,
                 collect_decode_cache_counters: true,
                 ..PackageVerificationExecutionOptions::default()
             },
@@ -6081,6 +8766,7 @@ mod tests {
             package_certificate_artifacts(&artifacts),
             PackageVerificationExecutionOptions {
                 selected_modules: selected,
+                decode_cache: PackageVerificationDecodeCacheMode::ProcessLocal,
                 collect_decode_cache_counters: true,
                 ..PackageVerificationExecutionOptions::default()
             },
@@ -6112,6 +8798,102 @@ mod tests {
     }
 
     #[test]
+    fn package_measurements_preserve_decode_cache_hit_on_later_verifier_failure() {
+        fn counter(
+            report: &PerformanceMeasurementReport,
+            label: PerformanceMeasurementLabel,
+        ) -> u64 {
+            report
+                .counters
+                .iter()
+                .find(|counter| counter.label == label)
+                .map(|counter| counter.value)
+                .expect("measurement counter is present")
+        }
+
+        let _guard = decode_cache_test_lock();
+        clear_package_verification_decode_cache();
+        let manifest = proof_manifest();
+        let target_module = manifest
+            .modules
+            .first()
+            .expect("proof fixture has a local module")
+            .module
+            .clone();
+        let validated = validate_manifest(manifest.clone()).unwrap();
+        let lock = proof_lock();
+        let artifacts = proof_certificate_artifacts(&lock);
+        let selected = Some(BTreeSet::from([target_module.clone()]));
+        let options = PackageVerificationExecutionOptions {
+            selected_modules: selected.clone(),
+            decode_cache: PackageVerificationDecodeCacheMode::ProcessLocal,
+            collect_decode_cache_counters: true,
+            measurement_mode: PerformanceMeasurementMode::Detailed,
+            ..PackageVerificationExecutionOptions::default()
+        };
+
+        let warm = verify_package_fast_source_free_with_options(
+            &validated,
+            &lock,
+            package_certificate_artifacts(&artifacts),
+            options.clone(),
+        )
+        .unwrap();
+        assert_eq!(warm.status, PackageVerificationStatus::Passed);
+        assert!(
+            counter(
+                warm.measurements.as_ref().unwrap(),
+                PerformanceMeasurementLabel::PackageModulesDecoded,
+            ) > 0
+        );
+
+        let rejected_axiom_report_hash = PackageHash::new(test_hash(0xa7));
+        let mut rejected_lock = lock.clone();
+        rejected_lock
+            .entries
+            .iter_mut()
+            .find(|entry| entry.module == target_module)
+            .unwrap()
+            .axiom_report_hash = rejected_axiom_report_hash;
+        let mut rejected_manifest = manifest;
+        rejected_manifest
+            .modules
+            .iter_mut()
+            .find(|module| module.module == target_module)
+            .unwrap()
+            .expected_axiom_report_hash = rejected_axiom_report_hash;
+        let rejected = validate_manifest(rejected_manifest).unwrap();
+
+        let failed = verify_package_fast_source_free_with_options(
+            &rejected,
+            &rejected_lock,
+            package_certificate_artifacts(&artifacts),
+            PackageVerificationExecutionOptions {
+                selected_modules: selected,
+                ..options
+            },
+        )
+        .unwrap();
+        assert_eq!(failed.status, PackageVerificationStatus::Failed);
+        let cache_counters = failed.decode_cache_counters.unwrap();
+        assert!(cache_counters.certificate_hits > 0);
+        let measurements = failed.measurements.as_ref().unwrap();
+        assert_eq!(
+            counter(
+                measurements,
+                PerformanceMeasurementLabel::PackageModulesDecoded,
+            ),
+            0
+        );
+        assert!(
+            counter(
+                measurements,
+                PerformanceMeasurementLabel::PackageDecodeCacheHits,
+            ) > 0
+        );
+    }
+
+    #[test]
     fn package_verifier_decode_cache_corrupt_certificate_still_fails_like_uncached_run() {
         let _guard = decode_cache_test_lock();
         clear_package_verification_decode_cache();
@@ -6126,6 +8908,7 @@ mod tests {
             package_certificate_artifacts(&artifacts),
             PackageVerificationExecutionOptions {
                 selected_modules: selected.clone(),
+                decode_cache: PackageVerificationDecodeCacheMode::ProcessLocal,
                 collect_decode_cache_counters: true,
                 ..PackageVerificationExecutionOptions::default()
             },
@@ -6172,6 +8955,7 @@ mod tests {
             package_certificate_artifacts(&artifacts),
             PackageVerificationExecutionOptions {
                 selected_modules: selected.clone(),
+                decode_cache: PackageVerificationDecodeCacheMode::ProcessLocal,
                 collect_decode_cache_counters: true,
                 ..PackageVerificationExecutionOptions::default()
             },
@@ -6183,6 +8967,7 @@ mod tests {
             package_certificate_artifacts(&corrupt_artifacts),
             PackageVerificationExecutionOptions {
                 selected_modules: selected,
+                decode_cache: PackageVerificationDecodeCacheMode::ProcessLocal,
                 collect_decode_cache_counters: true,
                 ..PackageVerificationExecutionOptions::default()
             },
@@ -6399,6 +9184,26 @@ mod tests {
         assert_eq!(second.counters.import_context_disk_schema_misses, 0);
         assert_eq!(second.counters.import_context_disk_inserted, 0);
         assert_eq!(second.value, first.value);
+
+        let mut failed_counters = PackageVerificationDecodeCacheCounters::default();
+        let failed = reference_import_store_with_cache_observed(
+            *target_index,
+            target_entry,
+            direct_imports,
+            PackageReferenceImportContext {
+                lock: &lock,
+                entries: &entries,
+                checked_by_module: &BTreeMap::new(),
+                config: &config,
+            },
+            &mut failed_counters,
+        )
+        .expect_err("disk hit still requires verified imports in this run");
+        assert_eq!(
+            failed.reason_code,
+            PackageVerificationErrorReason::EarlierModuleFailed
+        );
+        assert_eq!(failed_counters.import_context_disk_hits, 1);
     }
 
     #[test]
@@ -6510,6 +9315,7 @@ mod tests {
             package_certificate_artifacts(&artifacts),
             PackageVerificationExecutionOptions {
                 selected_modules: selected.clone(),
+                decode_cache: PackageVerificationDecodeCacheMode::ProcessLocal,
                 collect_decode_cache_counters: true,
                 ..PackageVerificationExecutionOptions::default()
             },
@@ -6529,6 +9335,7 @@ mod tests {
             package_certificate_artifacts(&artifacts),
             PackageVerificationExecutionOptions {
                 selected_modules: selected,
+                decode_cache: PackageVerificationDecodeCacheMode::ProcessLocal,
                 collect_decode_cache_counters: true,
                 ..PackageVerificationExecutionOptions::default()
             },

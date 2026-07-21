@@ -533,11 +533,19 @@ pub fn validate_promotion_origin_registry_transition(
 ) -> PackageArtifactResult<()> {
     validate_promotion_origin_registry(previous)?;
     validate_promotion_origin_registry(next)?;
+    let expected_generation = previous.generation.checked_add(1).ok_or_else(|| {
+        PackageArtifactError::invalid_enum_value(
+            "$",
+            "registry_transition",
+            "same registry identity and next generation",
+            "generation overflow",
+        )
+    })?;
     if previous.schema != next.schema
         || previous.registry_id != next.registry_id
         || previous.registry_version != next.registry_version
         || previous.target_package != next.target_package
-        || next.generation != previous.generation + 1
+        || next.generation != expected_generation
     {
         return Err(PackageArtifactError::invalid_enum_value(
             "$",
@@ -672,7 +680,10 @@ fn validate_registry_shape(
     Ok(())
 }
 
-fn validate_entry(entry: &PromotionOriginEntry, index: usize) -> PackageArtifactResult<()> {
+pub(crate) fn validate_entry(
+    entry: &PromotionOriginEntry,
+    index: usize,
+) -> PackageArtifactResult<()> {
     let path = format!("entries[{index}]");
     validate_source(&entry.canonical_source, &format!("{path}.canonical_source"))?;
     validate_version(
@@ -831,7 +842,7 @@ fn validate_route(route: &PromotionModuleRoute, path: &str) -> PackageArtifactRe
     })
 }
 
-fn validate_reservation(
+pub(crate) fn validate_reservation(
     reservation: &PromotionLegacyTargetReservation,
     index: usize,
 ) -> PackageArtifactResult<()> {
@@ -1164,7 +1175,10 @@ fn duplicate_error(path: &str, actual: &str) -> PackageArtifactError {
     PackageArtifactError::non_canonical(path, actual)
 }
 
-fn parse_entry(value: &JsonValue, index: usize) -> PackageArtifactResult<PromotionOriginEntry> {
+pub(crate) fn parse_entry(
+    value: &JsonValue,
+    index: usize,
+) -> PackageArtifactResult<PromotionOriginEntry> {
     let path = format!("entries[{index}]");
     let members = expect_object(value, &path)?;
     reject_unknown_fields(&path, members, ENTRY_FIELDS)?;
@@ -1435,7 +1449,7 @@ fn parse_transport_evidence(
     })
 }
 
-fn parse_reservation(
+pub(crate) fn parse_reservation(
     value: &JsonValue,
     index: usize,
 ) -> PackageArtifactResult<PromotionLegacyTargetReservation> {
@@ -1493,7 +1507,7 @@ fn registry_json(registry: &PromotionOriginRegistry) -> String {
     ])
 }
 
-fn entry_json(entry: &PromotionOriginEntry) -> String {
+pub(crate) fn entry_json(entry: &PromotionOriginEntry) -> String {
     json_object_in_order(vec![
         ("promotion_id", hash_json(entry.promotion_id)),
         ("lifecycle", lifecycle_json(&entry.lifecycle)),
@@ -1737,7 +1751,7 @@ fn transport_evidence_json(value: &PromotionTransportEvidence) -> String {
     ])
 }
 
-fn reservation_json(reservation: &PromotionLegacyTargetReservation) -> String {
+pub(crate) fn reservation_json(reservation: &PromotionLegacyTargetReservation) -> String {
     json_object_in_order(vec![
         ("reservation_id", hash_json(reservation.reservation_id)),
         ("lifecycle", lifecycle_json(&reservation.lifecycle)),
@@ -1790,5 +1804,24 @@ mod tests {
             parse_promotion_origin_registry_json(&json).unwrap(),
             registry
         );
+    }
+
+    #[test]
+    fn transition_rejects_generation_overflow_without_panicking() {
+        let mut previous = PromotionOriginRegistry {
+            schema: MATHLIB_PROMOTION_ORIGIN_REGISTRY_SCHEMA.to_owned(),
+            registry_id: MATHLIB_PROMOTION_REGISTRY_ID.to_owned(),
+            registry_version: 1,
+            generation: u64::MAX,
+            target_package: PackageId::new("npa-mathlib"),
+            entries: Vec::new(),
+            unresolved_legacy_targets: Vec::new(),
+            registry_hash: zero_hash(),
+            proof_evidence: false,
+        };
+        previous.refresh_hash().unwrap();
+        let next = previous.clone();
+
+        assert!(validate_promotion_origin_registry_transition(&previous, &next).is_err());
     }
 }

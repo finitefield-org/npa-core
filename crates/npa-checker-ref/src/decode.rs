@@ -10,7 +10,8 @@ use sha2::{Digest, Sha256};
 use crate::{
     reference_name_component_is_canonical, ReferenceAxiomDependency,
     ReferenceCertificateFormatVersion, ReferenceCertificateHeader, ReferenceCertificateSection,
-    ReferenceCheckError, ReferenceCheckImportTarget, ReferenceCheckReason, ReferenceCheckReference,
+    ReferenceCheckDeclarationObservation, ReferenceCheckError, ReferenceCheckImportTarget,
+    ReferenceCheckObservation, ReferenceCheckReason, ReferenceCheckReference,
     ReferenceCheckResolvedImportIdentity, ReferenceCheckedModule, ReferenceCheckerPolicy,
     ReferenceCoreExpr, ReferenceCoreFeature, ReferenceCoreGlobalRef, ReferenceCoreLevel,
     ReferenceDecodedCertificate, ReferenceDecodedCertificateCounts, ReferenceExportKind,
@@ -114,6 +115,29 @@ pub(crate) fn check_certificate_impl(
     policy: &ReferenceCheckerPolicy,
 ) -> DecodeResult<ReferenceCheckedModule> {
     let cert = decode_module_certificate(bytes)?;
+    check_decoded_certificate(cert, bytes, import_store, policy)
+}
+
+pub(crate) fn check_certificate_impl_with_observation(
+    bytes: &[u8],
+    import_store: &ReferenceImportStore,
+    policy: &ReferenceCheckerPolicy,
+    declaration_detail_limit: usize,
+    observation: &mut ReferenceCheckObservation,
+) -> DecodeResult<ReferenceCheckedModule> {
+    let cert = decode_module_certificate(bytes)?;
+    observation.certificate_decoded = true;
+    observation.declaration_count = cert.declarations.len();
+    observation.declarations = cert.declaration_observations(declaration_detail_limit);
+    check_decoded_certificate(cert, bytes, import_store, policy)
+}
+
+fn check_decoded_certificate(
+    cert: DecodedModuleCertificate,
+    bytes: &[u8],
+    import_store: &ReferenceImportStore,
+    policy: &ReferenceCheckerPolicy,
+) -> DecodeResult<ReferenceCheckedModule> {
     cert.verify_hashes(bytes)?;
     cert.enforce_core_feature_policy(policy)?;
     let imports = cert.build_import_environment(import_store, policy)?;
@@ -216,6 +240,7 @@ impl DecodedModuleCertificate {
             self.hashes.export_hash,
             self.hashes.axiom_report_hash,
             self.hashes.certificate_hash,
+            self.declarations.len(),
             Arc::new(self.public_environment()?),
         ))
     }
@@ -495,6 +520,53 @@ impl DecodedModuleCertificate {
                 .value
                 .clone()
         })
+    }
+
+    fn declaration_observations(&self, limit: usize) -> Vec<ReferenceCheckDeclarationObservation> {
+        self.declarations
+            .iter()
+            .take(limit)
+            .enumerate()
+            .map(
+                |(declaration_index, declaration)| ReferenceCheckDeclarationObservation {
+                    declaration_index,
+                    declaration: self.name_table[declaration.value.decl.name_id()]
+                        .value
+                        .clone(),
+                    term_nodes: self.declaration_term_nodes(&declaration.value.decl),
+                },
+            )
+            .collect()
+    }
+
+    fn declaration_term_nodes(&self, declaration: &DeclPayload) -> usize {
+        let mut pending = declaration.term_roots();
+        let mut visited = BTreeSet::new();
+        while let Some(term_id) = pending.pop() {
+            if !visited.insert(term_id) {
+                continue;
+            }
+            let Some(node) = self.term_table.get(term_id) else {
+                continue;
+            };
+            match &node.value {
+                TermNode::App(function, argument) => {
+                    pending.push(*function);
+                    pending.push(*argument);
+                }
+                TermNode::Lam { ty, body } | TermNode::Pi { ty, body } => {
+                    pending.push(*ty);
+                    pending.push(*body);
+                }
+                TermNode::Let { ty, value, body } => {
+                    pending.push(*ty);
+                    pending.push(*value);
+                    pending.push(*body);
+                }
+                TermNode::Sort(_) | TermNode::BVar(_) | TermNode::Const { .. } => {}
+            }
+        }
+        visited.len()
     }
 
     fn reference_context(
@@ -8087,6 +8159,17 @@ impl ReferenceUniverseContext {
         if lhs == rhs {
             return Ok(true);
         }
+        // If the rhs is zero, `imax` is zero. Otherwise a lhs bounded by one
+        // is also bounded by the positive rhs.
+        if let ReferenceCoreLevel::IMax(imax_lhs, imax_rhs) = &lhs {
+            let smallest_positive_sort =
+                ReferenceCoreLevel::Succ(Arc::new(ReferenceCoreLevel::Zero));
+            if **imax_rhs == rhs
+                && self.entails_level_le(imax_lhs, &smallest_positive_sort, offset)?
+            {
+                return Ok(true);
+            }
+        }
         let lhs_atoms = decompose_reference_lhs_level_expr(&lhs, offset)?;
         let rhs_atoms = decompose_reference_level_expr(&rhs, offset)?;
         let comparison_count = lhs_atoms
@@ -8226,6 +8309,55 @@ impl DeclPayload {
             | Self::Inductive { name, .. }
             | Self::InductiveConstrained { name, .. }
             | Self::MutualInductiveBlock { name, .. } => *name,
+        }
+    }
+
+    fn term_roots(&self) -> Vec<usize> {
+        match self {
+            Self::Axiom { ty, .. } | Self::AxiomConstrained { ty, .. } => vec![*ty],
+            Self::Def { ty, value, .. } | Self::DefConstrained { ty, value, .. } => {
+                vec![*ty, *value]
+            }
+            Self::Theorem { ty, proof, .. } | Self::TheoremConstrained { ty, proof, .. } => {
+                vec![*ty, *proof]
+            }
+            Self::Inductive {
+                params,
+                indices,
+                constructors,
+                recursor,
+                ..
+            }
+            | Self::InductiveConstrained {
+                params,
+                indices,
+                constructors,
+                recursor,
+                ..
+            } => params
+                .iter()
+                .chain(indices)
+                .map(|binder| binder.ty)
+                .chain(constructors.iter().map(|constructor| constructor.ty))
+                .chain(recursor.iter().map(|recursor| recursor.ty))
+                .collect(),
+            Self::MutualInductiveBlock { inductives, .. } => inductives
+                .iter()
+                .flat_map(|inductive| {
+                    inductive
+                        .params
+                        .iter()
+                        .chain(&inductive.indices)
+                        .map(|binder| binder.ty)
+                        .chain(
+                            inductive
+                                .constructors
+                                .iter()
+                                .map(|constructor| constructor.ty),
+                        )
+                        .chain(inductive.recursor.iter().map(|recursor| recursor.ty))
+                })
+                .collect(),
         }
     }
 }

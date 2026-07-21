@@ -2054,6 +2054,77 @@ fn package_promotion_commands_parse_strict_modes() {
 }
 
 #[test]
+fn declaration_promotion_args_are_mutually_exclusive_and_attestation_bound() {
+    let prepared = parse(&[
+        "package",
+        "prepare-promotion",
+        "--root=source",
+        "--target-baseline-root=baseline",
+        "--declaration-request=promotion/selection.json",
+        "--out=promotion/plan.json",
+    ]);
+    let CliAction::Run(CliCommand::Package(PackageCommand::PreparePromotion(options))) = prepared
+    else {
+        panic!("expected declaration prepare-promotion");
+    };
+    assert_eq!(
+        options.declaration_request,
+        Some(PathBuf::from("promotion/selection.json"))
+    );
+    assert!(options.acceptance_policy.is_none());
+
+    let mixed = parse_error(&[
+        "package",
+        "prepare-promotion",
+        "--root=source",
+        "--target-baseline-root=baseline",
+        "--declaration-request=promotion/selection.json",
+        "--mapping=promotion/mapping.json",
+        "--out=promotion/plan.json",
+    ]);
+    assert_eq!(mixed.reason, UsageReason::InvalidFlagValue);
+    assert_eq!(mixed.flag.as_deref(), Some("--declaration-request"));
+
+    let tracked = parse(&[
+        "package",
+        "materialize-promotion",
+        "--root=source",
+        "--target-baseline-root=baseline",
+        "--target-root=target",
+        "--plan=promotion/plan.json",
+        "--verification-attestation=promotion/verified.json",
+        "--phase=tracked",
+    ]);
+    let CliAction::Run(CliCommand::Package(PackageCommand::MaterializePromotion(options))) =
+        tracked
+    else {
+        panic!("expected declaration materialize-promotion");
+    };
+    assert_eq!(
+        options.verification_attestation,
+        Some(PathBuf::from("promotion/verified.json"))
+    );
+    assert!(options.transport_attestation.is_none());
+
+    let validated = parse(&[
+        "package",
+        "validate-promotion-materialization",
+        "--root=source",
+        "--target-baseline-root=baseline",
+        "--target-root=temporary",
+        "--plan=promotion/plan.json",
+        "--out=promotion/verified.json",
+        "--check",
+    ]);
+    assert!(matches!(
+        validated,
+        CliAction::Run(CliCommand::Package(
+            PackageCommand::ValidatePromotionMaterialization(_)
+        ))
+    ));
+}
+
+#[test]
 fn package_promotion_registry_commands_parse() {
     let validate = parse(&[
         "package",

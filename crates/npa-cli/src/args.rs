@@ -63,6 +63,8 @@ pub enum PackageCommand {
     PreparePromotion(Box<PackagePreparePromotionOptions>),
     /// `npa package materialize-promotion`.
     MaterializePromotion(Box<PackageMaterializePromotionOptions>),
+    /// `npa package validate-promotion-materialization`.
+    ValidatePromotionMaterialization(Box<PackageValidatePromotionMaterializationOptions>),
     /// `npa package validate-promotion-origin-registry`.
     ValidatePromotionOriginRegistry(PackageValidatePromotionOriginRegistryOptions),
     /// `npa package register-equivalent-promotion-origin`.
@@ -104,6 +106,9 @@ impl PackageCommand {
             Self::ValidateL2NamespaceTransport(_) => "package validate-l2-namespace-transport",
             Self::PreparePromotion(_) => "package prepare-promotion",
             Self::MaterializePromotion(_) => "package materialize-promotion",
+            Self::ValidatePromotionMaterialization(_) => {
+                "package validate-promotion-materialization"
+            }
             Self::ValidatePromotionOriginRegistry(_) => {
                 "package validate-promotion-origin-registry"
             }
@@ -140,6 +145,7 @@ impl PackageCommand {
             Self::ValidateL2NamespaceTransport(options) => &options.common,
             Self::PreparePromotion(options) => &options.common,
             Self::MaterializePromotion(options) => &options.common,
+            Self::ValidatePromotionMaterialization(options) => &options.common,
             Self::ValidatePromotionOriginRegistry(options) => &options.common,
             Self::RegisterEquivalentPromotionOrigin(options) => &options.common,
             Self::VerifyCerts(options) => &options.common,
@@ -440,13 +446,15 @@ pub struct PackagePreparePromotionOptions {
     /// Clean target package baseline.
     pub target_baseline_root: PathBuf,
     /// Canonical current L2 policy.
-    pub acceptance_policy: PathBuf,
+    pub acceptance_policy: Option<PathBuf>,
     /// Source-root-relative v2 acceptance ledger.
-    pub source_acceptance: PathBuf,
+    pub source_acceptance: Option<PathBuf>,
     /// Canonical namespace-transport policy.
-    pub transport_policy: PathBuf,
+    pub transport_policy: Option<PathBuf>,
     /// Source-root-relative mapping request.
-    pub mapping: PathBuf,
+    pub mapping: Option<PathBuf>,
+    /// Source-root-relative declaration selection request for plan v2.
+    pub declaration_request: Option<PathBuf>,
     /// Optional artifact-identical source package roots.
     pub equivalent_origin_roots: Vec<PathBuf>,
     /// Source-root-relative canonical plan output.
@@ -489,12 +497,31 @@ pub struct PackageMaterializePromotionOptions {
     pub equivalent_origin_roots: Vec<PathBuf>,
     /// Source-root-relative transport attestation for tracked mode.
     pub transport_attestation: Option<PathBuf>,
+    /// Source-root-relative verified materialization attestation for plan v2 tracked mode.
+    pub verification_attestation: Option<PathBuf>,
     /// Explicit safety phase in normal mode.
     pub phase: Option<PackagePromotionPhase>,
     /// Whether the validated change set may be written.
     pub apply: bool,
     /// Recovery journal path; when present all normal-mode options are absent.
     pub recover: Option<PathBuf>,
+}
+
+/// Options for `package validate-promotion-materialization`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PackageValidatePromotionMaterializationOptions {
+    /// Common options; root is the source package root.
+    pub common: PackageCommonOptions,
+    /// Clean target package baseline.
+    pub target_baseline_root: PathBuf,
+    /// Already materialized disposable target copy.
+    pub target_root: PathBuf,
+    /// Source-root-relative declaration promotion plan v2.
+    pub plan: PathBuf,
+    /// Source-root-relative canonical attestation output.
+    pub out: PathBuf,
+    /// Compare an existing attestation without writing.
+    pub check: bool,
 }
 
 /// Options for `package validate-promotion-origin-registry`.
@@ -930,6 +957,8 @@ pub enum HelpTopic {
     PackagePreparePromotion,
     /// `npa package materialize-promotion --help`.
     PackageMaterializePromotion,
+    /// `npa package validate-promotion-materialization --help`.
+    PackageValidatePromotionMaterialization,
     /// `npa package validate-promotion-origin-registry --help`.
     PackageValidatePromotionOriginRegistry,
     /// `npa package register-equivalent-promotion-origin --help`.
@@ -1112,6 +1141,9 @@ fn parse_package_args(args: &[String]) -> Result<CliAction, CliUsageError> {
         }
         "prepare-promotion" => parse_package_prepare_promotion_args(&args[1..]),
         "materialize-promotion" => parse_package_materialize_promotion_args(&args[1..]),
+        "validate-promotion-materialization" => {
+            parse_package_validate_promotion_materialization_args(&args[1..])
+        }
         "validate-promotion-origin-registry" => {
             parse_package_validate_promotion_origin_registry_args(&args[1..])
         }
@@ -2364,6 +2396,7 @@ fn parse_package_prepare_promotion_args(args: &[String]) -> Result<CliAction, Cl
     let mut source_acceptance = None;
     let mut transport_policy = None;
     let mut mapping = None;
+    let mut declaration_request = None;
     let mut equivalent_origin_roots = Vec::new();
     let mut out = None;
     let mut check = false;
@@ -2376,6 +2409,7 @@ fn parse_package_prepare_promotion_args(args: &[String]) -> Result<CliAction, Cl
             "--source-acceptance" => Some(("--source-acceptance", &mut source_acceptance)),
             "--transport-policy" => Some(("--transport-policy", &mut transport_policy)),
             "--mapping" => Some(("--mapping", &mut mapping)),
+            "--declaration-request" => Some(("--declaration-request", &mut declaration_request)),
             "--out" => Some(("--out", &mut out)),
             "--equivalent-origin-root" => {
                 equivalent_origin_roots.push(PathBuf::from(flag_value(
@@ -2417,6 +2451,7 @@ fn parse_package_prepare_promotion_args(args: &[String]) -> Result<CliAction, Cl
             ("--source-acceptance", &mut source_acceptance),
             ("--transport-policy", &mut transport_policy),
             ("--mapping", &mut mapping),
+            ("--declaration-request", &mut declaration_request),
             ("--out", &mut out),
         ] {
             if token.starts_with(&format!("{flag}=")) {
@@ -2439,6 +2474,34 @@ fn parse_package_prepare_promotion_args(args: &[String]) -> Result<CliAction, Cl
     if !root_explicit {
         return Err(flag_error("--root", UsageReason::MissingRequiredFlag).with_command(COMMAND));
     }
+    let l2_count = [
+        acceptance_policy.is_some(),
+        source_acceptance.is_some(),
+        transport_policy.is_some(),
+        mapping.is_some(),
+    ]
+    .into_iter()
+    .filter(|present| *present)
+    .count();
+    if declaration_request.is_some() {
+        if l2_count != 0 {
+            return Err(
+                flag_error("--declaration-request", UsageReason::InvalidFlagValue)
+                    .with_command(COMMAND),
+            );
+        }
+    } else if l2_count != 4 {
+        let flag = if acceptance_policy.is_none() {
+            "--acceptance-policy"
+        } else if source_acceptance.is_none() {
+            "--source-acceptance"
+        } else if transport_policy.is_none() {
+            "--transport-policy"
+        } else {
+            "--mapping"
+        };
+        return Err(flag_error(flag, UsageReason::MissingRequiredFlag).with_command(COMMAND));
+    }
     let mut seen_origins = BTreeSet::new();
     if equivalent_origin_roots
         .iter()
@@ -2453,10 +2516,11 @@ fn parse_package_prepare_promotion_args(args: &[String]) -> Result<CliAction, Cl
         PackageCommand::PreparePromotion(Box::new(PackagePreparePromotionOptions {
             common: parse_common_options(&common_tokens, COMMAND, &[])?,
             target_baseline_root: required(baseline, "--target-baseline-root")?,
-            acceptance_policy: required(acceptance_policy, "--acceptance-policy")?,
-            source_acceptance: required(source_acceptance, "--source-acceptance")?,
-            transport_policy: required(transport_policy, "--transport-policy")?,
-            mapping: required(mapping, "--mapping")?,
+            acceptance_policy,
+            source_acceptance,
+            transport_policy,
+            mapping,
+            declaration_request,
             equivalent_origin_roots,
             out: required(out, "--out")?,
             check,
@@ -2478,6 +2542,7 @@ fn parse_package_materialize_promotion_args(args: &[String]) -> Result<CliAction
     let mut plan = None;
     let mut equivalent_origin_roots = Vec::new();
     let mut attestation = None;
+    let mut verification_attestation = None;
     let mut phase = None;
     let mut recover = None;
     let mut apply = false;
@@ -2490,6 +2555,9 @@ fn parse_package_materialize_promotion_args(args: &[String]) -> Result<CliAction
             "--target-root" => Some(("--target-root", &mut target)),
             "--plan" => Some(("--plan", &mut plan)),
             "--transport-attestation" => Some(("--transport-attestation", &mut attestation)),
+            "--verification-attestation" => {
+                Some(("--verification-attestation", &mut verification_attestation))
+            }
             "--recover" => Some(("--recover", &mut recover)),
             "--equivalent-origin-root" => {
                 equivalent_origin_roots.push(PathBuf::from(flag_value(
@@ -2557,6 +2625,7 @@ fn parse_package_materialize_promotion_args(args: &[String]) -> Result<CliAction
             ("--target-root", &mut target),
             ("--plan", &mut plan),
             ("--transport-attestation", &mut attestation),
+            ("--verification-attestation", &mut verification_attestation),
             ("--recover", &mut recover),
         ] {
             if token.starts_with(&format!("{flag}=")) {
@@ -2584,6 +2653,7 @@ fn parse_package_materialize_promotion_args(args: &[String]) -> Result<CliAction
             || plan.is_some()
             || !equivalent_origin_roots.is_empty()
             || attestation.is_some()
+            || verification_attestation.is_some()
             || phase.is_some()
             || apply
             || dry_run
@@ -2609,19 +2679,29 @@ fn parse_package_materialize_promotion_args(args: &[String]) -> Result<CliAction
             };
             return Err(flag_error(flag, UsageReason::MissingRequiredFlag).with_command(COMMAND));
         }
-        match (phase, attestation.is_some()) {
-            (Some(PackagePromotionPhase::Tracked), false) => {
+        let attestation_count =
+            usize::from(attestation.is_some()) + usize::from(verification_attestation.is_some());
+        match (phase, attestation_count) {
+            (Some(PackagePromotionPhase::Tracked), 0) => {
                 return Err(flag_error(
                     "--transport-attestation",
                     UsageReason::MissingRequiredFlag,
                 )
                 .with_command(COMMAND));
             }
-            (Some(PackagePromotionPhase::Temporary), true) => {
-                return Err(
-                    flag_error("--transport-attestation", UsageReason::InvalidFlagValue)
-                        .with_command(COMMAND),
-                );
+            (Some(PackagePromotionPhase::Tracked), 2) => {
+                return Err(flag_error(
+                    "--verification-attestation",
+                    UsageReason::InvalidFlagValue,
+                )
+                .with_command(COMMAND));
+            }
+            (Some(PackagePromotionPhase::Temporary), 1 | 2) => {
+                return Err(flag_error(
+                    "--verification-attestation",
+                    UsageReason::InvalidFlagValue,
+                )
+                .with_command(COMMAND));
             }
             _ => {}
         }
@@ -2644,6 +2724,7 @@ fn parse_package_materialize_promotion_args(args: &[String]) -> Result<CliAction
             plan,
             equivalent_origin_roots,
             transport_attestation: attestation,
+            verification_attestation,
             phase,
             apply,
             recover,
@@ -2663,6 +2744,87 @@ fn parse_promotion_phase(
             .with_flag("--phase")
             .with_value(value)),
     }
+}
+
+fn parse_package_validate_promotion_materialization_args(
+    args: &[String],
+) -> Result<CliAction, CliUsageError> {
+    const COMMAND: &str = "package validate-promotion-materialization";
+    if contains_help(args) {
+        return Ok(CliAction::Help(
+            HelpTopic::PackageValidatePromotionMaterialization,
+        ));
+    }
+    let root_explicit = args
+        .iter()
+        .any(|token| token == "--root" || token.starts_with("--root="));
+    let mut common_tokens = Vec::new();
+    let mut baseline = None;
+    let mut target = None;
+    let mut plan = None;
+    let mut out = None;
+    let mut check = false;
+    let mut index = 0;
+    while index < args.len() {
+        let token = args[index].as_str();
+        let slot = match token {
+            "--target-baseline-root" => Some(("--target-baseline-root", &mut baseline)),
+            "--target-root" => Some(("--target-root", &mut target)),
+            "--plan" => Some(("--plan", &mut plan)),
+            "--out" => Some(("--out", &mut out)),
+            "--check" if !check => {
+                check = true;
+                index += 1;
+                continue;
+            }
+            "--check" => {
+                return Err(flag_error("--check", UsageReason::DuplicateFlag).with_command(COMMAND));
+            }
+            _ => None,
+        };
+        if let Some((flag, slot)) = slot {
+            parse_path_flag(args, &mut index, flag, COMMAND, slot)?;
+            continue;
+        }
+        let mut handled = false;
+        for (flag, slot) in [
+            ("--target-baseline-root", &mut baseline),
+            ("--target-root", &mut target),
+            ("--plan", &mut plan),
+            ("--out", &mut out),
+        ] {
+            if token.starts_with(&format!("{flag}=")) {
+                parse_path_equals_flag(token, flag, COMMAND, slot)?;
+                handled = true;
+                break;
+            }
+        }
+        if handled {
+            index += 1;
+        } else {
+            common_tokens.push(token.to_owned());
+            index += 1;
+        }
+    }
+    if !root_explicit {
+        return Err(flag_error("--root", UsageReason::MissingRequiredFlag).with_command(COMMAND));
+    }
+    let required = |value: Option<PathBuf>, flag: &'static str| {
+        value
+            .ok_or_else(|| flag_error(flag, UsageReason::MissingRequiredFlag).with_command(COMMAND))
+    };
+    Ok(CliAction::Run(CliCommand::Package(
+        PackageCommand::ValidatePromotionMaterialization(Box::new(
+            PackageValidatePromotionMaterializationOptions {
+                common: parse_common_options(&common_tokens, COMMAND, &[])?,
+                target_baseline_root: required(baseline, "--target-baseline-root")?,
+                target_root: required(target, "--target-root")?,
+                plan: required(plan, "--plan")?,
+                out: required(out, "--out")?,
+                check,
+            },
+        )),
+    )))
 }
 
 fn parse_package_validate_promotion_origin_registry_args(
@@ -3972,7 +4134,7 @@ pub fn render_help(topic: HelpTopic) -> &'static str {
             "Usage: npa <command> [options]\n\nCommands:\n  package    Package manifest and certificate commands\n  version    Print npa CLI version\n\nOptions:\n  --help\n  --version"
         }
         HelpTopic::Package => {
-            "Usage: npa package <command> [options]\n\nCommands:\n  check\n  build-certs\n  axiom-report\n  index\n  theorem-premise-report\n  export-summary\n  export-candidate-metadata\n  prepare-l2-review-input\n  aggregate-l2-acceptance\n  validate-l2-acceptance\n  validate-l2-namespace-transport\n  prepare-promotion\n  materialize-promotion\n  validate-promotion-origin-registry\n  register-equivalent-promotion-origin\n  verify-certs\n  check-hashes\n  audit-artifact-ledger\n  lock\n  publish-plan\n  check-generated\n  high-trust\n  gate-plan\n  refactor-plan\n\nCommon options:\n  --root PATH    Package root, default: .\n  --json         Emit deterministic JSON diagnostics\n  --help         Show help"
+            "Usage: npa package <command> [options]\n\nCommands:\n  check\n  build-certs\n  axiom-report\n  index\n  theorem-premise-report\n  export-summary\n  export-candidate-metadata\n  prepare-l2-review-input\n  aggregate-l2-acceptance\n  validate-l2-acceptance\n  validate-l2-namespace-transport\n  prepare-promotion\n  materialize-promotion\n  validate-promotion-materialization\n  validate-promotion-origin-registry\n  register-equivalent-promotion-origin\n  verify-certs\n  check-hashes\n  audit-artifact-ledger\n  lock\n  publish-plan\n  check-generated\n  high-trust\n  gate-plan\n  refactor-plan\n\nCommon options:\n  --root PATH    Package root, default: .\n  --json         Emit deterministic JSON diagnostics\n  --help         Show help"
         }
         HelpTopic::PackageCheck => {
             "Usage: npa package check [--root PATH] [--json]\n\nValidate npa-package.toml metadata without reading source or certificate artifacts."
@@ -4008,10 +4170,13 @@ pub fn render_help(topic: HelpTopic) -> &'static str {
             "Usage: npa package validate-l2-namespace-transport --source-root PATH --target-baseline-root PATH --target-root PATH --acceptance-policy PATH --source-acceptance PATH --transport-policy PATH --mapping PATH [--out PATH] [--check] [--json]\n\nValidate source-free, canonical-certificate namespace-only transport."
         }
         HelpTopic::PackagePreparePromotion => {
-            "Usage: npa package prepare-promotion --root PATH --target-baseline-root PATH --acceptance-policy PATH --source-acceptance PATH --transport-policy PATH --mapping PATH [--equivalent-origin-root PATH]... --out PATH [--check] [--json]\n\nBuild or check a canonical package-generic mathlib promotion plan after validating current L2 and namespace-transport governance."
+            "Usage: npa package prepare-promotion --root PATH --target-baseline-root PATH --acceptance-policy PATH --source-acceptance PATH --transport-policy PATH --mapping PATH [--equivalent-origin-root PATH]... --out PATH [--check] [--json]\n       npa package prepare-promotion --root PATH --target-baseline-root PATH --declaration-request PATH [--equivalent-origin-root PATH]... --out PATH [--check] [--json]\n\nBuild or check a canonical mathlib promotion plan. The declaration request form selects a bounded verified declaration closure and is mutually exclusive with L2 namespace-transport inputs."
         }
         HelpTopic::PackageMaterializePromotion => {
-            "Usage: npa package materialize-promotion --root PATH --target-baseline-root PATH --target-root PATH --plan PATH [--equivalent-origin-root PATH]... --phase temporary|tracked [--transport-attestation PATH] [--dry-run|--apply] [--json]\n       npa package materialize-promotion --target-root PATH --recover PATH [--json]\n\nValidate and deterministically materialize a promotion plan. Every equivalent origin in the plan requires its matching package root. Dry-run is the default; tracked apply requires a current transport attestation."
+            "Usage: npa package materialize-promotion --root PATH --target-baseline-root PATH --target-root PATH --plan PATH [--equivalent-origin-root PATH]... --phase temporary|tracked [--transport-attestation PATH|--verification-attestation PATH] [--dry-run|--apply] [--json]\n       npa package materialize-promotion --target-root PATH --recover PATH [--json]\n\nValidate and deterministically materialize a promotion plan. Plan v1 tracked apply requires transport evidence; plan v2 tracked apply requires a verified materialization attestation."
+        }
+        HelpTopic::PackageValidatePromotionMaterialization => {
+            "Usage: npa package validate-promotion-materialization --root PATH --target-baseline-root PATH --target-root PATH --plan PATH --out PATH [--check] [--json]\n\nIndependently verify one disposable declaration-level target, including deterministic rebuild and normalized closure equality, then create or check its canonical attestation."
         }
         HelpTopic::PackageValidatePromotionOriginRegistry => {
             "Usage: npa package validate-promotion-origin-registry [--root PATH] [--source-root PATH]... [--previous-registry PATH] [--json]\n\nValidate the canonical target registry, current target identities, optional source identities, and an optional append-only transition."

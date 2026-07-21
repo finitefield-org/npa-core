@@ -10,7 +10,8 @@ use npa_cli::{
         PackageAxiomReportOptions, PackageCommand, PackageCommonOptions, PackageIndexOptions,
         PackageL2AcceptanceAggregateOptions, PackageL2NamespaceTransportOptions,
         PackageL2ReviewInputOptions, PackageLockCommand, PackageMaterializePromotionOptions,
-        PackagePreparePromotionOptions, PackagePromotionPhase, PackageTimingMode,
+        PackagePreparePromotionOptions, PackagePromotionPhase,
+        PackageRegisterEquivalentPromotionOriginOptions, PackageTimingMode,
         PackageValidatePromotionOriginRegistryOptions,
     },
     diagnostic::CommandStatus,
@@ -20,16 +21,16 @@ use npa_package::{
     format_package_hash, package_file_hash, parse_and_validate_manifest_str,
     parse_l2_acceptance_policy_json, parse_l2_namespace_transport_attestation_json,
     parse_l2_review_input_json, parse_package_proof_replay, parse_package_theorem_index_json,
-    parse_promotion_origin_registry_json, promotion_legacy_target_reservation_id,
+    parse_promotion_origin_registry_v2_json, promotion_legacy_target_reservation_id,
     promotion_transaction_path_hash, L2NamespaceTransportRequest, L2ReviewCheckDecision,
     L2ReviewCheckResult, L2ReviewReport, L2TransportEndpoint, L2TransportModuleMapping,
     L2TransportModuleRole, L2TransportPackageIdentity, PackageArtifactOrigin, PackageHash,
     PackagePath, PromotionAuditLocation, PromotionEvidence, PromotionLegacyTargetReservation,
-    PromotionLifecycle, PromotionOldFile, PromotionOriginRegistry, PromotionReplacementState,
-    PromotionReservedTheorem, PromotionTargetRevision, PromotionTransactionJournal,
-    PromotionTransactionPhase, PromotionTransactionRow, PromotionTransactionState,
-    MATHLIB_PROMOTION_ORIGIN_REGISTRY_SCHEMA, MATHLIB_PROMOTION_REGISTRY_ID,
-    MATHLIB_PROMOTION_TRANSACTION_SCHEMA,
+    PromotionLifecycle, PromotionOldFile, PromotionOriginEntryV2, PromotionOriginRegistry,
+    PromotionReplacementState, PromotionReservedTheorem, PromotionTargetRevision,
+    PromotionTransactionJournal, PromotionTransactionPhase, PromotionTransactionRow,
+    PromotionTransactionState, MATHLIB_PROMOTION_ORIGIN_REGISTRY_SCHEMA,
+    MATHLIB_PROMOTION_REGISTRY_ID, MATHLIB_PROMOTION_TRANSACTION_SCHEMA,
 };
 
 static NEXT_TEMP_DIR: AtomicUsize = AtomicUsize::new(0);
@@ -38,6 +39,7 @@ struct Fixture {
     root: PathBuf,
     source: PathBuf,
     equivalent_source: PathBuf,
+    unregistered_equivalent_source: PathBuf,
     baseline: PathBuf,
     target: PathBuf,
     tracked: PathBuf,
@@ -54,6 +56,7 @@ impl Fixture {
         fs::create_dir_all(&root).unwrap();
         let source = root.join("source");
         let equivalent_source = root.join("equivalent-source");
+        let unregistered_equivalent_source = root.join("unregistered-equivalent-source");
         let baseline = root.join("baseline");
         let target = root.join("target");
         let tracked = root.join("tracked");
@@ -65,6 +68,13 @@ impl Fixture {
         copy_directory(&source, &equivalent_source);
         replace_manifest_package(&equivalent_source, "npa-mathlib-seed", "npa-project-alias");
         regenerate_generated_artifacts(&equivalent_source);
+        copy_directory(&source, &unregistered_equivalent_source);
+        replace_manifest_package(
+            &unregistered_equivalent_source,
+            "npa-mathlib-seed",
+            "npa-project-alias-two",
+        );
+        regenerate_generated_artifacts(&unregistered_equivalent_source);
         copy_directory(&repo_root().join("testdata/package/npa-mathlib"), &baseline);
         for (module, path) in [
             ("Mathlib.Core.Reduction", "Mathlib/Core/Reduction"),
@@ -81,6 +91,7 @@ impl Fixture {
             root,
             source,
             equivalent_source,
+            unregistered_equivalent_source,
             baseline,
             target,
             tracked,
@@ -290,10 +301,11 @@ fn promotion_prepare_materialize_transport_and_registry_end_to_end() {
     let prepare_options = PackagePreparePromotionOptions {
         common: common(&fixture.source),
         target_baseline_root: fixture.baseline.clone(),
-        acceptance_policy: policy_path.clone(),
-        source_acceptance: acceptance_path.clone(),
-        transport_policy: transport_policy_path.clone(),
-        mapping: mapping_path.clone(),
+        acceptance_policy: Some(policy_path.clone()),
+        source_acceptance: Some(acceptance_path.clone()),
+        transport_policy: Some(transport_policy_path.clone()),
+        mapping: Some(mapping_path.clone()),
+        declaration_request: None,
         equivalent_origin_roots: vec![fixture.equivalent_source.clone()],
         out: plan_path.clone(),
         check: false,
@@ -320,10 +332,11 @@ fn promotion_prepare_materialize_transport_and_registry_end_to_end() {
         PackagePreparePromotionOptions {
             common: common(&fixture.source),
             target_baseline_root: collision_baseline.clone(),
-            acceptance_policy: policy_path.clone(),
-            source_acceptance: acceptance_path.clone(),
-            transport_policy: transport_policy_path.clone(),
-            mapping: mapping_path.clone(),
+            acceptance_policy: Some(policy_path.clone()),
+            source_acceptance: Some(acceptance_path.clone()),
+            transport_policy: Some(transport_policy_path.clone()),
+            mapping: Some(mapping_path.clone()),
+            declaration_request: None,
             equivalent_origin_roots: vec![fixture.equivalent_source.clone()],
             out: collision_plan_path.clone(),
             check: false,
@@ -496,12 +509,61 @@ fn promotion_prepare_materialize_transport_and_registry_end_to_end() {
         CommandStatus::Passed,
         "{registry_validation:?}"
     );
-    let registry = parse_promotion_origin_registry_json(
+    let registry = parse_promotion_origin_registry_v2_json(
         &fs::read_to_string(fixture.tracked.join("promotion-origins.json")).unwrap(),
     )
     .unwrap();
     assert_eq!(registry.entries.len(), 1);
-    assert_eq!(registry.entries[0].equivalent_sources.len(), 1);
+    let PromotionOriginEntryV2::WholeModuleV1(entry) = &registry.entries[0] else {
+        panic!("plan v1 promotion must be wrapped in registry v2")
+    };
+    assert_eq!(entry.equivalent_sources.len(), 1);
+
+    // Legacy complete-module preparation must continue to understand a v2
+    // baseline. This second request is otherwise fresh, but its exact source
+    // origin was registered by the first promotion and must be rejected as a
+    // duplicate rather than as an unreadable registry.
+    let mut v2_baseline_request = request.clone();
+    v2_baseline_request.target.version = npa_package::PackageVersion::new("0.3.0");
+    for mapping in &mut v2_baseline_request.module_mappings {
+        mapping.target.version = npa_package::PackageVersion::new("0.3.0");
+        if mapping.role == L2TransportModuleRole::Selected {
+            mapping.target.module = npa_cert::Name::from_dotted(format!(
+                "{}.Second",
+                mapping.target.module.as_dotted()
+            ));
+        }
+    }
+    let v2_mapping_path = PathBuf::from("l2-transports/v2-baseline.transport-request.json");
+    fs::write(
+        fixture.source.join(&v2_mapping_path),
+        v2_baseline_request.canonical_json().unwrap(),
+    )
+    .unwrap();
+    let v2_baseline_prepare = run_package_command(PackageCommand::PreparePromotion(Box::new(
+        PackagePreparePromotionOptions {
+            common: common(&fixture.source),
+            target_baseline_root: fixture.tracked.clone(),
+            acceptance_policy: Some(policy_path.clone()),
+            source_acceptance: Some(acceptance_path.clone()),
+            transport_policy: Some(transport_policy_path.clone()),
+            mapping: Some(v2_mapping_path),
+            declaration_request: None,
+            equivalent_origin_roots: vec![fixture.equivalent_source.clone()],
+            out: PathBuf::from("promotions/v2-baseline.plan.json"),
+            check: false,
+        },
+    )));
+    assert_eq!(v2_baseline_prepare.status, CommandStatus::Failed);
+    assert_eq!(
+        v2_baseline_prepare.diagnostics[0].reason_code,
+        "promotion_plan_origin_already_promoted"
+    );
+    assert!(!fixture
+        .source
+        .join("promotions/v2-baseline.plan.json")
+        .exists());
+
     let replay = parse_package_proof_replay(
         &fs::read_to_string(fixture.tracked.join("Mathlib/Core/Reduction/replay.json")).unwrap(),
     )
@@ -530,6 +592,28 @@ fn promotion_prepare_materialize_transport_and_registry_end_to_end() {
         "promotion_materialize_target_not_clean"
     );
     assert_eq!(snapshot_directory(&fixture.tracked), tracked_before_repeat);
+
+    let registry_before_rejected_registration =
+        fs::read(fixture.tracked.join("promotion-origins.json")).unwrap();
+    fs::write(
+        fixture.tracked.join("Mathlib/Core/Reduction/source.npa"),
+        b"tampered\n",
+    )
+    .unwrap();
+    let rejected_registration =
+        run_package_command(PackageCommand::RegisterEquivalentPromotionOrigin(
+            PackageRegisterEquivalentPromotionOriginOptions {
+                common: common(&fixture.unregistered_equivalent_source),
+                target_root: fixture.tracked.clone(),
+                promotion_id: format_package_hash(&registry.entries[0].promotion_id()),
+                apply: true,
+            },
+        ));
+    assert_eq!(rejected_registration.status, CommandStatus::Failed);
+    assert_eq!(
+        fs::read(fixture.tracked.join("promotion-origins.json")).unwrap(),
+        registry_before_rejected_registration
+    );
 
     fs::write(
         fixture.target.join("Mathlib/Core/Reduction/source.npa"),
@@ -764,6 +848,7 @@ fn run_recovery_case(
             plan: None,
             equivalent_origin_roots: Vec::new(),
             transport_attestation: None,
+            verification_attestation: None,
             phase: None,
             apply: false,
             recover: Some(transaction.join("journal.json")),
@@ -808,6 +893,7 @@ fn materialize_options(
         plan: Some(plan.to_path_buf()),
         equivalent_origin_roots,
         transport_attestation,
+        verification_attestation: None,
         phase: Some(phase),
         apply,
         recover: None,

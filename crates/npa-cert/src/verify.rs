@@ -2,7 +2,8 @@ use std::collections::BTreeSet;
 
 use npa_kernel::{
     expr::collect_apps, level::level_eq, level::levels_eq, Binder, ConstructorDecl, Env, Expr,
-    InductiveDecl, Level, MutualInductiveBlock,
+    InductiveDecl, KernelExecutionOptions, KernelWorkCounterSink, KernelWorkCounters, Level,
+    MutualInductiveBlock,
 };
 
 use crate::*;
@@ -13,9 +14,13 @@ pub(crate) fn verify_module_cert_impl(
     policy: &AxiomPolicy,
 ) -> Result<VerifiedModule> {
     let cert = decode_module_cert(bytes)?;
-    let verified = verify_owned_module_cert_with_import_resolver(cert, bytes, policy, |cert| {
-        resolve_imports(cert, session, policy)
-    })?;
+    let verified = verify_owned_module_cert_with_import_resolver(
+        cert,
+        bytes,
+        policy,
+        KernelExecutionOptions::default(),
+        |cert| resolve_imports(cert, session, policy),
+    )?;
     session.insert_verified(verified.clone(), policy.mode);
     Ok(verified)
 }
@@ -33,9 +38,13 @@ pub(crate) fn verify_decoded_module_cert_impl(
     session: &mut VerifierSession,
     policy: &AxiomPolicy,
 ) -> Result<VerifiedModule> {
-    let verified = verify_decoded_module_cert_with_import_resolver(cert, bytes, policy, |cert| {
-        resolve_imports(cert, session, policy)
-    })?;
+    let verified = verify_decoded_module_cert_with_import_resolver(
+        cert,
+        bytes,
+        policy,
+        KernelExecutionOptions::default(),
+        |cert| resolve_imports(cert, session, policy),
+    )?;
     session.insert_verified(verified.clone(), policy.mode);
     Ok(verified)
 }
@@ -45,10 +54,45 @@ pub(crate) fn verify_module_cert_with_import_refs_impl(
     imports: &[&VerifiedModule],
     policy: &AxiomPolicy,
 ) -> Result<VerifiedModule> {
+    verify_module_cert_with_import_refs_and_options_impl(
+        bytes,
+        imports,
+        policy,
+        KernelExecutionOptions::default(),
+    )
+}
+
+pub(crate) fn verify_module_cert_with_import_refs_and_options_impl(
+    bytes: &[u8],
+    imports: &[&VerifiedModule],
+    policy: &AxiomPolicy,
+    kernel_options: KernelExecutionOptions,
+) -> Result<VerifiedModule> {
     let cert = decode_module_cert(bytes)?;
-    verify_owned_module_cert_with_import_resolver(cert, bytes, policy, |cert| {
+    verify_owned_module_cert_with_import_resolver(cert, bytes, policy, kernel_options, |cert| {
         resolve_import_refs(cert, imports, policy)
     })
+}
+
+pub(crate) fn verify_module_cert_with_import_refs_and_options_and_work_counters_impl(
+    bytes: &[u8],
+    imports: &[&VerifiedModule],
+    policy: &AxiomPolicy,
+    kernel_options: KernelExecutionOptions,
+    work_counters: &mut KernelWorkCounters,
+) -> Result<VerifiedModule> {
+    let cert = decode_module_cert(bytes)?;
+    let sink = KernelWorkCounterSink::default();
+    let result = verify_owned_module_cert_with_import_resolver_and_work_counter_sink(
+        cert,
+        bytes,
+        policy,
+        kernel_options,
+        sink.clone(),
+        |cert| resolve_import_refs(cert, imports, policy),
+    );
+    work_counters.merge(sink.snapshot());
+    result
 }
 
 pub(crate) fn verify_decoded_module_cert_with_import_refs_impl(
@@ -57,7 +101,23 @@ pub(crate) fn verify_decoded_module_cert_with_import_refs_impl(
     imports: &[&VerifiedModule],
     policy: &AxiomPolicy,
 ) -> Result<VerifiedModule> {
-    verify_decoded_module_cert_with_import_resolver(cert, bytes, policy, |cert| {
+    verify_decoded_module_cert_with_import_refs_and_options_impl(
+        cert,
+        bytes,
+        imports,
+        policy,
+        KernelExecutionOptions::default(),
+    )
+}
+
+pub(crate) fn verify_decoded_module_cert_with_import_refs_and_options_impl(
+    cert: &ModuleCert,
+    bytes: &[u8],
+    imports: &[&VerifiedModule],
+    policy: &AxiomPolicy,
+    kernel_options: KernelExecutionOptions,
+) -> Result<VerifiedModule> {
+    verify_decoded_module_cert_with_import_resolver(cert, bytes, policy, kernel_options, |cert| {
         resolve_import_refs(cert, imports, policy)
     })
 }
@@ -67,7 +127,21 @@ pub(crate) fn verify_built_module_cert_with_import_refs_impl(
     imports: &[&VerifiedModule],
     policy: &AxiomPolicy,
 ) -> Result<VerifiedModule> {
-    verify_decoded_module_cert_after_encoding_check(cert, policy, |cert| {
+    verify_built_module_cert_with_import_refs_and_options_impl(
+        cert,
+        imports,
+        policy,
+        KernelExecutionOptions::default(),
+    )
+}
+
+pub(crate) fn verify_built_module_cert_with_import_refs_and_options_impl(
+    cert: &ModuleCert,
+    imports: &[&VerifiedModule],
+    policy: &AxiomPolicy,
+    kernel_options: KernelExecutionOptions,
+) -> Result<VerifiedModule> {
+    verify_decoded_module_cert_after_encoding_check(cert, policy, kernel_options, |cert| {
         resolve_import_refs(cert, imports, policy)
     })
 }
@@ -76,20 +150,41 @@ fn verify_decoded_module_cert_with_import_resolver<'a>(
     cert: &ModuleCert,
     bytes: &[u8],
     policy: &AxiomPolicy,
+    kernel_options: KernelExecutionOptions,
     resolve_imports: impl FnOnce(&ModuleCert) -> Result<Vec<&'a VerifiedModule>>,
 ) -> Result<VerifiedModule> {
     verify_canonical_encoding(cert, bytes)?;
-    verify_decoded_module_cert_after_encoding_check(cert, policy, resolve_imports)
+    verify_decoded_module_cert_after_encoding_check(cert, policy, kernel_options, resolve_imports)
 }
 
 fn verify_owned_module_cert_with_import_resolver<'a>(
     cert: ModuleCert,
     bytes: &[u8],
     policy: &AxiomPolicy,
+    kernel_options: KernelExecutionOptions,
     resolve_imports: impl FnOnce(&ModuleCert) -> Result<Vec<&'a VerifiedModule>>,
 ) -> Result<VerifiedModule> {
     verify_canonical_encoding(&cert, bytes)?;
-    verify_decoded_module_cert_checks(&cert, policy, resolve_imports)?;
+    verify_decoded_module_cert_checks(&cert, policy, kernel_options, resolve_imports)?;
+    Ok(verified_module_from_owned_cert(cert))
+}
+
+fn verify_owned_module_cert_with_import_resolver_and_work_counter_sink<'a>(
+    cert: ModuleCert,
+    bytes: &[u8],
+    policy: &AxiomPolicy,
+    kernel_options: KernelExecutionOptions,
+    work_counter_sink: KernelWorkCounterSink,
+    resolve_imports: impl FnOnce(&ModuleCert) -> Result<Vec<&'a VerifiedModule>>,
+) -> Result<VerifiedModule> {
+    verify_canonical_encoding(&cert, bytes)?;
+    verify_decoded_module_cert_checks_inner(
+        &cert,
+        policy,
+        kernel_options,
+        Some(work_counter_sink),
+        resolve_imports,
+    )?;
     Ok(verified_module_from_owned_cert(cert))
 }
 
@@ -106,15 +201,27 @@ fn verify_canonical_encoding(cert: &ModuleCert, bytes: &[u8]) -> Result<()> {
 fn verify_decoded_module_cert_after_encoding_check<'a>(
     cert: &ModuleCert,
     policy: &AxiomPolicy,
+    kernel_options: KernelExecutionOptions,
     resolve_imports: impl FnOnce(&ModuleCert) -> Result<Vec<&'a VerifiedModule>>,
 ) -> Result<VerifiedModule> {
-    verify_decoded_module_cert_checks(cert, policy, resolve_imports)?;
+    verify_decoded_module_cert_checks(cert, policy, kernel_options, resolve_imports)?;
     Ok(verified_module_from_cert(cert))
 }
 
 fn verify_decoded_module_cert_checks<'a>(
     cert: &ModuleCert,
     policy: &AxiomPolicy,
+    kernel_options: KernelExecutionOptions,
+    resolve_imports: impl FnOnce(&ModuleCert) -> Result<Vec<&'a VerifiedModule>>,
+) -> Result<()> {
+    verify_decoded_module_cert_checks_inner(cert, policy, kernel_options, None, resolve_imports)
+}
+
+fn verify_decoded_module_cert_checks_inner<'a>(
+    cert: &ModuleCert,
+    policy: &AxiomPolicy,
+    kernel_options: KernelExecutionOptions,
+    work_counter_sink: Option<KernelWorkCounterSink>,
     resolve_imports: impl FnOnce(&ModuleCert) -> Result<Vec<&'a VerifiedModule>>,
 ) -> Result<()> {
     verify_hash_and_table_checks(cert)?;
@@ -127,7 +234,10 @@ fn verify_decoded_module_cert_checks<'a>(
     enforce_axiom_policy(cert, policy)?;
     enforce_import_axiom_policy(&imports, policy)?;
 
-    let mut env = Env::new();
+    let mut env = match work_counter_sink {
+        Some(sink) => Env::with_execution_options_and_work_counter_sink(kernel_options, sink),
+        None => Env::with_execution_options(kernel_options),
+    };
     let builtin_refs = referenced_builtins_from_cert(cert)?;
     add_referenced_imports_to_env(&mut env, cert, &imports)?;
     add_referenced_builtins_to_env(&mut env, &builtin_refs)?;

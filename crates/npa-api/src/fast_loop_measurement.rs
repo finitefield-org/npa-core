@@ -6,25 +6,48 @@
 
 use std::collections::BTreeMap;
 
+use npa_tactic::MachineTacticPreparationCounters;
+
 use crate::tactic::{
     MachineTacticBatchOkFields, MachineTacticBatchSchedulerFields, MachineTacticRunSuccessFields,
 };
+use crate::types::MachineSchedulerArtifactKind;
+use crate::{
+    performance_measurement_report_json, PerformanceCandidateMeasurement,
+    PerformanceCandidateOutcome, PerformanceMeasurementLabel, PerformanceMeasurementMode,
+    PerformanceMeasurementRecorder, PerformanceMeasurementReport,
+};
 
-pub const FAST_LOOP_MEASUREMENT_SCHEMA: &str = "npa.fast-loop-measurement.v1";
+pub const FAST_LOOP_MEASUREMENT_SCHEMA: &str = "npa.fast-loop-measurement.v2";
+pub const FAST_LOOP_MEASUREMENT_SCHEMA_V1: &str = "npa.fast-loop-measurement.v1";
+pub const FAST_LOOP_MEASUREMENT_SCHEMA_V1_1: &str = "npa.fast-loop-measurement.v1.1";
 pub const FAST_LOOP_MEASUREMENT_TRUST_BOUNDARY: &str =
     "authoring diagnostic sidecar only; not proof evidence and not checker input";
+
+/// Compatibility-window schema negotiation for downstream sidecar readers.
+pub fn fast_loop_measurement_schema_supported(schema: &str) -> bool {
+    matches!(
+        schema,
+        FAST_LOOP_MEASUREMENT_SCHEMA_V1
+            | FAST_LOOP_MEASUREMENT_SCHEMA_V1_1
+            | FAST_LOOP_MEASUREMENT_SCHEMA
+    )
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FastLoopMeasurementMode {
     Disabled,
+    /// Compatibility spelling for summary measurement.
     Enabled,
+    Detailed,
 }
 
 impl FastLoopMeasurementMode {
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::Disabled => "disabled",
-            Self::Enabled => "enabled",
+            Self::Disabled => "off",
+            Self::Enabled => "summary",
+            Self::Detailed => "detailed",
         }
     }
 }
@@ -38,6 +61,23 @@ pub enum FastLoopMeasurementLabel {
     FocusedReplayArtifactBytes,
     ModuleBuildElapsed,
     SourceFreeVerificationElapsed,
+    DelayedCandidateParsedCount,
+    DelayedCandidateSkippedCount,
+    PreparedSnapshotCount,
+    PreparedSnapshotElapsed,
+    CompleteInputStateValidationCount,
+    InputStateValidationReuseCount,
+    GoalProjectionCount,
+    ContextProjectionCount,
+    CandidateLocalValidationCount,
+    CandidateLocalValidationElapsed,
+    CandidateExecutionCount,
+    CandidateExecutionElapsed,
+    ExecutableInputStateCloneCount,
+    OutputStateCloneCount,
+    OutputStateValidationCount,
+    SchedulerTimeoutStopCount,
+    SchedulerResourceLimitStopCount,
 }
 
 impl FastLoopMeasurementLabel {
@@ -50,6 +90,23 @@ impl FastLoopMeasurementLabel {
             Self::FocusedReplayArtifactBytes => "focused_replay_artifact_bytes",
             Self::ModuleBuildElapsed => "module_build_elapsed_ms",
             Self::SourceFreeVerificationElapsed => "source_free_verification_elapsed_ms",
+            Self::DelayedCandidateParsedCount => "delayed_candidate_parsed_count",
+            Self::DelayedCandidateSkippedCount => "delayed_candidate_skipped_count",
+            Self::PreparedSnapshotCount => "prepared_snapshot_count",
+            Self::PreparedSnapshotElapsed => "prepared_snapshot_elapsed_ns",
+            Self::CompleteInputStateValidationCount => "complete_input_state_validation_count",
+            Self::InputStateValidationReuseCount => "input_state_validation_reuse_count",
+            Self::GoalProjectionCount => "goal_projection_count",
+            Self::ContextProjectionCount => "context_projection_count",
+            Self::CandidateLocalValidationCount => "candidate_local_validation_count",
+            Self::CandidateLocalValidationElapsed => "candidate_local_validation_elapsed_ns",
+            Self::CandidateExecutionCount => "candidate_execution_count",
+            Self::CandidateExecutionElapsed => "candidate_execution_elapsed_ns",
+            Self::ExecutableInputStateCloneCount => "executable_input_state_clone_count",
+            Self::OutputStateCloneCount => "output_state_clone_count",
+            Self::OutputStateValidationCount => "output_state_validation_count",
+            Self::SchedulerTimeoutStopCount => "scheduler_timeout_stop_count",
+            Self::SchedulerResourceLimitStopCount => "scheduler_resource_limit_stop_count",
         }
     }
 }
@@ -59,6 +116,7 @@ pub enum FastLoopMeasurementUnit {
     Count,
     Bytes,
     Milliseconds,
+    Nanoseconds,
 }
 
 impl FastLoopMeasurementUnit {
@@ -67,6 +125,7 @@ impl FastLoopMeasurementUnit {
             Self::Count => "count",
             Self::Bytes => "bytes",
             Self::Milliseconds => "ms",
+            Self::Nanoseconds => "ns",
         }
     }
 }
@@ -135,6 +194,9 @@ pub struct FastLoopPerformanceHandoffItem {
 pub struct FastLoopMeasurementReport {
     pub schema: &'static str,
     pub mode: FastLoopMeasurementMode,
+    pub trusted: bool,
+    pub proof_evidence: bool,
+    pub measurements: PerformanceMeasurementReport,
     pub counters: Vec<FastLoopMeasurementCounter>,
     pub authoring_cache_status: FastLoopAuthoringCacheStatus,
     pub performance_handoff: Vec<FastLoopPerformanceHandoffItem>,
@@ -146,6 +208,8 @@ pub struct FastLoopMeasurementRecorder {
     mode: FastLoopMeasurementMode,
     counters: BTreeMap<(FastLoopMeasurementLabel, Option<FastLoopCandidateStage>), u64>,
     authoring_cache_status: FastLoopAuthoringCacheStatus,
+    measurements: PerformanceMeasurementRecorder,
+    next_batch_index: u64,
 }
 
 impl FastLoopMeasurementRecorder {
@@ -154,6 +218,8 @@ impl FastLoopMeasurementRecorder {
             mode: FastLoopMeasurementMode::Disabled,
             counters: BTreeMap::new(),
             authoring_cache_status: FastLoopAuthoringCacheStatus::Disabled,
+            measurements: PerformanceMeasurementRecorder::new(PerformanceMeasurementMode::Off),
+            next_batch_index: 0,
         }
     }
 
@@ -162,6 +228,18 @@ impl FastLoopMeasurementRecorder {
             mode: FastLoopMeasurementMode::Enabled,
             counters: BTreeMap::new(),
             authoring_cache_status: FastLoopAuthoringCacheStatus::NotObserved,
+            measurements: PerformanceMeasurementRecorder::new(PerformanceMeasurementMode::Summary),
+            next_batch_index: 0,
+        }
+    }
+
+    pub fn detailed() -> Self {
+        Self {
+            mode: FastLoopMeasurementMode::Detailed,
+            counters: BTreeMap::new(),
+            authoring_cache_status: FastLoopAuthoringCacheStatus::NotObserved,
+            measurements: PerformanceMeasurementRecorder::new(PerformanceMeasurementMode::Detailed),
+            next_batch_index: 0,
         }
     }
 
@@ -170,7 +248,39 @@ impl FastLoopMeasurementRecorder {
     }
 
     pub const fn is_enabled(&self) -> bool {
-        matches!(self.mode, FastLoopMeasurementMode::Enabled)
+        !matches!(self.mode, FastLoopMeasurementMode::Disabled)
+    }
+
+    pub(crate) fn begin_candidate_batch(&mut self) -> u64 {
+        let index = self.next_batch_index;
+        let Some(next) = self.next_batch_index.checked_add(1) else {
+            self.measurements.mark_overflowed();
+            return index;
+        };
+        self.next_batch_index = next;
+        index
+    }
+
+    pub(crate) fn start_timer(&mut self) -> Option<std::time::Instant> {
+        self.measurements.start_timer()
+    }
+
+    pub(crate) fn observe_candidate_detail(
+        &mut self,
+        batch_index: u64,
+        candidate_index: u64,
+        validation_elapsed_ns: u64,
+        execution_elapsed_ns: u64,
+        outcome: PerformanceCandidateOutcome,
+    ) {
+        self.measurements
+            .update_candidate(PerformanceCandidateMeasurement {
+                batch_index,
+                candidate_index,
+                validation_elapsed_ns,
+                execution_elapsed_ns,
+                outcome,
+            });
     }
 
     pub fn observe_snapshot_latency_ms(&mut self, elapsed_ms: u64) {
@@ -230,9 +340,144 @@ impl FastLoopMeasurementRecorder {
         );
     }
 
+    pub fn observe_delayed_candidate_parsed(&mut self) {
+        self.add_counter(
+            FastLoopMeasurementLabel::DelayedCandidateParsedCount,
+            None,
+            1,
+        );
+    }
+
+    pub fn observe_delayed_candidates_skipped(&mut self, count: u64) {
+        if count == 0 {
+            return;
+        }
+        self.add_counter(
+            FastLoopMeasurementLabel::DelayedCandidateSkippedCount,
+            None,
+            count,
+        );
+    }
+
+    pub fn observe_prepared_snapshot(&mut self, elapsed_ns: u64) {
+        self.add_counter(FastLoopMeasurementLabel::PreparedSnapshotCount, None, 1);
+        self.add_counter(
+            FastLoopMeasurementLabel::PreparedSnapshotElapsed,
+            None,
+            elapsed_ns,
+        );
+    }
+
+    pub fn observe_candidate_local_validation_elapsed_ns(&mut self, elapsed_ns: u64) {
+        self.add_counter(
+            FastLoopMeasurementLabel::CandidateLocalValidationElapsed,
+            None,
+            elapsed_ns,
+        );
+    }
+
+    pub fn observe_candidate_execution_elapsed_ns(&mut self, elapsed_ns: u64) {
+        self.add_counter(
+            FastLoopMeasurementLabel::CandidateExecutionElapsed,
+            None,
+            elapsed_ns,
+        );
+    }
+
+    pub fn observe_executable_input_state_clone(&mut self) {
+        self.add_counter(
+            FastLoopMeasurementLabel::ExecutableInputStateCloneCount,
+            None,
+            1,
+        );
+    }
+
+    pub(crate) fn observe_candidate_input_validation(&mut self) {
+        self.measurements
+            .add_counter(PerformanceMeasurementLabel::CandidateInputValidations, 1);
+    }
+
+    pub fn observe_machine_tactic_preparation_counter_delta(
+        &mut self,
+        before: MachineTacticPreparationCounters,
+        after: MachineTacticPreparationCounters,
+    ) {
+        for (label, value) in [
+            (
+                FastLoopMeasurementLabel::CompleteInputStateValidationCount,
+                after
+                    .complete_input_state_validations
+                    .saturating_sub(before.complete_input_state_validations),
+            ),
+            (
+                FastLoopMeasurementLabel::InputStateValidationReuseCount,
+                after
+                    .input_state_validation_reuses
+                    .saturating_sub(before.input_state_validation_reuses),
+            ),
+            (
+                FastLoopMeasurementLabel::GoalProjectionCount,
+                after
+                    .selected_goal_projections
+                    .saturating_sub(before.selected_goal_projections),
+            ),
+            (
+                FastLoopMeasurementLabel::ContextProjectionCount,
+                after
+                    .selected_context_projections
+                    .saturating_sub(before.selected_context_projections),
+            ),
+            (
+                FastLoopMeasurementLabel::CandidateLocalValidationCount,
+                after
+                    .candidate_local_validations
+                    .saturating_sub(before.candidate_local_validations),
+            ),
+            (
+                FastLoopMeasurementLabel::CandidateExecutionCount,
+                after
+                    .candidate_executions
+                    .saturating_sub(before.candidate_executions),
+            ),
+            (
+                FastLoopMeasurementLabel::OutputStateCloneCount,
+                after
+                    .output_state_clones
+                    .saturating_sub(before.output_state_clones),
+            ),
+            (
+                FastLoopMeasurementLabel::OutputStateValidationCount,
+                after
+                    .output_state_validations
+                    .saturating_sub(before.output_state_validations),
+            ),
+        ] {
+            if value != 0 {
+                self.add_counter(label, None, value);
+            }
+        }
+    }
+
     pub fn observe_authoring_cache_status(&mut self, status: FastLoopAuthoringCacheStatus) {
         if self.is_enabled() {
             self.authoring_cache_status = status;
+            let label = match status {
+                FastLoopAuthoringCacheStatus::Hit => {
+                    Some(PerformanceMeasurementLabel::CacheContextHits)
+                }
+                FastLoopAuthoringCacheStatus::Disabled => {
+                    Some(PerformanceMeasurementLabel::CacheContextOff)
+                }
+                FastLoopAuthoringCacheStatus::Miss
+                | FastLoopAuthoringCacheStatus::SchemaMiss
+                | FastLoopAuthoringCacheStatus::Stale => {
+                    Some(PerformanceMeasurementLabel::CacheContextMisses)
+                }
+                FastLoopAuthoringCacheStatus::NotObserved => None,
+            };
+            if let Some(label) = label {
+                self.measurements.add_counter(label, 1);
+            }
         }
     }
 
@@ -248,6 +493,12 @@ impl FastLoopMeasurementRecorder {
         requested_candidate_count: usize,
         fields: &MachineTacticBatchOkFields,
     ) {
+        self.measurements
+            .observe_candidate_attempts(u64::try_from(fields.results.len()).unwrap_or(u64::MAX));
+        self.measurements.add_counter(
+            PerformanceMeasurementLabel::CandidateEvaluatedPrefix,
+            u64::try_from(fields.results.len()).unwrap_or(u64::MAX),
+        );
         self.observe_candidate_stage_count(
             FastLoopCandidateStage::Generated,
             requested_candidate_count
@@ -277,6 +528,12 @@ impl FastLoopMeasurementRecorder {
         requested_candidate_count: usize,
         fields: &MachineTacticBatchSchedulerFields,
     ) {
+        self.measurements
+            .observe_candidate_attempts(u64::try_from(fields.results.len()).unwrap_or(u64::MAX));
+        self.measurements.add_counter(
+            PerformanceMeasurementLabel::CandidateEvaluatedPrefix,
+            u64::from(fields.completed_prefix_len),
+        );
         self.observe_candidate_stage_count(
             FastLoopCandidateStage::Generated,
             requested_candidate_count
@@ -297,6 +554,21 @@ impl FastLoopMeasurementRecorder {
         );
     }
 
+    pub fn observe_tactic_batch_scheduler_stop_reason(
+        &mut self,
+        kind: MachineSchedulerArtifactKind,
+    ) {
+        let label = match kind {
+            MachineSchedulerArtifactKind::Timeout => {
+                FastLoopMeasurementLabel::SchedulerTimeoutStopCount
+            }
+            MachineSchedulerArtifactKind::ResourceLimitExceeded => {
+                FastLoopMeasurementLabel::SchedulerResourceLimitStopCount
+            }
+        };
+        self.add_counter(label, None, 1);
+    }
+
     pub fn report(&self) -> Option<FastLoopMeasurementReport> {
         if !self.is_enabled() {
             return None;
@@ -315,6 +587,12 @@ impl FastLoopMeasurementRecorder {
         Some(FastLoopMeasurementReport {
             schema: FAST_LOOP_MEASUREMENT_SCHEMA,
             mode: self.mode,
+            trusted: false,
+            proof_evidence: false,
+            measurements: self
+                .measurements
+                .report()
+                .expect("enabled fast-loop recorder has common measurement state"),
             counters,
             authoring_cache_status: self.authoring_cache_status,
             performance_handoff: fast_loop_performance_handoff_items(),
@@ -331,16 +609,62 @@ impl FastLoopMeasurementRecorder {
         if !self.is_enabled() {
             return;
         }
-        *self.counters.entry((label, stage)).or_default() += value;
+        let counter = self.counters.entry((label, stage)).or_default();
+        let (next, overflowed) = counter.overflowing_add(value);
+        *counter = if overflowed { u64::MAX } else { next };
+        if overflowed {
+            self.measurements.mark_overflowed();
+        }
+        if let Some((common_label, multiplier)) = common_label(label, stage) {
+            self.measurements
+                .add_counter(common_label, value.saturating_mul(multiplier));
+        }
     }
+}
+
+fn common_label(
+    label: FastLoopMeasurementLabel,
+    stage: Option<FastLoopCandidateStage>,
+) -> Option<(PerformanceMeasurementLabel, u64)> {
+    use FastLoopCandidateStage as Stage;
+    use FastLoopMeasurementLabel as Legacy;
+    use PerformanceMeasurementLabel as Common;
+    let mapped = match (label, stage) {
+        (Legacy::CandidateStageCount, Some(Stage::Generated)) => Common::CandidateSubmitted,
+        (Legacy::CandidateStageCount, Some(Stage::Executed)) => Common::CandidateEvaluated,
+        (Legacy::CandidateStageCount, Some(Stage::Accepted)) => Common::CandidateAccepted,
+        (Legacy::CandidateStageCount, Some(Stage::Rejected)) => Common::CandidateRejected,
+        (Legacy::DelayedCandidateParsedCount, _) => Common::CandidateDelayedPayloadsParsed,
+        (Legacy::DelayedCandidateSkippedCount, _) => Common::CandidateDelayedPayloadsSkipped,
+        (Legacy::PreparedSnapshotCount, _) => Common::CandidateBatchPreparations,
+        (Legacy::PreparedSnapshotElapsed, _) => Common::CandidatePreparationElapsed,
+        (Legacy::CompleteInputStateValidationCount, _) => Common::CandidateBaseValidations,
+        (Legacy::InputStateValidationReuseCount, _) => Common::CandidateBaseValidationsReused,
+        (Legacy::GoalProjectionCount, _) => Common::CandidateGoalProjections,
+        (Legacy::ContextProjectionCount, _) => Common::CandidateContextProjections,
+        (Legacy::CandidateLocalValidationCount, _) => Common::CandidateLocalValidations,
+        (Legacy::CandidateLocalValidationElapsed, _) => Common::CandidateValidationElapsed,
+        (Legacy::CandidateExecutionElapsed, _) => Common::CandidateExecutionElapsed,
+        (Legacy::ExecutableInputStateCloneCount, _) => Common::CandidateExecutableBaseStateClones,
+        (Legacy::OutputStateCloneCount, _) => Common::CandidateOutputStateClones,
+        (Legacy::OutputStateValidationCount, _) => Common::CandidateOutputValidations,
+        (Legacy::ModuleBuildElapsed, _) => Common::ModuleBuildElapsed,
+        (Legacy::SourceFreeVerificationElapsed, _) => Common::CacheFreshTargetElapsed,
+        (Legacy::SchedulerTimeoutStopCount, _) => Common::CandidateSchedulerTimeoutStops,
+        (Legacy::SchedulerResourceLimitStopCount, _) => {
+            Common::CandidateSchedulerResourceLimitStops
+        }
+        _ => return None,
+    };
+    let multiplier = match label {
+        Legacy::ModuleBuildElapsed | Legacy::SourceFreeVerificationElapsed => 1_000_000,
+        _ => 1,
+    };
+    Some((mapped, multiplier))
 }
 
 pub fn fast_loop_performance_handoff_items() -> Vec<FastLoopPerformanceHandoffItem> {
     vec![
-        FastLoopPerformanceHandoffItem {
-            need: "true_batching",
-            reason: "share parsing, local-context projection, and validation work across same-snapshot candidates",
-        },
         FastLoopPerformanceHandoffItem {
             need: "replay_prefix_cache",
             reason: "reuse verified replay prefixes without treating cache hits as proof evidence",
@@ -392,10 +716,11 @@ pub fn fast_loop_measurement_report_json(report: &FastLoopMeasurementReport) -> 
         .collect::<Vec<_>>()
         .join(",");
     format!(
-        "{{\"schema\":\"{}\",\"trusted\":false,\"mode\":\"{}\",\"counters\":[{}],\"authoring_cache_status\":\"{}\",\"performance_handoff\":[{}],\"trust_boundary\":\"{}\"}}",
+        "{{\"schema\":\"{}\",\"trusted\":false,\"proof_evidence\":false,\"mode\":\"{}\",\"counters\":[{}],\"measurements\":{},\"authoring_cache_status\":\"{}\",\"performance_handoff\":[{}],\"trust_boundary\":\"{}\"}}",
         json_escape(report.schema),
         json_escape(report.mode.as_str()),
         counters,
+        performance_measurement_report_json(&report.measurements),
         json_escape(report.authoring_cache_status.as_str()),
         handoff,
         json_escape(report.trust_boundary)
@@ -411,8 +736,29 @@ fn unit_for_label(label: FastLoopMeasurementLabel) -> FastLoopMeasurementUnit {
         | FastLoopMeasurementLabel::SourceFreeVerificationElapsed => {
             FastLoopMeasurementUnit::Milliseconds
         }
+        FastLoopMeasurementLabel::PreparedSnapshotElapsed
+        | FastLoopMeasurementLabel::CandidateLocalValidationElapsed
+        | FastLoopMeasurementLabel::CandidateExecutionElapsed => {
+            FastLoopMeasurementUnit::Nanoseconds
+        }
         FastLoopMeasurementLabel::RetrievalResultCount
-        | FastLoopMeasurementLabel::CandidateStageCount => FastLoopMeasurementUnit::Count,
+        | FastLoopMeasurementLabel::CandidateStageCount
+        | FastLoopMeasurementLabel::DelayedCandidateParsedCount
+        | FastLoopMeasurementLabel::DelayedCandidateSkippedCount
+        | FastLoopMeasurementLabel::PreparedSnapshotCount
+        | FastLoopMeasurementLabel::CompleteInputStateValidationCount
+        | FastLoopMeasurementLabel::InputStateValidationReuseCount
+        | FastLoopMeasurementLabel::GoalProjectionCount
+        | FastLoopMeasurementLabel::ContextProjectionCount
+        | FastLoopMeasurementLabel::CandidateLocalValidationCount
+        | FastLoopMeasurementLabel::CandidateExecutionCount
+        | FastLoopMeasurementLabel::ExecutableInputStateCloneCount
+        | FastLoopMeasurementLabel::OutputStateCloneCount
+        | FastLoopMeasurementLabel::OutputStateValidationCount
+        | FastLoopMeasurementLabel::SchedulerTimeoutStopCount
+        | FastLoopMeasurementLabel::SchedulerResourceLimitStopCount => {
+            FastLoopMeasurementUnit::Count
+        }
     }
 }
 
@@ -465,6 +811,9 @@ mod tests {
         recorder.observe_candidate_stage_count(FastLoopCandidateStage::Generated, 4);
         recorder.observe_candidate_stage_count(FastLoopCandidateStage::Validated, 3);
         recorder.observe_candidate_batch_elapsed_ms(5);
+        recorder.observe_prepared_snapshot(7);
+        recorder.observe_candidate_local_validation_elapsed_ns(11);
+        recorder.observe_candidate_execution_elapsed_ns(13);
         recorder.observe_focused_replay_artifact_bytes(89);
         recorder.observe_module_build_elapsed_ms(13);
         recorder.observe_source_free_verification_elapsed_ms(21);
@@ -481,7 +830,10 @@ mod tests {
             == FastLoopMeasurementLabel::CandidateStageCount
             && counter.stage == Some(FastLoopCandidateStage::Retrieved)
             && counter.value == 2));
-        assert!(report
+        assert!(!report.measurements.counters.iter().any(|counter| {
+            counter.label == PerformanceMeasurementLabel::CandidateCanonicalBytesHashed
+        }));
+        assert!(!report
             .performance_handoff
             .iter()
             .any(|item| item.need == "true_batching"));
@@ -491,12 +843,32 @@ mod tests {
             .any(|item| item.need == "performance_gates"));
 
         let json = fast_loop_measurement_report_json(&report);
-        assert!(json.contains("\"schema\":\"npa.fast-loop-measurement.v1\""));
+        assert!(json.contains("\"schema\":\"npa.fast-loop-measurement.v2\""));
         assert!(json.contains("\"trusted\":false"));
+        assert!(json.contains("\"proof_evidence\":false"));
+        assert!(json.contains("\"schema\":\"npa.performance.measurements.v0.2\""));
         assert!(json.contains("\"label\":\"focused_replay_artifact_bytes\""));
+        assert!(json.contains("\"label\":\"prepared_snapshot_elapsed_ns\""));
+        assert!(json.contains("\"unit\":\"ns\""));
         assert!(json.contains("\"authoring_cache_status\":\"miss\""));
         assert!(json.contains("\"need\":\"replay_prefix_cache\""));
         assert!(json.contains("not proof evidence"));
+    }
+
+    #[test]
+    fn fast_loop_schema_compatibility_window_accepts_v1_v1_1_and_v2() {
+        assert!(fast_loop_measurement_schema_supported(
+            FAST_LOOP_MEASUREMENT_SCHEMA_V1
+        ));
+        assert!(fast_loop_measurement_schema_supported(
+            FAST_LOOP_MEASUREMENT_SCHEMA_V1_1
+        ));
+        assert!(fast_loop_measurement_schema_supported(
+            FAST_LOOP_MEASUREMENT_SCHEMA
+        ));
+        assert!(!fast_loop_measurement_schema_supported(
+            "npa.fast-loop-measurement.v3"
+        ));
     }
 
     #[test]
@@ -513,6 +885,28 @@ mod tests {
 
         assert_eq!(recorder.mode(), FastLoopMeasurementMode::Disabled);
         assert!(recorder.report().is_none());
+    }
+
+    #[test]
+    fn detailed_fast_loop_report_retains_candidate_measurements() {
+        let mut recorder = FastLoopMeasurementRecorder::detailed();
+        let batch = recorder.begin_candidate_batch();
+        recorder.observe_candidate_detail(
+            batch,
+            3,
+            11,
+            0,
+            PerformanceCandidateOutcome::NotEvaluated,
+        );
+        recorder.observe_candidate_detail(batch, 3, 0, 17, PerformanceCandidateOutcome::Accepted);
+        recorder.measurements.observe_candidate_attempts(1);
+        let report = recorder.report().unwrap();
+        assert_eq!(report.mode, FastLoopMeasurementMode::Detailed);
+        assert_eq!(report.measurements.candidates.len(), 1);
+        let candidate = &report.measurements.candidates[0];
+        assert_eq!(candidate.validation_elapsed_ns, 11);
+        assert_eq!(candidate.execution_elapsed_ns, 17);
+        assert_eq!(candidate.outcome, PerformanceCandidateOutcome::Accepted);
     }
 
     #[test]

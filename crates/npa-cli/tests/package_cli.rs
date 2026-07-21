@@ -7,13 +7,13 @@ use std::sync::{Mutex, MutexGuard};
 
 use npa_api::{
     project_package_axiom_report_from_extraction, project_package_theorem_index_from_extraction,
-    PackageArtifactReferenceSummaryMode,
+    project_package_theorem_premise_report_from_extraction, PackageArtifactReferenceSummaryMode,
 };
 use npa_cli::diagnostic::{CommandResult, PACKAGE_COMMAND_RESULT_SCHEMA};
 use npa_cli::package::PACKAGE_MANIFEST_PATH;
 use npa_cli::package_artifacts::{
     load_package_artifact_extraction, PackageGeneratedArtifactReadMode, PACKAGE_AXIOM_REPORT_PATH,
-    PACKAGE_THEOREM_INDEX_PATH,
+    PACKAGE_THEOREM_INDEX_PATH, PACKAGE_THEOREM_PREMISE_REPORT_PATH,
 };
 use npa_cli::package_publish::{
     checksum_only_signature_policy, collect_package_publish_artifacts,
@@ -1433,6 +1433,12 @@ fn write_publish_input_metadata(package: &TestPackage) {
     let theorem_index = project_package_theorem_index_from_extraction(
         &loaded.validated,
         &loaded.extraction,
+        loaded.package_lock.clone(),
+    )
+    .unwrap();
+    let theorem_premise_report = project_package_theorem_premise_report_from_extraction(
+        &loaded.validated,
+        &loaded.extraction,
         loaded.package_lock,
     )
     .unwrap();
@@ -1443,6 +1449,10 @@ fn write_publish_input_metadata(package: &TestPackage) {
     write_file(
         package.artifact_path(PACKAGE_THEOREM_INDEX_PATH),
         &theorem_index.canonical_json().unwrap(),
+    );
+    write_file(
+        package.artifact_path(PACKAGE_THEOREM_PREMISE_REPORT_PATH),
+        &theorem_premise_report.canonical_json().unwrap(),
     );
 }
 

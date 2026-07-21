@@ -93,6 +93,27 @@ fn id_def_module_with_value_and_reducibility(
     }
 }
 
+#[test]
+fn explicit_ephemeral_kernel_memo_preserves_verified_module_identity() {
+    let cert = build_module_cert(id_module("A", "x"), &[]).unwrap();
+    let bytes = encode_module_cert(&cert).unwrap();
+    let policy = AxiomPolicy::normal();
+    let off = verify_module_cert_with_import_refs(&bytes, &[], &policy).unwrap();
+    let mut counters = npa_kernel::KernelWorkCounters::default();
+    let memo = verify_module_cert_with_import_refs_and_kernel_options_and_work_counters(
+        &bytes,
+        &[],
+        &policy,
+        npa_kernel::KernelExecutionOptions::ephemeral_memo(),
+        &mut counters,
+    )
+    .unwrap();
+    assert_eq!(memo, off);
+    assert!(counters.infer_calls > 0);
+    assert!(counters.check_calls > 0);
+    assert_eq!(counters.memo_entry_capacity, 12_288);
+}
+
 fn const_module() -> CoreModule {
     CoreModule {
         name: Name::from_dotted("Test.Const"),
@@ -2882,6 +2903,354 @@ fn transparent_def_body_change_changes_interface_and_export_hashes() {
     assert_ne!(
         cert_a.hashes.certificate_hash,
         cert_b.hashes.certificate_hash
+    );
+}
+
+#[test]
+fn import_certificate_rebind_matches_ordinary_rebuild_for_export_stable_provider() {
+    let old_provider = build_module_cert(
+        id_def_module_with_value_and_reducibility(id_value("A", "x"), Reducibility::Opaque),
+        &[],
+    )
+    .unwrap();
+    let new_provider = build_module_cert(
+        id_def_module_with_value_and_reducibility(id_value_with_beta_redex(), Reducibility::Opaque),
+        &[],
+    )
+    .unwrap();
+    let policy = AxiomPolicy::normal();
+    let old_verified = verify_module_cert_with_import_refs(
+        &encode_module_cert(&old_provider).unwrap(),
+        &[],
+        &policy,
+    )
+    .unwrap();
+    let new_verified = verify_module_cert_with_import_refs(
+        &encode_module_cert(&new_provider).unwrap(),
+        &[],
+        &policy,
+    )
+    .unwrap();
+    assert_eq!(old_verified.export_hash(), new_verified.export_hash());
+    assert_ne!(
+        old_verified.certificate_hash(),
+        new_verified.certificate_hash()
+    );
+
+    let dependent = build_module_cert(use_id_module(), &[old_verified]).unwrap();
+    let dependent_bytes = encode_module_cert(&dependent).unwrap();
+    assert!(matches!(
+        verify_module_cert_with_import_refs(&dependent_bytes, &[&new_verified], &policy),
+        Err(CertError::ImportCertificateHashMismatch { .. })
+    ));
+    let expected = ModuleCertRebindExpectedIdentity {
+        module: dependent.header.module.clone(),
+        export_hash: dependent.hashes.export_hash,
+        axiom_report_hash: dependent.hashes.axiom_report_hash,
+        certificate_hash: dependent.hashes.certificate_hash,
+    };
+
+    let outcome = rebind_module_cert_import_certificate_hashes(
+        &dependent_bytes,
+        &expected,
+        &[ModuleCertRebindImport {
+            verified: &new_verified,
+            origin: ModuleCertRebindImportOrigin::Local,
+        }],
+        &policy,
+    )
+    .unwrap();
+    let ModuleCertImportRebindOutcome::Rebound {
+        certificate,
+        bytes,
+        verified,
+        changed_imports,
+    } = outcome
+    else {
+        panic!("expected rebound certificate");
+    };
+
+    assert_eq!(changed_imports, vec![Name::from_dotted("Test.Id")]);
+    assert_eq!(certificate.hashes.export_hash, dependent.hashes.export_hash);
+    assert_eq!(
+        certificate.hashes.axiom_report_hash,
+        dependent.hashes.axiom_report_hash
+    );
+    assert_ne!(
+        certificate.hashes.certificate_hash,
+        dependent.hashes.certificate_hash
+    );
+    assert_eq!(
+        verified.certificate_hash(),
+        certificate.hashes.certificate_hash
+    );
+    let rebuilt = build_module_cert(use_id_module(), &[new_verified]).unwrap();
+    assert_eq!(bytes, encode_module_cert(&rebuilt).unwrap());
+}
+
+#[test]
+fn import_certificate_rebind_returns_unchanged_after_live_verification() {
+    let provider = build_module_cert(id_module("A", "x"), &[]).unwrap();
+    let policy = AxiomPolicy::normal();
+    let verified_provider =
+        verify_module_cert_with_import_refs(&encode_module_cert(&provider).unwrap(), &[], &policy)
+            .unwrap();
+    let dependent =
+        build_module_cert(use_id_module(), std::slice::from_ref(&verified_provider)).unwrap();
+    let bytes = encode_module_cert(&dependent).unwrap();
+    let expected = ModuleCertRebindExpectedIdentity {
+        module: dependent.header.module.clone(),
+        export_hash: dependent.hashes.export_hash,
+        axiom_report_hash: dependent.hashes.axiom_report_hash,
+        certificate_hash: dependent.hashes.certificate_hash,
+    };
+
+    let outcome = rebind_module_cert_import_certificate_hashes(
+        &bytes,
+        &expected,
+        &[ModuleCertRebindImport {
+            verified: &verified_provider,
+            origin: ModuleCertRebindImportOrigin::Local,
+        }],
+        &policy,
+    )
+    .unwrap();
+
+    let ModuleCertImportRebindOutcome::Unchanged {
+        certificate,
+        verified,
+    } = outcome
+    else {
+        panic!("expected unchanged certificate");
+    };
+    assert_eq!(certificate, dependent);
+    assert_eq!(
+        verified.certificate_hash(),
+        dependent.hashes.certificate_hash
+    );
+}
+
+#[test]
+fn import_certificate_rebind_reports_local_export_change() {
+    let old_provider = build_module_cert(id_module("A", "x"), &[]).unwrap();
+    let new_provider =
+        build_module_cert(id_def_module_with_value(id_value_with_beta_redex()), &[]).unwrap();
+    let policy = AxiomPolicy::normal();
+    let old_verified = verify_module_cert_with_import_refs(
+        &encode_module_cert(&old_provider).unwrap(),
+        &[],
+        &policy,
+    )
+    .unwrap();
+    let new_verified = verify_module_cert_with_import_refs(
+        &encode_module_cert(&new_provider).unwrap(),
+        &[],
+        &policy,
+    )
+    .unwrap();
+    let dependent = build_module_cert(use_id_module(), &[old_verified]).unwrap();
+    let bytes = encode_module_cert(&dependent).unwrap();
+    let expected = ModuleCertRebindExpectedIdentity {
+        module: dependent.header.module.clone(),
+        export_hash: dependent.hashes.export_hash,
+        axiom_report_hash: dependent.hashes.axiom_report_hash,
+        certificate_hash: dependent.hashes.certificate_hash,
+    };
+
+    let outcome = rebind_module_cert_import_certificate_hashes(
+        &bytes,
+        &expected,
+        &[ModuleCertRebindImport {
+            verified: &new_verified,
+            origin: ModuleCertRebindImportOrigin::Local,
+        }],
+        &policy,
+    )
+    .unwrap();
+
+    assert_eq!(
+        outcome,
+        ModuleCertImportRebindOutcome::ExportChanged {
+            module: Name::from_dotted("Test.Id"),
+            expected: old_provider.hashes.export_hash,
+            actual: new_provider.hashes.export_hash,
+        }
+    );
+}
+
+#[test]
+fn import_certificate_rebind_prioritizes_external_identity_failure_in_any_import_order() {
+    let old_local = build_module_cert(id_module("A", "x"), &[]).unwrap();
+    let new_local =
+        build_module_cert(id_def_module_with_value(id_value_with_beta_redex()), &[]).unwrap();
+    let policy = AxiomPolicy::normal();
+    let old_verified_local =
+        verify_module_cert_with_import_refs(&encode_module_cert(&old_local).unwrap(), &[], &policy)
+            .unwrap();
+    let new_verified_local =
+        verify_module_cert_with_import_refs(&encode_module_cert(&new_local).unwrap(), &[], &policy)
+            .unwrap();
+
+    for external_module in ["A.External", "Z.External"] {
+        let external_with_value = |value| CoreModule {
+            name: Name::from_dotted(external_module),
+            declarations: vec![Decl::Def {
+                name: "external_id".to_owned(),
+                universe_params: vec!["u".to_owned()],
+                ty: id_type("A", "x"),
+                value,
+                reducibility: Reducibility::Opaque,
+            }],
+        };
+        let old_external = build_module_cert(external_with_value(id_value("A", "x")), &[]).unwrap();
+        let new_external =
+            build_module_cert(external_with_value(id_value_with_beta_redex()), &[]).unwrap();
+        assert_eq!(
+            old_external.hashes.export_hash,
+            new_external.hashes.export_hash
+        );
+        assert_ne!(
+            old_external.hashes.certificate_hash,
+            new_external.hashes.certificate_hash
+        );
+        let old_verified_external = verify_module_cert_with_import_refs(
+            &encode_module_cert(&old_external).unwrap(),
+            &[],
+            &policy,
+        )
+        .unwrap();
+        let new_verified_external = verify_module_cert_with_import_refs(
+            &encode_module_cert(&new_external).unwrap(),
+            &[],
+            &policy,
+        )
+        .unwrap();
+        let dependent = build_module_cert(
+            use_id_module(),
+            &[old_verified_local.clone(), old_verified_external],
+        )
+        .unwrap();
+        let external_index = dependent
+            .imports
+            .iter()
+            .position(|import| import.module == Name::from_dotted(external_module))
+            .unwrap();
+        let local_index = dependent
+            .imports
+            .iter()
+            .position(|import| import.module == Name::from_dotted("Test.Id"))
+            .unwrap();
+        assert_eq!(
+            external_index < local_index,
+            external_module == "A.External"
+        );
+        let bytes = encode_module_cert(&dependent).unwrap();
+        let expected = ModuleCertRebindExpectedIdentity {
+            module: dependent.header.module.clone(),
+            export_hash: dependent.hashes.export_hash,
+            axiom_report_hash: dependent.hashes.axiom_report_hash,
+            certificate_hash: dependent.hashes.certificate_hash,
+        };
+
+        let error = rebind_module_cert_import_certificate_hashes(
+            &bytes,
+            &expected,
+            &[
+                ModuleCertRebindImport {
+                    verified: &new_verified_local,
+                    origin: ModuleCertRebindImportOrigin::Local,
+                },
+                ModuleCertRebindImport {
+                    verified: &new_verified_external,
+                    origin: ModuleCertRebindImportOrigin::External,
+                },
+            ],
+            &policy,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            ModuleCertImportRebindError::ExternalIdentityChanged {
+                module: Name::from_dotted(external_module)
+            }
+        );
+    }
+}
+
+#[test]
+fn import_certificate_rebind_rejects_duplicate_certificate_module_before_mapped_duplicates() {
+    let old_provider = build_module_cert(
+        id_def_module_with_value_and_reducibility(id_value("A", "x"), Reducibility::Opaque),
+        &[],
+    )
+    .unwrap();
+    let new_provider = build_module_cert(
+        id_def_module_with_value_and_reducibility(id_value_with_beta_redex(), Reducibility::Opaque),
+        &[],
+    )
+    .unwrap();
+    let policy = AxiomPolicy::normal();
+    let old_verified = verify_module_cert_with_import_refs(
+        &encode_module_cert(&old_provider).unwrap(),
+        &[],
+        &policy,
+    )
+    .unwrap();
+    let new_verified = verify_module_cert_with_import_refs(
+        &encode_module_cert(&new_provider).unwrap(),
+        &[],
+        &policy,
+    )
+    .unwrap();
+    let mut dependent =
+        build_module_cert(use_id_module(), std::slice::from_ref(&old_verified)).unwrap();
+    dependent.imports.push(ImportEntry {
+        module: new_verified.module().clone(),
+        export_hash: new_verified.export_hash(),
+        certificate_hash: Some(new_verified.certificate_hash()),
+    });
+    dependent.imports.sort_by_key(|import| {
+        (
+            import.module.clone(),
+            import.export_hash,
+            import.certificate_hash,
+        )
+    });
+    dependent.hashes.certificate_hash = hash_with_domain(
+        MODULE_CERT_DOMAIN,
+        &encode_module_cert_without_certificate_hash(&dependent),
+    );
+    let bytes = encode_module_cert(&dependent).unwrap();
+    let expected = ModuleCertRebindExpectedIdentity {
+        module: dependent.header.module.clone(),
+        export_hash: dependent.hashes.export_hash,
+        axiom_report_hash: dependent.hashes.axiom_report_hash,
+        certificate_hash: dependent.hashes.certificate_hash,
+    };
+
+    let error = rebind_module_cert_import_certificate_hashes(
+        &bytes,
+        &expected,
+        &[
+            ModuleCertRebindImport {
+                verified: &old_verified,
+                origin: ModuleCertRebindImportOrigin::Local,
+            },
+            ModuleCertRebindImport {
+                verified: &new_verified,
+                origin: ModuleCertRebindImportOrigin::Local,
+            },
+        ],
+        &policy,
+    )
+    .unwrap_err();
+
+    assert_eq!(
+        error,
+        ModuleCertImportRebindError::DuplicateCertificateImport {
+            module: Name::from_dotted("Test.Id")
+        }
     );
 }
 

@@ -48,9 +48,20 @@ pub const L2_NAMESPACE_TRANSPORT_ATTESTATION_SCHEMA: &str =
 
 /// Canonical generic mathlib promotion plan schema.
 pub const MATHLIB_PROMOTION_PLAN_SCHEMA: &str = "npa.mathlib.promotion_plan.v1";
+/// Canonical declaration-level mathlib promotion request schema.
+pub const MATHLIB_DECLARATION_PROMOTION_REQUEST_SCHEMA: &str =
+    "npa.mathlib.declaration_promotion_request.v1";
+/// Canonical declaration-level mathlib promotion plan schema.
+pub const MATHLIB_PROMOTION_PLAN_V2_SCHEMA: &str = "npa.mathlib.promotion_plan.v2";
+/// Verified declaration materialization attestation schema.
+pub const MATHLIB_VERIFIED_MATERIALIZATION_ATTESTATION_SCHEMA: &str =
+    "npa.mathlib.verified_materialization_attestation.v1";
 /// Canonical mathlib promotion-origin registry schema.
 pub const MATHLIB_PROMOTION_ORIGIN_REGISTRY_SCHEMA: &str =
     "npa.mathlib.promotion_origin_registry.v1";
+/// Canonical declaration-aware mathlib promotion-origin registry schema.
+pub const MATHLIB_PROMOTION_ORIGIN_REGISTRY_V2_SCHEMA: &str =
+    "npa.mathlib.promotion_origin_registry.v2";
 /// Recoverable promotion transaction journal schema.
 pub const MATHLIB_PROMOTION_TRANSACTION_SCHEMA: &str = "npa.mathlib.promotion_transaction.v1";
 
@@ -87,9 +98,12 @@ mod tests {
         KERNEL_PROFILE_V0_1, L2_ACCEPTANCE_POLICY_SCHEMA, L2_ACCEPTANCE_SCHEMA,
         L2_ACCEPTANCE_V2_SCHEMA, L2_NAMESPACE_TRANSPORT_ATTESTATION_SCHEMA,
         L2_NAMESPACE_TRANSPORT_POLICY_SCHEMA, L2_NAMESPACE_TRANSPORT_REQUEST_SCHEMA,
-        L2_REVIEW_INPUT_SCHEMA, L2_REVIEW_REPORT_SCHEMA, PACKAGE_AXIOM_REPORT_SCHEMA,
-        PACKAGE_LOCK_SCHEMA, PACKAGE_MANIFEST_SCHEMA, PACKAGE_PUBLISH_PLAN_SCHEMA,
-        PACKAGE_THEOREM_INDEX_SCHEMA, PACKAGE_VERIFIED_HIGH_TRUST_SCHEMA, REGISTRY_MODULE_SCHEMA,
+        L2_REVIEW_INPUT_SCHEMA, L2_REVIEW_REPORT_SCHEMA,
+        MATHLIB_DECLARATION_PROMOTION_REQUEST_SCHEMA, MATHLIB_PROMOTION_ORIGIN_REGISTRY_V2_SCHEMA,
+        MATHLIB_PROMOTION_PLAN_V2_SCHEMA, MATHLIB_VERIFIED_MATERIALIZATION_ATTESTATION_SCHEMA,
+        PACKAGE_AXIOM_REPORT_SCHEMA, PACKAGE_LOCK_SCHEMA, PACKAGE_MANIFEST_SCHEMA,
+        PACKAGE_PUBLISH_PLAN_SCHEMA, PACKAGE_THEOREM_INDEX_SCHEMA,
+        PACKAGE_VERIFIED_HIGH_TRUST_SCHEMA, REGISTRY_MODULE_SCHEMA,
     };
 
     #[test]
@@ -113,6 +127,22 @@ mod tests {
         assert_eq!(
             L2_NAMESPACE_TRANSPORT_ATTESTATION_SCHEMA,
             "npa.l2_namespace_transport_attestation.v2"
+        );
+        assert_eq!(
+            MATHLIB_DECLARATION_PROMOTION_REQUEST_SCHEMA,
+            "npa.mathlib.declaration_promotion_request.v1"
+        );
+        assert_eq!(
+            MATHLIB_PROMOTION_PLAN_V2_SCHEMA,
+            "npa.mathlib.promotion_plan.v2"
+        );
+        assert_eq!(
+            MATHLIB_VERIFIED_MATERIALIZATION_ATTESTATION_SCHEMA,
+            "npa.mathlib.verified_materialization_attestation.v1"
+        );
+        assert_eq!(
+            MATHLIB_PROMOTION_ORIGIN_REGISTRY_V2_SCHEMA,
+            "npa.mathlib.promotion_origin_registry.v2"
         );
         assert_eq!(
             PACKAGE_THEOREM_INDEX_SCHEMA,

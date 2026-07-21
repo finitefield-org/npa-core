@@ -18,15 +18,25 @@ use crate::{
         ensure_level_wf, level_eq, levels_eq, normalize_level, Level, UniverseConstraint,
         UniverseContext,
     },
+    memo::{
+        DefeqMemoLookup, KernelExecutionOptions, KernelOperationMemo, MemoExprOrigin,
+        WhnfMemoLookup,
+    },
     name::is_canonical_dotted_name,
     positivity::approved_nested_functor,
     subst::{instantiate, subst_levels_expr},
+    work::{KernelWorkCounterSink, KernelWorkCounters},
 };
+
+#[cfg(test)]
+use crate::memo::KernelMemoLimits;
 
 #[derive(Clone, Debug, Default)]
 pub struct Env {
     decls: BTreeMap<String, Decl>,
     mutual_groups: BTreeMap<String, MutualGroupInfo>,
+    execution_options: KernelExecutionOptions,
+    work_counter_sink: Option<KernelWorkCounterSink>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -46,6 +56,105 @@ struct MutualRecursorResultCheck<'a> {
     universe_context: &'a UniverseContext,
     family_index: usize,
     index_start: usize,
+}
+
+#[derive(Clone, Copy)]
+enum KernelWorkCounter {
+    CheckCall,
+    InferCall,
+    WhnfCall,
+    DefeqCall,
+    QuickEqualityHit,
+    BetaStep,
+    DeltaStep,
+    IotaStep,
+    ZetaStep,
+    PhysicalReduction,
+    ContextLookup,
+    ContextShift,
+}
+
+trait KernelWorkMeter {
+    fn increment(&mut self, _counter: KernelWorkCounter) {}
+
+    fn record_fuel(&mut self, _spent: usize, _exhausted: bool) {}
+
+    fn merge_counters(&mut self, _counters: KernelWorkCounters) {}
+}
+
+struct DisabledKernelWorkMeter;
+
+impl KernelWorkMeter for DisabledKernelWorkMeter {}
+
+impl KernelWorkMeter for KernelWorkCounters {
+    fn increment(&mut self, counter: KernelWorkCounter) {
+        let value = match counter {
+            KernelWorkCounter::CheckCall => &mut self.check_calls,
+            KernelWorkCounter::InferCall => &mut self.infer_calls,
+            KernelWorkCounter::WhnfCall => &mut self.whnf_calls,
+            KernelWorkCounter::DefeqCall => &mut self.defeq_calls,
+            KernelWorkCounter::QuickEqualityHit => &mut self.quick_equality_hits,
+            KernelWorkCounter::BetaStep => &mut self.beta_steps,
+            KernelWorkCounter::DeltaStep => &mut self.delta_steps,
+            KernelWorkCounter::IotaStep => &mut self.iota_steps,
+            KernelWorkCounter::ZetaStep => &mut self.zeta_steps,
+            KernelWorkCounter::PhysicalReduction => &mut self.physical_reductions,
+            KernelWorkCounter::ContextLookup => &mut self.context_lookups,
+            KernelWorkCounter::ContextShift => &mut self.context_shifts,
+        };
+        if *value == u64::MAX {
+            self.overflowed = true;
+        } else {
+            *value += 1;
+        }
+    }
+
+    fn record_fuel(&mut self, spent: usize, exhausted: bool) {
+        let spent = u64::try_from(spent).unwrap_or(u64::MAX);
+        KernelWorkCounters::add(&mut self.logical_fuel, spent, &mut self.overflowed);
+        if exhausted {
+            KernelWorkCounters::add(&mut self.exhausted_fuel, spent, &mut self.overflowed);
+        } else {
+            KernelWorkCounters::add(&mut self.successful_fuel, spent, &mut self.overflowed);
+        }
+    }
+
+    fn merge_counters(&mut self, counters: KernelWorkCounters) {
+        self.merge(counters);
+    }
+}
+
+struct KernelOperationState {
+    memo: KernelOperationMemo,
+    counters: KernelWorkCounters,
+}
+
+impl KernelOperationState {
+    fn new(options: KernelExecutionOptions) -> Self {
+        let memo = KernelOperationMemo::new(options)
+            .expect("reuse state is created only for memo or repetition probing");
+        Self {
+            counters: KernelWorkCounters {
+                memo_entry_capacity: memo.entry_capacity() as u64,
+                memo_retained_bytes: memo.retained_bytes() as u64,
+                ..KernelWorkCounters::default()
+            },
+            memo,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_limits(options: KernelExecutionOptions, limits: KernelMemoLimits) -> Self {
+        let memo = KernelOperationMemo::with_limits(options, limits);
+        Self {
+            counters: KernelWorkCounters {
+                memo_entry_capacity: memo.entry_capacity() as u64,
+                memo_retained_bytes: memo.retained_bytes() as u64,
+                ..KernelWorkCounters::default()
+            },
+            memo,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -84,8 +193,55 @@ impl Env {
         Self::default()
     }
 
+    /// Construct an empty environment with explicit out-of-band execution
+    /// options. The environment retains only the mode; every memo remains
+    /// operation-local.
+    pub fn with_execution_options(execution_options: KernelExecutionOptions) -> Self {
+        Self {
+            execution_options,
+            ..Self::default()
+        }
+    }
+
+    /// Construct an empty environment that aggregates deterministic work
+    /// counters from ordinary nondiagnosed declaration-validation operations.
+    pub fn with_execution_options_and_work_counter_sink(
+        execution_options: KernelExecutionOptions,
+        work_counter_sink: KernelWorkCounterSink,
+    ) -> Self {
+        Self {
+            execution_options,
+            work_counter_sink: Some(work_counter_sink),
+            ..Self::default()
+        }
+    }
+
+    /// Return the out-of-band execution selection retained by this
+    /// environment.
+    pub const fn execution_options(&self) -> KernelExecutionOptions {
+        self.execution_options
+    }
+
+    fn observes_work_counters(&self) -> bool {
+        self.work_counter_sink.is_some()
+    }
+
+    fn observe_work_counters(&self, counters: KernelWorkCounters) {
+        if let Some(sink) = &self.work_counter_sink {
+            sink.observe(counters);
+        }
+    }
+
     pub fn with_builtins() -> Result<Self> {
-        let mut env = Self::new();
+        Self::with_builtins_and_execution_options(KernelExecutionOptions::default())
+    }
+
+    /// Construct a built-in environment with explicit out-of-band execution
+    /// options. The selected mode is retained, but memo tables are not.
+    pub fn with_builtins_and_execution_options(
+        execution_options: KernelExecutionOptions,
+    ) -> Result<Self> {
+        let mut env = Self::with_execution_options(execution_options);
         env.add_inductive(nat_inductive())?;
         env.add_inductive(eq_inductive())?;
         env.add_axiom(
@@ -440,36 +596,99 @@ impl Env {
         universe_context: &UniverseContext,
         term: &Expr,
     ) -> Result<Expr> {
+        if self.execution_options.needs_reuse_state() {
+            let mut state = KernelOperationState::new(self.execution_options);
+            let result = self.infer_in_universe_context_with_memo(
+                ctx,
+                universe_context,
+                term,
+                MemoExprOrigin::Borrowed,
+                &mut state,
+            );
+            self.observe_work_counters(state.counters);
+            return result;
+        }
+        if self.observes_work_counters() {
+            let mut counters = KernelWorkCounters::default();
+            let result = self.infer_in_universe_context_with_work(
+                ctx,
+                universe_context,
+                term,
+                &mut counters,
+            );
+            self.observe_work_counters(counters);
+            return result;
+        }
+        self.infer_in_universe_context_with_work(
+            ctx,
+            universe_context,
+            term,
+            &mut DisabledKernelWorkMeter,
+        )
+    }
+
+    fn infer_in_universe_context_with_work(
+        &self,
+        ctx: &Ctx,
+        universe_context: &UniverseContext,
+        term: &Expr,
+        meter: &mut impl KernelWorkMeter,
+    ) -> Result<Expr> {
+        meter.increment(KernelWorkCounter::InferCall);
         match term {
             Expr::Sort(level) => {
                 ensure_level_wf(&universe_context.params, level)?;
                 Ok(Expr::sort(Level::succ(level.clone())))
             }
-            Expr::BVar(index) => ctx.lookup_type(*index),
+            Expr::BVar(index) => {
+                meter.increment(KernelWorkCounter::ContextLookup);
+                meter.increment(KernelWorkCounter::ContextShift);
+                ctx.lookup_type(*index)
+            }
             Expr::Const { name, levels } => {
                 self.infer_const_type_in_universe_context(universe_context, name, levels)
             }
             Expr::Pi { binder, ty, body } => {
-                let domain_sort =
-                    self.expect_sort_in_universe_context(ctx, universe_context, ty)?;
+                let domain_sort = self.expect_sort_in_universe_context_with_work(
+                    ctx,
+                    universe_context,
+                    ty,
+                    meter,
+                )?;
                 let mut body_ctx = ctx.clone();
                 body_ctx.push_assumption(binder.clone(), (**ty).clone());
-                let body_sort =
-                    self.expect_sort_in_universe_context(&body_ctx, universe_context, body)?;
+                let body_sort = self.expect_sort_in_universe_context_with_work(
+                    &body_ctx,
+                    universe_context,
+                    body,
+                    meter,
+                )?;
                 Ok(Expr::sort(Level::imax(domain_sort, body_sort)))
             }
             Expr::Lam { binder, ty, body } => {
-                self.expect_sort_in_universe_context(ctx, universe_context, ty)?;
+                self.expect_sort_in_universe_context_with_work(ctx, universe_context, ty, meter)?;
                 let mut body_ctx = ctx.clone();
                 body_ctx.push_assumption(binder.clone(), (**ty).clone());
-                let body_ty = self.infer_in_universe_context(&body_ctx, universe_context, body)?;
+                let body_ty = self.infer_in_universe_context_with_work(
+                    &body_ctx,
+                    universe_context,
+                    body,
+                    meter,
+                )?;
                 Ok(Expr::pi(binder.clone(), (**ty).clone(), body_ty))
             }
             Expr::App(fun, arg) => {
-                let fun_ty = self.infer_in_universe_context(ctx, universe_context, fun)?;
-                match self.whnf(ctx, &universe_context.params, &fun_ty)? {
+                let fun_ty =
+                    self.infer_in_universe_context_with_work(ctx, universe_context, fun, meter)?;
+                match self.whnf_with_work(ctx, &universe_context.params, &fun_ty, meter)? {
                     Expr::Pi { ty, body, .. } => {
-                        self.check_in_universe_context(ctx, universe_context, arg, &ty)?;
+                        self.check_in_universe_context_with_work(
+                            ctx,
+                            universe_context,
+                            arg,
+                            &ty,
+                            meter,
+                        )?;
                         instantiate(&body, arg)
                     }
                     actual => Err(Error::ExpectedPi { actual }),
@@ -481,11 +700,16 @@ impl Env {
                 value,
                 body,
             } => {
-                self.expect_sort_in_universe_context(ctx, universe_context, ty)?;
-                self.check_in_universe_context(ctx, universe_context, value, ty)?;
+                self.expect_sort_in_universe_context_with_work(ctx, universe_context, ty, meter)?;
+                self.check_in_universe_context_with_work(ctx, universe_context, value, ty, meter)?;
                 let mut body_ctx = ctx.clone();
                 body_ctx.push_definition(binder.clone(), (**ty).clone(), (**value).clone());
-                let body_ty = self.infer_in_universe_context(&body_ctx, universe_context, body)?;
+                let body_ty = self.infer_in_universe_context_with_work(
+                    &body_ctx,
+                    universe_context,
+                    body,
+                    meter,
+                )?;
                 instantiate(&body_ty, value)
             }
         }
@@ -503,8 +727,53 @@ impl Env {
         term: &Expr,
         expected: &Expr,
     ) -> Result<()> {
-        let actual = self.infer_in_universe_context(ctx, universe_context, term)?;
-        if self.is_defeq(ctx, &universe_context.params, &actual, expected)? {
+        if self.execution_options.needs_reuse_state() {
+            let mut state = KernelOperationState::new(self.execution_options);
+            let result = self.check_in_universe_context_with_memo(
+                ctx,
+                universe_context,
+                term,
+                MemoExprOrigin::Borrowed,
+                expected,
+                MemoExprOrigin::Borrowed,
+                &mut state,
+            );
+            self.observe_work_counters(state.counters);
+            return result;
+        }
+        if self.observes_work_counters() {
+            let mut counters = KernelWorkCounters::default();
+            let result = self.check_in_universe_context_with_work(
+                ctx,
+                universe_context,
+                term,
+                expected,
+                &mut counters,
+            );
+            self.observe_work_counters(counters);
+            return result;
+        }
+        self.check_in_universe_context_with_work(
+            ctx,
+            universe_context,
+            term,
+            expected,
+            &mut DisabledKernelWorkMeter,
+        )
+    }
+
+    fn check_in_universe_context_with_work(
+        &self,
+        ctx: &Ctx,
+        universe_context: &UniverseContext,
+        term: &Expr,
+        expected: &Expr,
+        meter: &mut impl KernelWorkMeter,
+    ) -> Result<()> {
+        meter.increment(KernelWorkCounter::CheckCall);
+        let actual =
+            self.infer_in_universe_context_with_work(ctx, universe_context, term, meter)?;
+        if self.is_defeq_with_work(ctx, &universe_context.params, &actual, expected, meter)? {
             Ok(())
         } else {
             Err(Error::TypeMismatch {
@@ -584,7 +853,7 @@ impl Env {
                 let fun_ty =
                     self.infer_in_universe_context_diagnosed(ctx, universe_context, fun, phase)?;
                 match self
-                    .whnf(ctx, &universe_context.params, &fun_ty)
+                    .whnf_diagnosed_off(ctx, &universe_context.params, &fun_ty)
                     .map_err(DiagnosedKernelError::new)?
                 {
                     Expr::Pi { ty, body, .. } => {
@@ -631,7 +900,7 @@ impl Env {
         let inferred =
             self.infer_in_universe_context_diagnosed(ctx, universe_context, term, phase)?;
         match self
-            .whnf(ctx, &universe_context.params, &inferred)
+            .whnf_diagnosed_off(ctx, &universe_context.params, &inferred)
             .map_err(DiagnosedKernelError::new)?
         {
             Expr::Sort(level) => Ok(level),
@@ -689,6 +958,27 @@ impl Env {
 
     /// Add one declaration with bounded authoring context on failure.
     pub fn add_decl_diagnosed(
+        &mut self,
+        declaration: Decl,
+    ) -> std::result::Result<(), DiagnosedKernelError> {
+        if self.execution_options.needs_reuse_state() {
+            let mut counters = KernelWorkCounters::default();
+            KernelWorkCounters::add(
+                &mut counters.memo_ineligible_diagnosed,
+                1,
+                &mut counters.overflowed,
+            );
+            self.observe_work_counters(counters);
+            let execution_options = self.execution_options;
+            self.execution_options = KernelExecutionOptions::memo_off();
+            let result = self.add_decl_diagnosed_off(declaration);
+            self.execution_options = execution_options;
+            return result;
+        }
+        self.add_decl_diagnosed_off(declaration)
+    }
+
+    fn add_decl_diagnosed_off(
         &mut self,
         declaration: Decl,
     ) -> std::result::Result<(), DiagnosedKernelError> {
@@ -873,6 +1163,18 @@ impl Env {
         whnf_fuel: &mut usize,
         conversion_fuel: &mut usize,
     ) -> Result<Expr> {
+        if self.execution_options.needs_reuse_state() {
+            let mut state = KernelOperationState::new(self.execution_options);
+            return self.infer_with_remaining_fuel_memo_shared(
+                ctx,
+                universe_context,
+                term,
+                MemoExprOrigin::Borrowed,
+                whnf_fuel,
+                conversion_fuel,
+                &mut state,
+            );
+        }
         self.infer_with_remaining_fuel(ctx, universe_context, term, whnf_fuel, conversion_fuel)
     }
 
@@ -905,6 +1207,20 @@ impl Env {
         whnf_fuel: &mut usize,
         conversion_fuel: &mut usize,
     ) -> Result<()> {
+        if self.execution_options.needs_reuse_state() {
+            let mut state = KernelOperationState::new(self.execution_options);
+            return self.check_with_remaining_fuel_memo_shared(
+                ctx,
+                universe_context,
+                term,
+                MemoExprOrigin::Borrowed,
+                expected,
+                MemoExprOrigin::Borrowed,
+                whnf_fuel,
+                conversion_fuel,
+                &mut state,
+            );
+        }
         self.check_with_remaining_fuel(
             ctx,
             universe_context,
@@ -923,6 +1239,220 @@ impl Env {
         self.is_defeq_with_fuel(ctx, delta, lhs, rhs, Self::DEFEQ_FUEL)
     }
 
+    /// Infer a term while updating an optional operation-scoped work meter.
+    pub fn infer_with_work_counters(
+        &self,
+        ctx: &Ctx,
+        delta: &[String],
+        term: &Expr,
+        meter: Option<&mut KernelWorkCounters>,
+    ) -> Result<Expr> {
+        let Some(meter) = meter else {
+            return self.infer(ctx, delta, term);
+        };
+        let universe_context = UniverseContext::from_params(delta.to_vec())?;
+        if self.execution_options.needs_reuse_state() {
+            let mut state = KernelOperationState::new(self.execution_options);
+            let result = self.infer_in_universe_context_with_memo(
+                ctx,
+                &universe_context,
+                term,
+                MemoExprOrigin::Borrowed,
+                &mut state,
+            );
+            let counters = state.counters;
+            meter.merge(counters);
+            self.observe_work_counters(counters);
+            return result;
+        }
+        if self.observes_work_counters() {
+            let mut counters = KernelWorkCounters::default();
+            let result = self.infer_in_universe_context_with_work(
+                ctx,
+                &universe_context,
+                term,
+                &mut counters,
+            );
+            meter.merge(counters);
+            self.observe_work_counters(counters);
+            return result;
+        }
+        self.infer_in_universe_context_with_work(ctx, &universe_context, term, meter)
+    }
+
+    /// Check a term while updating an optional operation-scoped work meter.
+    pub fn check_with_work_counters(
+        &self,
+        ctx: &Ctx,
+        delta: &[String],
+        term: &Expr,
+        expected: &Expr,
+        meter: Option<&mut KernelWorkCounters>,
+    ) -> Result<()> {
+        let Some(meter) = meter else {
+            return self.check(ctx, delta, term, expected);
+        };
+        let universe_context = UniverseContext::from_params(delta.to_vec())?;
+        if self.execution_options.needs_reuse_state() {
+            let mut state = KernelOperationState::new(self.execution_options);
+            let result = self.check_in_universe_context_with_memo(
+                ctx,
+                &universe_context,
+                term,
+                MemoExprOrigin::Borrowed,
+                expected,
+                MemoExprOrigin::Borrowed,
+                &mut state,
+            );
+            let counters = state.counters;
+            meter.merge(counters);
+            self.observe_work_counters(counters);
+            return result;
+        }
+        if self.observes_work_counters() {
+            let mut counters = KernelWorkCounters::default();
+            let result = self.check_in_universe_context_with_work(
+                ctx,
+                &universe_context,
+                term,
+                expected,
+                &mut counters,
+            );
+            meter.merge(counters);
+            self.observe_work_counters(counters);
+            return result;
+        }
+        self.check_in_universe_context_with_work(ctx, &universe_context, term, expected, meter)
+    }
+
+    /// Reduce to WHNF while updating an optional operation-scoped work meter.
+    pub fn whnf_with_work_counters(
+        &self,
+        ctx: &Ctx,
+        delta: &[String],
+        term: &Expr,
+        meter: Option<&mut KernelWorkCounters>,
+    ) -> Result<Expr> {
+        let Some(meter) = meter else {
+            return self.whnf(ctx, delta, term);
+        };
+        if self.observes_work_counters() {
+            let mut counters = KernelWorkCounters::default();
+            let result = self.whnf_with_work(ctx, delta, term, &mut counters);
+            meter.merge(counters);
+            self.observe_work_counters(counters);
+            return result;
+        }
+        self.whnf_with_work(ctx, delta, term, meter)
+    }
+
+    fn whnf_with_work(
+        &self,
+        ctx: &Ctx,
+        delta: &[String],
+        term: &Expr,
+        meter: &mut impl KernelWorkMeter,
+    ) -> Result<Expr> {
+        let mut fuel = Self::WHNF_FUEL;
+        if self.execution_options.needs_reuse_state() {
+            let mut state = KernelOperationState::new(self.execution_options);
+            let result = self.whnf_with_remaining_fuel_memo(
+                ctx,
+                delta,
+                term,
+                MemoExprOrigin::Borrowed,
+                &mut fuel,
+                ResourceLimitKind::Whnf,
+                &mut state,
+            );
+            let exhausted = matches!(&result, Err(Error::ResourceLimit { .. }));
+            state
+                .counters
+                .record_fuel(Self::WHNF_FUEL - fuel, exhausted);
+            meter.merge_counters(state.counters);
+            return result;
+        }
+        let result = self.whnf_with_remaining_fuel(
+            ctx,
+            delta,
+            term,
+            &mut fuel,
+            ResourceLimitKind::Whnf,
+            meter,
+        );
+        let exhausted = matches!(&result, Err(Error::ResourceLimit { .. }));
+        meter.record_fuel(Self::WHNF_FUEL - fuel, exhausted);
+        result
+    }
+
+    /// Compare terms while updating an optional operation-scoped work meter.
+    pub fn is_defeq_with_work_counters(
+        &self,
+        ctx: &Ctx,
+        delta: &[String],
+        lhs: &Expr,
+        rhs: &Expr,
+        meter: Option<&mut KernelWorkCounters>,
+    ) -> Result<bool> {
+        let Some(meter) = meter else {
+            return self.is_defeq(ctx, delta, lhs, rhs);
+        };
+        if self.observes_work_counters() {
+            let mut counters = KernelWorkCounters::default();
+            let result = self.is_defeq_with_work(ctx, delta, lhs, rhs, &mut counters);
+            meter.merge(counters);
+            self.observe_work_counters(counters);
+            return result;
+        }
+        self.is_defeq_with_work(ctx, delta, lhs, rhs, meter)
+    }
+
+    fn is_defeq_with_work(
+        &self,
+        ctx: &Ctx,
+        delta: &[String],
+        lhs: &Expr,
+        rhs: &Expr,
+        meter: &mut impl KernelWorkMeter,
+    ) -> Result<bool> {
+        let mut fuel = Self::DEFEQ_FUEL;
+        if self.execution_options.needs_reuse_state() {
+            let mut state = KernelOperationState::new(self.execution_options);
+            let result = self.is_defeq_with_remaining_fuel_memo(
+                ctx,
+                delta,
+                lhs,
+                MemoExprOrigin::Borrowed,
+                rhs,
+                MemoExprOrigin::Borrowed,
+                &mut fuel,
+                &mut state,
+            );
+            let exhausted = matches!(&result, Err(Error::ResourceLimit { .. }));
+            state
+                .counters
+                .record_fuel(Self::DEFEQ_FUEL - fuel, exhausted);
+            meter.merge_counters(state.counters);
+            return result;
+        }
+        let result = self.is_defeq_with_remaining_fuel(ctx, delta, lhs, rhs, &mut fuel, meter);
+        let exhausted = matches!(&result, Err(Error::ResourceLimit { .. }));
+        meter.record_fuel(Self::DEFEQ_FUEL - fuel, exhausted);
+        result
+    }
+
+    fn whnf_diagnosed_off(&self, ctx: &Ctx, delta: &[String], term: &Expr) -> Result<Expr> {
+        let mut fuel = Self::WHNF_FUEL;
+        self.whnf_with_remaining_fuel(
+            ctx,
+            delta,
+            term,
+            &mut fuel,
+            ResourceLimitKind::Whnf,
+            &mut DisabledKernelWorkMeter,
+        )
+    }
+
     /// Compare expressions with explicit fuel and bounded failure context.
     pub fn is_defeq_diagnosed_with_fuel(
         &self,
@@ -932,6 +1462,29 @@ impl Env {
         rhs: &Expr,
         fuel: usize,
     ) -> std::result::Result<bool, DiagnosedKernelError> {
+        self.is_defeq_diagnosed_with_fuel_and_work_counters(ctx, delta, lhs, rhs, fuel, None)
+    }
+
+    /// Compare expressions with diagnosed conversion while recording that the
+    /// v1 diagnosed path is deliberately memo-ineligible.
+    pub fn is_defeq_diagnosed_with_fuel_and_work_counters(
+        &self,
+        ctx: &Ctx,
+        delta: &[String],
+        lhs: &Expr,
+        rhs: &Expr,
+        fuel: usize,
+        meter: Option<&mut KernelWorkCounters>,
+    ) -> std::result::Result<bool, DiagnosedKernelError> {
+        if let Some(meter) = meter {
+            if self.execution_options.needs_reuse_state() {
+                KernelWorkCounters::add(
+                    &mut meter.memo_ineligible_diagnosed,
+                    1,
+                    &mut meter.overflowed,
+                );
+            }
+        }
         let mut fuel = fuel;
         let mut recorder = KernelConversionRecorder::default();
         match self.is_defeq_with_remaining_fuel_diagnosed(
@@ -976,7 +1529,49 @@ impl Env {
         term: &Expr,
         fuel: &mut usize,
     ) -> Result<Expr> {
-        self.whnf_with_remaining_fuel(ctx, delta, term, fuel, ResourceLimitKind::Whnf)
+        if self.execution_options.needs_reuse_state() {
+            let mut state = KernelOperationState::new(self.execution_options);
+            let starting_fuel = *fuel;
+            let result = self.whnf_with_remaining_fuel_memo(
+                ctx,
+                delta,
+                term,
+                MemoExprOrigin::Borrowed,
+                fuel,
+                ResourceLimitKind::Whnf,
+                &mut state,
+            );
+            let exhausted = matches!(&result, Err(Error::ResourceLimit { .. }));
+            state
+                .counters
+                .record_fuel(starting_fuel.saturating_sub(*fuel), exhausted);
+            self.observe_work_counters(state.counters);
+            return result;
+        }
+        if self.observes_work_counters() {
+            let starting_fuel = *fuel;
+            let mut counters = KernelWorkCounters::default();
+            let result = self.whnf_with_remaining_fuel(
+                ctx,
+                delta,
+                term,
+                fuel,
+                ResourceLimitKind::Whnf,
+                &mut counters,
+            );
+            let exhausted = matches!(&result, Err(Error::ResourceLimit { .. }));
+            counters.record_fuel(starting_fuel.saturating_sub(*fuel), exhausted);
+            self.observe_work_counters(counters);
+            return result;
+        }
+        self.whnf_with_remaining_fuel(
+            ctx,
+            delta,
+            term,
+            fuel,
+            ResourceLimitKind::Whnf,
+            &mut DisabledKernelWorkMeter,
+        )
     }
 
     pub fn is_defeq_with_fuel(
@@ -999,7 +1594,37 @@ impl Env {
         rhs: &Expr,
         fuel: &mut usize,
     ) -> Result<bool> {
-        self.is_defeq_with_remaining_fuel(ctx, delta, lhs, rhs, fuel)
+        if self.execution_options.needs_reuse_state() {
+            let mut state = KernelOperationState::new(self.execution_options);
+            let starting_fuel = *fuel;
+            let result = self.is_defeq_with_remaining_fuel_memo(
+                ctx,
+                delta,
+                lhs,
+                MemoExprOrigin::Borrowed,
+                rhs,
+                MemoExprOrigin::Borrowed,
+                fuel,
+                &mut state,
+            );
+            let exhausted = matches!(&result, Err(Error::ResourceLimit { .. }));
+            state
+                .counters
+                .record_fuel(starting_fuel.saturating_sub(*fuel), exhausted);
+            self.observe_work_counters(state.counters);
+            return result;
+        }
+        if self.observes_work_counters() {
+            let starting_fuel = *fuel;
+            let mut counters = KernelWorkCounters::default();
+            let result =
+                self.is_defeq_with_remaining_fuel(ctx, delta, lhs, rhs, fuel, &mut counters);
+            let exhausted = matches!(&result, Err(Error::ResourceLimit { .. }));
+            counters.record_fuel(starting_fuel.saturating_sub(*fuel), exhausted);
+            self.observe_work_counters(counters);
+            return result;
+        }
+        self.is_defeq_with_remaining_fuel(ctx, delta, lhs, rhs, fuel, &mut DisabledKernelWorkMeter)
     }
 
     fn ensure_fresh(&self, name: &str) -> Result<()> {
@@ -1061,11 +1686,47 @@ impl Env {
         universe_context: &UniverseContext,
         term: &Expr,
     ) -> Result<Level> {
-        match self.whnf(
+        if self.execution_options.needs_reuse_state() {
+            let mut state = KernelOperationState::new(self.execution_options);
+            let result = self.expect_sort_in_universe_context_with_memo(
+                ctx,
+                universe_context,
+                term,
+                MemoExprOrigin::Borrowed,
+                &mut state,
+            );
+            self.observe_work_counters(state.counters);
+            return result;
+        }
+        if self.observes_work_counters() {
+            let mut counters = KernelWorkCounters::default();
+            let result = self.expect_sort_in_universe_context_with_work(
+                ctx,
+                universe_context,
+                term,
+                &mut counters,
+            );
+            self.observe_work_counters(counters);
+            return result;
+        }
+        self.expect_sort_in_universe_context_with_work(
             ctx,
-            &universe_context.params,
-            &self.infer_in_universe_context(ctx, universe_context, term)?,
-        )? {
+            universe_context,
+            term,
+            &mut DisabledKernelWorkMeter,
+        )
+    }
+
+    fn expect_sort_in_universe_context_with_work(
+        &self,
+        ctx: &Ctx,
+        universe_context: &UniverseContext,
+        term: &Expr,
+        meter: &mut impl KernelWorkMeter,
+    ) -> Result<Level> {
+        let inferred =
+            self.infer_in_universe_context_with_work(ctx, universe_context, term, meter)?;
+        match self.whnf_with_work(ctx, &universe_context.params, &inferred, meter)? {
             Expr::Sort(level) => Ok(level),
             actual => Err(Error::ExpectedSort { actual }),
         }
@@ -1149,6 +1810,463 @@ impl Env {
         Ok((&data.universe_params, &data.universe_constraints))
     }
 
+    fn infer_in_universe_context_with_memo(
+        &self,
+        ctx: &Ctx,
+        universe_context: &UniverseContext,
+        term: &Expr,
+        _origin: MemoExprOrigin<'_>,
+        state: &mut KernelOperationState,
+    ) -> Result<Expr> {
+        state.counters.increment(KernelWorkCounter::InferCall);
+        match term {
+            Expr::Sort(level) => {
+                ensure_level_wf(&universe_context.params, level)?;
+                Ok(Expr::sort(Level::succ(level.clone())))
+            }
+            Expr::BVar(index) => {
+                state.counters.increment(KernelWorkCounter::ContextLookup);
+                state.counters.increment(KernelWorkCounter::ContextShift);
+                ctx.lookup_type(*index)
+            }
+            Expr::Const { name, levels } => {
+                self.infer_const_type_in_universe_context(universe_context, name, levels)
+            }
+            Expr::Pi { binder, ty, body } => {
+                let domain_sort = self.expect_sort_in_universe_context_with_memo(
+                    ctx,
+                    universe_context,
+                    ty,
+                    MemoExprOrigin::Retained(ty),
+                    state,
+                )?;
+                let mut body_ctx = ctx.clone();
+                body_ctx.push_assumption(binder.clone(), (**ty).clone());
+                let body_sort = self.expect_sort_in_universe_context_with_memo(
+                    &body_ctx,
+                    universe_context,
+                    body,
+                    MemoExprOrigin::Retained(body),
+                    state,
+                )?;
+                Ok(Expr::sort(Level::imax(domain_sort, body_sort)))
+            }
+            Expr::Lam { binder, ty, body } => {
+                self.expect_sort_in_universe_context_with_memo(
+                    ctx,
+                    universe_context,
+                    ty,
+                    MemoExprOrigin::Retained(ty),
+                    state,
+                )?;
+                let mut body_ctx = ctx.clone();
+                body_ctx.push_assumption(binder.clone(), (**ty).clone());
+                let body_ty = self.infer_in_universe_context_with_memo(
+                    &body_ctx,
+                    universe_context,
+                    body,
+                    MemoExprOrigin::Retained(body),
+                    state,
+                )?;
+                Ok(Expr::pi(binder.clone(), (**ty).clone(), body_ty))
+            }
+            Expr::App(fun, arg) => {
+                let fun_ty = self.infer_in_universe_context_with_memo(
+                    ctx,
+                    universe_context,
+                    fun,
+                    MemoExprOrigin::Retained(fun),
+                    state,
+                )?;
+                match self.whnf_with_default_memo(
+                    ctx,
+                    &universe_context.params,
+                    &fun_ty,
+                    MemoExprOrigin::Fresh,
+                    state,
+                )? {
+                    Expr::Pi { ty, body, .. } => {
+                        self.check_in_universe_context_with_memo(
+                            ctx,
+                            universe_context,
+                            arg,
+                            MemoExprOrigin::Retained(arg),
+                            &ty,
+                            MemoExprOrigin::Retained(&ty),
+                            state,
+                        )?;
+                        instantiate(&body, arg)
+                    }
+                    actual => Err(Error::ExpectedPi { actual }),
+                }
+            }
+            Expr::Let {
+                binder,
+                ty,
+                value,
+                body,
+            } => {
+                self.expect_sort_in_universe_context_with_memo(
+                    ctx,
+                    universe_context,
+                    ty,
+                    MemoExprOrigin::Retained(ty),
+                    state,
+                )?;
+                self.check_in_universe_context_with_memo(
+                    ctx,
+                    universe_context,
+                    value,
+                    MemoExprOrigin::Retained(value),
+                    ty,
+                    MemoExprOrigin::Retained(ty),
+                    state,
+                )?;
+                let mut body_ctx = ctx.clone();
+                body_ctx.push_definition(binder.clone(), (**ty).clone(), (**value).clone());
+                let body_ty = self.infer_in_universe_context_with_memo(
+                    &body_ctx,
+                    universe_context,
+                    body,
+                    MemoExprOrigin::Retained(body),
+                    state,
+                )?;
+                instantiate(&body_ty, value)
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn check_in_universe_context_with_memo(
+        &self,
+        ctx: &Ctx,
+        universe_context: &UniverseContext,
+        term: &Expr,
+        term_origin: MemoExprOrigin<'_>,
+        expected: &Expr,
+        expected_origin: MemoExprOrigin<'_>,
+        state: &mut KernelOperationState,
+    ) -> Result<()> {
+        state.counters.increment(KernelWorkCounter::CheckCall);
+        let actual = self.infer_in_universe_context_with_memo(
+            ctx,
+            universe_context,
+            term,
+            term_origin,
+            state,
+        )?;
+        if self.is_defeq_with_default_memo(
+            ctx,
+            &universe_context.params,
+            &actual,
+            MemoExprOrigin::Fresh,
+            expected,
+            expected_origin,
+            state,
+        )? {
+            Ok(())
+        } else {
+            Err(Error::TypeMismatch {
+                expected: expected.clone(),
+                actual,
+            })
+        }
+    }
+
+    fn expect_sort_in_universe_context_with_memo(
+        &self,
+        ctx: &Ctx,
+        universe_context: &UniverseContext,
+        term: &Expr,
+        origin: MemoExprOrigin<'_>,
+        state: &mut KernelOperationState,
+    ) -> Result<Level> {
+        let inferred =
+            self.infer_in_universe_context_with_memo(ctx, universe_context, term, origin, state)?;
+        match self.whnf_with_default_memo(
+            ctx,
+            &universe_context.params,
+            &inferred,
+            MemoExprOrigin::Fresh,
+            state,
+        )? {
+            Expr::Sort(level) => Ok(level),
+            actual => Err(Error::ExpectedSort { actual }),
+        }
+    }
+
+    fn whnf_with_default_memo(
+        &self,
+        ctx: &Ctx,
+        delta: &[String],
+        term: &Expr,
+        origin: MemoExprOrigin<'_>,
+        state: &mut KernelOperationState,
+    ) -> Result<Expr> {
+        let mut fuel = Self::WHNF_FUEL;
+        let result = self.whnf_with_remaining_fuel_memo(
+            ctx,
+            delta,
+            term,
+            origin,
+            &mut fuel,
+            ResourceLimitKind::Whnf,
+            state,
+        );
+        let exhausted = matches!(&result, Err(Error::ResourceLimit { .. }));
+        state
+            .counters
+            .record_fuel(Self::WHNF_FUEL - fuel, exhausted);
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn is_defeq_with_default_memo(
+        &self,
+        ctx: &Ctx,
+        delta: &[String],
+        lhs: &Expr,
+        lhs_origin: MemoExprOrigin<'_>,
+        rhs: &Expr,
+        rhs_origin: MemoExprOrigin<'_>,
+        state: &mut KernelOperationState,
+    ) -> Result<bool> {
+        let mut fuel = Self::DEFEQ_FUEL;
+        let result = self.is_defeq_with_remaining_fuel_memo(
+            ctx, delta, lhs, lhs_origin, rhs, rhs_origin, &mut fuel, state,
+        );
+        let exhausted = matches!(&result, Err(Error::ResourceLimit { .. }));
+        state
+            .counters
+            .record_fuel(Self::DEFEQ_FUEL - fuel, exhausted);
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn infer_with_remaining_fuel_memo_shared(
+        &self,
+        ctx: &Ctx,
+        universe_context: &UniverseContext,
+        term: &Expr,
+        _origin: MemoExprOrigin<'_>,
+        whnf_fuel: &mut usize,
+        conversion_fuel: &mut usize,
+        state: &mut KernelOperationState,
+    ) -> Result<Expr> {
+        state.counters.increment(KernelWorkCounter::InferCall);
+        match term {
+            Expr::Sort(level) => {
+                ensure_level_wf(&universe_context.params, level)?;
+                Ok(Expr::sort(Level::succ(level.clone())))
+            }
+            Expr::BVar(index) => {
+                state.counters.increment(KernelWorkCounter::ContextLookup);
+                state.counters.increment(KernelWorkCounter::ContextShift);
+                ctx.lookup_type(*index)
+            }
+            Expr::Const { name, levels } => {
+                self.infer_const_type_in_universe_context(universe_context, name, levels)
+            }
+            Expr::Pi { binder, ty, body } => {
+                let domain_sort = self.expect_sort_with_remaining_fuel_memo_shared(
+                    ctx,
+                    universe_context,
+                    ty,
+                    MemoExprOrigin::Retained(ty),
+                    whnf_fuel,
+                    conversion_fuel,
+                    state,
+                )?;
+                let mut body_ctx = ctx.clone();
+                body_ctx.push_assumption(binder.clone(), (**ty).clone());
+                let body_sort = self.expect_sort_with_remaining_fuel_memo_shared(
+                    &body_ctx,
+                    universe_context,
+                    body,
+                    MemoExprOrigin::Retained(body),
+                    whnf_fuel,
+                    conversion_fuel,
+                    state,
+                )?;
+                Ok(Expr::sort(Level::imax(domain_sort, body_sort)))
+            }
+            Expr::Lam { binder, ty, body } => {
+                self.expect_sort_with_remaining_fuel_memo_shared(
+                    ctx,
+                    universe_context,
+                    ty,
+                    MemoExprOrigin::Retained(ty),
+                    whnf_fuel,
+                    conversion_fuel,
+                    state,
+                )?;
+                let mut body_ctx = ctx.clone();
+                body_ctx.push_assumption(binder.clone(), (**ty).clone());
+                let body_ty = self.infer_with_remaining_fuel_memo_shared(
+                    &body_ctx,
+                    universe_context,
+                    body,
+                    MemoExprOrigin::Retained(body),
+                    whnf_fuel,
+                    conversion_fuel,
+                    state,
+                )?;
+                Ok(Expr::pi(binder.clone(), (**ty).clone(), body_ty))
+            }
+            Expr::App(fun, arg) => {
+                let fun_ty = self.infer_with_remaining_fuel_memo_shared(
+                    ctx,
+                    universe_context,
+                    fun,
+                    MemoExprOrigin::Retained(fun),
+                    whnf_fuel,
+                    conversion_fuel,
+                    state,
+                )?;
+                match self.whnf_with_remaining_fuel_memo(
+                    ctx,
+                    &universe_context.params,
+                    &fun_ty,
+                    MemoExprOrigin::Fresh,
+                    whnf_fuel,
+                    ResourceLimitKind::Whnf,
+                    state,
+                )? {
+                    Expr::Pi { ty, body, .. } => {
+                        self.check_with_remaining_fuel_memo_shared(
+                            ctx,
+                            universe_context,
+                            arg,
+                            MemoExprOrigin::Retained(arg),
+                            &ty,
+                            MemoExprOrigin::Retained(&ty),
+                            whnf_fuel,
+                            conversion_fuel,
+                            state,
+                        )?;
+                        instantiate(&body, arg)
+                    }
+                    actual => Err(Error::ExpectedPi { actual }),
+                }
+            }
+            Expr::Let {
+                binder,
+                ty,
+                value,
+                body,
+            } => {
+                self.expect_sort_with_remaining_fuel_memo_shared(
+                    ctx,
+                    universe_context,
+                    ty,
+                    MemoExprOrigin::Retained(ty),
+                    whnf_fuel,
+                    conversion_fuel,
+                    state,
+                )?;
+                self.check_with_remaining_fuel_memo_shared(
+                    ctx,
+                    universe_context,
+                    value,
+                    MemoExprOrigin::Retained(value),
+                    ty,
+                    MemoExprOrigin::Retained(ty),
+                    whnf_fuel,
+                    conversion_fuel,
+                    state,
+                )?;
+                let mut body_ctx = ctx.clone();
+                body_ctx.push_definition(binder.clone(), (**ty).clone(), (**value).clone());
+                let body_ty = self.infer_with_remaining_fuel_memo_shared(
+                    &body_ctx,
+                    universe_context,
+                    body,
+                    MemoExprOrigin::Retained(body),
+                    whnf_fuel,
+                    conversion_fuel,
+                    state,
+                )?;
+                instantiate(&body_ty, value)
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn check_with_remaining_fuel_memo_shared(
+        &self,
+        ctx: &Ctx,
+        universe_context: &UniverseContext,
+        term: &Expr,
+        term_origin: MemoExprOrigin<'_>,
+        expected: &Expr,
+        expected_origin: MemoExprOrigin<'_>,
+        whnf_fuel: &mut usize,
+        conversion_fuel: &mut usize,
+        state: &mut KernelOperationState,
+    ) -> Result<()> {
+        state.counters.increment(KernelWorkCounter::CheckCall);
+        let actual = self.infer_with_remaining_fuel_memo_shared(
+            ctx,
+            universe_context,
+            term,
+            term_origin,
+            whnf_fuel,
+            conversion_fuel,
+            state,
+        )?;
+        if self.is_defeq_with_remaining_fuel_memo(
+            ctx,
+            &universe_context.params,
+            &actual,
+            MemoExprOrigin::Fresh,
+            expected,
+            expected_origin,
+            conversion_fuel,
+            state,
+        )? {
+            Ok(())
+        } else {
+            Err(Error::TypeMismatch {
+                expected: expected.clone(),
+                actual,
+            })
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn expect_sort_with_remaining_fuel_memo_shared(
+        &self,
+        ctx: &Ctx,
+        universe_context: &UniverseContext,
+        term: &Expr,
+        origin: MemoExprOrigin<'_>,
+        whnf_fuel: &mut usize,
+        conversion_fuel: &mut usize,
+        state: &mut KernelOperationState,
+    ) -> Result<Level> {
+        let ty = self.infer_with_remaining_fuel_memo_shared(
+            ctx,
+            universe_context,
+            term,
+            origin,
+            whnf_fuel,
+            conversion_fuel,
+            state,
+        )?;
+        match self.whnf_with_remaining_fuel_memo(
+            ctx,
+            &universe_context.params,
+            &ty,
+            MemoExprOrigin::Fresh,
+            whnf_fuel,
+            ResourceLimitKind::Whnf,
+            state,
+        )? {
+            Expr::Sort(level) => Ok(level),
+            actual => Err(Error::ExpectedSort { actual }),
+        }
+    }
+
     fn infer_with_remaining_fuel(
         &self,
         ctx: &Ctx,
@@ -1218,6 +2336,7 @@ impl Env {
                     &fun_ty,
                     whnf_fuel,
                     ResourceLimitKind::Whnf,
+                    &mut DisabledKernelWorkMeter,
                 )? {
                     Expr::Pi { ty, body, .. } => {
                         self.check_with_remaining_fuel(
@@ -1290,6 +2409,7 @@ impl Env {
             &actual,
             expected,
             conversion_fuel,
+            &mut DisabledKernelWorkMeter,
         )? {
             Ok(())
         } else {
@@ -1321,6 +2441,7 @@ impl Env {
             &ty,
             whnf_fuel,
             ResourceLimitKind::Whnf,
+            &mut DisabledKernelWorkMeter,
         )? {
             Expr::Sort(level) => Ok(level),
             actual => Err(Error::ExpectedSort { actual }),
@@ -1875,6 +2996,124 @@ impl Env {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn whnf_with_remaining_fuel_memo(
+        &self,
+        ctx: &Ctx,
+        delta: &[String],
+        term: &Expr,
+        origin: MemoExprOrigin<'_>,
+        fuel: &mut usize,
+        kind: ResourceLimitKind,
+        state: &mut KernelOperationState,
+    ) -> Result<Expr> {
+        let lookup = state
+            .memo
+            .whnf_lookup(origin, ctx, delta, kind, &mut state.counters);
+        let token = match lookup {
+            WhnfMemoLookup::Hit { result, fuel_cost } => {
+                replay_memo_fuel(fuel, fuel_cost, kind, &mut state.counters)?;
+                KernelWorkCounters::add(
+                    &mut state.counters.memo_bypassed_call_bodies,
+                    1,
+                    &mut state.counters.overflowed,
+                );
+                return Ok(result);
+            }
+            WhnfMemoLookup::Miss(token) => Some(token),
+            WhnfMemoLookup::Ineligible => None,
+        };
+
+        let starting_fuel = *fuel;
+        state.counters.increment(KernelWorkCounter::WhnfCall);
+        let result = (|| {
+            let mut current = term.clone();
+            loop {
+                spend_fuel(fuel, kind)?;
+
+                match current {
+                    Expr::BVar(index) => {
+                        state.counters.increment(KernelWorkCounter::ContextLookup);
+                        let value = ctx.lookup_value(index)?;
+                        if let Some(value) = value {
+                            state.counters.increment(KernelWorkCounter::ContextShift);
+                            record_reduction(&mut state.counters, KernelWorkCounter::ZetaStep);
+                            current = value;
+                        } else {
+                            return Ok(Expr::BVar(index));
+                        }
+                    }
+                    Expr::Const {
+                        ref name,
+                        ref levels,
+                    } => {
+                        if let Some(
+                            Decl::Def {
+                                universe_params,
+                                value,
+                                reducibility: Reducibility::Reducible,
+                                ..
+                            }
+                            | Decl::DefConstrained {
+                                universe_params,
+                                value,
+                                reducibility: Reducibility::Reducible,
+                                ..
+                            },
+                        ) = self.decls.get(name)
+                        {
+                            record_reduction(&mut state.counters, KernelWorkCounter::DeltaStep);
+                            current = subst_levels_expr(value, universe_params, levels);
+                        } else {
+                            return Ok(current);
+                        }
+                    }
+                    Expr::App(fun, arg) => {
+                        let fun_whnf = self.whnf_with_remaining_fuel_memo(
+                            ctx,
+                            delta,
+                            &fun,
+                            MemoExprOrigin::Retained(&fun),
+                            fuel,
+                            kind,
+                            state,
+                        )?;
+                        if let Expr::Lam { body, .. } = fun_whnf {
+                            record_reduction(&mut state.counters, KernelWorkCounter::BetaStep);
+                            current = instantiate(&body, &arg)?;
+                            continue;
+                        }
+
+                        let app = Expr::App(Arc::new(fun_whnf), arg);
+                        if let Some(reduced) =
+                            self.reduce_recursor_memo(ctx, delta, &app, fuel, kind, state)?
+                        {
+                            record_reduction(&mut state.counters, KernelWorkCounter::IotaStep);
+                            current = reduced;
+                            continue;
+                        }
+                        return Ok(app);
+                    }
+                    Expr::Let { value, body, .. } => {
+                        record_reduction(&mut state.counters, KernelWorkCounter::ZetaStep);
+                        current = instantiate(&body, &value)?;
+                    }
+                    _ => return Ok(current),
+                }
+            }
+        })();
+
+        if let (Some(token), Ok(value)) = (token, &result) {
+            state.memo.insert_whnf(
+                token,
+                value,
+                starting_fuel.saturating_sub(*fuel),
+                &mut state.counters,
+            );
+        }
+        result
+    }
+
     fn whnf_with_remaining_fuel(
         &self,
         ctx: &Ctx,
@@ -1882,14 +3121,20 @@ impl Env {
         term: &Expr,
         fuel: &mut usize,
         kind: ResourceLimitKind,
+        meter: &mut impl KernelWorkMeter,
     ) -> Result<Expr> {
+        meter.increment(KernelWorkCounter::WhnfCall);
         let mut current = term.clone();
         loop {
             spend_fuel(fuel, kind)?;
 
             match current {
                 Expr::BVar(index) => {
-                    if let Some(value) = ctx.lookup_value(index)? {
+                    meter.increment(KernelWorkCounter::ContextLookup);
+                    let value = ctx.lookup_value(index)?;
+                    if let Some(value) = value {
+                        meter.increment(KernelWorkCounter::ContextShift);
+                        record_reduction(meter, KernelWorkCounter::ZetaStep);
                         current = value;
                     } else {
                         return Ok(Expr::BVar(index));
@@ -1914,31 +3159,82 @@ impl Env {
                         },
                     ) = self.decls.get(name)
                     {
+                        record_reduction(meter, KernelWorkCounter::DeltaStep);
                         current = subst_levels_expr(value, universe_params, levels);
                     } else {
                         return Ok(current);
                     }
                 }
                 Expr::App(fun, arg) => {
-                    let fun_whnf = self.whnf_with_remaining_fuel(ctx, delta, &fun, fuel, kind)?;
+                    let fun_whnf =
+                        self.whnf_with_remaining_fuel(ctx, delta, &fun, fuel, kind, meter)?;
                     if let Expr::Lam { body, .. } = fun_whnf {
+                        record_reduction(meter, KernelWorkCounter::BetaStep);
                         current = instantiate(&body, &arg)?;
                         continue;
                     }
 
                     let app = Expr::App(Arc::new(fun_whnf), arg);
-                    if let Some(reduced) = self.reduce_recursor(ctx, delta, &app, fuel, kind)? {
+                    if let Some(reduced) =
+                        self.reduce_recursor(ctx, delta, &app, fuel, kind, meter)?
+                    {
+                        record_reduction(meter, KernelWorkCounter::IotaStep);
                         current = reduced;
                         continue;
                     }
                     return Ok(app);
                 }
                 Expr::Let { value, body, .. } => {
+                    record_reduction(meter, KernelWorkCounter::ZetaStep);
                     current = instantiate(&body, &value)?;
                 }
                 _ => return Ok(current),
             }
         }
+    }
+
+    fn reduce_recursor_memo(
+        &self,
+        ctx: &Ctx,
+        delta: &[String],
+        term: &Expr,
+        fuel: &mut usize,
+        kind: ResourceLimitKind,
+        state: &mut KernelOperationState,
+    ) -> Result<Option<Expr>> {
+        let (head, retained_args) = collect_apps_with_retained_args(term);
+        let Expr::Const {
+            name: recursor_name,
+            levels,
+        } = head
+        else {
+            return Ok(None);
+        };
+        let Some(Decl::Recursor {
+            inductive, rules, ..
+        }) = self.decls.get(&recursor_name)
+        else {
+            return Ok(None);
+        };
+        if retained_args.len() <= rules.major_index {
+            return Ok(None);
+        }
+
+        let major = &retained_args[rules.major_index];
+        let major_whnf = self.whnf_with_remaining_fuel_memo(
+            ctx,
+            delta,
+            major,
+            MemoExprOrigin::Retained(major),
+            fuel,
+            kind,
+            state,
+        )?;
+        let args = retained_args
+            .iter()
+            .map(|argument| (**argument).clone())
+            .collect::<Vec<_>>();
+        self.finish_recursor_reduction(&recursor_name, &levels, inductive, rules, &args, major_whnf)
     }
 
     fn reduce_recursor(
@@ -1948,6 +3244,7 @@ impl Env {
         term: &Expr,
         fuel: &mut usize,
         kind: ResourceLimitKind,
+        meter: &mut impl KernelWorkMeter,
     ) -> Result<Option<Expr>> {
         let (head, args) = collect_apps(term);
         let Expr::Const {
@@ -1968,8 +3265,21 @@ impl Env {
         }
 
         let major = args[rules.major_index].clone();
+        let major_whnf = self.whnf_with_remaining_fuel(ctx, delta, &major, fuel, kind, meter)?;
+        self.finish_recursor_reduction(&recursor_name, &levels, inductive, rules, &args, major_whnf)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finish_recursor_reduction(
+        &self,
+        recursor_name: &str,
+        levels: &[Level],
+        inductive: &str,
+        rules: &RecursorRules,
+        args: &[Expr],
+        major_whnf: Expr,
+    ) -> Result<Option<Expr>> {
         let rest = args[rules.major_index + 1..].to_vec();
-        let major_whnf = self.whnf_with_remaining_fuel(ctx, delta, &major, fuel, kind)?;
         let (ctor_head, ctor_args) = collect_apps(&major_whnf);
         let Expr::Const {
             name: ctor_name, ..
@@ -2049,7 +3359,7 @@ impl Env {
                     reduced = Expr::app(
                         reduced,
                         Expr::apps(
-                            Expr::konst(recursive_recursor_name.clone(), levels.clone()),
+                            Expr::konst(recursive_recursor_name.clone(), levels.to_vec()),
                             recursive_args,
                         ),
                     );
@@ -2065,7 +3375,7 @@ impl Env {
                 reduced = Expr::app(
                     reduced,
                     Expr::apps(
-                        Expr::konst(recursor_name.clone(), levels.clone()),
+                        Expr::konst(recursor_name.to_owned(), levels.to_vec()),
                         recursive_args,
                     ),
                 );
@@ -2091,6 +3401,193 @@ impl Env {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn is_defeq_with_remaining_fuel_memo(
+        &self,
+        ctx: &Ctx,
+        delta: &[String],
+        lhs: &Expr,
+        lhs_origin: MemoExprOrigin<'_>,
+        rhs: &Expr,
+        rhs_origin: MemoExprOrigin<'_>,
+        fuel: &mut usize,
+        state: &mut KernelOperationState,
+    ) -> Result<bool> {
+        let lookup =
+            state
+                .memo
+                .defeq_lookup(lhs_origin, rhs_origin, ctx, delta, &mut state.counters);
+        let token = match lookup {
+            DefeqMemoLookup::Hit { fuel_cost } => {
+                replay_memo_fuel(
+                    fuel,
+                    fuel_cost,
+                    ResourceLimitKind::Conversion,
+                    &mut state.counters,
+                )?;
+                KernelWorkCounters::add(
+                    &mut state.counters.memo_bypassed_call_bodies,
+                    1,
+                    &mut state.counters.overflowed,
+                );
+                return Ok(true);
+            }
+            DefeqMemoLookup::Miss(token) => Some(token),
+            DefeqMemoLookup::Ineligible => None,
+        };
+
+        let starting_fuel = *fuel;
+        state.counters.increment(KernelWorkCounter::DefeqCall);
+        let result = (|| {
+            spend_fuel(fuel, ResourceLimitKind::Conversion)?;
+            if quick_syntactic_eq(lhs, rhs) {
+                state
+                    .counters
+                    .increment(KernelWorkCounter::QuickEqualityHit);
+                return Ok(true);
+            }
+
+            let lhs = self.whnf_with_remaining_fuel_memo(
+                ctx,
+                delta,
+                lhs,
+                lhs_origin,
+                fuel,
+                ResourceLimitKind::Conversion,
+                state,
+            )?;
+            let rhs = self.whnf_with_remaining_fuel_memo(
+                ctx,
+                delta,
+                rhs,
+                rhs_origin,
+                fuel,
+                ResourceLimitKind::Conversion,
+                state,
+            )?;
+
+            match (&lhs, &rhs) {
+                (Expr::Sort(lhs), Expr::Sort(rhs)) => Ok(level_eq(lhs, rhs)),
+                (Expr::BVar(lhs), Expr::BVar(rhs)) => Ok(lhs == rhs),
+                (
+                    Expr::Const {
+                        name: lhs_name,
+                        levels: lhs_levels,
+                    },
+                    Expr::Const {
+                        name: rhs_name,
+                        levels: rhs_levels,
+                    },
+                ) => Ok(lhs_name == rhs_name && levels_eq(lhs_levels, rhs_levels)),
+                (Expr::App(lhs_f, lhs_a), Expr::App(rhs_f, rhs_a)) => {
+                    Ok(self.is_defeq_with_remaining_fuel_memo(
+                        ctx,
+                        delta,
+                        lhs_f,
+                        MemoExprOrigin::Retained(lhs_f),
+                        rhs_f,
+                        MemoExprOrigin::Retained(rhs_f),
+                        fuel,
+                        state,
+                    )? && self.is_defeq_with_remaining_fuel_memo(
+                        ctx,
+                        delta,
+                        lhs_a,
+                        MemoExprOrigin::Retained(lhs_a),
+                        rhs_a,
+                        MemoExprOrigin::Retained(rhs_a),
+                        fuel,
+                        state,
+                    )?)
+                }
+                (
+                    Expr::Pi {
+                        binder,
+                        ty: lhs_ty,
+                        body: lhs_body,
+                    },
+                    Expr::Pi {
+                        ty: rhs_ty,
+                        body: rhs_body,
+                        ..
+                    },
+                ) => {
+                    if !self.is_defeq_with_remaining_fuel_memo(
+                        ctx,
+                        delta,
+                        lhs_ty,
+                        MemoExprOrigin::Retained(lhs_ty),
+                        rhs_ty,
+                        MemoExprOrigin::Retained(rhs_ty),
+                        fuel,
+                        state,
+                    )? {
+                        return Ok(false);
+                    }
+                    let mut body_ctx = ctx.clone();
+                    body_ctx.push_assumption(binder.clone(), (**lhs_ty).clone());
+                    self.is_defeq_with_remaining_fuel_memo(
+                        &body_ctx,
+                        delta,
+                        lhs_body,
+                        MemoExprOrigin::Retained(lhs_body),
+                        rhs_body,
+                        MemoExprOrigin::Retained(rhs_body),
+                        fuel,
+                        state,
+                    )
+                }
+                (
+                    Expr::Lam {
+                        binder,
+                        ty: lhs_ty,
+                        body: lhs_body,
+                    },
+                    Expr::Lam {
+                        ty: rhs_ty,
+                        body: rhs_body,
+                        ..
+                    },
+                ) => {
+                    if !self.is_defeq_with_remaining_fuel_memo(
+                        ctx,
+                        delta,
+                        lhs_ty,
+                        MemoExprOrigin::Retained(lhs_ty),
+                        rhs_ty,
+                        MemoExprOrigin::Retained(rhs_ty),
+                        fuel,
+                        state,
+                    )? {
+                        return Ok(false);
+                    }
+                    let mut body_ctx = ctx.clone();
+                    body_ctx.push_assumption(binder.clone(), (**lhs_ty).clone());
+                    self.is_defeq_with_remaining_fuel_memo(
+                        &body_ctx,
+                        delta,
+                        lhs_body,
+                        MemoExprOrigin::Retained(lhs_body),
+                        rhs_body,
+                        MemoExprOrigin::Retained(rhs_body),
+                        fuel,
+                        state,
+                    )
+                }
+                _ => Ok(false),
+            }
+        })();
+
+        if let (Some(token), Ok(true)) = (token, &result) {
+            state.memo.insert_defeq(
+                token,
+                starting_fuel.saturating_sub(*fuel),
+                &mut state.counters,
+            );
+        }
+        result
+    }
+
     fn is_defeq_with_remaining_fuel(
         &self,
         ctx: &Ctx,
@@ -2098,20 +3595,35 @@ impl Env {
         lhs: &Expr,
         rhs: &Expr,
         fuel: &mut usize,
+        meter: &mut impl KernelWorkMeter,
     ) -> Result<bool> {
+        meter.increment(KernelWorkCounter::DefeqCall);
         spend_fuel(fuel, ResourceLimitKind::Conversion)?;
 
         // Syntactically identical terms are definitionally equal by
         // reflexivity; this avoids reducing both sides to weak head normal
         // form on the common reflexive comparison.
         if quick_syntactic_eq(lhs, rhs) {
+            meter.increment(KernelWorkCounter::QuickEqualityHit);
             return Ok(true);
         }
 
-        let lhs =
-            self.whnf_with_remaining_fuel(ctx, delta, lhs, fuel, ResourceLimitKind::Conversion)?;
-        let rhs =
-            self.whnf_with_remaining_fuel(ctx, delta, rhs, fuel, ResourceLimitKind::Conversion)?;
+        let lhs = self.whnf_with_remaining_fuel(
+            ctx,
+            delta,
+            lhs,
+            fuel,
+            ResourceLimitKind::Conversion,
+            meter,
+        )?;
+        let rhs = self.whnf_with_remaining_fuel(
+            ctx,
+            delta,
+            rhs,
+            fuel,
+            ResourceLimitKind::Conversion,
+            meter,
+        )?;
 
         match (&lhs, &rhs) {
             (Expr::Sort(lhs), Expr::Sort(rhs)) => Ok(level_eq(lhs, rhs)),
@@ -2127,8 +3639,8 @@ impl Env {
                 },
             ) => Ok(lhs_name == rhs_name && levels_eq(lhs_levels, rhs_levels)),
             (Expr::App(lhs_f, lhs_a), Expr::App(rhs_f, rhs_a)) => Ok(self
-                .is_defeq_with_remaining_fuel(ctx, delta, lhs_f, rhs_f, fuel)?
-                && self.is_defeq_with_remaining_fuel(ctx, delta, lhs_a, rhs_a, fuel)?),
+                .is_defeq_with_remaining_fuel(ctx, delta, lhs_f, rhs_f, fuel, meter)?
+                && self.is_defeq_with_remaining_fuel(ctx, delta, lhs_a, rhs_a, fuel, meter)?),
             (
                 Expr::Pi {
                     binder,
@@ -2141,12 +3653,12 @@ impl Env {
                     ..
                 },
             ) => {
-                if !self.is_defeq_with_remaining_fuel(ctx, delta, lhs_ty, rhs_ty, fuel)? {
+                if !self.is_defeq_with_remaining_fuel(ctx, delta, lhs_ty, rhs_ty, fuel, meter)? {
                     return Ok(false);
                 }
                 let mut body_ctx = ctx.clone();
                 body_ctx.push_assumption(binder.clone(), (**lhs_ty).clone());
-                self.is_defeq_with_remaining_fuel(&body_ctx, delta, lhs_body, rhs_body, fuel)
+                self.is_defeq_with_remaining_fuel(&body_ctx, delta, lhs_body, rhs_body, fuel, meter)
             }
             (
                 Expr::Lam {
@@ -2160,12 +3672,12 @@ impl Env {
                     ..
                 },
             ) => {
-                if !self.is_defeq_with_remaining_fuel(ctx, delta, lhs_ty, rhs_ty, fuel)? {
+                if !self.is_defeq_with_remaining_fuel(ctx, delta, lhs_ty, rhs_ty, fuel, meter)? {
                     return Ok(false);
                 }
                 let mut body_ctx = ctx.clone();
                 body_ctx.push_assumption(binder.clone(), (**lhs_ty).clone());
-                self.is_defeq_with_remaining_fuel(&body_ctx, delta, lhs_body, rhs_body, fuel)
+                self.is_defeq_with_remaining_fuel(&body_ctx, delta, lhs_body, rhs_body, fuel, meter)
             }
             _ => Ok(false),
         }
@@ -2199,6 +3711,7 @@ impl Env {
             lhs,
             fuel,
             ResourceLimitKind::Conversion,
+            &mut DisabledKernelWorkMeter,
         ) {
             Ok(lhs) => lhs,
             Err(error) => {
@@ -2219,6 +3732,7 @@ impl Env {
             rhs,
             fuel,
             ResourceLimitKind::Conversion,
+            &mut DisabledKernelWorkMeter,
         ) {
             Ok(rhs) => rhs,
             Err(error) => {
@@ -2316,12 +3830,44 @@ impl Env {
     }
 }
 
+fn record_reduction(meter: &mut impl KernelWorkMeter, counter: KernelWorkCounter) {
+    meter.increment(counter);
+    meter.increment(KernelWorkCounter::PhysicalReduction);
+}
+
+fn replay_memo_fuel(
+    fuel: &mut usize,
+    fuel_cost: usize,
+    kind: ResourceLimitKind,
+    counters: &mut KernelWorkCounters,
+) -> Result<()> {
+    let charged = (*fuel).min(fuel_cost);
+    counters.add_memo_replayed_fuel(charged);
+    if *fuel < fuel_cost {
+        *fuel = 0;
+        return Err(Error::ResourceLimit { kind });
+    }
+    *fuel -= fuel_cost;
+    Ok(())
+}
+
 fn spend_fuel(fuel: &mut usize, kind: ResourceLimitKind) -> Result<()> {
     if *fuel == 0 {
         return Err(Error::ResourceLimit { kind });
     }
     *fuel -= 1;
     Ok(())
+}
+
+fn collect_apps_with_retained_args(term: &Expr) -> (Expr, Vec<Arc<Expr>>) {
+    let mut head = term;
+    let mut args = Vec::new();
+    while let Expr::App(fun, arg) = head {
+        args.push(Arc::clone(arg));
+        head = fun;
+    }
+    args.reverse();
+    (head.clone(), args)
 }
 
 fn generated_recursor_rules(data: &InductiveDecl) -> RecursorRules {
@@ -3170,4 +4716,855 @@ fn contains_const(expr: &Expr, needle: &str) -> bool {
 
 fn contains_any_const<'a>(expr: &Expr, needles: impl Iterator<Item = &'a str> + Clone) -> bool {
     needles.clone().any(|needle| contains_const(expr, needle))
+}
+
+#[cfg(test)]
+mod memo_tests {
+    use super::*;
+    use crate::{nat, nat_zero};
+
+    fn beta_owner() -> Arc<Expr> {
+        Arc::new(Expr::app(
+            Expr::lam("x", Expr::sort(Level::zero()), Expr::bvar(0)),
+            Expr::konst("a", vec![]),
+        ))
+    }
+
+    fn repeated_defeq_pair() -> (Expr, Expr) {
+        let beta = beta_owner();
+        let normal = Arc::new(Expr::konst("a", vec![]));
+        let lhs_inner = Arc::new(Expr::App(
+            Arc::new(Expr::konst("f", vec![])),
+            Arc::clone(&beta),
+        ));
+        let rhs_inner = Arc::new(Expr::App(
+            Arc::new(Expr::konst("f", vec![])),
+            Arc::clone(&normal),
+        ));
+        (Expr::App(lhs_inner, beta), Expr::App(rhs_inner, normal))
+    }
+
+    #[test]
+    fn ephemeral_defeq_preserves_logical_fuel_and_reduces_physical_calls() {
+        let (lhs, rhs) = repeated_defeq_pair();
+        let off = Env::new();
+        let memo = Env::with_execution_options(KernelExecutionOptions::ephemeral_memo());
+        let mut off_counters = KernelWorkCounters::default();
+        let mut memo_counters = KernelWorkCounters::default();
+
+        let off_result = off
+            .is_defeq_with_work_counters(&Ctx::new(), &[], &lhs, &rhs, Some(&mut off_counters))
+            .unwrap();
+        let memo_result = memo
+            .is_defeq_with_work_counters(&Ctx::new(), &[], &lhs, &rhs, Some(&mut memo_counters))
+            .unwrap();
+
+        assert!(off_result && memo_result);
+        assert_eq!(memo_counters.logical_fuel, off_counters.logical_fuel);
+        assert!(memo_counters.defeq_memo_hits > 0);
+        assert!(memo_counters.memo_logical_fuel_replayed > 0);
+        assert!(memo_counters.defeq_calls < off_counters.defeq_calls);
+        assert_eq!(off_counters.memo_entry_capacity, 0);
+        assert_eq!(memo_counters.memo_entry_capacity, 12_288);
+    }
+
+    #[test]
+    fn memo_and_probe_preserve_explicit_conversion_fuel_and_errors() {
+        let (lhs, rhs) = repeated_defeq_pair();
+        let off = Env::new();
+        let memo = Env::with_execution_options(KernelExecutionOptions::ephemeral_memo());
+        for initial in 0..40 {
+            let mut off_fuel = initial;
+            let mut memo_fuel = initial;
+            let off_result =
+                off.is_defeq_with_fuel_metered(&Ctx::new(), &[], &lhs, &rhs, &mut off_fuel);
+            let memo_result =
+                memo.is_defeq_with_fuel_metered(&Ctx::new(), &[], &lhs, &rhs, &mut memo_fuel);
+            assert_eq!(memo_result, off_result, "initial fuel {initial}");
+            assert_eq!(memo_fuel, off_fuel, "initial fuel {initial}");
+        }
+
+        let probe = Env::with_execution_options(KernelExecutionOptions::repetition_probe());
+        let mut off_counters = KernelWorkCounters::default();
+        let mut probe_counters = KernelWorkCounters::default();
+        let off_result =
+            off.is_defeq_with_work_counters(&Ctx::new(), &[], &lhs, &rhs, Some(&mut off_counters));
+        let probe_result = probe.is_defeq_with_work_counters(
+            &Ctx::new(),
+            &[],
+            &lhs,
+            &rhs,
+            Some(&mut probe_counters),
+        );
+        assert_eq!(probe_result, off_result);
+        assert_eq!(probe_counters.logical_fuel, off_counters.logical_fuel);
+        assert_eq!(probe_counters.defeq_calls, off_counters.defeq_calls);
+        assert_eq!(probe_counters.defeq_memo_hits, 0);
+        assert!(probe_counters.memo_probe_repetitions > 0);
+    }
+
+    #[test]
+    fn work_counter_sink_observes_off_memo_and_probe_operations() {
+        let (lhs, rhs) = repeated_defeq_pair();
+
+        let off_sink = KernelWorkCounterSink::default();
+        let off = Env::with_execution_options_and_work_counter_sink(
+            KernelExecutionOptions::memo_off(),
+            off_sink.clone(),
+        );
+        assert!(off.is_defeq(&Ctx::new(), &[], &lhs, &rhs).unwrap());
+        let off_counters = off_sink.snapshot();
+        assert!(off_counters.defeq_calls > 0);
+        assert!(off_counters.logical_fuel > 0);
+        assert_eq!(off_counters.memo_entry_capacity, 0);
+
+        let memo_sink = KernelWorkCounterSink::default();
+        let memo = Env::with_execution_options_and_work_counter_sink(
+            KernelExecutionOptions::ephemeral_memo(),
+            memo_sink.clone(),
+        );
+        assert!(memo.is_defeq(&Ctx::new(), &[], &lhs, &rhs).unwrap());
+        let memo_counters = memo_sink.snapshot();
+        assert!(memo_counters.defeq_memo_hits > 0);
+        assert_eq!(memo_counters.logical_fuel, off_counters.logical_fuel);
+
+        let probe_sink = KernelWorkCounterSink::default();
+        let probe = Env::with_execution_options_and_work_counter_sink(
+            KernelExecutionOptions::repetition_probe(),
+            probe_sink.clone(),
+        );
+        assert!(probe.is_defeq(&Ctx::new(), &[], &lhs, &rhs).unwrap());
+        let probe_counters = probe_sink.snapshot();
+        assert_eq!(probe_counters.defeq_memo_hits, 0);
+        assert!(probe_counters.memo_probe_repetitions > 0);
+        assert_eq!(probe_counters.logical_fuel, off_counters.logical_fuel);
+    }
+
+    #[test]
+    fn diagnosed_declaration_restores_options_without_environment_clone() {
+        let sink = KernelWorkCounterSink::default();
+        let mut env = Env::with_execution_options_and_work_counter_sink(
+            KernelExecutionOptions::ephemeral_memo(),
+            sink.clone(),
+        );
+        let bad = Decl::Def {
+            name: "Diagnosed.bad".to_owned(),
+            universe_params: vec![],
+            ty: Expr::sort(Level::zero()),
+            value: Expr::bvar(0),
+            reducibility: Reducibility::Reducible,
+        };
+        assert!(env.add_decl_diagnosed(bad).is_err());
+        assert_eq!(
+            env.execution_options(),
+            KernelExecutionOptions::ephemeral_memo()
+        );
+        assert!(env.decl("Diagnosed.bad").is_none());
+
+        env.add_decl_diagnosed(Decl::Axiom {
+            name: "Diagnosed.good".to_owned(),
+            universe_params: vec![],
+            ty: Expr::sort(Level::zero()),
+        })
+        .unwrap();
+        assert_eq!(
+            env.execution_options(),
+            KernelExecutionOptions::ephemeral_memo()
+        );
+        assert!(env.decl("Diagnosed.good").is_some());
+        assert_eq!(sink.snapshot().memo_ineligible_diagnosed, 2);
+    }
+
+    #[test]
+    fn ordinary_and_shared_pool_check_families_match_memo_off() {
+        let term = Expr::lam("A", Expr::sort(Level::zero()), Expr::bvar(0));
+        let expected = Expr::pi("A", Expr::sort(Level::zero()), Expr::sort(Level::zero()));
+        let off = Env::new();
+        let memo = Env::with_execution_options(KernelExecutionOptions::ephemeral_memo());
+        assert_eq!(
+            memo.check(&Ctx::new(), &[], &term, &expected),
+            off.check(&Ctx::new(), &[], &term, &expected)
+        );
+        assert_eq!(
+            memo.infer(&Ctx::new(), &[], &term),
+            off.infer(&Ctx::new(), &[], &term)
+        );
+
+        let mut off_whnf = 1_000;
+        let mut off_conversion = 1_000;
+        let mut memo_whnf = 1_000;
+        let mut memo_conversion = 1_000;
+        let off_result = off.check_with_fuel_metered(
+            &Ctx::new(),
+            &[],
+            &term,
+            &expected,
+            &mut off_whnf,
+            &mut off_conversion,
+        );
+        let memo_result = memo.check_with_fuel_metered(
+            &Ctx::new(),
+            &[],
+            &term,
+            &expected,
+            &mut memo_whnf,
+            &mut memo_conversion,
+        );
+        assert_eq!(memo_result, off_result);
+        assert_eq!(memo_whnf, off_whnf);
+        assert_eq!(memo_conversion, off_conversion);
+    }
+
+    #[test]
+    fn compact_beta_delta_iota_zeta_and_binder_matrix_is_differential() {
+        let mut off = Env::with_builtins().unwrap();
+        let mut memo =
+            Env::with_builtins_and_execution_options(KernelExecutionOptions::ephemeral_memo())
+                .unwrap();
+        for env in [&mut off, &mut memo] {
+            env.add_def(
+                "Memo.zero",
+                vec![],
+                nat(),
+                nat_zero(),
+                Reducibility::Reducible,
+            )
+            .unwrap();
+        }
+
+        let beta = Expr::app(Expr::lam("x", nat(), Expr::bvar(0)), nat_zero());
+        let delta = Expr::konst("Memo.zero", vec![]);
+        let zeta = Expr::let_in("x", nat(), nat_zero(), Expr::bvar(0));
+        let motive = Expr::lam("_", nat(), nat());
+        let step = Expr::lam("_", nat(), Expr::lam("ih", nat(), Expr::bvar(0)));
+        let iota = Expr::apps(
+            Expr::konst("Nat.rec", vec![Level::zero()]),
+            vec![motive, nat_zero(), step, nat_zero()],
+        );
+        let binder = Expr::pi("x", nat(), Expr::bvar(0));
+        let expressions = [beta, delta, zeta, iota, binder];
+        for expression in &expressions {
+            for initial in 0..16 {
+                let mut off_fuel = initial;
+                let mut memo_fuel = initial;
+                let off_result =
+                    off.whnf_with_fuel_metered(&Ctx::new(), &[], expression, &mut off_fuel);
+                let memo_result =
+                    memo.whnf_with_fuel_metered(&Ctx::new(), &[], expression, &mut memo_fuel);
+                assert_eq!(memo_result, off_result, "fuel {initial}: {expression:?}");
+                assert_eq!(memo_fuel, off_fuel, "fuel {initial}: {expression:?}");
+            }
+        }
+
+        for expression in &expressions[..4] {
+            for initial in 0..24 {
+                let mut off_fuel = initial;
+                let mut memo_fuel = initial;
+                let off_result = off.is_defeq_with_fuel_metered(
+                    &Ctx::new(),
+                    &[],
+                    expression,
+                    &nat_zero(),
+                    &mut off_fuel,
+                );
+                let memo_result = memo.is_defeq_with_fuel_metered(
+                    &Ctx::new(),
+                    &[],
+                    expression,
+                    &nat_zero(),
+                    &mut memo_fuel,
+                );
+                assert_eq!(memo_result, off_result, "fuel {initial}: {expression:?}");
+                assert_eq!(memo_fuel, off_fuel, "fuel {initial}: {expression:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn recursor_major_whnf_uses_memo_and_repetition_probe() {
+        let major = Arc::new(Expr::app(Expr::lam("x", nat(), Expr::bvar(0)), nat_zero()));
+        let motive = Expr::lam("_", nat(), nat());
+        let step = Expr::lam("_", nat(), Expr::lam("ih", nat(), Expr::bvar(0)));
+        let recursor_prefix = Expr::apps(
+            Expr::konst("Nat.rec", vec![Level::zero()]),
+            vec![motive, nat_zero(), step],
+        );
+        let recursor = Expr::App(Arc::new(recursor_prefix), Arc::clone(&major));
+
+        let memo_env =
+            Env::with_builtins_and_execution_options(KernelExecutionOptions::ephemeral_memo())
+                .unwrap();
+        let mut memo_state = KernelOperationState::new(KernelExecutionOptions::ephemeral_memo());
+        for _ in 0..2 {
+            let mut fuel = 100;
+            let reduced = memo_env
+                .reduce_recursor_memo(
+                    &Ctx::new(),
+                    &[],
+                    &recursor,
+                    &mut fuel,
+                    ResourceLimitKind::Whnf,
+                    &mut memo_state,
+                )
+                .unwrap();
+            assert_eq!(reduced, Some(nat_zero()));
+        }
+        assert_eq!(memo_state.counters.whnf_memo_hits, 1);
+        assert!(memo_state.counters.memo_logical_fuel_replayed > 0);
+
+        let probe_env =
+            Env::with_builtins_and_execution_options(KernelExecutionOptions::repetition_probe())
+                .unwrap();
+        let mut probe_state = KernelOperationState::new(KernelExecutionOptions::repetition_probe());
+        for _ in 0..2 {
+            let mut fuel = 100;
+            probe_env
+                .reduce_recursor_memo(
+                    &Ctx::new(),
+                    &[],
+                    &recursor,
+                    &mut fuel,
+                    ResourceLimitKind::Whnf,
+                    &mut probe_state,
+                )
+                .unwrap();
+        }
+        assert_eq!(probe_state.counters.whnf_memo_hits, 0);
+        assert!(probe_state.counters.memo_probe_repetitions >= 1);
+
+        let left = Expr::App(
+            Arc::new(Expr::apps(
+                Expr::konst("Nat.rec", vec![Level::zero()]),
+                vec![
+                    Expr::lam("_", nat(), nat()),
+                    nat_zero(),
+                    Expr::lam("_", nat(), Expr::lam("ih", nat(), Expr::bvar(0))),
+                ],
+            )),
+            Arc::clone(&major),
+        );
+        let right = Expr::App(
+            Arc::new(Expr::apps(
+                Expr::konst("Nat.rec", vec![Level::zero()]),
+                vec![
+                    Expr::lam("_", nat(), nat()),
+                    nat_zero(),
+                    Expr::lam("_", nat(), Expr::lam("_", nat(), nat_zero())),
+                ],
+            )),
+            Arc::clone(&major),
+        );
+
+        let memo_sink = KernelWorkCounterSink::default();
+        let memo_env = Env::with_execution_options_and_work_counter_sink(
+            KernelExecutionOptions::ephemeral_memo(),
+            memo_sink.clone(),
+        );
+        let mut memo_env = memo_env;
+        memo_env.add_inductive(nat_inductive()).unwrap();
+        let memo_hits_before = memo_sink.snapshot().whnf_memo_hits;
+        assert!(memo_env.is_defeq(&Ctx::new(), &[], &left, &right).unwrap());
+        assert!(memo_sink.snapshot().whnf_memo_hits > memo_hits_before);
+
+        let probe_sink = KernelWorkCounterSink::default();
+        let probe_env = Env::with_execution_options_and_work_counter_sink(
+            KernelExecutionOptions::repetition_probe(),
+            probe_sink.clone(),
+        );
+        let mut probe_env = probe_env;
+        probe_env.add_inductive(nat_inductive()).unwrap();
+        let probe_repetitions_before = probe_sink.snapshot().memo_probe_repetitions;
+        assert!(probe_env.is_defeq(&Ctx::new(), &[], &left, &right).unwrap());
+        assert!(probe_sink.snapshot().memo_probe_repetitions > probe_repetitions_before);
+    }
+
+    #[test]
+    fn retained_identity_context_parameters_and_fuel_domain_are_exact() {
+        let env = Env::new();
+        let owner = beta_owner();
+        let mut state = KernelOperationState::new(KernelExecutionOptions::ephemeral_memo());
+        let mut context = Ctx::new();
+        context.push_assumption("shared", Expr::sort(Level::zero()));
+        let mut fuel = 100;
+        env.whnf_with_remaining_fuel_memo(
+            &context,
+            &[],
+            &owner,
+            MemoExprOrigin::Retained(&owner),
+            &mut fuel,
+            ResourceLimitKind::Whnf,
+            &mut state,
+        )
+        .unwrap();
+
+        let mut same_fuel = 100;
+        env.whnf_with_remaining_fuel_memo(
+            &context.clone(),
+            &[],
+            &owner,
+            MemoExprOrigin::Retained(&owner),
+            &mut same_fuel,
+            ResourceLimitKind::Whnf,
+            &mut state,
+        )
+        .unwrap();
+        assert_eq!(state.counters.whnf_memo_hits, 1);
+
+        let mut extended = context.clone();
+        extended.push_assumption("x", Expr::sort(Level::zero()));
+        let mut context_fuel = 100;
+        env.whnf_with_remaining_fuel_memo(
+            &extended,
+            &[],
+            &owner,
+            MemoExprOrigin::Retained(&owner),
+            &mut context_fuel,
+            ResourceLimitKind::Whnf,
+            &mut state,
+        )
+        .unwrap();
+        let mut independently_allocated = Ctx::new();
+        independently_allocated.push_assumption("shared", Expr::sort(Level::zero()));
+        let mut independent_context_fuel = 100;
+        env.whnf_with_remaining_fuel_memo(
+            &independently_allocated,
+            &[],
+            &owner,
+            MemoExprOrigin::Retained(&owner),
+            &mut independent_context_fuel,
+            ResourceLimitKind::Whnf,
+            &mut state,
+        )
+        .unwrap();
+        let mut parameter_fuel = 100;
+        env.whnf_with_remaining_fuel_memo(
+            &context,
+            &["u".to_owned()],
+            &owner,
+            MemoExprOrigin::Retained(&owner),
+            &mut parameter_fuel,
+            ResourceLimitKind::Whnf,
+            &mut state,
+        )
+        .unwrap();
+        for parameters in [
+            vec!["u".to_owned(), "v".to_owned()],
+            vec!["v".to_owned(), "u".to_owned()],
+        ] {
+            let mut ordered_profile_fuel = 100;
+            env.whnf_with_remaining_fuel_memo(
+                &context,
+                &parameters,
+                &owner,
+                MemoExprOrigin::Retained(&owner),
+                &mut ordered_profile_fuel,
+                ResourceLimitKind::Whnf,
+                &mut state,
+            )
+            .unwrap();
+        }
+        let mut conversion_fuel = 100;
+        env.whnf_with_remaining_fuel_memo(
+            &context,
+            &[],
+            &owner,
+            MemoExprOrigin::Retained(&owner),
+            &mut conversion_fuel,
+            ResourceLimitKind::Conversion,
+            &mut state,
+        )
+        .unwrap();
+        assert_eq!(state.counters.whnf_memo_hits, 1);
+        assert!(state.counters.whnf_memo_misses >= 4);
+    }
+
+    #[test]
+    fn definition_values_shadowing_and_shifted_locals_do_not_cross_reuse() {
+        let env = Env::new();
+        let owner = Arc::new(Expr::bvar(0));
+        let mut state = KernelOperationState::new(KernelExecutionOptions::ephemeral_memo());
+
+        let mut first = Ctx::new();
+        first.push_definition("x", Expr::sort(Level::zero()), Expr::konst("a", vec![]));
+        let mut fuel = 100;
+        assert_eq!(
+            env.whnf_with_remaining_fuel_memo(
+                &first,
+                &[],
+                &owner,
+                MemoExprOrigin::Retained(&owner),
+                &mut fuel,
+                ResourceLimitKind::Whnf,
+                &mut state,
+            )
+            .unwrap(),
+            Expr::konst("a", vec![]),
+        );
+
+        let mut cloned_fuel = 100;
+        env.whnf_with_remaining_fuel_memo(
+            &first.clone(),
+            &[],
+            &owner,
+            MemoExprOrigin::Retained(&owner),
+            &mut cloned_fuel,
+            ResourceLimitKind::Whnf,
+            &mut state,
+        )
+        .unwrap();
+        assert_eq!(state.counters.whnf_memo_hits, 1);
+
+        let mut distinct_value = Ctx::new();
+        distinct_value.push_definition("x", Expr::sort(Level::zero()), Expr::konst("b", vec![]));
+        let mut distinct_fuel = 100;
+        assert_eq!(
+            env.whnf_with_remaining_fuel_memo(
+                &distinct_value,
+                &[],
+                &owner,
+                MemoExprOrigin::Retained(&owner),
+                &mut distinct_fuel,
+                ResourceLimitKind::Whnf,
+                &mut state,
+            )
+            .unwrap(),
+            Expr::konst("b", vec![]),
+        );
+
+        let mut shadowed = first.clone();
+        shadowed.push_definition("x", Expr::sort(Level::zero()), Expr::konst("c", vec![]));
+        let mut shadowed_fuel = 100;
+        assert_eq!(
+            env.whnf_with_remaining_fuel_memo(
+                &shadowed,
+                &[],
+                &owner,
+                MemoExprOrigin::Retained(&owner),
+                &mut shadowed_fuel,
+                ResourceLimitKind::Whnf,
+                &mut state,
+            )
+            .unwrap(),
+            Expr::konst("c", vec![]),
+        );
+
+        let shifted_owner = Arc::new(Expr::bvar(1));
+        let mut shifted_fuel = 100;
+        let memo_result = env.whnf_with_remaining_fuel_memo(
+            &shadowed,
+            &[],
+            &shifted_owner,
+            MemoExprOrigin::Retained(&shifted_owner),
+            &mut shifted_fuel,
+            ResourceLimitKind::Whnf,
+            &mut state,
+        );
+        let mut oracle_fuel = 100;
+        let oracle_result = env.whnf_with_remaining_fuel(
+            &shadowed,
+            &[],
+            &shifted_owner,
+            &mut oracle_fuel,
+            ResourceLimitKind::Whnf,
+            &mut DisabledKernelWorkMeter,
+        );
+        assert_eq!(memo_result, oracle_result);
+        assert_eq!(shifted_fuel, oracle_fuel);
+        assert_eq!(state.counters.whnf_memo_hits, 1);
+    }
+
+    #[test]
+    fn whnf_hit_charges_less_equal_and_greater_fuel_exactly() {
+        let env = Env::new();
+        let owner = beta_owner();
+        let mut state = KernelOperationState::new(KernelExecutionOptions::ephemeral_memo());
+        let mut first_fuel = 100;
+        let expected = env
+            .whnf_with_remaining_fuel_memo(
+                &Ctx::new(),
+                &[],
+                &owner,
+                MemoExprOrigin::Retained(&owner),
+                &mut first_fuel,
+                ResourceLimitKind::Whnf,
+                &mut state,
+            )
+            .unwrap();
+        let cost = 100 - first_fuel;
+        assert!(cost > 0);
+
+        let mut less = cost - 1;
+        assert_eq!(
+            env.whnf_with_remaining_fuel_memo(
+                &Ctx::new(),
+                &[],
+                &owner,
+                MemoExprOrigin::Retained(&owner),
+                &mut less,
+                ResourceLimitKind::Whnf,
+                &mut state,
+            ),
+            Err(Error::ResourceLimit {
+                kind: ResourceLimitKind::Whnf
+            })
+        );
+        assert_eq!(less, 0);
+
+        let mut equal = cost;
+        assert_eq!(
+            env.whnf_with_remaining_fuel_memo(
+                &Ctx::new(),
+                &[],
+                &owner,
+                MemoExprOrigin::Retained(&owner),
+                &mut equal,
+                ResourceLimitKind::Whnf,
+                &mut state,
+            )
+            .unwrap(),
+            expected
+        );
+        assert_eq!(equal, 0);
+
+        let mut greater = cost + 7;
+        env.whnf_with_remaining_fuel_memo(
+            &Ctx::new(),
+            &[],
+            &owner,
+            MemoExprOrigin::Retained(&owner),
+            &mut greater,
+            ResourceLimitKind::Whnf,
+            &mut state,
+        )
+        .unwrap();
+        assert_eq!(greater, 7);
+    }
+
+    #[test]
+    fn defeq_hit_charges_less_equal_and_greater_fuel_exactly() {
+        let env = Env::new();
+        let owner = Arc::new(Expr::konst("a", vec![]));
+        let mut state = KernelOperationState::new(KernelExecutionOptions::ephemeral_memo());
+        let mut first_fuel = 100;
+        assert!(env
+            .is_defeq_with_remaining_fuel_memo(
+                &Ctx::new(),
+                &[],
+                &owner,
+                MemoExprOrigin::Retained(&owner),
+                &owner,
+                MemoExprOrigin::Retained(&owner),
+                &mut first_fuel,
+                &mut state,
+            )
+            .unwrap());
+        let cost = 100 - first_fuel;
+        assert_eq!(cost, 1);
+
+        let mut less = cost - 1;
+        assert_eq!(
+            env.is_defeq_with_remaining_fuel_memo(
+                &Ctx::new(),
+                &[],
+                &owner,
+                MemoExprOrigin::Retained(&owner),
+                &owner,
+                MemoExprOrigin::Retained(&owner),
+                &mut less,
+                &mut state,
+            ),
+            Err(Error::ResourceLimit {
+                kind: ResourceLimitKind::Conversion
+            })
+        );
+        assert_eq!(less, 0);
+
+        let mut equal = cost;
+        assert!(env
+            .is_defeq_with_remaining_fuel_memo(
+                &Ctx::new(),
+                &[],
+                &owner,
+                MemoExprOrigin::Retained(&owner),
+                &owner,
+                MemoExprOrigin::Retained(&owner),
+                &mut equal,
+                &mut state,
+            )
+            .unwrap());
+        assert_eq!(equal, 0);
+
+        let mut greater = cost + 7;
+        assert!(env
+            .is_defeq_with_remaining_fuel_memo(
+                &Ctx::new(),
+                &[],
+                &owner,
+                MemoExprOrigin::Retained(&owner),
+                &owner,
+                MemoExprOrigin::Retained(&owner),
+                &mut greater,
+                &mut state,
+            )
+            .unwrap());
+        assert_eq!(greater, 7);
+    }
+
+    #[test]
+    fn borrowed_and_independently_allocated_roots_do_not_alias() {
+        let env = Env::with_execution_options(KernelExecutionOptions::ephemeral_memo());
+        let mut borrowed_counters = KernelWorkCounters::default();
+        env.whnf_with_work_counters(
+            &Ctx::new(),
+            &[],
+            &Expr::konst("a", vec![]),
+            Some(&mut borrowed_counters),
+        )
+        .unwrap();
+        assert_eq!(borrowed_counters.whnf_memo_lookups, 0);
+        assert_eq!(borrowed_counters.memo_ineligible_borrowed, 1);
+
+        let mut fresh_state = KernelOperationState::new(KernelExecutionOptions::ephemeral_memo());
+        let fresh = Expr::konst("fresh", vec![]);
+        let mut fresh_fuel = 100;
+        env.whnf_with_remaining_fuel_memo(
+            &Ctx::new(),
+            &[],
+            &fresh,
+            MemoExprOrigin::Fresh,
+            &mut fresh_fuel,
+            ResourceLimitKind::Whnf,
+            &mut fresh_state,
+        )
+        .unwrap();
+        assert_eq!(fresh_state.counters.whnf_memo_lookups, 0);
+        assert_eq!(fresh_state.counters.memo_ineligible_fresh, 1);
+
+        let mut state = KernelOperationState::new(KernelExecutionOptions::ephemeral_memo());
+        let retained = beta_owner();
+        let retained_weak = Arc::downgrade(&retained);
+        let mut retained_fuel = 100;
+        env.whnf_with_remaining_fuel_memo(
+            &Ctx::new(),
+            &[],
+            &retained,
+            MemoExprOrigin::Retained(&retained),
+            &mut retained_fuel,
+            ResourceLimitKind::Whnf,
+            &mut state,
+        )
+        .unwrap();
+        drop(retained);
+        assert!(retained_weak.upgrade().is_some());
+
+        let misses_before_independent = state.counters.whnf_memo_misses;
+        for owner in [beta_owner(), beta_owner()] {
+            let mut fuel = 100;
+            env.whnf_with_remaining_fuel_memo(
+                &Ctx::new(),
+                &[],
+                &owner,
+                MemoExprOrigin::Retained(&owner),
+                &mut fuel,
+                ResourceLimitKind::Whnf,
+                &mut state,
+            )
+            .unwrap();
+        }
+        assert_eq!(state.counters.whnf_memo_hits, 0);
+        assert!(state.counters.whnf_memo_misses >= misses_before_independent.saturating_add(2));
+        assert!(state.counters.memo_expr_identities >= 2);
+    }
+
+    #[test]
+    fn capacity_stop_and_diagnosed_isolation_are_observational() {
+        let env = Env::new();
+        let mut state = KernelOperationState::with_limits(
+            KernelExecutionOptions::ephemeral_memo(),
+            KernelMemoLimits::tiny(),
+        );
+        for owner in [beta_owner(), Arc::new(Expr::konst("b", vec![]))] {
+            let mut memo_fuel = 100;
+            let memo_result = env.whnf_with_remaining_fuel_memo(
+                &Ctx::new(),
+                &[],
+                &owner,
+                MemoExprOrigin::Retained(&owner),
+                &mut memo_fuel,
+                ResourceLimitKind::Whnf,
+                &mut state,
+            );
+            let mut oracle_fuel = 100;
+            let oracle_result = env.whnf_with_remaining_fuel(
+                &Ctx::new(),
+                &[],
+                &owner,
+                &mut oracle_fuel,
+                ResourceLimitKind::Whnf,
+                &mut DisabledKernelWorkMeter,
+            );
+            assert_eq!(memo_result, oracle_result);
+            assert_eq!(memo_fuel, oracle_fuel);
+        }
+        assert!(state.counters.whnf_memo_capacity_stops > 0);
+
+        let mut probe_state = KernelOperationState::with_limits(
+            KernelExecutionOptions::repetition_probe(),
+            KernelMemoLimits::tiny(),
+        );
+        for owner in [beta_owner(), beta_owner(), beta_owner()] {
+            let mut probe_fuel = 100;
+            let probe_result = env.whnf_with_remaining_fuel_memo(
+                &Ctx::new(),
+                &[],
+                &owner,
+                MemoExprOrigin::Retained(&owner),
+                &mut probe_fuel,
+                ResourceLimitKind::Whnf,
+                &mut probe_state,
+            );
+            let mut oracle_fuel = 100;
+            let oracle_result = env.whnf_with_remaining_fuel(
+                &Ctx::new(),
+                &[],
+                &owner,
+                &mut oracle_fuel,
+                ResourceLimitKind::Whnf,
+                &mut DisabledKernelWorkMeter,
+            );
+            assert_eq!(probe_result, oracle_result);
+            assert_eq!(probe_fuel, oracle_fuel);
+        }
+        assert!(probe_state.counters.memo_probe_truncated);
+        assert!(probe_state.counters.memo_probe_capacity_stops > 0);
+        assert_eq!(probe_state.counters.whnf_memo_hits, 0);
+
+        let diagnosed = Env::with_execution_options(KernelExecutionOptions::ephemeral_memo());
+        let (lhs, rhs) = repeated_defeq_pair();
+        let mut counters = KernelWorkCounters::default();
+        let memo_error = diagnosed
+            .is_defeq_diagnosed_with_fuel_and_work_counters(
+                &Ctx::new(),
+                &[],
+                &lhs,
+                &rhs,
+                0,
+                Some(&mut counters),
+            )
+            .unwrap_err();
+        let off_error = env
+            .is_defeq_diagnosed_with_fuel(&Ctx::new(), &[], &lhs, &rhs, 0)
+            .unwrap_err();
+        assert_eq!(memo_error, off_error);
+        assert_eq!(counters.memo_ineligible_diagnosed, 1);
+        assert_eq!(counters.whnf_memo_lookups, 0);
+        assert_eq!(counters.defeq_memo_lookups, 0);
+
+        let term = Expr::lam("A", Expr::sort(Level::zero()), Expr::bvar(0));
+        let expected = Expr::sort(Level::zero());
+        assert_eq!(
+            diagnosed.check_diagnosed(&Ctx::new(), &[], &term, &expected),
+            env.check_diagnosed(&Ctx::new(), &[], &term, &expected),
+        );
+    }
 }

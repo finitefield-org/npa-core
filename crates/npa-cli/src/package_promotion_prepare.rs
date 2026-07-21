@@ -5,12 +5,12 @@ use std::{collections::BTreeSet, fs};
 use npa_api::PackageArtifactReferenceSummaryMode;
 use npa_cert::{ExportKind, Name};
 use npa_package::{
-    lookup_promotion_origin, package_file_hash, parse_l2_acceptance_policy_json,
-    parse_l2_acceptance_v2_json, parse_l2_namespace_transport_policy_json,
-    parse_l2_namespace_transport_request_json, MathlibPromotionPlan, PackageArtifactOrigin,
-    PackageHash, PackagePath, PackageVersion, PromotionGovernance, PromotionOriginLookup,
-    PromotionPackageSnapshot, PromotionPlanDependencyMapping, PromotionPlanEndpoint,
-    PromotionPlanExport, PromotionPlanSelectedModule, PromotionPlanTheorem, PromotionSourceModule,
+    package_file_hash, parse_l2_acceptance_policy_json, parse_l2_acceptance_v2_json,
+    parse_l2_namespace_transport_policy_json, parse_l2_namespace_transport_request_json,
+    MathlibPromotionPlan, PackageArtifactOrigin, PackageHash, PackagePath, PackageVersion,
+    PromotionGovernance, PromotionOriginLookup, PromotionPackageSnapshot,
+    PromotionPlanDependencyMapping, PromotionPlanEndpoint, PromotionPlanExport,
+    PromotionPlanSelectedModule, PromotionPlanTheorem, PromotionSourceModule,
     PromotionSourceOrigin, PromotionTargetSnapshot, MATHLIB_PROMOTION_PLAN_SCHEMA,
     MATHLIB_PROMOTION_REGISTRY_PATH,
 };
@@ -24,18 +24,52 @@ use crate::{
     },
     package::load_package_root,
     package_artifacts::{
-        load_package_audit_snapshot, LoadedPackageAuditSnapshot, PackageGeneratedArtifactReadMode,
-        PACKAGE_THEOREM_INDEX_PATH,
+        load_package_audit_snapshot, LoadedPackageAuditSnapshot, PACKAGE_THEOREM_INDEX_PATH,
     },
     package_l2_acceptance_aggregate::validate_l2_acceptance_v2_current,
-    package_promotion_registry::{load_registry_with_source, validate_checked_generated},
+    package_promotion_prepare_declaration::run_package_prepare_declaration_promotion,
+    package_promotion_registry::{
+        load_registry_versioned_with_source, lookup_promotion_origin_versioned,
+        promotion_plan_generated_read_mode, validate_checked_generated,
+    },
 };
 
 const COMMAND: &str = "package prepare-promotion";
 
 /// Validate current promotion inputs and create or check one canonical plan.
 pub fn run_package_prepare_promotion(options: PackagePreparePromotionOptions) -> CommandResult {
+    if options.declaration_request.is_some() {
+        return run_package_prepare_declaration_promotion(options);
+    }
+    run_package_prepare_module_promotion(options)
+}
+
+fn run_package_prepare_module_promotion(options: PackagePreparePromotionOptions) -> CommandResult {
     let root_display = render_package_root(&options.common.root);
+    let Some(acceptance_policy_path) = options.acceptance_policy.as_ref() else {
+        return failure(
+            &root_display,
+            "promotion_plan_policy_stale",
+            "--acceptance-policy",
+        );
+    };
+    let Some(source_acceptance_path) = options.source_acceptance.as_ref() else {
+        return failure(
+            &root_display,
+            "promotion_plan_source_acceptance_failed",
+            "--source-acceptance",
+        );
+    };
+    let Some(transport_policy_path) = options.transport_policy.as_ref() else {
+        return failure(
+            &root_display,
+            "promotion_plan_policy_stale",
+            "--transport-policy",
+        );
+    };
+    let Some(mapping_request_path) = options.mapping.as_ref() else {
+        return failure(&root_display, "promotion_plan_mapping_stale", "--mapping");
+    };
     let source_root = match load_package_root(&options.common.root, COMMAND) {
         Ok(root) => root,
         Err(result) => return result,
@@ -43,7 +77,7 @@ pub fn run_package_prepare_promotion(options: PackagePreparePromotionOptions) ->
     let source = match load_package_audit_snapshot(
         &options.common.root,
         COMMAND,
-        PackageGeneratedArtifactReadMode::all(),
+        promotion_plan_generated_read_mode(),
         PackageArtifactReferenceSummaryMode::Include,
     ) {
         Ok(snapshot) => snapshot,
@@ -52,7 +86,7 @@ pub fn run_package_prepare_promotion(options: PackagePreparePromotionOptions) ->
     let target = match load_package_audit_snapshot(
         &options.target_baseline_root,
         COMMAND,
-        PackageGeneratedArtifactReadMode::all(),
+        promotion_plan_generated_read_mode(),
         PackageArtifactReferenceSummaryMode::Include,
     ) {
         Ok(snapshot) => snapshot,
@@ -65,7 +99,7 @@ pub fn run_package_prepare_promotion(options: PackagePreparePromotionOptions) ->
     }
 
     let policy_source =
-        match read_workspace_file(&options.acceptance_policy, "promotion_plan_policy_stale") {
+        match read_workspace_file(acceptance_policy_path, "promotion_plan_policy_stale") {
             Ok(source) => source,
             Err(diagnostic) => {
                 return CommandResult::failed(COMMAND, root_display, vec![*diagnostic])
@@ -81,7 +115,7 @@ pub fn run_package_prepare_promotion(options: PackagePreparePromotionOptions) ->
             )
         }
     };
-    let acceptance_path = PackagePath::new(options.source_acceptance.to_string_lossy());
+    let acceptance_path = PackagePath::new(source_acceptance_path.to_string_lossy());
     let acceptance_source = match read_source_file(
         &options.common.root,
         &acceptance_path,
@@ -111,7 +145,7 @@ pub fn run_package_prepare_promotion(options: PackagePreparePromotionOptions) ->
     }
 
     let transport_policy_source =
-        match read_workspace_file(&options.transport_policy, "promotion_plan_policy_stale") {
+        match read_workspace_file(transport_policy_path, "promotion_plan_policy_stale") {
             Ok(source) => source,
             Err(diagnostic) => {
                 return CommandResult::failed(COMMAND, root_display, vec![*diagnostic])
@@ -128,7 +162,7 @@ pub fn run_package_prepare_promotion(options: PackagePreparePromotionOptions) ->
             )
         }
     };
-    let mapping_path = PackagePath::new(options.mapping.to_string_lossy());
+    let mapping_path = PackagePath::new(mapping_request_path.to_string_lossy());
     let mapping_source = match read_source_file(
         &options.common.root,
         &mapping_path,
@@ -148,7 +182,7 @@ pub fn run_package_prepare_promotion(options: PackagePreparePromotionOptions) ->
         }
     };
     let (registry, registry_source) =
-        match load_registry_with_source(&options.target_baseline_root, COMMAND) {
+        match load_registry_versioned_with_source(&options.target_baseline_root, COMMAND) {
             Ok(registry) => registry,
             Err(diagnostic) => {
                 return CommandResult::failed(COMMAND, root_display, vec![*diagnostic])
@@ -233,7 +267,8 @@ pub fn run_package_prepare_promotion(options: PackagePreparePromotionOptions) ->
         .iter()
         .map(|module| module.target_module.clone())
         .collect::<Vec<_>>();
-    let duplicate = lookup_promotion_origin(&registry, &canonical_origin, &target_names, &[]);
+    let duplicate =
+        lookup_promotion_origin_versioned(&registry, &canonical_origin, &target_names, &[]);
     if duplicate != PromotionOriginLookup::NoRegistryMatch {
         let reason = match duplicate {
             PromotionOriginLookup::ExactOriginAlreadyPromoted => {
@@ -258,7 +293,7 @@ pub fn run_package_prepare_promotion(options: PackagePreparePromotionOptions) ->
         let equivalent = match load_package_audit_snapshot(
             equivalent_root,
             COMMAND,
-            PackageGeneratedArtifactReadMode::all(),
+            promotion_plan_generated_read_mode(),
             PackageArtifactReferenceSummaryMode::Include,
         ) {
             Ok(snapshot) => snapshot,

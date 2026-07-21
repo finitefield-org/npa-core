@@ -13,6 +13,7 @@ mod equation;
 mod human;
 mod human_diagnostic;
 mod human_elaborator;
+mod human_extraction;
 mod human_parser;
 mod human_resolver;
 mod lexer;
@@ -138,15 +139,23 @@ pub use human_elaborator::{
     HumanTacticTermCheckOutput, HumanTacticTermElabContext, HumanTacticTermElabContextRequest,
     HumanTacticTermInferOutput,
 };
+pub use human_extraction::{
+    collect_human_source_declaration_families, extract_human_declaration_source,
+    ExtractedHumanModule, HumanDeclarationFamilyMember, HumanDeclarationFamilyMemberKind,
+    HumanDeclarationSelection, HumanGlobalIdentity, HumanGlobalMapping, HumanGlobalMappingRow,
+    HumanResolvedRewrite, HumanRewriteResolution, HumanSelectedDeclaration,
+    HumanSourceDeclarationFamilies, HumanSourceDeclarationFamily,
+};
 pub use human_parser::{
     parse_human_import_spans, parse_human_module, parse_human_module_with_source_interfaces,
     parse_human_name_spans, parse_human_term, HumanImportSpan, HumanNameSpan,
 };
 pub use human_resolver::{
-    resolve_human_module, resolve_human_module_with_source_interfaces,
-    HumanEquationSemanticIdentity, HumanGlobalRef, HumanGlobalScope, HumanGlobalScopeEntry,
-    HumanResolvedEquationItem, HumanResolvedEquationRow, HumanResolvedMeasureDecreaseProof,
-    HumanResolvedName, HumanResolvedNameUse, HumanResolvedNotationEntry, HumanResolvedNotationUse,
+    bind_human_source_interface_to_verified_import, resolve_human_module,
+    resolve_human_module_with_source_interfaces, HumanEquationSemanticIdentity, HumanGlobalRef,
+    HumanGlobalScope, HumanGlobalScopeEntry, HumanResolvedEquationItem, HumanResolvedEquationRow,
+    HumanResolvedMeasureDecreaseProof, HumanResolvedName, HumanResolvedNameUse,
+    HumanResolvedNotationEntry, HumanResolvedNotationUse, HumanResolvedOpenDirective,
     HumanResolvedPattern, HumanResolvedTerminationAnnotation, ResolvedHumanModule,
 };
 pub use lexer::{lex, Token, TokenKind};

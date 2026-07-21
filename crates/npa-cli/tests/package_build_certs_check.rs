@@ -366,6 +366,41 @@ fn package_build_certs_selection_changed_covers_unstaged_and_staged_source() {
 }
 
 #[test]
+fn package_build_certs_selection_changed_refresh_plans_export_stable_rebind() {
+    let package = build_synthetic_local_import_fixture("changed-refresh-rebind");
+    init_git_package(&package, true);
+    fs::write(
+        package.artifact_path("Fixture/A/source.npa"),
+        "theorem a_id :\n  forall (P : Prop), forall (p : P), P :=\n  fun P => fun p => (fun (q : P) => q) p\n",
+    )
+    .unwrap();
+    let before = package_snapshot(&package);
+
+    let result = run_package_build_certs(
+        refresh_artifacts_check(common_options(package.path(), true)).with_changed(),
+    );
+
+    assert_eq!(result.exit_code(), CommandExitCode::PackageFailure);
+    assert_eq!(result.diagnostics.len(), 3);
+    assert!(result.diagnostics[0]
+        .actual_value
+        .as_deref()
+        .unwrap()
+        .contains("mode=changed,seeds=1,rebuild=2"));
+    assert_eq!(
+        result.diagnostics[1].reason_code,
+        "package_build_refresh_plan"
+    );
+    assert!(result.diagnostics[1]
+        .actual_value
+        .as_deref()
+        .unwrap()
+        .contains("source_rebuild=1,certificate_rebind=1,unchanged=0"));
+    assert_eq!(result.diagnostics[2].reason_code, "manifest_hashes_stale");
+    assert_eq!(package_snapshot(&package), before);
+}
+
+#[test]
 fn package_build_certs_selection_changed_without_head_selects_all_local_modules() {
     let package = build_synthetic_local_import_fixture("changed-no-head");
     init_git_package(&package, false);
