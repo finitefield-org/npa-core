@@ -222,7 +222,7 @@ fn write_legacy_registry(root: &Path) -> Vec<u8> {
 }
 
 #[test]
-fn reconciliation_dry_run_apply_validate_and_repeat_are_consistent() {
+fn reconciliation_dry_run_apply_validate_and_repeat_are_consistent_for_revision() {
     let temporary = TempRoot(std::env::temp_dir().join(format!(
         "npa-registry-reconciliation-{}-{}",
         std::process::id(),
@@ -235,19 +235,18 @@ fn reconciliation_dry_run_apply_validate_and_repeat_are_consistent() {
     let current = temporary.0.join("current");
     copy_tree(&fixture, &previous);
     copy_tree(&fixture, &current);
-    let manifest = fs::read_to_string(current.join("npa-package.toml"))
-        .unwrap()
-        .replace("version = \"0.1.0\"", "version = \"0.1.1\"");
-    fs::write(current.join("npa-package.toml"), manifest).unwrap();
+    let binary = Path::new(env!("CARGO_BIN_EXE_npa"));
+    prepare_module_package(binary, &previous, "0.1.0", &["Mathlib.Legacy"]);
+    prepare_module_package(binary, &current, "0.1.1", &["Mathlib.Legacy"]);
+    let registry = write_legacy_registry(&previous);
+    fs::write(previous.join("promotion-origins.json"), &registry).unwrap();
+    fs::write(current.join("promotion-origins.json"), &registry).unwrap();
     fs::create_dir_all(current.join("docs/promotion")).unwrap();
     fs::write(
         current.join("docs/promotion/audit.md"),
         "catalog reconciliation audit\n",
     )
     .unwrap();
-
-    let binary = Path::new(env!("CARGO_BIN_EXE_npa"));
-    generate_projections(binary, &current);
     let common = [
         OsStr::new("package"),
         OsStr::new("reconcile-promotion-origin-registry"),
@@ -391,6 +390,79 @@ fn reconciliation_dry_run_apply_validate_and_repeat_are_consistent() {
         .replace("version = \"0.1.1\"", "version = \"0.1.2\"");
     fs::write(current.join("npa-package.toml"), stale_manifest).unwrap();
     assert!(!run(binary, &apply).status.success());
+}
+
+#[test]
+fn reconciliation_version_only_is_noop_without_registry_or_attestation_writes() {
+    let temporary = TempRoot(std::env::temp_dir().join(format!(
+        "npa-registry-version-only-{}-{}",
+        std::process::id(),
+        NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
+    )));
+    fs::create_dir(&temporary.0).unwrap();
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let fixture = repository.join("testdata/package/npa-mathlib-declaration-baseline");
+    let previous = temporary.0.join("previous");
+    let current = temporary.0.join("current");
+    copy_tree(&fixture, &previous);
+    copy_tree(&fixture, &current);
+    let manifest = fs::read_to_string(current.join("npa-package.toml"))
+        .unwrap()
+        .replace("version = \"0.1.0\"", "version = \"0.1.1\"");
+    fs::write(current.join("npa-package.toml"), manifest).unwrap();
+    fs::create_dir_all(current.join("docs/promotion")).unwrap();
+    fs::write(
+        current.join("docs/promotion/audit.md"),
+        "version-only snapshot audit\n",
+    )
+    .unwrap();
+
+    let binary = Path::new(env!("CARGO_BIN_EXE_npa"));
+    generate_projections(binary, &current);
+    let original_registry = fs::read(current.join("promotion-origins.json")).unwrap();
+    let common = [
+        OsStr::new("package"),
+        OsStr::new("reconcile-promotion-origin-registry"),
+        OsStr::new("--root"),
+        current.as_os_str(),
+        OsStr::new("--previous-target-root"),
+        previous.as_os_str(),
+        OsStr::new("--audit"),
+        OsStr::new("docs/promotion/audit.md"),
+        OsStr::new("--out"),
+        OsStr::new("docs/promotion/sync.json"),
+        OsStr::new("--json"),
+    ];
+
+    let mut dry_run = common.to_vec();
+    dry_run.push(OsStr::new("--dry-run"));
+    let dry_run_output = assert_passed(run(binary, &dry_run));
+    assert!(dry_run_output.contains("\"reason_code\":\"promotion_registry_no_catalog_change\""));
+    assert!(!current.join("docs/promotion/sync.json").exists());
+    assert_eq!(
+        fs::read(current.join("promotion-origins.json")).unwrap(),
+        original_registry
+    );
+
+    let mut apply = common.to_vec();
+    apply.push(OsStr::new("--apply"));
+    let apply_output = assert_passed(run(binary, &apply));
+    assert!(apply_output.contains("\"reason_code\":\"promotion_registry_no_catalog_change\""));
+    assert!(!current.join("docs/promotion/sync.json").exists());
+    assert_eq!(
+        fs::read(current.join("promotion-origins.json")).unwrap(),
+        original_registry
+    );
+    assert_passed(run(
+        binary,
+        &[
+            OsStr::new("package"),
+            OsStr::new("validate-promotion-origin-registry"),
+            OsStr::new("--root"),
+            current.as_os_str(),
+            OsStr::new("--json"),
+        ],
+    ));
 }
 
 #[test]

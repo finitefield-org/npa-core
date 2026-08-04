@@ -699,6 +699,34 @@ pub fn run_package_reconcile_promotion_origin_registry(
         }
     };
     lifecycle_changes.sort();
+    if revised_routes.is_empty()
+        && added_targets.is_empty()
+        && lifecycle_changes.is_empty()
+        && request.is_none()
+    {
+        if let Err(diagnostic) =
+            validate_registry_v3_target(&options.common.root, &current, &proposed)
+        {
+            return CommandResult::failed(COMMAND, root_display, vec![*diagnostic]);
+        }
+        let mut result = CommandResult::passed(COMMAND, root_display);
+        result.diagnostics.push(
+            CommandDiagnostic::info(
+                DiagnosticKind::PackagePolicy,
+                "promotion_registry_no_catalog_change",
+            )
+            .with_actual_value(format!(
+                "previous_version={};target_version={};registry_unchanged=true",
+                previous_manifest.version.as_str(),
+                current_manifest.version.as_str()
+            )),
+        );
+        result.artifacts.push(CommandArtifact {
+            kind: "promotion_origin_registry_v3".to_owned(),
+            path: MATHLIB_PROMOTION_REGISTRY_PATH.to_owned(),
+        });
+        return result;
+    }
     proposed.generation = match proposed.generation.checked_add(1) {
         Some(value) => value,
         None => {

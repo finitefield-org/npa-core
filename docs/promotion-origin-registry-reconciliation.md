@@ -204,6 +204,15 @@ binds the unchanged module's continued presence in its target projection.
 Package-version advancement alone is never an identity mismatch and never
 forces duplicate revisions.
 
+When the previous and current projections differ only by package version and
+every module identity is unchanged, reconciliation is a successful no-op. It
+must preserve `promotion-origins.json` and its generation, must not append a
+catalog-change event or create the attestation output, and must report that
+the registry is unchanged after running the normal current/previous target
+gates. Publication records the new package version in its release audit and
+ledger; it does not manufacture a registry event for the version-only
+snapshot.
+
 When intermediate releases are skipped, one event proves only the two supplied
 endpoints. It must not infer or claim which intermediate release introduced a
 module or identity.
@@ -541,8 +550,8 @@ The v1/v2-to-v3 validator requires:
 - old entries and reservations preserved exactly;
 - at most one revised-route event row per old active target module;
 - new catalog-target entries only for modules absent from the previous target;
-- exactly one change event describing every appended revision, target owner,
-  and lifecycle transition; and
+- when at least one revision, target owner, or lifecycle transition is
+  present, exactly one change event describing all of them; and
 - no other change.
 
 Normal v3 transitions preserve all prior events byte-for-byte, increment the
@@ -781,7 +790,8 @@ No implementation may add a general “ignore registry mismatch” flag.
 
 Create compact fixtures for:
 
-- all modules unchanged;
+- all modules unchanged, including a package-version-only no-op that leaves the
+  registry and attestation output untouched;
 - one revised legacy route;
 - one new catalog target;
 - revised plus new catalog targets;
