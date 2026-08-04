@@ -27,6 +27,7 @@ pub(crate) fn verify_module_cert_impl(
 
 pub(crate) fn verify_module_cert_hashes_impl(bytes: &[u8]) -> Result<ModuleCert> {
     let cert = decode_module_cert(bytes)?;
+    structural_preflight(&cert)?;
     verify_canonical_encoding(&cert, bytes)?;
     verify_pre_import_checks(&cert)?;
     Ok(cert)
@@ -141,9 +142,14 @@ pub(crate) fn verify_built_module_cert_with_import_refs_and_options_impl(
     policy: &AxiomPolicy,
     kernel_options: KernelExecutionOptions,
 ) -> Result<VerifiedModule> {
-    verify_decoded_module_cert_after_encoding_check(cert, policy, kernel_options, |cert| {
-        resolve_import_refs(cert, imports, policy)
-    })
+    let structural_cost = structural_preflight(cert)?;
+    verify_decoded_module_cert_after_encoding_check(
+        cert,
+        structural_cost,
+        policy,
+        kernel_options,
+        |cert| resolve_import_refs(cert, imports, policy),
+    )
 }
 
 fn verify_decoded_module_cert_with_import_resolver<'a>(
@@ -153,8 +159,16 @@ fn verify_decoded_module_cert_with_import_resolver<'a>(
     kernel_options: KernelExecutionOptions,
     resolve_imports: impl FnOnce(&ModuleCert) -> Result<Vec<&'a VerifiedModule>>,
 ) -> Result<VerifiedModule> {
+    ensure_certificate_byte_limit(bytes)?;
+    let structural_cost = structural_preflight(cert)?;
     verify_canonical_encoding(cert, bytes)?;
-    verify_decoded_module_cert_after_encoding_check(cert, policy, kernel_options, resolve_imports)
+    verify_decoded_module_cert_after_encoding_check(
+        cert,
+        structural_cost,
+        policy,
+        kernel_options,
+        resolve_imports,
+    )
 }
 
 fn verify_owned_module_cert_with_import_resolver<'a>(
@@ -164,9 +178,17 @@ fn verify_owned_module_cert_with_import_resolver<'a>(
     kernel_options: KernelExecutionOptions,
     resolve_imports: impl FnOnce(&ModuleCert) -> Result<Vec<&'a VerifiedModule>>,
 ) -> Result<VerifiedModule> {
+    ensure_certificate_byte_limit(bytes)?;
+    let structural_cost = structural_preflight(&cert)?;
     verify_canonical_encoding(&cert, bytes)?;
-    verify_decoded_module_cert_checks(&cert, policy, kernel_options, resolve_imports)?;
-    Ok(verified_module_from_owned_cert(cert))
+    let structural_closure = verify_decoded_module_cert_checks(
+        &cert,
+        structural_cost,
+        policy,
+        kernel_options,
+        resolve_imports,
+    )?;
+    Ok(verified_module_from_owned_cert(cert, structural_closure))
 }
 
 fn verify_owned_module_cert_with_import_resolver_and_work_counter_sink<'a>(
@@ -177,15 +199,18 @@ fn verify_owned_module_cert_with_import_resolver_and_work_counter_sink<'a>(
     work_counter_sink: KernelWorkCounterSink,
     resolve_imports: impl FnOnce(&ModuleCert) -> Result<Vec<&'a VerifiedModule>>,
 ) -> Result<VerifiedModule> {
+    ensure_certificate_byte_limit(bytes)?;
+    let structural_cost = structural_preflight(&cert)?;
     verify_canonical_encoding(&cert, bytes)?;
-    verify_decoded_module_cert_checks_inner(
+    let structural_closure = verify_decoded_module_cert_checks_inner(
         &cert,
+        structural_cost,
         policy,
         kernel_options,
         Some(work_counter_sink),
         resolve_imports,
     )?;
-    Ok(verified_module_from_owned_cert(cert))
+    Ok(verified_module_from_owned_cert(cert, structural_closure))
 }
 
 fn verify_canonical_encoding(cert: &ModuleCert, bytes: &[u8]) -> Result<()> {
@@ -200,36 +225,53 @@ fn verify_canonical_encoding(cert: &ModuleCert, bytes: &[u8]) -> Result<()> {
 
 fn verify_decoded_module_cert_after_encoding_check<'a>(
     cert: &ModuleCert,
+    structural_cost: StructuralCost,
     policy: &AxiomPolicy,
     kernel_options: KernelExecutionOptions,
     resolve_imports: impl FnOnce(&ModuleCert) -> Result<Vec<&'a VerifiedModule>>,
 ) -> Result<VerifiedModule> {
-    verify_decoded_module_cert_checks(cert, policy, kernel_options, resolve_imports)?;
-    Ok(verified_module_from_cert(cert))
+    let structural_closure = verify_decoded_module_cert_checks(
+        cert,
+        structural_cost,
+        policy,
+        kernel_options,
+        resolve_imports,
+    )?;
+    Ok(verified_module_from_cert(cert, structural_closure))
 }
 
 fn verify_decoded_module_cert_checks<'a>(
     cert: &ModuleCert,
+    structural_cost: StructuralCost,
     policy: &AxiomPolicy,
     kernel_options: KernelExecutionOptions,
     resolve_imports: impl FnOnce(&ModuleCert) -> Result<Vec<&'a VerifiedModule>>,
-) -> Result<()> {
-    verify_decoded_module_cert_checks_inner(cert, policy, kernel_options, None, resolve_imports)
+) -> Result<StructuralClosureSummary> {
+    verify_decoded_module_cert_checks_inner(
+        cert,
+        structural_cost,
+        policy,
+        kernel_options,
+        None,
+        resolve_imports,
+    )
 }
 
 fn verify_decoded_module_cert_checks_inner<'a>(
     cert: &ModuleCert,
+    structural_cost: StructuralCost,
     policy: &AxiomPolicy,
     kernel_options: KernelExecutionOptions,
     work_counter_sink: Option<KernelWorkCounterSink>,
     resolve_imports: impl FnOnce(&ModuleCert) -> Result<Vec<&'a VerifiedModule>>,
-) -> Result<()> {
+) -> Result<StructuralClosureSummary> {
     verify_hash_and_table_checks(cert)?;
     enforce_core_feature_policy(&cert.axiom_report, policy)?;
     verify_declaration_order(cert)?;
     verify_inductive_generated_artifacts(cert)?;
 
     let imports = resolve_imports(cert)?;
+    let structural_closure = build_closure_summary(cert, structural_cost, &imports)?;
     verify_dependencies_and_axioms(cert, &imports)?;
     enforce_axiom_policy(cert, policy)?;
     enforce_import_axiom_policy(&imports, policy)?;
@@ -247,7 +289,7 @@ fn verify_decoded_module_cert_checks_inner<'a>(
     }
     drop(env);
 
-    Ok(())
+    Ok(structural_closure)
 }
 
 fn verify_pre_import_checks(cert: &ModuleCert) -> Result<()> {
@@ -264,7 +306,10 @@ fn verify_hash_and_table_checks(cert: &ModuleCert) -> Result<()> {
     Ok(())
 }
 
-fn verified_module_from_cert(cert: &ModuleCert) -> VerifiedModule {
+fn verified_module_from_cert(
+    cert: &ModuleCert,
+    structural_closure: StructuralClosureSummary,
+) -> VerifiedModule {
     VerifiedModule {
         module: cert.header.module.clone(),
         imports: cert.imports.clone(),
@@ -276,10 +321,14 @@ fn verified_module_from_cert(cert: &ModuleCert) -> VerifiedModule {
         certificate_hash: cert.hashes.certificate_hash,
         export_block: cert.export_block.clone(),
         axiom_report: cert.axiom_report.clone(),
+        structural_closure,
     }
 }
 
-fn verified_module_from_owned_cert(cert: ModuleCert) -> VerifiedModule {
+fn verified_module_from_owned_cert(
+    cert: ModuleCert,
+    structural_closure: StructuralClosureSummary,
+) -> VerifiedModule {
     let ModuleCert {
         header,
         imports,
@@ -302,6 +351,7 @@ fn verified_module_from_owned_cert(cert: ModuleCert) -> VerifiedModule {
         certificate_hash: hashes.certificate_hash,
         export_block,
         axiom_report,
+        structural_closure,
     }
 }
 fn verify_header(header: &CertHeader) -> Result<()> {
@@ -342,11 +392,11 @@ fn verify_tables(cert: &ModuleCert) -> Result<()> {
                 object: "LevelTable",
             });
         }
-        if !level_node_is_normalized(cert, index)? {
-            return Err(CertError::NonCanonicalEncoding {
-                object: "LevelTable",
-            });
-        }
+    }
+    if !level_table_is_normalized(cert)? {
+        return Err(CertError::NonCanonicalEncoding {
+            object: "LevelTable",
+        });
     }
     let level_hashes = compute_level_hashes(&cert.level_table, &cert.name_table)?;
     let level_heights = level_node_heights(&cert.level_table)?;
@@ -677,14 +727,21 @@ fn collect_level_names_from_level_id(
     level: LevelId,
     names: &mut BTreeSet<Name>,
 ) -> Result<()> {
-    match cert.level_table.get(level).ok_or(CertError::DecodeError)? {
-        LevelNode::Zero => {}
-        LevelNode::Succ(inner) => collect_level_names_from_level_id(cert, *inner, names)?,
-        LevelNode::Max(lhs, rhs) | LevelNode::IMax(lhs, rhs) => {
-            collect_level_names_from_level_id(cert, *lhs, names)?;
-            collect_level_names_from_level_id(cert, *rhs, names)?;
+    let mut stack = vec![level];
+    let mut seen = BTreeSet::new();
+    while let Some(level) = stack.pop() {
+        if !seen.insert(level) {
+            continue;
         }
-        LevelNode::Param(name) => collect_name_id(cert, *name, names)?,
+        match cert.level_table.get(level).ok_or(CertError::DecodeError)? {
+            LevelNode::Zero => {}
+            LevelNode::Succ(inner) => stack.push(*inner),
+            LevelNode::Max(lhs, rhs) | LevelNode::IMax(lhs, rhs) => {
+                stack.push(*rhs);
+                stack.push(*lhs);
+            }
+            LevelNode::Param(name) => collect_name_id(cert, *name, names)?,
+        }
     }
     Ok(())
 }
@@ -855,24 +912,27 @@ fn term_node_loose_bvar_bounds(terms: &[TermNode]) -> Result<Vec<u32>> {
 }
 
 fn mark_term_reachable(terms: &[TermNode], root: TermId, reachable: &mut [bool]) {
-    if reachable[root] {
-        return;
-    }
-    reachable[root] = true;
-    match &terms[root] {
-        TermNode::Sort(_) | TermNode::BVar(_) | TermNode::Const { .. } => {}
-        TermNode::App(fun, arg) => {
-            mark_term_reachable(terms, *fun, reachable);
-            mark_term_reachable(terms, *arg, reachable);
+    let mut stack = vec![root];
+    while let Some(term) = stack.pop() {
+        if reachable[term] {
+            continue;
         }
-        TermNode::Lam { ty, body } | TermNode::Pi { ty, body } => {
-            mark_term_reachable(terms, *ty, reachable);
-            mark_term_reachable(terms, *body, reachable);
-        }
-        TermNode::Let { ty, value, body } => {
-            mark_term_reachable(terms, *ty, reachable);
-            mark_term_reachable(terms, *value, reachable);
-            mark_term_reachable(terms, *body, reachable);
+        reachable[term] = true;
+        match &terms[term] {
+            TermNode::Sort(_) | TermNode::BVar(_) | TermNode::Const { .. } => {}
+            TermNode::App(fun, arg) => {
+                stack.push(*arg);
+                stack.push(*fun);
+            }
+            TermNode::Lam { ty, body } | TermNode::Pi { ty, body } => {
+                stack.push(*body);
+                stack.push(*ty);
+            }
+            TermNode::Let { ty, value, body } => {
+                stack.push(*body);
+                stack.push(*value);
+                stack.push(*ty);
+            }
         }
     }
 }
@@ -884,30 +944,33 @@ fn verify_term_scope(
     seen: &mut BTreeSet<(TermId, u32)>,
     reachable_terms: &mut BTreeSet<TermId>,
 ) -> Result<()> {
-    if !seen.insert((term, depth)) {
+    let mut stack = vec![(term, depth)];
+    while let Some((term, depth)) = stack.pop() {
+        if !seen.insert((term, depth)) {
+            reachable_terms.insert(term);
+            continue;
+        }
         reachable_terms.insert(term);
-        return Ok(());
-    }
-    reachable_terms.insert(term);
-    match cert.term_table.get(term).ok_or(CertError::DecodeError)? {
-        TermNode::Sort(_) | TermNode::Const { .. } => {}
-        TermNode::BVar(index) => {
-            if *index >= depth {
-                return Err(CertError::InvalidBVar { index: *index });
+        match cert.term_table.get(term).ok_or(CertError::DecodeError)? {
+            TermNode::Sort(_) | TermNode::Const { .. } => {}
+            TermNode::BVar(index) => {
+                if *index >= depth {
+                    return Err(CertError::InvalidBVar { index: *index });
+                }
             }
-        }
-        TermNode::App(fun, arg) => {
-            verify_term_scope(cert, *fun, depth, seen, reachable_terms)?;
-            verify_term_scope(cert, *arg, depth, seen, reachable_terms)?;
-        }
-        TermNode::Lam { ty, body } | TermNode::Pi { ty, body } => {
-            verify_term_scope(cert, *ty, depth, seen, reachable_terms)?;
-            verify_term_scope(cert, *body, depth + 1, seen, reachable_terms)?;
-        }
-        TermNode::Let { ty, value, body } => {
-            verify_term_scope(cert, *ty, depth, seen, reachable_terms)?;
-            verify_term_scope(cert, *value, depth, seen, reachable_terms)?;
-            verify_term_scope(cert, *body, depth + 1, seen, reachable_terms)?;
+            TermNode::App(fun, arg) => {
+                stack.push((*arg, depth));
+                stack.push((*fun, depth));
+            }
+            TermNode::Lam { ty, body } | TermNode::Pi { ty, body } => {
+                stack.push((*body, depth.saturating_add(1)));
+                stack.push((*ty, depth));
+            }
+            TermNode::Let { ty, value, body } => {
+                stack.push((*body, depth.saturating_add(1)));
+                stack.push((*value, depth));
+                stack.push((*ty, depth));
+            }
         }
     }
     Ok(())
@@ -918,17 +981,20 @@ fn collect_level_reachable(
     level: LevelId,
     reachable_levels: &mut [bool],
 ) -> Result<()> {
-    let node = cert.level_table.get(level).ok_or(CertError::DecodeError)?;
-    if reachable_levels[level] {
-        return Ok(());
-    }
-    reachable_levels[level] = true;
-    match node {
-        LevelNode::Zero | LevelNode::Param(_) => {}
-        LevelNode::Succ(inner) => collect_level_reachable(cert, *inner, reachable_levels)?,
-        LevelNode::Max(lhs, rhs) | LevelNode::IMax(lhs, rhs) => {
-            collect_level_reachable(cert, *lhs, reachable_levels)?;
-            collect_level_reachable(cert, *rhs, reachable_levels)?;
+    let mut stack = vec![level];
+    while let Some(level) = stack.pop() {
+        let node = cert.level_table.get(level).ok_or(CertError::DecodeError)?;
+        if reachable_levels[level] {
+            continue;
+        }
+        reachable_levels[level] = true;
+        match node {
+            LevelNode::Zero | LevelNode::Param(_) => {}
+            LevelNode::Succ(inner) => stack.push(*inner),
+            LevelNode::Max(lhs, rhs) | LevelNode::IMax(lhs, rhs) => {
+                stack.push(*rhs);
+                stack.push(*lhs);
+            }
         }
     }
     Ok(())
@@ -1149,32 +1215,94 @@ fn global_ref_is_in_range(cert: &ModuleCert, global_ref: &GlobalRef) -> bool {
     }
 }
 
-fn level_node_is_normalized(cert: &ModuleCert, index: usize) -> Result<bool> {
-    let raw = raw_level_from_node(cert, index)?;
-    Ok(npa_kernel::level::normalize_level(raw.clone()) == raw)
-}
+fn level_table_is_normalized(cert: &ModuleCert) -> Result<bool> {
+    fn tag(node: &LevelNode) -> u8 {
+        match node {
+            LevelNode::Zero => 0,
+            LevelNode::Succ(_) => 1,
+            LevelNode::Max(_, _) => 2,
+            LevelNode::IMax(_, _) => 3,
+            LevelNode::Param(_) => 4,
+        }
+    }
 
-fn raw_level_from_node(cert: &ModuleCert, index: usize) -> Result<Level> {
-    Ok(
-        match cert.level_table.get(index).ok_or(CertError::DecodeError)? {
-            LevelNode::Zero => Level::Zero,
-            LevelNode::Succ(inner) => Level::Succ(Box::new(raw_level_from_node(cert, *inner)?)),
-            LevelNode::Max(lhs, rhs) => Level::Max(
-                Box::new(raw_level_from_node(cert, *lhs)?),
-                Box::new(raw_level_from_node(cert, *rhs)?),
+    fn compare_levels(cert: &ModuleCert, lhs: LevelId, rhs: LevelId) -> Result<std::cmp::Ordering> {
+        let mut pending = vec![(lhs, rhs)];
+        while let Some((lhs, rhs)) = pending.pop() {
+            if lhs == rhs {
+                continue;
+            }
+            let lhs_node = cert.level_table.get(lhs).ok_or(CertError::DecodeError)?;
+            let rhs_node = cert.level_table.get(rhs).ok_or(CertError::DecodeError)?;
+            let tag_order = tag(lhs_node).cmp(&tag(rhs_node));
+            if tag_order != std::cmp::Ordering::Equal {
+                return Ok(tag_order);
+            }
+            match (lhs_node, rhs_node) {
+                (LevelNode::Zero, LevelNode::Zero) => {}
+                (LevelNode::Succ(lhs), LevelNode::Succ(rhs)) => pending.push((*lhs, *rhs)),
+                (LevelNode::Max(lhs_l, lhs_r), LevelNode::Max(rhs_l, rhs_r))
+                | (LevelNode::IMax(lhs_l, lhs_r), LevelNode::IMax(rhs_l, rhs_r)) => {
+                    pending.push((*lhs_r, *rhs_r));
+                    pending.push((*lhs_l, *rhs_l));
+                }
+                (LevelNode::Param(lhs), LevelNode::Param(rhs)) => {
+                    let lhs = cert
+                        .name_table
+                        .get(*lhs)
+                        .ok_or(CertError::DecodeError)?
+                        .as_dotted();
+                    let rhs = cert
+                        .name_table
+                        .get(*rhs)
+                        .ok_or(CertError::DecodeError)?
+                        .as_dotted();
+                    let order = lhs.cmp(&rhs);
+                    if order != std::cmp::Ordering::Equal {
+                        return Ok(order);
+                    }
+                }
+                _ => return Err(CertError::DecodeError),
+            }
+        }
+        Ok(std::cmp::Ordering::Equal)
+    }
+
+    let mut naturals: Vec<Option<u64>> = Vec::with_capacity(cert.level_table.len());
+    for (index, node) in cert.level_table.iter().enumerate() {
+        let natural = match node {
+            LevelNode::Zero => Some(0u64),
+            LevelNode::Succ(inner) => naturals
+                .get(*inner)
+                .copied()
+                .flatten()
+                .and_then(|value| value.checked_add(1)),
+            LevelNode::Param(_) | LevelNode::Max(_, _) | LevelNode::IMax(_, _) => None,
+        };
+        let normalized = match node {
+            LevelNode::Zero | LevelNode::Param(_) | LevelNode::Succ(_) => true,
+            LevelNode::Max(lhs, rhs) => {
+                *lhs != *rhs
+                    && !matches!(cert.level_table.get(*lhs), Some(LevelNode::Zero))
+                    && !matches!(cert.level_table.get(*rhs), Some(LevelNode::Zero))
+                    && !(naturals.get(*lhs).is_some_and(Option::is_some)
+                        && naturals.get(*rhs).is_some_and(Option::is_some))
+                    && compare_levels(cert, *lhs, *rhs)? != std::cmp::Ordering::Greater
+            }
+            LevelNode::IMax(_, rhs) => !matches!(
+                cert.level_table.get(*rhs),
+                Some(LevelNode::Zero | LevelNode::Succ(_))
             ),
-            LevelNode::IMax(lhs, rhs) => Level::IMax(
-                Box::new(raw_level_from_node(cert, *lhs)?),
-                Box::new(raw_level_from_node(cert, *rhs)?),
-            ),
-            LevelNode::Param(name) => Level::Param(
-                cert.name_table
-                    .get(*name)
-                    .ok_or(CertError::DecodeError)?
-                    .as_dotted(),
-            ),
-        },
-    )
+        };
+        if !normalized {
+            return Ok(false);
+        }
+        if matches!(node, LevelNode::Succ(inner) if *inner >= index) {
+            return Err(CertError::DecodeError);
+        }
+        naturals.push(natural);
+    }
+    Ok(true)
 }
 
 /// Computes every level node's height in one forward pass. Children always
@@ -1811,38 +1939,26 @@ fn collect_imported_dependency_targets_from_term(
     term: TermId,
     deps: &mut BTreeSet<(Name, Hash)>,
 ) -> Result<()> {
-    match module.term_table.get(term).ok_or(CertError::DecodeError)? {
-        TermNode::Sort(_) | TermNode::BVar(_) => {}
-        TermNode::Const { global_ref, .. } => {
-            if let GlobalRef::Imported {
-                name,
-                decl_interface_hash,
-                ..
-            } = global_ref
-            {
-                let name = module
-                    .name_table
-                    .get(*name)
-                    .ok_or(CertError::DecodeError)?
-                    .clone();
-                deps.insert((name, *decl_interface_hash));
-            }
+    visit_reachable_terms(&module.term_table, term, |node| {
+        if let TermNode::Const {
+            global_ref:
+                GlobalRef::Imported {
+                    name,
+                    decl_interface_hash,
+                    ..
+                },
+            ..
+        } = node
+        {
+            let name = module
+                .name_table
+                .get(*name)
+                .ok_or(CertError::DecodeError)?
+                .clone();
+            deps.insert((name, *decl_interface_hash));
         }
-        TermNode::App(fun, arg) => {
-            collect_imported_dependency_targets_from_term(module, *fun, deps)?;
-            collect_imported_dependency_targets_from_term(module, *arg, deps)?;
-        }
-        TermNode::Lam { ty, body } | TermNode::Pi { ty, body } => {
-            collect_imported_dependency_targets_from_term(module, *ty, deps)?;
-            collect_imported_dependency_targets_from_term(module, *body, deps)?;
-        }
-        TermNode::Let { ty, value, body } => {
-            collect_imported_dependency_targets_from_term(module, *ty, deps)?;
-            collect_imported_dependency_targets_from_term(module, *value, deps)?;
-            collect_imported_dependency_targets_from_term(module, *body, deps)?;
-        }
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 fn module_exports_dependency(
@@ -2439,63 +2555,162 @@ fn remap_bvars(
     target_ctx_len: usize,
     source_to_target: &[usize],
 ) -> Result<Expr> {
-    match expr {
-        Expr::Sort(level) => Ok(Expr::sort(level.clone())),
-        Expr::BVar(index) => {
-            let index = *index as usize;
-            if index >= source_ctx_len {
-                return Err(CertError::InvalidBVar {
-                    index: index as u32,
-                });
+    enum Frame<'a> {
+        Visit {
+            expr: &'a Expr,
+            source_ctx_len: usize,
+            target_ctx_len: usize,
+        },
+        BuildApp,
+        BuildLam(String),
+        BuildPi(String),
+        BuildLet(String),
+    }
+
+    let mut pending = vec![Frame::Visit {
+        expr,
+        source_ctx_len,
+        target_ctx_len,
+    }];
+    let initial_source_ctx_len = source_ctx_len;
+    let initial_map_len = source_to_target.len();
+    let initial_target_ctx_len = target_ctx_len;
+    let mut mapped = Vec::new();
+    while let Some(frame) = pending.pop() {
+        match frame {
+            Frame::Visit {
+                expr,
+                source_ctx_len,
+                target_ctx_len,
+            } => match expr {
+                Expr::Sort(level) => mapped.push(Expr::sort(level.clone())),
+                Expr::BVar(index) => {
+                    let index = *index as usize;
+                    if index >= source_ctx_len {
+                        return Err(CertError::InvalidBVar {
+                            index: index as u32,
+                        });
+                    }
+                    let source_abs = source_ctx_len - 1 - index;
+                    let target_abs = if source_abs < initial_map_len {
+                        source_to_target
+                            .get(source_abs)
+                            .copied()
+                            .ok_or(CertError::InvalidBVar {
+                                index: index as u32,
+                            })?
+                    } else {
+                        let binder_offset = source_abs - initial_map_len;
+                        let binder_depth = source_ctx_len
+                            .checked_sub(initial_source_ctx_len)
+                            .ok_or(CertError::InvalidBVar {
+                                index: index as u32,
+                            })?;
+                        if binder_offset >= binder_depth {
+                            return Err(CertError::InvalidBVar {
+                                index: index as u32,
+                            });
+                        }
+                        initial_target_ctx_len
+                            .checked_add(binder_offset)
+                            .ok_or(CertError::DecodeError)?
+                    };
+                    mapped.push(bvar_for_abs(target_ctx_len, target_abs)?);
+                }
+                Expr::Const { name, levels } => {
+                    mapped.push(Expr::konst(name.clone(), levels.clone()));
+                }
+                Expr::App(fun, arg) => {
+                    pending.push(Frame::BuildApp);
+                    pending.push(Frame::Visit {
+                        expr: arg,
+                        source_ctx_len,
+                        target_ctx_len,
+                    });
+                    pending.push(Frame::Visit {
+                        expr: fun,
+                        source_ctx_len,
+                        target_ctx_len,
+                    });
+                }
+                Expr::Lam { binder, ty, body } => {
+                    pending.push(Frame::BuildLam(binder.clone()));
+                    pending.push(Frame::Visit {
+                        expr: body,
+                        source_ctx_len: source_ctx_len + 1,
+                        target_ctx_len: target_ctx_len + 1,
+                    });
+                    pending.push(Frame::Visit {
+                        expr: ty,
+                        source_ctx_len,
+                        target_ctx_len,
+                    });
+                }
+                Expr::Pi { binder, ty, body } => {
+                    pending.push(Frame::BuildPi(binder.clone()));
+                    pending.push(Frame::Visit {
+                        expr: body,
+                        source_ctx_len: source_ctx_len + 1,
+                        target_ctx_len: target_ctx_len + 1,
+                    });
+                    pending.push(Frame::Visit {
+                        expr: ty,
+                        source_ctx_len,
+                        target_ctx_len,
+                    });
+                }
+                Expr::Let {
+                    binder,
+                    ty,
+                    value,
+                    body,
+                } => {
+                    pending.push(Frame::BuildLet(binder.clone()));
+                    pending.push(Frame::Visit {
+                        expr: body,
+                        source_ctx_len: source_ctx_len + 1,
+                        target_ctx_len: target_ctx_len + 1,
+                    });
+                    pending.push(Frame::Visit {
+                        expr: value,
+                        source_ctx_len,
+                        target_ctx_len,
+                    });
+                    pending.push(Frame::Visit {
+                        expr: ty,
+                        source_ctx_len,
+                        target_ctx_len,
+                    });
+                }
+            },
+            Frame::BuildApp => {
+                let arg = mapped.pop().ok_or(CertError::DecodeError)?;
+                let fun = mapped.pop().ok_or(CertError::DecodeError)?;
+                mapped.push(Expr::app(fun, arg));
             }
-            let source_abs = source_ctx_len - 1 - index;
-            let target_abs =
-                source_to_target
-                    .get(source_abs)
-                    .copied()
-                    .ok_or(CertError::InvalidBVar {
-                        index: index as u32,
-                    })?;
-            bvar_for_abs(target_ctx_len, target_abs)
+            Frame::BuildLam(binder) => {
+                let body = mapped.pop().ok_or(CertError::DecodeError)?;
+                let ty = mapped.pop().ok_or(CertError::DecodeError)?;
+                mapped.push(Expr::lam(binder, ty, body));
+            }
+            Frame::BuildPi(binder) => {
+                let body = mapped.pop().ok_or(CertError::DecodeError)?;
+                let ty = mapped.pop().ok_or(CertError::DecodeError)?;
+                mapped.push(Expr::pi(binder, ty, body));
+            }
+            Frame::BuildLet(binder) => {
+                let body = mapped.pop().ok_or(CertError::DecodeError)?;
+                let value = mapped.pop().ok_or(CertError::DecodeError)?;
+                let ty = mapped.pop().ok_or(CertError::DecodeError)?;
+                mapped.push(Expr::let_in(binder, ty, value, body));
+            }
         }
-        Expr::Const { name, levels } => Ok(Expr::konst(name.clone(), levels.clone())),
-        Expr::App(fun, arg) => Ok(Expr::app(
-            remap_bvars(fun, source_ctx_len, target_ctx_len, source_to_target)?,
-            remap_bvars(arg, source_ctx_len, target_ctx_len, source_to_target)?,
-        )),
-        Expr::Lam { binder, ty, body } => {
-            let mut body_map = source_to_target.to_vec();
-            body_map.push(target_ctx_len);
-            Ok(Expr::lam(
-                binder.clone(),
-                remap_bvars(ty, source_ctx_len, target_ctx_len, source_to_target)?,
-                remap_bvars(body, source_ctx_len + 1, target_ctx_len + 1, &body_map)?,
-            ))
-        }
-        Expr::Pi { binder, ty, body } => {
-            let mut body_map = source_to_target.to_vec();
-            body_map.push(target_ctx_len);
-            Ok(Expr::pi(
-                binder.clone(),
-                remap_bvars(ty, source_ctx_len, target_ctx_len, source_to_target)?,
-                remap_bvars(body, source_ctx_len + 1, target_ctx_len + 1, &body_map)?,
-            ))
-        }
-        Expr::Let {
-            binder,
-            ty,
-            value,
-            body,
-        } => {
-            let mut body_map = source_to_target.to_vec();
-            body_map.push(target_ctx_len);
-            Ok(Expr::let_in(
-                binder.clone(),
-                remap_bvars(ty, source_ctx_len, target_ctx_len, source_to_target)?,
-                remap_bvars(value, source_ctx_len, target_ctx_len, source_to_target)?,
-                remap_bvars(body, source_ctx_len + 1, target_ctx_len + 1, &body_map)?,
-            ))
-        }
+    }
+    let result = mapped.pop().ok_or(CertError::DecodeError)?;
+    if mapped.is_empty() {
+        Ok(result)
+    } else {
+        Err(CertError::DecodeError)
     }
 }
 
@@ -2593,21 +2808,33 @@ fn constructor_result_index_args(
 }
 
 fn contains_const(expr: &Expr, needle: &str) -> bool {
-    match expr {
-        Expr::Sort(_) | Expr::BVar(_) => false,
-        Expr::Const { name, .. } => name == needle,
-        Expr::App(fun, arg) => contains_const(fun, needle) || contains_const(arg, needle),
-        Expr::Lam { ty, body, .. } | Expr::Pi { ty, body, .. } => {
-            contains_const(ty, needle) || contains_const(body, needle)
-        }
-        Expr::Let {
-            ty, value, body, ..
-        } => {
-            contains_const(ty, needle)
-                || contains_const(value, needle)
-                || contains_const(body, needle)
+    let mut pending = vec![expr];
+    while let Some(current) = pending.pop() {
+        match current {
+            Expr::Sort(_) | Expr::BVar(_) => {}
+            Expr::Const { name, .. } => {
+                if name == needle {
+                    return true;
+                }
+            }
+            Expr::App(fun, arg) => {
+                pending.push(arg);
+                pending.push(fun);
+            }
+            Expr::Lam { ty, body, .. } | Expr::Pi { ty, body, .. } => {
+                pending.push(body);
+                pending.push(ty);
+            }
+            Expr::Let {
+                ty, value, body, ..
+            } => {
+                pending.push(body);
+                pending.push(value);
+                pending.push(ty);
+            }
         }
     }
+    false
 }
 
 pub(crate) fn expected_dependencies_for_decl(
@@ -2942,25 +3169,62 @@ fn collect_global_refs_from_term_table(
     term: TermId,
     refs: &mut BTreeSet<GlobalRef>,
 ) -> Result<()> {
-    match term_table.get(term).ok_or(CertError::DecodeError)? {
-        TermNode::Sort(_) | TermNode::BVar(_) => {}
-        TermNode::Const { global_ref, .. } => {
+    visit_reachable_terms(term_table, term, |node| {
+        if let TermNode::Const { global_ref, .. } = node {
             refs.insert(global_ref.clone());
         }
-        TermNode::App(fun, arg) => {
-            collect_global_refs_from_term_table(term_table, *fun, refs)?;
-            collect_global_refs_from_term_table(term_table, *arg, refs)?;
+        Ok(())
+    })
+}
+
+fn visit_reachable_terms(
+    term_table: &[TermNode],
+    root: TermId,
+    mut visit: impl FnMut(&TermNode) -> Result<()>,
+) -> Result<()> {
+    if root >= term_table.len() {
+        return Err(CertError::DecodeError);
+    }
+
+    let mut visited = BTreeSet::new();
+    let mut pending = Vec::new();
+    pending
+        .try_reserve(term_table.len().min(1_024))
+        .map_err(|_| CertError::DecodeError)?;
+    pending.push(root);
+
+    while let Some(term) = pending.pop() {
+        if !visited.insert(term) {
+            continue;
         }
-        TermNode::Lam { ty, body } | TermNode::Pi { ty, body } => {
-            collect_global_refs_from_term_table(term_table, *ty, refs)?;
-            collect_global_refs_from_term_table(term_table, *body, refs)?;
-        }
-        TermNode::Let { ty, value, body } => {
-            collect_global_refs_from_term_table(term_table, *ty, refs)?;
-            collect_global_refs_from_term_table(term_table, *value, refs)?;
-            collect_global_refs_from_term_table(term_table, *body, refs)?;
+        let node = term_table.get(term).ok_or(CertError::DecodeError)?;
+        visit(node)?;
+        let child_count = match node {
+            TermNode::Sort(_) | TermNode::BVar(_) | TermNode::Const { .. } => 0,
+            TermNode::App(_, _) | TermNode::Lam { .. } | TermNode::Pi { .. } => 2,
+            TermNode::Let { .. } => 3,
+        };
+        pending
+            .try_reserve(child_count)
+            .map_err(|_| CertError::DecodeError)?;
+        match node {
+            TermNode::Sort(_) | TermNode::BVar(_) | TermNode::Const { .. } => {}
+            TermNode::App(fun, arg) => {
+                pending.push(*arg);
+                pending.push(*fun);
+            }
+            TermNode::Lam { ty, body } | TermNode::Pi { ty, body } => {
+                pending.push(*body);
+                pending.push(*ty);
+            }
+            TermNode::Let { ty, value, body } => {
+                pending.push(*body);
+                pending.push(*value);
+                pending.push(*ty);
+            }
         }
     }
+
     Ok(())
 }
 
@@ -3214,4 +3478,41 @@ fn enforce_axiom_policy_for_report(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod stack_safety_tests {
+    use super::*;
+
+    #[test]
+    fn global_ref_collection_is_stack_safe_and_memoized() {
+        std::thread::Builder::new()
+            .stack_size(128 * 1024)
+            .spawn(|| {
+                let mut terms = vec![TermNode::Const {
+                    global_ref: GlobalRef::Local { decl_index: 0 },
+                    levels: vec![],
+                }];
+                for index in 0..MAX_STRUCTURAL_DEPTH - 1 {
+                    terms.push(TermNode::App(index, index));
+                }
+                let mut refs = BTreeSet::new();
+                collect_global_refs_from_term_table(&terms, terms.len() - 1, &mut refs).unwrap();
+                assert_eq!(refs, BTreeSet::from([GlobalRef::Local { decl_index: 0 }]));
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn remap_bvars_preserves_preextended_mapping_under_binder() {
+        let expr = Expr::lam("_", Expr::sort(Level::zero()), Expr::bvar(0));
+        let remapped = remap_bvars(&expr, 1, 2, &[0, 1]).unwrap();
+
+        assert_eq!(
+            remapped,
+            Expr::lam("_", Expr::sort(Level::zero()), Expr::bvar(1))
+        );
+    }
 }

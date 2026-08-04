@@ -35,6 +35,19 @@ type public_environment = {
   public_inductive_groups : public_inductive_group list;
 }
 
+type structural_identity = {
+  structural_module_name : Ext_name.t;
+  structural_export_hash : Ext_hash.digest;
+  structural_certificate_hash : Ext_hash.digest;
+}
+
+type structural_closure_entry = {
+  structural_identity : structural_identity;
+  structural_expansion : int;
+}
+
+type structural_closure = structural_closure_entry list
+
 (* Public interfaces use a fixed sentinel for references to the imported module itself. *)
 let public_self_import_index = 1_073_741_823
 
@@ -43,6 +56,8 @@ type module_entry = {
   axiom_report_hash : Ext_hash.digest;
   public_environment : public_environment;
   checked_by_ext_checker : bool;
+  local_structural_expansion : int;
+  structural_closure : structural_closure option;
 }
 
 type store = module_entry list
@@ -62,9 +77,13 @@ type resolved_import = {
   resolved_export_hash : Ext_hash.digest;
   resolved_certificate_hash : Ext_hash.digest option;
   resolved_public_environment : public_environment;
+  resolved_structural_closure : structural_closure;
 }
 
-type import_environment = { resolved_imports : resolved_import list }
+type import_environment = {
+  resolved_imports : resolved_import list;
+  structural_closure : structural_closure;
+}
 
 type hash_mismatch = {
   hash_mismatch_kind : string;
@@ -90,6 +109,8 @@ type resolve_error_reason =
   | Missing_import_certificate_hash
   | Unchecked_import
   | Duplicate_import
+  | Import_cycle
+  | Structural_limit of Ext_bytes.structural_limit_kind * int * int
 
 type resolve_error = {
   resolve_reason : resolve_error_reason;
@@ -100,7 +121,8 @@ let empty = []
 
 let entries store = store
 
-let import_environment_empty = { resolved_imports = [] }
+let import_environment_empty =
+  { resolved_imports = []; structural_closure = [] }
 
 let import_environment_imports environment = environment.resolved_imports
 
@@ -121,12 +143,14 @@ let bind result f =
   | Error err -> Error err
   | Ok value -> f value
 
-let rec map_result f values =
-  match values with
-  | [] -> Ok []
-  | value :: rest ->
-      bind (f value) (fun mapped ->
-          bind (map_result f rest) (fun mapped_rest -> Ok (mapped :: mapped_rest)))
+let map_result f values =
+  let rec loop remaining mapped =
+    match remaining with
+    | [] -> Ok (List.rev mapped)
+    | value :: rest ->
+        bind (f value) (fun result -> loop rest (result :: mapped))
+  in
+  loop values []
 
 let map_option_result f value =
   match value with
@@ -407,29 +431,11 @@ let public_global_ref section offset declarations global_ref =
             (imported_self_ref name
                declaration.Ext_cert.hashes.Ext_cert.decl_interface_hash))
 
-let rec public_term section offset declarations term =
-  match term with
-  | Ext_term.Sort _ | Ext_term.BVar _ -> Ok term
-  | Ext_term.Const (global_ref, levels) ->
-      bind (public_global_ref section offset declarations global_ref) (fun public_ref ->
-          Ok (Ext_term.Const (public_ref, levels)))
-  | Ext_term.App (fn, arg) ->
-      bind (public_term section offset declarations fn) (fun public_fn ->
-          bind (public_term section offset declarations arg) (fun public_arg ->
-              Ok (Ext_term.App (public_fn, public_arg))))
-  | Ext_term.Lam (ty, body) ->
-      bind (public_term section offset declarations ty) (fun public_ty ->
-          bind (public_term section offset declarations body) (fun public_body ->
-              Ok (Ext_term.Lam (public_ty, public_body))))
-  | Ext_term.Pi (ty, body) ->
-      bind (public_term section offset declarations ty) (fun public_ty ->
-          bind (public_term section offset declarations body) (fun public_body ->
-              Ok (Ext_term.Pi (public_ty, public_body))))
-  | Ext_term.Let (ty, value, body) ->
-      bind (public_term section offset declarations ty) (fun public_ty ->
-          bind (public_term section offset declarations value) (fun public_value ->
-              bind (public_term section offset declarations body) (fun public_body ->
-                  Ok (Ext_term.Let (public_ty, public_value, public_body)))))
+let public_term section offset declarations term =
+  Ext_term.map_global_refs
+    (public_global_ref section offset declarations)
+    (fun () -> Ext_bytes.error section offset Ext_bytes.Dangling_reference)
+    term
 
 let public_axiom_ref section offset declarations axiom =
   match axiom.Ext_cert.axiom_global_ref with
@@ -596,6 +602,11 @@ let public_environment_of_decoded decoded =
 
 let module_entry_of_decoded decoded =
   bind (public_environment_of_decoded decoded) (fun public_environment ->
+      let local_structural_expansion =
+        match decoded.Ext_cert.structural_cost with
+        | Some cost -> cost.Ext_cert.certificate_expansion
+        | None -> 0
+      in
       Ok
         {
           import_entry =
@@ -607,6 +618,8 @@ let module_entry_of_decoded decoded =
           axiom_report_hash = decoded.Ext_cert.hashes.Ext_cert.axiom_report_hash;
           public_environment;
           checked_by_ext_checker = false;
+          local_structural_expansion;
+          structural_closure = None;
         })
 
 let module_entry_from_source_free_certificate bytes =
@@ -615,8 +628,12 @@ let module_entry_from_source_free_certificate bytes =
       (Certificate_decode_error
          {
            Ext_bytes.section = Ext_bytes.Full_certificate;
-           offset = Ext_bytes.max_certificate_bytes;
-           reason = Ext_bytes.Resource_limit;
+           offset = 0;
+           reason =
+             Ext_bytes.Structural_resource_limit
+               ( Ext_bytes.Certificate_bytes,
+                 Ext_bytes.max_certificate_bytes,
+                 String.length bytes );
          })
   else match Ext_cert.read_module (Ext_bytes.of_string bytes) with
   | Error err -> Error (Certificate_decode_error err)
@@ -698,11 +715,13 @@ let resolve_error_kind error =
   | Missing_import
   | Missing_import_certificate_hash
   | Unchecked_import
-  | Duplicate_import ->
+  | Duplicate_import
+  | Import_cycle ->
       "import_not_found"
   | Import_export_hash_mismatch
   | Import_certificate_hash_mismatch ->
       "import_hash_mismatch"
+  | Structural_limit _ -> "certificate_decode_error"
 
 let resolve_error_reason_code reason =
   match reason with
@@ -712,6 +731,8 @@ let resolve_error_reason_code reason =
   | Missing_import_certificate_hash -> "missing_import_certificate_hash"
   | Unchecked_import -> "unchecked_import"
   | Duplicate_import -> "duplicate_import"
+  | Import_cycle -> "import_cycle"
+  | Structural_limit _ -> "resource_limit"
 
 let resolve_normal ?(offset = 0) store requested =
   let same_module_entries = List.filter (fun entry -> same_module entry requested) store in
@@ -759,23 +780,201 @@ let resolve ?(policy = normal_policy) ?(offset = 0) store requested =
       | Normal -> Ok entry
       | High_trust -> enforce_high_trust_import ~offset requested entry)
 
-let resolved_import_of_module_entry entry =
+let structural_identity_of_entry entry =
+  match entry.import_entry.Ext_import.certificate_hash with
+  | None -> None
+  | Some structural_certificate_hash ->
+      Some
+        {
+          structural_module_name =
+            entry.import_entry.Ext_import.module_name;
+          structural_export_hash =
+            entry.import_entry.Ext_import.export_hash;
+          structural_certificate_hash;
+        }
+
+let compare_structural_identity lhs rhs =
+  Stdlib.compare
+    ( Ext_name.components lhs.structural_module_name,
+      lhs.structural_export_hash,
+      lhs.structural_certificate_hash )
+    ( Ext_name.components rhs.structural_module_name,
+      rhs.structural_export_hash,
+      rhs.structural_certificate_hash )
+
+let closure_total closure =
+  List.fold_left
+    (fun total entry -> total + entry.structural_expansion)
+    0 closure
+
+let validate_closure_limits offset closure =
+  let module_count = List.length closure in
+  if module_count > Ext_bytes.max_closure_modules then
+    Error
+      {
+        resolve_reason =
+          Structural_limit
+            ( Ext_bytes.Closure_modules,
+              Ext_bytes.max_closure_modules,
+              Ext_bytes.max_closure_modules + 1 );
+        resolve_offset = offset;
+      }
+  else
+    let total = closure_total closure in
+    if total > Ext_bytes.max_closure_expanded_nodes then
+      Error
+        {
+          resolve_reason =
+            Structural_limit
+              ( Ext_bytes.Closure_expanded_nodes,
+                Ext_bytes.max_closure_expanded_nodes,
+                Ext_bytes.max_closure_expanded_nodes + 1 );
+          resolve_offset = offset;
+        }
+    else Ok closure
+
+let insert_closure_entry offset entry closure =
+  let rec loop prefix = function
+    | [] ->
+        validate_closure_limits offset
+          (List.rev_append prefix [ entry ])
+    | existing :: rest ->
+        let comparison =
+          compare_structural_identity entry.structural_identity
+            existing.structural_identity
+        in
+        if comparison = 0 then
+          if entry.structural_expansion = existing.structural_expansion then
+            Ok (List.rev_append prefix (existing :: rest))
+          else
+            Error
+              {
+                resolve_reason = Duplicate_import;
+                resolve_offset = offset;
+              }
+        else if comparison < 0 then
+          validate_closure_limits offset
+            (List.rev_append prefix (entry :: existing :: rest))
+        else loop (existing :: prefix) rest
+  in
+  loop [] closure
+
+let merge_closure offset closure incoming =
+  List.fold_left
+    (fun result entry ->
+      bind result (fun accumulated ->
+          insert_closure_entry offset entry accumulated))
+    (Ok closure) incoming
+
+let resolved_import_of_module_entry structural_closure entry =
   {
     resolved_module_name = entry.import_entry.Ext_import.module_name;
     resolved_export_hash = entry.import_entry.Ext_import.export_hash;
     resolved_certificate_hash = entry.import_entry.Ext_import.certificate_hash;
     resolved_public_environment = entry.public_environment;
+    resolved_structural_closure = structural_closure;
   }
 
 let build_import_environment ?(policy = normal_policy) store decoded =
-  let rec loop remaining resolved =
+  let rec entry_closure visiting offset (entry : module_entry) =
+    match entry.structural_closure with
+    | Some closure -> validate_closure_limits offset closure
+    | None -> (
+        match structural_identity_of_entry entry with
+        | None ->
+            Error
+              {
+                resolve_reason = Missing_import_certificate_hash;
+                resolve_offset = offset;
+              }
+        | Some identity ->
+            if
+              List.exists
+                (fun current ->
+                  compare_structural_identity current identity = 0)
+                visiting
+            then
+              Error
+                { resolve_reason = Import_cycle; resolve_offset = offset }
+            else
+              let rec dependencies closure = function
+                | [] ->
+                    insert_closure_entry offset
+                      {
+                        structural_identity = identity;
+                        structural_expansion =
+                          entry.local_structural_expansion;
+                      }
+                      closure
+                | requested :: rest ->
+                    bind (resolve ~policy store requested) (fun dependency ->
+                        bind
+                          (entry_closure (identity :: visiting) offset
+                             dependency)
+                          (fun dependency_closure ->
+                            bind
+                              (merge_closure offset closure
+                                 dependency_closure)
+                              (fun closure ->
+                                dependencies closure rest)))
+              in
+              dependencies []
+                entry.public_environment.public_imports)
+  in
+  let rec loop remaining resolved closure =
     match remaining with
-    | [] -> Ok { resolved_imports = List.rev resolved }
+    | [] -> (
+        match decoded.Ext_cert.structural_cost with
+        | None ->
+            Error
+              {
+                resolve_reason =
+                  Structural_limit
+                    ( Ext_bytes.Certificate_expanded_nodes,
+                      Ext_bytes.max_certificate_expanded_nodes,
+                      Ext_bytes.max_certificate_expanded_nodes + 1 );
+                resolve_offset = 0;
+              }
+        | Some cost ->
+            let current_identity =
+              {
+                structural_module_name =
+                  decoded.Ext_cert.header.Ext_cert.module_name;
+                structural_export_hash =
+                  decoded.Ext_cert.hashes.Ext_cert.export_hash;
+                structural_certificate_hash =
+                  decoded.Ext_cert.hashes.Ext_cert.certificate_hash;
+              }
+            in
+            bind
+              (insert_closure_entry 0
+                 {
+                   structural_identity = current_identity;
+                   structural_expansion =
+                     cost.Ext_cert.certificate_expansion;
+                 }
+                 closure)
+              (fun structural_closure ->
+                Ok
+                  {
+                    resolved_imports = List.rev resolved;
+                    structural_closure;
+                  }))
     | requested :: rest ->
         bind
           (resolve ~policy ~offset:requested.Ext_cert.import_offset store
              requested.Ext_cert.import_entry)
           (fun entry ->
-            loop rest (resolved_import_of_module_entry entry :: resolved))
+            bind
+              (entry_closure [] requested.Ext_cert.import_offset entry)
+              (fun entry_summary ->
+                bind
+                  (merge_closure requested.Ext_cert.import_offset closure
+                     entry_summary)
+                  (fun closure ->
+                    loop rest
+                      (resolved_import_of_module_entry entry_summary entry
+                      :: resolved)
+                      closure)))
   in
-  loop decoded.Ext_cert.imports []
+  loop decoded.Ext_cert.imports [] []

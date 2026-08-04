@@ -87,7 +87,9 @@ let term_id section offset term_table term =
     match entries with
     | [] -> error section offset Ext_bytes.Dangling_reference
     | entry :: rest ->
-        if entry.Ext_term.term = term then Ok index else loop (index + 1) rest
+        if entry.Ext_term.term == term || entry.Ext_term.term = term then
+          Ok index
+        else loop (index + 1) rest
   in
   loop 0 term_table
 
@@ -96,7 +98,9 @@ let level_id section offset level_table level =
     match entries with
     | [] -> error section offset Ext_bytes.Dangling_reference
     | entry :: rest ->
-        if entry.Ext_level.level = level then Ok index else loop (index + 1) rest
+        if entry.Ext_level.level == level || entry.Ext_level.level = level then
+          Ok index
+        else loop (index + 1) rest
   in
   loop 0 level_table
 
@@ -132,52 +136,119 @@ let encode_global_ref section offset name_table global_ref =
       bind (encode_name_id section offset name_table name) (fun name_bytes ->
           Ok (byte 0x03 ^ name_bytes ^ encode_hash decl_interface_hash))
 
-let rec level_payload level =
-  match level with
-  | Ext_level.Zero -> byte 0x00
-  | Ext_level.Succ inner -> byte 0x01 ^ level_hash inner
-  | Ext_level.Max (lhs, rhs) -> byte 0x02 ^ level_hash lhs ^ level_hash rhs
-  | Ext_level.Imax (lhs, rhs) -> byte 0x03 ^ level_hash lhs ^ level_hash rhs
-  | Ext_level.Param name -> byte 0x04 ^ encode_name name
+module Level_hash_cache = Hashtbl.Make (struct
+  type t = Ext_level.t
 
-and level_hash level = hash_with_domain domain_level (level_payload level)
+  let equal lhs rhs = lhs == rhs
+  let hash = Hashtbl.hash
+end)
 
-let rec term_payload section offset name_table term =
-  match term with
-  | Ext_term.Sort level -> Ok (byte 0x00 ^ level_hash level)
-  | Ext_term.BVar index -> Ok (byte 0x01 ^ encode_uvar index)
-  | Ext_term.Const (global_ref, levels) ->
-      bind (encode_global_ref section offset name_table global_ref) (fun global_ref_bytes ->
-          Ok
-            (byte 0x02 ^ global_ref_bytes ^ encode_uvar (List.length levels)
-           ^ String.concat "" (List.map level_hash levels)))
-  | Ext_term.App (fn, arg) ->
-      bind (term_hash section offset name_table fn) (fun fn_hash ->
-          bind (term_hash section offset name_table arg) (fun arg_hash ->
-              Ok (byte 0x03 ^ fn_hash ^ arg_hash)))
-  | Ext_term.Lam (ty, body) ->
-      bind (term_hash section offset name_table ty) (fun ty_hash ->
-          bind (term_hash section offset name_table body) (fun body_hash ->
-              Ok (byte 0x04 ^ ty_hash ^ body_hash)))
-  | Ext_term.Pi (ty, body) ->
-      bind (term_hash section offset name_table ty) (fun ty_hash ->
-          bind (term_hash section offset name_table body) (fun body_hash ->
-              Ok (byte 0x05 ^ ty_hash ^ body_hash)))
-  | Ext_term.Let (ty, value, body) ->
-      bind (term_hash section offset name_table ty) (fun ty_hash ->
-          bind (term_hash section offset name_table value) (fun value_hash ->
-              bind (term_hash section offset name_table body) (fun body_hash ->
-                  Ok (byte 0x06 ^ ty_hash ^ value_hash ^ body_hash))))
+module Term_hash_cache = Hashtbl.Make (struct
+  type t = Ext_term.t
 
-and term_hash section offset name_table term =
-  bind (term_payload section offset name_table term) (fun payload ->
-      Ok (hash_with_domain domain_term payload))
+  let equal lhs rhs = lhs == rhs
+  let hash = Hashtbl.hash
+end)
+
+let level_hash_with_cache cache root =
+  let rec loop = function
+    | [] -> Level_hash_cache.find cache root
+    | (level, ready) :: rest ->
+        if Level_hash_cache.mem cache level then loop rest
+        else if ready then
+          let payload =
+            match level with
+            | Ext_level.Zero -> byte 0x00
+            | Ext_level.Succ inner ->
+                byte 0x01 ^ Level_hash_cache.find cache inner
+            | Ext_level.Max (lhs, rhs) ->
+                byte 0x02 ^ Level_hash_cache.find cache lhs
+                ^ Level_hash_cache.find cache rhs
+            | Ext_level.Imax (lhs, rhs) ->
+                byte 0x03 ^ Level_hash_cache.find cache lhs
+                ^ Level_hash_cache.find cache rhs
+            | Ext_level.Param name -> byte 0x04 ^ encode_name name
+          in
+          Level_hash_cache.add cache level
+            (hash_with_domain domain_level payload);
+          loop rest
+        else
+          let children =
+            match level with
+            | Ext_level.Zero | Ext_level.Param _ -> []
+            | Ext_level.Succ inner -> [ (inner, false) ]
+            | Ext_level.Max (lhs, rhs) | Ext_level.Imax (lhs, rhs) ->
+                [ (lhs, false); (rhs, false) ]
+          in
+          loop ((level, true) :: children @ rest)
+  in
+  loop [ (root, false) ]
+
+let term_hash section offset name_table root =
+  let level_cache = Level_hash_cache.create 64 in
+  let term_cache = Term_hash_cache.create 256 in
+  let level_hash level = level_hash_with_cache level_cache level in
+  let rec loop = function
+    | [] -> Ok (Term_hash_cache.find term_cache root)
+    | (term, ready) :: rest ->
+        if Term_hash_cache.mem term_cache term then loop rest
+        else if ready then
+          let payload =
+            match term with
+            | Ext_term.Sort level -> Ok (byte 0x00 ^ level_hash level)
+            | Ext_term.BVar index -> Ok (byte 0x01 ^ encode_uvar index)
+            | Ext_term.Const (global_ref, levels) ->
+                bind
+                  (encode_global_ref section offset name_table global_ref)
+                  (fun global_ref_bytes ->
+                    Ok
+                      (byte 0x02 ^ global_ref_bytes
+                     ^ encode_uvar (List.length levels)
+                     ^ String.concat "" (List.map level_hash levels)))
+            | Ext_term.App (fn, arg) ->
+                Ok
+                  (byte 0x03 ^ Term_hash_cache.find term_cache fn
+                 ^ Term_hash_cache.find term_cache arg)
+            | Ext_term.Lam (ty, body) ->
+                Ok
+                  (byte 0x04 ^ Term_hash_cache.find term_cache ty
+                 ^ Term_hash_cache.find term_cache body)
+            | Ext_term.Pi (ty, body) ->
+                Ok
+                  (byte 0x05 ^ Term_hash_cache.find term_cache ty
+                 ^ Term_hash_cache.find term_cache body)
+            | Ext_term.Let (ty, value, body) ->
+                Ok
+                  (byte 0x06 ^ Term_hash_cache.find term_cache ty
+                 ^ Term_hash_cache.find term_cache value
+                 ^ Term_hash_cache.find term_cache body)
+          in
+          bind payload (fun payload ->
+              Term_hash_cache.add term_cache term
+                (hash_with_domain domain_term payload);
+              loop rest)
+        else
+          let children =
+            match term with
+            | Ext_term.Sort _ | Ext_term.BVar _ | Ext_term.Const _ -> []
+            | Ext_term.App (fn, arg)
+            | Ext_term.Lam (fn, arg)
+            | Ext_term.Pi (fn, arg) ->
+                [ (fn, false); (arg, false) ]
+            | Ext_term.Let (ty, value, body) ->
+                [ (ty, false); (value, false); (body, false) ]
+          in
+          loop ((term, true) :: children @ rest)
+  in
+  loop [ (root, false) ]
 
 let lookup_level_hash section offset level_table level_hashes level =
   let rec loop levels hashes =
     match (levels, hashes) with
     | entry :: rest_levels, hash :: rest_hashes ->
-        if entry.Ext_level.level = level then Ok hash else loop rest_levels rest_hashes
+        if entry.Ext_level.level == level || entry.Ext_level.level = level then
+          Ok hash
+        else loop rest_levels rest_hashes
     | _ -> error section offset Ext_bytes.Dangling_reference
   in
   loop level_table level_hashes
@@ -224,7 +295,9 @@ let lookup_term_hash section offset term_table term_hashes term =
   let rec loop terms hashes =
     match (terms, hashes) with
     | entry :: rest_terms, hash :: rest_hashes ->
-        if entry.Ext_term.term = term then Ok hash else loop rest_terms rest_hashes
+        if entry.Ext_term.term == term || entry.Ext_term.term = term then
+          Ok hash
+        else loop rest_terms rest_hashes
     | _ -> error section offset Ext_bytes.Dangling_reference
   in
   loop term_table term_hashes
@@ -368,18 +441,27 @@ let encode_axiom_refs section offset name_table axioms =
   in
   loop axioms []
 
-let rec collect_global_refs_from_term term refs =
-  match term with
-  | Ext_term.Sort _ | Ext_term.BVar _ -> refs
-  | Ext_term.Const (global_ref, _) ->
-      if List.exists (( = ) global_ref) refs then refs else global_ref :: refs
-  | Ext_term.App (fn, arg) ->
-      collect_global_refs_from_term arg (collect_global_refs_from_term fn refs)
-  | Ext_term.Lam (ty, body) | Ext_term.Pi (ty, body) ->
-      collect_global_refs_from_term body (collect_global_refs_from_term ty refs)
-  | Ext_term.Let (ty, value, body) ->
-      collect_global_refs_from_term body
-        (collect_global_refs_from_term value (collect_global_refs_from_term ty refs))
+let collect_global_refs_from_term term refs =
+  let rec loop pending collected =
+    match pending with
+    | [] -> collected
+    | current :: rest -> (
+        match current with
+        | Ext_term.Sort _ | Ext_term.BVar _ -> loop rest collected
+        | Ext_term.Const (global_ref, _) ->
+            let next =
+              if List.exists (( = ) global_ref) collected then collected
+              else global_ref :: collected
+            in
+            loop rest next
+        | Ext_term.App (fn, arg)
+        | Ext_term.Lam (fn, arg)
+        | Ext_term.Pi (fn, arg) ->
+            loop (fn :: arg :: rest) collected
+        | Ext_term.Let (ty, value, body) ->
+            loop (ty :: value :: body :: rest) collected)
+  in
+  loop [ term ] refs
 
 let interface_terms payload =
   match payload with

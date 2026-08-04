@@ -37,7 +37,8 @@ use npa_package::{
     PromotionOriginEntryV2, PromotionReplacementState, PromotionReplayOmission,
     PromotionRouteTheorem, PromotionSourceModule, PromotionSourceOrigin, PromotionTargetRevision,
     PromotionTransactionJournal, PromotionTransactionPhase, PromotionTransactionRow,
-    PromotionTransactionState, PromotionTransportEvidence, MATHLIB_PROMOTION_PLAN_SCHEMA,
+    PromotionTransactionState, PromotionTransportEvidence,
+    MATHLIB_PROMOTION_ORIGIN_REGISTRY_V2_SCHEMA, MATHLIB_PROMOTION_PLAN_SCHEMA,
     MATHLIB_PROMOTION_REGISTRY_PATH, MATHLIB_PROMOTION_TRANSACTION_SCHEMA,
     PACKAGE_PUBLISH_PLAN_PATH, PACKAGE_VERIFIED_EXPORT_SUMMARY_PATH,
     PROMOTION_REPLAY_OMISSION_UNSUPPORTED_REWRITE_REASON,
@@ -1706,6 +1707,7 @@ fn update_stage_registry(
     enum PreviousRegistry {
         V1(npa_package::PromotionOriginRegistry),
         V2(npa_package::PromotionOriginRegistryV2),
+        V3(npa_package::PromotionOriginRegistryV3),
     }
     let registry_path = stage.join(MATHLIB_PROMOTION_REGISTRY_PATH);
     let registry_source = fs::read_to_string(&registry_path).map_err(|_| ())?;
@@ -1718,6 +1720,10 @@ fn update_stage_registry(
         ParsedPromotionOriginRegistry::V1(previous) => {
             let migrated = migrate_promotion_origin_registry_v1_to_v2(&previous).map_err(|_| ())?;
             (PreviousRegistry::V1(previous), migrated)
+        }
+        ParsedPromotionOriginRegistry::V3(previous) => {
+            let base = v3_source_registry(&previous)?;
+            (PreviousRegistry::V3(previous), base)
         }
     };
     let loaded = crate::package::load_package_root(stage, COMMAND).map_err(|_| ())?;
@@ -1846,8 +1852,87 @@ fn update_stage_registry(
             validate_promotion_origin_registry_v2_transition(&previous, &registry)
                 .map_err(|_| ())?;
         }
+        PreviousRegistry::V3(previous) => {
+            let next = merge_v3_source_registry(previous, registry)?;
+            return fs::write(registry_path, next.canonical_json().map_err(|_| ())?)
+                .map_err(|_| ());
+        }
     }
     fs::write(registry_path, registry.canonical_json().map_err(|_| ())?).map_err(|_| ())
+}
+
+fn v3_source_registry(
+    registry: &npa_package::PromotionOriginRegistryV3,
+) -> Result<npa_package::PromotionOriginRegistryV2, ()> {
+    let mut base = npa_package::PromotionOriginRegistryV2 {
+        schema: MATHLIB_PROMOTION_ORIGIN_REGISTRY_V2_SCHEMA.to_owned(),
+        registry_id: registry.registry_id.clone(),
+        registry_version: 2,
+        generation: registry.generation,
+        target_package: registry.target_package.clone(),
+        entries: registry
+            .entries
+            .iter()
+            .filter_map(|entry| match entry {
+                npa_package::PromotionOriginEntryV3::SourceV2(entry) => Some(entry.clone()),
+                npa_package::PromotionOriginEntryV3::CatalogTargetV1(_) => None,
+            })
+            .collect(),
+        unresolved_legacy_targets: registry.unresolved_legacy_targets.clone(),
+        registry_hash: PackageHash::new([0; 32]),
+        proof_evidence: false,
+    };
+    base.refresh_hash().map_err(|_| ())?;
+    Ok(base)
+}
+
+fn merge_v3_source_registry(
+    mut previous: npa_package::PromotionOriginRegistryV3,
+    source_registry: npa_package::PromotionOriginRegistryV2,
+) -> Result<npa_package::PromotionOriginRegistryV3, ()> {
+    let previous_before = previous.clone();
+    let old_source_ids = previous
+        .entries
+        .iter()
+        .filter_map(|entry| match entry {
+            npa_package::PromotionOriginEntryV3::SourceV2(entry) => Some(entry.promotion_id()),
+            npa_package::PromotionOriginEntryV3::CatalogTargetV1(_) => None,
+        })
+        .collect::<BTreeSet<_>>();
+    let new_source_ids = source_registry
+        .entries
+        .iter()
+        .map(PromotionOriginEntryV2::promotion_id)
+        .collect::<BTreeSet<_>>();
+    if source_registry.generation != previous.generation.checked_add(1).ok_or(())?
+        || !old_source_ids.is_subset(&new_source_ids)
+        || new_source_ids.len() != old_source_ids.len() + 1
+    {
+        return Err(());
+    }
+    previous.entries.retain(|entry| {
+        matches!(
+            entry,
+            npa_package::PromotionOriginEntryV3::CatalogTargetV1(_)
+        )
+    });
+    previous.entries.extend(
+        source_registry
+            .entries
+            .into_iter()
+            .map(npa_package::PromotionOriginEntryV3::SourceV2),
+    );
+    previous
+        .entries
+        .sort_by_key(npa_package::PromotionOriginEntryV3::owner_id);
+    previous.generation = source_registry.generation;
+    previous.refresh_hash().map_err(|_| ())?;
+    npa_package::validate_promotion_origin_registry_v3_source_promotion_transition(
+        &previous_before,
+        &previous,
+    )
+    .map_err(|_| ())?;
+    Ok(previous)
 }
 
 fn change_is_scoped(
@@ -3988,6 +4073,7 @@ fn update_stage_registry_v2(
     enum Previous {
         V1(npa_package::PromotionOriginRegistry),
         V2(npa_package::PromotionOriginRegistryV2),
+        V3(npa_package::PromotionOriginRegistryV3),
     }
     let (previous, mut registry) = match parse_promotion_origin_registry_versioned(&registry_source)
         .map_err(|_| ())?
@@ -3996,6 +4082,10 @@ fn update_stage_registry_v2(
         ParsedPromotionOriginRegistry::V1(previous) => {
             let migrated = migrate_promotion_origin_registry_v1_to_v2(&previous).map_err(|_| ())?;
             (Previous::V1(previous), migrated)
+        }
+        ParsedPromotionOriginRegistry::V3(previous) => {
+            let base = v3_source_registry(&previous)?;
+            (Previous::V3(previous), base)
         }
     };
     let snapshot = load_package_audit_snapshot(
@@ -4093,6 +4183,11 @@ fn update_stage_registry_v2(
         Previous::V2(previous) => {
             validate_promotion_origin_registry_v2_transition(&previous, &registry)
                 .map_err(|_| ())?;
+        }
+        Previous::V3(previous) => {
+            let next = merge_v3_source_registry(previous, registry)?;
+            return fs::write(registry_path, next.canonical_json().map_err(|_| ())?)
+                .map_err(|_| ());
         }
     }
     fs::write(registry_path, registry.canonical_json().map_err(|_| ())?).map_err(|_| ())

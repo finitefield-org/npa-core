@@ -111,6 +111,7 @@ fn candidate_bridge_decode_error() -> ReferenceCheckError {
         offset: 0,
         reason: None,
         reference: None,
+        structural_limit: None,
     }
 }
 
@@ -165,6 +166,7 @@ fn graph_error(reason: ReferenceCheckReason, offset: usize) -> ReferenceCheckErr
         offset,
         reason: Some(reason),
         reference: None,
+        structural_limit: None,
     }
 }
 
@@ -178,6 +180,7 @@ fn candidate_resource_error(
         offset,
         reason: Some(ReferenceCheckReason::ResourceLimit),
         reference: None,
+        structural_limit: None,
     }
 }
 
@@ -188,6 +191,7 @@ fn source_input_error() -> ReferenceCheckError {
         offset: 0,
         reason: Some(ReferenceCheckReason::SourceInputForbidden),
         reference: None,
+        structural_limit: None,
     }
 }
 
@@ -746,6 +750,7 @@ fn failed_json_with_context(
         error.offset,
         certificate,
         error.reference.as_ref(),
+        error.structural_limit.as_ref(),
     )
 }
 
@@ -756,6 +761,7 @@ fn failed_json_fields(
     offset: usize,
     certificate: Option<&ModuleCert>,
     reference: Option<&ReferenceCheckReference>,
+    structural_limit: Option<&npa_checker_ref::ReferenceStructuralLimit>,
 ) -> String {
     let mut error_fields = vec![format!("\"kind\":{}", json_string(kind))];
     if let Some(reason_code) = reason_code {
@@ -776,6 +782,16 @@ fn failed_json_fields(
                     .join(",")
             ));
         }
+    }
+    if let Some(limit) = structural_limit {
+        error_fields.push(format!(
+            "\"expected_value\":{}",
+            json_string(&format!("{}<={}", limit.kind.as_str(), limit.limit))
+        ));
+        error_fields.push(format!(
+            "\"actual_value\":{}",
+            json_string(&limit.observed.to_string())
+        ));
     }
     error_fields.push(format!("\"section\":{}", json_string(section)));
     error_fields.push(format!("\"offset\":{offset}"));
@@ -805,6 +821,7 @@ fn certificate_input_json() -> String {
         0,
         None,
         None,
+        None,
     )
 }
 
@@ -818,6 +835,7 @@ fn policy_input_json(bytes: &[u8]) -> String {
         "policy",
         0,
         certificate.as_ref(),
+        None,
         None,
     )
 }
@@ -962,6 +980,7 @@ mod tests {
                 declaration: reference_name("Std.Logic.Eq.rec"),
                 decl_interface_hash: [0xef; 32],
             }),
+            structural_limit: None,
         };
 
         let raw = failed_json_with_context(&error, None);
@@ -989,6 +1008,7 @@ mod tests {
                 declaration_index: 6,
                 declaration: None,
             }),
+            structural_limit: None,
         };
 
         let raw = failed_json_with_context(&error, None);
@@ -1007,6 +1027,7 @@ mod tests {
             offset: 13,
             reason: Some(ReferenceCheckReason::UnknownReference),
             reference: None,
+            structural_limit: None,
         };
 
         let raw = failed_json_with_context(&error, None);

@@ -196,6 +196,12 @@ type module_hashes = {
   certificate_hash_offset : Ext_bytes.offset;
 }
 
+type structural_cost = {
+  max_depth : int;
+  max_root_expansion : int;
+  certificate_expansion : int;
+}
+
 type decoded_module = {
   header : header;
   imports : located_import list;
@@ -206,6 +212,7 @@ type decoded_module = {
   export_block : export_entry list;
   axiom_report : axiom_report;
   hashes : module_hashes;
+  structural_cost : structural_cost option;
 }
 
 let current_format = "NPA-CERT-0.2.0"
@@ -256,8 +263,8 @@ let find_dot_offset component =
 
 let read_hash section reader = Ext_bytes.take section 32 reader
 
-let read_vector section read_item reader =
-  match Ext_bytes.read_count section reader with
+let read_vector_with_limit section kind limit read_item reader =
+  match Ext_bytes.read_count_with_limit section kind limit reader with
   | Error err -> Error err
   | Ok (count, after_count) ->
       if count > Ext_bytes.remaining after_count then
@@ -271,6 +278,10 @@ let read_vector section read_item reader =
             | Ok (value, next) -> loop (remaining - 1) next (value :: decoded)
         in
         loop count after_count []
+
+let read_vector section read_item reader =
+  read_vector_with_limit section Ext_bytes.Nested_vector_entries
+    Ext_bytes.max_nested_vector_entries read_item reader
 
 let read_option section read_value reader =
   let tag_offset = Ext_bytes.offset reader in
@@ -339,24 +350,6 @@ let read_global_ref section import_count declaration_count names reader =
       bind
         (validate_global_ref section import_count declaration_count offset global_ref)
         (fun () -> Ok (global_ref, next)))
-
-let rec validate_term_global_refs section import_count declaration_count offset term =
-  match term with
-  | Ext_term.Sort _ | Ext_term.BVar _ -> Ok ()
-  | Ext_term.Const (global_ref, _) ->
-      validate_global_ref section import_count declaration_count offset global_ref
-  | Ext_term.App (fn, arg) ->
-      bind (validate_term_global_refs section import_count declaration_count offset fn)
-        (fun () -> validate_term_global_refs section import_count declaration_count offset arg)
-  | Ext_term.Lam (ty, body) | Ext_term.Pi (ty, body) ->
-      bind (validate_term_global_refs section import_count declaration_count offset ty)
-        (fun () -> validate_term_global_refs section import_count declaration_count offset body)
-  | Ext_term.Let (ty, value, body) ->
-      bind (validate_term_global_refs section import_count declaration_count offset ty)
-        (fun () ->
-          bind (validate_term_global_refs section import_count declaration_count offset value)
-            (fun () ->
-              validate_term_global_refs section import_count declaration_count offset body))
 
 let read_reducibility section reader =
   let offset = Ext_bytes.offset reader in
@@ -694,7 +687,10 @@ let read_axiom_refs section import_count declaration_count names reader =
     reader
 
 let read_declarations import_count names levels terms reader =
-  match Ext_bytes.read_usize Ext_bytes.Declarations reader with
+  match
+    Ext_bytes.read_count_with_limit Ext_bytes.Declarations
+      Ext_bytes.Declarations_limit Ext_bytes.max_declarations reader
+  with
   | Error err -> Error err
   | Ok (declaration_count, after_count) ->
       if declaration_count > Ext_bytes.remaining after_count then
@@ -814,7 +810,8 @@ let read_header reader =
                   Ok ({ format; core_spec; module_name; version }, next)))
 
 let read_imports reader =
-  read_vector Ext_bytes.Imports
+  read_vector_with_limit Ext_bytes.Imports Ext_bytes.Imports_limit
+    Ext_bytes.max_imports
     (fun current ->
       let import_offset = Ext_bytes.offset current in
       bind (read_name Ext_bytes.Imports current) (fun (module_name, after_name) ->
@@ -826,7 +823,10 @@ let read_imports reader =
     reader
 
 let read_name_table reader =
-  match Ext_bytes.read_count Ext_bytes.Name_table reader with
+  match
+    Ext_bytes.read_count_with_limit Ext_bytes.Name_table
+      Ext_bytes.Name_table_entries Ext_bytes.max_name_table_entries reader
+  with
   | Error err -> Error err
   | Ok (name_count, after_count) ->
       let rec loop remaining current names =
@@ -860,7 +860,8 @@ let read_export_kind reader =
       | tag -> Ext_bytes.error Ext_bytes.Export_block offset (Ext_bytes.Unknown_tag tag))
 
 let read_export_block version import_count names levels terms declaration_count reader =
-  read_vector Ext_bytes.Export_block
+  read_vector_with_limit Ext_bytes.Export_block Ext_bytes.Exports_limit
+    Ext_bytes.max_exports
     (fun current ->
       let export_offset = Ext_bytes.offset current in
       bind (read_name_ref Ext_bytes.Export_block names current) (fun (export_name, after_name) ->
@@ -876,20 +877,8 @@ let read_export_block version import_count names levels terms declaration_count 
                     (fun (export_universe_constraints, after_constraints) ->
                   bind (read_term_ref Ext_bytes.Export_block terms after_constraints)
                     (fun (export_ty, after_ty) ->
-                      bind
-                        (validate_term_global_refs Ext_bytes.Export_block import_count
-                           declaration_count export_offset export_ty)
-                        (fun () ->
-                          bind (read_option_term Ext_bytes.Export_block terms after_ty)
-                            (fun (export_body, after_body) ->
-                              let validate_body =
-                                match export_body with
-                                | None -> Ok ()
-                                | Some body ->
-                                    validate_term_global_refs Ext_bytes.Export_block import_count
-                                      declaration_count export_offset body
-                              in
-                              bind validate_body (fun () ->
+                      bind (read_option_term Ext_bytes.Export_block terms after_ty)
+                        (fun (export_body, after_body) ->
                                   bind (read_hash Ext_bytes.Export_block after_body)
                                     (fun (export_type_hash, after_type_hash) ->
                                       bind
@@ -936,7 +925,7 @@ let read_export_block version import_count names levels terms declaration_count 
                                                                 export_axiom_dependencies;
                                                                 export_offset;
                                                               },
-                                                              next ))))))))))))))))
+                                                              next ))))))))))))))
     reader
 
 let read_axiom_report import_count names declaration_count reader =
@@ -960,7 +949,10 @@ let read_axiom_report import_count names declaration_count reader =
                     },
                     next ))))
   in
-  bind (read_vector Ext_bytes.Axiom_report read_decl_report reader)
+  bind
+    (read_vector_with_limit Ext_bytes.Axiom_report
+       Ext_bytes.Declarations_limit Ext_bytes.max_declarations read_decl_report
+       reader)
     (fun (per_declaration, after_reports) ->
       let module_axioms_offset = Ext_bytes.offset after_reports in
       bind
@@ -1093,6 +1085,7 @@ let read_module_sections reader =
                                                 export_block;
                                                 axiom_report;
                                                 hashes;
+                                                structural_cost = None;
                                               },
                                               next )))))))))))
 
@@ -1132,106 +1125,6 @@ let empty_used_tables () =
 
 let mark_name used name = Name_set.replace used.used_names name ()
 
-let byte value = String.make 1 (Char.chr value)
-
-let encode_usize value = Ext_bytes.encode_uvar (Int64.of_int value)
-
-let encode_name_key name =
-  let components = Ext_name.components name in
-  encode_usize (List.length components)
-  ^ String.concat ""
-      (List.map (fun component -> encode_usize (String.length component) ^ component) components)
-
-let hash_with_domain domain payload =
-  Bytes.to_string (Ext_hash.sha256_raw_string (domain ^ payload))
-
-let name_index section offset name_table name =
-  let rec loop index entries =
-    match entries with
-    | [] -> Ext_bytes.error section offset Ext_bytes.Dangling_reference
-    | entry :: rest ->
-        if Ext_name.equal entry.name name then Ok index else loop (index + 1) rest
-  in
-  loop 0 name_table
-
-let global_ref_payload section offset name_table global_ref =
-  match global_ref with
-  | Ext_term.Imported { import_index; name; decl_interface_hash } ->
-      bind (name_index section offset name_table name) (fun name_id ->
-          Ok
-            (byte 0x00 ^ encode_usize import_index ^ encode_usize name_id
-           ^ decl_interface_hash))
-  | Ext_term.Local { decl_index } -> Ok (byte 0x01 ^ encode_usize decl_index)
-  | Ext_term.LocalGenerated { decl_index; name } ->
-      bind (name_index section offset name_table name) (fun name_id ->
-          Ok (byte 0x02 ^ encode_usize decl_index ^ encode_usize name_id))
-  | Ext_term.Builtin { name; decl_interface_hash } ->
-      bind (name_index section offset name_table name) (fun name_id ->
-          Ok (byte 0x03 ^ encode_usize name_id ^ decl_interface_hash))
-
-let rec level_height level =
-  match level with
-  | Ext_level.Zero | Ext_level.Param _ -> 0
-  | Ext_level.Succ inner -> level_height inner + 1
-  | Ext_level.Max (lhs, rhs) | Ext_level.Imax (lhs, rhs) ->
-      max (level_height lhs) (level_height rhs) + 1
-
-let rec level_payload level =
-  match level with
-  | Ext_level.Zero -> byte 0x00
-  | Ext_level.Succ inner -> byte 0x01 ^ level_hash inner
-  | Ext_level.Max (lhs, rhs) -> byte 0x02 ^ level_hash lhs ^ level_hash rhs
-  | Ext_level.Imax (lhs, rhs) -> byte 0x03 ^ level_hash lhs ^ level_hash rhs
-  | Ext_level.Param name -> byte 0x04 ^ encode_name_key name
-
-and level_hash level = hash_with_domain "NPA-LEVEL-0.1" (level_payload level)
-
-let level_order_key level = (level_height level, level_payload level)
-
-let rec term_height term =
-  match term with
-  | Ext_term.Sort _ | Ext_term.BVar _ | Ext_term.Const _ -> 0
-  | Ext_term.App (fn, arg) -> max (term_height fn) (term_height arg) + 1
-  | Ext_term.Lam (ty, body) | Ext_term.Pi (ty, body) ->
-      max (term_height ty) (term_height body) + 1
-  | Ext_term.Let (ty, value, body) ->
-      max (term_height ty) (max (term_height value) (term_height body)) + 1
-
-let rec term_payload name_table offset term =
-  match term with
-  | Ext_term.Sort level -> Ok (byte 0x00 ^ level_hash level)
-  | Ext_term.BVar index -> Ok (byte 0x01 ^ encode_usize index)
-  | Ext_term.Const (global_ref, levels) ->
-      bind (global_ref_payload Ext_bytes.Term_table offset name_table global_ref)
-        (fun global_ref_bytes ->
-          Ok
-            (byte 0x02 ^ global_ref_bytes ^ encode_usize (List.length levels)
-           ^ String.concat "" (List.map level_hash levels)))
-  | Ext_term.App (fn, arg) ->
-      bind (term_hash name_table offset fn) (fun fn_hash ->
-          bind (term_hash name_table offset arg) (fun arg_hash ->
-              Ok (byte 0x03 ^ fn_hash ^ arg_hash)))
-  | Ext_term.Lam (ty, body) ->
-      bind (term_hash name_table offset ty) (fun ty_hash ->
-          bind (term_hash name_table offset body) (fun body_hash ->
-              Ok (byte 0x04 ^ ty_hash ^ body_hash)))
-  | Ext_term.Pi (ty, body) ->
-      bind (term_hash name_table offset ty) (fun ty_hash ->
-          bind (term_hash name_table offset body) (fun body_hash ->
-              Ok (byte 0x05 ^ ty_hash ^ body_hash)))
-  | Ext_term.Let (ty, value, body) ->
-      bind (term_hash name_table offset ty) (fun ty_hash ->
-          bind (term_hash name_table offset value) (fun value_hash ->
-              bind (term_hash name_table offset body) (fun body_hash ->
-                  Ok (byte 0x06 ^ ty_hash ^ value_hash ^ body_hash))))
-
-and term_hash name_table offset term =
-  bind (term_payload name_table offset term) (fun payload ->
-      Ok (hash_with_domain "NPA-TERM-0.1" payload))
-
-let term_order_key name_table offset term =
-  bind (term_payload name_table offset term) (fun payload -> Ok (term_height term, payload))
-
 let validate_strict_order section offset_of value_of key_of entries =
   let rec loop previous entries =
     match entries with
@@ -1255,39 +1148,123 @@ let validate_name_table_order name_table =
 let validate_level_table_order level_table =
   validate_strict_order Ext_bytes.Level_table
     (fun (entry : Ext_level.located) -> entry.offset)
-    (fun entry -> entry.Ext_level.level)
-    level_order_key level_table
+    (fun entry -> entry)
+    (fun entry ->
+      (entry.Ext_level.depth - 1, entry.Ext_level.order_payload))
+    level_table
 
 let validate_term_table_order name_table term_table =
-  let rec loop previous entries =
-    match entries with
+  let _ = name_table in
+  validate_strict_order Ext_bytes.Term_table
+    (fun (entry : Ext_term.located) -> entry.offset)
+    (fun entry -> entry)
+    (fun entry ->
+      (entry.Ext_term.order_height, entry.Ext_term.order_payload))
+    term_table
+
+let level_rank = function
+  | Ext_level.Zero -> 0
+  | Ext_level.Succ _ -> 1
+  | Ext_level.Max _ -> 2
+  | Ext_level.Imax _ -> 3
+  | Ext_level.Param _ -> 4
+
+let compare_levels_iterative lhs rhs =
+  let rec loop = function
+    | [] -> 0
+    | (lhs, rhs) :: rest ->
+        if lhs == rhs then loop rest
+        else
+          let rank_comparison =
+            Int.compare (level_rank lhs) (level_rank rhs)
+          in
+          if rank_comparison <> 0 then rank_comparison
+          else
+            match (lhs, rhs) with
+            | Ext_level.Zero, Ext_level.Zero -> loop rest
+            | Ext_level.Succ lhs, Ext_level.Succ rhs ->
+                loop ((lhs, rhs) :: rest)
+            | Ext_level.Max (lhs_a, lhs_b), Ext_level.Max (rhs_a, rhs_b)
+            | Ext_level.Imax (lhs_a, lhs_b),
+              Ext_level.Imax (rhs_a, rhs_b) ->
+                loop ((lhs_a, rhs_a) :: (lhs_b, rhs_b) :: rest)
+            | Ext_level.Param lhs, Ext_level.Param rhs ->
+                let comparison =
+                  String.compare
+                    (Ext_name.to_string lhs)
+                    (Ext_name.to_string rhs)
+                in
+                if comparison = 0 then loop rest else comparison
+            | _ -> rank_comparison
+  in
+  loop [ (lhs, rhs) ]
+
+module Level_identity_map = Hashtbl.Make (struct
+  type t = Ext_level.t
+
+  let equal lhs rhs = lhs == rhs
+  let hash = Hashtbl.hash
+end)
+
+let validate_level_table_normalization level_table =
+  let naturals = Level_identity_map.create (max 16 (List.length level_table)) in
+  let natural level =
+    match Level_identity_map.find_opt naturals level with
+    | Some value -> value
+    | None -> None
+  in
+  let is_zero = function Ext_level.Zero -> true | _ -> false in
+  let rec loop = function
     | [] -> Ok ()
     | entry :: rest ->
-        bind (term_order_key name_table entry.Ext_term.offset entry.Ext_term.term)
-          (fun current ->
-            if Stdlib.compare previous current >= 0 then
-              Ext_bytes.error Ext_bytes.Term_table entry.Ext_term.offset
-                Ext_bytes.Noncanonical_order
-            else loop current rest)
+        let level = entry.Ext_level.level in
+        let normalized, as_natural =
+          match level with
+          | Ext_level.Zero -> (true, Some 0)
+          | Ext_level.Param _ -> (true, None)
+          | Ext_level.Succ inner ->
+              (true, Option.map (( + ) 1) (natural inner))
+          | Ext_level.Max (lhs, rhs) ->
+              ( (not (lhs == rhs))
+                && not (is_zero lhs)
+                && not (is_zero rhs)
+                &&
+                (match (natural lhs, natural rhs) with
+                | Some _, Some _ -> false
+                | _ -> compare_levels_iterative rhs lhs >= 0),
+                None )
+          | Ext_level.Imax (_, rhs) ->
+              ( (match rhs with
+                | Ext_level.Zero | Ext_level.Succ _ -> false
+                | _ -> true),
+                None )
+        in
+        if not normalized then
+          Ext_bytes.error Ext_bytes.Level_table entry.Ext_level.offset
+            Ext_bytes.Non_normalized_level
+        else (
+          Level_identity_map.replace naturals level as_natural;
+          loop rest)
   in
-  match term_table with
-  | [] -> Ok ()
-  | entry :: rest ->
-      bind (term_order_key name_table entry.Ext_term.offset entry.Ext_term.term) (fun first ->
-          loop first rest)
+  loop level_table
 
-let rec mark_level used level =
-  if Level_identity_set.mem used.used_levels level then Ok ()
-  else (
-    Level_identity_set.add used.used_levels level ();
-    match level with
-    | Ext_level.Zero -> Ok ()
-    | Ext_level.Param name ->
-        mark_name used name;
-        Ok ()
-    | Ext_level.Succ inner -> mark_level used inner
-    | Ext_level.Max (lhs, rhs) | Ext_level.Imax (lhs, rhs) ->
-        bind (mark_level used lhs) (fun () -> mark_level used rhs))
+let mark_level used level =
+  let rec loop = function
+    | [] -> Ok ()
+    | level :: rest ->
+        if Level_identity_set.mem used.used_levels level then loop rest
+        else (
+          Level_identity_set.add used.used_levels level ();
+          match level with
+          | Ext_level.Zero -> loop rest
+          | Ext_level.Param name ->
+              mark_name used name;
+              loop rest
+          | Ext_level.Succ inner -> loop (inner :: rest)
+          | Ext_level.Max (lhs, rhs) | Ext_level.Imax (lhs, rhs) ->
+              loop (lhs :: rhs :: rest))
+  in
+  loop [ level ]
 
 let mark_global_ref used import_count declaration_count section offset global_ref =
   bind (validate_global_ref section import_count declaration_count offset global_ref) (fun () ->
@@ -1300,30 +1277,36 @@ let mark_global_ref used import_count declaration_count section offset global_re
           Ok ()
       | Ext_term.Local _ -> Ok ())
 
-let rec mark_term used import_count declaration_count section offset term =
-  if Term_identity_set.mem used.used_terms term then Ok ()
-  else (
-    Term_identity_set.add used.used_terms term ();
-    match term with
-    | Ext_term.Sort level -> mark_level used level
-    | Ext_term.BVar _ -> Ok ()
-    | Ext_term.Const (global_ref, levels) ->
-        bind (mark_global_ref used import_count declaration_count section offset global_ref)
-          (fun () ->
-            List.fold_left
-              (fun result level -> bind result (fun () -> mark_level used level))
-              (Ok ()) levels)
-    | Ext_term.App (fn, arg) ->
-        bind (mark_term used import_count declaration_count section offset fn)
-          (fun () -> mark_term used import_count declaration_count section offset arg)
-    | Ext_term.Lam (ty, body) | Ext_term.Pi (ty, body) ->
-        bind (mark_term used import_count declaration_count section offset ty)
-          (fun () -> mark_term used import_count declaration_count section offset body)
-    | Ext_term.Let (ty, value, body) ->
-        bind (mark_term used import_count declaration_count section offset ty)
-          (fun () ->
-            bind (mark_term used import_count declaration_count section offset value) (fun () ->
-                mark_term used import_count declaration_count section offset body)))
+let mark_term used import_count declaration_count section offset term =
+  let rec loop = function
+    | [] -> Ok ()
+    | term :: rest ->
+        if Term_identity_set.mem used.used_terms term then loop rest
+        else (
+          Term_identity_set.add used.used_terms term ();
+          match term with
+          | Ext_term.Sort level ->
+              bind (mark_level used level) (fun () -> loop rest)
+          | Ext_term.BVar _ -> loop rest
+          | Ext_term.Const (global_ref, levels) ->
+              bind
+                (mark_global_ref used import_count declaration_count section
+                   offset global_ref)
+                (fun () ->
+                  bind
+                    (List.fold_left
+                       (fun result level ->
+                         bind result (fun () -> mark_level used level))
+                       (Ok ()) levels)
+                    (fun () -> loop rest))
+          | Ext_term.App (fn, arg)
+          | Ext_term.Lam (fn, arg)
+          | Ext_term.Pi (fn, arg) ->
+              loop (fn :: arg :: rest)
+          | Ext_term.Let (ty, value, body) ->
+              loop (ty :: value :: body :: rest))
+  in
+  loop [ term ]
 
 let mark_names used names =
   List.iter (mark_name used) names;
@@ -1571,94 +1554,232 @@ let validate_used_terms term_table used_terms =
   in
   loop term_table
 
-let validate_resource_shape decoded =
-  let max_steps = 5_000_000 in
-  let steps = ref 0 in
-  let resource_error section offset =
-    Ext_bytes.error section offset Ext_bytes.Resource_limit
-  in
-  let spend section offset =
-    if !steps >= max_steps then resource_error section offset
-    else (
-      steps := !steps + 1;
-      Ok ())
-  in
-  let rec levels stack =
-    match stack with
+module Term_identity_map = Hashtbl.Make (struct
+  type t = Ext_term.t
+
+  let equal lhs rhs = lhs == rhs
+  let hash = Hashtbl.hash
+end)
+
+let validate_structural_depth decoded =
+  match
+    List.find_opt
+      (fun located ->
+        located.Ext_level.depth > Ext_bytes.max_node_depth)
+      decoded.level_table
+  with
+  | Some located ->
+      Ext_bytes.structural_error Ext_bytes.Level_table
+        located.Ext_level.offset Ext_bytes.Structural_depth
+        Ext_bytes.max_node_depth (Ext_bytes.max_node_depth + 1)
+  | None -> (
+      match
+        List.find_opt
+          (fun located ->
+            located.Ext_term.depth > Ext_bytes.max_node_depth)
+          decoded.term_table
+      with
+      | Some located ->
+          Ext_bytes.structural_error Ext_bytes.Term_table
+            located.Ext_term.offset Ext_bytes.Structural_depth
+            Ext_bytes.max_node_depth (Ext_bytes.max_node_depth + 1)
+      | None -> Ok ())
+
+let validate_term_global_refs decoded =
+  let import_count = List.length decoded.imports in
+  let declaration_count = List.length decoded.declaration_table in
+  let rec loop = function
     | [] -> Ok ()
-    | (depth, offset, level) :: rest ->
-        if depth > Ext_bytes.max_node_depth then
-          resource_error Ext_bytes.Level_table offset
-        else
-          match spend Ext_bytes.Level_table offset with
-          | Error error -> Error error
-          | Ok () -> (
-              match level with
-              | Ext_level.Zero | Ext_level.Param _ -> levels rest
-              | Ext_level.Succ inner ->
-                  levels ((depth + 1, offset, inner) :: rest)
-              | Ext_level.Max (lhs, rhs) | Ext_level.Imax (lhs, rhs) ->
-                  levels
-                    ((depth + 1, offset, lhs)
-                    :: (depth + 1, offset, rhs)
-                    :: rest))
+    | located :: rest -> (
+        match located.Ext_term.term with
+        | Ext_term.Const (global_ref, _) ->
+            bind
+              (validate_global_ref Ext_bytes.Term_table import_count declaration_count
+                 located.Ext_term.offset global_ref)
+              (fun () -> loop rest)
+        | _ -> loop rest)
   in
-  let level_stack =
-    List.fold_left
-      (fun stack located ->
-        (1, located.Ext_level.offset, located.Ext_level.level) :: stack)
-      [] decoded.level_table
+  loop decoded.term_table
+
+let validate_resource_shape decoded =
+  let level_costs =
+    Level_identity_map.create (max 16 (List.length decoded.level_table))
   in
-  bind (levels level_stack) (fun () ->
-      let rec terms stack =
-        match stack with
-        | [] -> Ok ()
-        | (depth, offset, term) :: rest ->
-            if depth > Ext_bytes.max_node_depth then
-              resource_error Ext_bytes.Term_table offset
-            else
-              match spend Ext_bytes.Term_table offset with
-              | Error error -> Error error
-              | Ok () -> (
-                  match term with
-                  | Ext_term.Sort _ | Ext_term.BVar _ | Ext_term.Const _ ->
-                      terms rest
-                  | Ext_term.App (fn, arg)
-                  | Ext_term.Lam (fn, arg)
-                  | Ext_term.Pi (fn, arg) ->
-                      terms
-                        ((depth + 1, offset, fn)
-                        :: (depth + 1, offset, arg)
-                        :: rest)
-                  | Ext_term.Let (ty, value, body) ->
-                      terms
-                        ((depth + 1, offset, ty)
-                        :: (depth + 1, offset, value)
-                        :: (depth + 1, offset, body)
-                        :: rest))
-      in
-      let term_stack =
-        List.fold_left
-          (fun stack located ->
-            (1, located.Ext_term.offset, located.Ext_term.term) :: stack)
-          [] decoded.term_table
-      in
-      terms term_stack)
+  let term_costs =
+    Term_identity_map.create (max 16 (List.length decoded.term_table))
+  in
+  List.iter
+    (fun located ->
+      Level_identity_map.replace level_costs located.Ext_level.level
+        (located.Ext_level.depth, located.Ext_level.expanded))
+    decoded.level_table;
+  List.iter
+    (fun located ->
+      Term_identity_map.replace term_costs located.Ext_term.term
+        (located.Ext_term.depth, located.Ext_term.expanded))
+    decoded.term_table;
+  let total = ref 0 in
+  let max_depth = ref 0 in
+  let max_root = ref 0 in
+  let charge section offset depth expanded =
+    if expanded > Ext_bytes.max_root_expanded_nodes then
+      Ext_bytes.structural_error section offset
+        Ext_bytes.Root_expanded_nodes Ext_bytes.max_root_expanded_nodes
+        (Ext_bytes.max_root_expanded_nodes + 1)
+    else (
+      max_depth := max !max_depth depth;
+      max_root := max !max_root expanded;
+      if
+        !total > Ext_bytes.max_certificate_expanded_nodes - expanded
+      then
+        Ext_bytes.structural_error section offset
+          Ext_bytes.Certificate_expanded_nodes
+          Ext_bytes.max_certificate_expanded_nodes
+          (Ext_bytes.max_certificate_expanded_nodes + 1)
+      else (
+        total := !total + expanded;
+        Ok ()))
+  in
+  let charge_level section offset level =
+    match Level_identity_map.find_opt level_costs level with
+    | None -> Ext_bytes.error section offset Ext_bytes.Dangling_reference
+    | Some (depth, expanded) -> charge section offset depth expanded
+  in
+  let charge_term section offset term =
+    match Term_identity_map.find_opt term_costs term with
+    | None -> Ext_bytes.error section offset Ext_bytes.Dangling_reference
+    | Some (depth, expanded) -> charge section offset depth expanded
+  in
+  let constraints section offset constraints =
+    fold_unit constraints (fun constraint_ ->
+        bind
+          (charge_level section offset constraint_.constraint_lhs)
+          (fun () ->
+            charge_level section offset constraint_.constraint_rhs))
+  in
+  let binders section offset binders =
+    fold_unit binders (fun binder ->
+        charge_term section offset binder.binder_ty)
+  in
+  let constructors section offset constructors =
+    fold_unit constructors (fun constructor ->
+        charge_term section offset constructor.constructor_ty)
+  in
+  let recursor section offset = function
+    | None -> Ok ()
+    | Some recursor -> charge_term section offset recursor.recursor_ty
+  in
+  let inductive_roots section offset params indices sort constructors_
+      recursor_ =
+    bind (binders section offset params) (fun () ->
+        bind (binders section offset indices) (fun () ->
+            bind (charge_level section offset sort) (fun () ->
+                bind (constructors section offset constructors_) (fun () ->
+                    recursor section offset recursor_))))
+  in
+  let declaration (declaration : declaration) =
+    let section = Ext_bytes.Declarations in
+    let offset = declaration.offset in
+    match declaration.payload with
+    | AxiomDecl { decl_universe_constraints; decl_ty; _ } ->
+        bind (constraints section offset decl_universe_constraints)
+          (fun () -> charge_term section offset decl_ty)
+    | DefDecl
+        {
+          decl_universe_constraints;
+          decl_ty;
+          decl_value;
+          _;
+        } ->
+        bind (constraints section offset decl_universe_constraints)
+          (fun () ->
+            bind (charge_term section offset decl_ty) (fun () ->
+                charge_term section offset decl_value))
+    | TheoremDecl
+        {
+          decl_universe_constraints;
+          decl_ty;
+          decl_proof;
+          _;
+        } ->
+        bind (constraints section offset decl_universe_constraints)
+          (fun () ->
+            bind (charge_term section offset decl_ty) (fun () ->
+                charge_term section offset decl_proof))
+    | InductiveDecl
+        {
+          decl_universe_constraints;
+          ind_params;
+          ind_indices;
+          ind_sort;
+          ind_constructors;
+          ind_recursor;
+          _;
+        } ->
+        bind (constraints section offset decl_universe_constraints)
+          (fun () ->
+            inductive_roots section offset ind_params ind_indices ind_sort
+              ind_constructors ind_recursor)
+    | MutualInductiveBlockDecl
+        {
+          decl_universe_constraints;
+          mutual_inductives;
+          _;
+        } ->
+        bind (constraints section offset decl_universe_constraints)
+          (fun () ->
+            fold_unit mutual_inductives (fun inductive ->
+                inductive_roots section offset inductive.mutual_params
+                  inductive.mutual_indices inductive.mutual_sort
+                  inductive.mutual_constructors inductive.mutual_recursor))
+  in
+  let export (export : export_entry) =
+    let section = Ext_bytes.Export_block in
+    let offset = export.export_offset in
+    bind
+      (constraints section offset export.export_universe_constraints)
+      (fun () ->
+        bind (charge_term section offset export.export_ty) (fun () ->
+            match export.export_body with
+            | None -> Ok ()
+            | Some body -> charge_term section offset body))
+  in
+  bind (fold_unit decoded.declaration_table declaration) (fun () ->
+      bind (fold_unit decoded.export_block export) (fun () ->
+          Ok
+            {
+              max_depth = !max_depth;
+              max_root_expansion = !max_root;
+              certificate_expansion = !total;
+            }))
 
 let validate_decoded_module decoded =
   bind (validate_name_table_order decoded.name_table) (fun () ->
-      bind (validate_level_table_order decoded.level_table) (fun () ->
+      bind (validate_level_table_normalization decoded.level_table) (fun () ->
+        bind (validate_level_table_order decoded.level_table) (fun () ->
           bind (validate_term_table_order decoded.name_table decoded.term_table) (fun () ->
               bind (collect_roots decoded) (fun used ->
                   bind (validate_used_names decoded.name_table used.used_names) (fun () ->
                       bind (validate_used_levels decoded.level_table used.used_levels) (fun () ->
-                          validate_used_terms decoded.term_table used.used_terms))))))
+                          validate_used_terms decoded.term_table used.used_terms)))))))
 
 let read_module reader =
+  if Ext_bytes.length reader > Ext_bytes.max_certificate_bytes then
+    Ext_bytes.structural_error Ext_bytes.Full_certificate 0
+      Ext_bytes.Certificate_bytes Ext_bytes.max_certificate_bytes
+      (Ext_bytes.length reader)
+  else
   bind (read_module_sections reader) (fun (decoded, next) ->
-      bind (validate_resource_shape decoded) (fun () ->
-          bind (validate_decoded_module decoded) (fun () ->
-              if Ext_bytes.remaining next = 0 then Ok (decoded, next)
-              else
-                Ext_bytes.error Ext_bytes.Full_certificate
-                  (Ext_bytes.offset next) Ext_bytes.Trailing_bytes)))
+      if Ext_bytes.remaining next <> 0 then
+        Ext_bytes.error Ext_bytes.Full_certificate
+          (Ext_bytes.offset next) Ext_bytes.Trailing_bytes
+      else
+      bind (validate_term_global_refs decoded) (fun () ->
+          bind (validate_structural_depth decoded) (fun () ->
+              bind (validate_resource_shape decoded) (fun structural_cost ->
+                  let decoded = { decoded with structural_cost = Some structural_cost } in
+                  bind (validate_decoded_module decoded) (fun () ->
+                      if Ext_bytes.remaining next = 0 then Ok (decoded, next)
+                      else
+                        Ext_bytes.error Ext_bytes.Full_certificate
+                          (Ext_bytes.offset next) Ext_bytes.Trailing_bytes)))))

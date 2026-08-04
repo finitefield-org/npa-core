@@ -16,6 +16,7 @@ npa-api = { path = "../npa-api" }
 npa-cert = { path = "../npa-cert" }
 npa-checker-ref = { path = "../npa-checker-ref" }
 npa-frontend = { path = "../npa-frontend" }
+npa-kernel = { path = "../npa-kernel" }
 npa-package = { path = "../npa-package" }
 sha2 = "0.10"
 toml_edit = "0.22"

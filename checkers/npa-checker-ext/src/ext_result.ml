@@ -64,12 +64,14 @@ type checker_error = {
   core_path : string list option;
   section : string option;
   offset : int option;
+  expected_value : string option;
+  actual_value : string option;
   expected_hash : string option;
   actual_hash : string option;
 }
 
 let checker_error ?reason_code ?declaration ?core_path ?section ?offset
-    ?expected_hash ?actual_hash kind =
+    ?expected_value ?actual_value ?expected_hash ?actual_hash kind =
   {
     kind;
     reason_code;
@@ -77,6 +79,8 @@ let checker_error ?reason_code ?declaration ?core_path ?section ?offset
     core_path;
     section;
     offset;
+    expected_value;
+    actual_value;
     expected_hash;
     actual_hash;
   }
@@ -127,6 +131,12 @@ let render_error error =
     (match error.offset with
     | None -> []
     | Some offset -> [ "\"offset\": " ^ string_of_int offset ])
+    @ (match error.expected_value with
+      | None -> []
+      | Some value -> [ "\"expected_value\": " ^ json_string value ])
+    @ (match error.actual_value with
+      | None -> []
+      | Some value -> [ "\"actual_value\": " ^ json_string value ])
     @ (match error.expected_hash with
       | None -> []
       | Some hash -> [ "\"expected_hash\": " ^ json_string hash ])
@@ -219,7 +229,8 @@ let decode_error_kind error =
   | Ext_bytes.Dangling_reference
   | Ext_bytes.Trailing_bytes
   | Ext_bytes.Unresolved_metavariable
-  | Ext_bytes.Resource_limit ->
+  | Ext_bytes.Resource_limit
+  | Ext_bytes.Structural_resource_limit _ ->
       "certificate_decode_error"
 
 let decode_error error =

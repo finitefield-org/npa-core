@@ -93,6 +93,7 @@ pub struct HumanDiagnosticPayload {
     pub hole_goals: Vec<HumanHoleGoal>,
     pub unsolved_meta: Option<HumanUnsolvedMeta>,
     pub conversion: Option<HumanDiagnosticConversionContext>,
+    pub universe_mismatch: Option<HumanUniverseMismatchContext>,
 }
 
 impl HumanDiagnosticPayload {
@@ -112,6 +113,72 @@ impl HumanDiagnosticPayload {
     pub fn with_conversion(mut self, conversion: HumanDiagnosticConversionContext) -> Self {
         self.conversion = Some(conversion);
         self
+    }
+
+    #[must_use]
+    pub fn with_universe_mismatch(mut self, mismatch: HumanUniverseMismatchContext) -> Self {
+        self.universe_mismatch = Some(mismatch);
+        self
+    }
+}
+
+/// Bounded universe-level context for a kernel-rejected Human declaration.
+#[non_exhaustive]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HumanUniverseMismatchContext {
+    declaration_name: String,
+    type_path: String,
+    declared_level: String,
+    inferred_level: String,
+    universe_params: Vec<String>,
+}
+
+impl HumanUniverseMismatchContext {
+    pub fn new(
+        declaration_name: impl Into<String>,
+        type_path: impl Into<String>,
+        declared_level: impl Into<String>,
+        inferred_level: impl Into<String>,
+        universe_params: Vec<String>,
+    ) -> Option<Self> {
+        let declaration_name = declaration_name.into();
+        let type_path = type_path.into();
+        let declared_level = declared_level.into();
+        let inferred_level = inferred_level.into();
+        if declaration_name.is_empty()
+            || type_path.is_empty()
+            || declared_level.is_empty()
+            || inferred_level.is_empty()
+        {
+            return None;
+        }
+        Some(Self {
+            declaration_name,
+            type_path,
+            declared_level,
+            inferred_level,
+            universe_params,
+        })
+    }
+
+    pub fn declaration_name(&self) -> &str {
+        &self.declaration_name
+    }
+
+    pub fn type_path(&self) -> &str {
+        &self.type_path
+    }
+
+    pub fn declared_level(&self) -> &str {
+        &self.declared_level
+    }
+
+    pub fn inferred_level(&self) -> &str {
+        &self.inferred_level
+    }
+
+    pub fn universe_params(&self) -> &[String] {
+        &self.universe_params
     }
 }
 
@@ -331,6 +398,9 @@ fn merge_human_diagnostic_payload(
     }
     if next.conversion.is_none() {
         next.conversion = existing.conversion;
+    }
+    if next.universe_mismatch.is_none() {
+        next.universe_mismatch = existing.universe_mismatch;
     }
     next
 }

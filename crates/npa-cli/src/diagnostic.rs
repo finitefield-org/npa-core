@@ -14,6 +14,13 @@ pub const PACKAGE_TIMINGS_SCHEMA_V0_1: &str = "npa.package.timings.v0.1";
 pub const PACKAGE_TIMINGS_SCHEMA_V0_2: &str = "npa.package.timings.v0.2";
 /// Current integrated timing schema.
 pub const PACKAGE_TIMINGS_SCHEMA: &str = PACKAGE_TIMINGS_SCHEMA_V0_2;
+/// Stable schema string for interface-proposal curation checks.
+pub const INTERFACE_PROPOSAL_CHECK_SCHEMA: &str = "npa.mathlib.interface_proposal_check.v1";
+/// Stable schema string for the Lean interface-inventory adapter.
+pub const INTERFACE_INVENTORY_SCHEMA: &str = "npa.mathlib.interface_inventory.v1";
+/// Stable schema string for adopted interface-proposal surface drift.
+pub const INTERFACE_PROPOSAL_SURFACE_DRIFT_SCHEMA: &str =
+    "npa.mathlib.interface_proposal_surface_drift.v1";
 
 /// Process exit class for a command result.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -89,6 +96,10 @@ pub enum DiagnosticKind {
     GeneratedArtifact,
     /// Package artifact policy evaluation.
     PackagePolicy,
+    /// Interface-proposal curation metadata validation.
+    InterfaceProposal,
+    /// Lean interface-inventory metadata validation.
+    InterfaceInventory,
     /// Unexpected internal command failure.
     Internal,
 }
@@ -112,6 +123,8 @@ impl DiagnosticKind {
             Self::TheoremIndex => "TheoremIndex",
             Self::GeneratedArtifact => "GeneratedArtifact",
             Self::PackagePolicy => "PackagePolicy",
+            Self::InterfaceProposal => "InterfaceProposal",
+            Self::InterfaceInventory => "InterfaceInventory",
             Self::Internal => "Internal",
         }
     }
@@ -132,7 +145,9 @@ impl DiagnosticKind {
             | Self::AxiomReport
             | Self::TheoremIndex
             | Self::GeneratedArtifact
-            | Self::PackagePolicy => CommandExitCode::PackageFailure,
+            | Self::PackagePolicy
+            | Self::InterfaceProposal
+            | Self::InterfaceInventory => CommandExitCode::PackageFailure,
         }
     }
 }
@@ -650,6 +665,260 @@ pub struct CommandTimings {
     pub measurements: Option<PerformanceMeasurementReport>,
 }
 
+/// Deterministic lifecycle-status counts for one interface-proposal snapshot.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InterfaceProposalStatusCounts {
+    /// Number of observed records.
+    pub observed: usize,
+    /// Number of proposed records.
+    pub proposed: usize,
+    /// Number of adopted records.
+    pub adopted: usize,
+    /// Number of withdrawn records.
+    pub withdrawn: usize,
+    /// Number of superseded records.
+    pub superseded: usize,
+}
+
+/// One deterministic interface-proposal row in a command result.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InterfaceProposalCheckRow {
+    /// Proposal-root-relative canonical path.
+    pub path: String,
+    /// Exact file hash rendered as `sha256:<hex>`.
+    pub file_hash: String,
+    /// Parsed proposal ID, or `None` when parsing failed.
+    pub proposal_id: Option<String>,
+    /// Parsed target module, or `None` when parsing failed.
+    pub module: Option<String>,
+    /// Parsed positive revision, or `None` when parsing failed.
+    pub proposal_revision: Option<u64>,
+    /// Parsed lifecycle status, or `None` when parsing failed.
+    pub interface_status: Option<String>,
+}
+
+/// One bounded, sanitized interface-proposal diagnostic.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InterfaceProposalCheckDiagnostic {
+    /// Stable lower-case diagnostic category.
+    pub category: String,
+    /// Stable lower-case diagnostic reason.
+    pub reason: String,
+    /// Sanitized proposal-relative path.
+    pub path: String,
+    /// Optional field name.
+    pub field: Option<String>,
+    /// Optional expected value.
+    pub expected: Option<String>,
+    /// Optional observed value.
+    pub actual: Option<String>,
+}
+
+/// Deterministic snapshot summary emitted by the interface-proposal command.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InterfaceProposalCheckSnapshot {
+    /// Number of discovered canonical TOML files.
+    pub proposal_count: usize,
+    /// Counts of successfully parsed records by lifecycle status.
+    pub status_counts: InterfaceProposalStatusCounts,
+    /// Ordered proposal rows.
+    pub proposal_rows: Vec<InterfaceProposalCheckRow>,
+    /// Complete proposal-set hash, or `None` for an incomplete scan.
+    pub proposal_set_hash: Option<String>,
+}
+
+/// Exact v1 payload for `package check-interface-proposals --json`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InterfaceProposalCheckOutput {
+    /// Whether the curation result is valid.
+    pub status: String,
+    /// Current proposal snapshot.
+    pub current: InterfaceProposalCheckSnapshot,
+    /// Optional caller-supplied previous proposal snapshot.
+    pub previous: Option<InterfaceProposalCheckSnapshot>,
+    /// Ordered structured diagnostics.
+    pub diagnostics: Vec<InterfaceProposalCheckDiagnostic>,
+}
+
+/// Caller-supplied immutable input pin for the interface-inventory adapter.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InterfaceInventoryPin {
+    /// Frozen ecosystem identifier.
+    pub ecosystem: String,
+    /// Caller-supplied repository identity.
+    pub repository: String,
+    /// Immutable locator kind.
+    pub revision_kind: String,
+    /// Caller-supplied full revision.
+    pub revision: String,
+    /// Caller-supplied license identifier.
+    pub license: String,
+    /// Optional license follow-up note.
+    pub license_note: Option<String>,
+    /// Explicitly non-authoritative revision binding mode.
+    pub revision_binding: String,
+}
+
+/// Exact bytes/hash summary for one selected inventory input file.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InterfaceInventoryInputFile {
+    /// Checkout-relative source path.
+    pub path: String,
+    /// SHA-256 hash of exact file bytes.
+    pub file_hash: String,
+    /// Exact source byte count.
+    pub byte_count: usize,
+}
+
+/// One normalized interface-inventory row.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InterfaceInventoryRow {
+    /// Normalized row family.
+    pub row_kind: String,
+    /// Stable deterministic row ID.
+    pub id: String,
+    /// Checkout-relative source path.
+    pub path: String,
+    /// One-based source line.
+    pub line: u32,
+    /// Caller-supplied repository identity.
+    pub repository: String,
+    /// Immutable locator kind.
+    pub revision_kind: String,
+    /// Caller-supplied full revision.
+    pub revision: String,
+    /// Caller-supplied license identifier.
+    pub license: String,
+    /// Normalized source module or imported module.
+    pub source_module: Option<String>,
+    /// Enclosing or selected source declaration.
+    pub source_declaration: Option<String>,
+    /// Referenced selected declaration for use rows.
+    pub referenced_declaration: Option<String>,
+    /// Canonical proposal usage kind.
+    pub usage_kind: String,
+    /// Lean declaration kind for declaration rows.
+    pub declaration_kind: Option<String>,
+    /// Import visibility for import rows.
+    pub import_visibility: Option<String>,
+    /// Bounded normalized notes.
+    pub notes: String,
+}
+
+/// One bounded interface-inventory diagnostic.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InterfaceInventoryDiagnostic {
+    /// Stable diagnostic category.
+    pub category: String,
+    /// Stable lower-case reason code.
+    pub reason: String,
+    /// Sanitized checkout-relative path, when applicable.
+    pub path: Option<String>,
+    /// One-based source line, when applicable.
+    pub line: Option<u32>,
+    /// Input field, when applicable.
+    pub field: Option<String>,
+    /// Bounded expected value.
+    pub expected: Option<String>,
+    /// Bounded actual value.
+    pub actual: Option<String>,
+}
+
+/// Exact v1 payload for `package inventory-interface --json`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InterfaceInventoryOutput {
+    /// Aggregate adapter status: `ok` or `invalid`.
+    pub status: String,
+    /// Validated caller pin, or `None` before pin validation succeeds.
+    pub pin: Option<InterfaceInventoryPin>,
+    /// Selected input files and exact hashes.
+    pub input_files: Vec<InterfaceInventoryInputFile>,
+    /// Deterministic selected-file set hash, when files were read.
+    pub source_set_hash: Option<String>,
+    /// Normalized rows; empty on any invalid result.
+    pub rows: Vec<InterfaceInventoryRow>,
+    /// Ordered bounded diagnostics.
+    pub diagnostics: Vec<InterfaceInventoryDiagnostic>,
+}
+
+/// Target artifact identity in the surface-drift result.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InterfaceProposalSurfaceTarget {
+    /// Target module name.
+    pub module: Option<String>,
+    /// Package-relative source path.
+    pub source: Option<String>,
+    /// Exact source file hash.
+    pub source_file_sha256: Option<String>,
+    /// Package-relative certificate path.
+    pub certificate: Option<String>,
+    /// Exact certificate file hash.
+    pub certificate_file_sha256: Option<String>,
+    /// Certificate identity hash.
+    pub certificate_sha256: Option<String>,
+    /// Export identity hash.
+    pub export_sha256: Option<String>,
+}
+
+/// Ten comparison-axis values in the frozen surface-drift contract.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InterfaceProposalSurfaceComparison {
+    /// Module-name comparison.
+    pub module_name: String,
+    /// Direct-import comparison.
+    pub direct_imports: String,
+    /// Declaration-order comparison.
+    pub declaration_order: String,
+    /// Declaration-name comparison.
+    pub declaration_names: String,
+    /// Declaration-kind comparison.
+    pub declaration_kinds: String,
+    /// Public/support surface comparison.
+    pub declaration_surfaces: String,
+    /// Signature comparison.
+    pub signatures: String,
+    /// Definition-body comparison.
+    pub definition_bodies: String,
+    /// Inductive-family comparison.
+    pub inductive_family_members: String,
+    /// Exported support-closure comparison.
+    pub exported_support_closure: String,
+}
+
+/// One bounded surface-drift diagnostic.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InterfaceProposalSurfaceDiagnostic {
+    /// Stable lower-case diagnostic category.
+    pub category: String,
+    /// Stable lower-case reason code.
+    pub reason: String,
+    /// Sanitized relative path, when applicable.
+    pub path: Option<String>,
+    /// Structured field, when applicable.
+    pub field: Option<String>,
+    /// Bounded expected value.
+    pub expected: Option<String>,
+    /// Bounded actual value.
+    pub actual: Option<String>,
+}
+
+/// Exact v1 payload for the adopted interface-proposal surface-drift command.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InterfaceProposalSurfaceOutput {
+    /// `parity`, `drift`, or `invalid`.
+    pub status: String,
+    /// Proposal-root-relative selected path.
+    pub proposal_path: String,
+    /// Caller-attested proposal hash string.
+    pub proposal_sha256: String,
+    /// Target identity, with unavailable scalars represented as `None`.
+    pub target: InterfaceProposalSurfaceTarget,
+    /// Frozen comparison-axis result.
+    pub comparison: InterfaceProposalSurfaceComparison,
+    /// Ordered bounded diagnostics.
+    pub diagnostics: Vec<InterfaceProposalSurfaceDiagnostic>,
+}
+
 /// Deterministic command result.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CommandResult {
@@ -665,6 +934,12 @@ pub struct CommandResult {
     pub artifacts: Vec<CommandArtifact>,
     /// Optional informational timing telemetry.
     pub timings: Option<Box<CommandTimings>>,
+    /// Optional command-specific interface-proposal result payload.
+    pub interface_proposals: Option<Box<InterfaceProposalCheckOutput>>,
+    /// Optional command-specific interface-inventory result payload.
+    pub interface_inventory: Option<Box<InterfaceInventoryOutput>>,
+    /// Optional command-specific surface-drift result payload.
+    pub interface_proposal_surface: Option<Box<InterfaceProposalSurfaceOutput>>,
 }
 
 impl CommandResult {
@@ -677,6 +952,9 @@ impl CommandResult {
             diagnostics: Vec::new(),
             artifacts: Vec::new(),
             timings: None,
+            interface_proposals: None,
+            interface_inventory: None,
+            interface_proposal_surface: None,
         }
     }
 
@@ -693,6 +971,9 @@ impl CommandResult {
             diagnostics,
             artifacts: Vec::new(),
             timings: None,
+            interface_proposals: None,
+            interface_inventory: None,
+            interface_proposal_surface: None,
         }
     }
 
@@ -727,8 +1008,38 @@ impl CommandResult {
         self
     }
 
+    /// Attach the exact interface-proposal command result payload.
+    pub fn with_interface_proposals(mut self, output: InterfaceProposalCheckOutput) -> Self {
+        self.interface_proposals = Some(Box::new(output));
+        self
+    }
+
+    /// Attach the exact interface-inventory command result payload.
+    pub fn with_interface_inventory(mut self, output: InterfaceInventoryOutput) -> Self {
+        self.interface_inventory = Some(Box::new(output));
+        self
+    }
+
+    /// Attach the exact interface-proposal surface-drift result payload.
+    pub fn with_interface_proposal_surface(
+        mut self,
+        output: InterfaceProposalSurfaceOutput,
+    ) -> Self {
+        self.interface_proposal_surface = Some(Box::new(output));
+        self
+    }
+
     /// Render deterministic JSON.
     pub fn render_json(&self) -> String {
+        if let Some(output) = &self.interface_proposal_surface {
+            return render_interface_proposal_surface_json(output);
+        }
+        if let Some(output) = &self.interface_inventory {
+            return render_interface_inventory_json(output);
+        }
+        if let Some(output) = &self.interface_proposals {
+            return render_interface_proposal_json(output);
+        }
         let mut output = String::new();
         output.push('{');
         push_json_pair(
@@ -799,8 +1110,560 @@ impl CommandResult {
                 }));
             }
         }
+        if let Some(interface_proposals) = &self.interface_proposals {
+            lines.push(
+                "interface-proposal boundary: network-free curation validation; not proof verification or catalog admission; no Git or network; no writes"
+                    .to_owned(),
+            );
+            lines.push(
+                "interface-proposal continuity: the caller must supply the immediately preceding validated snapshot; only locally detectable per-record continuity is checked"
+                    .to_owned(),
+            );
+            lines.push(format!(
+                "interface-proposal current: {} records set_hash={}",
+                interface_proposals.current.proposal_count,
+                interface_proposals
+                    .current
+                    .proposal_set_hash
+                    .as_deref()
+                    .unwrap_or("null")
+            ));
+        }
+        if let Some(interface_inventory) = &self.interface_inventory {
+            lines.push(
+                "interface-inventory boundary: read-only caller-pinned curation metadata; not proof evidence or catalog admission; no Git, network, or writes"
+                    .to_owned(),
+            );
+            lines.push(format!(
+                "interface-inventory result: status={} rows={} source_set_hash={}",
+                interface_inventory.status,
+                interface_inventory.rows.len(),
+                interface_inventory
+                    .source_set_hash
+                    .as_deref()
+                    .unwrap_or("null")
+            ));
+        }
+        if let Some(surface) = &self.interface_proposal_surface {
+            lines.push(
+                "interface-proposal-surface boundary: read-only local surface comparison; not proof evidence or catalog admission; no Git, network, or writes"
+                    .to_owned(),
+            );
+            lines.push(format!(
+                "interface-proposal-surface result: status={} proposal={} target={}",
+                surface.status,
+                surface.proposal_path,
+                surface.target.module.as_deref().unwrap_or("null")
+            ));
+        }
         lines.join("\n")
     }
+}
+
+fn render_interface_proposal_json(result: &InterfaceProposalCheckOutput) -> String {
+    let mut output = String::new();
+    output.push('{');
+    push_json_pair(
+        &mut output,
+        "schema",
+        &JsonValue::String(INTERFACE_PROPOSAL_CHECK_SCHEMA),
+        true,
+    );
+    push_json_pair(
+        &mut output,
+        "proof_evidence",
+        &JsonValue::Bool(false),
+        false,
+    );
+    push_json_pair(
+        &mut output,
+        "status",
+        &JsonValue::String(&result.status),
+        false,
+    );
+    output.push_str(",\"current\":");
+    push_interface_proposal_snapshot_json(&mut output, &result.current);
+    output.push_str(",\"previous\":");
+    if let Some(previous) = &result.previous {
+        push_interface_proposal_snapshot_json(&mut output, previous);
+    } else {
+        output.push_str("null");
+    }
+    output.push_str(",\"diagnostics\":");
+    push_interface_proposal_diagnostics_json(&mut output, &result.diagnostics);
+    output.push('}');
+    output
+}
+
+fn render_interface_inventory_json(result: &InterfaceInventoryOutput) -> String {
+    let mut output = String::new();
+    output.push('{');
+    push_json_pair(
+        &mut output,
+        "schema",
+        &JsonValue::String(INTERFACE_INVENTORY_SCHEMA),
+        true,
+    );
+    push_json_pair(
+        &mut output,
+        "proof_evidence",
+        &JsonValue::Bool(false),
+        false,
+    );
+    push_json_pair(
+        &mut output,
+        "status",
+        &JsonValue::String(&result.status),
+        false,
+    );
+    output.push_str(",\"pin\":");
+    if let Some(pin) = &result.pin {
+        output.push('{');
+        push_json_pair(
+            &mut output,
+            "ecosystem",
+            &JsonValue::String(&pin.ecosystem),
+            true,
+        );
+        push_json_pair(
+            &mut output,
+            "repository",
+            &JsonValue::String(&pin.repository),
+            false,
+        );
+        push_json_pair(
+            &mut output,
+            "revision_kind",
+            &JsonValue::String(&pin.revision_kind),
+            false,
+        );
+        push_json_pair(
+            &mut output,
+            "revision",
+            &JsonValue::String(&pin.revision),
+            false,
+        );
+        push_json_pair(
+            &mut output,
+            "license",
+            &JsonValue::String(&pin.license),
+            false,
+        );
+        push_nullable_json_pair(&mut output, "license_note", pin.license_note.as_deref());
+        push_json_pair(
+            &mut output,
+            "revision_binding",
+            &JsonValue::String(&pin.revision_binding),
+            false,
+        );
+        output.push('}');
+    } else {
+        output.push_str("null");
+    }
+    output.push_str(",\"input_files\":[");
+    for (index, file) in result.input_files.iter().enumerate() {
+        if index > 0 {
+            output.push(',');
+        }
+        output.push('{');
+        push_json_pair(&mut output, "path", &JsonValue::String(&file.path), true);
+        push_json_pair(
+            &mut output,
+            "file_hash",
+            &JsonValue::String(&file.file_hash),
+            false,
+        );
+        output.push_str(",\"byte_count\":");
+        write!(output, "{}", file.byte_count).expect("write to String cannot fail");
+        output.push('}');
+    }
+    output.push(']');
+    output.push_str(",\"source_set_hash\":");
+    if let Some(hash) = &result.source_set_hash {
+        push_json_string(&mut output, hash);
+    } else {
+        output.push_str("null");
+    }
+    output.push_str(",\"rows\":[");
+    for (index, row) in result.rows.iter().enumerate() {
+        if index > 0 {
+            output.push(',');
+        }
+        output.push('{');
+        push_json_pair(
+            &mut output,
+            "row_kind",
+            &JsonValue::String(&row.row_kind),
+            true,
+        );
+        push_json_pair(&mut output, "id", &JsonValue::String(&row.id), false);
+        push_json_pair(&mut output, "path", &JsonValue::String(&row.path), false);
+        output.push_str(",\"line\":");
+        write!(output, "{}", row.line).expect("write to String cannot fail");
+        push_json_pair(
+            &mut output,
+            "repository",
+            &JsonValue::String(&row.repository),
+            false,
+        );
+        push_json_pair(
+            &mut output,
+            "revision_kind",
+            &JsonValue::String(&row.revision_kind),
+            false,
+        );
+        push_json_pair(
+            &mut output,
+            "revision",
+            &JsonValue::String(&row.revision),
+            false,
+        );
+        push_json_pair(
+            &mut output,
+            "license",
+            &JsonValue::String(&row.license),
+            false,
+        );
+        push_nullable_json_pair(&mut output, "source_module", row.source_module.as_deref());
+        push_nullable_json_pair(
+            &mut output,
+            "source_declaration",
+            row.source_declaration.as_deref(),
+        );
+        push_nullable_json_pair(
+            &mut output,
+            "referenced_declaration",
+            row.referenced_declaration.as_deref(),
+        );
+        push_json_pair(
+            &mut output,
+            "usage_kind",
+            &JsonValue::String(&row.usage_kind),
+            false,
+        );
+        push_nullable_json_pair(
+            &mut output,
+            "declaration_kind",
+            row.declaration_kind.as_deref(),
+        );
+        push_nullable_json_pair(
+            &mut output,
+            "import_visibility",
+            row.import_visibility.as_deref(),
+        );
+        push_json_pair(&mut output, "notes", &JsonValue::String(&row.notes), false);
+        output.push('}');
+    }
+    output.push(']');
+    output.push_str(",\"diagnostics\":");
+    push_interface_inventory_diagnostics_json(&mut output, &result.diagnostics);
+    output.push('}');
+    output
+}
+
+fn render_interface_proposal_surface_json(result: &InterfaceProposalSurfaceOutput) -> String {
+    let mut output = String::new();
+    output.push('{');
+    push_json_pair(
+        &mut output,
+        "schema",
+        &JsonValue::String(INTERFACE_PROPOSAL_SURFACE_DRIFT_SCHEMA),
+        true,
+    );
+    push_json_pair(
+        &mut output,
+        "proof_evidence",
+        &JsonValue::Bool(false),
+        false,
+    );
+    push_json_pair(
+        &mut output,
+        "status",
+        &JsonValue::String(&result.status),
+        false,
+    );
+    push_json_pair(
+        &mut output,
+        "proposal_path",
+        &JsonValue::String(&result.proposal_path),
+        false,
+    );
+    push_json_pair(
+        &mut output,
+        "proposal_sha256",
+        &JsonValue::String(&result.proposal_sha256),
+        false,
+    );
+    output.push_str(",\"target\":{");
+    push_nullable_json_pair_first(&mut output, "module", result.target.module.as_deref());
+    push_nullable_json_pair(&mut output, "source", result.target.source.as_deref());
+    push_nullable_json_pair(
+        &mut output,
+        "source_file_sha256",
+        result.target.source_file_sha256.as_deref(),
+    );
+    push_nullable_json_pair(
+        &mut output,
+        "certificate",
+        result.target.certificate.as_deref(),
+    );
+    push_nullable_json_pair(
+        &mut output,
+        "certificate_file_sha256",
+        result.target.certificate_file_sha256.as_deref(),
+    );
+    push_nullable_json_pair(
+        &mut output,
+        "certificate_sha256",
+        result.target.certificate_sha256.as_deref(),
+    );
+    push_nullable_json_pair(
+        &mut output,
+        "export_sha256",
+        result.target.export_sha256.as_deref(),
+    );
+    output.push('}');
+    output.push_str(",\"comparison\":{");
+    push_json_pair(
+        &mut output,
+        "module_name",
+        &JsonValue::String(&result.comparison.module_name),
+        true,
+    );
+    push_json_pair(
+        &mut output,
+        "direct_imports",
+        &JsonValue::String(&result.comparison.direct_imports),
+        false,
+    );
+    push_json_pair(
+        &mut output,
+        "declaration_order",
+        &JsonValue::String(&result.comparison.declaration_order),
+        false,
+    );
+    push_json_pair(
+        &mut output,
+        "declaration_names",
+        &JsonValue::String(&result.comparison.declaration_names),
+        false,
+    );
+    push_json_pair(
+        &mut output,
+        "declaration_kinds",
+        &JsonValue::String(&result.comparison.declaration_kinds),
+        false,
+    );
+    push_json_pair(
+        &mut output,
+        "declaration_surfaces",
+        &JsonValue::String(&result.comparison.declaration_surfaces),
+        false,
+    );
+    push_json_pair(
+        &mut output,
+        "signatures",
+        &JsonValue::String(&result.comparison.signatures),
+        false,
+    );
+    push_json_pair(
+        &mut output,
+        "definition_bodies",
+        &JsonValue::String(&result.comparison.definition_bodies),
+        false,
+    );
+    push_json_pair(
+        &mut output,
+        "inductive_family_members",
+        &JsonValue::String(&result.comparison.inductive_family_members),
+        false,
+    );
+    push_json_pair(
+        &mut output,
+        "exported_support_closure",
+        &JsonValue::String(&result.comparison.exported_support_closure),
+        false,
+    );
+    output.push('}');
+    output.push_str(",\"diagnostics\":");
+    output.push('[');
+    for (index, diagnostic) in result.diagnostics.iter().enumerate() {
+        if index > 0 {
+            output.push(',');
+        }
+        output.push('{');
+        push_json_pair(
+            &mut output,
+            "category",
+            &JsonValue::String(&diagnostic.category),
+            true,
+        );
+        push_json_pair(
+            &mut output,
+            "reason",
+            &JsonValue::String(&diagnostic.reason),
+            false,
+        );
+        push_nullable_json_pair(&mut output, "path", diagnostic.path.as_deref());
+        push_nullable_json_pair(&mut output, "field", diagnostic.field.as_deref());
+        push_nullable_json_pair(&mut output, "expected", diagnostic.expected.as_deref());
+        push_nullable_json_pair(&mut output, "actual", diagnostic.actual.as_deref());
+        output.push('}');
+    }
+    output.push(']');
+    output.push('}');
+    output
+}
+
+fn push_interface_inventory_diagnostics_json(
+    output: &mut String,
+    diagnostics: &[InterfaceInventoryDiagnostic],
+) {
+    output.push('[');
+    for (index, diagnostic) in diagnostics.iter().enumerate() {
+        if index > 0 {
+            output.push(',');
+        }
+        output.push('{');
+        push_json_pair(
+            output,
+            "category",
+            &JsonValue::String(&diagnostic.category),
+            true,
+        );
+        push_json_pair(
+            output,
+            "reason",
+            &JsonValue::String(&diagnostic.reason),
+            false,
+        );
+        push_nullable_json_pair(output, "path", diagnostic.path.as_deref());
+        push_nullable_json_number(output, "line", diagnostic.line);
+        push_nullable_json_pair(output, "field", diagnostic.field.as_deref());
+        push_nullable_json_pair(output, "expected", diagnostic.expected.as_deref());
+        push_nullable_json_pair(output, "actual", diagnostic.actual.as_deref());
+        output.push('}');
+    }
+    output.push(']');
+}
+
+fn push_nullable_json_number(output: &mut String, key: &str, value: Option<u32>) {
+    output.push(',');
+    push_json_string(output, key);
+    output.push(':');
+    if let Some(value) = value {
+        write!(output, "{value}").expect("write to String cannot fail");
+    } else {
+        output.push_str("null");
+    }
+}
+
+fn push_interface_proposal_snapshot_json(
+    output: &mut String,
+    snapshot: &InterfaceProposalCheckSnapshot,
+) {
+    output.push('{');
+    push_json_pair(
+        output,
+        "proposal_count",
+        &JsonValue::U128(snapshot.proposal_count as u128),
+        true,
+    );
+    output.push_str(",\"status_counts\":{");
+    push_json_pair(
+        output,
+        "observed",
+        &JsonValue::U128(snapshot.status_counts.observed as u128),
+        true,
+    );
+    push_json_pair(
+        output,
+        "proposed",
+        &JsonValue::U128(snapshot.status_counts.proposed as u128),
+        false,
+    );
+    push_json_pair(
+        output,
+        "adopted",
+        &JsonValue::U128(snapshot.status_counts.adopted as u128),
+        false,
+    );
+    push_json_pair(
+        output,
+        "withdrawn",
+        &JsonValue::U128(snapshot.status_counts.withdrawn as u128),
+        false,
+    );
+    push_json_pair(
+        output,
+        "superseded",
+        &JsonValue::U128(snapshot.status_counts.superseded as u128),
+        false,
+    );
+    output.push('}');
+    output.push_str(",\"proposal_rows\":[");
+    for (index, row) in snapshot.proposal_rows.iter().enumerate() {
+        if index > 0 {
+            output.push(',');
+        }
+        output.push('{');
+        push_json_pair(output, "path", &JsonValue::String(&row.path), true);
+        push_json_pair(
+            output,
+            "file_hash",
+            &JsonValue::String(&row.file_hash),
+            false,
+        );
+        push_nullable_json_pair(output, "proposal_id", row.proposal_id.as_deref());
+        push_nullable_json_pair(output, "module", row.module.as_deref());
+        output.push_str(",\"proposal_revision\":");
+        if let Some(revision) = row.proposal_revision {
+            write!(output, "{revision}").expect("write to String cannot fail");
+        } else {
+            output.push_str("null");
+        }
+        push_nullable_json_pair(output, "interface_status", row.interface_status.as_deref());
+        output.push('}');
+    }
+    output.push(']');
+    output.push_str(",\"proposal_set_hash\":");
+    if let Some(hash) = &snapshot.proposal_set_hash {
+        push_json_string(output, hash);
+    } else {
+        output.push_str("null");
+    }
+    output.push('}');
+}
+
+fn push_interface_proposal_diagnostics_json(
+    output: &mut String,
+    diagnostics: &[InterfaceProposalCheckDiagnostic],
+) {
+    output.push('[');
+    for (index, diagnostic) in diagnostics.iter().enumerate() {
+        if index > 0 {
+            output.push(',');
+        }
+        output.push('{');
+        push_json_pair(
+            output,
+            "category",
+            &JsonValue::String(&diagnostic.category),
+            true,
+        );
+        push_json_pair(
+            output,
+            "reason",
+            &JsonValue::String(&diagnostic.reason),
+            false,
+        );
+        push_json_pair(output, "path", &JsonValue::String(&diagnostic.path), false);
+        push_nullable_json_pair(output, "field", diagnostic.field.as_deref());
+        push_nullable_json_pair(output, "expected", diagnostic.expected.as_deref());
+        push_nullable_json_pair(output, "actual", diagnostic.actual.as_deref());
+        output.push('}');
+    }
+    output.push(']');
 }
 
 enum JsonValue<'a> {
@@ -988,6 +1851,27 @@ fn push_optional_json_pair(output: &mut String, key: &str, value: Option<&str>) 
         push_json_string(output, key);
         output.push(':');
         push_json_string(output, value);
+    }
+}
+
+fn push_nullable_json_pair(output: &mut String, key: &str, value: Option<&str>) {
+    output.push(',');
+    push_json_string(output, key);
+    output.push(':');
+    if let Some(value) = value {
+        push_json_string(output, value);
+    } else {
+        output.push_str("null");
+    }
+}
+
+fn push_nullable_json_pair_first(output: &mut String, key: &str, value: Option<&str>) {
+    push_json_string(output, key);
+    output.push(':');
+    if let Some(value) = value {
+        push_json_string(output, value);
+    } else {
+        output.push_str("null");
     }
 }
 

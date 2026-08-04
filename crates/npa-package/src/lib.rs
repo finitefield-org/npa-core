@@ -95,6 +95,8 @@ pub mod audit_cache;
 pub mod audit_selection;
 pub mod axiom_report;
 pub mod build_check_cache;
+pub mod catalog_registry_change_request;
+pub mod catalog_registry_sync_attestation;
 pub mod declaration_promotion_request;
 pub mod error;
 pub mod export_summary;
@@ -102,6 +104,7 @@ pub mod gate_plan;
 pub mod graph;
 pub mod hash;
 pub mod incremental_projection;
+pub mod interface_proposal;
 mod json;
 pub mod l2_acceptance;
 pub mod l2_acceptance_v2;
@@ -116,6 +119,7 @@ pub mod promotion_plan;
 pub mod promotion_plan_v2;
 pub mod promotion_registry;
 pub mod promotion_registry_v2;
+pub mod promotion_registry_v3;
 pub mod promotion_transaction;
 pub mod proof_replay;
 pub mod publish_plan;
@@ -186,6 +190,18 @@ pub use build_check_cache::{
     PACKAGE_BUILD_CHECK_CACHE_LAYOUT_DIR, PACKAGE_BUILD_CHECK_CACHE_SCHEMA,
     PACKAGE_BUILD_CHECK_RESULT_SCHEMA,
 };
+pub use catalog_registry_change_request::{
+    catalog_registry_change_request_hash, parse_catalog_registry_change_request_json,
+    validate_catalog_registry_change_request, CatalogRegistryChangeRequest,
+    CatalogRegistryRequestedChange,
+};
+pub use catalog_registry_sync_attestation::{
+    catalog_registry_sync_attestation_hash, parse_catalog_registry_sync_attestation_json,
+    validate_catalog_registry_sync_attestation,
+    validate_catalog_registry_sync_attestation_against_event,
+    validate_catalog_registry_sync_attestation_against_transition, CatalogRegistryComparison,
+    CatalogRegistryInputIdentity, CatalogRegistrySyncAttestation,
+};
 pub use declaration_promotion_request::{
     parse_declaration_promotion_request_json, validate_declaration_promotion_request,
     DeclarationPromotionDependencyMapping, DeclarationPromotionRequest, DeclarationPromotionRoot,
@@ -219,6 +235,20 @@ pub use hash::{
 pub use incremental_projection::{
     PackageIncrementalProjectionMode, PackageIncrementalProjectionModule,
     PackageIncrementalProjectionPlan, PACKAGE_INCREMENTAL_PROJECTION_TRUST_BOUNDARY,
+};
+pub use interface_proposal::{
+    interface_proposal_file_hash, parse_and_validate_interface_proposal, parse_interface_proposal,
+    parse_interface_proposal_str, validate_interface_proposal, InterfaceProposal,
+    InterfaceProposalAlternative, InterfaceProposalAlternativeDisposition,
+    InterfaceProposalAlternativeKind, InterfaceProposalChangeKind, InterfaceProposalDeclaration,
+    InterfaceProposalDeclarationKind, InterfaceProposalError, InterfaceProposalErrorCategory,
+    InterfaceProposalErrorReason, InterfaceProposalObservation, InterfaceProposalProofReference,
+    InterfaceProposalReferenceRole, InterfaceProposalResult, InterfaceProposalRevisionKind,
+    InterfaceProposalStatus, InterfaceProposalSurface, InterfaceProposalUsageKind,
+    INTERFACE_PROPOSAL_HASH_PREFIX, INTERFACE_PROPOSAL_SCHEMA, MAX_ALTERNATIVES, MAX_DECLARATIONS,
+    MAX_DIAGNOSTICS, MAX_DIAGNOSTIC_VALUE_BYTES, MAX_IMPORTS, MAX_INTERFACE_FILE_BYTES,
+    MAX_LINKS_PER_ARRAY, MAX_OBSERVATIONS, MAX_PATH_BYTES, MAX_PROOF_REFERENCES,
+    MAX_PROPOSAL_FILES, MAX_PROPOSAL_FILE_BYTES, MAX_PROPOSAL_SET_BYTES, MAX_STRING_BYTES,
 };
 pub use l2_acceptance::{
     compute_l2_review_input_hash, parse_l2_acceptance_json, parse_l2_acceptance_policy_json,
@@ -309,6 +339,24 @@ pub use promotion_registry_v2::{
     PromotionDeclarationTargetTheorem, PromotionMaturityEvent, PromotionOriginEntryV2,
     PromotionOriginRegistryV2,
 };
+pub use promotion_registry_v3::{
+    active_catalog_routes, active_catalog_target_revisions, catalog_change_event_id,
+    catalog_change_set_hash, catalog_target_id, catalog_target_revision_hash,
+    lookup_promotion_origin_v3, migrate_promotion_origin_registry_v1_to_v3,
+    migrate_promotion_origin_registry_v2_to_v3, parse_promotion_origin_registry_v3_json,
+    promotion_origin_registry_v3_hash, validate_promotion_origin_registry_v1_to_v3_reconciliation,
+    validate_promotion_origin_registry_v1_to_v3_reconciliation_with_previous_hashes,
+    validate_promotion_origin_registry_v2_to_v3_reconciliation,
+    validate_promotion_origin_registry_v2_to_v3_reconciliation_with_previous_hashes,
+    validate_promotion_origin_registry_v3,
+    validate_promotion_origin_registry_v3_source_promotion_transition,
+    validate_promotion_origin_registry_v3_transition,
+    validate_promotion_origin_registry_v3_transition_with_previous_hashes, CatalogAddedTarget,
+    CatalogAttestationRef, CatalogChangeEvent, CatalogChangeRequestRef, CatalogGovernanceFileRef,
+    CatalogLifecycleChange, CatalogRevisedRoute, CatalogRouteRef, CatalogTargetEntry,
+    CatalogTargetEvidence, CatalogTargetProjection, PromotionOriginEntryV3,
+    PromotionOriginRegistryV3,
+};
 pub use promotion_transaction::{
     parse_promotion_transaction_json, promotion_transaction_hash, promotion_transaction_path_hash,
     validate_promotion_transaction, PromotionOldFile, PromotionReplacementState,
@@ -337,8 +385,10 @@ pub use registry::{
 pub use schema::{
     CERTIFICATE_FORMAT_CANONICAL_V0_1, CHECKER_PROFILE_REFERENCE_V0_1, CORE_SPEC_V0_1,
     KERNEL_PROFILE_V0_1, L2_ACCEPTANCE_POLICY_SCHEMA, L2_ACCEPTANCE_SCHEMA,
-    MATHLIB_DECLARATION_PROMOTION_REQUEST_SCHEMA, MATHLIB_PROMOTION_ORIGIN_REGISTRY_SCHEMA,
-    MATHLIB_PROMOTION_ORIGIN_REGISTRY_V2_SCHEMA, MATHLIB_PROMOTION_PLAN_SCHEMA,
+    MATHLIB_CATALOG_REGISTRY_CHANGE_REQUEST_SCHEMA,
+    MATHLIB_CATALOG_REGISTRY_SYNC_ATTESTATION_SCHEMA, MATHLIB_DECLARATION_PROMOTION_REQUEST_SCHEMA,
+    MATHLIB_PROMOTION_ORIGIN_REGISTRY_SCHEMA, MATHLIB_PROMOTION_ORIGIN_REGISTRY_V2_SCHEMA,
+    MATHLIB_PROMOTION_ORIGIN_REGISTRY_V3_SCHEMA, MATHLIB_PROMOTION_PLAN_SCHEMA,
     MATHLIB_PROMOTION_PLAN_V2_SCHEMA, MATHLIB_PROMOTION_TRANSACTION_SCHEMA,
     MATHLIB_VERIFIED_MATERIALIZATION_ATTESTATION_SCHEMA, PACKAGE_AXIOM_REPORT_SCHEMA,
     PACKAGE_LOCK_SCHEMA, PACKAGE_MANIFEST_SCHEMA, PACKAGE_PUBLISH_PLAN_SCHEMA,

@@ -8,7 +8,12 @@ reviewed.
 
 Run `scripts/check-performance.sh`. The script builds once with the locked,
 offline dependency graph, performs the declared warmup, then checks the
-machine-readable v0.1 measurement output. It does not update baselines.
+machine-readable package-verifier and proof-authoring true-batching outputs. It
+does not update baselines. The true-batching harness covers fixed small,
+medium, and large proof-state fixtures plus the ordered certificate producer at
+candidate counts 1, 8, 32, and 256. Its producer work counters verify that one
+prepared name index is reused and that fingerprinting copies no accepted-prefix
+elements.
 The Rust harness strictly validates every counter listed in the selected
 baseline scenario and reports raw elapsed samples, median, median absolute
 deviation, minimum, and maximum. Elapsed values remain advisory unless a

@@ -39,6 +39,12 @@ impl CliCommand {
 pub enum PackageCommand {
     /// `npa package check`.
     Check(PackageCommonOptions),
+    /// `npa package check-interface-proposals`.
+    CheckInterfaceProposals(PackageCheckInterfaceProposalsOptions),
+    /// `npa package check-interface-proposal-surface`.
+    CheckInterfaceProposalSurface(PackageCheckInterfaceProposalSurfaceOptions),
+    /// `npa package inventory-interface`.
+    InventoryInterface(PackageInventoryInterfaceOptions),
     /// `npa package build-certs`.
     BuildCerts(PackageBuildCertsOptions),
     /// `npa package axiom-report`.
@@ -67,6 +73,8 @@ pub enum PackageCommand {
     ValidatePromotionMaterialization(Box<PackageValidatePromotionMaterializationOptions>),
     /// `npa package validate-promotion-origin-registry`.
     ValidatePromotionOriginRegistry(PackageValidatePromotionOriginRegistryOptions),
+    /// `npa package reconcile-promotion-origin-registry`.
+    ReconcilePromotionOriginRegistry(PackageReconcilePromotionOriginRegistryOptions),
     /// `npa package register-equivalent-promotion-origin`.
     RegisterEquivalentPromotionOrigin(PackageRegisterEquivalentPromotionOriginOptions),
     /// `npa package verify-certs`.
@@ -94,6 +102,9 @@ impl PackageCommand {
     pub fn command_name(&self) -> &'static str {
         match self {
             Self::Check(_) => "package check",
+            Self::CheckInterfaceProposals(_) => "package check-interface-proposals",
+            Self::CheckInterfaceProposalSurface(_) => "package check-interface-proposal-surface",
+            Self::InventoryInterface(_) => "package inventory-interface",
             Self::BuildCerts(_) => "package build-certs",
             Self::AxiomReport(_) => "package axiom-report",
             Self::Index(_) => "package index",
@@ -111,6 +122,9 @@ impl PackageCommand {
             }
             Self::ValidatePromotionOriginRegistry(_) => {
                 "package validate-promotion-origin-registry"
+            }
+            Self::ReconcilePromotionOriginRegistry(_) => {
+                "package reconcile-promotion-origin-registry"
             }
             Self::RegisterEquivalentPromotionOrigin(_) => {
                 "package register-equivalent-promotion-origin"
@@ -131,6 +145,9 @@ impl PackageCommand {
     pub fn common_options(&self) -> &PackageCommonOptions {
         match self {
             Self::Check(options) | Self::CheckHashes(options) => options,
+            Self::CheckInterfaceProposals(options) => &options.common,
+            Self::CheckInterfaceProposalSurface(options) => &options.common,
+            Self::InventoryInterface(options) => &options.common,
             Self::AuditArtifactLedger(options) => &options.common,
             Self::Lock(command) => command.common_options(),
             Self::BuildCerts(options) => &options.common,
@@ -147,6 +164,7 @@ impl PackageCommand {
             Self::MaterializePromotion(options) => &options.common,
             Self::ValidatePromotionMaterialization(options) => &options.common,
             Self::ValidatePromotionOriginRegistry(options) => &options.common,
+            Self::ReconcilePromotionOriginRegistry(options) => &options.common,
             Self::RegisterEquivalentPromotionOrigin(options) => &options.common,
             Self::VerifyCerts(options) => &options.common,
             Self::PublishPlan(options) => &options.common,
@@ -192,6 +210,55 @@ pub struct PackageCommonOptions {
     pub root: PathBuf,
     /// Whether deterministic JSON output was requested.
     pub json: bool,
+}
+
+/// Options for the read-only interface-proposal curation validator.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PackageCheckInterfaceProposalsOptions {
+    /// Common package command options.
+    pub common: PackageCommonOptions,
+    /// Current proposal root relative to the package root, defaulting to
+    /// `interface-proposals`.
+    pub proposal_root: Option<PathBuf>,
+    /// Optional caller-supplied immediately preceding proposal root.
+    pub previous_proposal_root: Option<PathBuf>,
+}
+
+/// Options for the read-only adopted interface-proposal surface-drift gate.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PackageCheckInterfaceProposalSurfaceOptions {
+    /// Common package command options.
+    pub common: PackageCommonOptions,
+    /// Proposal root relative to the package root; defaults to
+    /// `interface-proposals` when absent.
+    pub proposal_root: Option<PathBuf>,
+    /// One proposal path relative to the proposal root.
+    pub proposal_path: PathBuf,
+    /// Caller-attested exact proposal SHA-256 string.
+    pub proposal_sha256: String,
+    /// Exact target module selected from the validated package manifest.
+    pub target_module: Name,
+}
+
+/// Options for the read-only Lean 4/mathlib4 interface inventory adapter.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PackageInventoryInterfaceOptions {
+    /// Common package command options; `root` is the local checkout root.
+    pub common: PackageCommonOptions,
+    /// Frozen ecosystem identifier; v1 accepts `lean4-mathlib4` only.
+    pub ecosystem: String,
+    /// Caller-supplied repository identity, never dereferenced.
+    pub repository: String,
+    /// Caller-supplied full lowercase Git commit SHA.
+    pub revision: String,
+    /// Caller-supplied license identifier.
+    pub license: String,
+    /// Follow-up note required when `license` is `UNKNOWN`.
+    pub license_note: Option<String>,
+    /// Literal checkout-relative Lean source paths to scan.
+    pub paths: Vec<PathBuf>,
+    /// Fully qualified top-level Lean declarations to inventory.
+    pub declarations: Vec<String>,
 }
 
 impl Default for PackageCommonOptions {
@@ -533,6 +600,25 @@ pub struct PackageValidatePromotionOriginRegistryOptions {
     pub source_roots: Vec<PathBuf>,
     /// Optional previous registry used for append-only transition validation.
     pub previous_registry: Option<PathBuf>,
+}
+
+/// Options for `package reconcile-promotion-origin-registry`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PackageReconcilePromotionOriginRegistryOptions {
+    /// Common options; root is the current target package root.
+    pub common: PackageCommonOptions,
+    /// Older target package whose artifact identities the input registry records.
+    pub previous_target_root: Option<PathBuf>,
+    /// Target-relative human audit record.
+    pub audit: Option<PathBuf>,
+    /// Target-relative canonical reconciliation attestation output.
+    pub out: Option<PathBuf>,
+    /// Optional target-relative lifecycle change request.
+    pub request: Option<PathBuf>,
+    /// Whether the validated transition may be written.
+    pub apply: bool,
+    /// Target-relative recovery journal path.
+    pub recover: Option<PathBuf>,
 }
 
 /// Options for `package register-equivalent-promotion-origin`.
@@ -933,6 +1019,12 @@ pub enum HelpTopic {
     Package,
     /// `npa package check --help`.
     PackageCheck,
+    /// `npa package check-interface-proposals --help`.
+    PackageCheckInterfaceProposals,
+    /// `npa package check-interface-proposal-surface --help`.
+    PackageCheckInterfaceProposalSurface,
+    /// `npa package inventory-interface --help`.
+    PackageInventoryInterface,
     /// `npa package build-certs --help`.
     PackageBuildCerts,
     /// `npa package axiom-report --help`.
@@ -961,6 +1053,8 @@ pub enum HelpTopic {
     PackageValidatePromotionMaterialization,
     /// `npa package validate-promotion-origin-registry --help`.
     PackageValidatePromotionOriginRegistry,
+    /// `npa package reconcile-promotion-origin-registry --help`.
+    PackageReconcilePromotionOriginRegistry,
     /// `npa package register-equivalent-promotion-origin --help`.
     PackageRegisterEquivalentPromotionOrigin,
     /// `npa package verify-certs --help`.
@@ -1127,6 +1221,11 @@ fn parse_package_args(args: &[String]) -> Result<CliAction, CliUsageError> {
     match args[0].as_str() {
         "--help" | "-h" => Ok(CliAction::Help(HelpTopic::Package)),
         "check" => parse_package_check_args(&args[1..]),
+        "check-interface-proposals" => parse_package_check_interface_proposals_args(&args[1..]),
+        "check-interface-proposal-surface" => {
+            parse_package_check_interface_proposal_surface_args(&args[1..])
+        }
+        "inventory-interface" => parse_package_inventory_interface_args(&args[1..]),
         "build-certs" => parse_package_build_certs_args(&args[1..]),
         "axiom-report" => parse_package_axiom_report_args(&args[1..]),
         "index" => parse_package_index_args(&args[1..]),
@@ -1146,6 +1245,9 @@ fn parse_package_args(args: &[String]) -> Result<CliAction, CliUsageError> {
         }
         "validate-promotion-origin-registry" => {
             parse_package_validate_promotion_origin_registry_args(&args[1..])
+        }
+        "reconcile-promotion-origin-registry" => {
+            parse_package_reconcile_promotion_origin_registry_args(&args[1..])
         }
         "register-equivalent-promotion-origin" => {
             parse_package_register_equivalent_promotion_origin_args(&args[1..])
@@ -1211,6 +1313,391 @@ fn parse_package_check_args(args: &[String]) -> Result<CliAction, CliUsageError>
     Ok(CliAction::Run(CliCommand::Package(PackageCommand::Check(
         common,
     ))))
+}
+
+fn parse_package_check_interface_proposals_args(
+    args: &[String],
+) -> Result<CliAction, CliUsageError> {
+    const COMMAND: &str = "package check-interface-proposals";
+    if contains_help(args) {
+        return Ok(CliAction::Help(HelpTopic::PackageCheckInterfaceProposals));
+    }
+
+    let mut root = None;
+    let mut proposal_root = None;
+    let mut previous_proposal_root = None;
+    let mut json = false;
+    let mut index = 0usize;
+    while index < args.len() {
+        let token = args[index].as_str();
+        match token {
+            "--root" => {
+                parse_path_flag(args, &mut index, "--root", COMMAND, &mut root)?;
+            }
+            "--proposal-root" => {
+                parse_path_flag(
+                    args,
+                    &mut index,
+                    "--proposal-root",
+                    COMMAND,
+                    &mut proposal_root,
+                )?;
+            }
+            "--previous-proposal-root" => {
+                parse_path_flag(
+                    args,
+                    &mut index,
+                    "--previous-proposal-root",
+                    COMMAND,
+                    &mut previous_proposal_root,
+                )?;
+            }
+            "--json" => {
+                if json {
+                    return Err(
+                        flag_error("--json", UsageReason::DuplicateFlag).with_command(COMMAND)
+                    );
+                }
+                json = true;
+                index += 1;
+            }
+            token if token.starts_with("--root=") => {
+                parse_path_equals_flag(token, "--root", COMMAND, &mut root)?;
+                index += 1;
+            }
+            token if token.starts_with("--proposal-root=") => {
+                parse_path_equals_flag(token, "--proposal-root", COMMAND, &mut proposal_root)?;
+                index += 1;
+            }
+            token if token.starts_with("--previous-proposal-root=") => {
+                parse_path_equals_flag(
+                    token,
+                    "--previous-proposal-root",
+                    COMMAND,
+                    &mut previous_proposal_root,
+                )?;
+                index += 1;
+            }
+            flag if flag.starts_with('-') => {
+                return Err(flag_error(flag, UsageReason::UnknownFlag).with_command(COMMAND));
+            }
+            value => {
+                return Err(CliUsageError::new(UsageReason::UnknownCommand).with_command(value));
+            }
+        }
+    }
+
+    let root = root.ok_or_else(|| {
+        flag_error("--root", UsageReason::MissingRequiredFlag).with_command(COMMAND)
+    })?;
+    if !json {
+        return Err(flag_error("--json", UsageReason::MissingRequiredFlag).with_command(COMMAND));
+    }
+
+    Ok(CliAction::Run(CliCommand::Package(
+        PackageCommand::CheckInterfaceProposals(PackageCheckInterfaceProposalsOptions {
+            common: PackageCommonOptions { root, json },
+            proposal_root,
+            previous_proposal_root,
+        }),
+    )))
+}
+
+fn parse_package_check_interface_proposal_surface_args(
+    args: &[String],
+) -> Result<CliAction, CliUsageError> {
+    const COMMAND: &str = "package check-interface-proposal-surface";
+    if contains_help(args) {
+        return Ok(CliAction::Help(
+            HelpTopic::PackageCheckInterfaceProposalSurface,
+        ));
+    }
+
+    let mut root = None;
+    let mut proposal_root = None;
+    let mut proposal_path = None;
+    let mut proposal_sha256 = None;
+    let mut target_module = None;
+    let mut json = false;
+    let mut index = 0usize;
+    while index < args.len() {
+        let token = args[index].as_str();
+        match token {
+            "--root" => {
+                parse_path_flag(args, &mut index, "--root", COMMAND, &mut root)?;
+            }
+            "--proposal-root" => {
+                parse_path_flag(
+                    args,
+                    &mut index,
+                    "--proposal-root",
+                    COMMAND,
+                    &mut proposal_root,
+                )?;
+            }
+            "--proposal-path" => {
+                parse_path_flag(
+                    args,
+                    &mut index,
+                    "--proposal-path",
+                    COMMAND,
+                    &mut proposal_path,
+                )?;
+            }
+            "--proposal-sha256" => {
+                parse_string_flag(
+                    args,
+                    &mut index,
+                    "--proposal-sha256",
+                    COMMAND,
+                    &mut proposal_sha256,
+                )?;
+            }
+            "--target-module" => {
+                parse_string_flag(
+                    args,
+                    &mut index,
+                    "--target-module",
+                    COMMAND,
+                    &mut target_module,
+                )?;
+            }
+            "--json" => {
+                if json {
+                    return Err(
+                        flag_error("--json", UsageReason::DuplicateFlag).with_command(COMMAND)
+                    );
+                }
+                json = true;
+                index += 1;
+            }
+            token if token.starts_with("--root=") => {
+                parse_path_equals_flag(token, "--root", COMMAND, &mut root)?;
+                index += 1;
+            }
+            token if token.starts_with("--proposal-root=") => {
+                parse_path_equals_flag(token, "--proposal-root", COMMAND, &mut proposal_root)?;
+                index += 1;
+            }
+            token if token.starts_with("--proposal-path=") => {
+                parse_path_equals_flag(token, "--proposal-path", COMMAND, &mut proposal_path)?;
+                index += 1;
+            }
+            token if token.starts_with("--proposal-sha256=") => {
+                parse_string_equals_flag(
+                    token,
+                    "--proposal-sha256",
+                    COMMAND,
+                    &mut proposal_sha256,
+                )?;
+                index += 1;
+            }
+            token if token.starts_with("--target-module=") => {
+                parse_string_equals_flag(token, "--target-module", COMMAND, &mut target_module)?;
+                index += 1;
+            }
+            flag if flag.starts_with('-') => {
+                return Err(flag_error(flag, UsageReason::UnknownFlag).with_command(COMMAND));
+            }
+            value => {
+                return Err(CliUsageError::new(UsageReason::UnknownCommand).with_command(value));
+            }
+        }
+    }
+
+    if !json {
+        return Err(flag_error("--json", UsageReason::MissingRequiredFlag).with_command(COMMAND));
+    }
+    let proposal_path = proposal_path.ok_or_else(|| {
+        flag_error("--proposal-path", UsageReason::MissingRequiredFlag).with_command(COMMAND)
+    })?;
+    let proposal_sha256 = proposal_sha256.ok_or_else(|| {
+        flag_error("--proposal-sha256", UsageReason::MissingRequiredFlag).with_command(COMMAND)
+    })?;
+    let target_module_value = target_module.ok_or_else(|| {
+        flag_error("--target-module", UsageReason::MissingRequiredFlag).with_command(COMMAND)
+    })?;
+    let target_module = Name::from_dotted(&target_module_value);
+    if !target_module.is_canonical()
+        || target_module.0.first().map(String::as_str) != Some("Mathlib")
+        || target_module.0.len() < 2
+    {
+        return Err(CliUsageError::new(UsageReason::InvalidModuleName)
+            .with_command(COMMAND)
+            .with_flag("--target-module")
+            .with_value(target_module_value));
+    }
+
+    Ok(CliAction::Run(CliCommand::Package(
+        PackageCommand::CheckInterfaceProposalSurface(
+            PackageCheckInterfaceProposalSurfaceOptions {
+                common: PackageCommonOptions {
+                    root: root.unwrap_or_else(|| PathBuf::from(".")),
+                    json,
+                },
+                proposal_root,
+                proposal_path,
+                proposal_sha256,
+                target_module,
+            },
+        ),
+    )))
+}
+
+fn parse_package_inventory_interface_args(args: &[String]) -> Result<CliAction, CliUsageError> {
+    const COMMAND: &str = "package inventory-interface";
+    if contains_help(args) {
+        return Ok(CliAction::Help(HelpTopic::PackageInventoryInterface));
+    }
+
+    let root_explicit = args
+        .iter()
+        .any(|token| token == "--root" || token.starts_with("--root="));
+    let mut common_tokens = Vec::new();
+    let mut ecosystem = None;
+    let mut repository = None;
+    let mut revision = None;
+    let mut license = None;
+    let mut license_note = None;
+    let mut paths = Vec::new();
+    let mut declarations = Vec::new();
+    let mut json = false;
+    let mut index = 0usize;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--ecosystem" => {
+                parse_string_flag(args, &mut index, "--ecosystem", COMMAND, &mut ecosystem)?;
+            }
+            "--repository" => {
+                parse_string_flag(args, &mut index, "--repository", COMMAND, &mut repository)?;
+            }
+            "--revision" => {
+                parse_string_flag(args, &mut index, "--revision", COMMAND, &mut revision)?;
+            }
+            "--license" => {
+                parse_string_flag(args, &mut index, "--license", COMMAND, &mut license)?;
+            }
+            "--license-note" => {
+                parse_string_flag(
+                    args,
+                    &mut index,
+                    "--license-note",
+                    COMMAND,
+                    &mut license_note,
+                )?;
+            }
+            "--path" => {
+                paths.push(PathBuf::from(flag_value(args, index, "--path", COMMAND)?));
+                index += 2;
+            }
+            "--declaration" => {
+                declarations.push(flag_value(args, index, "--declaration", COMMAND)?.to_owned());
+                index += 2;
+            }
+            "--json" => {
+                if json {
+                    return Err(
+                        flag_error("--json", UsageReason::DuplicateFlag).with_command(COMMAND)
+                    );
+                }
+                json = true;
+                index += 1;
+            }
+            token if token.starts_with("--ecosystem=") => {
+                parse_string_equals_flag(token, "--ecosystem", COMMAND, &mut ecosystem)?;
+                index += 1;
+            }
+            token if token.starts_with("--repository=") => {
+                parse_string_equals_flag(token, "--repository", COMMAND, &mut repository)?;
+                index += 1;
+            }
+            token if token.starts_with("--revision=") => {
+                parse_string_equals_flag(token, "--revision", COMMAND, &mut revision)?;
+                index += 1;
+            }
+            token if token.starts_with("--license=") => {
+                parse_string_equals_flag(token, "--license", COMMAND, &mut license)?;
+                index += 1;
+            }
+            token if token.starts_with("--license-note=") => {
+                parse_string_equals_flag(token, "--license-note", COMMAND, &mut license_note)?;
+                index += 1;
+            }
+            token if token.starts_with("--path=") => {
+                let value = token.trim_start_matches("--path=");
+                if value.is_empty() {
+                    return Err(
+                        flag_error("--path", UsageReason::MissingFlagValue).with_command(COMMAND)
+                    );
+                }
+                paths.push(PathBuf::from(value));
+                index += 1;
+            }
+            token if token.starts_with("--declaration=") => {
+                let value = token.trim_start_matches("--declaration=");
+                if value.is_empty() {
+                    return Err(flag_error("--declaration", UsageReason::MissingFlagValue)
+                        .with_command(COMMAND));
+                }
+                declarations.push(value.to_owned());
+                index += 1;
+            }
+            token => {
+                common_tokens.push(token.to_owned());
+                index += 1;
+            }
+        }
+    }
+
+    if !root_explicit {
+        return Err(flag_error("--root", UsageReason::MissingRequiredFlag).with_command(COMMAND));
+    }
+    if !json {
+        return Err(flag_error("--json", UsageReason::MissingRequiredFlag).with_command(COMMAND));
+    }
+    if paths.is_empty() {
+        return Err(flag_error("--path", UsageReason::MissingRequiredFlag).with_command(COMMAND));
+    }
+    if declarations.is_empty() {
+        return Err(
+            flag_error("--declaration", UsageReason::MissingRequiredFlag).with_command(COMMAND),
+        );
+    }
+
+    let mut common = parse_common_options(
+        &common_tokens,
+        COMMAND,
+        &[
+            "--ecosystem",
+            "--repository",
+            "--revision",
+            "--license",
+            "--license-note",
+            "--path",
+            "--declaration",
+        ],
+    )?;
+    common.json = json;
+    Ok(CliAction::Run(CliCommand::Package(
+        PackageCommand::InventoryInterface(PackageInventoryInterfaceOptions {
+            common,
+            ecosystem: ecosystem.ok_or_else(|| {
+                flag_error("--ecosystem", UsageReason::MissingRequiredFlag).with_command(COMMAND)
+            })?,
+            repository: repository.ok_or_else(|| {
+                flag_error("--repository", UsageReason::MissingRequiredFlag).with_command(COMMAND)
+            })?,
+            revision: revision.ok_or_else(|| {
+                flag_error("--revision", UsageReason::MissingRequiredFlag).with_command(COMMAND)
+            })?,
+            license: license.ok_or_else(|| {
+                flag_error("--license", UsageReason::MissingRequiredFlag).with_command(COMMAND)
+            })?,
+            license_note,
+            paths,
+            declarations,
+        }),
+    )))
 }
 
 fn parse_package_check_hashes_args(args: &[String]) -> Result<CliAction, CliUsageError> {
@@ -2893,6 +3380,144 @@ fn parse_package_validate_promotion_origin_registry_args(
     )))
 }
 
+fn parse_package_reconcile_promotion_origin_registry_args(
+    args: &[String],
+) -> Result<CliAction, CliUsageError> {
+    const COMMAND: &str = "package reconcile-promotion-origin-registry";
+    if contains_help(args) {
+        return Ok(CliAction::Help(
+            HelpTopic::PackageReconcilePromotionOriginRegistry,
+        ));
+    }
+    let root_explicit = args
+        .iter()
+        .any(|token| token == "--root" || token.starts_with("--root="));
+    let mut common_tokens = Vec::new();
+    let mut previous_target_root = None;
+    let mut audit = None;
+    let mut out = None;
+    let mut request = None;
+    let mut recover = None;
+    let mut apply = false;
+    let mut dry_run = false;
+    let mut index = 0;
+    while index < args.len() {
+        let token = args[index].as_str();
+        let slot = match token {
+            "--previous-target-root" => Some(("--previous-target-root", &mut previous_target_root)),
+            "--audit" => Some(("--audit", &mut audit)),
+            "--out" => Some(("--out", &mut out)),
+            "--request" => Some(("--request", &mut request)),
+            "--recover" => Some(("--recover", &mut recover)),
+            "--apply" if !apply => {
+                apply = true;
+                index += 1;
+                continue;
+            }
+            "--dry-run" if !dry_run => {
+                dry_run = true;
+                index += 1;
+                continue;
+            }
+            "--apply" | "--dry-run" => {
+                return Err(flag_error(token, UsageReason::DuplicateFlag).with_command(COMMAND));
+            }
+            _ => None,
+        };
+        if let Some((flag, slot)) = slot {
+            parse_path_flag(args, &mut index, flag, COMMAND, slot)?;
+            continue;
+        }
+        let mut handled = false;
+        for (flag, slot) in [
+            ("--previous-target-root", &mut previous_target_root),
+            ("--audit", &mut audit),
+            ("--out", &mut out),
+            ("--request", &mut request),
+            ("--recover", &mut recover),
+        ] {
+            if token.starts_with(&format!("{flag}=")) {
+                parse_path_equals_flag(token, flag, COMMAND, slot)?;
+                handled = true;
+                break;
+            }
+        }
+        if handled {
+            index += 1;
+        } else {
+            common_tokens.push(token.to_owned());
+            index += 1;
+        }
+    }
+    if apply && dry_run {
+        return Err(flag_error("--apply", UsageReason::InvalidFlagValue).with_command(COMMAND));
+    }
+    for (value, flag) in [
+        (audit.as_ref(), "--audit"),
+        (out.as_ref(), "--out"),
+        (request.as_ref(), "--request"),
+        (recover.as_ref(), "--recover"),
+    ] {
+        if value.is_some_and(|path| {
+            path.to_str().is_none_or(|path| {
+                npa_package::validate_package_path(&npa_package::PackagePath::new(path), flag)
+                    .is_err()
+            })
+        }) {
+            return Err(flag_error(flag, UsageReason::InvalidFlagValue).with_command(COMMAND));
+        }
+    }
+    let common = parse_common_options(&common_tokens, COMMAND, &[])?;
+    if recover.is_some() {
+        if !root_explicit {
+            return Err(
+                flag_error("--root", UsageReason::MissingRequiredFlag).with_command(COMMAND)
+            );
+        }
+        if previous_target_root.is_some()
+            || audit.is_some()
+            || out.is_some()
+            || request.is_some()
+            || apply
+            || dry_run
+        {
+            return Err(
+                flag_error("--recover", UsageReason::InvalidFlagValue).with_command(COMMAND)
+            );
+        }
+    } else {
+        if !root_explicit {
+            return Err(
+                flag_error("--root", UsageReason::MissingRequiredFlag).with_command(COMMAND)
+            );
+        }
+        for (present, flag) in [
+            (previous_target_root.is_some(), "--previous-target-root"),
+            (audit.is_some(), "--audit"),
+            (out.is_some(), "--out"),
+        ] {
+            if !present {
+                return Err(
+                    flag_error(flag, UsageReason::MissingRequiredFlag).with_command(COMMAND)
+                );
+            }
+        }
+    }
+    Ok(CliAction::Run(CliCommand::Package(
+        PackageCommand::ReconcilePromotionOriginRegistry(
+            PackageReconcilePromotionOriginRegistryOptions {
+                common,
+                previous_target_root,
+                audit,
+                out,
+                request,
+                apply,
+                recover,
+            },
+        ),
+    )))
+}
+
 fn parse_package_register_equivalent_promotion_origin_args(
     args: &[String],
 ) -> Result<CliAction, CliUsageError> {
@@ -4134,10 +4759,19 @@ pub fn render_help(topic: HelpTopic) -> &'static str {
             "Usage: npa <command> [options]\n\nCommands:\n  package    Package manifest and certificate commands\n  version    Print npa CLI version\n\nOptions:\n  --help\n  --version"
         }
         HelpTopic::Package => {
-            "Usage: npa package <command> [options]\n\nCommands:\n  check\n  build-certs\n  axiom-report\n  index\n  theorem-premise-report\n  export-summary\n  export-candidate-metadata\n  prepare-l2-review-input\n  aggregate-l2-acceptance\n  validate-l2-acceptance\n  validate-l2-namespace-transport\n  prepare-promotion\n  materialize-promotion\n  validate-promotion-materialization\n  validate-promotion-origin-registry\n  register-equivalent-promotion-origin\n  verify-certs\n  check-hashes\n  audit-artifact-ledger\n  lock\n  publish-plan\n  check-generated\n  high-trust\n  gate-plan\n  refactor-plan\n\nCommon options:\n  --root PATH    Package root, default: .\n  --json         Emit deterministic JSON diagnostics\n  --help         Show help"
+            "Usage: npa package <command> [options]\n\nCommands:\n  check\n  check-interface-proposals\n  check-interface-proposal-surface\n  inventory-interface\n  build-certs\n  axiom-report\n  index\n  theorem-premise-report\n  export-summary\n  export-candidate-metadata\n  prepare-l2-review-input\n  aggregate-l2-acceptance\n  validate-l2-acceptance\n  validate-l2-namespace-transport\n  prepare-promotion\n  materialize-promotion\n  validate-promotion-materialization\n  validate-promotion-origin-registry\n  reconcile-promotion-origin-registry\n  register-equivalent-promotion-origin\n  verify-certs\n  check-hashes\n  audit-artifact-ledger\n  lock\n  publish-plan\n  check-generated\n  high-trust\n  gate-plan\n  refactor-plan\n\nCommon options:\n  --root PATH    Package root, default: .\n  --json         Emit deterministic JSON diagnostics\n  --help         Show help"
         }
         HelpTopic::PackageCheck => {
             "Usage: npa package check [--root PATH] [--json]\n\nValidate npa-package.toml metadata without reading source or certificate artifacts."
+        }
+        HelpTopic::PackageCheckInterfaceProposals => {
+            "Usage: npa package check-interface-proposals --root PATH [--proposal-root PATH] [--previous-proposal-root PATH] --json\n\nValidate network-free interface-proposal curation metadata and locally detectable per-record continuity. The caller must supply the immediately preceding validated snapshot when using --previous-proposal-root. This command is curation validation only: it is not proof verification or catalog admission, invokes no Git or network, and writes no files."
+        }
+        HelpTopic::PackageCheckInterfaceProposalSurface => {
+            "Usage: npa package check-interface-proposal-surface [--root PATH] [--proposal-root PATH] --proposal-path Mathlib/....toml --proposal-sha256 sha256:<64 lowercase hex> --target-module Mathlib.... --json\n\nCompare one adopted interface proposal with one hash-pinned local package surface. The command is read-only, local-only, network-free, Git-free, emits npa.mathlib.interface_proposal_surface_drift.v1, never edits proposals or artifacts, and never emits proof evidence."
+        }
+        HelpTopic::PackageInventoryInterface => {
+            "Usage: npa package inventory-interface --ecosystem lean4-mathlib4 --root PATH --repository ID --revision SHA --license ID [--license-note TEXT] --path PATH... --declaration NAME... --json\n\nInventory selected Lean 4/mathlib4 source paths with a caller-supplied immutable pin. The adapter is token-level, read-only, network-free, emits npa.mathlib.interface_inventory.v1, never invokes Git, and never writes proposals or proof evidence."
         }
         HelpTopic::PackageBuildCerts => {
             "Usage: npa package build-certs [--root PATH] [--json] [--check] [--build-check-cache off|read-through] [--update-manifest-hashes] [--module MODULE]... [--changed]\n\nRebuild package certificates. Build-check caching requires --check; for example: --check --build-check-cache read-through. --module and --changed select targeted authoring builds and are mutually exclusive. Targeted ordinary builds require --check; targeted writes require --update-manifest-hashes and rebuild the dependency-safe local dependent closure. Full build-certs --check and source-free verification remain required release gates. --update-manifest-hashes refreshes local module hash pins and declared metadata before rebuilding generated/package-lock.json."
@@ -4180,6 +4814,9 @@ pub fn render_help(topic: HelpTopic) -> &'static str {
         }
         HelpTopic::PackageValidatePromotionOriginRegistry => {
             "Usage: npa package validate-promotion-origin-registry [--root PATH] [--source-root PATH]... [--previous-registry PATH] [--json]\n\nValidate the canonical target registry, current target identities, optional source identities, and an optional append-only transition."
+        }
+        HelpTopic::PackageReconcilePromotionOriginRegistry => {
+            "Usage: npa package reconcile-promotion-origin-registry --root PATH --previous-target-root PATH --audit PATH --out PATH [--request PATH] [--dry-run|--apply] [--json]\n       npa package reconcile-promotion-origin-registry --root PATH --recover PATH [--json]\n\nValidate and deterministically migrate or advance the promotion-origin registry to any strictly newer catalog version. Dry-run is the default."
         }
         HelpTopic::PackageRegisterEquivalentPromotionOrigin => {
             "Usage: npa package register-equivalent-promotion-origin --root PATH --target-root PATH --promotion-id HASH [--dry-run|--apply] [--json]\n\nValidate and optionally append one artifact-identical source package origin to an existing promotion route. Dry-run is the default."

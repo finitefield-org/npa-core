@@ -580,11 +580,31 @@ pub(crate) fn encode_uvar_to(out: &mut Vec<u8>, mut value: u64) {
 pub(crate) struct Decoder<'a> {
     bytes: &'a [u8],
     offset: usize,
+    allow_unknown_core_features: bool,
+    audit_core_feature_count: usize,
 }
 
 impl<'a> Decoder<'a> {
     pub(crate) fn new(bytes: &'a [u8]) -> Self {
-        Self { bytes, offset: 0 }
+        Self {
+            bytes,
+            offset: 0,
+            allow_unknown_core_features: false,
+            audit_core_feature_count: 0,
+        }
+    }
+
+    pub(crate) fn new_for_structural_audit(bytes: &'a [u8]) -> Self {
+        Self {
+            bytes,
+            offset: 0,
+            allow_unknown_core_features: true,
+            audit_core_feature_count: 0,
+        }
+    }
+
+    pub(crate) fn audit_core_feature_count(&self) -> usize {
+        self.audit_core_feature_count
     }
 
     pub(crate) fn is_done(&self) -> bool {
@@ -651,9 +671,15 @@ impl<'a> Decoder<'a> {
     }
 
     fn imports_with_offsets(&mut self) -> Result<(Vec<ImportEntry>, Vec<usize>)> {
-        let len = self.bounded_len()?;
-        let mut imports = Vec::with_capacity(len);
-        let mut offsets = Vec::with_capacity(len);
+        let len = self.bounded_len_for(StructuralLimitKind::Imports, MAX_IMPORTS)?;
+        let mut imports = Vec::new();
+        imports
+            .try_reserve_exact(len)
+            .map_err(|_| CertError::DecodeError)?;
+        let mut offsets = Vec::new();
+        offsets
+            .try_reserve_exact(len)
+            .map_err(|_| CertError::DecodeError)?;
         for _ in 0..len {
             offsets.push(self.offset);
             imports.push(ImportEntry {
@@ -666,72 +692,71 @@ impl<'a> Decoder<'a> {
     }
 
     fn name_table(&mut self) -> Result<Vec<Name>> {
-        let len = self.bounded_len()?;
-        (0..len).map(|_| self.name()).collect()
+        let len = self.bounded_len_for(
+            StructuralLimitKind::NameTableEntries,
+            MAX_NAME_TABLE_ENTRIES,
+        )?;
+        self.collect_n(len, |decoder| decoder.name())
     }
 
     fn level_table(&mut self) -> Result<Vec<LevelNode>> {
-        let len = self.bounded_len()?;
-        (0..len)
-            .map(|_| {
-                Ok(match self.byte()? {
-                    0x00 => LevelNode::Zero,
-                    0x01 => LevelNode::Succ(self.usize()?),
-                    0x02 => LevelNode::Max(self.usize()?, self.usize()?),
-                    0x03 => LevelNode::IMax(self.usize()?, self.usize()?),
-                    0x04 => LevelNode::Param(self.usize()?),
-                    tag => return Err(CertError::UnsupportedEncoding { tag }),
-                })
+        let len =
+            self.bounded_len_for(StructuralLimitKind::LevelTableNodes, MAX_LEVEL_TABLE_NODES)?;
+        self.collect_n(len, |decoder| {
+            Ok(match decoder.byte()? {
+                0x00 => LevelNode::Zero,
+                0x01 => LevelNode::Succ(decoder.usize()?),
+                0x02 => LevelNode::Max(decoder.usize()?, decoder.usize()?),
+                0x03 => LevelNode::IMax(decoder.usize()?, decoder.usize()?),
+                0x04 => LevelNode::Param(decoder.usize()?),
+                tag => return Err(CertError::UnsupportedEncoding { tag }),
             })
-            .collect()
+        })
     }
 
     fn term_table(&mut self) -> Result<Vec<TermNode>> {
-        let len = self.bounded_len()?;
-        (0..len)
-            .map(|_| {
-                Ok(match self.byte()? {
-                    0x00 => TermNode::Sort(self.usize()?),
-                    0x01 => TermNode::BVar(self.u32()?),
-                    0x02 => TermNode::Const {
-                        global_ref: self.global_ref()?,
-                        levels: self.usize_vec()?,
-                    },
-                    0x03 => TermNode::App(self.usize()?, self.usize()?),
-                    0x04 => TermNode::Lam {
-                        ty: self.usize()?,
-                        body: self.usize()?,
-                    },
-                    0x05 => TermNode::Pi {
-                        ty: self.usize()?,
-                        body: self.usize()?,
-                    },
-                    0x06 => TermNode::Let {
-                        ty: self.usize()?,
-                        value: self.usize()?,
-                        body: self.usize()?,
-                    },
-                    tag => return Err(CertError::UnsupportedEncoding { tag }),
-                })
+        let len =
+            self.bounded_len_for(StructuralLimitKind::TermTableNodes, MAX_TERM_TABLE_NODES)?;
+        self.collect_n(len, |decoder| {
+            Ok(match decoder.byte()? {
+                0x00 => TermNode::Sort(decoder.usize()?),
+                0x01 => TermNode::BVar(decoder.u32()?),
+                0x02 => TermNode::Const {
+                    global_ref: decoder.global_ref()?,
+                    levels: decoder.usize_vec()?,
+                },
+                0x03 => TermNode::App(decoder.usize()?, decoder.usize()?),
+                0x04 => TermNode::Lam {
+                    ty: decoder.usize()?,
+                    body: decoder.usize()?,
+                },
+                0x05 => TermNode::Pi {
+                    ty: decoder.usize()?,
+                    body: decoder.usize()?,
+                },
+                0x06 => TermNode::Let {
+                    ty: decoder.usize()?,
+                    value: decoder.usize()?,
+                    body: decoder.usize()?,
+                },
+                tag => return Err(CertError::UnsupportedEncoding { tag }),
             })
-            .collect()
+        })
     }
 
     fn declarations(&mut self) -> Result<Vec<DeclCert>> {
-        let len = self.bounded_len()?;
-        (0..len)
-            .map(|_| {
-                Ok(DeclCert {
-                    decl: self.decl_payload()?,
-                    dependencies: self.dependency_entries()?,
-                    axiom_dependencies: self.axiom_refs()?,
-                    hashes: DeclHashes {
-                        decl_interface_hash: self.hash()?,
-                        decl_certificate_hash: self.hash()?,
-                    },
-                })
+        let len = self.bounded_len_for(StructuralLimitKind::Declarations, MAX_DECLARATIONS)?;
+        self.collect_n(len, |decoder| {
+            Ok(DeclCert {
+                decl: decoder.decl_payload()?,
+                dependencies: decoder.dependency_entries()?,
+                axiom_dependencies: decoder.axiom_refs()?,
+                hashes: DeclHashes {
+                    decl_interface_hash: decoder.hash()?,
+                    decl_certificate_hash: decoder.hash()?,
+                },
             })
-            .collect()
+        })
     }
 
     fn decl_payload(&mut self) -> Result<DeclPayload> {
@@ -784,7 +809,10 @@ impl<'a> Decoder<'a> {
                 let indices = self.binder_types()?;
                 let sort = self.usize()?;
                 let constructors_len = self.bounded_len()?;
-                let mut constructors = Vec::with_capacity(constructors_len);
+                let mut constructors = Vec::new();
+                constructors
+                    .try_reserve_exact(constructors_len)
+                    .map_err(|_| CertError::DecodeError)?;
                 for _ in 0..constructors_len {
                     constructors.push(ConstructorSpec {
                         name: self.usize()?,
@@ -822,7 +850,10 @@ impl<'a> Decoder<'a> {
                 let indices = self.binder_types()?;
                 let sort = self.usize()?;
                 let constructors_len = self.bounded_len()?;
-                let mut constructors = Vec::with_capacity(constructors_len);
+                let mut constructors = Vec::new();
+                constructors
+                    .try_reserve_exact(constructors_len)
+                    .map_err(|_| CertError::DecodeError)?;
                 for _ in 0..constructors_len {
                     constructors.push(ConstructorSpec {
                         name: self.usize()?,
@@ -858,7 +889,10 @@ impl<'a> Decoder<'a> {
                 let universe_params = self.usize_vec()?;
                 let universe_constraints = self.universe_constraint_specs()?;
                 let len = self.bounded_len()?;
-                let mut inductives = Vec::with_capacity(len);
+                let mut inductives = Vec::new();
+                inductives
+                    .try_reserve_exact(len)
+                    .map_err(|_| CertError::DecodeError)?;
                 for _ in 0..len {
                     inductives.push(MutualInductiveSpec {
                         name: self.usize()?,
@@ -882,40 +916,38 @@ impl<'a> Decoder<'a> {
 
     fn universe_constraint_specs(&mut self) -> Result<Vec<UniverseConstraintSpec>> {
         let len = self.bounded_len()?;
-        (0..len)
-            .map(|_| {
-                let lhs = self.usize()?;
-                let relation = match self.byte()? {
-                    0x00 => npa_kernel::UniverseConstraintRelation::Le,
-                    0x01 => npa_kernel::UniverseConstraintRelation::Eq,
-                    tag => return Err(CertError::UnsupportedEncoding { tag }),
-                };
-                Ok(UniverseConstraintSpec {
-                    lhs,
-                    relation,
-                    rhs: self.usize()?,
-                })
+        self.collect_n(len, |decoder| {
+            let lhs = decoder.usize()?;
+            let relation = match decoder.byte()? {
+                0x00 => npa_kernel::UniverseConstraintRelation::Le,
+                0x01 => npa_kernel::UniverseConstraintRelation::Eq,
+                tag => return Err(CertError::UnsupportedEncoding { tag }),
+            };
+            Ok(UniverseConstraintSpec {
+                lhs,
+                relation,
+                rhs: decoder.usize()?,
             })
-            .collect()
+        })
     }
 
     fn binder_types(&mut self) -> Result<Vec<BinderType>> {
         let len = self.bounded_len()?;
-        (0..len)
-            .map(|_| Ok(BinderType { ty: self.usize()? }))
-            .collect()
+        self.collect_n(len, |decoder| {
+            Ok(BinderType {
+                ty: decoder.usize()?,
+            })
+        })
     }
 
     fn constructor_specs(&mut self) -> Result<Vec<ConstructorSpec>> {
         let len = self.bounded_len()?;
-        (0..len)
-            .map(|_| {
-                Ok(ConstructorSpec {
-                    name: self.usize()?,
-                    ty: self.usize()?,
-                })
+        self.collect_n(len, |decoder| {
+            Ok(ConstructorSpec {
+                name: decoder.usize()?,
+                ty: decoder.usize()?,
             })
-            .collect()
+        })
     }
 
     fn recursor_spec(&mut self) -> Result<Option<RecursorSpec>> {
@@ -935,52 +967,48 @@ impl<'a> Decoder<'a> {
     }
 
     fn export_block(&mut self, version: CertificateFormatVersion) -> Result<ExportBlock> {
-        let len = self.bounded_len()?;
-        (0..len)
-            .map(|_| {
-                let name = self.usize()?;
-                let kind = match self.byte()? {
-                    0x00 => ExportKind::Axiom,
-                    0x01 => ExportKind::Def,
-                    0x02 => ExportKind::Theorem,
-                    0x03 => ExportKind::Inductive,
-                    0x04 => ExportKind::Constructor,
-                    0x05 => ExportKind::Recursor,
-                    tag => return Err(CertError::UnsupportedEncoding { tag }),
-                };
-                Ok(ExportEntry {
-                    name,
-                    kind,
-                    universe_params: self.usize_vec()?,
-                    universe_constraints: if version.encodes_export_universe_constraints() {
-                        self.universe_constraint_specs()?
-                    } else {
-                        Vec::new()
-                    },
-                    ty: self.usize()?,
-                    body: self.option_usize()?,
-                    type_hash: self.hash()?,
-                    body_hash: self.option_hash()?,
-                    reducibility: self.option_reducibility()?,
-                    opacity: self.option_opacity()?,
-                    decl_interface_hash: self.hash()?,
-                    axiom_dependencies: self.axiom_refs()?,
-                })
+        let len = self.bounded_len_for(StructuralLimitKind::Exports, MAX_EXPORTS)?;
+        self.collect_n(len, |decoder| {
+            let name = decoder.usize()?;
+            let kind = match decoder.byte()? {
+                0x00 => ExportKind::Axiom,
+                0x01 => ExportKind::Def,
+                0x02 => ExportKind::Theorem,
+                0x03 => ExportKind::Inductive,
+                0x04 => ExportKind::Constructor,
+                0x05 => ExportKind::Recursor,
+                tag => return Err(CertError::UnsupportedEncoding { tag }),
+            };
+            Ok(ExportEntry {
+                name,
+                kind,
+                universe_params: decoder.usize_vec()?,
+                universe_constraints: if version.encodes_export_universe_constraints() {
+                    decoder.universe_constraint_specs()?
+                } else {
+                    Vec::new()
+                },
+                ty: decoder.usize()?,
+                body: decoder.option_usize()?,
+                type_hash: decoder.hash()?,
+                body_hash: decoder.option_hash()?,
+                reducibility: decoder.option_reducibility()?,
+                opacity: decoder.option_opacity()?,
+                decl_interface_hash: decoder.hash()?,
+                axiom_dependencies: decoder.axiom_refs()?,
             })
-            .collect()
+        })
     }
 
     fn axiom_report(&mut self) -> Result<AxiomReport> {
-        let len = self.bounded_len()?;
-        let per_declaration = (0..len)
-            .map(|_| {
-                Ok(DeclAxiomReport {
-                    decl_index: self.usize()?,
-                    direct_axioms: self.axiom_refs()?,
-                    transitive_axioms: self.axiom_refs()?,
-                })
+        let len = self.bounded_len_for(StructuralLimitKind::Declarations, MAX_DECLARATIONS)?;
+        let per_declaration = self.collect_n(len, |decoder| {
+            Ok(DeclAxiomReport {
+                decl_index: decoder.usize()?,
+                direct_axioms: decoder.axiom_refs()?,
+                transitive_axioms: decoder.axiom_refs()?,
             })
-            .collect::<Result<Vec<_>>>()?;
+        })?;
         let module_axioms = self.axiom_refs()?;
         Ok(AxiomReport {
             per_declaration,
@@ -997,17 +1025,23 @@ impl<'a> Decoder<'a> {
             });
         }
         let len = self.bounded_len()?;
+        self.audit_core_feature_count = len;
         if len == 0 {
             return Err(CertError::NonCanonicalEncoding {
                 object: "CoreFeatureReport",
             });
         }
-        let mut features = Vec::with_capacity(len);
+        let mut features = Vec::new();
+        features
+            .try_reserve_exact(len)
+            .map_err(|_| CertError::DecodeError)?;
         for _ in 0..len {
             let feature = self.string()?;
-            let feature = CoreFeature::from_name(&feature)
-                .ok_or(CertError::UnsupportedCoreFeature { feature })?;
-            features.push(feature);
+            if let Some(feature) = CoreFeature::from_name(&feature) {
+                features.push(feature);
+            } else if !self.allow_unknown_core_features {
+                return Err(CertError::UnsupportedCoreFeature { feature });
+            }
         }
         if features.windows(2).any(|pair| pair[0] >= pair[1]) {
             return Err(CertError::NonCanonicalEncoding {
@@ -1019,27 +1053,23 @@ impl<'a> Decoder<'a> {
 
     fn dependency_entries(&mut self) -> Result<Vec<DependencyEntry>> {
         let len = self.bounded_len()?;
-        (0..len)
-            .map(|_| {
-                Ok(DependencyEntry {
-                    global_ref: self.global_ref()?,
-                    decl_interface_hash: self.hash()?,
-                })
+        self.collect_n(len, |decoder| {
+            Ok(DependencyEntry {
+                global_ref: decoder.global_ref()?,
+                decl_interface_hash: decoder.hash()?,
             })
-            .collect()
+        })
     }
 
     fn axiom_refs(&mut self) -> Result<Vec<AxiomRef>> {
         let len = self.bounded_len()?;
-        (0..len)
-            .map(|_| {
-                Ok(AxiomRef {
-                    global_ref: self.global_ref()?,
-                    name: self.usize()?,
-                    decl_interface_hash: self.hash()?,
-                })
+        self.collect_n(len, |decoder| {
+            Ok(AxiomRef {
+                global_ref: decoder.global_ref()?,
+                name: decoder.usize()?,
+                decl_interface_hash: decoder.hash()?,
             })
-            .collect()
+        })
     }
 
     fn global_ref(&mut self) -> Result<GlobalRef> {
@@ -1100,7 +1130,10 @@ impl<'a> Decoder<'a> {
         if len == 0 {
             return Err(CertError::NonCanonicalEncoding { object: "Name" });
         }
-        let mut components = Vec::with_capacity(len);
+        let mut components = Vec::new();
+        components
+            .try_reserve_exact(len)
+            .map_err(|_| CertError::DecodeError)?;
         for _ in 0..len {
             let component = self.string()?;
             if component.is_empty() || component.contains('.') {
@@ -1125,7 +1158,7 @@ impl<'a> Decoder<'a> {
 
     fn usize_vec(&mut self) -> Result<Vec<usize>> {
         let len = self.bounded_len()?;
-        (0..len).map(|_| self.usize()).collect()
+        self.collect_n(len, |decoder| decoder.usize())
     }
 
     fn option_usize(&mut self) -> Result<Option<usize>> {
@@ -1181,12 +1214,35 @@ impl<'a> Decoder<'a> {
     }
 
     fn bounded_len(&mut self) -> Result<usize> {
+        self.bounded_len_for(
+            StructuralLimitKind::NestedVectorEntries,
+            MAX_NESTED_VECTOR_ENTRIES,
+        )
+    }
+
+    fn bounded_len_for(&mut self, kind: StructuralLimitKind, limit: usize) -> Result<usize> {
         let len = self.usize()?;
+        ensure_count_limit(kind, limit, len)?;
         let remaining = self.bytes.len().saturating_sub(self.offset);
         if len > remaining {
             return Err(CertError::DecodeError);
         }
         Ok(len)
+    }
+
+    fn collect_n<T>(
+        &mut self,
+        len: usize,
+        mut decode: impl FnMut(&mut Self) -> Result<T>,
+    ) -> Result<Vec<T>> {
+        let mut values = Vec::new();
+        values
+            .try_reserve_exact(len)
+            .map_err(|_| CertError::DecodeError)?;
+        for _ in 0..len {
+            values.push(decode(self)?);
+        }
+        Ok(values)
     }
 
     fn byte(&mut self) -> Result<u8> {

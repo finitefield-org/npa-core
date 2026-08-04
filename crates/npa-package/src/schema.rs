@@ -62,6 +62,15 @@ pub const MATHLIB_PROMOTION_ORIGIN_REGISTRY_SCHEMA: &str =
 /// Canonical declaration-aware mathlib promotion-origin registry schema.
 pub const MATHLIB_PROMOTION_ORIGIN_REGISTRY_V2_SCHEMA: &str =
     "npa.mathlib.promotion_origin_registry.v2";
+/// Canonical catalog-change-aware mathlib promotion-origin registry schema.
+pub const MATHLIB_PROMOTION_ORIGIN_REGISTRY_V3_SCHEMA: &str =
+    "npa.mathlib.promotion_origin_registry.v3";
+/// Canonical direct catalog lifecycle change request schema.
+pub const MATHLIB_CATALOG_REGISTRY_CHANGE_REQUEST_SCHEMA: &str =
+    "npa.mathlib.catalog_registry_change_request.v1";
+/// Canonical catalog registry synchronization attestation schema.
+pub const MATHLIB_CATALOG_REGISTRY_SYNC_ATTESTATION_SCHEMA: &str =
+    "npa.mathlib.catalog_registry_sync_attestation.v1";
 /// Recoverable promotion transaction journal schema.
 pub const MATHLIB_PROMOTION_TRANSACTION_SCHEMA: &str = "npa.mathlib.promotion_transaction.v1";
 
@@ -99,11 +108,13 @@ mod tests {
         L2_ACCEPTANCE_V2_SCHEMA, L2_NAMESPACE_TRANSPORT_ATTESTATION_SCHEMA,
         L2_NAMESPACE_TRANSPORT_POLICY_SCHEMA, L2_NAMESPACE_TRANSPORT_REQUEST_SCHEMA,
         L2_REVIEW_INPUT_SCHEMA, L2_REVIEW_REPORT_SCHEMA,
+        MATHLIB_CATALOG_REGISTRY_CHANGE_REQUEST_SCHEMA,
+        MATHLIB_CATALOG_REGISTRY_SYNC_ATTESTATION_SCHEMA,
         MATHLIB_DECLARATION_PROMOTION_REQUEST_SCHEMA, MATHLIB_PROMOTION_ORIGIN_REGISTRY_V2_SCHEMA,
-        MATHLIB_PROMOTION_PLAN_V2_SCHEMA, MATHLIB_VERIFIED_MATERIALIZATION_ATTESTATION_SCHEMA,
-        PACKAGE_AXIOM_REPORT_SCHEMA, PACKAGE_LOCK_SCHEMA, PACKAGE_MANIFEST_SCHEMA,
-        PACKAGE_PUBLISH_PLAN_SCHEMA, PACKAGE_THEOREM_INDEX_SCHEMA,
-        PACKAGE_VERIFIED_HIGH_TRUST_SCHEMA, REGISTRY_MODULE_SCHEMA,
+        MATHLIB_PROMOTION_ORIGIN_REGISTRY_V3_SCHEMA, MATHLIB_PROMOTION_PLAN_V2_SCHEMA,
+        MATHLIB_VERIFIED_MATERIALIZATION_ATTESTATION_SCHEMA, PACKAGE_AXIOM_REPORT_SCHEMA,
+        PACKAGE_LOCK_SCHEMA, PACKAGE_MANIFEST_SCHEMA, PACKAGE_PUBLISH_PLAN_SCHEMA,
+        PACKAGE_THEOREM_INDEX_SCHEMA, PACKAGE_VERIFIED_HIGH_TRUST_SCHEMA, REGISTRY_MODULE_SCHEMA,
     };
 
     #[test]
@@ -143,6 +154,18 @@ mod tests {
         assert_eq!(
             MATHLIB_PROMOTION_ORIGIN_REGISTRY_V2_SCHEMA,
             "npa.mathlib.promotion_origin_registry.v2"
+        );
+        assert_eq!(
+            MATHLIB_PROMOTION_ORIGIN_REGISTRY_V3_SCHEMA,
+            "npa.mathlib.promotion_origin_registry.v3"
+        );
+        assert_eq!(
+            MATHLIB_CATALOG_REGISTRY_CHANGE_REQUEST_SCHEMA,
+            "npa.mathlib.catalog_registry_change_request.v1"
+        );
+        assert_eq!(
+            MATHLIB_CATALOG_REGISTRY_SYNC_ATTESTATION_SCHEMA,
+            "npa.mathlib.catalog_registry_sync_attestation.v1"
         );
         assert_eq!(
             PACKAGE_THEOREM_INDEX_SCHEMA,

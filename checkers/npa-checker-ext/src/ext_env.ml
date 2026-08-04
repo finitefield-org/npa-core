@@ -363,48 +363,7 @@ let find_current_import_index imports source =
   in
   loop 0 resolved
 
-let rec instantiate_public_term env owner_import_index owner_public_env section offset term =
-  match term with
-  | Ext_term.Sort _ | Ext_term.BVar _ -> Ok term
-  | Ext_term.Const (global_ref, levels) ->
-      bind
-        (instantiate_public_global_ref env owner_import_index owner_public_env section offset
-           global_ref)
-        (fun public_ref -> Ok (Ext_term.Const (public_ref, levels)))
-  | Ext_term.App (fn, arg) ->
-      bind
-        (instantiate_public_term env owner_import_index owner_public_env section offset fn)
-        (fun public_fn ->
-          bind
-            (instantiate_public_term env owner_import_index owner_public_env section offset arg)
-            (fun public_arg -> Ok (Ext_term.App (public_fn, public_arg))))
-  | Ext_term.Lam (ty, body) ->
-      bind
-        (instantiate_public_term env owner_import_index owner_public_env section offset ty)
-        (fun public_ty ->
-          bind
-            (instantiate_public_term env owner_import_index owner_public_env section offset body)
-            (fun public_body -> Ok (Ext_term.Lam (public_ty, public_body))))
-  | Ext_term.Pi (ty, body) ->
-      bind
-        (instantiate_public_term env owner_import_index owner_public_env section offset ty)
-        (fun public_ty ->
-          bind
-            (instantiate_public_term env owner_import_index owner_public_env section offset body)
-            (fun public_body -> Ok (Ext_term.Pi (public_ty, public_body))))
-  | Ext_term.Let (ty, value, body) ->
-      bind
-        (instantiate_public_term env owner_import_index owner_public_env section offset ty)
-        (fun public_ty ->
-          bind
-            (instantiate_public_term env owner_import_index owner_public_env section offset value)
-            (fun public_value ->
-              bind
-                (instantiate_public_term env owner_import_index owner_public_env section offset
-                   body)
-                (fun public_body -> Ok (Ext_term.Let (public_ty, public_value, public_body)))))
-
-and instantiate_public_global_ref env owner_import_index owner_public_env section offset
+let instantiate_public_global_ref env owner_import_index owner_public_env section offset
     global_ref =
   match global_ref with
   | Ext_term.Builtin _ -> Ok global_ref
@@ -420,6 +379,12 @@ and instantiate_public_global_ref env owner_import_index owner_public_env sectio
           | Some remapped ->
               Ok (Ext_term.Imported { import_index = remapped; name; decl_interface_hash })))
   | Ext_term.Local _ | Ext_term.LocalGenerated _ -> error section offset Unknown_reference
+
+let instantiate_public_term env owner_import_index owner_public_env section offset term =
+  Ext_term.map_global_refs
+    (instantiate_public_global_ref env owner_import_index owner_public_env section offset)
+    (fun () -> error section offset Unknown_reference)
+    term
 
 let signature_of_public_export env import_index public_environment section offset export =
   bind

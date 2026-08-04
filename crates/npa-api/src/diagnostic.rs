@@ -3685,6 +3685,41 @@ mod tests {
     }
 
     #[test]
+    fn diagnostic_adapter_human_universe_mismatch_keeps_stable_api_classification() {
+        let mismatch = npa_frontend::HumanUniverseMismatchContext::new(
+            "FunctionAlias",
+            "pi_body",
+            "max 1 u",
+            "imax 1 u",
+            vec!["u".to_owned()],
+        )
+        .unwrap();
+        let diagnostic = npa_frontend::HumanDiagnostic::error(
+            npa_frontend::HumanDiagnosticKind::TypeMismatch,
+            npa_frontend::Span::new(npa_frontend::FileId(1), 2, 9),
+            "declaration FunctionAlias: declared_level=max 1 u; \
+             inferred_level=imax 1 u; type_path=pi_body",
+        )
+        .with_phase(npa_frontend::HumanDiagnosticPhase::KernelHandoff)
+        .with_payload(
+            npa_frontend::HumanDiagnosticPayload::default().with_universe_mismatch(mismatch),
+        );
+
+        let tree = human_diagnostic_tree(&diagnostic, MachineDiagnosticTreeAdapterContext::basic())
+            .unwrap();
+
+        assert_eq!(tree.kind, MachineApiErrorKind::MachineTermElaborationError);
+        assert_eq!(tree.phase, MachineApiDiagnosticPhase::KernelCheck);
+        assert!(tree
+            .source_message
+            .as_deref()
+            .unwrap()
+            .contains("inferred_level=imax 1 u"));
+        assert!(tree.expected_summary.is_none());
+        assert!(tree.actual_summary.is_none());
+    }
+
+    #[test]
     fn diagnostic_adapter_retryable_scheduler_projection_is_not_tree_diagnostic() {
         let mut diagnostic = projection(MachineApiErrorKind::BudgetExceeded);
         diagnostic.retryable = true;

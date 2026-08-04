@@ -27,14 +27,18 @@ let bind result f =
 
 let max_certificate_bytes = Ext_bytes.max_certificate_bytes
 
-let resource_error section offset =
+let resource_error section offset reason =
   Error
     (Decode_error
-       { Ext_bytes.section; offset; reason = Ext_bytes.Resource_limit })
+       { Ext_bytes.section; offset; reason })
 
 let decode bytes =
   if String.length bytes > max_certificate_bytes then
-    resource_error Ext_bytes.Full_certificate max_certificate_bytes
+    resource_error Ext_bytes.Full_certificate 0
+      (Ext_bytes.Structural_resource_limit
+         ( Ext_bytes.Certificate_bytes,
+           max_certificate_bytes,
+           String.length bytes ))
   else
     match Ext_cert.read_module (Ext_bytes.of_string bytes) with
     | Error error -> Error (Decode_error error)
@@ -182,6 +186,12 @@ let module_entry (checked : high_trust checked) =
     axiom_report_hash = decoded.Ext_cert.hashes.Ext_cert.axiom_report_hash;
     public_environment = checked.semantic.public_environment;
     checked_by_ext_checker = true;
+    local_structural_expansion =
+      (match decoded.Ext_cert.structural_cost with
+      | Some cost -> cost.Ext_cert.certificate_expansion
+      | None -> 0);
+    structural_closure =
+      Some checked.semantic.import_environment.Ext_import_store.structural_closure;
   }
 
 let check_high_trust checked_imports policy bytes =

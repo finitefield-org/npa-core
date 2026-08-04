@@ -21,6 +21,15 @@ pub(crate) struct TargetLock {
 impl TargetLock {
     /// Acquire the target-specific sibling lock until this value is dropped.
     pub(crate) fn acquire(target: &Path) -> io::Result<Self> {
+        Self::acquire_mode(target, true)
+    }
+
+    /// Acquire a shared target-specific lock for a read-only dry-run.
+    pub(crate) fn acquire_shared(target: &Path) -> io::Result<Self> {
+        Self::acquire_mode(target, false)
+    }
+
+    fn acquire_mode(target: &Path, exclusive: bool) -> io::Result<Self> {
         let canonical = std::fs::canonicalize(target)?;
         let parent = canonical.parent().unwrap_or_else(|| Path::new("."));
         let lock_hash = package_file_hash(canonical.to_string_lossy().as_bytes());
@@ -36,7 +45,12 @@ impl TargetLock {
             )))?;
         // SAFETY: `file` owns this live descriptor for the guard's full
         // lifetime; `flock` neither dereferences pointers nor transfers it.
-        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        let operation = if exclusive {
+            libc::LOCK_EX
+        } else {
+            libc::LOCK_SH
+        };
+        let result = unsafe { libc::flock(file.as_raw_fd(), operation | libc::LOCK_NB) };
         if result != 0 {
             return Err(io::Error::last_os_error());
         }
@@ -44,7 +58,9 @@ impl TargetLock {
             file,
             target_path_hash: lock_hash,
         };
-        lock.record(None, "locked", None)?;
+        if exclusive {
+            lock.record(None, "locked", None)?;
+        }
         Ok(lock)
     }
 

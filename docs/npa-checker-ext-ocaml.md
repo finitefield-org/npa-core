@@ -501,12 +501,15 @@ based on canonical names and `decl_interface_hash`.
 
 ```text
 - certificate/policy file bytes: 64 MiB
-- table/declaration/export/report vectors: 10,000 entries
+- name/level/term tables: 1,048,576 / 262,144 / 4,194,304 entries
+- declarations/exports: 262,144 / 1,048,576 entries
+- every other encoded vector: 262,144 entries
 - imports and import-directory certificate candidates: 4,096
-- level/term depth: 1,024
-- import-DAG depth: 1,024
+- combined level/term structural depth: 8,192
+- one semantic root / one certificate expanded nodes: 1,048,576 / 16,777,216
+- one resolved import closure: 4,097 modules and 67,108,864 expanded nodes
+- import-DAG depth: 4,096
 - import-directory depth: 128
-- decoded structural traversal: 5,000,000 nodes
 - each conversion/typechecking fuel budget: 100,000 steps
 ```
 
@@ -517,7 +520,8 @@ Timeout / resource exhaustion enforced by the runner is represented as
 a checker raw result. When `npa-checker-ext` emits a raw result itself, it must
 not put `resource_exhausted` or `timeout` in `checker_raw.error.kind`.
 Deterministic decoder limits use reason `resource_limit` under the existing
-`certificate_decode_error` kind. Fuel failure inside the semantic checker is
+`certificate_decode_error` kind and include the fixed limit name/value plus
+the observed value. Fuel failure inside the semantic checker is
 classified as `conversion_failure` or the applicable typed semantic error.
 OCaml exception backtraces and host-specific messages are never included in raw
 results.

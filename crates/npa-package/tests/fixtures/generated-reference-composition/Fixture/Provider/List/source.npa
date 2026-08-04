@@ -1,0 +1,8 @@
+import Fixture.Provider.Tag
+
+inductive List : Type where
+| nil : List
+| cons : forall (tail : List), List
+
+def List.default : List := List.nil
+def List.tag : Tag := Tag.default

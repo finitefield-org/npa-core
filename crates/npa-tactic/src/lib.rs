@@ -7077,12 +7077,7 @@ fn run_have_tactic_with_budget(
     validate_local_lemma_name_available(state, goal, &payload.name)?;
     let fuel = TacticRunFuel::new(budget);
     let lemma_ty = elaborate_local_lemma_type_with_budget(state, goal, &payload.ty, &fuel)?;
-    let HavePayload {
-        name,
-        proof,
-        insertion: _,
-        ..
-    } = payload;
+    let HavePayload { name, proof, .. } = payload;
     let first_new_meta = state.metas.next_id;
     let mut new_goal_specs = Vec::new();
     let lemma_proof = match proof {

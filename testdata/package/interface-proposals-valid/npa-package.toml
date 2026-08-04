@@ -1,0 +1,15 @@
+schema = "npa.package.v0.1"
+package = "interface-proposals-valid"
+version = "0.1.0"
+license = "Apache-2.0"
+description = "Compact read-only interface-proposal validator fixture."
+
+core_spec = "npa.core.v0.1"
+kernel_profile = "npa.kernel.v0.1"
+certificate_format = "npa.certificate.canonical.v0.1"
+checker_profile = "npa.checker.reference.v0.1"
+modules = []
+
+[policy]
+allow_custom_axioms = false
+allowed_axioms = []

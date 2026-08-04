@@ -1,0 +1,4 @@
+inductive Tag : Type where
+| mark : Tag
+
+def Tag.default : Tag := Tag.mark

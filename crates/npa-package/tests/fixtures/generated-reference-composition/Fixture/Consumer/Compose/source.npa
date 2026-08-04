@@ -1,0 +1,10 @@
+import Fixture.Provider.List
+import Fixture.Provider.Tag
+
+inductive Choice : Type where
+| first : Choice
+| next : forall (choice : Choice), Choice
+
+def Compose.list : List := List.cons List.default
+def Compose.tag : Tag := List.tag
+def Compose.choice : Choice := Choice.next Choice.first

@@ -136,6 +136,79 @@ other deterministic subresults; the group fails after collecting all six.
 The snapshot, checker timings, and aggregate command result are local
 orchestration metadata and are not proof evidence.
 
+## Interface-proposal curation validator
+
+`npa-cli 0.7.x` exposes the read-only v1 Mathlib interface-proposal check:
+
+```sh
+npa package check-interface-proposals \
+  --root <package-root> [--proposal-root <path>] \
+  [--previous-proposal-root <path>] --json
+```
+
+`--proposal-root` defaults to `interface-proposals` beneath `--root` and
+`--previous-proposal-root` is an explicit caller-supplied earlier proposal
+root. The JSON result is ordered and byte-stable, with proposal rows, exact
+file/set hashes, five lifecycle counts, and bounded diagnostics. The previous
+root is treated as the immediately preceding validated snapshot by caller
+contract; the command reports only detectable per-record continuity and does
+not inspect Git history.
+
+This command is curation validation, not catalog admission or proof
+verification. It always reports `proof_evidence: false`, reads only the local
+manifest and canonical proposal TOML tree, never dereferences evidence URLs,
+does not invoke Git, network, source rebuilds, certificate verification, or a
+proof checker, and writes no files. The compact in-repository example is
+`testdata/package/interface-proposals-valid`.
+
+## Adopted surface and direct reconciliation gates
+
+After an adopted proposal has an independently authored target artifact, use
+the read-only exact-surface gate before accepting either catalog route:
+
+```sh
+npa package check-interface-proposal-surface \
+  --root <package-root> --proposal-root interface-proposals \
+  --proposal-path Mathlib/Logic/Function/Basic.toml \
+  --proposal-sha256 sha256:<64 lowercase hexadecimal characters> \
+  --target-module Mathlib.Logic.Function.Basic --json
+```
+
+`status = "parity"` means the proposal and prepared certificate surface are
+equal on module name, imports, declaration order/names/kinds/surfaces,
+signatures, definition bodies, inductive families, and exported support
+closure. The command is local, read-only, Git-free, network-free, and always
+emits `proof_evidence: false`; it does not edit the proposal or target.
+
+For directly authored `npa-mathlib` content, the caller prepares the complete
+strictly newer target and invokes the implemented registry transaction with an
+explicit older target and audit. Review the deterministic dry-run first, then
+apply the same inputs:
+
+```sh
+npa package reconcile-promotion-origin-registry \
+  --root <current-npa-mathlib> \
+  --previous-target-root <previous-validated-npa-mathlib> \
+  --audit docs/promotion/catalog-sync.md \
+  --out docs/promotion/catalog-sync.json \
+  --dry-run --json
+npa package reconcile-promotion-origin-registry \
+  --root <current-npa-mathlib> \
+  --previous-target-root <previous-validated-npa-mathlib> \
+  --audit docs/promotion/catalog-sync.md \
+  --out docs/promotion/catalog-sync.json \
+  --apply --json
+```
+
+The transaction validates package and generated identities, writes its
+attestation and registry last, and does not create or modify source,
+certificates, metadata, replay, manifest, generated projections, released
+snapshots, or Git state. `validate-promotion-origin-registry` is the post-apply
+registry gate. Source-backed implementations remain owned by the separate
+promotion materializer (`prepare-promotion`, `materialize-promotion`, and
+`validate-promotion-materialization`); reconciliation must not be used to
+replace that route.
+
 Older published packages do not contain the new report. Their historical
 release bundles remain governed by the recorded host/toolchain contract.
 Current `npa-cli 0.7.x` source closure requires the sixth artifact.

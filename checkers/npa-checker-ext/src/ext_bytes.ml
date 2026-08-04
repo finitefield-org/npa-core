@@ -15,6 +15,21 @@ type certificate_section =
   | Import_store
   | Full_certificate
 
+type structural_limit_kind =
+  | Certificate_bytes
+  | Imports_limit
+  | Name_table_entries
+  | Level_table_nodes
+  | Term_table_nodes
+  | Declarations_limit
+  | Exports_limit
+  | Nested_vector_entries
+  | Structural_depth
+  | Root_expanded_nodes
+  | Certificate_expanded_nodes
+  | Closure_modules
+  | Closure_expanded_nodes
+
 type decode_error_reason =
   | Unexpected_eof
   | Noncanonical_uvar
@@ -39,6 +54,7 @@ type decode_error_reason =
   | Trailing_bytes
   | Unresolved_metavariable
   | Resource_limit
+  | Structural_resource_limit of structural_limit_kind * int * int
 
 type decode_error = {
   section : certificate_section;
@@ -53,7 +69,19 @@ type reader = {
 
 type 'a read_result = ('a * reader, decode_error) result
 
-let max_certificate_bytes = 64 * 1024 * 1024
+let max_certificate_bytes = 67_108_864
+let max_imports = 4_096
+let max_name_table_entries = 1_048_576
+let max_level_table_nodes = 262_144
+let max_term_table_nodes = 4_194_304
+let max_declarations = 262_144
+let max_exports = 1_048_576
+let max_nested_vector_entries = 262_144
+let max_node_depth = 8_192
+let max_root_expanded_nodes = 1_048_576
+let max_certificate_expanded_nodes = 16_777_216
+let max_closure_modules = 4_097
+let max_closure_expanded_nodes = 67_108_864
 
 let empty = { data = ""; offset = 0 }
 
@@ -109,6 +137,27 @@ let reason_code reason =
   | Trailing_bytes -> "trailing_bytes"
   | Unresolved_metavariable -> "unresolved_metavariable"
   | Resource_limit -> "resource_limit"
+  | Structural_resource_limit _ -> "resource_limit"
+
+let structural_limit_name = function
+  | Certificate_bytes -> "certificate_bytes"
+  | Imports_limit -> "imports"
+  | Name_table_entries -> "name_table_entries"
+  | Level_table_nodes -> "level_table_nodes"
+  | Term_table_nodes -> "term_table_nodes"
+  | Declarations_limit -> "declarations"
+  | Exports_limit -> "exports"
+  | Nested_vector_entries -> "nested_vector_entries"
+  | Structural_depth -> "structural_depth"
+  | Root_expanded_nodes -> "root_expanded_nodes"
+  | Certificate_expanded_nodes -> "certificate_expanded_nodes"
+  | Closure_modules -> "closure_modules"
+  | Closure_expanded_nodes -> "closure_expanded_nodes"
+
+let structural_limit_context = function
+  | Structural_resource_limit (kind, limit, observed) ->
+      Some (kind, limit, observed)
+  | _ -> None
 
 let error section offset reason = Error { section; offset; reason }
 
@@ -251,22 +300,20 @@ let read_usize section reader =
         error section (max start (next.offset - 1)) Length_overflow
       else Ok (Int64.to_int value, next)
 
-let max_count_for_section = function
-  | Imports -> 4_096
-  | Name_table | Level_table | Term_table | Declarations | Export_block
-  | Axiom_report -> 10_000
-  | Header_format | Header_core_spec | Header_module | Hashes | Import_store
-  | Full_certificate -> 10_000
+let structural_error section offset kind limit observed =
+  error section offset (Structural_resource_limit (kind, limit, observed))
 
-let read_count section reader =
+let read_count_with_limit section kind limit reader =
   match read_usize section reader with
   | Error err -> Error err
   | Ok (count, next) ->
-      if count > max_count_for_section section then
-        error section (offset reader) Resource_limit
+      if count > limit then
+        structural_error section (offset reader) kind limit count
       else Ok (count, next)
 
-let max_node_depth = 1_024
+let read_count section reader =
+  read_count_with_limit section Nested_vector_entries
+    max_nested_vector_entries reader
 
 let read_string_with_offset section reader =
   match read_usize section reader with

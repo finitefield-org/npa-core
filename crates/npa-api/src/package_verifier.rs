@@ -6816,6 +6816,7 @@ mod tests {
                 declaration: ReferenceModuleName::from_dotted("Std.Logic.Eq.rec").unwrap(),
                 decl_interface_hash: [0xab; 32],
             }),
+            structural_limit: None,
         };
 
         let error =

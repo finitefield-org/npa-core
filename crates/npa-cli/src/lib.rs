@@ -1,4 +1,8 @@
 #![deny(missing_docs)]
+// CommandResult intentionally carries several optional, boxed command payloads
+// so the CLI can keep its typed result boundary without serializing through an
+// untyped map. Its value size is therefore not a useful Result ABI heuristic.
+#![allow(clippy::result_large_err)]
 
 //! Contributor-facing NPA command-line parsing.
 //!
@@ -26,6 +30,9 @@ pub mod package_gate_plan;
 pub mod package_hashes;
 pub mod package_high_trust;
 pub mod package_index;
+pub mod package_interface_inventory;
+pub mod package_interface_proposal_surface;
+pub mod package_interface_proposals;
 pub mod package_l2_acceptance;
 pub mod package_l2_acceptance_aggregate;
 pub mod package_l2_namespace_transport;
@@ -36,6 +43,7 @@ pub mod package_promotion_materialize;
 pub mod package_promotion_prepare;
 mod package_promotion_prepare_declaration;
 pub mod package_promotion_registry;
+pub mod package_promotion_registry_reconcile;
 mod package_promotion_transaction;
 pub mod package_publish;
 pub mod package_refactor_plan;

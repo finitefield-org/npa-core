@@ -19,18 +19,22 @@ use crate::{
     HumanSourceDeclarationKind, HumanSourceDeclarationMetadata, HumanSourceInterface,
     HumanTacticScript, HumanTypeclassClassMetadata, HumanTypeclassInstanceMetadata,
     HumanTypeclassSearchOutput, HumanTypeclassSearchPolicy, HumanTypeclassSearchStatus,
-    HumanUnsolvedMeta, HumanUnsolvedMetaKind, MachineBinder, MachineCallableBinderVisibility,
-    MachineCheckedCurrentDecl, MachineCheckedCurrentGeneratedDecl, MachineDecl,
-    MachineDiagnosticKind, MachineLevel, MachineLocalDecl, MachineName, MachineTerm,
+    HumanUniverseMismatchContext, HumanUnsolvedMeta, HumanUnsolvedMetaKind, MachineBinder,
+    MachineCallableBinderVisibility, MachineCheckedCurrentDecl, MachineCheckedCurrentGeneratedDecl,
+    MachineDecl, MachineDiagnosticKind, MachineLevel, MachineLocalDecl, MachineName, MachineTerm,
     MachineUniverseParam, ResolvedHumanModule, Span, VerifiedImport,
 };
 use npa_kernel::{
     eq_inductive, eq_rec_type, nat_inductive, subst, Binder, ConstructorDecl, Ctx, Decl,
     DiagnosedKernelError, Env, Error, Expr, InductiveDecl, Level, RecursorDecl, Reducibility,
+    UniverseConstraint, UniverseContext,
 };
 
 const MAX_HUMAN_IMPLICIT_INSERTION_STEPS: usize = 64;
 const MAX_HUMAN_TYPECLASS_DIAGNOSTIC_CANDIDATES: usize = 32;
+const MAX_HUMAN_UNIVERSE_MISMATCH_STEPS: usize = 64;
+const MAX_HUMAN_UNIVERSE_DOMAIN_DEFEQ_FUEL: usize = 100_000;
+const MAX_HUMAN_UNIVERSE_LEVEL_RENDER_NODES: usize = 64;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HumanCoreCompileOutput {
@@ -4831,10 +4835,18 @@ impl HumanBidirectionalElaborator {
             "Human declaration handoff",
         )?;
 
-        self.env.add_decl_diagnosed(decl).map_err(|err| {
-            human_diagnosed_kernel_decl_diagnostic(span, err, "Human declaration handoff")
-                .with_phase(HumanDiagnosticPhase::KernelHandoff)
-        })
+        let diagnostic_context = HumanKernelDeclDiagnosticContext::from_decl(&decl);
+        if let Err(err) = self.env.add_decl_diagnosed(decl) {
+            return Err(human_diagnosed_kernel_decl_diagnostic(
+                span,
+                &self.env,
+                err,
+                "Human declaration handoff",
+                diagnostic_context.as_ref(),
+            )
+            .with_phase(HumanDiagnosticPhase::KernelHandoff));
+        }
+        Ok(())
     }
 }
 
@@ -6333,74 +6345,19 @@ impl HumanImplicitInserter {
             "Human implicit environment",
         )?;
 
-        match decl {
-            Decl::Axiom {
-                name,
-                universe_params,
-                ty,
-            } => self.env.add_axiom(name, universe_params, ty),
-            Decl::AxiomConstrained {
-                name,
-                universe_params,
-                universe_constraints,
-                ty,
-            } => self.env.add_axiom_with_universe_constraints(
-                name,
-                universe_params,
-                universe_constraints,
-                ty,
-            ),
-            Decl::Def {
-                name,
-                universe_params,
-                ty,
-                value,
-                reducibility,
-            } => self
-                .env
-                .add_def(name, universe_params, ty, value, reducibility),
-            Decl::DefConstrained {
-                name,
-                universe_params,
-                universe_constraints,
-                ty,
-                value,
-                reducibility,
-            } => self.env.add_def_with_universe_constraints(
-                name,
-                universe_params,
-                universe_constraints,
-                ty,
-                value,
-                reducibility,
-            ),
-            Decl::Theorem {
-                name,
-                universe_params,
-                ty,
-                proof,
-            } => self.env.add_theorem(name, universe_params, ty, proof),
-            Decl::TheoremConstrained {
-                name,
-                universe_params,
-                universe_constraints,
-                ty,
-                proof,
-            } => self.env.add_theorem_with_universe_constraints(
-                name,
-                universe_params,
-                universe_constraints,
-                ty,
-                proof,
-            ),
-            Decl::Inductive { data, .. } => add_human_inductive_to_env(&mut self.env, *data),
-            Decl::MutualInductiveBlock { data, .. } => self.env.add_mutual_inductive(*data),
-            Decl::Constructor { .. } | Decl::Recursor { .. } => Ok(()),
+        let decl = prepare_human_decl_for_diagnosed_admission(decl);
+        let diagnostic_context = HumanKernelDeclDiagnosticContext::from_decl(&decl);
+        if let Err(err) = self.env.add_decl_diagnosed(decl) {
+            return Err(human_diagnosed_kernel_decl_diagnostic(
+                span,
+                &self.env,
+                err,
+                "Human implicit environment",
+                diagnostic_context.as_ref(),
+            )
+            .with_phase(HumanDiagnosticPhase::KernelHandoff));
         }
-        .map_err(|err| {
-            human_kernel_decl_diagnostic(span, err, "Human implicit environment")
-                .with_phase(HumanDiagnosticPhase::KernelHandoff)
-        })
+        Ok(())
     }
 
     fn bump_insertion_step(&mut self, span: Span) -> HumanResult<()> {
@@ -6437,6 +6394,204 @@ fn add_referenced_builtin_decls_to_human_env(
     collect_const_names_from_human_decl(&mut names, decl);
     remove_human_decl_owned_const_names(&mut names, decl);
     add_human_builtin_decls_for_names(env, &names, span, context)
+}
+
+fn prepare_human_decl_for_diagnosed_admission(mut decl: Decl) -> Decl {
+    if let Decl::Inductive { data, .. } = &mut decl {
+        if data.name == "Eq" {
+            data.recursor = None;
+        }
+    }
+    decl
+}
+
+#[derive(Clone, Debug)]
+struct HumanKernelDeclDiagnosticContext {
+    declaration_name: String,
+    universe_params: Vec<String>,
+    universe_constraints: Vec<UniverseConstraint>,
+}
+
+impl HumanKernelDeclDiagnosticContext {
+    fn from_decl(decl: &Decl) -> Option<Self> {
+        match decl {
+            Decl::Def {
+                name,
+                universe_params,
+                ..
+            }
+            | Decl::DefConstrained {
+                name,
+                universe_params,
+                ..
+            }
+            | Decl::Theorem {
+                name,
+                universe_params,
+                ..
+            }
+            | Decl::TheoremConstrained {
+                name,
+                universe_params,
+                ..
+            } => Some(Self {
+                declaration_name: name.clone(),
+                universe_params: universe_params.clone(),
+                universe_constraints: decl.universe_constraints().to_vec(),
+            }),
+            _ => None,
+        }
+    }
+}
+
+fn locate_human_universe_mismatch(
+    env: &Env,
+    declaration_context: &HumanKernelDeclDiagnosticContext,
+    declared_type: &Expr,
+    inferred_type: &Expr,
+) -> Option<HumanUniverseMismatchContext> {
+    struct WorkItem {
+        context: Ctx,
+        declared_type: Expr,
+        inferred_type: Expr,
+        path: Vec<&'static str>,
+    }
+
+    let universe_context = UniverseContext::new(
+        declaration_context.universe_params.clone(),
+        declaration_context.universe_constraints.clone(),
+    )
+    .ok()?;
+    let mut work = vec![WorkItem {
+        context: Ctx::new(),
+        declared_type: declared_type.clone(),
+        inferred_type: inferred_type.clone(),
+        path: Vec::new(),
+    }];
+    let mut steps = 0usize;
+
+    while let Some(item) = work.pop() {
+        steps = steps.checked_add(1)?;
+        if steps > MAX_HUMAN_UNIVERSE_MISMATCH_STEPS {
+            return None;
+        }
+        let declared = env
+            .whnf(&item.context, &universe_context.params, &item.declared_type)
+            .ok()?;
+        let inferred = env
+            .whnf(&item.context, &universe_context.params, &item.inferred_type)
+            .ok()?;
+        match (declared, inferred) {
+            (Expr::Sort(declared_level), Expr::Sort(inferred_level)) => {
+                if npa_kernel::level::level_eq(&declared_level, &inferred_level) {
+                    continue;
+                }
+                let declared_level = render_human_core_level(&declared_level)?;
+                let inferred_level = render_human_core_level(&inferred_level)?;
+                let type_path = if item.path.is_empty() {
+                    "root".to_owned()
+                } else {
+                    item.path.join(".")
+                };
+                return HumanUniverseMismatchContext::new(
+                    declaration_context.declaration_name.clone(),
+                    type_path,
+                    declared_level,
+                    inferred_level,
+                    declaration_context.universe_params.clone(),
+                );
+            }
+            (
+                Expr::Pi {
+                    binder,
+                    ty: declared_domain,
+                    body: declared_body,
+                },
+                Expr::Pi {
+                    ty: inferred_domain,
+                    body: inferred_body,
+                    ..
+                },
+            ) => {
+                let domains_are_defeq = env
+                    .is_defeq_with_fuel(
+                        &item.context,
+                        &universe_context.params,
+                        declared_domain.as_ref(),
+                        inferred_domain.as_ref(),
+                        MAX_HUMAN_UNIVERSE_DOMAIN_DEFEQ_FUEL,
+                    )
+                    .ok()?;
+                if domains_are_defeq {
+                    let mut body_context = item.context;
+                    body_context.push_assumption(binder, (*declared_domain).clone());
+                    let mut path = item.path;
+                    path.push("pi_body");
+                    work.push(WorkItem {
+                        context: body_context,
+                        declared_type: (*declared_body).clone(),
+                        inferred_type: (*inferred_body).clone(),
+                        path,
+                    });
+                } else {
+                    let mut path = item.path;
+                    path.push("pi_domain");
+                    work.push(WorkItem {
+                        context: item.context,
+                        declared_type: (*declared_domain).clone(),
+                        inferred_type: (*inferred_domain).clone(),
+                        path,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn render_human_core_level(level: &Level) -> Option<String> {
+    fn numeric_level(level: &Level, limit: usize) -> Option<(u64, usize)> {
+        let mut current = level;
+        let mut value = 0u64;
+        let mut nodes = 1usize;
+        while let Level::Succ(inner) = current {
+            if nodes >= limit {
+                return None;
+            }
+            value = value.checked_add(1)?;
+            nodes += 1;
+            current = inner;
+        }
+        matches!(current, Level::Zero).then_some((value, nodes))
+    }
+
+    fn render(level: &Level, remaining: &mut usize) -> Option<String> {
+        if let Some((value, nodes)) = numeric_level(level, *remaining) {
+            *remaining = remaining.checked_sub(nodes)?;
+            return Some(value.to_string());
+        }
+        *remaining = remaining.checked_sub(1)?;
+        match level {
+            Level::Zero => Some("0".to_owned()),
+            Level::Succ(inner) => Some(format!("succ {}", render(inner, remaining)?)),
+            Level::Max(lhs, rhs) => Some(format!(
+                "max {} {}",
+                render(lhs, remaining)?,
+                render(rhs, remaining)?
+            )),
+            Level::IMax(lhs, rhs) => Some(format!(
+                "imax {} {}",
+                render(lhs, remaining)?,
+                render(rhs, remaining)?
+            )),
+            Level::Param(name) => Some(name.clone()),
+        }
+    }
+
+    let normalized = npa_kernel::level::normalize_level(level.clone());
+    let mut remaining = MAX_HUMAN_UNIVERSE_LEVEL_RENDER_NODES;
+    render(&normalized, &mut remaining)
 }
 
 fn add_human_builtin_eq_rec_import_bridge<'a>(
@@ -6693,9 +6848,20 @@ fn human_kernel_decl_diagnostic(span: Span, err: Error, context: &str) -> HumanD
 
 fn human_diagnosed_kernel_decl_diagnostic(
     span: Span,
+    env: &Env,
     error: DiagnosedKernelError,
     context: &str,
+    declaration_context: Option<&HumanKernelDeclDiagnosticContext>,
 ) -> HumanDiagnostic {
+    let scoped_context = declaration_context.map_or_else(
+        || Cow::Borrowed(context),
+        |declaration| {
+            Cow::Owned(format!(
+                "{context}: declaration {}",
+                declaration.declaration_name
+            ))
+        },
+    );
     let conversion = error.context().and_then(|diagnostic| {
         diagnostic.conversion().and_then(|conversion| {
             HumanDiagnosticConversionContext::new(
@@ -6716,20 +6882,40 @@ fn human_diagnosed_kernel_decl_diagnostic(
             }
     );
     if !conversion_failure {
-        return human_kernel_decl_diagnostic(span, error.into_error(), context);
+        return human_kernel_decl_diagnostic(span, error.into_error(), &scoped_context);
     }
     let kind = if matches!(error.error(), Error::TypeMismatch { .. }) {
         HumanDiagnosticKind::TypeMismatch
     } else {
         HumanDiagnosticKind::KernelRejected
     };
-    let wording = conversion
-        .as_ref()
-        .map(|conversion| format!("kernel conversion {}", conversion.outcome()))
-        .unwrap_or_else(|| "kernel conversion failed".to_owned());
-    HumanDiagnostic::error(kind, span, format!("{context}: {wording}")).with_payload(
+    let universe_mismatch = match (declaration_context, error.error()) {
+        (Some(declaration_context), Error::TypeMismatch { expected, actual }) => {
+            locate_human_universe_mismatch(env, declaration_context, expected, actual)
+        }
+        _ => None,
+    };
+    let wording = universe_mismatch.as_ref().map_or_else(
+        || {
+            conversion
+                .as_ref()
+                .map(|conversion| format!("kernel conversion {}", conversion.outcome()))
+                .unwrap_or_else(|| "kernel conversion failed".to_owned())
+        },
+        |universe_mismatch| {
+            format!(
+                "value type is not convertible to declared type; declared_level={}; \
+                 inferred_level={}; type_path={}",
+                universe_mismatch.declared_level(),
+                universe_mismatch.inferred_level(),
+                universe_mismatch.type_path(),
+            )
+        },
+    );
+    HumanDiagnostic::error(kind, span, format!("{scoped_context}: {wording}")).with_payload(
         HumanDiagnosticPayload {
             conversion,
+            universe_mismatch,
             ..HumanDiagnosticPayload::default()
         },
     )
@@ -10845,6 +11031,67 @@ inductive Nat : Type where
     }
 
     #[test]
+    fn generated_reference_composition_fixture_compiles_and_verifies() {
+        const TAG_SOURCE: &str = include_str!(
+            "../../npa-package/tests/fixtures/generated-reference-composition/Fixture/Provider/Tag/source.npa"
+        );
+        const LIST_SOURCE: &str = include_str!(
+            "../../npa-package/tests/fixtures/generated-reference-composition/Fixture/Provider/List/source.npa"
+        );
+        const COMPOSE_SOURCE: &str = include_str!(
+            "../../npa-package/tests/fixtures/generated-reference-composition/Fixture/Consumer/Compose/source.npa"
+        );
+
+        let options = HumanCompileOptions::default();
+        let policy = npa_cert::AxiomPolicy::normal();
+        let mut session = npa_cert::VerifierSession::new();
+        let compile_and_verify =
+            |file_id,
+             module_name: &str,
+             source: &str,
+             imports: &[npa_cert::VerifiedModule],
+             session: &mut npa_cert::VerifierSession| {
+                let cert = compile_human_source_to_certificate(
+                    FileId(file_id),
+                    npa_cert::Name::from_dotted(module_name),
+                    source,
+                    imports,
+                    &options,
+                )
+                .expect("generated-reference fixture source should compile");
+                let bytes =
+                    npa_cert::encode_module_cert(&cert).expect("fixture certificate should encode");
+                npa_cert::verify_module_cert(&bytes, session, &policy)
+                    .expect("fixture certificate should verify")
+            };
+
+        let tag = compile_and_verify(1, "Fixture.Provider.Tag", TAG_SOURCE, &[], &mut session);
+        let list = compile_and_verify(
+            2,
+            "Fixture.Provider.List",
+            LIST_SOURCE,
+            std::slice::from_ref(&tag),
+            &mut session,
+        );
+        let compose = compile_and_verify(
+            3,
+            "Fixture.Consumer.Compose",
+            COMPOSE_SOURCE,
+            &[list, tag],
+            &mut session,
+        );
+
+        assert!(compose.export_block().iter().any(|entry| {
+            entry.kind == npa_cert::ExportKind::Constructor
+                && compose.name_table()[entry.name] == npa_cert::Name::from_dotted("Choice.first")
+        }));
+        assert!(compose.export_block().iter().any(|entry| {
+            entry.kind == npa_cert::ExportKind::Recursor
+                && compose.name_table()[entry.name] == npa_cert::Name::from_dotted("Choice.rec")
+        }));
+    }
+
+    #[test]
     fn human_certificate_output_hashes_source_interface_exports() {
         let output = compile_human_source_to_certificate_output_with_source_interfaces(
             FileId(0),
@@ -11291,6 +11538,127 @@ def bad : Nat := Type",
         .expect_err("ill-typed Human value should be rejected as a structured diagnostic");
 
         assert_eq!(err.kind, HumanDiagnosticKind::TypeMismatch);
+        assert!(err
+            .payload
+            .as_deref()
+            .and_then(|payload| payload.universe_mismatch.as_ref())
+            .is_none());
+    }
+
+    #[test]
+    fn human_function_alias_universe_mismatch_reports_structured_context() {
+        let imports = [nat_import()];
+        let source = "\
+import Std.Nat.Basic
+def FunctionAlias.{u} : forall (Carrier : Sort u), Sort max 1 u :=
+  fun Carrier => Nat -> Carrier";
+        let err = compile_human_source_to_core(
+            FileId(0),
+            npa_cert::Name::from_dotted("Test"),
+            source,
+            &imports,
+            &HumanCompileOptions::default(),
+        )
+        .expect_err("max versus imax function alias must remain kernel-rejected");
+
+        assert_eq!(err.kind, HumanDiagnosticKind::TypeMismatch);
+        let mismatch = err
+            .payload
+            .as_deref()
+            .and_then(|payload| payload.universe_mismatch.as_ref())
+            .expect("universe mismatch should retain bounded declaration context");
+        assert_eq!(mismatch.declaration_name(), "FunctionAlias");
+        assert_eq!(mismatch.type_path(), "pi_body");
+        assert_eq!(mismatch.declared_level(), "max 1 u");
+        assert_eq!(mismatch.inferred_level(), "imax 1 u");
+        assert_eq!(mismatch.universe_params(), ["u"]);
+        assert!(err.message.contains("declared_level=max 1 u"));
+        assert!(err.message.contains("inferred_level=imax 1 u"));
+        assert!(err.message.contains("type_path=pi_body"));
+        let declaration_source = source
+            .get(err.primary_span.start.0 as usize..err.primary_span.end.0 as usize)
+            .expect("declaration span should be inside the source");
+        assert!(declaration_source.contains("FunctionAlias"));
+    }
+
+    #[test]
+    fn human_function_alias_universe_mismatch_depends_on_universe_value() {
+        let imports = [nat_import()];
+        let err = compile_human_source_to_core(
+            FileId(0),
+            npa_cert::Name::from_dotted("Test"),
+            "\
+import Std.Nat.Basic
+def BadAtZero : forall (Carrier : Sort 0), Sort 1 :=
+  fun Carrier => Nat -> Carrier",
+            &imports,
+            &HumanCompileOptions::default(),
+        )
+        .expect_err("the closed Prop-valued case must expose the numeric mismatch");
+        let mismatch = err
+            .payload
+            .as_deref()
+            .and_then(|payload| payload.universe_mismatch.as_ref())
+            .expect("closed mismatch should retain normalized levels");
+        assert_eq!(mismatch.declared_level(), "1");
+        assert_eq!(mismatch.inferred_level(), "0");
+
+        compile_human_source_to_core(
+            FileId(0),
+            npa_cert::Name::from_dotted("Test"),
+            "\
+import Std.Nat.Basic
+def GoodAtOne : forall (Carrier : Sort 1), Sort 1 :=
+  fun Carrier => Nat -> Carrier",
+            &imports,
+            &HumanCompileOptions::default(),
+        )
+        .expect("the positive-universe specialization should remain valid");
+    }
+
+    #[test]
+    fn human_function_alias_universe_mismatch_crosses_definitionally_equal_domain() {
+        let source = "\
+def PropAlias : Type := Prop
+def Bad : forall (Carrier : Prop), Type :=
+  fun (Carrier : PropAlias) => Prop -> Carrier";
+        let err = compile_human_source_to_core(
+            FileId(0),
+            npa_cert::Name::from_dotted("Test"),
+            source,
+            &[],
+            &HumanCompileOptions::default(),
+        )
+        .expect_err("the codomain mismatch must survive a reducible binder-domain alias");
+
+        assert_eq!(err.kind, HumanDiagnosticKind::TypeMismatch);
+        let mismatch = err
+            .payload
+            .as_deref()
+            .and_then(|payload| payload.universe_mismatch.as_ref())
+            .expect("definitionally equal Pi domains should remain aligned");
+        assert_eq!(mismatch.declaration_name(), "Bad");
+        assert_eq!(mismatch.type_path(), "pi_body");
+        assert_eq!(mismatch.declared_level(), "1");
+        assert_eq!(mismatch.inferred_level(), "0");
+    }
+
+    #[test]
+    fn human_function_alias_valid_encodings_remain_accepted() {
+        let imports = [nat_import()];
+        compile_human_source_to_core(
+            FileId(0),
+            npa_cert::Name::from_dotted("Test"),
+            "\
+import Std.Nat.Basic
+def FunctionAlias.{u} : forall (Carrier : Sort u), Sort imax 1 u :=
+  fun Carrier => Nat -> Carrier
+inductive FunctionAliasWrapper.{u} (Carrier : Sort u) : Sort max 1 u where
+| mk : (Nat -> Carrier) -> FunctionAliasWrapper Carrier",
+            &imports,
+            &HumanCompileOptions::default(),
+        )
+        .expect("correct imax annotations and inductive wrappers should remain valid");
     }
 
     #[test]
@@ -11315,8 +11683,10 @@ def bad : Nat := Type",
 
         let diagnostic = human_diagnosed_kernel_decl_diagnostic(
             Span::empty(FileId(0)),
+            &Env::new(),
             error,
             "Human declaration handoff",
+            None,
         );
 
         assert_eq!(diagnostic.kind, HumanDiagnosticKind::TypeMismatch);

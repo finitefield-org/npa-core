@@ -239,6 +239,12 @@ pub(crate) fn build_module_cert_from_import_refs_with_preferred_imports_impl(
     )?;
     let referenced_builtins =
         referenced_builtin_names(&module.declarations, &imports, &local_public_names)?;
+    let reference_bindings = build_reference_bindings(
+        &local_name_to_index,
+        &local_generated_name_to_index,
+        &imported_decls,
+        &referenced_builtins,
+    )?;
     let selected_import_exports = imported_decls
         .iter()
         .map(|(name, info)| (info.import_index, name.clone(), info.decl_interface_hash))
@@ -262,9 +268,7 @@ pub(crate) fn build_module_cert_from_import_refs_with_preferred_imports_impl(
         let resolver = Resolver {
             current_decl_index: decl_index,
             allow_self,
-            local_name_to_index: &local_name_to_index,
-            local_generated_name_to_index: &local_generated_name_to_index,
-            imported_decls: &imported_decls,
+            reference_bindings: &reference_bindings,
             name_index: &name_index,
             canon_term_memo: &canon_term_memo,
         };
@@ -354,6 +358,7 @@ pub(crate) fn build_module_cert_from_import_refs_with_preferred_imports_impl(
             certificate_hash: [0; 32],
         },
     };
+    audit_emitted_reference_origins(&cert, &reference_bindings)?;
     cert.hashes.certificate_hash = hash_with_domain(
         MODULE_CERT_DOMAIN,
         &encode_module_cert_without_certificate_hash(&cert),
@@ -666,7 +671,7 @@ pub(crate) fn canonical_producer_checked_decl_hashes(
     }
     collect_names_from_decl(&mut names, decl);
     let referenced_imports =
-        producer_referenced_imported_export_names(decl, &lookup_env.import_exports)?;
+        producer_referenced_imported_export_names(decl, &lookup_env.imported_export_names);
     producer_collect_imported_axiom_names_for_referenced_exports(
         &mut names,
         &lookup_env.import_exports,
@@ -682,13 +687,24 @@ pub(crate) fn canonical_producer_checked_decl_hashes(
         .collect();
     let imported_decls =
         producer_imported_decl_map(&lookup_env.import_exports, &name_index, &referenced_imports)?;
-    let local_name_to_index: BTreeMap<_, _> = lookup_env
-        .checked_decl_names
-        .iter()
+    let referenced_builtins = name_index
+        .keys()
+        .filter(|name| {
+            !lookup_env.checked_decl_name_to_index.contains_key(*name)
+                && !lookup_env
+                    .checked_generated_name_to_index
+                    .contains_key(*name)
+                && !imported_decls.contains_key(*name)
+                && builtin_decl_interface_hash(name).is_some()
+        })
         .cloned()
-        .enumerate()
-        .map(|(index, name)| (name, index))
         .collect();
+    let reference_bindings = build_reference_bindings(
+        &lookup_env.checked_decl_name_to_index,
+        &lookup_env.checked_generated_name_to_index,
+        &imported_decls,
+        &referenced_builtins,
+    )?;
     let canon_term_memo = std::cell::RefCell::new(CanonTermMemo::default());
     let resolver = Resolver {
         current_decl_index,
@@ -696,9 +712,7 @@ pub(crate) fn canonical_producer_checked_decl_hashes(
             decl,
             Decl::Inductive { .. } | Decl::Axiom { .. } | Decl::AxiomConstrained { .. }
         ),
-        local_name_to_index: &local_name_to_index,
-        local_generated_name_to_index: &lookup_env.checked_generated_name_to_index,
-        imported_decls: &imported_decls,
+        reference_bindings: &reference_bindings,
         name_index: &name_index,
         canon_term_memo: &canon_term_memo,
     };
@@ -748,9 +762,7 @@ pub(crate) fn canonical_producer_checked_decl_hashes(
 struct Resolver<'a> {
     current_decl_index: usize,
     allow_self: bool,
-    local_name_to_index: &'a BTreeMap<Name, usize>,
-    local_generated_name_to_index: &'a BTreeMap<Name, usize>,
-    imported_decls: &'a BTreeMap<Name, ImportedDeclInfo>,
+    reference_bindings: &'a BTreeMap<Name, ResolvedReferenceBinding>,
     name_index: &'a BTreeMap<Name, usize>,
     // Canonicalization memo keyed by kernel `Arc<Expr>` pointer identity,
     // shared across every declaration of one module build. The anchored
@@ -774,6 +786,94 @@ struct ImportedDeclInfo {
     decl_interface_hash: Hash,
     kind: ExportKind,
     axiom_dependencies: Vec<AxiomRef>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ResolvedReferenceBinding {
+    LocalDeclaration {
+        decl_index: usize,
+    },
+    LocalGenerated {
+        owner_decl_index: usize,
+        name: Name,
+    },
+    ImportedExport {
+        import_index: usize,
+        name: Name,
+        decl_interface_hash: Hash,
+        export_kind: ExportKind,
+    },
+    Builtin {
+        name: Name,
+        decl_interface_hash: Hash,
+    },
+}
+
+fn build_reference_bindings(
+    local_declarations: &BTreeMap<Name, usize>,
+    local_generated: &BTreeMap<Name, usize>,
+    imported_decls: &BTreeMap<Name, ImportedDeclInfo>,
+    referenced_builtins: &BTreeSet<Name>,
+) -> Result<BTreeMap<Name, ResolvedReferenceBinding>> {
+    let mut bindings = BTreeMap::new();
+
+    for name in referenced_builtins {
+        let decl_interface_hash = builtin_decl_interface_hash(name)
+            .ok_or_else(|| CertError::UnknownDependency { name: name.clone() })?;
+        bindings.insert(
+            name.clone(),
+            ResolvedReferenceBinding::Builtin {
+                name: name.clone(),
+                decl_interface_hash,
+            },
+        );
+    }
+    for (name, info) in imported_decls {
+        let binding = ResolvedReferenceBinding::ImportedExport {
+            import_index: info.import_index,
+            name: name.clone(),
+            decl_interface_hash: info.decl_interface_hash,
+            export_kind: info.kind,
+        };
+        if let Some(previous) = bindings.insert(name.clone(), binding.clone()) {
+            if !matches!(previous, ResolvedReferenceBinding::Builtin { .. }) && previous != binding
+            {
+                return Err(reference_origin_mismatch(
+                    name.clone(),
+                    "unique imported export identity",
+                    "ambiguous imported export identity",
+                ));
+            }
+        }
+    }
+    for (name, decl_index) in local_declarations {
+        bindings.insert(
+            name.clone(),
+            ResolvedReferenceBinding::LocalDeclaration {
+                decl_index: *decl_index,
+            },
+        );
+    }
+    for (name, owner_decl_index) in local_generated {
+        let replaced = bindings.insert(
+            name.clone(),
+            ResolvedReferenceBinding::LocalGenerated {
+                owner_decl_index: *owner_decl_index,
+                name: name.clone(),
+            },
+        );
+        if matches!(
+            replaced,
+            Some(
+                ResolvedReferenceBinding::LocalDeclaration { .. }
+                    | ResolvedReferenceBinding::LocalGenerated { .. }
+            )
+        ) {
+            return Err(CertError::DuplicateName { name: name.clone() });
+        }
+    }
+
+    Ok(bindings)
 }
 
 struct FinalizedCanonDecl {
@@ -969,39 +1069,331 @@ impl Resolver<'_> {
     }
 
     fn resolve_const(&self, name: &Name) -> Result<GlobalRef> {
-        if let Some(index) = self.local_name_to_index.get(name).copied() {
-            if index < self.current_decl_index
-                || (self.allow_self && index == self.current_decl_index)
-            {
-                return Ok(GlobalRef::Local { decl_index: index });
+        let binding = self
+            .reference_bindings
+            .get(name)
+            .ok_or_else(|| CertError::UnknownDependency { name: name.clone() })?;
+        match binding {
+            ResolvedReferenceBinding::LocalDeclaration { decl_index } => {
+                self.resolve_local(name, *decl_index)?;
+                Ok(GlobalRef::Local {
+                    decl_index: *decl_index,
+                })
             }
-            return Err(CertError::DependencyCycle { name: name.clone() });
-        }
-        if let Some(index) = self.local_generated_name_to_index.get(name).copied() {
-            if index < self.current_decl_index
-                || (self.allow_self && index == self.current_decl_index)
-            {
-                return Ok(GlobalRef::LocalGenerated {
-                    decl_index: index,
+            ResolvedReferenceBinding::LocalGenerated {
+                owner_decl_index, ..
+            } => {
+                self.resolve_local(name, *owner_decl_index)?;
+                Ok(GlobalRef::LocalGenerated {
+                    decl_index: *owner_decl_index,
                     name: self.name_id(name)?,
-                });
+                })
             }
-            return Err(CertError::DependencyCycle { name: name.clone() });
-        }
-        if let Some(info) = self.imported_decls.get(name) {
-            return Ok(GlobalRef::Imported {
-                import_index: info.import_index,
-                name: self.name_id(name)?,
-                decl_interface_hash: info.decl_interface_hash,
-            });
-        }
-        if let Some(decl_interface_hash) = builtin_decl_interface_hash(name) {
-            return Ok(GlobalRef::Builtin {
-                name: self.name_id(name)?,
+            ResolvedReferenceBinding::ImportedExport {
+                import_index,
                 decl_interface_hash,
-            });
+                ..
+            } => Ok(GlobalRef::Imported {
+                import_index: *import_index,
+                name: self.name_id(name)?,
+                decl_interface_hash: *decl_interface_hash,
+            }),
+            ResolvedReferenceBinding::Builtin {
+                decl_interface_hash,
+                ..
+            } => Ok(GlobalRef::Builtin {
+                name: self.name_id(name)?,
+                decl_interface_hash: *decl_interface_hash,
+            }),
         }
-        Err(CertError::UnknownDependency { name: name.clone() })
+    }
+
+    fn resolve_local(&self, name: &Name, decl_index: usize) -> Result<()> {
+        if decl_index < self.current_decl_index
+            || (self.allow_self && decl_index == self.current_decl_index)
+        {
+            Ok(())
+        } else {
+            Err(CertError::DependencyCycle { name: name.clone() })
+        }
+    }
+}
+
+fn audit_emitted_reference_origins(
+    cert: &ModuleCert,
+    bindings: &BTreeMap<Name, ResolvedReferenceBinding>,
+) -> Result<()> {
+    for node in &cert.term_table {
+        if let TermNode::Const { global_ref, .. } = node {
+            audit_global_ref_origin(cert, bindings, global_ref)?;
+        }
+    }
+    for declaration in &cert.declarations {
+        for dependency in &declaration.dependencies {
+            let (name, expected_hash) =
+                audit_global_ref_origin(cert, bindings, &dependency.global_ref)?;
+            if dependency.decl_interface_hash != expected_hash {
+                return Err(reference_origin_mismatch(
+                    name,
+                    "binding interface hash",
+                    "dependency interface hash",
+                ));
+            }
+        }
+        audit_axiom_ref_origins(cert, bindings, &declaration.axiom_dependencies)?;
+    }
+    for export in &cert.export_block {
+        let name = cert
+            .name_table
+            .get(export.name)
+            .ok_or(CertError::DecodeError)?;
+        let owner_decl_index = match bindings.get(name) {
+            Some(ResolvedReferenceBinding::LocalDeclaration { decl_index }) => *decl_index,
+            Some(ResolvedReferenceBinding::LocalGenerated {
+                owner_decl_index, ..
+            }) => *owner_decl_index,
+            Some(ResolvedReferenceBinding::ImportedExport { .. }) => {
+                return Err(reference_origin_mismatch(
+                    name.clone(),
+                    "local export",
+                    "imported export",
+                ))
+            }
+            Some(ResolvedReferenceBinding::Builtin { .. }) | None => {
+                return Err(reference_origin_mismatch(
+                    name.clone(),
+                    "local export",
+                    "builtin or unknown export",
+                ))
+            }
+        };
+        let expected_hash = cert
+            .declarations
+            .get(owner_decl_index)
+            .ok_or(CertError::DecodeError)?
+            .hashes
+            .decl_interface_hash;
+        if export.decl_interface_hash != expected_hash {
+            return Err(reference_origin_mismatch(
+                name.clone(),
+                "owner declaration interface hash",
+                "export interface hash",
+            ));
+        }
+        audit_axiom_ref_origins(cert, bindings, &export.axiom_dependencies)?;
+    }
+    audit_axiom_ref_origins(cert, bindings, &cert.axiom_report.module_axioms)?;
+    Ok(())
+}
+
+fn audit_axiom_ref_origins(
+    cert: &ModuleCert,
+    bindings: &BTreeMap<Name, ResolvedReferenceBinding>,
+    axioms: &[AxiomRef],
+) -> Result<()> {
+    for axiom in axioms {
+        let (name, expected_hash) = audit_axiom_ref_origin(cert, bindings, &axiom.global_ref)?;
+        let reported_name = cert
+            .name_table
+            .get(axiom.name)
+            .ok_or(CertError::DecodeError)?;
+        if reported_name != &name {
+            return Err(reference_origin_mismatch(
+                name,
+                "reference name",
+                "axiom dependency name",
+            ));
+        }
+        if axiom.decl_interface_hash != expected_hash {
+            return Err(reference_origin_mismatch(
+                name,
+                "binding interface hash",
+                "axiom interface hash",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn audit_axiom_ref_origin(
+    cert: &ModuleCert,
+    bindings: &BTreeMap<Name, ResolvedReferenceBinding>,
+    global_ref: &GlobalRef,
+) -> Result<(Name, Hash)> {
+    match global_ref {
+        GlobalRef::Imported {
+            import_index,
+            name,
+            decl_interface_hash,
+        } => {
+            cert.imports
+                .get(*import_index)
+                .ok_or(CertError::DecodeError)?;
+            let name = cert
+                .name_table
+                .get(*name)
+                .cloned()
+                .ok_or(CertError::DecodeError)?;
+            Ok((name, *decl_interface_hash))
+        }
+        GlobalRef::Builtin {
+            name,
+            decl_interface_hash,
+        } => {
+            let name = cert
+                .name_table
+                .get(*name)
+                .cloned()
+                .ok_or(CertError::DecodeError)?;
+            if builtin_decl_interface_hash(&name) != Some(*decl_interface_hash) {
+                return Err(reference_origin_mismatch(
+                    name,
+                    "builtin axiom identity",
+                    "builtin axiom with mismatched identity",
+                ));
+            }
+            Ok((name, *decl_interface_hash))
+        }
+        GlobalRef::Local { .. } | GlobalRef::LocalGenerated { .. } => {
+            audit_global_ref_origin(cert, bindings, global_ref)
+        }
+    }
+}
+
+fn audit_global_ref_origin(
+    cert: &ModuleCert,
+    bindings: &BTreeMap<Name, ResolvedReferenceBinding>,
+    global_ref: &GlobalRef,
+) -> Result<(Name, Hash)> {
+    match global_ref {
+        GlobalRef::Local { decl_index } => {
+            let declaration = cert
+                .declarations
+                .get(*decl_index)
+                .ok_or(CertError::DecodeError)?;
+            let name = cert
+                .name_table
+                .get(decl_payload_name_id(&declaration.decl))
+                .cloned()
+                .ok_or(CertError::DecodeError)?;
+            if bindings.get(&name)
+                != Some(&ResolvedReferenceBinding::LocalDeclaration {
+                    decl_index: *decl_index,
+                })
+            {
+                return Err(reference_origin_mismatch(
+                    name,
+                    "local declaration",
+                    "local declaration with mismatched owner",
+                ));
+            }
+            Ok((name, declaration.hashes.decl_interface_hash))
+        }
+        GlobalRef::LocalGenerated { decl_index, name } => {
+            let name = cert
+                .name_table
+                .get(*name)
+                .cloned()
+                .ok_or(CertError::DecodeError)?;
+            if bindings.get(&name)
+                != Some(&ResolvedReferenceBinding::LocalGenerated {
+                    owner_decl_index: *decl_index,
+                    name: name.clone(),
+                })
+            {
+                return Err(reference_origin_mismatch(
+                    name,
+                    "local generated declaration",
+                    "local generated declaration with mismatched owner",
+                ));
+            }
+            let hash = cert
+                .declarations
+                .get(*decl_index)
+                .ok_or(CertError::DecodeError)?
+                .hashes
+                .decl_interface_hash;
+            Ok((name, hash))
+        }
+        GlobalRef::Imported {
+            import_index,
+            name,
+            decl_interface_hash,
+        } => {
+            let name = cert
+                .name_table
+                .get(*name)
+                .cloned()
+                .ok_or(CertError::DecodeError)?;
+            let matches = matches!(
+                bindings.get(&name),
+                Some(ResolvedReferenceBinding::ImportedExport {
+                    import_index: expected_import,
+                    name: expected_name,
+                    decl_interface_hash: expected_hash,
+                    export_kind: _,
+                }) if expected_import == import_index
+                    && expected_name == &name
+                    && expected_hash == decl_interface_hash
+            );
+            if !matches {
+                return Err(reference_origin_mismatch(
+                    name,
+                    "imported export identity",
+                    "imported reference with mismatched identity",
+                ));
+            }
+            Ok((name, *decl_interface_hash))
+        }
+        GlobalRef::Builtin {
+            name,
+            decl_interface_hash,
+        } => {
+            let name = cert
+                .name_table
+                .get(*name)
+                .cloned()
+                .ok_or(CertError::DecodeError)?;
+            if bindings.get(&name)
+                != Some(&ResolvedReferenceBinding::Builtin {
+                    name: name.clone(),
+                    decl_interface_hash: *decl_interface_hash,
+                })
+            {
+                return Err(reference_origin_mismatch(
+                    name,
+                    "builtin identity",
+                    "builtin reference with mismatched identity",
+                ));
+            }
+            Ok((name, *decl_interface_hash))
+        }
+    }
+}
+
+fn decl_payload_name_id(payload: &DeclPayload) -> NameId {
+    match payload {
+        DeclPayload::Axiom { name, .. }
+        | DeclPayload::AxiomConstrained { name, .. }
+        | DeclPayload::Def { name, .. }
+        | DeclPayload::DefConstrained { name, .. }
+        | DeclPayload::Theorem { name, .. }
+        | DeclPayload::TheoremConstrained { name, .. }
+        | DeclPayload::Inductive { name, .. }
+        | DeclPayload::InductiveConstrained { name, .. }
+        | DeclPayload::MutualInductiveBlock { name, .. } => *name,
+    }
+}
+
+fn reference_origin_mismatch(
+    name: Name,
+    expected: &'static str,
+    actual: &'static str,
+) -> CertError {
+    CertError::ReferenceOriginMismatch {
+        name,
+        expected,
+        actual,
     }
 }
 
@@ -2323,26 +2715,12 @@ fn referenced_imported_export_names(
 
 fn producer_referenced_imported_export_names(
     decl: &Decl,
-    imports: &[ProducerImportExportView],
-) -> Result<BTreeSet<Name>> {
+    imported_export_names: &BTreeSet<Name>,
+) -> BTreeSet<Name> {
     let mut referenced_names = BTreeSet::new();
     collect_const_names_from_decl(&mut referenced_names, decl);
-
-    let mut imported_exports = BTreeSet::new();
-    for import in imports {
-        for entry in &import.exports {
-            imported_exports.insert(
-                import
-                    .name_table
-                    .get(entry.name)
-                    .cloned()
-                    .ok_or(CertError::DecodeError)?,
-            );
-        }
-    }
-    referenced_names.retain(|name| imported_exports.contains(name));
-
-    Ok(referenced_names)
+    referenced_names.retain(|name| imported_export_names.contains(name));
+    referenced_names
 }
 
 fn referenced_builtin_names(
@@ -2516,4 +2894,76 @@ pub(crate) fn union_axioms(axioms: impl IntoIterator<Item = AxiomRef>) -> Vec<Ax
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect()
+}
+
+#[cfg(test)]
+mod reference_binding_tests {
+    use super::*;
+
+    #[test]
+    fn reference_binding_table_records_each_origin_before_emission() {
+        let local = Name::from_dotted("Fixture.local");
+        let generated = Name::from_dotted("Fixture.local.mk");
+        let imported = Name::from_dotted("Fixture.imported");
+        let builtin = Name::from_dotted("Nat");
+        let imported_hash = [0x51; 32];
+        let builtin_hash = builtin_decl_interface_hash(&builtin).unwrap();
+        let bindings = build_reference_bindings(
+            &BTreeMap::from([(local.clone(), 2)]),
+            &BTreeMap::from([(generated.clone(), 2)]),
+            &BTreeMap::from([(
+                imported.clone(),
+                ImportedDeclInfo {
+                    import_index: 1,
+                    decl_interface_hash: imported_hash,
+                    kind: ExportKind::Constructor,
+                    axiom_dependencies: Vec::new(),
+                },
+            )]),
+            &BTreeSet::from([builtin.clone()]),
+        )
+        .unwrap();
+
+        assert_eq!(
+            bindings.get(&local),
+            Some(&ResolvedReferenceBinding::LocalDeclaration { decl_index: 2 })
+        );
+        assert_eq!(
+            bindings.get(&generated),
+            Some(&ResolvedReferenceBinding::LocalGenerated {
+                owner_decl_index: 2,
+                name: generated,
+            })
+        );
+        assert_eq!(
+            bindings.get(&imported),
+            Some(&ResolvedReferenceBinding::ImportedExport {
+                import_index: 1,
+                name: imported,
+                decl_interface_hash: imported_hash,
+                export_kind: ExportKind::Constructor,
+            })
+        );
+        assert_eq!(
+            bindings.get(&builtin),
+            Some(&ResolvedReferenceBinding::Builtin {
+                name: builtin,
+                decl_interface_hash: builtin_hash,
+            })
+        );
+    }
+
+    #[test]
+    fn reference_binding_table_rejects_duplicate_local_and_generated_names() {
+        let collision = Name::from_dotted("Fixture.collision");
+        let error = build_reference_bindings(
+            &BTreeMap::from([(collision.clone(), 0)]),
+            &BTreeMap::from([(collision.clone(), 0)]),
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+        )
+        .unwrap_err();
+
+        assert_eq!(error, CertError::DuplicateName { name: collision });
+    }
 }

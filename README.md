@@ -94,6 +94,23 @@ npa package index --root . --check --json
 npa package audit-artifact-ledger --root . --json
 ```
 
+The Mathlib interface-proposal validator is a separate curation-only command:
+
+```sh
+npa package check-interface-proposals \
+  --root testdata/package/interface-proposals-valid \
+  --proposal-root proposals --json
+```
+
+It is deterministic, network-free, read-only, and emits
+`npa.mathlib.interface_proposal_check.v1` with `proof_evidence: false`. It
+reads only the selected package manifest and canonical `Mathlib/**/*.toml`
+proposal files; it does not dereference evidence URLs, invoke Git or a proof
+checker, read certificate/source sidecars, write files, admit catalog modules,
+or turn curation status into proof evidence. Supplying
+`--previous-proposal-root` enables only the locally detectable continuity
+checks for the caller-selected immediately preceding snapshot.
+
 For local certificate-only edits, use the source-free changed-certificate path:
 
 ```sh

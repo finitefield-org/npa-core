@@ -5691,11 +5691,29 @@ fn frontend_build_failed(
             )
         })
     });
+    let universe_mismatch = error.payload.as_ref().and_then(|payload| {
+        payload.universe_mismatch.as_ref().map(|mismatch| {
+            (
+                mismatch.declared_level().to_owned(),
+                format!(
+                    "declaration={};inferred_level={};type_path={}",
+                    mismatch.declaration_name(),
+                    mismatch.inferred_level(),
+                    mismatch.type_path(),
+                ),
+            )
+        })
+    });
     let mut diagnostic = CommandDiagnostic::error(DiagnosticKind::Build, "build_failed")
         .with_module(module.module.as_dotted())
         .with_path(format!("modules[{module_index}].source"))
         .with_field(phase)
         .with_actual_value(error.message);
+    if let Some((declared_level, inferred_context)) = universe_mismatch {
+        diagnostic = diagnostic
+            .with_expected_value(declared_level)
+            .with_actual_value(inferred_context);
+    }
     if let Some(conversion) = conversion {
         diagnostic = diagnostic.with_conversion(conversion);
     }

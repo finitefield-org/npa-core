@@ -480,6 +480,7 @@ fn raw_error_json(error: &ReferenceCheckError) -> String {
             Some("constructor_universe_bound_violation")
         }
         Some(ReferenceCheckReason::UnknownReference) => Some("unknown_reference"),
+        Some(ReferenceCheckReason::ResourceLimit) => Some("resource_limit"),
         _ => None,
     };
     if let Some(reason_code) = reason_code {
@@ -500,6 +501,16 @@ fn raw_error_json(error: &ReferenceCheckError) -> String {
                     .join(",")
             ));
         }
+    }
+    if let Some(limit) = error.structural_limit {
+        fields.push(format!(
+            "\"expected_value\":{}",
+            json_string(&format!("{}<={}", limit.kind.as_str(), limit.limit))
+        ));
+        fields.push(format!(
+            "\"actual_value\":{}",
+            json_string(&limit.observed.to_string())
+        ));
     }
     fields.push(format!(
         "\"section\":{}",
@@ -977,6 +988,7 @@ mod tests {
                 offset: 17,
                 reason: Some(ReferenceCheckReason::HashMismatch { object }),
                 reference: None,
+                structural_limit: None,
             };
             let json = raw_error_json(&error);
             assert!(json.contains("\"kind\":\"dependency_hash_mismatch\""));
@@ -1011,6 +1023,7 @@ mod tests {
                 declaration: reference_name("Std.Logic.Eq.rec"),
                 decl_interface_hash: [0xef; 32],
             }),
+            structural_limit: None,
         };
 
         assert_eq!(
@@ -1036,6 +1049,7 @@ mod tests {
                 declaration: reference_name("Missing.value"),
                 decl_interface_hash: [0x11; 32],
             }),
+            structural_limit: None,
         };
 
         assert_eq!(
@@ -1079,6 +1093,7 @@ mod tests {
                 offset: 5,
                 reason: Some(ReferenceCheckReason::UnknownReference),
                 reference: Some(reference),
+                structural_limit: None,
             };
             assert!(raw_error_json(&error).contains(expected));
         }
@@ -1125,6 +1140,7 @@ mod tests {
                 offset: 5,
                 reason: Some(ReferenceCheckReason::UnknownReference),
                 reference: Some(reference),
+                structural_limit: None,
             };
             let json = raw_error_json(&error);
             assert!(json.contains(&expected_path), "{json}");
@@ -1144,6 +1160,7 @@ mod tests {
             offset: 13,
             reason: Some(ReferenceCheckReason::UnknownReference),
             reference: None,
+            structural_limit: None,
         };
 
         assert_eq!(

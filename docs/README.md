@@ -52,6 +52,12 @@ certificate and import hashes, and axiom reports.
   initial design and implementation record for the package artifact refresh
   mode. The current v0.7 workflow additionally refreshes declared metadata and
   supports dependency-safe targeted selection as documented above.
+- [Interface Proposal Surface-Drift Contract v1](interface-proposal-surface-drift-v1.md):
+  implemented read-only comparison between an adopted proposal and a prepared
+  target module.
+- [Promotion-Origin Registry Reconciliation Command](promotion-origin-registry-reconciliation.md):
+  implemented recurring transaction for synchronizing any valid older catalog
+  registry with a strictly newer mutable `npa-mathlib` target.
 
 ## Verify A Package
 
@@ -67,9 +73,32 @@ npa package check-hashes --root .
 npa package axiom-report --root . --check
 npa package index --root . --check
 npa package theorem-premise-report --root . --check
+npa package export-summary --root . --check
 npa package publish-plan --root . --check
+npa package check-generated --root . --timings summary
+npa package validate-promotion-origin-registry --root . --json
 npa package audit-artifact-ledger --root . --json
 ```
+
+For the compact Mathlib interface-proposal curation fixture, run this from
+the `npa-core` repository root using the separate network-free, read-only
+validator:
+
+```sh
+npa package check-interface-proposals \
+  --root testdata/package/interface-proposals-valid \
+  --proposal-root proposals --json
+```
+
+The command emits `npa.mathlib.interface_proposal_check.v1` rows, hashes,
+lifecycle counts, and bounded diagnostics. An optional
+`--previous-proposal-root` is a caller-supplied immediately preceding
+snapshot; the command checks only locally detectable per-record continuity and
+does not select history itself. It reads the local package manifest and the
+canonical proposal tree, does not follow evidence URLs or invoke Git, network,
+certificate verification, or proof checking, writes no files, and is not proof
+verification or catalog admission. Its `proof_evidence` field is always
+`false`.
 
 Explicit export destinations are package-root-relative. Pair `--root` with an
 `--out` that names only the path below that root:

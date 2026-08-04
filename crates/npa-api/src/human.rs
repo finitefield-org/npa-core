@@ -6422,7 +6422,7 @@ fn human_compile_machine_tactic_diagnostic(
         None,
         format!(
             "Human by proof tactic execution failed before certificate handoff: {:?}: {}",
-            &diagnostic.kind, diagnostic.message
+            diagnostic.kind, diagnostic.message
         ),
     )
     .into()

@@ -378,13 +378,24 @@ let run_decoder_bytes_tests () =
     (Ext_bytes.read_usize Ext_bytes.Imports (Ext_bytes.of_string usize_overflow));
   let too_many_imports = Ext_bytes.encode_uvar 4_097L in
   assert_decode_error "import count resource limit" "certificate_decode_error"
-    Ext_bytes.Resource_limit Ext_bytes.Imports 0
-    (Ext_bytes.read_count Ext_bytes.Imports
+    (Ext_bytes.Structural_resource_limit
+       (Ext_bytes.Imports_limit, Ext_bytes.max_imports, 4_097))
+    Ext_bytes.Imports 0
+    (Ext_bytes.read_count_with_limit Ext_bytes.Imports
+       Ext_bytes.Imports_limit Ext_bytes.max_imports
        (Ext_bytes.of_string too_many_imports));
-  let too_many_terms = Ext_bytes.encode_uvar 100_001L in
+  let too_many_terms =
+    Ext_bytes.encode_uvar
+      (Int64.of_int (Ext_bytes.max_term_table_nodes + 1))
+  in
   assert_decode_error "term count resource limit" "certificate_decode_error"
-    Ext_bytes.Resource_limit Ext_bytes.Term_table 0
-    (Ext_bytes.read_count Ext_bytes.Term_table
+    (Ext_bytes.Structural_resource_limit
+       ( Ext_bytes.Term_table_nodes,
+         Ext_bytes.max_term_table_nodes,
+         Ext_bytes.max_term_table_nodes + 1 ))
+    Ext_bytes.Term_table 0
+    (Ext_bytes.read_count_with_limit Ext_bytes.Term_table
+       Ext_bytes.Term_table_nodes Ext_bytes.max_term_table_nodes
        (Ext_bytes.of_string too_many_terms))
 
 let encode_uvar_int value = Ext_bytes.encode_uvar (Int64.of_int value)
@@ -856,12 +867,17 @@ let run_decoder_tables_tests () =
     Ext_bytes.Dangling_reference Ext_bytes.Level_table 1
     (Ext_level.read_table [ universe_name ]
        (Ext_bytes.of_string (encode_uvar_int 1 ^ encode_level_param 1)));
+  let non_normalized_max_zero =
+    Ext_level.read_table [ universe_name ]
+      (Ext_bytes.of_string
+         (encode_uvar_int 3 ^ encode_level_zero ^ encode_level_param 0
+        ^ encode_level_max 0 1))
+  in
   assert_decode_error "non-normalized max zero" "noncanonical_encoding"
     Ext_bytes.Non_normalized_level Ext_bytes.Level_table 4
-    (Ext_level.read_table [ universe_name ]
-       (Ext_bytes.of_string
-          (encode_uvar_int 3 ^ encode_level_zero ^ encode_level_param 0
-         ^ encode_level_max 0 1)));
+    (match non_normalized_max_zero with
+    | Error error -> Error error
+    | Ok (levels, _) -> Ext_cert.validate_level_table_normalization levels);
   assert_decode_error "duplicate level entry" "noncanonical_encoding"
     Ext_bytes.Noncanonical_order Ext_bytes.Level_table 2
     (Ext_level.read_table names
@@ -875,13 +891,12 @@ let run_decoder_tables_tests () =
   let level_depth_table =
     encode_uvar_int (Ext_bytes.max_node_depth + 1) ^ level_depth_entries
   in
-  let last_level_offset =
-    String.length level_depth_table
-    - String.length (encode_level_succ (Ext_bytes.max_node_depth - 1))
+  let deep_levels, _ =
+    assert_ok "level depth is deferred until structural preflight"
+      (Ext_level.read_table names (Ext_bytes.of_string level_depth_table))
   in
-  assert_decode_error "level depth resource limit" "certificate_decode_error"
-    Ext_bytes.Resource_limit Ext_bytes.Level_table last_level_offset
-    (Ext_level.read_table names (Ext_bytes.of_string level_depth_table));
+  assert_int_equal "deep level table decoded count"
+    (Ext_bytes.max_node_depth + 1) (List.length deep_levels);
   assert_decode_error "unresolved universe metavariable" "certificate_decode_error"
     Ext_bytes.Unresolved_metavariable Ext_bytes.Level_table 1
     (Ext_level.read_table [ make_unchecked_name [ "z?meta" ] ]
@@ -919,9 +934,36 @@ let run_decoder_tables_tests () =
     (Ext_term.read_table names levels
        (Ext_bytes.of_string (encode_uvar_int 2 ^ encode_term_sort 0 ^ encode_term_sort 0)))
 
-let simple_level_table = [ { Ext_level.level = Ext_level.Zero; offset = 0 } ]
+let simple_level_payload = String.make 1 (Char.chr 0x00)
 
-let simple_term_table = [ { Ext_term.term = Ext_term.Sort Ext_level.Zero; offset = 0 } ]
+let simple_level_table =
+  [
+    {
+      Ext_level.level = Ext_level.Zero;
+      offset = 0;
+      depth = 1;
+      expanded = 1;
+      order_payload = simple_level_payload;
+      structural_hash = Ext_level.structural_hash simple_level_payload;
+    };
+  ]
+
+let simple_term_payload =
+  String.make 1 (Char.chr 0x00)
+  ^ Ext_level.structural_hash simple_level_payload
+
+let simple_term_table =
+  [
+    {
+      Ext_term.term = Ext_term.Sort Ext_level.Zero;
+      offset = 0;
+      depth = 2;
+      order_height = 0;
+      expanded = 2;
+      order_payload = simple_term_payload;
+      structural_hash = Ext_term.structural_hash simple_term_payload;
+    };
+  ]
 
 let encode_module ?(core_features = []) ?(axiom_report = encode_axiom_report [] [])
     ?(module_name = [ "M" ]) ?(imports = []) name_entries level_entries term_entries
@@ -1814,18 +1856,49 @@ let run_hash_level_term_tests () =
   assert_bool "mutating referenced term changes dependent term hash"
     (List.nth term_hashes 4 <> List.nth mutated_term_hashes 4);
 
-  let dangling_level_table = [ { Ext_level.level = Ext_level.Succ Ext_level.Zero; offset = 7 } ] in
+  let dangling_level_table =
+    [
+      {
+        Ext_level.level = Ext_level.Succ Ext_level.Zero;
+        offset = 7;
+        depth = 2;
+        expanded = 2;
+        order_payload = "";
+        structural_hash = "";
+      };
+    ]
+  in
   assert_decode_error "level hash dangling child" "certificate_decode_error"
     Ext_bytes.Dangling_reference Ext_bytes.Level_table 7
     (Ext_canonical.level_hashes dangling_level_table);
   let dangling_term_table =
-    [ { Ext_term.term = Ext_term.App (Ext_term.BVar 0, Ext_term.BVar 0); offset = 9 } ]
+    [
+      {
+        Ext_term.term = Ext_term.App (Ext_term.BVar 0, Ext_term.BVar 0);
+        offset = 9;
+        depth = 2;
+        order_height = 1;
+        expanded = 3;
+        order_payload = "";
+        structural_hash = "";
+      };
+    ]
   in
   assert_decode_error "term hash dangling child" "certificate_decode_error"
     Ext_bytes.Dangling_reference Ext_bytes.Term_table 9
     (Ext_canonical.term_hashes [] [] [] dangling_term_table);
   let missing_level_term_table =
-    [ { Ext_term.term = Ext_term.Sort Ext_level.Zero; offset = 11 } ]
+    [
+      {
+        Ext_term.term = Ext_term.Sort Ext_level.Zero;
+        offset = 11;
+        depth = 2;
+        order_height = 0;
+        expanded = 2;
+        order_payload = "";
+        structural_hash = "";
+      };
+    ]
   in
   assert_decode_error "term hash dangling level" "certificate_decode_error"
     Ext_bytes.Dangling_reference Ext_bytes.Term_table 11
@@ -2530,7 +2603,234 @@ let decoded_axiom_report_fixture ?(module_name = make_name [ "AxiomReportFixture
         axiom_report_hash_offset = 501;
         certificate_hash_offset = 502;
       };
+    structural_cost = None;
   }
+
+let structural_doubling_tables steps =
+  let level_bytes =
+    encode_uvar_int (steps + 1) ^ encode_level_zero
+    ^ String.concat ""
+        (List.init steps (fun index -> encode_level_max index index))
+  in
+  let levels, _ =
+    assert_ok "structural doubling levels"
+      (Ext_level.read_table [] (Ext_bytes.of_string level_bytes))
+  in
+  let term_bytes =
+    encode_uvar_int 1 ^ String.make 1 (Char.chr 0x00)
+    ^ encode_uvar_int steps
+  in
+  let terms, _ =
+    assert_ok "structural doubling term"
+      (Ext_term.read_table [] levels (Ext_bytes.of_string term_bytes))
+  in
+  (levels, terms)
+
+let run_structural_preflight_tests () =
+  let root_name = make_name [ "Structural"; "root" ] in
+  let resource_fixture steps declaration_count =
+    let levels, terms = structural_doubling_tables steps in
+    let root_term = (List.hd terms).Ext_term.term in
+    let declaration =
+      declaration_fixture ~offset:700 Ext_cert.Axiom
+        (Ext_cert.AxiomDecl
+           {
+             decl_name = root_name;
+             decl_universe_params = [];
+             decl_universe_constraints = [];
+             decl_ty = root_term;
+           })
+    in
+    {
+      (decoded_axiom_report_fixture [ root_name ]
+         (List.init declaration_count (fun _ -> declaration)))
+      with
+      Ext_cert.level_table = levels;
+      term_table = terms;
+    }
+  in
+  assert_decode_error "structural doubling root limit"
+    "certificate_decode_error"
+    (Ext_bytes.Structural_resource_limit
+       ( Ext_bytes.Root_expanded_nodes,
+         Ext_bytes.max_root_expanded_nodes,
+         Ext_bytes.max_root_expanded_nodes + 1 ))
+    Ext_bytes.Declarations 700
+    (Ext_cert.validate_resource_shape (resource_fixture 20 1));
+  assert_decode_error "structural certificate total limit"
+    "certificate_decode_error"
+    (Ext_bytes.Structural_resource_limit
+       ( Ext_bytes.Certificate_expanded_nodes,
+         Ext_bytes.max_certificate_expanded_nodes,
+         Ext_bytes.max_certificate_expanded_nodes + 1 ))
+    Ext_bytes.Declarations 700
+    (Ext_cert.validate_resource_shape (resource_fixture 18 33));
+  let deep_level_bytes =
+    encode_uvar_int (Ext_bytes.max_node_depth + 1) ^ encode_level_zero
+    ^ String.concat ""
+        (List.init Ext_bytes.max_node_depth (fun index ->
+             encode_level_succ index))
+  in
+  let deep_levels, _ =
+    assert_ok "structural deep levels decode"
+      (Ext_level.read_table []
+         (Ext_bytes.of_string deep_level_bytes))
+  in
+  let deep_offset =
+    (List.nth deep_levels Ext_bytes.max_node_depth).Ext_level.offset
+  in
+  let deep_decoded =
+    {
+      (decoded_axiom_report_fixture [] []) with
+      Ext_cert.level_table = deep_levels;
+    }
+  in
+  assert_decode_error "structural depth limit plus one"
+    "certificate_decode_error"
+    (Ext_bytes.Structural_resource_limit
+       ( Ext_bytes.Structural_depth,
+         Ext_bytes.max_node_depth,
+         Ext_bytes.max_node_depth + 1 ))
+    Ext_bytes.Level_table deep_offset
+    (Ext_cert.validate_structural_depth deep_decoded);
+  let dangling_global_offset = 733 in
+  let mixed_decoded =
+    {
+      deep_decoded with
+      Ext_cert.term_table =
+        [
+          {
+            Ext_term.term =
+              Ext_term.Const (Ext_term.Local { decl_index = 0 }, []);
+            offset = dangling_global_offset;
+            depth = 1;
+            order_height = 0;
+            expanded = 1;
+            order_payload = "";
+            structural_hash = "";
+          };
+        ];
+    }
+  in
+  assert_decode_error "dangling global ref precedes structural depth"
+    "certificate_decode_error" Ext_bytes.Dangling_reference
+    Ext_bytes.Term_table dangling_global_offset
+    (Ext_cert.validate_term_global_refs mixed_decoded);
+  let deep_term =
+    List.fold_left
+      (fun body _ -> Ext_term.Lam (Ext_term.BVar 0, body))
+      (Ext_term.BVar 0)
+      (List.init Ext_bytes.max_node_depth Fun.id)
+  in
+  ignore
+    (assert_ok "iterative term remapping"
+       (Ext_term.map_global_refs
+          (fun global_ref -> Ok global_ref)
+          (fun () ->
+            Ext_bytes.error Ext_bytes.Term_table 0 Ext_bytes.Dangling_reference)
+          deep_term));
+  let large_vector = List.init Ext_bytes.max_nested_vector_entries Fun.id in
+  let mapped_vector =
+    assert_ok "tail-recursive result mapping"
+      (Ext_import_store.map_result (fun value -> Ok value) large_vector)
+  in
+  assert_int_equal "tail-recursive result mapping length"
+    Ext_bytes.max_nested_vector_entries (List.length mapped_vector);
+  let expected_limits =
+    [
+      ("certificate_bytes", Ext_bytes.max_certificate_bytes);
+      ("imports", Ext_bytes.max_imports);
+      ("name_table_entries", Ext_bytes.max_name_table_entries);
+      ("level_table_nodes", Ext_bytes.max_level_table_nodes);
+      ("term_table_nodes", Ext_bytes.max_term_table_nodes);
+      ("declarations", Ext_bytes.max_declarations);
+      ("exports", Ext_bytes.max_exports);
+      ("nested_vector_entries", Ext_bytes.max_nested_vector_entries);
+      ("structural_depth", Ext_bytes.max_node_depth);
+      ("root_expanded_nodes", Ext_bytes.max_root_expanded_nodes);
+      ( "certificate_expanded_nodes",
+        Ext_bytes.max_certificate_expanded_nodes );
+      ("closure_modules", Ext_bytes.max_closure_modules);
+      ("closure_expanded_nodes", Ext_bytes.max_closure_expanded_nodes);
+    ]
+  in
+  let input =
+    open_in "../../testdata/certificate-structural-limits-maxima.tsv"
+  in
+  let rec read_limits limits =
+    match input_line input with
+    | line -> (
+        match String.split_on_char '\t' line with
+        | kind :: limit :: _ when kind <> "limit_kind" ->
+            read_limits ((kind, int_of_string limit) :: limits)
+        | _ -> read_limits limits)
+    | exception End_of_file -> List.rev limits
+  in
+  let actual_limits = read_limits [] in
+  close_in input;
+  assert_bool "external structural profile matches corpus fixture"
+    (List.sort Stdlib.compare actual_limits
+    = List.sort Stdlib.compare expected_limits);
+  let closure_entry index expansion =
+    {
+      Ext_import_store.structural_identity =
+        {
+          Ext_import_store.structural_module_name =
+            make_name [ Printf.sprintf "Closure%05d" index ];
+          structural_export_hash = hash_bytes (index land 0xff);
+          structural_certificate_hash =
+            hash_bytes ((index lsr 8) land 0xff);
+        };
+      structural_expansion = expansion;
+    }
+  in
+  let exact_modules =
+    List.init Ext_bytes.max_closure_modules (fun index ->
+        closure_entry index 0)
+  in
+  assert_bool "external closure accepts exact module limit"
+    (match Ext_import_store.validate_closure_limits 0 exact_modules with
+    | Ok _ -> true
+    | Error _ -> false);
+  assert_bool "external closure rejects module limit plus one"
+    (match
+       Ext_import_store.validate_closure_limits 0
+         (closure_entry Ext_bytes.max_closure_modules 0 :: exact_modules)
+     with
+    | Error
+        {
+          Ext_import_store.resolve_reason =
+            Ext_import_store.Structural_limit
+              (Ext_bytes.Closure_modules, _, observed);
+          _;
+        } ->
+        observed = Ext_bytes.max_closure_modules + 1
+    | _ -> false);
+  let exact_expansion =
+    List.init 4 (fun index ->
+        closure_entry index Ext_bytes.max_certificate_expanded_nodes)
+  in
+  assert_bool "external closure accepts exact expansion limit"
+    (match Ext_import_store.validate_closure_limits 0 exact_expansion with
+    | Ok _ -> true
+    | Error _ -> false);
+  assert_bool "external closure rejects expansion limit plus one"
+    (match
+       Ext_import_store.validate_closure_limits 0
+         [
+           closure_entry 0 Ext_bytes.max_closure_expanded_nodes;
+           closure_entry 1 1;
+         ]
+     with
+    | Error
+        {
+          Ext_import_store.resolve_reason =
+            Ext_import_store.Structural_limit
+              (Ext_bytes.Closure_expanded_nodes, _, observed);
+          _;
+        } ->
+        observed = Ext_bytes.max_closure_expanded_nodes + 1
+    | _ -> false)
 
 let set_axiom_report_hash decoded =
   let payload =
@@ -2921,6 +3221,7 @@ let run_axiom_policy_tests () =
             Ext_import_store.resolved_module_name = make_name [ "Std"; "Logic" ];
             resolved_export_hash = hash_bytes 0xb5;
             resolved_certificate_hash = None;
+            resolved_structural_closure = [];
             resolved_public_environment =
               {
                 Ext_import_store.public_imports = [];
@@ -2931,6 +3232,7 @@ let run_axiom_policy_tests () =
               };
           };
         ];
+      structural_closure = [];
     }
   in
   let import_eq_rec_decoded =
@@ -2975,6 +3277,7 @@ let run_axiom_policy_tests () =
             Ext_import_store.resolved_module_name = make_name [ "Imported" ];
             resolved_export_hash = hash_bytes 0xb8;
             resolved_certificate_hash = None;
+            resolved_structural_closure = [];
             resolved_public_environment =
               {
                 Ext_import_store.public_imports = [];
@@ -2997,6 +3300,7 @@ let run_axiom_policy_tests () =
               };
           };
         ];
+      structural_closure = [];
     }
   in
   let empty_decoded =
@@ -3210,9 +3514,11 @@ let run_axiom_report_tests () =
             Ext_import_store.resolved_module_name = make_name [ "Imported" ];
             resolved_export_hash = hash_bytes 0xa3;
             resolved_certificate_hash = None;
+            resolved_structural_closure = [];
             resolved_public_environment = public_environment;
           };
         ];
+      structural_closure = [];
     }
   in
   let imported_theorem_ref =
@@ -3452,6 +3758,7 @@ let run_type_env_tests () =
             Ext_import_store.resolved_module_name = make_name [ "Imported" ];
             resolved_export_hash = hash_bytes 0x92;
             resolved_certificate_hash = None;
+            resolved_structural_closure = [];
             resolved_public_environment =
               {
                 Ext_import_store.public_imports = [];
@@ -3474,6 +3781,7 @@ let run_type_env_tests () =
               };
           };
         ];
+      structural_closure = [];
     }
   in
   let imported_theorem_signature =
@@ -5622,7 +5930,10 @@ let run_defeq_tests () =
   in
   let wrong_eq_env =
     Ext_env.of_imports
-      { Ext_import_store.resolved_imports = [ wrong_eq_import ] }
+      {
+        Ext_import_store.resolved_imports = [ wrong_eq_import ];
+        structural_closure = [];
+      }
   in
   assert_defeq "defeq does not bridge an Eq-shaped untrusted module" false
     (defeq ~env:wrong_eq_env
@@ -6193,7 +6504,9 @@ let () =
   if should_run selected "sha256" then run_sha256_tests ();
   if should_run selected "decoder-bytes" then run_decoder_bytes_tests ();
   if should_run selected "decoder-header" then run_decoder_header_tests ();
-  if should_run selected "decoder-tables" then run_decoder_tables_tests ();
+  if should_run selected "decoder-tables" then (
+    run_decoder_tables_tests ();
+    run_structural_preflight_tests ());
   if should_run selected "decoder-declarations" then run_decoder_declarations_tests ();
   if should_run selected "decoder-reachability" then run_decoder_reachability_tests ();
   if should_run selected "feature-policy" then run_feature_policy_tests ();

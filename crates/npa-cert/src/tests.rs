@@ -4536,7 +4536,14 @@ fn rejects_name_component_count_larger_than_remaining_input() {
     encode_uvar_to(&mut bytes, u64::MAX);
 
     let err = decode_module_cert(&bytes).unwrap_err();
-    assert!(matches!(err, CertError::DecodeError));
+    assert!(matches!(
+        err,
+        CertError::StructuralLimitExceeded {
+            kind: StructuralLimitKind::NestedVectorEntries,
+            limit: MAX_NESTED_VECTOR_ENTRIES,
+            observed: usize::MAX,
+        }
+    ));
 }
 
 #[test]

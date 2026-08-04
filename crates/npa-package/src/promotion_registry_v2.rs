@@ -1037,7 +1037,10 @@ fn version_is_strictly_greater(left: &PackageVersion, right: &PackageVersion) ->
     matches!((parts(left), parts(right)), (Some(left), Some(right)) if left > right)
 }
 
-fn parse_entry(value: &JsonValue, index: usize) -> PackageArtifactResult<PromotionOriginEntryV2> {
+pub(crate) fn parse_entry(
+    value: &JsonValue,
+    index: usize,
+) -> PackageArtifactResult<PromotionOriginEntryV2> {
     let path = format!("entries[{index}]");
     let members = expect_object(value, &path)?;
     let kind = required_string(members, &path, "kind")?;
@@ -1146,7 +1149,7 @@ fn parse_array_bounded<T>(
         .collect()
 }
 
-fn parse_revision(
+pub(crate) fn parse_revision(
     value: &JsonValue,
     path: &str,
 ) -> PackageArtifactResult<PromotionDeclarationTargetRevision> {
@@ -1243,7 +1246,7 @@ fn registry_json(registry: &PromotionOriginRegistryV2) -> String {
     ])
 }
 
-fn entry_json(entry: &PromotionOriginEntryV2) -> String {
+pub(crate) fn entry_json(entry: &PromotionOriginEntryV2) -> String {
     match entry {
         PromotionOriginEntryV2::WholeModuleV1(entry) => json_object_in_order(vec![
             ("kind", json_string("whole_module_v1")),
@@ -1301,7 +1304,7 @@ fn entry_json(entry: &PromotionOriginEntryV2) -> String {
     }
 }
 
-fn revision_json(value: &PromotionDeclarationTargetRevision) -> String {
+pub(crate) fn revision_json(value: &PromotionDeclarationTargetRevision) -> String {
     json_object_in_order(vec![
         ("target_version", json_string(value.target_version.as_str())),
         (

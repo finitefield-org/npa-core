@@ -8,13 +8,14 @@ use std::{
 
 use npa_cert::Name;
 use npa_package::{
-    format_package_hash, package_file_hash, parse_and_validate_manifest_str,
-    parse_mathlib_promotion_plan_v2_json, parse_promotion_origin_registry_v2_json,
+    format_package_hash, migrate_promotion_origin_registry_v2_to_v3, package_file_hash,
+    parse_and_validate_manifest_str, parse_mathlib_promotion_plan_v2_json,
+    parse_promotion_origin_registry_v2_json, parse_promotion_origin_registry_v3_json,
     parse_verified_materialization_attestation_json, validate_declaration_registry_entry_admission,
     DeclarationPromotionDependencyMapping, DeclarationPromotionRequest, DeclarationPromotionRoot,
     DeclarationPromotionRootKind, DeclarationPromotionSource, DeclarationPromotionTarget,
     PackageArtifactOrigin, PackageHash, PackageId, PackagePath, PackageVersion,
-    PromotionOriginEntryV2, PromotionPlanEndpoint, PromotionReplayOmission,
+    PromotionOriginEntryV2, PromotionOriginEntryV3, PromotionPlanEndpoint, PromotionReplayOmission,
     MATHLIB_DECLARATION_PROMOTION_REQUEST_SCHEMA, MATHLIB_PROMOTION_ORIGIN_REGISTRY_V2_SCHEMA,
     PROMOTION_REPLAY_OMISSION_UNSUPPORTED_REWRITE_REASON,
 };
@@ -891,6 +892,20 @@ fn declaration_promotion_materializes_attests_and_publishes_exact_closure() {
     );
     assert!(!future_revision_result.status.success());
 
+    // Registry v3 preserves the first sourced declaration route. The second
+    // promotion must append another sourced route without altering catalog
+    // events or downgrading the registry schema.
+    let tracked_v2 = parse_promotion_origin_registry_v2_json(
+        &fs::read_to_string(tracked.join("promotion-origins.json")).unwrap(),
+    )
+    .unwrap();
+    let tracked_v3 = migrate_promotion_origin_registry_v2_to_v3(&tracked_v2).unwrap();
+    fs::write(
+        tracked.join("promotion-origins.json"),
+        tracked_v3.canonical_json().unwrap(),
+    )
+    .unwrap();
+
     // A later request from the same large source module may promote a disjoint
     // root when it explicitly externalizes already-public support.
     let later_request = DeclarationPromotionRequest {
@@ -962,11 +977,13 @@ fn declaration_promotion_materializes_attests_and_publishes_exact_closure() {
     // ownership by rebinding itself to an otherwise unchanged baseline.
     let unowned_baseline = root.0.join("unowned-baseline");
     copy_tree(&tracked, &unowned_baseline);
-    let mut unowned_registry = parse_promotion_origin_registry_v2_json(
+    let mut unowned_registry = parse_promotion_origin_registry_v3_json(
         &fs::read_to_string(unowned_baseline.join("promotion-origins.json")).unwrap(),
     )
     .unwrap();
-    unowned_registry.entries.clear();
+    unowned_registry
+        .entries
+        .retain(|entry| matches!(entry, PromotionOriginEntryV3::CatalogTargetV1(_)));
     unowned_registry.refresh_hash().unwrap();
     let unowned_registry_source = unowned_registry.canonical_json().unwrap();
     fs::write(
@@ -1079,6 +1096,22 @@ fn declaration_promotion_materializes_attests_and_publishes_exact_closure() {
             OsStr::new("--json"),
         ],
     ));
+    let final_registry = parse_promotion_origin_registry_v3_json(
+        &fs::read_to_string(later_tracked.join("promotion-origins.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        final_registry
+            .entries
+            .iter()
+            .filter(|entry| matches!(entry, PromotionOriginEntryV3::SourceV2(_)))
+            .count(),
+        2
+    );
+    assert_eq!(
+        final_registry.catalog_change_events,
+        tracked_v3.catalog_change_events
+    );
 
     // Consume only the newly promoted certificate from a fresh package. This
     // is the source-free downstream smoke for declaration-level publication.

@@ -8,6 +8,10 @@ type t =
 type located = {
   level : t;
   offset : Ext_bytes.offset;
+  depth : int;
+  expanded : int;
+  order_payload : string;
+  structural_hash : string;
 }
 
 let zero = Zero
@@ -53,12 +57,7 @@ let previous_level values index id offset =
   else
     match values.(id) with
     | None -> Ext_bytes.error Ext_bytes.Level_table offset Ext_bytes.Dangling_reference
-    | Some located -> Ok located.level
-
-let previous_depth depths index id offset =
-  if id < 0 || id >= index || depths.(id) = 0 then
-    Ext_bytes.error Ext_bytes.Level_table offset Ext_bytes.Dangling_reference
-  else Ok depths.(id)
+    | Some located -> Ok located
 
 let rec level_as_nat level =
   match level with
@@ -118,18 +117,40 @@ let rec normalize level =
       | Succ inner -> normalize (Max (lhs, Succ inner))
       | _ -> Imax (lhs, rhs))
 
-let read_previous_ref values depths index entry_offset reader =
+let byte value = String.make 1 (Char.chr value)
+
+let encode_name_key name =
+  let components = Ext_name.components name in
+  Ext_bytes.encode_uvar (Int64.of_int (List.length components))
+  ^ String.concat ""
+      (List.map
+         (fun component ->
+           Ext_bytes.encode_uvar (Int64.of_int (String.length component))
+           ^ component)
+         components)
+
+let structural_hash payload =
+  Bytes.to_string
+    (Ext_hash.sha256_raw_string ("NPA-LEVEL-0.1" ^ payload))
+
+let capped_add lhs rhs =
+  let cap = Ext_bytes.max_root_expanded_nodes + 1 in
+  if lhs >= cap || rhs >= cap || lhs > cap - rhs then cap else lhs + rhs
+
+let read_previous_ref values index entry_offset reader =
   bind (Ext_bytes.read_usize Ext_bytes.Level_table reader) (fun (id, next) ->
-      bind (previous_level values index id entry_offset) (fun level ->
-          bind (previous_depth depths index id entry_offset) (fun depth ->
-              Ok ((level, depth), next))))
+      bind (previous_level values index id entry_offset) (fun located ->
+          Ok (located, next)))
 
 let read_name_ref names entry_offset reader =
   bind (Ext_bytes.read_usize Ext_bytes.Level_table reader) (fun (id, next) ->
       bind (name_at names id entry_offset) (fun name -> Ok (name, next)))
 
 let read_table names reader =
-  match Ext_bytes.read_count Ext_bytes.Level_table reader with
+  match
+    Ext_bytes.read_count_with_limit Ext_bytes.Level_table
+      Ext_bytes.Level_table_nodes Ext_bytes.max_level_table_nodes reader
+  with
   | Error err -> Error err
   | Ok (level_count, after_count) ->
       if level_count > Ext_bytes.remaining after_count then
@@ -138,7 +159,6 @@ let read_table names reader =
       else
         let name_values = Array.of_list names in
         let values = Array.make level_count None in
-        let depths = Array.make level_count 0 in
         let seen_encodings = Hashtbl.create (min level_count 1_024) in
         let rec loop index current decoded =
           if index = level_count then Ok (List.rev decoded, current)
@@ -149,67 +169,84 @@ let read_table names reader =
             | Ok (tag, after_tag) ->
                 let decoded_level =
                   match tag with
-                  | 0x00 -> Ok ((Zero, 1), after_tag)
+                  | 0x00 -> Ok ((Zero, 1, 1, byte 0x00), after_tag)
                   | 0x01 ->
                       bind
-                        (read_previous_ref values depths index entry_offset
-                           after_tag)
-                        (fun ((inner, depth), next) ->
-                          Ok ((Succ inner, depth + 1), next))
+                        (read_previous_ref values index entry_offset after_tag)
+                        (fun (inner, next) ->
+                          Ok
+                            ( ( Succ inner.level,
+                                inner.depth + 1,
+                                capped_add 1 inner.expanded,
+                                byte 0x01 ^ inner.structural_hash ),
+                              next ))
                   | 0x02 ->
                       bind
-                        (read_previous_ref values depths index entry_offset
-                           after_tag)
-                        (fun ((lhs, lhs_depth), after_lhs) ->
+                        (read_previous_ref values index entry_offset after_tag)
+                        (fun (lhs, after_lhs) ->
                           bind
-                            (read_previous_ref values depths index entry_offset
+                            (read_previous_ref values index entry_offset
                                after_lhs)
-                            (fun ((rhs, rhs_depth), next) ->
+                            (fun (rhs, next) ->
                               Ok
-                                ( (Max (lhs, rhs),
-                                   1 + max lhs_depth rhs_depth),
+                                ( ( Max (lhs.level, rhs.level),
+                                    1 + max lhs.depth rhs.depth,
+                                    capped_add 1
+                                      (capped_add lhs.expanded rhs.expanded),
+                                    byte 0x02 ^ lhs.structural_hash
+                                    ^ rhs.structural_hash ),
                                   next )))
                   | 0x03 ->
                       bind
-                        (read_previous_ref values depths index entry_offset
-                           after_tag)
-                        (fun ((lhs, lhs_depth), after_lhs) ->
+                        (read_previous_ref values index entry_offset after_tag)
+                        (fun (lhs, after_lhs) ->
                           bind
-                            (read_previous_ref values depths index entry_offset
+                            (read_previous_ref values index entry_offset
                                after_lhs)
-                            (fun ((rhs, rhs_depth), next) ->
+                            (fun (rhs, next) ->
                               Ok
-                                ( (Imax (lhs, rhs),
-                                   1 + max lhs_depth rhs_depth),
+                                ( ( Imax (lhs.level, rhs.level),
+                                    1 + max lhs.depth rhs.depth,
+                                    capped_add 1
+                                      (capped_add lhs.expanded rhs.expanded),
+                                    byte 0x03 ^ lhs.structural_hash
+                                    ^ rhs.structural_hash ),
                                   next )))
                   | 0x04 ->
                       bind (read_name_ref name_values entry_offset after_tag)
-                        (fun (name, next) -> Ok ((Param name, 1), next))
+                        (fun (name, next) ->
+                          Ok
+                            ( ( Param name,
+                                1,
+                                1,
+                                byte 0x04 ^ encode_name_key name ),
+                              next ))
                   | tag ->
                       Ext_bytes.error Ext_bytes.Level_table entry_offset
                         (Ext_bytes.Unknown_tag tag)
                 in
                 (match decoded_level with
                 | Error err -> Error err
-                | Ok ((level, depth), next) ->
-                    if depth > Ext_bytes.max_node_depth then
-                      Ext_bytes.error Ext_bytes.Level_table entry_offset
-                        Ext_bytes.Resource_limit
-                    else if normalize level <> level then
-                      Ext_bytes.error Ext_bytes.Level_table entry_offset
-                        Ext_bytes.Non_normalized_level
-                    else
-                      let encoding =
+                | Ok ((level, depth, expanded, order_payload), next) ->
+                    let encoding =
                         String.sub current.Ext_bytes.data entry_offset
                           (Ext_bytes.offset next - entry_offset)
+                    in
+                    if Hashtbl.mem seen_encodings encoding then
+                      Ext_bytes.error Ext_bytes.Level_table entry_offset
+                        Ext_bytes.Noncanonical_order
+                    else
+                      let located =
+                        {
+                          level;
+                          offset = entry_offset;
+                          depth;
+                          expanded;
+                          order_payload;
+                          structural_hash = structural_hash order_payload;
+                        }
                       in
-                      if Hashtbl.mem seen_encodings encoding then
-                        Ext_bytes.error Ext_bytes.Level_table entry_offset
-                          Ext_bytes.Noncanonical_order
-                      else
-                      let located = { level; offset = entry_offset } in
                       values.(index) <- Some located;
-                      depths.(index) <- depth;
                       Hashtbl.add seen_encodings encoding ();
                       loop (index + 1) next (located :: decoded))
         in

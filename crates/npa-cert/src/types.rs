@@ -290,6 +290,8 @@ pub struct VerifiedModule {
     pub(crate) export_block: ExportBlock,
     /// Axiom report recomputed during verification.
     pub(crate) axiom_report: AxiomReport,
+    /// Unique structural cost summary for this verified import closure.
+    pub(crate) structural_closure: crate::structural::StructuralClosureSummary,
 }
 
 impl VerifiedModule {
@@ -982,6 +984,58 @@ pub enum ProducerTokenHashField {
     DeclCertificateHash,
 }
 
+/// Fixed structural certificate resource dimension.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum StructuralLimitKind {
+    /// Encoded certificate byte length.
+    CertificateBytes,
+    /// Direct import count.
+    Imports,
+    /// Canonical name-table entry count.
+    NameTableEntries,
+    /// Canonical level-table node count.
+    LevelTableNodes,
+    /// Canonical term-table node count.
+    TermTableNodes,
+    /// Declaration count.
+    Declarations,
+    /// Public export count.
+    Exports,
+    /// Count of an encoded vector without a more specific limit.
+    NestedVectorEntries,
+    /// Combined term/level structural depth.
+    StructuralDepth,
+    /// Unfolded nodes requested by one semantic root.
+    RootExpandedNodes,
+    /// Sum of unfolded nodes requested by one certificate.
+    CertificateExpandedNodes,
+    /// Unique certificate identities in one resolved closure.
+    ClosureModules,
+    /// Sum of certificate expansion across one resolved closure.
+    ClosureExpandedNodes,
+}
+
+impl StructuralLimitKind {
+    /// Return the stable raw diagnostic name.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::CertificateBytes => "certificate_bytes",
+            Self::Imports => "imports",
+            Self::NameTableEntries => "name_table_entries",
+            Self::LevelTableNodes => "level_table_nodes",
+            Self::TermTableNodes => "term_table_nodes",
+            Self::Declarations => "declarations",
+            Self::Exports => "exports",
+            Self::NestedVectorEntries => "nested_vector_entries",
+            Self::StructuralDepth => "structural_depth",
+            Self::RootExpandedNodes => "root_expanded_nodes",
+            Self::CertificateExpandedNodes => "certificate_expanded_nodes",
+            Self::ClosureModules => "closure_modules",
+            Self::ClosureExpandedNodes => "closure_expanded_nodes",
+        }
+    }
+}
+
 /// Structured certificate construction, decoding, and verification error.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CertError {
@@ -1060,6 +1114,15 @@ pub enum CertError {
         /// Duplicated name.
         name: ModuleName,
     },
+    /// Canonical emission selected a reference lane or identity that disagrees with its binding.
+    ReferenceOriginMismatch {
+        /// Declaration or generated declaration name.
+        name: ModuleName,
+        /// Stable expected reference-origin description.
+        expected: &'static str,
+        /// Stable emitted reference-origin description.
+        actual: &'static str,
+    },
     /// Referenced dependency could not be resolved.
     UnknownDependency {
         /// Unknown dependency name.
@@ -1122,6 +1185,15 @@ pub enum CertError {
     ProducerTokenLimitTooLoose {
         /// Prior-token index in `CandidateBatch.prior_current_decls`.
         token_index: usize,
+    },
+    /// Certificate structure exceeded a fixed verifier admission limit.
+    StructuralLimitExceeded {
+        /// Resource dimension that was exceeded.
+        kind: StructuralLimitKind,
+        /// Fixed inclusive maximum.
+        limit: usize,
+        /// Exact count, or `limit + 1` for saturated expansion arithmetic.
+        observed: usize,
     },
     /// Underlying Rust kernel rejected a declaration.
     Kernel(npa_kernel::Error),

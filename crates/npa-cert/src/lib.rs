@@ -14,6 +14,7 @@ mod inductive;
 mod kernel;
 mod producer;
 mod rebind;
+mod structural;
 mod theorem_premise_analysis;
 mod types;
 mod verify;
@@ -28,6 +29,12 @@ pub use inductive::{
 pub use kernel::{builtin_decl_interface_hash, verified_module_to_kernel_decls};
 pub use producer::*;
 pub use rebind::*;
+pub use structural::{
+    CertificateStructuralAudit, CertificateStructuralImportAudit, MAX_CERTIFICATE_BYTES,
+    MAX_CERTIFICATE_EXPANDED_NODES, MAX_CLOSURE_EXPANDED_NODES, MAX_CLOSURE_MODULES,
+    MAX_DECLARATIONS, MAX_EXPORTS, MAX_IMPORTS, MAX_LEVEL_TABLE_NODES, MAX_NAME_TABLE_ENTRIES,
+    MAX_NESTED_VECTOR_ENTRIES, MAX_ROOT_EXPANDED_NODES, MAX_STRUCTURAL_DEPTH, MAX_TERM_TABLE_NODES,
+};
 pub use theorem_premise_analysis::*;
 pub use types::*;
 
@@ -40,6 +47,7 @@ pub(crate) use kernel::{
     reserved_core_primitive_name, source_decl_index_for_export_entry, universe_names,
     verified_module_export_entry_to_kernel_decl, verified_module_referenced_builtin_names,
 };
+pub(crate) use structural::*;
 pub(crate) use verify::*;
 
 pub(crate) const FORMAT: &str = "NPA-CERT-0.2.0";
@@ -133,6 +141,7 @@ pub fn encode_module_cert(cert: &ModuleCert) -> Result<Vec<u8>> {
 /// This function does not trust or register the result. Use `verify_module_cert` to check
 /// canonical encoding, hashes, imports, axiom policy, and kernel validity.
 pub fn decode_module_cert(bytes: &[u8]) -> Result<ModuleCert> {
+    ensure_certificate_byte_limit(bytes)?;
     let mut decoder = binary::Decoder::new(bytes);
     let cert = decoder.module_cert()?;
     if !decoder.is_done() {
@@ -147,12 +156,32 @@ pub fn decode_module_cert(bytes: &[u8]) -> Result<ModuleCert> {
 /// first byte of the corresponding encoded import. This is useful for callers
 /// that must preserve precise import-resolution diagnostics.
 pub fn decode_module_cert_with_import_offsets(bytes: &[u8]) -> Result<(ModuleCert, Vec<usize>)> {
+    ensure_certificate_byte_limit(bytes)?;
     let mut decoder = binary::Decoder::new(bytes);
     let decoded = decoder.module_cert_with_import_offsets()?;
     if !decoder.is_done() {
         return Err(CertError::DecodeError);
     }
     Ok(decoded)
+}
+
+/// Decode structural certificate data and report fixed-profile measurements.
+///
+/// This entry point performs bounded decoding and structural preflight only.
+/// It does not verify canonical encoding, hashes, imports, axioms, or proofs,
+/// and its result is never proof evidence.
+pub fn audit_certificate_structural_limits(bytes: &[u8]) -> Result<CertificateStructuralAudit> {
+    ensure_certificate_byte_limit(bytes)?;
+    let mut decoder = binary::Decoder::new_for_structural_audit(bytes);
+    let certificate = decoder.module_cert()?;
+    if !decoder.is_done() {
+        return Err(CertError::DecodeError);
+    }
+    structural_audit(
+        &certificate,
+        bytes.len(),
+        decoder.audit_core_feature_count(),
+    )
 }
 
 /// Decode a canonical certificate and verify its stored structural hashes.

@@ -1,7 +1,7 @@
 use std::{
     cell::RefCell,
     cmp::Ordering,
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     sync::Arc,
 };
 
@@ -16,15 +16,16 @@ use crate::{
     ReferenceCoreExpr, ReferenceCoreFeature, ReferenceCoreGlobalRef, ReferenceCoreLevel,
     ReferenceDecodedCertificate, ReferenceDecodedCertificateCounts, ReferenceExportKind,
     ReferenceHash, ReferenceHashObject, ReferenceImportEntry, ReferenceImportEnvironment,
-    ReferenceImportStore, ReferenceModuleHashes, ReferenceModuleName, ReferencePublicEnvironment,
-    ReferencePublicExport, ReferencePublicInductiveGroup, ReferencePublicInductiveLayout,
-    ReferencePublicRecursorLayout, ReferenceResolvedImport, ReferenceTrustMode,
-    REFERENCE_CERTIFICATE_FORMAT, REFERENCE_CORE_SPEC, REFERENCE_LEGACY_CERTIFICATE_FORMAT,
-    REFERENCE_LEGACY_CORE_SPEC, REFERENCE_LEGACY_MODULE_CERT_DOMAIN,
-    REFERENCE_LEGACY_MODULE_EXPORT_DOMAIN, REFERENCE_MODULE_CERT_DOMAIN,
-    REFERENCE_MODULE_EXPORT_DOMAIN, REFERENCE_PREVIOUS_CERTIFICATE_FORMAT,
-    REFERENCE_PREVIOUS_CORE_SPEC, REFERENCE_PREVIOUS_MODULE_CERT_DOMAIN,
-    REFERENCE_PREVIOUS_MODULE_EXPORT_DOMAIN,
+    ReferenceImportStore, ReferenceModuleHashes, ReferenceModuleIdentity, ReferenceModuleName,
+    ReferencePublicEnvironment, ReferencePublicExport, ReferencePublicInductiveGroup,
+    ReferencePublicInductiveLayout, ReferencePublicRecursorLayout, ReferenceResolvedImport,
+    ReferenceStructuralClosureSummary, ReferenceStructuralIdentity, ReferenceStructuralLimitKind,
+    ReferenceTrustMode, REFERENCE_CERTIFICATE_FORMAT, REFERENCE_CORE_SPEC,
+    REFERENCE_LEGACY_CERTIFICATE_FORMAT, REFERENCE_LEGACY_CORE_SPEC,
+    REFERENCE_LEGACY_MODULE_CERT_DOMAIN, REFERENCE_LEGACY_MODULE_EXPORT_DOMAIN,
+    REFERENCE_MODULE_CERT_DOMAIN, REFERENCE_MODULE_EXPORT_DOMAIN,
+    REFERENCE_PREVIOUS_CERTIFICATE_FORMAT, REFERENCE_PREVIOUS_CORE_SPEC,
+    REFERENCE_PREVIOUS_MODULE_CERT_DOMAIN, REFERENCE_PREVIOUS_MODULE_EXPORT_DOMAIN,
 };
 
 type DecodeResult<T> = Result<T, ReferenceCheckError>;
@@ -36,6 +37,19 @@ const CORE_FEATURE_REPORT_TAG: &str = "core_features";
 pub(crate) const MAX_UNIVERSE_CONTEXT_NODES: usize = 65;
 #[allow(dead_code)]
 pub(crate) const MAX_UNIVERSE_ATOM_INEQUALITIES: usize = 1024;
+pub(crate) const MAX_CERTIFICATE_BYTES: usize = 67_108_864;
+pub(crate) const MAX_IMPORTS: usize = 4_096;
+pub(crate) const MAX_NAME_TABLE_ENTRIES: usize = 1_048_576;
+pub(crate) const MAX_LEVEL_TABLE_NODES: usize = 262_144;
+pub(crate) const MAX_TERM_TABLE_NODES: usize = 4_194_304;
+pub(crate) const MAX_DECLARATIONS: usize = 262_144;
+pub(crate) const MAX_EXPORTS: usize = 1_048_576;
+pub(crate) const MAX_NESTED_VECTOR_ENTRIES: usize = 262_144;
+pub(crate) const MAX_STRUCTURAL_DEPTH: usize = 8_192;
+pub(crate) const MAX_ROOT_EXPANDED_NODES: usize = 1_048_576;
+pub(crate) const MAX_CERTIFICATE_EXPANDED_NODES: usize = 16_777_216;
+pub(crate) const MAX_CLOSURE_MODULES: usize = 4_097;
+pub(crate) const MAX_CLOSURE_EXPANDED_NODES: usize = 67_108_864;
 
 fn resolved_import_identity(
     import_index: usize,
@@ -142,10 +156,19 @@ fn check_decoded_certificate(
     cert.enforce_core_feature_policy(policy)?;
     let imports = cert.build_import_environment(import_store, policy)?;
     cert.verify_axiom_report(&imports, policy)?;
-    cert.type_check(&imports)
+    cert.type_check(&imports, policy.trust_mode)
 }
 
 fn decode_module_certificate(bytes: &[u8]) -> DecodeResult<DecodedModuleCertificate> {
+    if bytes.len() > MAX_CERTIFICATE_BYTES {
+        return Err(ReferenceCheckError::structural_limit(
+            ReferenceCertificateSection::FullCertificate,
+            0,
+            ReferenceStructuralLimitKind::CertificateBytes,
+            MAX_CERTIFICATE_BYTES,
+            bytes.len(),
+        ));
+    }
     if bytes.is_empty() {
         return Err(ReferenceCheckError::empty());
     }
@@ -159,6 +182,7 @@ fn decode_module_certificate(bytes: &[u8]) -> DecodeResult<DecodedModuleCertific
             ReferenceCheckReason::TrailingBytes,
         ));
     }
+    cert.structural_preflight()?;
     cert.validate()?;
     Ok(cert)
 }
@@ -183,7 +207,432 @@ struct DecodedModuleCertificate {
     hash_offsets: ModuleHashOffsets,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ReferenceStructuralCost {
+    max_depth: usize,
+    max_root_expansion: usize,
+    certificate_expansion: usize,
+}
+
+struct ReferenceRootAccumulator {
+    max_depth: usize,
+    max_root_expansion: usize,
+    certificate_expansion: usize,
+}
+
+struct ExpectedAxiomDeclaration<'a> {
+    index: usize,
+    payload: &'a DeclPayload,
+    offset: usize,
+}
+
 impl DecodedModuleCertificate {
+    fn validate_structural_root_references(&self) -> DecodeResult<()> {
+        for declaration in &self.declarations {
+            let section = ReferenceCertificateSection::Declarations;
+            for constraint in decl_universe_constraints(&declaration.value.decl) {
+                self.require_level(constraint.lhs, section, declaration.offset)?;
+                self.require_level(constraint.rhs, section, declaration.offset)?;
+            }
+            match &declaration.value.decl {
+                DeclPayload::Axiom { ty, .. } | DeclPayload::AxiomConstrained { ty, .. } => {
+                    self.require_term(*ty, section, declaration.offset)?;
+                }
+                DeclPayload::Def { ty, value, .. }
+                | DeclPayload::DefConstrained { ty, value, .. } => {
+                    self.require_term(*ty, section, declaration.offset)?;
+                    self.require_term(*value, section, declaration.offset)?;
+                }
+                DeclPayload::Theorem { ty, proof, .. }
+                | DeclPayload::TheoremConstrained { ty, proof, .. } => {
+                    self.require_term(*ty, section, declaration.offset)?;
+                    self.require_term(*proof, section, declaration.offset)?;
+                }
+                DeclPayload::Inductive {
+                    params,
+                    indices,
+                    sort,
+                    constructors,
+                    recursor,
+                    ..
+                }
+                | DeclPayload::InductiveConstrained {
+                    params,
+                    indices,
+                    sort,
+                    constructors,
+                    recursor,
+                    ..
+                } => {
+                    for binder in params.iter().chain(indices) {
+                        self.require_term(binder.ty, section, declaration.offset)?;
+                    }
+                    self.require_level(*sort, section, declaration.offset)?;
+                    for constructor in constructors {
+                        self.require_term(constructor.ty, section, declaration.offset)?;
+                    }
+                    if let Some(recursor) = recursor {
+                        self.require_term(recursor.ty, section, declaration.offset)?;
+                    }
+                }
+                DeclPayload::MutualInductiveBlock { inductives, .. } => {
+                    for inductive in inductives {
+                        for binder in inductive.params.iter().chain(&inductive.indices) {
+                            self.require_term(binder.ty, section, declaration.offset)?;
+                        }
+                        self.require_level(inductive.sort, section, declaration.offset)?;
+                        for constructor in &inductive.constructors {
+                            self.require_term(constructor.ty, section, declaration.offset)?;
+                        }
+                        if let Some(recursor) = &inductive.recursor {
+                            self.require_term(recursor.ty, section, declaration.offset)?;
+                        }
+                    }
+                }
+            }
+        }
+        for export in &self.export_block {
+            let section = ReferenceCertificateSection::ExportBlock;
+            for constraint in &export.value.universe_constraints {
+                self.require_level(constraint.lhs, section, export.offset)?;
+                self.require_level(constraint.rhs, section, export.offset)?;
+            }
+            self.require_term(export.value.ty, section, export.offset)?;
+            if let Some(body) = export.value.body {
+                self.require_term(body, section, export.offset)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn structural_preflight(&self) -> DecodeResult<ReferenceStructuralCost> {
+        self.validate_structural_root_references()?;
+        let expansion_cap = MAX_ROOT_EXPANDED_NODES + 1;
+        let mut depth_exceeded = None;
+        let mut level_depths: Vec<usize> = Vec::new();
+        let mut level_expansions: Vec<usize> = Vec::new();
+        level_depths
+            .try_reserve_exact(self.level_table.len())
+            .map_err(|_| {
+                ReferenceCheckError::malformed(
+                    ReferenceCertificateSection::LevelTable,
+                    0,
+                    ReferenceCheckReason::LengthOverflow,
+                )
+            })?;
+        level_expansions
+            .try_reserve_exact(self.level_table.len())
+            .map_err(|_| {
+                ReferenceCheckError::malformed(
+                    ReferenceCertificateSection::LevelTable,
+                    0,
+                    ReferenceCheckReason::LengthOverflow,
+                )
+            })?;
+        for (index, located) in self.level_table.iter().enumerate() {
+            self.validate_level_refs(index, located)?;
+            let (depth, expansion) = match &located.value {
+                LevelNode::Zero | LevelNode::Param(_) => (1, 1),
+                LevelNode::Succ(inner) => (
+                    ref_child(&level_depths, *inner, located.offset)?.saturating_add(1),
+                    ref_child(&level_expansions, *inner, located.offset)?
+                        .saturating_add(1)
+                        .min(expansion_cap),
+                ),
+                LevelNode::Max(lhs, rhs) | LevelNode::IMax(lhs, rhs) => (
+                    ref_child(&level_depths, *lhs, located.offset)?
+                        .max(ref_child(&level_depths, *rhs, located.offset)?)
+                        .saturating_add(1),
+                    saturating_structural_sum(
+                        [
+                            1,
+                            ref_child(&level_expansions, *lhs, located.offset)?,
+                            ref_child(&level_expansions, *rhs, located.offset)?,
+                        ],
+                        expansion_cap,
+                    ),
+                ),
+            };
+            if depth > MAX_STRUCTURAL_DEPTH {
+                depth_exceeded
+                    .get_or_insert((ReferenceCertificateSection::LevelTable, located.offset));
+            }
+            level_depths.push(depth);
+            level_expansions.push(expansion);
+        }
+
+        let mut term_depths: Vec<usize> = Vec::new();
+        let mut term_expansions: Vec<usize> = Vec::new();
+        term_depths
+            .try_reserve_exact(self.term_table.len())
+            .map_err(|_| {
+                ReferenceCheckError::malformed(
+                    ReferenceCertificateSection::TermTable,
+                    0,
+                    ReferenceCheckReason::LengthOverflow,
+                )
+            })?;
+        term_expansions
+            .try_reserve_exact(self.term_table.len())
+            .map_err(|_| {
+                ReferenceCheckError::malformed(
+                    ReferenceCertificateSection::TermTable,
+                    0,
+                    ReferenceCheckReason::LengthOverflow,
+                )
+            })?;
+        for (index, located) in self.term_table.iter().enumerate() {
+            self.validate_term_refs(index, located)?;
+            let mut term_children = [0usize; 3];
+            let term_child_count;
+            let mut level_children: &[usize] = &[];
+            match &located.value {
+                TermNode::Sort(level) => {
+                    term_child_count = 0;
+                    level_children = std::slice::from_ref(level);
+                }
+                TermNode::BVar(_) => term_child_count = 0,
+                TermNode::Const { levels, .. } => {
+                    term_child_count = 0;
+                    level_children = levels;
+                }
+                TermNode::App(fun, arg) => {
+                    term_children[..2].copy_from_slice(&[*fun, *arg]);
+                    term_child_count = 2;
+                }
+                TermNode::Lam { ty, body } | TermNode::Pi { ty, body } => {
+                    term_children[..2].copy_from_slice(&[*ty, *body]);
+                    term_child_count = 2;
+                }
+                TermNode::Let { ty, value, body } => {
+                    term_children.copy_from_slice(&[*ty, *value, *body]);
+                    term_child_count = 3;
+                }
+            }
+            let term_children = &term_children[..term_child_count];
+            let mut child_depth = 0usize;
+            for child in term_children {
+                child_depth = child_depth.max(ref_child(&term_depths, *child, located.offset)?);
+            }
+            for level in level_children {
+                child_depth = child_depth.max(ref_child(&level_depths, *level, located.offset)?);
+            }
+            let depth = 1usize.saturating_add(child_depth);
+            let expansion = saturating_structural_sum(
+                std::iter::once(1)
+                    .chain(term_children.iter().map(|child| term_expansions[*child]))
+                    .chain(level_children.iter().map(|level| level_expansions[*level])),
+                expansion_cap,
+            );
+            if depth > MAX_STRUCTURAL_DEPTH {
+                depth_exceeded
+                    .get_or_insert((ReferenceCertificateSection::TermTable, located.offset));
+            }
+            term_depths.push(depth);
+            term_expansions.push(expansion);
+        }
+        if let Some((section, offset)) = depth_exceeded {
+            return Err(reference_limit(
+                section,
+                offset,
+                ReferenceStructuralLimitKind::StructuralDepth,
+                MAX_STRUCTURAL_DEPTH,
+            ));
+        }
+
+        let mut roots = ReferenceRootAccumulator {
+            max_depth: level_depths
+                .iter()
+                .chain(&term_depths)
+                .copied()
+                .max()
+                .unwrap_or(0),
+            max_root_expansion: 0,
+            certificate_expansion: 0,
+        };
+        for declaration in &self.declarations {
+            for constraint in decl_universe_constraints(&declaration.value.decl) {
+                reference_add_level_root(
+                    &mut roots,
+                    constraint.lhs,
+                    declaration.offset,
+                    &level_depths,
+                    &level_expansions,
+                )?;
+                reference_add_level_root(
+                    &mut roots,
+                    constraint.rhs,
+                    declaration.offset,
+                    &level_depths,
+                    &level_expansions,
+                )?;
+            }
+            match &declaration.value.decl {
+                DeclPayload::Axiom { ty, .. } | DeclPayload::AxiomConstrained { ty, .. } => {
+                    reference_add_term_root(
+                        &mut roots,
+                        *ty,
+                        declaration.offset,
+                        &term_depths,
+                        &term_expansions,
+                    )?;
+                }
+                DeclPayload::Def { ty, value, .. }
+                | DeclPayload::DefConstrained { ty, value, .. } => {
+                    for root in [*ty, *value] {
+                        reference_add_term_root(
+                            &mut roots,
+                            root,
+                            declaration.offset,
+                            &term_depths,
+                            &term_expansions,
+                        )?;
+                    }
+                }
+                DeclPayload::Theorem { ty, proof, .. }
+                | DeclPayload::TheoremConstrained { ty, proof, .. } => {
+                    for root in [*ty, *proof] {
+                        reference_add_term_root(
+                            &mut roots,
+                            root,
+                            declaration.offset,
+                            &term_depths,
+                            &term_expansions,
+                        )?;
+                    }
+                }
+                DeclPayload::Inductive {
+                    params,
+                    indices,
+                    sort,
+                    constructors,
+                    recursor,
+                    ..
+                }
+                | DeclPayload::InductiveConstrained {
+                    params,
+                    indices,
+                    sort,
+                    constructors,
+                    recursor,
+                    ..
+                } => {
+                    for binder in params.iter().chain(indices) {
+                        reference_add_term_root(
+                            &mut roots,
+                            binder.ty,
+                            declaration.offset,
+                            &term_depths,
+                            &term_expansions,
+                        )?;
+                    }
+                    reference_add_level_root(
+                        &mut roots,
+                        *sort,
+                        declaration.offset,
+                        &level_depths,
+                        &level_expansions,
+                    )?;
+                    for constructor in constructors {
+                        reference_add_term_root(
+                            &mut roots,
+                            constructor.ty,
+                            declaration.offset,
+                            &term_depths,
+                            &term_expansions,
+                        )?;
+                    }
+                    if let Some(recursor) = recursor {
+                        reference_add_term_root(
+                            &mut roots,
+                            recursor.ty,
+                            declaration.offset,
+                            &term_depths,
+                            &term_expansions,
+                        )?;
+                    }
+                }
+                DeclPayload::MutualInductiveBlock { inductives, .. } => {
+                    for inductive in inductives {
+                        for binder in inductive.params.iter().chain(&inductive.indices) {
+                            reference_add_term_root(
+                                &mut roots,
+                                binder.ty,
+                                declaration.offset,
+                                &term_depths,
+                                &term_expansions,
+                            )?;
+                        }
+                        reference_add_level_root(
+                            &mut roots,
+                            inductive.sort,
+                            declaration.offset,
+                            &level_depths,
+                            &level_expansions,
+                        )?;
+                        for constructor in &inductive.constructors {
+                            reference_add_term_root(
+                                &mut roots,
+                                constructor.ty,
+                                declaration.offset,
+                                &term_depths,
+                                &term_expansions,
+                            )?;
+                        }
+                        if let Some(recursor) = &inductive.recursor {
+                            reference_add_term_root(
+                                &mut roots,
+                                recursor.ty,
+                                declaration.offset,
+                                &term_depths,
+                                &term_expansions,
+                            )?;
+                        }
+                    }
+                }
+            }
+        }
+        for export in &self.export_block {
+            for constraint in &export.value.universe_constraints {
+                reference_add_export_level_root(
+                    &mut roots,
+                    constraint.lhs,
+                    export.offset,
+                    &level_depths,
+                    &level_expansions,
+                )?;
+                reference_add_export_level_root(
+                    &mut roots,
+                    constraint.rhs,
+                    export.offset,
+                    &level_depths,
+                    &level_expansions,
+                )?;
+            }
+            reference_add_export_term_root(
+                &mut roots,
+                export.value.ty,
+                export.offset,
+                &term_depths,
+                &term_expansions,
+            )?;
+            if let Some(body) = export.value.body {
+                reference_add_export_term_root(
+                    &mut roots,
+                    body,
+                    export.offset,
+                    &term_depths,
+                    &term_expansions,
+                )?;
+            }
+        }
+        Ok(ReferenceStructuralCost {
+            max_depth: roots.max_depth,
+            max_root_expansion: roots.max_root_expansion,
+            certificate_expansion: roots.certificate_expansion,
+        })
+    }
+
     fn validate(&self) -> DecodeResult<()> {
         self.validate_import_order()?;
         self.validate_name_table_order()?;
@@ -224,34 +673,54 @@ impl DecodedModuleCertificate {
         &self,
         checked_by_reference_checker: bool,
     ) -> DecodeResult<ReferenceImportEntry> {
+        let cost = self.structural_preflight()?.certificate_expansion;
         Ok(ReferenceImportEntry::new(
-            self.header.module.clone(),
-            self.hashes.export_hash,
-            self.hashes.axiom_report_hash,
-            self.hashes.certificate_hash,
+            ReferenceModuleIdentity::new(
+                self.header.module.clone(),
+                self.hashes.export_hash,
+                self.hashes.axiom_report_hash,
+                self.hashes.certificate_hash,
+            ),
             Arc::new(self.public_environment()?),
             checked_by_reference_checker,
+            cost,
+            None,
         ))
     }
 
-    fn checked_module(&self) -> DecodeResult<ReferenceCheckedModule> {
+    fn checked_module(
+        &self,
+        imports: &ReferenceImportEnvironment,
+    ) -> DecodeResult<ReferenceCheckedModule> {
+        let cost = self.structural_preflight()?.certificate_expansion;
+        let structural_closure = build_current_reference_closure(self, cost, imports)?;
         Ok(ReferenceCheckedModule::new(
-            self.header.module.clone(),
-            self.hashes.export_hash,
-            self.hashes.axiom_report_hash,
-            self.hashes.certificate_hash,
+            ReferenceModuleIdentity::new(
+                self.header.module.clone(),
+                self.hashes.export_hash,
+                self.hashes.axiom_report_hash,
+                self.hashes.certificate_hash,
+            ),
             self.declarations.len(),
             Arc::new(self.public_environment()?),
+            cost,
+            structural_closure,
         ))
     }
 
     fn public_environment(&self) -> DecodeResult<ReferencePublicEnvironment> {
         let core_levels = self.core_levels()?;
-        let core_terms = self.core_terms(&core_levels)?;
+        let core_terms = self.public_core_terms(&core_levels)?;
         let imports = self
             .imports
             .iter()
-            .map(|import| (import.value.module.clone(), import.value.export_hash))
+            .map(|import| {
+                (
+                    import.value.module.clone(),
+                    import.value.export_hash,
+                    import.value.certificate_hash,
+                )
+            })
             .collect();
         let exports = self
             .export_block
@@ -269,22 +738,20 @@ impl DecodedModuleCertificate {
                         ExportKind::Recursor => ReferenceExportKind::Recursor,
                     },
                     decl_interface_hash: entry.decl_interface_hash,
-                    axiom_dependencies: self.public_axiom_dependencies(&entry.axiom_dependencies),
+                    axiom_dependencies: self
+                        .public_axiom_dependencies(&entry.axiom_dependencies)?,
                     universe_params: self.name_ids_to_names(&entry.universe_params),
                     universe_constraints: self
                         .public_universe_constraints(&core_levels, &entry.universe_constraints)?,
-                    ty: self.public_expr(&core_terms[entry.ty])?,
-                    body: entry
-                        .body
-                        .map(|body| self.public_expr(&core_terms[body]))
-                        .transpose()?,
+                    ty: core_terms[entry.ty].clone(),
+                    body: entry.body.map(|body| core_terms[body].clone()),
                 })
             })
             .collect::<DecodeResult<Vec<_>>>()?;
         Ok(ReferencePublicEnvironment::new(
             imports,
             exports,
-            self.public_axiom_dependencies(&self.axiom_report.module_axioms),
+            self.public_axiom_dependencies(&self.axiom_report.module_axioms)?,
             self.axiom_report.core_features.clone(),
             self.public_inductive_groups(),
         ))
@@ -396,35 +863,7 @@ impl DecodedModuleCertificate {
             .collect()
     }
 
-    fn public_expr(&self, expr: &ReferenceCoreExpr) -> DecodeResult<ReferenceCoreExpr> {
-        Ok(match expr {
-            ReferenceCoreExpr::Sort(level) => ReferenceCoreExpr::Sort(level.clone()),
-            ReferenceCoreExpr::BVar(index) => ReferenceCoreExpr::BVar(*index),
-            ReferenceCoreExpr::Const { global_ref, levels } => ReferenceCoreExpr::Const {
-                global_ref: self.public_global_ref(global_ref)?,
-                levels: levels.clone(),
-            },
-            ReferenceCoreExpr::App(fun, arg) => ReferenceCoreExpr::App(
-                Arc::new(self.public_expr(fun)?),
-                Arc::new(self.public_expr(arg)?),
-            ),
-            ReferenceCoreExpr::Lam { ty, body } => ReferenceCoreExpr::Lam {
-                ty: Arc::new(self.public_expr(ty)?),
-                body: Arc::new(self.public_expr(body)?),
-            },
-            ReferenceCoreExpr::Pi { ty, body } => ReferenceCoreExpr::Pi {
-                ty: Arc::new(self.public_expr(ty)?),
-                body: Arc::new(self.public_expr(body)?),
-            },
-            ReferenceCoreExpr::Let { ty, value, body } => ReferenceCoreExpr::Let {
-                ty: Arc::new(self.public_expr(ty)?),
-                value: Arc::new(self.public_expr(value)?),
-                body: Arc::new(self.public_expr(body)?),
-            },
-        })
-    }
-
-    fn public_global_ref(
+    fn export_public_global_ref(
         &self,
         global_ref: &ReferenceCoreGlobalRef,
     ) -> DecodeResult<ReferenceCoreGlobalRef> {
@@ -497,12 +936,19 @@ impl DecodedModuleCertificate {
         Ok((name, declaration.value.hashes.decl_interface_hash))
     }
 
-    fn public_axiom_dependencies(&self, axioms: &[AxiomRef]) -> Vec<ReferenceAxiomDependency> {
+    fn public_axiom_dependencies(
+        &self,
+        axioms: &[AxiomRef],
+    ) -> DecodeResult<Vec<ReferenceAxiomDependency>> {
         axioms
             .iter()
-            .map(|axiom| ReferenceAxiomDependency {
-                name: self.name_table[axiom.name].value.clone(),
-                decl_interface_hash: axiom.decl_interface_hash,
+            .map(|axiom| {
+                Ok(ReferenceAxiomDependency {
+                    name: self.name_table[axiom.name].value.clone(),
+                    decl_interface_hash: axiom.decl_interface_hash,
+                    global_ref: self
+                        .export_public_global_ref(&self.core_global_ref(&axiom.global_ref))?,
+                })
             })
             .collect()
     }
@@ -617,14 +1063,20 @@ impl DecodedModuleCertificate {
         import_store: &ReferenceImportStore,
         policy: &ReferenceCheckerPolicy,
     ) -> DecodeResult<ReferenceImportEnvironment> {
-        let mut resolved = Vec::with_capacity(self.imports.len());
+        let mut resolved =
+            fallible_vec(self.imports.len(), ReferenceCertificateSection::Imports, 0)?;
+        let mut visiting = BTreeSet::new();
+        let mut memo = BTreeMap::new();
         for requested in &self.imports {
             let entry = resolve_import(requested, import_store, policy)?;
+            let structural_closure =
+                reference_entry_structural_closure(entry, import_store, &mut visiting, &mut memo)?;
             resolved.push(ReferenceResolvedImport {
                 module: entry.module().clone(),
                 export_hash: *entry.export_hash(),
                 certificate_hash: *entry.certificate_hash(),
                 public_environment: Arc::clone(&entry.public_environment),
+                structural_closure,
             });
         }
         Ok(ReferenceImportEnvironment::new(resolved))
@@ -641,9 +1093,10 @@ impl DecodedModuleCertificate {
     fn type_check(
         &self,
         imports: &ReferenceImportEnvironment,
+        trust_mode: ReferenceTrustMode,
     ) -> DecodeResult<ReferenceCheckedModule> {
-        TypeChecker::new(self, imports)?.check_declarations()?;
-        self.checked_module()
+        TypeChecker::new(self, imports, trust_mode)?.check_declarations()?;
+        self.checked_module(imports)
     }
 
     fn verify_axiom_report(
@@ -651,9 +1104,16 @@ impl DecodedModuleCertificate {
         imports: &ReferenceImportEnvironment,
         policy: &ReferenceCheckerPolicy,
     ) -> DecodeResult<()> {
-        let mut previous_axioms: Vec<Vec<AxiomRef>> = Vec::with_capacity(self.declarations.len());
-        let mut transitive_by_decl: Vec<Vec<AxiomRef>> =
-            Vec::with_capacity(self.declarations.len());
+        let mut previous_axioms: Vec<Vec<AxiomRef>> = fallible_vec(
+            self.declarations.len(),
+            ReferenceCertificateSection::AxiomReport,
+            0,
+        )?;
+        let mut transitive_by_decl: Vec<Vec<AxiomRef>> = fallible_vec(
+            self.declarations.len(),
+            ReferenceCertificateSection::AxiomReport,
+            0,
+        )?;
 
         if self.axiom_report.per_declaration.len() != self.declarations.len() {
             return Err(ReferenceCheckError::axiom_report(
@@ -678,11 +1138,14 @@ impl DecodedModuleCertificate {
 
             let (direct_axioms, transitive_axioms) = self.expected_axioms_for_decl(
                 imports,
-                decl_index,
-                &declaration.value.decl,
+                policy.trust_mode,
+                ExpectedAxiomDeclaration {
+                    index: decl_index,
+                    payload: &declaration.value.decl,
+                    offset: declaration.offset,
+                },
                 &expected_dependencies,
                 &previous_axioms,
-                declaration.offset,
             )?;
             if transitive_axioms != declaration.value.axiom_dependencies {
                 return Err(ReferenceCheckError::axiom_report(
@@ -931,12 +1394,16 @@ impl DecodedModuleCertificate {
     fn expected_axioms_for_decl(
         &self,
         imports: &ReferenceImportEnvironment,
-        decl_index: usize,
-        decl: &DeclPayload,
+        trust_mode: ReferenceTrustMode,
+        declaration: ExpectedAxiomDeclaration<'_>,
         dependencies: &[DependencyEntry],
         previous_axioms: &[Vec<AxiomRef>],
-        offset: usize,
     ) -> DecodeResult<(Vec<AxiomRef>, Vec<AxiomRef>)> {
+        let ExpectedAxiomDeclaration {
+            index: decl_index,
+            payload: decl,
+            offset,
+        } = declaration;
         let mut direct = BTreeSet::new();
         let mut transitive = BTreeSet::new();
 
@@ -984,9 +1451,9 @@ impl DecodedModuleCertificate {
                     transitive.extend(dep_axioms.iter().cloned());
                 }
                 GlobalRef::Imported {
+                    import_index,
                     name,
                     decl_interface_hash,
-                    ..
                 } => {
                     let export = self.imported_export_for_global_ref(
                         imports,
@@ -1000,9 +1467,22 @@ impl DecodedModuleCertificate {
                             decl_interface_hash: *decl_interface_hash,
                         });
                     }
+                    let owner = imports.imports().get(*import_index).ok_or_else(|| {
+                        ReferenceCheckError::unknown_reference(
+                            ReferenceCertificateSection::Declarations,
+                            offset,
+                            self.reference_context(Some(imports), &dependency.global_ref),
+                        )
+                    })?;
                     for axiom in &export.axiom_dependencies {
-                        transitive
-                            .insert(self.remap_imported_axiom_dependency(imports, axiom, offset)?);
+                        transitive.insert(self.remap_imported_axiom_dependency(
+                            imports,
+                            trust_mode,
+                            *import_index,
+                            &owner.public_environment,
+                            axiom,
+                            offset,
+                        )?);
                     }
                 }
             }
@@ -1131,39 +1611,145 @@ impl DecodedModuleCertificate {
     fn remap_imported_axiom_dependency(
         &self,
         imports: &ReferenceImportEnvironment,
+        trust_mode: ReferenceTrustMode,
+        owner_import_index: usize,
+        owner_environment: &ReferencePublicEnvironment,
         axiom: &ReferenceAxiomDependency,
         offset: usize,
     ) -> DecodeResult<AxiomRef> {
         let name = self.name_id_for_value(&axiom.name, offset)?;
-        if let Some(import_index) =
-            import_index_exporting_axiom(imports, &axiom.name, axiom.decl_interface_hash)
-        {
-            return Ok(AxiomRef {
-                global_ref: GlobalRef::Imported {
-                    import_index,
+        let global_ref = match &axiom.global_ref {
+            ReferenceCoreGlobalRef::Builtin {
+                name: origin_name,
+                decl_interface_hash,
+            } if *origin_name == axiom.name
+                && *decl_interface_hash == axiom.decl_interface_hash
+                && builtin_is_axiom(origin_name)
+                && builtin_decl_interface_hash(origin_name) == Some(*decl_interface_hash) =>
+            {
+                GlobalRef::Builtin {
                     name,
-                    decl_interface_hash: axiom.decl_interface_hash,
-                },
-                name,
-                decl_interface_hash: axiom.decl_interface_hash,
-            });
-        }
-        if builtin_is_axiom(&axiom.name)
-            && builtin_decl_interface_hash(&axiom.name) == Some(axiom.decl_interface_hash)
-        {
-            return Ok(AxiomRef {
-                global_ref: GlobalRef::Builtin {
+                    decl_interface_hash: *decl_interface_hash,
+                }
+            }
+            ReferenceCoreGlobalRef::Imported {
+                import_index,
+                name: origin_name,
+                decl_interface_hash,
+            } if *origin_name == axiom.name
+                && *decl_interface_hash == axiom.decl_interface_hash =>
+            {
+                let resolved_import_index = if *import_index == PUBLIC_SELF_IMPORT_INDEX {
+                    owner_import_index
+                } else {
+                    let source = owner_environment
+                        .imports
+                        .get(*import_index)
+                        .ok_or_else(|| {
+                            self.unknown_imported_public_reference(
+                                imports,
+                                owner_import_index,
+                                ReferenceCheckImportTarget::Unresolved {
+                                    import_index: *import_index,
+                                },
+                                origin_name,
+                                *decl_interface_hash,
+                                offset,
+                            )
+                        })?;
+                    let source_identity = ReferenceCheckResolvedImportIdentity {
+                        import_index: *import_index,
+                        module: source.module.clone(),
+                        export_hash: source.export_hash,
+                    };
+                    let mut matches = imports
+                        .imports()
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, import)| {
+                            import.module == source.module
+                                && import.export_hash == source.export_hash
+                                && (trust_mode != ReferenceTrustMode::HighTrust
+                                    || source
+                                        .certificate_hash
+                                        .is_some_and(|hash| import.certificate_hash == hash))
+                        })
+                        .map(|(index, _)| index);
+                    let resolved = matches.next().ok_or_else(|| {
+                        self.unknown_imported_public_reference(
+                            imports,
+                            owner_import_index,
+                            ReferenceCheckImportTarget::Resolved(source_identity.clone()),
+                            origin_name,
+                            *decl_interface_hash,
+                            offset,
+                        )
+                    })?;
+                    if matches.next().is_some() {
+                        return Err(self.unknown_imported_public_reference(
+                            imports,
+                            owner_import_index,
+                            ReferenceCheckImportTarget::Resolved(source_identity),
+                            origin_name,
+                            *decl_interface_hash,
+                            offset,
+                        ));
+                    }
+                    resolved
+                };
+                GlobalRef::Imported {
+                    import_index: resolved_import_index,
                     name,
-                    decl_interface_hash: axiom.decl_interface_hash,
-                },
-                name,
-                decl_interface_hash: axiom.decl_interface_hash,
-            });
+                    decl_interface_hash: *decl_interface_hash,
+                }
+            }
+            _ => {
+                return Err(ReferenceCheckError::axiom_report(
+                    ReferenceCertificateSection::AxiomReport,
+                    offset,
+                ));
+            }
+        };
+        let remapped = AxiomRef {
+            global_ref,
+            name,
+            decl_interface_hash: axiom.decl_interface_hash,
+        };
+        if matches!(remapped.global_ref, GlobalRef::Imported { .. }) {
+            let export =
+                self.imported_export_for_global_ref(imports, &remapped.global_ref, offset)?;
+            if export.kind != ReferenceExportKind::Axiom {
+                return Err(ReferenceCheckError::axiom_report(
+                    ReferenceCertificateSection::AxiomReport,
+                    offset,
+                ));
+            }
         }
-        Err(ReferenceCheckError::axiom_report(
-            ReferenceCertificateSection::AxiomReport,
+        Ok(remapped)
+    }
+
+    fn unknown_imported_public_reference(
+        &self,
+        imports: &ReferenceImportEnvironment,
+        owner_import_index: usize,
+        import: ReferenceCheckImportTarget,
+        declaration: &ReferenceModuleName,
+        decl_interface_hash: ReferenceHash,
+        offset: usize,
+    ) -> ReferenceCheckError {
+        ReferenceCheckError::unknown_reference(
+            ReferenceCertificateSection::Declarations,
             offset,
-        ))
+            ReferenceCheckReference::Imported {
+                owner_import: imports
+                    .imports()
+                    .get(owner_import_index)
+                    .map(|owner| resolved_import_identity(owner_import_index, owner)),
+                import,
+                declaration: declaration.clone(),
+                decl_interface_hash,
+            },
+        )
     }
 
     fn name_id_for_value(&self, name: &ReferenceModuleName, offset: usize) -> DecodeResult<usize> {
@@ -1226,13 +1812,7 @@ impl DecodedModuleCertificate {
                 .get(import_index)
                 .map_or(0, |located| located.offset);
             for axiom in import.public_environment.module_axioms() {
-                self.enforce_axiom_dependency_policy(
-                    imports,
-                    policy,
-                    &import.module,
-                    axiom,
-                    offset,
-                )?;
+                self.enforce_axiom_dependency_policy(policy, import, axiom, offset)?;
             }
         }
 
@@ -1280,23 +1860,53 @@ impl DecodedModuleCertificate {
 
     fn enforce_axiom_dependency_policy(
         &self,
-        imports: &ReferenceImportEnvironment,
         policy: &ReferenceCheckerPolicy,
-        module: &ReferenceModuleName,
+        owner: &ReferenceResolvedImport,
         axiom: &ReferenceAxiomDependency,
         offset: usize,
     ) -> DecodeResult<()> {
         let raw_name = axiom.name.dotted();
-        let qualified_name =
-            import_index_exporting_axiom(imports, &axiom.name, axiom.decl_interface_hash)
-                .and_then(|import_index| imports.imports().get(import_index))
-                .map(|source| qualify_name(&source.module, &raw_name))
-                .unwrap_or_else(|| qualify_name(module, &raw_name));
+        let qualified_name = match &axiom.global_ref {
+            ReferenceCoreGlobalRef::Builtin { .. } => None,
+            ReferenceCoreGlobalRef::Imported { import_index, .. }
+                if *import_index == PUBLIC_SELF_IMPORT_INDEX =>
+            {
+                Some(qualify_name(&owner.module, &raw_name))
+            }
+            ReferenceCoreGlobalRef::Imported { import_index, .. } => Some(
+                owner
+                    .public_environment
+                    .imports
+                    .get(*import_index)
+                    .map(|source| qualify_name(&source.module, &raw_name))
+                    .ok_or_else(|| {
+                        ReferenceCheckError::axiom_report(
+                            ReferenceCertificateSection::Imports,
+                            offset,
+                        )
+                    })?,
+            ),
+            ReferenceCoreGlobalRef::Local { .. }
+            | ReferenceCoreGlobalRef::LocalGenerated { .. } => {
+                return Err(ReferenceCheckError::axiom_report(
+                    ReferenceCertificateSection::Imports,
+                    offset,
+                ));
+            }
+        };
+        let is_standard_exception = match &axiom.global_ref {
+            ReferenceCoreGlobalRef::Builtin { .. } => raw_name == "Eq.rec",
+            ReferenceCoreGlobalRef::Imported { .. } => {
+                qualified_name.as_deref() == Some("Std.Logic.Eq.rec")
+            }
+            ReferenceCoreGlobalRef::Local { .. }
+            | ReferenceCoreGlobalRef::LocalGenerated { .. } => false,
+        };
         enforce_axiom_policy_name(
             policy,
             &raw_name,
-            Some(&qualified_name),
-            qualified_name == "Std.Logic.Eq.rec",
+            qualified_name.as_deref(),
+            is_standard_exception,
             ReferenceCertificateSection::Imports,
             offset,
         )
@@ -1351,6 +1961,25 @@ impl DecodedModuleCertificate {
         &self,
         core_levels: &[ReferenceCoreLevel],
     ) -> DecodeResult<Vec<ReferenceCoreExpr>> {
+        self.core_terms_with_global_refs(core_levels, |global_ref| {
+            Ok(self.core_global_ref(global_ref))
+        })
+    }
+
+    fn public_core_terms(
+        &self,
+        core_levels: &[ReferenceCoreLevel],
+    ) -> DecodeResult<Vec<ReferenceCoreExpr>> {
+        self.core_terms_with_global_refs(core_levels, |global_ref| {
+            self.export_public_global_ref(&self.core_global_ref(global_ref))
+        })
+    }
+
+    fn core_terms_with_global_refs(
+        &self,
+        core_levels: &[ReferenceCoreLevel],
+        mut map_global_ref: impl FnMut(&GlobalRef) -> DecodeResult<ReferenceCoreGlobalRef>,
+    ) -> DecodeResult<Vec<ReferenceCoreExpr>> {
         let mut terms: Vec<ReferenceCoreExpr> = Vec::with_capacity(self.term_table.len());
         for located in &self.term_table {
             terms.push(match &located.value {
@@ -1360,7 +1989,7 @@ impl DecodedModuleCertificate {
                     global_ref,
                     levels: level_ids,
                 } => ReferenceCoreExpr::Const {
-                    global_ref: self.core_global_ref(global_ref),
+                    global_ref: map_global_ref(global_ref)?,
                     levels: level_ids
                         .iter()
                         .map(|level| core_levels[*level].clone())
@@ -1739,22 +2368,35 @@ impl DecodedModuleCertificate {
     fn validate_level_table(&self) -> DecodeResult<Vec<ReferenceHash>> {
         let mut hashes = Vec::with_capacity(self.level_table.len());
         let mut keys = Vec::with_capacity(self.level_table.len());
-        let mut raw_levels = Vec::with_capacity(self.level_table.len());
+        let mut heights: Vec<usize> = Vec::with_capacity(self.level_table.len());
+        let mut naturals: Vec<Option<u64>> = Vec::with_capacity(self.level_table.len());
         for (index, located) in self.level_table.iter().enumerate() {
             self.validate_level_refs(index, located)?;
-            let raw = raw_level_from_node(&located.value, &raw_levels, &self.name_table)?;
-            if normalize_level(raw.clone()) != raw {
+            if !self.reference_level_node_is_normalized(&located.value, &naturals)? {
                 return Err(ReferenceCheckError::malformed(
                     ReferenceCertificateSection::LevelTable,
                     located.offset,
                     ReferenceCheckReason::NonNormalizedLevel,
                 ));
             }
+            let height = match &located.value {
+                LevelNode::Zero | LevelNode::Param(_) => 0,
+                LevelNode::Succ(inner) => heights[*inner].saturating_add(1),
+                LevelNode::Max(lhs, rhs) | LevelNode::IMax(lhs, rhs) => {
+                    heights[*lhs].max(heights[*rhs]).saturating_add(1)
+                }
+            };
+            let natural = match &located.value {
+                LevelNode::Zero => Some(0),
+                LevelNode::Succ(inner) => naturals[*inner].and_then(|value| value.checked_add(1)),
+                LevelNode::Param(_) | LevelNode::Max(_, _) | LevelNode::IMax(_, _) => None,
+            };
             let key = level_node_key(&located.value, &hashes, &self.name_table)?;
             let hash = hash_with_domain(b"NPA-LEVEL-0.1", &key);
-            keys.push((level_node_height(&located.value, &self.level_table)?, key));
+            keys.push((height, key));
             hashes.push(hash);
-            raw_levels.push(raw);
+            heights.push(height);
+            naturals.push(natural);
         }
         for (index, pair) in keys.windows(2).enumerate() {
             if pair[0] >= pair[1] {
@@ -1766,6 +2408,104 @@ impl DecodedModuleCertificate {
             }
         }
         Ok(hashes)
+    }
+
+    fn reference_level_node_is_normalized(
+        &self,
+        node: &LevelNode,
+        naturals: &[Option<u64>],
+    ) -> DecodeResult<bool> {
+        Ok(match node {
+            LevelNode::Zero | LevelNode::Param(_) | LevelNode::Succ(_) => true,
+            LevelNode::Max(lhs, rhs) => {
+                *lhs != *rhs
+                    && !matches!(
+                        self.level_table.get(*lhs).map(|entry| &entry.value),
+                        Some(LevelNode::Zero)
+                    )
+                    && !matches!(
+                        self.level_table.get(*rhs).map(|entry| &entry.value),
+                        Some(LevelNode::Zero)
+                    )
+                    && !(naturals.get(*lhs).is_some_and(Option::is_some)
+                        && naturals.get(*rhs).is_some_and(Option::is_some))
+                    && self.compare_reference_levels(*lhs, *rhs)? != Ordering::Greater
+            }
+            LevelNode::IMax(_, rhs) => !matches!(
+                self.level_table.get(*rhs).map(|entry| &entry.value),
+                Some(LevelNode::Zero | LevelNode::Succ(_))
+            ),
+        })
+    }
+
+    fn compare_reference_levels(&self, lhs: usize, rhs: usize) -> DecodeResult<Ordering> {
+        fn tag(node: &LevelNode) -> u8 {
+            match node {
+                LevelNode::Zero => 0,
+                LevelNode::Succ(_) => 1,
+                LevelNode::Max(_, _) => 2,
+                LevelNode::IMax(_, _) => 3,
+                LevelNode::Param(_) => 4,
+            }
+        }
+        let mut pending = vec![(lhs, rhs)];
+        while let Some((lhs, rhs)) = pending.pop() {
+            if lhs == rhs {
+                continue;
+            }
+            let lhs_node = &self
+                .level_table
+                .get(lhs)
+                .ok_or_else(|| {
+                    ReferenceCheckError::malformed(
+                        ReferenceCertificateSection::LevelTable,
+                        0,
+                        ReferenceCheckReason::DanglingReference,
+                    )
+                })?
+                .value;
+            let rhs_node = &self
+                .level_table
+                .get(rhs)
+                .ok_or_else(|| {
+                    ReferenceCheckError::malformed(
+                        ReferenceCertificateSection::LevelTable,
+                        0,
+                        ReferenceCheckReason::DanglingReference,
+                    )
+                })?
+                .value;
+            let order = tag(lhs_node).cmp(&tag(rhs_node));
+            if order != Ordering::Equal {
+                return Ok(order);
+            }
+            match (lhs_node, rhs_node) {
+                (LevelNode::Zero, LevelNode::Zero) => {}
+                (LevelNode::Succ(lhs), LevelNode::Succ(rhs)) => pending.push((*lhs, *rhs)),
+                (LevelNode::Max(lhs_l, lhs_r), LevelNode::Max(rhs_l, rhs_r))
+                | (LevelNode::IMax(lhs_l, lhs_r), LevelNode::IMax(rhs_l, rhs_r)) => {
+                    pending.push((*lhs_r, *rhs_r));
+                    pending.push((*lhs_l, *rhs_l));
+                }
+                (LevelNode::Param(lhs), LevelNode::Param(rhs)) => {
+                    let order = self.name_table[*lhs]
+                        .value
+                        .dotted()
+                        .cmp(&self.name_table[*rhs].value.dotted());
+                    if order != Ordering::Equal {
+                        return Ok(order);
+                    }
+                }
+                _ => {
+                    return Err(ReferenceCheckError::malformed(
+                        ReferenceCertificateSection::LevelTable,
+                        0,
+                        ReferenceCheckReason::DanglingReference,
+                    ));
+                }
+            }
+        }
+        Ok(Ordering::Equal)
     }
 
     fn validate_level_refs(&self, index: usize, located: &Located<LevelNode>) -> DecodeResult<()> {
@@ -1787,14 +2527,24 @@ impl DecodedModuleCertificate {
     fn validate_term_table(&self, level_hashes: &[ReferenceHash]) -> DecodeResult<()> {
         let mut hashes = Vec::with_capacity(self.term_table.len());
         let mut keys = Vec::with_capacity(self.term_table.len());
+        let mut heights: Vec<usize> = Vec::with_capacity(self.term_table.len());
         for (index, located) in self.term_table.iter().enumerate() {
             self.validate_term_refs(index, located)?;
             let key = term_node_key(&located.value, &hashes, level_hashes)?;
-            keys.push((
-                term_node_height(&located.value, &self.term_table)?,
-                key.clone(),
-            ));
+            let height = match &located.value {
+                TermNode::Sort(_) | TermNode::BVar(_) | TermNode::Const { .. } => 0,
+                TermNode::App(fun, arg) => heights[*fun].max(heights[*arg]).saturating_add(1),
+                TermNode::Lam { ty, body } | TermNode::Pi { ty, body } => {
+                    heights[*ty].max(heights[*body]).saturating_add(1)
+                }
+                TermNode::Let { ty, value, body } => heights[*ty]
+                    .max(heights[*value])
+                    .max(heights[*body])
+                    .saturating_add(1),
+            };
+            keys.push((height, key.clone()));
             hashes.push(hash_with_domain(b"NPA-TERM-0.1", &key));
+            heights.push(height);
         }
         for (index, pair) in keys.windows(2).enumerate() {
             if pair[0] >= pair[1] {
@@ -2713,6 +3463,287 @@ impl DecodedModuleCertificate {
     }
 }
 
+fn ref_child(values: &[usize], index: usize, offset: usize) -> DecodeResult<usize> {
+    values.get(index).copied().ok_or_else(|| {
+        ReferenceCheckError::malformed(
+            ReferenceCertificateSection::FullCertificate,
+            offset,
+            ReferenceCheckReason::DanglingReference,
+        )
+    })
+}
+
+fn saturating_structural_sum(values: impl IntoIterator<Item = usize>, cap: usize) -> usize {
+    values
+        .into_iter()
+        .fold(0usize, |sum, value| sum.saturating_add(value).min(cap))
+}
+
+fn reference_limit(
+    section: ReferenceCertificateSection,
+    offset: usize,
+    kind: ReferenceStructuralLimitKind,
+    limit: usize,
+) -> ReferenceCheckError {
+    ReferenceCheckError::structural_limit(section, offset, kind, limit, limit + 1)
+}
+
+fn fallible_vec<T>(
+    len: usize,
+    section: ReferenceCertificateSection,
+    offset: usize,
+) -> DecodeResult<Vec<T>> {
+    let mut values = Vec::new();
+    values.try_reserve_exact(len).map_err(|_| {
+        ReferenceCheckError::malformed(section, offset, ReferenceCheckReason::LengthOverflow)
+    })?;
+    Ok(values)
+}
+
+fn reference_add_level_root(
+    roots: &mut ReferenceRootAccumulator,
+    root: usize,
+    offset: usize,
+    depths: &[usize],
+    expansions: &[usize],
+) -> DecodeResult<()> {
+    roots.max_depth = roots.max_depth.max(ref_child(depths, root, offset)?);
+    reference_add_root(
+        roots,
+        ref_child(expansions, root, offset)?,
+        ReferenceCertificateSection::Declarations,
+        offset,
+    )
+}
+
+fn reference_add_term_root(
+    roots: &mut ReferenceRootAccumulator,
+    root: usize,
+    offset: usize,
+    depths: &[usize],
+    expansions: &[usize],
+) -> DecodeResult<()> {
+    roots.max_depth = roots.max_depth.max(ref_child(depths, root, offset)?);
+    reference_add_root(
+        roots,
+        ref_child(expansions, root, offset)?,
+        ReferenceCertificateSection::Declarations,
+        offset,
+    )
+}
+
+fn reference_add_export_level_root(
+    roots: &mut ReferenceRootAccumulator,
+    root: usize,
+    offset: usize,
+    depths: &[usize],
+    expansions: &[usize],
+) -> DecodeResult<()> {
+    roots.max_depth = roots.max_depth.max(ref_child(depths, root, offset)?);
+    reference_add_root(
+        roots,
+        ref_child(expansions, root, offset)?,
+        ReferenceCertificateSection::ExportBlock,
+        offset,
+    )
+}
+
+fn reference_add_export_term_root(
+    roots: &mut ReferenceRootAccumulator,
+    root: usize,
+    offset: usize,
+    depths: &[usize],
+    expansions: &[usize],
+) -> DecodeResult<()> {
+    roots.max_depth = roots.max_depth.max(ref_child(depths, root, offset)?);
+    reference_add_root(
+        roots,
+        ref_child(expansions, root, offset)?,
+        ReferenceCertificateSection::ExportBlock,
+        offset,
+    )
+}
+
+fn reference_add_root(
+    roots: &mut ReferenceRootAccumulator,
+    expansion: usize,
+    section: ReferenceCertificateSection,
+    offset: usize,
+) -> DecodeResult<()> {
+    if expansion > MAX_ROOT_EXPANDED_NODES {
+        return Err(reference_limit(
+            section,
+            offset,
+            ReferenceStructuralLimitKind::RootExpandedNodes,
+            MAX_ROOT_EXPANDED_NODES,
+        ));
+    }
+    roots.max_root_expansion = roots.max_root_expansion.max(expansion);
+    roots.certificate_expansion = roots
+        .certificate_expansion
+        .saturating_add(expansion)
+        .min(MAX_CERTIFICATE_EXPANDED_NODES + 1);
+    if roots.certificate_expansion > MAX_CERTIFICATE_EXPANDED_NODES {
+        return Err(reference_limit(
+            ReferenceCertificateSection::FullCertificate,
+            0,
+            ReferenceStructuralLimitKind::CertificateExpandedNodes,
+            MAX_CERTIFICATE_EXPANDED_NODES,
+        ));
+    }
+    Ok(())
+}
+
+fn reference_identity(entry: &ReferenceImportEntry) -> ReferenceStructuralIdentity {
+    ReferenceStructuralIdentity {
+        module: entry.module.clone(),
+        export_hash: entry.export_hash,
+        certificate_hash: entry.certificate_hash,
+    }
+}
+
+fn merge_reference_summary(
+    target: &mut BTreeMap<ReferenceStructuralIdentity, usize>,
+    source: &ReferenceStructuralClosureSummary,
+) -> DecodeResult<()> {
+    for (identity, expansion) in &source.modules {
+        if let Some(previous) = target.insert(identity.clone(), *expansion) {
+            if previous != *expansion {
+                return Err(ReferenceCheckError::import_resolution(
+                    ReferenceCertificateSection::ImportStore,
+                    0,
+                    ReferenceCheckReason::ImportCertificateHashMismatch,
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_reference_closure(
+    modules: BTreeMap<ReferenceStructuralIdentity, usize>,
+) -> DecodeResult<ReferenceStructuralClosureSummary> {
+    if modules.len() > MAX_CLOSURE_MODULES {
+        return Err(reference_limit(
+            ReferenceCertificateSection::FullCertificate,
+            0,
+            ReferenceStructuralLimitKind::ClosureModules,
+            MAX_CLOSURE_MODULES,
+        ));
+    }
+    let total = modules.values().copied().fold(0usize, |sum, expansion| {
+        sum.saturating_add(expansion)
+            .min(MAX_CLOSURE_EXPANDED_NODES + 1)
+    });
+    if total > MAX_CLOSURE_EXPANDED_NODES {
+        return Err(reference_limit(
+            ReferenceCertificateSection::FullCertificate,
+            0,
+            ReferenceStructuralLimitKind::ClosureExpandedNodes,
+            MAX_CLOSURE_EXPANDED_NODES,
+        ));
+    }
+    Ok(ReferenceStructuralClosureSummary { modules })
+}
+
+fn resolve_public_import<'a>(
+    requested: &crate::ReferencePublicImport,
+    import_store: &'a ReferenceImportStore,
+) -> DecodeResult<&'a ReferenceImportEntry> {
+    let entry = import_store
+        .entries
+        .iter()
+        .find(|entry| {
+            entry.module == requested.module && entry.export_hash == requested.export_hash
+        })
+        .ok_or_else(|| {
+            ReferenceCheckError::import_resolution(
+                ReferenceCertificateSection::ImportStore,
+                0,
+                ReferenceCheckReason::MissingImport,
+            )
+        })?;
+    if requested
+        .certificate_hash
+        .is_some_and(|hash| hash != entry.certificate_hash)
+    {
+        return Err(ReferenceCheckError::import_resolution(
+            ReferenceCertificateSection::ImportStore,
+            0,
+            ReferenceCheckReason::ImportCertificateHashMismatch,
+        ));
+    }
+    Ok(entry)
+}
+
+fn reference_entry_structural_closure(
+    entry: &ReferenceImportEntry,
+    import_store: &ReferenceImportStore,
+    visiting: &mut BTreeSet<ReferenceStructuralIdentity>,
+    memo: &mut BTreeMap<ReferenceStructuralIdentity, ReferenceStructuralClosureSummary>,
+) -> DecodeResult<ReferenceStructuralClosureSummary> {
+    if let Some(summary) = &entry.structural_closure {
+        return Ok(summary.clone());
+    }
+    let identity = reference_identity(entry);
+    if let Some(summary) = memo.get(&identity) {
+        return Ok(summary.clone());
+    }
+    if !visiting.insert(identity.clone()) {
+        return Err(ReferenceCheckError::import_resolution(
+            ReferenceCertificateSection::ImportStore,
+            0,
+            ReferenceCheckReason::ImportCycle,
+        ));
+    }
+    let mut modules = BTreeMap::new();
+    for requested in &entry.public_environment.imports {
+        let child = resolve_public_import(requested, import_store)?;
+        let child_summary =
+            reference_entry_structural_closure(child, import_store, visiting, memo)?;
+        merge_reference_summary(&mut modules, &child_summary)?;
+    }
+    visiting.remove(&identity);
+    if let Some(previous) = modules.insert(identity.clone(), entry.structural_cost) {
+        if previous != entry.structural_cost {
+            return Err(ReferenceCheckError::import_resolution(
+                ReferenceCertificateSection::ImportStore,
+                0,
+                ReferenceCheckReason::ImportCertificateHashMismatch,
+            ));
+        }
+    }
+    let summary = validate_reference_closure(modules)?;
+    memo.insert(identity, summary.clone());
+    Ok(summary)
+}
+
+fn build_current_reference_closure(
+    cert: &DecodedModuleCertificate,
+    cost: usize,
+    imports: &ReferenceImportEnvironment,
+) -> DecodeResult<ReferenceStructuralClosureSummary> {
+    let mut modules = BTreeMap::new();
+    for import in imports.imports() {
+        merge_reference_summary(&mut modules, &import.structural_closure)?;
+    }
+    let current = ReferenceStructuralIdentity {
+        module: cert.header.module.clone(),
+        export_hash: cert.hashes.export_hash,
+        certificate_hash: cert.hashes.certificate_hash,
+    };
+    if let Some(previous) = modules.insert(current, cost) {
+        if previous != cost {
+            return Err(ReferenceCheckError::import_resolution(
+                ReferenceCertificateSection::ImportStore,
+                0,
+                ReferenceCheckReason::ImportCertificateHashMismatch,
+            ));
+        }
+    }
+    validate_reference_closure(modules)
+}
+
 fn resolve_import<'a>(
     requested: &Located<ImportEntry>,
     import_store: &'a ReferenceImportStore,
@@ -2814,6 +3845,7 @@ fn enforce_core_feature_policy(
 struct TypeChecker<'a> {
     cert: &'a DecodedModuleCertificate,
     imports: &'a ReferenceImportEnvironment,
+    trust_mode: ReferenceTrustMode,
     levels: Vec<ReferenceCoreLevel>,
     terms: Vec<ReferenceCoreExpr>,
     locals: Vec<Arc<TypeSignature>>,
@@ -2839,12 +3871,14 @@ impl<'a> TypeChecker<'a> {
     fn new(
         cert: &'a DecodedModuleCertificate,
         imports: &'a ReferenceImportEnvironment,
+        trust_mode: ReferenceTrustMode,
     ) -> DecodeResult<Self> {
         let levels = cert.core_levels()?;
         let terms = cert.core_terms(&levels)?;
         let mut checker = Self {
             cert,
             imports,
+            trust_mode,
             levels,
             terms,
             locals: Vec::new(),
@@ -3206,8 +4240,12 @@ impl<'a> TypeChecker<'a> {
             ) else {
                 return Ok(Vec::new());
             };
-            let family_ty =
-                self.instantiate_public_expr(import_index, environment, &inductive.ty, offset)?;
+            let family_ty = self.instantiate_imported_public_expr(
+                import_index,
+                environment,
+                &inductive.ty,
+                offset,
+            )?;
             let (family_domains, family_result) = peel_pi_domains(&family_ty);
             let ReferenceCoreExpr::Sort(sort) = family_result else {
                 return Ok(Vec::new());
@@ -3228,7 +4266,7 @@ impl<'a> TypeChecker<'a> {
                 };
                 constructors.push(ReferenceConstructorSignature {
                     name: constructor.name.clone(),
-                    ty: self.instantiate_public_expr(
+                    ty: self.instantiate_imported_public_expr(
                         import_index,
                         environment,
                         &constructor.ty,
@@ -3249,7 +4287,7 @@ impl<'a> TypeChecker<'a> {
                 Some(ReferenceRecursorSignature {
                     name: recursor_export.name.clone(),
                     universe_params: recursor_export.universe_params.clone(),
-                    ty: self.instantiate_public_expr(
+                    ty: self.instantiate_imported_public_expr(
                         import_index,
                         environment,
                         &recursor_export.ty,
@@ -4677,7 +5715,7 @@ impl<'a> TypeChecker<'a> {
                 let signature = Arc::new(TypeSignature {
                     universe_params: export.universe_params.clone(),
                     universe_constraints: export.universe_constraints.clone(),
-                    ty: self.instantiate_public_expr(
+                    ty: self.instantiate_imported_public_expr(
                         *import_index,
                         &import.public_environment,
                         &export.ty,
@@ -4687,7 +5725,7 @@ impl<'a> TypeChecker<'a> {
                         .body
                         .as_ref()
                         .map(|body| {
-                            self.instantiate_public_expr(
+                            self.instantiate_imported_public_expr(
                                 *import_index,
                                 &import.public_environment,
                                 body,
@@ -4749,91 +5787,194 @@ impl<'a> TypeChecker<'a> {
         Ok(())
     }
 
-    fn instantiate_public_expr(
+    fn instantiate_imported_public_expr(
         &self,
         owner_import_index: usize,
         owner_environment: &ReferencePublicEnvironment,
         expr: &ReferenceCoreExpr,
         offset: usize,
     ) -> DecodeResult<ReferenceCoreExpr> {
-        Ok(match expr {
-            ReferenceCoreExpr::Sort(level) => ReferenceCoreExpr::Sort(level.clone()),
-            ReferenceCoreExpr::BVar(index) => ReferenceCoreExpr::BVar(*index),
-            ReferenceCoreExpr::Const { global_ref, levels } => ReferenceCoreExpr::Const {
-                global_ref: self.instantiate_public_global_ref(
-                    owner_import_index,
-                    owner_environment,
-                    global_ref,
-                    offset,
-                )?,
-                levels: levels.clone(),
-            },
-            ReferenceCoreExpr::App(fun, arg) => ReferenceCoreExpr::App(
-                Arc::new(self.instantiate_public_expr(
-                    owner_import_index,
-                    owner_environment,
-                    fun,
-                    offset,
-                )?),
-                Arc::new(self.instantiate_public_expr(
-                    owner_import_index,
-                    owner_environment,
-                    arg,
-                    offset,
-                )?),
-            ),
-            ReferenceCoreExpr::Lam { ty, body } => ReferenceCoreExpr::Lam {
-                ty: Arc::new(self.instantiate_public_expr(
-                    owner_import_index,
-                    owner_environment,
-                    ty,
-                    offset,
-                )?),
-                body: Arc::new(self.instantiate_public_expr(
-                    owner_import_index,
-                    owner_environment,
-                    body,
-                    offset,
-                )?),
-            },
-            ReferenceCoreExpr::Pi { ty, body } => ReferenceCoreExpr::Pi {
-                ty: Arc::new(self.instantiate_public_expr(
-                    owner_import_index,
-                    owner_environment,
-                    ty,
-                    offset,
-                )?),
-                body: Arc::new(self.instantiate_public_expr(
-                    owner_import_index,
-                    owner_environment,
-                    body,
-                    offset,
-                )?),
-            },
-            ReferenceCoreExpr::Let { ty, value, body } => ReferenceCoreExpr::Let {
-                ty: Arc::new(self.instantiate_public_expr(
-                    owner_import_index,
-                    owner_environment,
-                    ty,
-                    offset,
-                )?),
-                value: Arc::new(self.instantiate_public_expr(
-                    owner_import_index,
-                    owner_environment,
-                    value,
-                    offset,
-                )?),
-                body: Arc::new(self.instantiate_public_expr(
-                    owner_import_index,
-                    owner_environment,
-                    body,
-                    offset,
-                )?),
-            },
-        })
+        #[derive(Clone, Copy)]
+        enum Build {
+            App,
+            Lam,
+            Pi,
+            Let,
+        }
+        enum Frame<'a> {
+            Visit(&'a ReferenceCoreExpr),
+            Build { kind: Build, source_key: usize },
+        }
+
+        let mut pending = vec![Frame::Visit(expr)];
+        let mut mapped = Vec::new();
+        let mut memo = HashMap::<usize, ReferenceCoreExpr>::new();
+        while let Some(frame) = pending.pop() {
+            match frame {
+                Frame::Visit(source) => {
+                    let source_key = source as *const ReferenceCoreExpr as usize;
+                    if let Some(existing) = memo.get(&source_key) {
+                        mapped.push(existing.clone());
+                        continue;
+                    }
+                    match source {
+                        ReferenceCoreExpr::Sort(level) => {
+                            let result = ReferenceCoreExpr::Sort(level.clone());
+                            memo.insert(source_key, result.clone());
+                            mapped.push(result);
+                        }
+                        ReferenceCoreExpr::BVar(index) => {
+                            let result = ReferenceCoreExpr::BVar(*index);
+                            memo.insert(source_key, result.clone());
+                            mapped.push(result);
+                        }
+                        ReferenceCoreExpr::Const { global_ref, levels } => {
+                            let result = ReferenceCoreExpr::Const {
+                                global_ref: self.instantiate_imported_public_global_ref(
+                                    owner_import_index,
+                                    owner_environment,
+                                    global_ref,
+                                    offset,
+                                )?,
+                                levels: levels.clone(),
+                            };
+                            memo.insert(source_key, result.clone());
+                            mapped.push(result);
+                        }
+                        ReferenceCoreExpr::App(fun, arg) => {
+                            pending.push(Frame::Build {
+                                kind: Build::App,
+                                source_key,
+                            });
+                            pending.push(Frame::Visit(arg));
+                            pending.push(Frame::Visit(fun));
+                        }
+                        ReferenceCoreExpr::Lam { ty, body } => {
+                            pending.push(Frame::Build {
+                                kind: Build::Lam,
+                                source_key,
+                            });
+                            pending.push(Frame::Visit(body));
+                            pending.push(Frame::Visit(ty));
+                        }
+                        ReferenceCoreExpr::Pi { ty, body } => {
+                            pending.push(Frame::Build {
+                                kind: Build::Pi,
+                                source_key,
+                            });
+                            pending.push(Frame::Visit(body));
+                            pending.push(Frame::Visit(ty));
+                        }
+                        ReferenceCoreExpr::Let { ty, value, body } => {
+                            pending.push(Frame::Build {
+                                kind: Build::Let,
+                                source_key,
+                            });
+                            pending.push(Frame::Visit(body));
+                            pending.push(Frame::Visit(value));
+                            pending.push(Frame::Visit(ty));
+                        }
+                    }
+                }
+                Frame::Build { kind, source_key } => {
+                    let result = match kind {
+                        Build::App => {
+                            let arg = mapped.pop().ok_or_else(|| {
+                                ReferenceCheckError::malformed(
+                                    ReferenceCertificateSection::Declarations,
+                                    offset,
+                                    ReferenceCheckReason::DanglingReference,
+                                )
+                            })?;
+                            let fun = mapped.pop().ok_or_else(|| {
+                                ReferenceCheckError::malformed(
+                                    ReferenceCertificateSection::Declarations,
+                                    offset,
+                                    ReferenceCheckReason::DanglingReference,
+                                )
+                            })?;
+                            ReferenceCoreExpr::App(Arc::new(fun), Arc::new(arg))
+                        }
+                        Build::Lam | Build::Pi => {
+                            let body = mapped.pop().ok_or_else(|| {
+                                ReferenceCheckError::malformed(
+                                    ReferenceCertificateSection::Declarations,
+                                    offset,
+                                    ReferenceCheckReason::DanglingReference,
+                                )
+                            })?;
+                            let ty = mapped.pop().ok_or_else(|| {
+                                ReferenceCheckError::malformed(
+                                    ReferenceCertificateSection::Declarations,
+                                    offset,
+                                    ReferenceCheckReason::DanglingReference,
+                                )
+                            })?;
+                            match kind {
+                                Build::Lam => ReferenceCoreExpr::Lam {
+                                    ty: Arc::new(ty),
+                                    body: Arc::new(body),
+                                },
+                                Build::Pi => ReferenceCoreExpr::Pi {
+                                    ty: Arc::new(ty),
+                                    body: Arc::new(body),
+                                },
+                                Build::App | Build::Let => unreachable!(),
+                            }
+                        }
+                        Build::Let => {
+                            let body = mapped.pop().ok_or_else(|| {
+                                ReferenceCheckError::malformed(
+                                    ReferenceCertificateSection::Declarations,
+                                    offset,
+                                    ReferenceCheckReason::DanglingReference,
+                                )
+                            })?;
+                            let value = mapped.pop().ok_or_else(|| {
+                                ReferenceCheckError::malformed(
+                                    ReferenceCertificateSection::Declarations,
+                                    offset,
+                                    ReferenceCheckReason::DanglingReference,
+                                )
+                            })?;
+                            let ty = mapped.pop().ok_or_else(|| {
+                                ReferenceCheckError::malformed(
+                                    ReferenceCertificateSection::Declarations,
+                                    offset,
+                                    ReferenceCheckReason::DanglingReference,
+                                )
+                            })?;
+                            ReferenceCoreExpr::Let {
+                                ty: Arc::new(ty),
+                                value: Arc::new(value),
+                                body: Arc::new(body),
+                            }
+                        }
+                    };
+                    memo.insert(source_key, result.clone());
+                    mapped.push(result);
+                }
+            }
+        }
+        let result = mapped.pop().ok_or_else(|| {
+            ReferenceCheckError::malformed(
+                ReferenceCertificateSection::Declarations,
+                offset,
+                ReferenceCheckReason::DanglingReference,
+            )
+        })?;
+        if mapped.is_empty() {
+            Ok(result)
+        } else {
+            Err(ReferenceCheckError::malformed(
+                ReferenceCertificateSection::Declarations,
+                offset,
+                ReferenceCheckReason::DanglingReference,
+            ))
+        }
     }
 
-    fn instantiate_public_global_ref(
+    fn instantiate_imported_public_global_ref(
         &self,
         owner_import_index: usize,
         owner_environment: &ReferencePublicEnvironment,
@@ -4884,27 +6025,46 @@ impl<'a> TypeChecker<'a> {
                     module: source.module.clone(),
                     export_hash: source.export_hash,
                 };
-                let remapped = self
+                let mut remapped = self
                     .imports
                     .imports()
                     .iter()
-                    .position(|import| {
-                        import.module == source.module && import.export_hash == source.export_hash
+                    .enumerate()
+                    .filter(|(_, import)| {
+                        import.module == source.module
+                            && import.export_hash == source.export_hash
+                            && (self.trust_mode != ReferenceTrustMode::HighTrust
+                                || source
+                                    .certificate_hash
+                                    .is_some_and(|hash| import.certificate_hash == hash))
                     })
-                    .ok_or_else(|| {
-                        ReferenceCheckError::unknown_reference(
-                            ReferenceCertificateSection::Declarations,
-                            offset,
-                            self.imported_reference_context(
-                                owner_import_index,
-                                ReferenceCheckImportTarget::Resolved(source_identity),
-                                name,
-                                *decl_interface_hash,
-                            ),
-                        )
-                    })?;
+                    .map(|(index, _)| index);
+                let resolved = remapped.next().ok_or_else(|| {
+                    ReferenceCheckError::unknown_reference(
+                        ReferenceCertificateSection::Declarations,
+                        offset,
+                        self.imported_reference_context(
+                            owner_import_index,
+                            ReferenceCheckImportTarget::Resolved(source_identity.clone()),
+                            name,
+                            *decl_interface_hash,
+                        ),
+                    )
+                })?;
+                if remapped.next().is_some() {
+                    return Err(ReferenceCheckError::unknown_reference(
+                        ReferenceCertificateSection::Declarations,
+                        offset,
+                        self.imported_reference_context(
+                            owner_import_index,
+                            ReferenceCheckImportTarget::Resolved(source_identity),
+                            name,
+                            *decl_interface_hash,
+                        ),
+                    ));
+                }
                 ReferenceCoreGlobalRef::Imported {
-                    import_index: remapped,
+                    import_index: resolved,
                     name: name.clone(),
                     decl_interface_hash: *decl_interface_hash,
                 }
@@ -8503,96 +9663,6 @@ struct ModuleHashOffsets {
     certificate_hash_offset: usize,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-enum RawLevel {
-    Zero,
-    Succ(Box<RawLevel>),
-    Max(Box<RawLevel>, Box<RawLevel>),
-    IMax(Box<RawLevel>, Box<RawLevel>),
-    Param(String),
-}
-
-fn normalize_level(level: RawLevel) -> RawLevel {
-    match level {
-        RawLevel::Zero | RawLevel::Param(_) => level,
-        RawLevel::Succ(inner) => RawLevel::Succ(Box::new(normalize_level(*inner))),
-        RawLevel::Max(lhs, rhs) => {
-            let lhs = normalize_level(*lhs);
-            let rhs = normalize_level(*rhs);
-            if lhs == rhs {
-                return lhs;
-            }
-            if lhs == RawLevel::Zero {
-                return rhs;
-            }
-            if rhs == RawLevel::Zero {
-                return lhs;
-            }
-            match (level_as_nat(&lhs), level_as_nat(&rhs)) {
-                (Some(lhs_nat), Some(rhs_nat)) => level_from_nat(lhs_nat.max(rhs_nat)),
-                _ if rhs < lhs => RawLevel::Max(Box::new(rhs), Box::new(lhs)),
-                _ => RawLevel::Max(Box::new(lhs), Box::new(rhs)),
-            }
-        }
-        RawLevel::IMax(lhs, rhs) => {
-            let lhs = normalize_level(*lhs);
-            let rhs = normalize_level(*rhs);
-            match rhs {
-                RawLevel::Zero => RawLevel::Zero,
-                RawLevel::Succ(inner) => normalize_level(RawLevel::Max(
-                    Box::new(lhs),
-                    Box::new(RawLevel::Succ(inner)),
-                )),
-                rhs => RawLevel::IMax(Box::new(lhs), Box::new(rhs)),
-            }
-        }
-    }
-}
-
-fn level_as_nat(level: &RawLevel) -> Option<u32> {
-    match level {
-        RawLevel::Zero => Some(0),
-        RawLevel::Succ(inner) => Some(level_as_nat(inner)? + 1),
-        RawLevel::Max(_, _) | RawLevel::IMax(_, _) | RawLevel::Param(_) => None,
-    }
-}
-
-fn level_from_nat(n: u32) -> RawLevel {
-    (0..n).fold(RawLevel::Zero, |level, _| RawLevel::Succ(Box::new(level)))
-}
-
-fn raw_level_from_node(
-    node: &LevelNode,
-    previous: &[RawLevel],
-    names: &[Located<ReferenceModuleName>],
-) -> DecodeResult<RawLevel> {
-    Ok(match node {
-        LevelNode::Zero => RawLevel::Zero,
-        LevelNode::Succ(inner) => RawLevel::Succ(Box::new(previous[*inner].clone())),
-        LevelNode::Max(lhs, rhs) => RawLevel::Max(
-            Box::new(previous[*lhs].clone()),
-            Box::new(previous[*rhs].clone()),
-        ),
-        LevelNode::IMax(lhs, rhs) => RawLevel::IMax(
-            Box::new(previous[*lhs].clone()),
-            Box::new(previous[*rhs].clone()),
-        ),
-        LevelNode::Param(name) => RawLevel::Param(
-            names
-                .get(*name)
-                .ok_or_else(|| {
-                    ReferenceCheckError::malformed(
-                        ReferenceCertificateSection::LevelTable,
-                        0,
-                        ReferenceCheckReason::DanglingReference,
-                    )
-                })?
-                .value
-                .dotted(),
-        ),
-    })
-}
-
 struct Decoder<'a> {
     bytes: &'a [u8],
     offset: usize,
@@ -8613,6 +9683,22 @@ impl<'a> Decoder<'a> {
 
     fn remaining_len(&self) -> usize {
         self.bytes.len().saturating_sub(self.offset)
+    }
+
+    fn allocate_vec<T>(
+        &self,
+        len: usize,
+        section: ReferenceCertificateSection,
+    ) -> DecodeResult<Vec<T>> {
+        let mut values = Vec::new();
+        values.try_reserve_exact(len).map_err(|_| {
+            ReferenceCheckError::malformed(
+                section,
+                self.offset,
+                ReferenceCheckReason::LengthOverflow,
+            )
+        })?;
+        Ok(values)
     }
 
     fn has_core_feature_report(&self) -> bool {
@@ -8710,8 +9796,12 @@ impl<'a> Decoder<'a> {
     }
 
     fn imports(&mut self) -> DecodeResult<Vec<Located<ImportEntry>>> {
-        let len = self.bounded_len(ReferenceCertificateSection::Imports)?;
-        let mut imports = Vec::with_capacity(len);
+        let len = self.bounded_len_for(
+            ReferenceCertificateSection::Imports,
+            ReferenceStructuralLimitKind::Imports,
+            MAX_IMPORTS,
+        )?;
+        let mut imports = self.allocate_vec(len, ReferenceCertificateSection::Imports)?;
         for _ in 0..len {
             let offset = self.offset;
             imports.push(Located {
@@ -8727,8 +9817,12 @@ impl<'a> Decoder<'a> {
     }
 
     fn name_table(&mut self) -> DecodeResult<Vec<Located<ReferenceModuleName>>> {
-        let len = self.bounded_len(ReferenceCertificateSection::NameTable)?;
-        let mut names = Vec::with_capacity(len);
+        let len = self.bounded_len_for(
+            ReferenceCertificateSection::NameTable,
+            ReferenceStructuralLimitKind::NameTableEntries,
+            MAX_NAME_TABLE_ENTRIES,
+        )?;
+        let mut names = self.allocate_vec(len, ReferenceCertificateSection::NameTable)?;
         for _ in 0..len {
             let offset = self.offset;
             names.push(Located {
@@ -8740,8 +9834,12 @@ impl<'a> Decoder<'a> {
     }
 
     fn level_table(&mut self) -> DecodeResult<Vec<Located<LevelNode>>> {
-        let len = self.bounded_len(ReferenceCertificateSection::LevelTable)?;
-        let mut levels = Vec::with_capacity(len);
+        let len = self.bounded_len_for(
+            ReferenceCertificateSection::LevelTable,
+            ReferenceStructuralLimitKind::LevelTableNodes,
+            MAX_LEVEL_TABLE_NODES,
+        )?;
+        let mut levels = self.allocate_vec(len, ReferenceCertificateSection::LevelTable)?;
         for _ in 0..len {
             let offset = self.offset;
             let tag = self.byte(ReferenceCertificateSection::LevelTable)?;
@@ -8771,8 +9869,12 @@ impl<'a> Decoder<'a> {
     }
 
     fn term_table(&mut self) -> DecodeResult<Vec<Located<TermNode>>> {
-        let len = self.bounded_len(ReferenceCertificateSection::TermTable)?;
-        let mut terms = Vec::with_capacity(len);
+        let len = self.bounded_len_for(
+            ReferenceCertificateSection::TermTable,
+            ReferenceStructuralLimitKind::TermTableNodes,
+            MAX_TERM_TABLE_NODES,
+        )?;
+        let mut terms = self.allocate_vec(len, ReferenceCertificateSection::TermTable)?;
         for _ in 0..len {
             let offset = self.offset;
             let tag = self.byte(ReferenceCertificateSection::TermTable)?;
@@ -8814,8 +9916,12 @@ impl<'a> Decoder<'a> {
     }
 
     fn declarations(&mut self) -> DecodeResult<Vec<Located<DeclCert>>> {
-        let len = self.bounded_len(ReferenceCertificateSection::Declarations)?;
-        let mut declarations = Vec::with_capacity(len);
+        let len = self.bounded_len_for(
+            ReferenceCertificateSection::Declarations,
+            ReferenceStructuralLimitKind::Declarations,
+            MAX_DECLARATIONS,
+        )?;
+        let mut declarations = self.allocate_vec(len, ReferenceCertificateSection::Declarations)?;
         for _ in 0..len {
             let offset = self.offset;
             let decl = self.decl_payload()?;
@@ -8897,7 +10003,8 @@ impl<'a> Decoder<'a> {
                 let sort = self.usize(ReferenceCertificateSection::Declarations)?;
                 let constructors_len =
                     self.bounded_len(ReferenceCertificateSection::Declarations)?;
-                let mut constructors = Vec::with_capacity(constructors_len);
+                let mut constructors =
+                    self.allocate_vec(constructors_len, ReferenceCertificateSection::Declarations)?;
                 for _ in 0..constructors_len {
                     constructors.push(ConstructorSpec {
                         name: self.usize(ReferenceCertificateSection::Declarations)?,
@@ -8944,7 +10051,8 @@ impl<'a> Decoder<'a> {
                 let sort = self.usize(ReferenceCertificateSection::Declarations)?;
                 let constructors_len =
                     self.bounded_len(ReferenceCertificateSection::Declarations)?;
-                let mut constructors = Vec::with_capacity(constructors_len);
+                let mut constructors =
+                    self.allocate_vec(constructors_len, ReferenceCertificateSection::Declarations)?;
                 for _ in 0..constructors_len {
                     constructors.push(ConstructorSpec {
                         name: self.usize(ReferenceCertificateSection::Declarations)?,
@@ -8988,7 +10096,8 @@ impl<'a> Decoder<'a> {
                 let universe_params = self.usize_vec(ReferenceCertificateSection::Declarations)?;
                 let universe_constraints = self.universe_constraint_specs()?;
                 let len = self.bounded_len(ReferenceCertificateSection::Declarations)?;
-                let mut inductives = Vec::with_capacity(len);
+                let mut inductives =
+                    self.allocate_vec(len, ReferenceCertificateSection::Declarations)?;
                 for _ in 0..len {
                     inductives.push(MutualInductiveSpec {
                         name: self.usize(ReferenceCertificateSection::Declarations)?,
@@ -9051,7 +10160,7 @@ impl<'a> Decoder<'a> {
 
     fn binder_types(&mut self) -> DecodeResult<Vec<BinderType>> {
         let len = self.bounded_len(ReferenceCertificateSection::Declarations)?;
-        let mut binders = Vec::with_capacity(len);
+        let mut binders = self.allocate_vec(len, ReferenceCertificateSection::Declarations)?;
         for _ in 0..len {
             binders.push(BinderType {
                 ty: self.usize(ReferenceCertificateSection::Declarations)?,
@@ -9062,7 +10171,7 @@ impl<'a> Decoder<'a> {
 
     fn constructor_specs(&mut self) -> DecodeResult<Vec<ConstructorSpec>> {
         let len = self.bounded_len(ReferenceCertificateSection::Declarations)?;
-        let mut constructors = Vec::with_capacity(len);
+        let mut constructors = self.allocate_vec(len, ReferenceCertificateSection::Declarations)?;
         for _ in 0..len {
             constructors.push(ConstructorSpec {
                 name: self.usize(ReferenceCertificateSection::Declarations)?,
@@ -9097,8 +10206,12 @@ impl<'a> Decoder<'a> {
         &mut self,
         version: ReferenceCertificateFormatVersion,
     ) -> DecodeResult<Vec<Located<ExportEntry>>> {
-        let len = self.bounded_len(ReferenceCertificateSection::ExportBlock)?;
-        let mut exports = Vec::with_capacity(len);
+        let len = self.bounded_len_for(
+            ReferenceCertificateSection::ExportBlock,
+            ReferenceStructuralLimitKind::Exports,
+            MAX_EXPORTS,
+        )?;
+        let mut exports = self.allocate_vec(len, ReferenceCertificateSection::ExportBlock)?;
         for _ in 0..len {
             let offset = self.offset;
             let name = self.usize(ReferenceCertificateSection::ExportBlock)?;
@@ -9148,8 +10261,13 @@ impl<'a> Decoder<'a> {
     }
 
     fn axiom_report(&mut self) -> DecodeResult<AxiomReport> {
-        let len = self.bounded_len(ReferenceCertificateSection::AxiomReport)?;
-        let mut per_declaration = Vec::with_capacity(len);
+        let len = self.bounded_len_for(
+            ReferenceCertificateSection::AxiomReport,
+            ReferenceStructuralLimitKind::Declarations,
+            MAX_DECLARATIONS,
+        )?;
+        let mut per_declaration =
+            self.allocate_vec(len, ReferenceCertificateSection::AxiomReport)?;
         for _ in 0..len {
             let offset = self.offset;
             per_declaration.push(DeclAxiomReport {
@@ -9188,7 +10306,7 @@ impl<'a> Decoder<'a> {
                 ReferenceCheckReason::NonCanonicalOrder,
             ));
         }
-        let mut features = Vec::with_capacity(len);
+        let mut features = self.allocate_vec(len, ReferenceCertificateSection::AxiomReport)?;
         for _ in 0..len {
             let feature = self.string(ReferenceCertificateSection::AxiomReport)?;
             let Some(feature) = ReferenceCoreFeature::from_name(&feature) else {
@@ -9205,7 +10323,7 @@ impl<'a> Decoder<'a> {
         section: ReferenceCertificateSection,
     ) -> DecodeResult<Vec<DependencyEntry>> {
         let len = self.bounded_len(section)?;
-        let mut entries = Vec::with_capacity(len);
+        let mut entries = self.allocate_vec(len, section)?;
         for _ in 0..len {
             entries.push(DependencyEntry {
                 global_ref: self.global_ref(section)?,
@@ -9217,7 +10335,7 @@ impl<'a> Decoder<'a> {
 
     fn axiom_refs(&mut self, section: ReferenceCertificateSection) -> DecodeResult<Vec<AxiomRef>> {
         let len = self.bounded_len(section)?;
-        let mut axioms = Vec::with_capacity(len);
+        let mut axioms = self.allocate_vec(len, section)?;
         for _ in 0..len {
             axioms.push(AxiomRef {
                 global_ref: self.global_ref(section)?,
@@ -9331,7 +10449,7 @@ impl<'a> Decoder<'a> {
                 ReferenceCheckReason::EmptyModuleName,
             ));
         }
-        let mut components = Vec::with_capacity(len);
+        let mut components = self.allocate_vec(len, section)?;
         for _ in 0..len {
             let component = self.string(section)?;
             if component.is_empty() {
@@ -9377,7 +10495,7 @@ impl<'a> Decoder<'a> {
 
     fn usize_vec(&mut self, section: ReferenceCertificateSection) -> DecodeResult<Vec<usize>> {
         let len = self.bounded_len(section)?;
-        let mut values = Vec::with_capacity(len);
+        let mut values = self.allocate_vec(len, section)?;
         for _ in 0..len {
             values.push(self.usize(section)?);
         }
@@ -9424,7 +10542,26 @@ impl<'a> Decoder<'a> {
     }
 
     fn bounded_len(&mut self, section: ReferenceCertificateSection) -> DecodeResult<usize> {
+        self.bounded_len_for(
+            section,
+            ReferenceStructuralLimitKind::NestedVectorEntries,
+            MAX_NESTED_VECTOR_ENTRIES,
+        )
+    }
+
+    fn bounded_len_for(
+        &mut self,
+        section: ReferenceCertificateSection,
+        kind: ReferenceStructuralLimitKind,
+        limit: usize,
+    ) -> DecodeResult<usize> {
+        let offset = self.offset;
         let len = self.usize(section)?;
+        if len > limit {
+            return Err(ReferenceCheckError::structural_limit(
+                section, offset, kind, limit, len,
+            ));
+        }
         let remaining = self.bytes.len().saturating_sub(self.offset);
         if len > remaining {
             return Err(ReferenceCheckError::malformed(
@@ -9597,40 +10734,6 @@ fn ensure_strict_order<T: Ord>(
             ReferenceCheckReason::NonCanonicalOrder,
         ))
     }
-}
-
-fn level_node_height(node: &LevelNode, levels: &[Located<LevelNode>]) -> DecodeResult<usize> {
-    Ok(match node {
-        LevelNode::Zero | LevelNode::Param(_) => 0,
-        LevelNode::Succ(inner) => level_node_height(&levels[*inner].value, levels)? + 1,
-        LevelNode::Max(lhs, rhs) | LevelNode::IMax(lhs, rhs) => {
-            level_node_height(&levels[*lhs].value, levels)?
-                .max(level_node_height(&levels[*rhs].value, levels)?)
-                + 1
-        }
-    })
-}
-
-fn term_node_height(node: &TermNode, terms: &[Located<TermNode>]) -> DecodeResult<usize> {
-    Ok(match node {
-        TermNode::Sort(_) | TermNode::BVar(_) | TermNode::Const { .. } => 0,
-        TermNode::App(fun, arg) => {
-            term_node_height(&terms[*fun].value, terms)?
-                .max(term_node_height(&terms[*arg].value, terms)?)
-                + 1
-        }
-        TermNode::Lam { ty, body } | TermNode::Pi { ty, body } => {
-            term_node_height(&terms[*ty].value, terms)?
-                .max(term_node_height(&terms[*body].value, terms)?)
-                + 1
-        }
-        TermNode::Let { ty, value, body } => {
-            term_node_height(&terms[*ty].value, terms)?
-                .max(term_node_height(&terms[*value].value, terms)?)
-                .max(term_node_height(&terms[*body].value, terms)?)
-                + 1
-        }
-    })
 }
 
 fn level_node_key(
@@ -10283,23 +11386,44 @@ fn collect_global_refs_from_term(
     term: usize,
     refs: &mut BTreeSet<GlobalRef>,
 ) -> DecodeResult<()> {
-    match &terms[term].value {
-        TermNode::Sort(_) | TermNode::BVar(_) => {}
-        TermNode::Const { global_ref, .. } => {
-            refs.insert(global_ref.clone());
+    if term >= terms.len() {
+        return Err(ReferenceCheckError::malformed(
+            ReferenceCertificateSection::TermTable,
+            0,
+            ReferenceCheckReason::DanglingReference,
+        ));
+    }
+    let mut visited = BTreeSet::new();
+    let mut pending = vec![term];
+    while let Some(term) = pending.pop() {
+        if !visited.insert(term) {
+            continue;
         }
-        TermNode::App(fun, arg) => {
-            collect_global_refs_from_term(terms, *fun, refs)?;
-            collect_global_refs_from_term(terms, *arg, refs)?;
-        }
-        TermNode::Lam { ty, body } | TermNode::Pi { ty, body } => {
-            collect_global_refs_from_term(terms, *ty, refs)?;
-            collect_global_refs_from_term(terms, *body, refs)?;
-        }
-        TermNode::Let { ty, value, body } => {
-            collect_global_refs_from_term(terms, *ty, refs)?;
-            collect_global_refs_from_term(terms, *value, refs)?;
-            collect_global_refs_from_term(terms, *body, refs)?;
+        let node = terms.get(term).ok_or_else(|| {
+            ReferenceCheckError::malformed(
+                ReferenceCertificateSection::TermTable,
+                0,
+                ReferenceCheckReason::DanglingReference,
+            )
+        })?;
+        match &node.value {
+            TermNode::Sort(_) | TermNode::BVar(_) => {}
+            TermNode::Const { global_ref, .. } => {
+                refs.insert(global_ref.clone());
+            }
+            TermNode::App(fun, arg) => {
+                pending.push(*arg);
+                pending.push(*fun);
+            }
+            TermNode::Lam { ty, body } | TermNode::Pi { ty, body } => {
+                pending.push(*body);
+                pending.push(*ty);
+            }
+            TermNode::Let { ty, value, body } => {
+                pending.push(*body);
+                pending.push(*value);
+                pending.push(*ty);
+            }
         }
     }
     Ok(())
@@ -10316,29 +11440,6 @@ fn local_axiom_ref_for_decl(decl_index: usize, axioms: &[AxiomRef]) -> Option<Ax
             )
         })
         .cloned()
-}
-
-fn import_index_exporting_axiom(
-    imports: &ReferenceImportEnvironment,
-    name: &ReferenceModuleName,
-    decl_interface_hash: ReferenceHash,
-) -> Option<usize> {
-    imports
-        .imports()
-        .iter()
-        .enumerate()
-        .find_map(|(import_index, import)| {
-            import
-                .public_environment
-                .exports()
-                .iter()
-                .any(|export| {
-                    export.kind == ReferenceExportKind::Axiom
-                        && export.name == *name
-                        && export.decl_interface_hash == decl_interface_hash
-                })
-                .then_some(import_index)
-        })
 }
 
 fn union_axioms(axioms: impl IntoIterator<Item = AxiomRef>) -> Vec<AxiomRef> {
@@ -10740,6 +11841,7 @@ fn encode_uvar_to(out: &mut Vec<u8>, mut value: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ReferenceStructuralLimit;
 
     const MUTUAL_PROVIDER: &[u8] = include_bytes!(
         "../../../checkers/npa-checker-ext/test/fixtures/conformance/mutual-v0.2.npcert"
@@ -10754,6 +11856,242 @@ mod tests {
 
     fn succ(level: ReferenceCoreLevel) -> ReferenceCoreLevel {
         ReferenceCoreLevel::Succ(Arc::new(level))
+    }
+
+    fn structural_certificate(
+        level_table: Vec<npa_cert::LevelNode>,
+        root: usize,
+    ) -> npa_cert::ModuleCert {
+        npa_cert::ModuleCert {
+            header: npa_cert::CertHeader {
+                format: "NPA-CERT-0.2.0".to_string(),
+                core_spec: "NPA-Core-0.2.0".to_string(),
+                module: npa_cert::Name(vec!["ReferenceStructuralTest".to_string()]),
+            },
+            imports: vec![],
+            name_table: vec![npa_cert::Name(vec!["root".to_string()])],
+            level_table,
+            term_table: vec![npa_cert::TermNode::Sort(root)],
+            declarations: vec![npa_cert::DeclCert {
+                decl: npa_cert::DeclPayload::Axiom {
+                    name: 0,
+                    universe_params: vec![],
+                    ty: 0,
+                },
+                dependencies: vec![],
+                axiom_dependencies: vec![],
+                hashes: npa_cert::DeclHashes {
+                    decl_interface_hash: [0; 32],
+                    decl_certificate_hash: [0; 32],
+                },
+            }],
+            export_block: vec![],
+            axiom_report: npa_cert::AxiomReport {
+                per_declaration: vec![],
+                module_axioms: vec![],
+                core_features: vec![],
+            },
+            hashes: npa_cert::ModuleHashes {
+                export_hash: [0; 32],
+                axiom_report_hash: [0; 32],
+                certificate_hash: [0; 32],
+            },
+        }
+    }
+
+    fn structural_doubling_levels(steps: usize) -> Vec<npa_cert::LevelNode> {
+        let mut levels = vec![npa_cert::LevelNode::Zero];
+        for index in 0..steps {
+            levels.push(npa_cert::LevelNode::Max(index, index));
+        }
+        levels
+    }
+
+    #[test]
+    fn structural_preflight_rejects_doubling_dag_independently() {
+        let levels = structural_doubling_levels(20);
+        let certificate = structural_certificate(levels.clone(), levels.len() - 1);
+        let bytes = npa_cert::encode_module_cert(&certificate).unwrap();
+        let error = decode_module_certificate(&bytes).unwrap_err();
+
+        assert_eq!(
+            error.structural_limit,
+            Some(ReferenceStructuralLimit {
+                kind: ReferenceStructuralLimitKind::RootExpandedNodes,
+                limit: MAX_ROOT_EXPANDED_NODES,
+                observed: MAX_ROOT_EXPANDED_NODES + 1,
+            })
+        );
+    }
+
+    #[test]
+    fn structural_preflight_rejects_combined_depth_limit_plus_one() {
+        std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(|| {
+                let mut levels = vec![npa_cert::LevelNode::Zero];
+                for index in 0..MAX_STRUCTURAL_DEPTH {
+                    levels.push(npa_cert::LevelNode::Succ(index));
+                }
+                let certificate = structural_certificate(levels.clone(), levels.len() - 1);
+                let bytes = npa_cert::encode_module_cert(&certificate).unwrap();
+                let error = decode_module_certificate(&bytes).unwrap_err();
+
+                assert_eq!(
+                    error.structural_limit,
+                    Some(ReferenceStructuralLimit {
+                        kind: ReferenceStructuralLimitKind::StructuralDepth,
+                        limit: MAX_STRUCTURAL_DEPTH,
+                        observed: MAX_STRUCTURAL_DEPTH + 1,
+                    })
+                );
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn structural_preflight_reports_later_dangling_child_before_depth() {
+        let mut levels = vec![npa_cert::LevelNode::Zero];
+        for index in 0..MAX_STRUCTURAL_DEPTH {
+            levels.push(npa_cert::LevelNode::Succ(index));
+        }
+        levels.push(npa_cert::LevelNode::Succ(levels.len() + 1));
+        let certificate = structural_certificate(levels, 0);
+        let bytes = npa_cert::encode_module_cert(&certificate).unwrap();
+        let error = decode_module_certificate(&bytes).unwrap_err();
+
+        assert_eq!(error.reason, Some(ReferenceCheckReason::DanglingReference));
+        assert_eq!(error.structural_limit, None);
+    }
+
+    #[test]
+    fn structural_preflight_reports_dangling_global_ref_before_depth() {
+        let mut certificate = structural_certificate(vec![npa_cert::LevelNode::Zero], 0);
+        let mut terms = vec![npa_cert::TermNode::BVar(0)];
+        for index in 0..MAX_STRUCTURAL_DEPTH {
+            terms.push(npa_cert::TermNode::Lam { ty: 0, body: index });
+        }
+        terms.push(npa_cert::TermNode::Const {
+            global_ref: npa_cert::GlobalRef::Local {
+                decl_index: certificate.declarations.len(),
+            },
+            levels: vec![],
+        });
+        certificate.term_table = terms;
+        if let npa_cert::DeclPayload::Axiom { ty, .. } = &mut certificate.declarations[0].decl {
+            *ty = 0;
+        }
+        let bytes = npa_cert::encode_module_cert(&certificate).unwrap();
+        let error = decode_module_certificate(&bytes).unwrap_err();
+
+        assert_eq!(error.reason, Some(ReferenceCheckReason::DanglingReference));
+        assert_eq!(error.structural_limit, None);
+    }
+
+    #[test]
+    fn structural_preflight_counts_repeated_roots_in_certificate_total() {
+        let levels = structural_doubling_levels(18);
+        let mut certificate = structural_certificate(levels.clone(), levels.len() - 1);
+        let declaration = certificate.declarations[0].clone();
+        certificate.declarations = vec![declaration; 33];
+        let bytes = npa_cert::encode_module_cert(&certificate).unwrap();
+        let error = decode_module_certificate(&bytes).unwrap_err();
+
+        assert_eq!(
+            error.structural_limit,
+            Some(ReferenceStructuralLimit {
+                kind: ReferenceStructuralLimitKind::CertificateExpandedNodes,
+                limit: MAX_CERTIFICATE_EXPANDED_NODES,
+                observed: MAX_CERTIFICATE_EXPANDED_NODES + 1,
+            })
+        );
+    }
+
+    #[test]
+    fn structural_profile_matches_committed_corpus_fixture() {
+        let fixture = include_str!("../../../testdata/certificate-structural-limits-maxima.tsv");
+        let expected = BTreeMap::from([
+            ("certificate_bytes", MAX_CERTIFICATE_BYTES),
+            ("imports", MAX_IMPORTS),
+            ("name_table_entries", MAX_NAME_TABLE_ENTRIES),
+            ("level_table_nodes", MAX_LEVEL_TABLE_NODES),
+            ("term_table_nodes", MAX_TERM_TABLE_NODES),
+            ("declarations", MAX_DECLARATIONS),
+            ("exports", MAX_EXPORTS),
+            ("nested_vector_entries", MAX_NESTED_VECTOR_ENTRIES),
+            ("structural_depth", MAX_STRUCTURAL_DEPTH),
+            ("root_expanded_nodes", MAX_ROOT_EXPANDED_NODES),
+            ("certificate_expanded_nodes", MAX_CERTIFICATE_EXPANDED_NODES),
+            ("closure_modules", MAX_CLOSURE_MODULES),
+            ("closure_expanded_nodes", MAX_CLOSURE_EXPANDED_NODES),
+        ]);
+        let actual = fixture
+            .lines()
+            .skip(1)
+            .map(|line| {
+                let mut columns = line.split('\t');
+                let kind = columns.next().unwrap();
+                let limit = columns.next().unwrap().parse::<usize>().unwrap();
+                (kind, limit)
+            })
+            .collect::<BTreeMap<_, _>>();
+
+        assert_eq!(actual, expected);
+    }
+
+    fn reference_structural_identity(index: usize) -> ReferenceStructuralIdentity {
+        ReferenceStructuralIdentity {
+            module: rname(&format!("Closure{index:05}")),
+            export_hash: [index as u8; 32],
+            certificate_hash: [(index >> 8) as u8; 32],
+        }
+    }
+
+    #[test]
+    fn reference_closure_limits_have_exact_boundaries() {
+        let exact_modules = (0..MAX_CLOSURE_MODULES)
+            .map(|index| (reference_structural_identity(index), 0))
+            .collect();
+        validate_reference_closure(exact_modules).unwrap();
+
+        let too_many_modules = (0..=MAX_CLOSURE_MODULES)
+            .map(|index| (reference_structural_identity(index), 0))
+            .collect();
+        let error = validate_reference_closure(too_many_modules).unwrap_err();
+        assert_eq!(
+            error.structural_limit,
+            Some(ReferenceStructuralLimit {
+                kind: ReferenceStructuralLimitKind::ClosureModules,
+                limit: MAX_CLOSURE_MODULES,
+                observed: MAX_CLOSURE_MODULES + 1,
+            })
+        );
+
+        let exact_expansion = (0..4)
+            .map(|index| {
+                (
+                    reference_structural_identity(index),
+                    MAX_CERTIFICATE_EXPANDED_NODES,
+                )
+            })
+            .collect();
+        validate_reference_closure(exact_expansion).unwrap();
+
+        let over_expansion = BTreeMap::from([
+            (reference_structural_identity(0), MAX_CLOSURE_EXPANDED_NODES),
+            (reference_structural_identity(1), 1),
+        ]);
+        let error = validate_reference_closure(over_expansion).unwrap_err();
+        assert_eq!(
+            error.structural_limit,
+            Some(ReferenceStructuralLimit {
+                kind: ReferenceStructuralLimitKind::ClosureExpandedNodes,
+                limit: MAX_CLOSURE_EXPANDED_NODES,
+                observed: MAX_CLOSURE_EXPANDED_NODES + 1,
+            })
+        );
     }
 
     fn mutual_consumer_certificate_and_imports(
@@ -10795,7 +12133,7 @@ mod tests {
     #[test]
     fn imported_mutual_runtimes_share_block_storage() {
         let (certificate, imports) = mutual_consumer_certificate_and_imports();
-        let checker = TypeChecker::new(&certificate, &imports).unwrap();
+        let checker = TypeChecker::new(&certificate, &imports, ReferenceTrustMode::Normal).unwrap();
         let runtimes = checker.imported_recursors.values().collect::<Vec<_>>();
 
         assert_eq!(runtimes.len(), 2);
@@ -10870,7 +12208,7 @@ mod tests {
     #[test]
     fn signature_resolution_unknown_references_preserve_requested_identity() {
         let (certificate, imports) = mutual_consumer_certificate_and_imports();
-        let checker = TypeChecker::new(&certificate, &imports).unwrap();
+        let checker = TypeChecker::new(&certificate, &imports, ReferenceTrustMode::Normal).unwrap();
         let resolved_import = resolved_import_identity(0, &imports.imports()[0]);
         let declaration = rname("Missing.declaration");
         let decl_interface_hash = [0xa1; 32];
@@ -10961,7 +12299,7 @@ mod tests {
     #[test]
     fn imported_environment_unknown_references_identify_owner_and_target() {
         let (certificate, imports) = mutual_consumer_certificate_and_imports();
-        let checker = TypeChecker::new(&certificate, &imports).unwrap();
+        let checker = TypeChecker::new(&certificate, &imports, ReferenceTrustMode::Normal).unwrap();
         let owner_import = resolved_import_identity(0, &imports.imports()[0]);
         let declaration = rname("Missing.declaration");
         let decl_interface_hash = [0xb1; 32];
@@ -10975,7 +12313,7 @@ mod tests {
         };
         assert_unknown_reference(
             checker
-                .instantiate_public_global_ref(
+                .instantiate_imported_public_global_ref(
                     0,
                     &empty_environment,
                     &unresolved_nested_import,
@@ -10996,7 +12334,7 @@ mod tests {
         let nested_module = rname("Missing.Module");
         let nested_export_hash = [0xb2; 32];
         let unremappable_environment = ReferencePublicEnvironment::new(
-            vec![(nested_module.clone(), nested_export_hash)],
+            vec![(nested_module.clone(), nested_export_hash, None)],
             Vec::new(),
             Vec::new(),
             Vec::new(),
@@ -11009,7 +12347,7 @@ mod tests {
         };
         assert_unknown_reference(
             checker
-                .instantiate_public_global_ref(
+                .instantiate_imported_public_global_ref(
                     0,
                     &unremappable_environment,
                     &unremappable_nested_import,
@@ -11034,7 +12372,7 @@ mod tests {
         let illegal_local = ReferenceCoreGlobalRef::Local { decl_index: 9 };
         assert_unknown_reference(
             checker
-                .instantiate_public_global_ref(0, &empty_environment, &illegal_local, 203)
+                .instantiate_imported_public_global_ref(0, &empty_environment, &illegal_local, 203)
                 .unwrap_err(),
             203,
             ReferenceCheckReference::Local {
@@ -11051,7 +12389,12 @@ mod tests {
         };
         assert_unknown_reference(
             checker
-                .instantiate_public_global_ref(0, &empty_environment, &illegal_generated, 204)
+                .instantiate_imported_public_global_ref(
+                    0,
+                    &empty_environment,
+                    &illegal_generated,
+                    204,
+                )
                 .unwrap_err(),
             204,
             ReferenceCheckReference::LocalGenerated {
@@ -11059,6 +12402,70 @@ mod tests {
                 declaration_index: 10,
                 declaration: generated_name,
             },
+        );
+    }
+
+    #[test]
+    fn nested_import_rebasing_rejects_ambiguous_and_high_trust_identity_mismatch() {
+        let (certificate, base_imports) = mutual_consumer_certificate_and_imports();
+        let nested_module = rname("Nested.Provider");
+        let nested_export_hash = [0xc1; 32];
+        let expected_certificate_hash = [0xc2; 32];
+        let nested_declaration = rname("Nested.Provider.value");
+        let decl_interface_hash = [0xc3; 32];
+        let owner_environment = ReferencePublicEnvironment::new(
+            vec![(
+                nested_module.clone(),
+                nested_export_hash,
+                Some(expected_certificate_hash),
+            )],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        let nested_ref = ReferenceCoreGlobalRef::Imported {
+            import_index: 0,
+            name: nested_declaration,
+            decl_interface_hash,
+        };
+        let nested_import = |certificate_hash| ReferenceResolvedImport {
+            module: nested_module.clone(),
+            export_hash: nested_export_hash,
+            certificate_hash,
+            public_environment: Arc::new(ReferencePublicEnvironment::default()),
+            structural_closure: ReferenceStructuralClosureSummary::default(),
+        };
+
+        let mut ambiguous_entries = base_imports.imports().to_vec();
+        ambiguous_entries.push(nested_import(expected_certificate_hash));
+        ambiguous_entries.push(nested_import(expected_certificate_hash));
+        let ambiguous_imports = ReferenceImportEnvironment::new(ambiguous_entries);
+        let ambiguous_checker =
+            TypeChecker::new(&certificate, &ambiguous_imports, ReferenceTrustMode::Normal).unwrap();
+        let ambiguous_error = ambiguous_checker
+            .instantiate_imported_public_global_ref(0, &owner_environment, &nested_ref, 205)
+            .expect_err("ambiguous nested import identity must fail closed");
+        assert_eq!(
+            ambiguous_error.reason,
+            Some(ReferenceCheckReason::UnknownReference)
+        );
+
+        let mut mismatched_entries = base_imports.imports().to_vec();
+        mismatched_entries.push(nested_import([0xc4; 32]));
+        let mismatched_imports = ReferenceImportEnvironment::new(mismatched_entries);
+        let high_trust_checker = TypeChecker::new(
+            &certificate,
+            &mismatched_imports,
+            ReferenceTrustMode::HighTrust,
+        )
+        .unwrap();
+        let mismatch_error = high_trust_checker
+            .instantiate_imported_public_global_ref(0, &owner_environment, &nested_ref, 206)
+            .expect_err("high-trust nested import certificate identity must match");
+        assert_eq!(
+            mismatch_error.reason,
+            Some(ReferenceCheckReason::UnknownReference)
         );
     }
 
@@ -11147,7 +12554,7 @@ mod tests {
                 &ReferenceCheckerPolicy::default(),
             )
             .unwrap();
-        let checker = TypeChecker::new(&certificate, &imports).unwrap();
+        let checker = TypeChecker::new(&certificate, &imports, ReferenceTrustMode::Normal).unwrap();
         let canonical = succ(ReferenceCoreLevel::Zero);
         let redundant_max = ReferenceCoreLevel::Max(
             Arc::new(ReferenceCoreLevel::Zero),

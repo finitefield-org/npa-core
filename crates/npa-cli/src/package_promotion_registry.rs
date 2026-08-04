@@ -9,17 +9,19 @@ use std::{
 use npa_api::PackageArtifactReferenceSummaryMode;
 use npa_cert::{resolve_verified_declaration_export, GlobalDeclarationIdentity};
 use npa_package::{
-    lookup_promotion_origin, lookup_promotion_origin_v2,
-    migrate_promotion_origin_registry_v1_to_v2, package_file_hash,
-    parse_declaration_promotion_request_json, parse_mathlib_promotion_plan_v2_json,
-    parse_package_hash, parse_promotion_origin_registry_json,
-    parse_promotion_origin_registry_v2_json, parse_verified_materialization_attestation_json,
-    validate_declaration_registry_entry_admission, validate_promotion_origin_registry_transition,
+    active_catalog_target_revisions, lookup_promotion_origin, lookup_promotion_origin_v2,
+    lookup_promotion_origin_v3, migrate_promotion_origin_registry_v1_to_v2, package_file_hash,
+    parse_catalog_registry_sync_attestation_json, parse_declaration_promotion_request_json,
+    parse_mathlib_promotion_plan_v2_json, parse_package_hash, parse_promotion_origin_registry_json,
+    parse_promotion_origin_registry_v2_json, parse_promotion_origin_registry_v3_json,
+    parse_verified_materialization_attestation_json, validate_declaration_registry_entry_admission,
+    validate_promotion_origin_registry_transition,
     validate_promotion_origin_registry_v1_to_v2_transition,
-    validate_promotion_origin_registry_v2_transition, MathlibPromotionPlanV2,
+    validate_promotion_origin_registry_v2_transition,
+    validate_promotion_origin_registry_v3_transition, MathlibPromotionPlanV2,
     PackageArtifactOrigin, PackageLockEntryOrigin, PromotionLifecycle, PromotionOriginEntryV2,
     PromotionOriginLookup, PromotionOriginRegistry, PromotionOriginRegistryV2,
-    PromotionPlanEndpoint, PromotionSourceModule, PromotionSourceOrigin,
+    PromotionOriginRegistryV3, PromotionPlanEndpoint, PromotionSourceModule, PromotionSourceOrigin,
     MATHLIB_PROMOTION_REGISTRY_PATH,
 };
 
@@ -56,14 +58,19 @@ pub(crate) const fn promotion_plan_generated_read_mode() -> PackageGeneratedArti
     }
 }
 
+#[derive(Clone)]
 pub(crate) enum ParsedPromotionOriginRegistry {
     V1(PromotionOriginRegistry),
     V2(PromotionOriginRegistryV2),
+    V3(PromotionOriginRegistryV3),
 }
 
 pub(crate) fn parse_promotion_origin_registry_versioned(
     source: &str,
 ) -> Result<ParsedPromotionOriginRegistry, ()> {
+    if let Ok(registry) = parse_promotion_origin_registry_v3_json(source) {
+        return Ok(ParsedPromotionOriginRegistry::V3(registry));
+    }
     if let Ok(registry) = parse_promotion_origin_registry_v2_json(source) {
         return Ok(ParsedPromotionOriginRegistry::V2(registry));
     }
@@ -85,6 +92,9 @@ pub(crate) fn lookup_promotion_origin_versioned(
         ParsedPromotionOriginRegistry::V2(registry) => {
             lookup_promotion_origin_v2(registry, source, target_modules, target_artifacts)
         }
+        ParsedPromotionOriginRegistry::V3(registry) => {
+            lookup_promotion_origin_v3(registry, source, target_modules, target_artifacts)
+        }
     }
 }
 
@@ -100,6 +110,9 @@ pub fn run_package_validate_promotion_origin_registry(
         }
     };
     let registry = match parse_promotion_origin_registry_versioned(&registry_source) {
+        Ok(ParsedPromotionOriginRegistry::V3(registry)) => {
+            return run_validate_registry_v3(options, registry)
+        }
         Ok(ParsedPromotionOriginRegistry::V2(registry)) => {
             return run_validate_registry_v2(options, registry)
         }
@@ -240,6 +253,9 @@ pub fn run_package_register_equivalent_promotion_origin(
         }
     };
     match parse_promotion_origin_registry_versioned(&source) {
+        Ok(ParsedPromotionOriginRegistry::V3(registry)) => {
+            run_register_equivalent_v2(options, RegistryPrevious::V3(registry), source)
+        }
         Ok(ParsedPromotionOriginRegistry::V2(registry)) => {
             run_register_equivalent_v2(options, RegistryPrevious::V2(registry), source)
         }
@@ -258,6 +274,7 @@ pub fn run_package_register_equivalent_promotion_origin(
 enum RegistryPrevious {
     V1(PromotionOriginRegistry),
     V2(PromotionOriginRegistryV2),
+    V3(PromotionOriginRegistryV3),
 }
 
 fn run_register_equivalent_v2(
@@ -313,6 +330,35 @@ fn run_register_equivalent_v2(
             }
         }
         RegistryPrevious::V2(previous) => previous.clone(),
+        RegistryPrevious::V3(previous) => {
+            let mut base = PromotionOriginRegistryV2 {
+                schema: npa_package::MATHLIB_PROMOTION_ORIGIN_REGISTRY_V2_SCHEMA.to_owned(),
+                registry_id: previous.registry_id.clone(),
+                registry_version: 2,
+                generation: previous.generation,
+                target_package: previous.target_package.clone(),
+                entries: previous
+                    .entries
+                    .iter()
+                    .filter_map(|entry| match entry {
+                        npa_package::PromotionOriginEntryV3::SourceV2(entry) => Some(entry.clone()),
+                        npa_package::PromotionOriginEntryV3::CatalogTargetV1(_) => None,
+                    })
+                    .collect(),
+                unresolved_legacy_targets: previous.unresolved_legacy_targets.clone(),
+                registry_hash: npa_package::PackageHash::new([0; 32]),
+                proof_evidence: false,
+            };
+            if base.refresh_hash().is_err() {
+                return mismatch_result(
+                    REGISTER_COMMAND,
+                    root_display,
+                    "promotion_registry_noncanonical",
+                    MATHLIB_PROMOTION_REGISTRY_PATH,
+                );
+            }
+            base
+        }
     };
     let promotion_id = match parse_package_hash(&options.promotion_id, "--promotion-id") {
         Ok(hash) => hash,
@@ -502,6 +548,17 @@ fn run_register_equivalent_v2(
         RegistryPrevious::V2(previous) => {
             validate_promotion_origin_registry_v2_transition(previous, &registry).is_ok()
         }
+        RegistryPrevious::V3(previous) => {
+            let Ok(base) = v3_source_registry_for_equivalent(previous) else {
+                return mismatch_result(
+                    REGISTER_COMMAND,
+                    root_display,
+                    "promotion_registry_noncanonical",
+                    MATHLIB_PROMOTION_REGISTRY_PATH,
+                );
+            };
+            validate_promotion_origin_registry_v2_transition(&base, &registry).is_ok()
+        }
     };
     if !valid {
         return mismatch_result(
@@ -511,16 +568,56 @@ fn run_register_equivalent_v2(
             MATHLIB_PROMOTION_REGISTRY_PATH,
         );
     }
-    let json = match registry.canonical_json() {
-        Ok(json) => json,
-        Err(_) => {
-            return mismatch_result(
-                REGISTER_COMMAND,
-                root_display,
-                "promotion_registry_noncanonical",
-                MATHLIB_PROMOTION_REGISTRY_PATH,
-            )
+    let (json, artifact_kind) = match &previous {
+        RegistryPrevious::V3(previous) => {
+            let mut next = previous.clone();
+            next.entries.retain(|entry| {
+                matches!(
+                    entry,
+                    npa_package::PromotionOriginEntryV3::CatalogTargetV1(_)
+                )
+            });
+            next.entries.extend(
+                registry
+                    .entries
+                    .iter()
+                    .cloned()
+                    .map(npa_package::PromotionOriginEntryV3::SourceV2),
+            );
+            next.entries
+                .sort_by_key(npa_package::PromotionOriginEntryV3::owner_id);
+            next.generation = registry.generation;
+            if next.refresh_hash().is_err() {
+                return mismatch_result(
+                    REGISTER_COMMAND,
+                    root_display,
+                    "promotion_registry_noncanonical",
+                    MATHLIB_PROMOTION_REGISTRY_PATH,
+                );
+            }
+            match next.canonical_json() {
+                Ok(json) => (json, "promotion_origin_registry_v3"),
+                Err(_) => {
+                    return mismatch_result(
+                        REGISTER_COMMAND,
+                        root_display,
+                        "promotion_registry_noncanonical",
+                        MATHLIB_PROMOTION_REGISTRY_PATH,
+                    )
+                }
+            }
         }
+        _ => match registry.canonical_json() {
+            Ok(json) => (json, "promotion_origin_registry_v2"),
+            Err(_) => {
+                return mismatch_result(
+                    REGISTER_COMMAND,
+                    root_display,
+                    "promotion_registry_noncanonical",
+                    MATHLIB_PROMOTION_REGISTRY_PATH,
+                )
+            }
+        },
     };
     if options.apply {
         let path = npa_package::PackagePath::new(MATHLIB_PROMOTION_REGISTRY_PATH);
@@ -540,14 +637,38 @@ fn run_register_equivalent_v2(
     let mut result = CommandResult::passed(REGISTER_COMMAND, root_display);
     result.artifacts.push(CommandArtifact {
         kind: if options.apply {
-            "promotion_origin_registry_v2"
+            artifact_kind.to_owned()
         } else {
-            "promotion_origin_registry_v2_dry_run"
-        }
-        .to_owned(),
+            format!("{artifact_kind}_dry_run")
+        },
         path: MATHLIB_PROMOTION_REGISTRY_PATH.to_owned(),
     });
     result
+}
+
+fn v3_source_registry_for_equivalent(
+    registry: &PromotionOriginRegistryV3,
+) -> Result<PromotionOriginRegistryV2, ()> {
+    let mut base = PromotionOriginRegistryV2 {
+        schema: npa_package::MATHLIB_PROMOTION_ORIGIN_REGISTRY_V2_SCHEMA.to_owned(),
+        registry_id: registry.registry_id.clone(),
+        registry_version: 2,
+        generation: registry.generation,
+        target_package: registry.target_package.clone(),
+        entries: registry
+            .entries
+            .iter()
+            .filter_map(|entry| match entry {
+                npa_package::PromotionOriginEntryV3::SourceV2(entry) => Some(entry.clone()),
+                npa_package::PromotionOriginEntryV3::CatalogTargetV1(_) => None,
+            })
+            .collect(),
+        unresolved_legacy_targets: registry.unresolved_legacy_targets.clone(),
+        registry_hash: npa_package::PackageHash::new([0; 32]),
+        proof_evidence: false,
+    };
+    base.refresh_hash().map_err(|_| ())?;
+    Ok(base)
 }
 
 fn load_registry_source(root: &Path) -> Result<String, Box<CommandDiagnostic>> {
@@ -613,6 +734,7 @@ fn run_validate_registry_v2(
             }
         };
         let valid = match parse_promotion_origin_registry_versioned(&previous) {
+            Ok(ParsedPromotionOriginRegistry::V3(_)) => false,
             Ok(ParsedPromotionOriginRegistry::V2(previous)) => {
                 validate_promotion_origin_registry_v2_transition(&previous, &registry).is_ok()
             }
@@ -856,6 +978,399 @@ fn run_validate_registry_v2(
         path: MATHLIB_PROMOTION_REGISTRY_PATH.to_owned(),
     });
     result
+}
+
+fn run_validate_registry_v3(
+    options: PackageValidatePromotionOriginRegistryOptions,
+    registry: PromotionOriginRegistryV3,
+) -> CommandResult {
+    let root_display = render_package_root(&options.common.root);
+    if let Some(path) = &options.previous_registry {
+        let previous = match fs::read_to_string(path) {
+            Ok(source) => source,
+            Err(_) => {
+                return mismatch_result(
+                    VALIDATE_COMMAND,
+                    root_display,
+                    "promotion_registry_noncanonical",
+                    &path.display().to_string(),
+                )
+            }
+        };
+        let valid = match parse_promotion_origin_registry_versioned(&previous) {
+            Ok(ParsedPromotionOriginRegistry::V3(previous)) => {
+                validate_promotion_origin_registry_v3_transition(&previous, &registry).is_ok()
+            }
+            Ok(ParsedPromotionOriginRegistry::V2(previous)) => {
+                npa_package::validate_promotion_origin_registry_v2_to_v3_reconciliation(
+                    &previous, &registry,
+                )
+                .is_ok()
+            }
+            Ok(ParsedPromotionOriginRegistry::V1(previous)) => {
+                npa_package::validate_promotion_origin_registry_v1_to_v3_reconciliation(
+                    &previous, &registry,
+                )
+                .is_ok()
+            }
+            Err(()) => false,
+        };
+        if !valid {
+            return mismatch_result(
+                VALIDATE_COMMAND,
+                root_display,
+                "promotion_registry_transition_not_append_only",
+                MATHLIB_PROMOTION_REGISTRY_PATH,
+            );
+        }
+    }
+    let target = match load_package_audit_snapshot(
+        &options.common.root,
+        VALIDATE_COMMAND,
+        promotion_plan_generated_read_mode(),
+        PackageArtifactReferenceSummaryMode::Include,
+    ) {
+        Ok(target) => target,
+        Err(result) => return result,
+    };
+    if target.snapshot.validated.manifest().package != registry.target_package {
+        return mismatch_result(
+            VALIDATE_COMMAND,
+            root_display,
+            "promotion_registry_target_identity_mismatch",
+            "$.target_package",
+        );
+    }
+    if let Err(diagnostic) = validate_checked_generated(&target) {
+        return CommandResult::failed(VALIDATE_COMMAND, root_display, vec![*diagnostic]);
+    }
+    for event in &registry.catalog_change_events {
+        let audit = match read_governance_bytes(&options.common.root, &event.audit.path) {
+            Ok(value) => value,
+            Err(diagnostic) => {
+                return CommandResult::failed(VALIDATE_COMMAND, root_display, vec![*diagnostic])
+            }
+        };
+        if package_file_hash(&audit) != event.audit.file_hash {
+            return mismatch_result(
+                VALIDATE_COMMAND,
+                root_display,
+                "promotion_registry_evidence_hash_mismatch",
+                event.audit.path.as_str(),
+            );
+        }
+        let attestation = match read_governance_bytes(&options.common.root, &event.attestation.path)
+        {
+            Ok(value) => value,
+            Err(diagnostic) => {
+                return CommandResult::failed(VALIDATE_COMMAND, root_display, vec![*diagnostic])
+            }
+        };
+        let parsed_attestation = std::str::from_utf8(&attestation)
+            .ok()
+            .and_then(|source| parse_catalog_registry_sync_attestation_json(source).ok());
+        if parsed_attestation.as_ref().is_none_or(|attestation| {
+            npa_package::validate_catalog_registry_sync_attestation_against_event(
+                attestation,
+                event,
+            )
+            .is_err()
+        }) {
+            return mismatch_result(
+                VALIDATE_COMMAND,
+                root_display,
+                "promotion_registry_evidence_hash_mismatch",
+                event.attestation.path.as_str(),
+            );
+        }
+        if let Some(request) = &event.request {
+            let bytes = match read_governance_bytes(&options.common.root, &request.path) {
+                Ok(value) => value,
+                Err(diagnostic) => {
+                    return CommandResult::failed(VALIDATE_COMMAND, root_display, vec![*diagnostic])
+                }
+            };
+            let parsed = std::str::from_utf8(&bytes).ok().and_then(|source| {
+                npa_package::parse_catalog_registry_change_request_json(source).ok()
+            });
+            let request_matches_event = parsed.as_ref().is_some_and(|parsed| {
+                let requested = parsed
+                    .changes
+                    .iter()
+                    .map(|change| {
+                        (
+                            change.kind.clone(),
+                            change
+                                .old_modules
+                                .iter()
+                                .map(npa_cert::Name::as_dotted)
+                                .collect::<Vec<_>>(),
+                            change
+                                .new_modules
+                                .iter()
+                                .map(npa_cert::Name::as_dotted)
+                                .collect::<Vec<_>>(),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let recorded = event
+                    .lifecycle_changes
+                    .iter()
+                    .map(|change| {
+                        (
+                            change.kind.clone(),
+                            change
+                                .old_routes
+                                .iter()
+                                .map(|route| route.target_module.as_dotted())
+                                .collect::<Vec<_>>(),
+                            change
+                                .new_routes
+                                .iter()
+                                .map(|route| route.target_module.as_dotted())
+                                .collect::<Vec<_>>(),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                parsed.previous_version == event.previous_target.version
+                    && parsed.target_version == event.target.version
+                    && parsed.audit_path == event.audit.path
+                    && parsed.audit_file_hash == event.audit.file_hash
+                    && requested == recorded
+            });
+            if package_file_hash(&bytes) != request.file_hash
+                || parsed.as_ref().map(|value| value.request_hash) != Some(request.request_hash)
+                || !request_matches_event
+            {
+                return mismatch_result(
+                    VALIDATE_COMMAND,
+                    root_display,
+                    "promotion_registry_evidence_hash_mismatch",
+                    request.path.as_str(),
+                );
+            }
+        }
+    }
+    if let Err(diagnostic) = validate_registry_v3_target(&options.common.root, &target, &registry) {
+        return CommandResult::failed(VALIDATE_COMMAND, root_display, vec![*diagnostic]);
+    }
+    let mut source_snapshots = BTreeMap::new();
+    for root in &options.source_roots {
+        let snapshot = match load_package_audit_snapshot(
+            root,
+            VALIDATE_COMMAND,
+            promotion_plan_generated_read_mode(),
+            PackageArtifactReferenceSummaryMode::Include,
+        ) {
+            Ok(snapshot) => snapshot,
+            Err(result) => return result,
+        };
+        if let Err(diagnostic) = validate_checked_generated(&snapshot) {
+            return CommandResult::failed(VALIDATE_COMMAND, root_display, vec![*diagnostic]);
+        }
+        source_snapshots
+            .entry((
+                snapshot.snapshot.validated.manifest().package.clone(),
+                snapshot.snapshot.validated.manifest().version.clone(),
+            ))
+            .or_insert_with(Vec::new)
+            .push((root.as_path(), snapshot));
+    }
+    let mut unavailable = 0usize;
+    for entry in &registry.entries {
+        match entry {
+            npa_package::PromotionOriginEntryV3::SourceV2(
+                PromotionOriginEntryV2::WholeModuleV1(entry),
+            ) => {
+                for origin in
+                    std::iter::once(&entry.canonical_source).chain(&entry.equivalent_sources)
+                {
+                    if let Some(snapshots) =
+                        source_snapshots.get(&(origin.package.clone(), origin.version.clone()))
+                    {
+                        for (root, snapshot) in snapshots {
+                            if let Err(diagnostic) =
+                                validate_source_origin(root, snapshot, origin, entry)
+                            {
+                                return CommandResult::failed(
+                                    VALIDATE_COMMAND,
+                                    root_display,
+                                    vec![*diagnostic],
+                                );
+                            }
+                        }
+                    } else {
+                        unavailable += 1;
+                    }
+                }
+            }
+            npa_package::PromotionOriginEntryV3::SourceV2(
+                PromotionOriginEntryV2::DeclarationClosureV1(entry),
+            ) => {
+                for origin in
+                    std::iter::once(&entry.canonical_source).chain(&entry.equivalent_sources)
+                {
+                    if let Some(snapshots) =
+                        source_snapshots.get(&(origin.package.clone(), origin.version.clone()))
+                    {
+                        for (root, snapshot) in snapshots {
+                            if let Err(diagnostic) = validate_declaration_source_v2(
+                                root,
+                                snapshot,
+                                &options.common.root,
+                                &target,
+                                origin,
+                                entry,
+                            ) {
+                                return CommandResult::failed(
+                                    VALIDATE_COMMAND,
+                                    root_display,
+                                    vec![*diagnostic],
+                                );
+                            }
+                        }
+                    } else {
+                        unavailable += 1;
+                    }
+                }
+            }
+            npa_package::PromotionOriginEntryV3::CatalogTargetV1(_) => {}
+        }
+    }
+    let mut result = CommandResult::passed(VALIDATE_COMMAND, root_display);
+    if unavailable != 0 {
+        result.diagnostics.push(
+            CommandDiagnostic::info(DiagnosticKind::PackagePolicy, "source_unavailable")
+                .with_actual_value(unavailable.to_string()),
+        );
+    }
+    result.artifacts.push(CommandArtifact {
+        kind: "promotion_origin_registry_v3".to_owned(),
+        path: MATHLIB_PROMOTION_REGISTRY_PATH.to_owned(),
+    });
+    result
+}
+
+pub(crate) fn validate_registry_v3_target(
+    root: &Path,
+    target: &crate::package_artifacts::LoadedPackageAuditSnapshot,
+    registry: &PromotionOriginRegistryV3,
+) -> Result<(), Box<CommandDiagnostic>> {
+    let active = active_catalog_target_revisions(registry)
+        .map_err(|_| identity_mismatch_path("$.catalog_change_events"))?;
+    let current = target
+        .snapshot
+        .validated
+        .manifest()
+        .modules
+        .iter()
+        .map(|module| module.module.as_dotted())
+        .collect::<BTreeSet<_>>();
+    if active.keys().cloned().collect::<BTreeSet<_>>() != current {
+        return Err(identity_mismatch_path("$.entries"));
+    }
+    for (module, revision) in active {
+        validate_effective_declaration_revision(
+            root,
+            target,
+            &npa_cert::Name::from_dotted(module),
+            &revision,
+        )?;
+    }
+    Ok(())
+}
+
+fn identity_mismatch_path(path: &str) -> Box<CommandDiagnostic> {
+    diagnostic(
+        DiagnosticKind::PackagePolicy,
+        "promotion_registry_target_identity_mismatch",
+        path,
+    )
+}
+
+fn read_governance_bytes(
+    root: &Path,
+    path: &npa_package::PackagePath,
+) -> Result<Vec<u8>, Box<CommandDiagnostic>> {
+    let full = confined_governance_path(
+        root,
+        path,
+        path.as_str(),
+        "promotion_registry_evidence_hash_mismatch",
+    )?;
+    fs::read(full).map_err(|_| {
+        diagnostic(
+            DiagnosticKind::ArtifactIo,
+            "promotion_registry_evidence_hash_mismatch",
+            path.as_str(),
+        )
+    })
+}
+
+fn validate_effective_declaration_revision(
+    root: &Path,
+    target: &crate::package_artifacts::LoadedPackageAuditSnapshot,
+    module_name: &npa_cert::Name,
+    revision: &npa_package::PromotionDeclarationTargetRevision,
+) -> Result<(), Box<CommandDiagnostic>> {
+    let module = target
+        .snapshot
+        .validated
+        .manifest()
+        .modules
+        .iter()
+        .find(|module| &module.module == module_name)
+        .ok_or_else(|| identity_mismatch(module_name))?;
+    let hash_optional = |path: Option<&npa_package::PackagePath>| {
+        path.map_or(Ok(npa_package::PackageHash::new([0; 32])), |path| {
+            fs::read(confined_governance_path(
+                root,
+                path,
+                path.as_str(),
+                "promotion_registry_target_identity_mismatch",
+            )?)
+            .map(|bytes| package_file_hash(&bytes))
+            .map_err(|_| identity_mismatch(module_name))
+        })
+    };
+    let source = fs::read(confined_governance_path(
+        root,
+        &module.source,
+        module.source.as_str(),
+        "promotion_registry_target_identity_mismatch",
+    )?)
+    .map_err(|_| identity_mismatch(module_name))?;
+    if package_file_hash(&source) != revision.target_source_file_hash
+        || hash_optional(module.meta.as_ref())? != revision.target_meta_file_hash
+        || hash_optional(module.replay.as_ref())? != revision.target_replay_file_hash
+        || module.expected_certificate_file_hash != revision.target_certificate_file_hash
+        || module.expected_certificate_hash != revision.target_certificate_hash
+        || module.expected_export_hash != revision.target_export_hash
+        || module.expected_axiom_report_hash != revision.target_axiom_report_hash
+    {
+        return Err(identity_mismatch(module_name));
+    }
+    let index = target
+        .snapshot
+        .project_theorem_index()
+        .map_err(|_| identity_mismatch(module_name))?;
+    let actual = index
+        .entries
+        .iter()
+        .filter(|row| {
+            &row.global_ref.module == module_name
+                && row.kind == npa_package::PackageTheoremIndexKind::Theorem
+        })
+        .map(|row| (row.global_ref.name.clone(), row.statement.core_hash))
+        .collect::<BTreeSet<_>>();
+    let expected = revision
+        .theorems
+        .iter()
+        .map(|row| (row.target_name.clone(), row.statement_hash))
+        .collect::<BTreeSet<_>>();
+    (actual == expected)
+        .then_some(())
+        .ok_or_else(|| identity_mismatch(module_name))
 }
 
 fn validate_declaration_target_v2(

@@ -2157,4 +2157,244 @@ fn package_promotion_registry_commands_parse() {
         panic!("expected equivalent-origin registration");
     };
     assert!(!options.apply);
+
+    let reconcile = parse(&[
+        "package",
+        "reconcile-promotion-origin-registry",
+        "--root=mathlib",
+        "--previous-target-root=old-mathlib",
+        "--audit=docs/promotion/reconcile.md",
+        "--out=docs/promotion/reconcile.json",
+        "--apply",
+        "--json",
+    ]);
+    let CliAction::Run(CliCommand::Package(PackageCommand::ReconcilePromotionOriginRegistry(
+        options,
+    ))) = reconcile
+    else {
+        panic!("expected registry reconciliation");
+    };
+    assert!(options.apply && options.common.json);
+    assert_eq!(
+        options.previous_target_root,
+        Some(PathBuf::from("old-mathlib"))
+    );
+
+    let recovery = parse(&[
+        "package",
+        "reconcile-promotion-origin-registry",
+        "--root=mathlib",
+        "--recover=target/registry-reconciliation/event.json",
+    ]);
+    assert!(matches!(
+        recovery,
+        CliAction::Run(CliCommand::Package(
+            PackageCommand::ReconcilePromotionOriginRegistry(_)
+        ))
+    ));
+
+    let conflict = parse_error(&[
+        "package",
+        "reconcile-promotion-origin-registry",
+        "--root=mathlib",
+        "--previous-target-root=old-mathlib",
+        "--audit=docs/promotion/reconcile.md",
+        "--out=docs/promotion/reconcile.json",
+        "--dry-run",
+        "--apply",
+    ]);
+    assert_eq!(conflict.reason, UsageReason::InvalidFlagValue);
+
+    let absolute = parse_error(&[
+        "package",
+        "reconcile-promotion-origin-registry",
+        "--root=mathlib",
+        "--previous-target-root=old-mathlib",
+        "--audit=/tmp/reconcile.md",
+        "--out=docs/promotion/reconcile.json",
+    ]);
+    assert_eq!(absolute.reason, UsageReason::InvalidFlagValue);
+}
+
+#[test]
+fn package_interface_proposal_check_args_follow_frozen_read_only_contract() {
+    let default_root = parse(&[
+        "package",
+        "check-interface-proposals",
+        "--root",
+        "npa-mathlib",
+        "--json",
+    ]);
+    let CliAction::Run(CliCommand::Package(PackageCommand::CheckInterfaceProposals(options))) =
+        default_root
+    else {
+        panic!("expected interface-proposal check command");
+    };
+    assert_eq!(options.common.root, PathBuf::from("npa-mathlib"));
+    assert!(options.common.json);
+    assert_eq!(options.proposal_root, None);
+    assert_eq!(options.previous_proposal_root, None);
+
+    let explicit = parse(&[
+        "package",
+        "check-interface-proposals",
+        "--root=npa-mathlib",
+        "--proposal-root=interface-proposals",
+        "--previous-proposal-root=../previous/interface-proposals",
+        "--json",
+    ]);
+    let CliAction::Run(CliCommand::Package(PackageCommand::CheckInterfaceProposals(options))) =
+        explicit
+    else {
+        panic!("expected explicit interface-proposal roots");
+    };
+    assert_eq!(
+        options.proposal_root,
+        Some(PathBuf::from("interface-proposals"))
+    );
+    assert_eq!(
+        options.previous_proposal_root,
+        Some(PathBuf::from("../previous/interface-proposals"))
+    );
+
+    let duplicate = parse_error(&[
+        "package",
+        "check-interface-proposals",
+        "--root",
+        "npa-mathlib",
+        "--proposal-root",
+        "one",
+        "--proposal-root=two",
+        "--json",
+    ]);
+    assert_eq!(duplicate.reason, UsageReason::DuplicateFlag);
+    assert_eq!(duplicate.flag.as_deref(), Some("--proposal-root"));
+
+    let unknown = parse_error(&[
+        "package",
+        "check-interface-proposals",
+        "--root",
+        "npa-mathlib",
+        "--not-a-real-flag",
+        "--json",
+    ]);
+    assert_eq!(unknown.reason, UsageReason::UnknownFlag);
+    assert_eq!(unknown.flag.as_deref(), Some("--not-a-real-flag"));
+
+    let missing_value = parse_error(&[
+        "package",
+        "check-interface-proposals",
+        "--root",
+        "npa-mathlib",
+        "--previous-proposal-root",
+        "--json",
+    ]);
+    assert_eq!(missing_value.reason, UsageReason::MissingFlagValue);
+    assert_eq!(
+        missing_value.flag.as_deref(),
+        Some("--previous-proposal-root")
+    );
+
+    let missing_root = parse_error(&["package", "check-interface-proposals", "--json"]);
+    assert_eq!(missing_root.reason, UsageReason::MissingRequiredFlag);
+    assert_eq!(missing_root.flag.as_deref(), Some("--root"));
+
+    let missing_json = parse_error(&[
+        "package",
+        "check-interface-proposals",
+        "--root",
+        "npa-mathlib",
+    ]);
+    assert_eq!(missing_json.reason, UsageReason::MissingRequiredFlag);
+    assert_eq!(missing_json.flag.as_deref(), Some("--json"));
+
+    assert_eq!(
+        parse(&["package", "check-interface-proposals", "--help"]),
+        CliAction::Help(HelpTopic::PackageCheckInterfaceProposals)
+    );
+}
+
+#[test]
+fn package_interface_inventory_args_follow_frozen_read_only_contract() {
+    let action = parse(&[
+        "package",
+        "inventory-interface",
+        "--ecosystem",
+        "lean4-mathlib4",
+        "--root",
+        "checkout",
+        "--repository=https://github.com/leanprover-community/mathlib4",
+        "--revision",
+        "c5ea00351c28e24afc9f0f84379aa41082b1188f",
+        "--license",
+        "Apache-2.0",
+        "--path",
+        "Mathlib/Logic/Function/Defs.lean",
+        "--path=Mathlib/Logic/Function/Iterate.lean",
+        "--declaration",
+        "Function.comp_assoc",
+        "--declaration=Function.iterate_invariant",
+        "--json",
+    ]);
+    let CliAction::Run(CliCommand::Package(PackageCommand::InventoryInterface(options))) = action
+    else {
+        panic!("expected interface-inventory command");
+    };
+    assert_eq!(options.common.root, PathBuf::from("checkout"));
+    assert!(options.common.json);
+    assert_eq!(options.ecosystem, "lean4-mathlib4");
+    assert_eq!(
+        options.repository,
+        "https://github.com/leanprover-community/mathlib4"
+    );
+    assert_eq!(options.revision.len(), 40);
+    assert_eq!(options.license, "Apache-2.0");
+    assert_eq!(options.paths.len(), 2);
+    assert_eq!(options.declarations.len(), 2);
+
+    let missing_path = parse_error(&[
+        "package",
+        "inventory-interface",
+        "--ecosystem",
+        "lean4-mathlib4",
+        "--root",
+        "checkout",
+        "--repository",
+        "repo",
+        "--revision",
+        "c5ea00351c28e24afc9f0f84379aa41082b1188f",
+        "--license",
+        "Apache-2.0",
+        "--declaration",
+        "Function.comp_assoc",
+        "--json",
+    ]);
+    assert_eq!(missing_path.reason, UsageReason::MissingRequiredFlag);
+    assert_eq!(missing_path.flag.as_deref(), Some("--path"));
+
+    let missing_json = parse_error(&[
+        "package",
+        "inventory-interface",
+        "--ecosystem",
+        "lean4-mathlib4",
+        "--root",
+        "checkout",
+        "--repository",
+        "repo",
+        "--revision",
+        "c5ea00351c28e24afc9f0f84379aa41082b1188f",
+        "--license",
+        "Apache-2.0",
+        "--path",
+        "Mathlib/Logic/Function/Defs.lean",
+        "--declaration",
+        "Function.comp_assoc",
+    ]);
+    assert_eq!(missing_json.reason, UsageReason::MissingRequiredFlag);
+    assert_eq!(missing_json.flag.as_deref(), Some("--json"));
+
+    assert_eq!(
+        parse(&["package", "inventory-interface", "--help"]),
+        CliAction::Help(HelpTopic::PackageInventoryInterface)
+    );
 }

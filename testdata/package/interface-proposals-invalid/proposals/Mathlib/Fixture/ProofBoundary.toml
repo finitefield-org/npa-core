@@ -1,0 +1,12 @@
+schema = "npa.mathlib.interface_proposal.v1"
+proposal_id = "Mathlib.Fixture.ProofBoundary"
+proposal_revision = 1
+module = "Mathlib.Fixture.ProofBoundary"
+change_kind = "add"
+source_modules = []
+interface_status = "observed"
+proof_evidence = true
+summary = "This fixture must be rejected because proposal metadata is not proof evidence."
+scope = "Invalid proof-boundary fixture."
+imports = []
+supersedes = []

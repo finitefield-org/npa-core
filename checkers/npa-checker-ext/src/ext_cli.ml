@@ -220,11 +220,23 @@ let render_error context error =
 
 let phase_error context = function
   | Ext_checker.Decode_error error ->
+      let expected_value, actual_value =
+        match
+          Ext_bytes.structural_limit_context error.Ext_bytes.reason
+        with
+        | None -> (None, None)
+        | Some (kind, limit, observed) ->
+            ( Some
+                (Ext_bytes.structural_limit_name kind ^ "<="
+               ^ string_of_int limit),
+              Some (string_of_int observed) )
+      in
       render_error context
         (Ext_result.checker_error
            ~reason_code:(Ext_bytes.reason_code error.Ext_bytes.reason)
            ~section:(Ext_bytes.section_name error.Ext_bytes.section)
            ~offset:error.Ext_bytes.offset
+           ?expected_value ?actual_value
            (Ext_result.decode_error_kind error))
   | Ext_checker.Declaration_hash_mismatch mismatch ->
       render_error context
@@ -256,12 +268,22 @@ let phase_error context = function
            ~section:"core_features" ?offset:feature.Ext_feature.offset
            "unsupported_core_feature")
   | Ext_checker.Import_error error ->
+      let expected_value, actual_value =
+        match error.Ext_import_store.resolve_reason with
+        | Ext_import_store.Structural_limit (kind, limit, observed) ->
+            ( Some
+                (Ext_bytes.structural_limit_name kind ^ "<="
+               ^ string_of_int limit),
+              Some (string_of_int observed) )
+        | _ -> (None, None)
+      in
       render_error context
         (Ext_result.checker_error
            ~reason_code:
              (Ext_import_store.resolve_error_reason_code
                 error.Ext_import_store.resolve_reason)
            ~section:"imports" ~offset:error.Ext_import_store.resolve_offset
+           ?expected_value ?actual_value
            (Ext_import_store.resolve_error_kind error))
   | Ext_checker.Type_error error ->
       render_error context

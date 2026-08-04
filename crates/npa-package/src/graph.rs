@@ -139,6 +139,12 @@ enum VisitState {
     Visited,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct VisitFrame {
+    module_index: usize,
+    next_import_index: usize,
+}
+
 /// Resolve module-level imports and build a deterministic local module graph.
 ///
 /// This helper assumes scalar and duplicate validation have already run. It
@@ -245,8 +251,25 @@ fn visit_module(
     order: &mut Vec<usize>,
 ) -> PackageManifestResult<()> {
     states[module_index] = VisitState::Visiting;
+    let mut frames = vec![VisitFrame {
+        module_index,
+        next_import_index: 0,
+    }];
 
-    for (import_index, import) in resolved_module_imports[module_index].iter().enumerate() {
+    while let Some(frame) = frames.last() {
+        let module_index = frame.module_index;
+        let import_index = frame.next_import_index;
+        let Some(import) = resolved_module_imports[module_index].get(import_index) else {
+            frames.pop();
+            states[module_index] = VisitState::Visited;
+            order.push(module_index);
+            continue;
+        };
+        frames
+            .last_mut()
+            .expect("manifest graph traversal has an active frame")
+            .next_import_index += 1;
+
         let ResolvedModuleImportKind::Local {
             module_index: dependency_index,
         } = import.kind
@@ -256,7 +279,11 @@ fn visit_module(
 
         match states[dependency_index] {
             VisitState::Unvisited => {
-                visit_module(dependency_index, resolved_module_imports, states, order)?;
+                states[dependency_index] = VisitState::Visiting;
+                frames.push(VisitFrame {
+                    module_index: dependency_index,
+                    next_import_index: 0,
+                });
             }
             VisitState::Visiting => {
                 return Err(PackageManifestError::import_cycle(
@@ -268,8 +295,6 @@ fn visit_module(
         }
     }
 
-    states[module_index] = VisitState::Visited;
-    order.push(module_index);
     Ok(())
 }
 

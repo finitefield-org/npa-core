@@ -1472,6 +1472,8 @@ pub(crate) fn registry_owns_active_target(
                 .iter()
                 .any(reservation_owns)
         }
+        ParsedPromotionOriginRegistry::V3(registry) => npa_package::active_catalog_routes(registry)
+            .is_ok_and(|routes| routes.contains_key(&target.as_dotted())),
     }
 }
 
@@ -1482,6 +1484,36 @@ fn registry_collides(
     source_origin: &PromotionSourceModule,
 ) -> bool {
     match registry {
+        ParsedPromotionOriginRegistry::V3(registry) => {
+            if npa_package::active_catalog_routes(registry)
+                .is_ok_and(|routes| routes.contains_key(&request.target_module.as_dotted()))
+            {
+                return true;
+            }
+            registry.entries.iter().any(|entry| match entry {
+                npa_package::PromotionOriginEntryV3::CatalogTargetV1(_) => false,
+                npa_package::PromotionOriginEntryV3::SourceV2(
+                    PromotionOriginEntryV2::WholeModuleV1(entry),
+                ) => {
+                    whole_module_origin_matches(&entry.canonical_source, source_origin)
+                        || entry
+                            .equivalent_sources
+                            .iter()
+                            .any(|origin| whole_module_origin_matches(origin, source_origin))
+                }
+                npa_package::PromotionOriginEntryV3::SourceV2(
+                    PromotionOriginEntryV2::DeclarationClosureV1(entry),
+                ) => entry.closure.iter().any(|old| {
+                    closure.declarations.iter().any(|new| {
+                        entry.source_module == new.identity.module
+                            && old.source_name == new.identity.name
+                            && old.certificate_kind == new.identity.kind.as_str()
+                            && old.decl_interface_hash
+                                == PackageHash::from(new.identity.decl_interface_hash)
+                    })
+                }),
+            })
+        }
         ParsedPromotionOriginRegistry::V2(registry) => {
             registry
                 .unresolved_legacy_targets
@@ -1812,6 +1844,7 @@ mod tests {
         let mut registry = match parse_promotion_origin_registry_versioned(&source).unwrap() {
             ParsedPromotionOriginRegistry::V1(registry) => registry,
             ParsedPromotionOriginRegistry::V2(_) => panic!("fixture registry must be v1"),
+            ParsedPromotionOriginRegistry::V3(_) => panic!("fixture registry must be v1"),
         };
         let target = Name::from_dotted("Mathlib.Registered.Dependency");
         assert!(!registry_owns_active_target(

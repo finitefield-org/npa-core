@@ -18,7 +18,7 @@
 
 mod decode;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use sha2::{Digest, Sha256};
@@ -145,17 +145,59 @@ pub struct ReferenceImportEntry {
     certificate_hash: ReferenceHash,
     public_environment: Arc<ReferencePublicEnvironment>,
     checked_by_reference_checker: bool,
+    structural_cost: usize,
+    structural_closure: Option<ReferenceStructuralClosureSummary>,
 }
 
-impl ReferenceImportEntry {
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct ReferenceStructuralIdentity {
+    module: ReferenceModuleName,
+    export_hash: ReferenceHash,
+    certificate_hash: ReferenceHash,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct ReferenceStructuralClosureSummary {
+    modules: BTreeMap<ReferenceStructuralIdentity, usize>,
+}
+
+pub(crate) struct ReferenceModuleIdentity {
+    module: ReferenceModuleName,
+    export_hash: ReferenceHash,
+    axiom_report_hash: ReferenceHash,
+    certificate_hash: ReferenceHash,
+}
+
+impl ReferenceModuleIdentity {
     pub(crate) fn new(
         module: ReferenceModuleName,
         export_hash: ReferenceHash,
         axiom_report_hash: ReferenceHash,
         certificate_hash: ReferenceHash,
+    ) -> Self {
+        Self {
+            module,
+            export_hash,
+            axiom_report_hash,
+            certificate_hash,
+        }
+    }
+}
+
+impl ReferenceImportEntry {
+    pub(crate) fn new(
+        identity: ReferenceModuleIdentity,
         public_environment: Arc<ReferencePublicEnvironment>,
         checked_by_reference_checker: bool,
+        structural_cost: usize,
+        structural_closure: Option<ReferenceStructuralClosureSummary>,
     ) -> Self {
+        let ReferenceModuleIdentity {
+            module,
+            export_hash,
+            axiom_report_hash,
+            certificate_hash,
+        } = identity;
         Self {
             module,
             export_hash,
@@ -163,6 +205,8 @@ impl ReferenceImportEntry {
             certificate_hash,
             public_environment,
             checked_by_reference_checker,
+            structural_cost,
+            structural_closure,
         }
     }
 
@@ -227,6 +271,7 @@ pub struct ReferencePublicEnvironment {
 struct ReferencePublicImport {
     module: ReferenceModuleName,
     export_hash: ReferenceHash,
+    certificate_hash: Option<ReferenceHash>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -253,7 +298,7 @@ pub(crate) struct ReferencePublicInductiveGroup {
 
 impl ReferencePublicEnvironment {
     pub(crate) fn new(
-        imports: Vec<(ReferenceModuleName, ReferenceHash)>,
+        imports: Vec<(ReferenceModuleName, ReferenceHash, Option<ReferenceHash>)>,
         exports: Vec<ReferencePublicExport>,
         module_axioms: Vec<ReferenceAxiomDependency>,
         core_features: Vec<ReferenceCoreFeature>,
@@ -262,10 +307,13 @@ impl ReferencePublicEnvironment {
         Self {
             imports: imports
                 .into_iter()
-                .map(|(module, export_hash)| ReferencePublicImport {
-                    module,
-                    export_hash,
-                })
+                .map(
+                    |(module, export_hash, certificate_hash)| ReferencePublicImport {
+                        module,
+                        export_hash,
+                        certificate_hash,
+                    },
+                )
                 .collect(),
             exports,
             module_axioms,
@@ -331,6 +379,9 @@ pub struct ReferenceAxiomDependency {
     pub name: ReferenceModuleName,
     /// Axiom declaration interface hash.
     pub decl_interface_hash: ReferenceHash,
+    /// Provider-relative origin, exported with the same rebasing contract as
+    /// public expression references.
+    pub(crate) global_ref: ReferenceCoreGlobalRef,
 }
 
 /// Import environment resolved for the module currently being checked.
@@ -371,6 +422,7 @@ pub struct ReferenceResolvedImport {
     pub certificate_hash: ReferenceHash,
     /// Imported public environment.
     pub public_environment: Arc<ReferencePublicEnvironment>,
+    structural_closure: ReferenceStructuralClosureSummary,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -719,17 +771,24 @@ pub struct ReferenceCheckedModule {
     declaration_count: usize,
     public_environment: Arc<ReferencePublicEnvironment>,
     checked_by_reference_checker: bool,
+    structural_cost: usize,
+    structural_closure: ReferenceStructuralClosureSummary,
 }
 
 impl ReferenceCheckedModule {
     pub(crate) fn new(
-        module: ReferenceModuleName,
-        export_hash: ReferenceHash,
-        axiom_report_hash: ReferenceHash,
-        certificate_hash: ReferenceHash,
+        identity: ReferenceModuleIdentity,
         declaration_count: usize,
         public_environment: Arc<ReferencePublicEnvironment>,
+        structural_cost: usize,
+        structural_closure: ReferenceStructuralClosureSummary,
     ) -> Self {
+        let ReferenceModuleIdentity {
+            module,
+            export_hash,
+            axiom_report_hash,
+            certificate_hash,
+        } = identity;
         Self {
             module,
             export_hash,
@@ -738,29 +797,39 @@ impl ReferenceCheckedModule {
             declaration_count,
             public_environment,
             checked_by_reference_checker: true,
+            structural_cost,
+            structural_closure,
         }
     }
 
     #[cfg(test)]
     pub(crate) fn from_import_entry(entry: ReferenceImportEntry) -> Self {
         Self::new(
-            entry.module,
-            entry.export_hash,
-            entry.axiom_report_hash,
-            entry.certificate_hash,
+            ReferenceModuleIdentity::new(
+                entry.module,
+                entry.export_hash,
+                entry.axiom_report_hash,
+                entry.certificate_hash,
+            ),
             0,
             entry.public_environment,
+            entry.structural_cost,
+            entry.structural_closure.unwrap_or_default(),
         )
     }
 
     fn into_import_entry(self) -> ReferenceImportEntry {
         ReferenceImportEntry::new(
-            self.module,
-            self.export_hash,
-            self.axiom_report_hash,
-            self.certificate_hash,
+            ReferenceModuleIdentity::new(
+                self.module,
+                self.export_hash,
+                self.axiom_report_hash,
+                self.certificate_hash,
+            ),
             self.public_environment,
             self.checked_by_reference_checker,
+            self.structural_cost,
+            Some(self.structural_closure),
         )
     }
 
@@ -897,6 +966,71 @@ pub struct ReferenceCheckError {
     /// The two existing universe-parameter failures that reuse that reason do
     /// not carry declaration reference context.
     pub reference: Option<ReferenceCheckReference>,
+    /// Optional fixed structural resource-limit details.
+    pub structural_limit: Option<ReferenceStructuralLimit>,
+}
+
+/// Fixed structural resource dimension used by the independent checker.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ReferenceStructuralLimitKind {
+    /// Encoded certificate byte length.
+    CertificateBytes,
+    /// Direct import count.
+    Imports,
+    /// Canonical name-table entry count.
+    NameTableEntries,
+    /// Canonical level-table node count.
+    LevelTableNodes,
+    /// Canonical term-table node count.
+    TermTableNodes,
+    /// Declaration count.
+    Declarations,
+    /// Public export count.
+    Exports,
+    /// Count of an encoded nested vector.
+    NestedVectorEntries,
+    /// Combined term/level structural depth.
+    StructuralDepth,
+    /// Unfolded nodes requested by one semantic root.
+    RootExpandedNodes,
+    /// Summed unfolded nodes requested by one certificate.
+    CertificateExpandedNodes,
+    /// Unique certificates in one resolved closure.
+    ClosureModules,
+    /// Summed expansion across one resolved closure.
+    ClosureExpandedNodes,
+}
+
+impl ReferenceStructuralLimitKind {
+    /// Return the stable raw diagnostic name.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::CertificateBytes => "certificate_bytes",
+            Self::Imports => "imports",
+            Self::NameTableEntries => "name_table_entries",
+            Self::LevelTableNodes => "level_table_nodes",
+            Self::TermTableNodes => "term_table_nodes",
+            Self::Declarations => "declarations",
+            Self::Exports => "exports",
+            Self::NestedVectorEntries => "nested_vector_entries",
+            Self::StructuralDepth => "structural_depth",
+            Self::RootExpandedNodes => "root_expanded_nodes",
+            Self::CertificateExpandedNodes => "certificate_expanded_nodes",
+            Self::ClosureModules => "closure_modules",
+            Self::ClosureExpandedNodes => "closure_expanded_nodes",
+        }
+    }
+}
+
+/// Structured context for a fixed structural resource-limit rejection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReferenceStructuralLimit {
+    /// Resource dimension that was exceeded.
+    pub kind: ReferenceStructuralLimitKind,
+    /// Fixed inclusive maximum.
+    pub limit: usize,
+    /// Exact count, or `limit + 1` for saturated expansion arithmetic.
+    pub observed: usize,
 }
 
 impl ReferenceCheckError {
@@ -907,6 +1041,7 @@ impl ReferenceCheckError {
             offset: 0,
             reason: None,
             reference: None,
+            structural_limit: None,
         }
     }
 
@@ -921,6 +1056,7 @@ impl ReferenceCheckError {
             offset,
             reason: Some(reason),
             reference: None,
+            structural_limit: None,
         }
     }
 
@@ -931,6 +1067,7 @@ impl ReferenceCheckError {
             offset,
             reason: Some(ReferenceCheckReason::ReferenceCheckerBodyUnimplemented),
             reference: None,
+            structural_limit: None,
         }
     }
 
@@ -941,6 +1078,7 @@ impl ReferenceCheckError {
             offset,
             reason: Some(ReferenceCheckReason::UnsupportedCoreFeature),
             reference: None,
+            structural_limit: None,
         }
     }
 
@@ -955,6 +1093,7 @@ impl ReferenceCheckError {
             offset,
             reason: Some(reason),
             reference: None,
+            structural_limit: None,
         }
     }
 
@@ -969,6 +1108,7 @@ impl ReferenceCheckError {
             offset,
             reason: Some(reason),
             reference: None,
+            structural_limit: None,
         }
     }
 
@@ -983,6 +1123,28 @@ impl ReferenceCheckError {
             offset,
             reason: Some(ReferenceCheckReason::UnknownReference),
             reference: Some(reference),
+            structural_limit: None,
+        }
+    }
+
+    pub(crate) fn structural_limit(
+        section: ReferenceCertificateSection,
+        offset: usize,
+        kind: ReferenceStructuralLimitKind,
+        limit: usize,
+        observed: usize,
+    ) -> Self {
+        Self {
+            kind: ReferenceCheckErrorKind::MalformedCertificate,
+            section,
+            offset,
+            reason: Some(ReferenceCheckReason::ResourceLimit),
+            reference: None,
+            structural_limit: Some(ReferenceStructuralLimit {
+                kind,
+                limit,
+                observed,
+            }),
         }
     }
 }
@@ -1178,6 +1340,7 @@ impl ReferenceCheckError {
             offset,
             reason: Some(ReferenceCheckReason::AxiomReportMismatch),
             reference: None,
+            structural_limit: None,
         }
     }
 
@@ -1192,6 +1355,7 @@ impl ReferenceCheckError {
             offset,
             reason: Some(reason),
             reference: None,
+            structural_limit: None,
         }
     }
 
@@ -1206,6 +1370,7 @@ impl ReferenceCheckError {
             offset,
             reason: Some(ReferenceCheckReason::HashMismatch { object }),
             reference: None,
+            structural_limit: None,
         }
     }
 }
@@ -1337,11 +1502,13 @@ mod tests {
 
     use crate::decode::{ReferenceUniverseConstraint, ReferenceUniverseContext};
     use npa_cert::{
-        build_module_cert, encode_module_cert, generate_inductive_artifacts_v1,
+        build_module_cert, build_module_cert_from_import_refs_with_preferred_imports,
+        encode_module_cert, generate_inductive_artifacts_v1,
         generate_mutual_inductive_artifacts_v1, verify_module_cert,
         verify_module_cert_with_import_refs,
         verify_module_cert_with_import_refs_and_kernel_options, AxiomPolicy, CertError, CoreModule,
-        Name, VerifierSession,
+        ExportKind, GlobalRef, ImportEntry, ModuleCert, Name, TermNode, VerifiedModule,
+        VerifierSession,
     };
     use npa_kernel::{
         eq, eq_inductive, eq_refl, nat, nat_inductive, nat_succ, nat_zero, prop, type0, Binder,
@@ -1350,6 +1517,7 @@ mod tests {
         MAX_UNIVERSE_CONTEXT_NODES,
     };
     use sha2::{Digest, Sha256};
+    use std::collections::BTreeMap;
 
     fn encode_uvar(mut value: u64) -> Vec<u8> {
         let mut out = Vec::new();
@@ -1508,6 +1676,92 @@ mod tests {
         )
         .unwrap();
         encode_module_cert(&cert).unwrap()
+    }
+
+    fn generated_reference_fixture_family(prefix: &str) -> InductiveDecl {
+        let family = format!("{prefix}.Item");
+        generate_inductive_artifacts_v1(&InductiveDecl::new(
+            family.clone(),
+            vec![],
+            vec![],
+            vec![],
+            Level::succ(Level::zero()),
+            vec![ConstructorDecl::new(
+                format!("{family}.mk"),
+                Expr::konst(family, vec![]),
+            )],
+            None,
+        ))
+        .expect("fixture family must support a generated recursor")
+    }
+
+    fn generated_reference_recursor_alias(
+        alias: &str,
+        recursor: &npa_kernel::RecursorDecl,
+    ) -> Decl {
+        Decl::Def {
+            name: alias.to_owned(),
+            universe_params: recursor.universe_params.clone(),
+            ty: recursor.ty.clone(),
+            value: Expr::konst(
+                recursor.name.clone(),
+                recursor
+                    .universe_params
+                    .iter()
+                    .map(|name| Level::param(name.clone()))
+                    .collect(),
+            ),
+            reducibility: Reducibility::Reducible,
+        }
+    }
+
+    fn verify_generated_reference_fixture_cert(
+        cert: &ModuleCert,
+        imports: &[&VerifiedModule],
+    ) -> (Vec<u8>, VerifiedModule) {
+        let bytes = encode_module_cert(cert).expect("fixture certificate must encode");
+        let mut session = VerifierSession::new();
+        for import in imports {
+            session.register_verified_module((*import).clone());
+        }
+        let verified = verify_module_cert(&bytes, &mut session, &AxiomPolicy::normal())
+            .expect("fixture certificate must pass the fast verifier");
+        (bytes, verified)
+    }
+
+    fn fixture_export_hash(cert: &ModuleCert, name: &str, kind: ExportKind) -> [u8; 32] {
+        cert.export_block
+            .iter()
+            .find(|entry| entry.kind == kind && cert.name_table[entry.name].as_dotted() == name)
+            .map(|entry| entry.decl_interface_hash)
+            .unwrap_or_else(|| panic!("missing fixture export {name:?} with kind {kind:?}"))
+    }
+
+    fn assert_fixture_imported_ref(
+        cert: &ModuleCert,
+        name: &str,
+        import_index: usize,
+        decl_interface_hash: [u8; 32],
+    ) {
+        assert!(
+            cert.term_table.iter().any(|term| {
+                matches!(
+                    term,
+                    TermNode::Const {
+                        global_ref:
+                            GlobalRef::Imported {
+                                import_index: actual_import,
+                                name: actual_name,
+                                decl_interface_hash: actual_hash,
+                            },
+                        ..
+                    } if *actual_import == import_index
+                        && cert.name_table[*actual_name].as_dotted() == name
+                        && *actual_hash == decl_interface_hash
+                )
+            }),
+            "missing exact imported reference for {name}"
+        );
     }
 
     #[test]
@@ -3649,7 +3903,7 @@ mod tests {
             production_source
                 .matches("ReferenceCheckError::unknown_reference(")
                 .count(),
-            14
+            17
         );
         assert_eq!(
             production_source
@@ -3683,6 +3937,7 @@ mod tests {
                 offset: 0,
                 reason: None,
                 reference: None,
+                structural_limit: None,
             })
         );
     }
@@ -3718,6 +3973,7 @@ mod tests {
                 offset: 1,
                 reason: Some(ReferenceCheckReason::FormatMismatch),
                 reference: None,
+                structural_limit: None,
             })
         );
     }
@@ -5037,6 +5293,233 @@ mod tests {
     }
 
     #[test]
+    fn generated_references_compose_across_two_providers_and_one_consumer() {
+        const TAG_PREFIX: &str = "Fixture.Provider.Tag";
+        const LIST_PREFIX: &str = "Fixture.Provider.List";
+        const LOCAL_PREFIX: &str = "Fixture.Consumer.Compose.Local";
+
+        let tag_family = generated_reference_fixture_family(TAG_PREFIX);
+        let tag_name = tag_family.name.clone();
+        let tag_constructor = tag_family.constructors[0].name.clone();
+        let tag_cert = build_module_cert(
+            CoreModule {
+                name: Name::from_dotted(TAG_PREFIX),
+                declarations: vec![
+                    Decl::Inductive {
+                        name: tag_family.name.clone(),
+                        universe_params: tag_family.universe_params.clone(),
+                        ty: Expr::sort(tag_family.sort.clone()),
+                        data: Box::new(tag_family),
+                    },
+                    Decl::Def {
+                        name: format!("{TAG_PREFIX}.default"),
+                        universe_params: vec![],
+                        ty: Expr::konst(tag_name.clone(), vec![]),
+                        value: Expr::konst(tag_constructor.clone(), vec![]),
+                        reducibility: Reducibility::Reducible,
+                    },
+                ],
+            },
+            &[],
+        )
+        .expect("tag provider certificate must build");
+        let (tag_bytes, tag_verified) = verify_generated_reference_fixture_cert(&tag_cert, &[]);
+
+        let list_family = generated_reference_fixture_family(LIST_PREFIX);
+        let list_name = list_family.name.clone();
+        let list_constructor = list_family.constructors[0].name.clone();
+        let list_recursor = list_family
+            .recursor
+            .clone()
+            .expect("generated list recursor must exist");
+        let list_recursor_alias = format!("{LIST_PREFIX}.rec_alias");
+        let list_tag_value = format!("{LIST_PREFIX}.tag_value");
+        let list_cert = build_module_cert(
+            CoreModule {
+                name: Name::from_dotted(LIST_PREFIX),
+                declarations: vec![
+                    Decl::Inductive {
+                        name: list_family.name.clone(),
+                        universe_params: list_family.universe_params.clone(),
+                        ty: Expr::sort(list_family.sort.clone()),
+                        data: Box::new(list_family),
+                    },
+                    Decl::Def {
+                        name: format!("{LIST_PREFIX}.default"),
+                        universe_params: vec![],
+                        ty: Expr::konst(list_name.clone(), vec![]),
+                        value: Expr::konst(list_constructor.clone(), vec![]),
+                        reducibility: Reducibility::Reducible,
+                    },
+                    generated_reference_recursor_alias(&list_recursor_alias, &list_recursor),
+                    Decl::Def {
+                        name: list_tag_value.clone(),
+                        universe_params: vec![],
+                        ty: Expr::konst(tag_name.clone(), vec![]),
+                        value: Expr::konst(tag_constructor.clone(), vec![]),
+                        reducibility: Reducibility::Reducible,
+                    },
+                ],
+            },
+            std::slice::from_ref(&tag_verified),
+        )
+        .expect("list provider certificate must build");
+        let (list_bytes, list_verified) =
+            verify_generated_reference_fixture_cert(&list_cert, &[&tag_verified]);
+
+        let local_family = generated_reference_fixture_family(LOCAL_PREFIX);
+        let local_name = local_family.name.clone();
+        let local_constructor = local_family.constructors[0].name.clone();
+        let local_recursor = local_family
+            .recursor
+            .clone()
+            .expect("generated local recursor must exist");
+        let consumer_module = CoreModule {
+            name: Name::from_dotted("Fixture.Consumer.Compose"),
+            declarations: vec![
+                Decl::Inductive {
+                    name: local_family.name.clone(),
+                    universe_params: local_family.universe_params.clone(),
+                    ty: Expr::sort(local_family.sort.clone()),
+                    data: Box::new(local_family),
+                },
+                Decl::Def {
+                    name: "Fixture.Consumer.Compose.imported_default".to_owned(),
+                    universe_params: vec![],
+                    ty: Expr::konst(list_name.clone(), vec![]),
+                    value: Expr::konst(list_constructor.clone(), vec![]),
+                    reducibility: Reducibility::Reducible,
+                },
+                generated_reference_recursor_alias(
+                    "Fixture.Consumer.Compose.imported_rec",
+                    &list_recursor,
+                ),
+                Decl::Def {
+                    name: "Fixture.Consumer.Compose.provider_rec".to_owned(),
+                    universe_params: list_recursor.universe_params.clone(),
+                    ty: list_recursor.ty.clone(),
+                    value: Expr::konst(
+                        list_recursor_alias.clone(),
+                        list_recursor
+                            .universe_params
+                            .iter()
+                            .map(|name| Level::param(name.clone()))
+                            .collect(),
+                    ),
+                    reducibility: Reducibility::Reducible,
+                },
+                Decl::Def {
+                    name: "Fixture.Consumer.Compose.nested_tag".to_owned(),
+                    universe_params: vec![],
+                    ty: Expr::konst(tag_name.clone(), vec![]),
+                    value: Expr::konst(list_tag_value, vec![]),
+                    reducibility: Reducibility::Reducible,
+                },
+                Decl::Def {
+                    name: "Fixture.Consumer.Compose.local_default".to_owned(),
+                    universe_params: vec![],
+                    ty: Expr::konst(local_name, vec![]),
+                    value: Expr::konst(local_constructor.clone(), vec![]),
+                    reducibility: Reducibility::Reducible,
+                },
+                generated_reference_recursor_alias(
+                    "Fixture.Consumer.Compose.local_rec",
+                    &local_recursor,
+                ),
+            ],
+        };
+        let list_import = ImportEntry {
+            module: list_verified.module().clone(),
+            export_hash: list_verified.export_hash(),
+            certificate_hash: Some(list_verified.certificate_hash()),
+        };
+        let preferred_imports =
+            BTreeMap::from([(Name::from_dotted(&list_constructor), list_import)]);
+        let canonical_imports = [&tag_verified, &list_verified];
+        let reversed_imports = [&list_verified, &tag_verified];
+        let canonical_cert = build_module_cert_from_import_refs_with_preferred_imports(
+            consumer_module.clone(),
+            &canonical_imports,
+            &preferred_imports,
+        )
+        .expect("consumer certificate must build from canonical supplied-import order");
+        let reversed_cert = build_module_cert_from_import_refs_with_preferred_imports(
+            consumer_module,
+            &reversed_imports,
+            &preferred_imports,
+        )
+        .expect("consumer certificate must build from reversed supplied-import order");
+        let canonical_bytes =
+            encode_module_cert(&canonical_cert).expect("canonical consumer must encode");
+        let reversed_bytes =
+            encode_module_cert(&reversed_cert).expect("reversed consumer must encode");
+        assert_eq!(canonical_bytes, reversed_bytes);
+
+        let list_import_index = canonical_cert
+            .imports
+            .iter()
+            .position(|entry| entry.module == *list_verified.module())
+            .expect("consumer must import list provider");
+        let list_family_hash = fixture_export_hash(&list_cert, &list_name, ExportKind::Inductive);
+        assert_fixture_imported_ref(
+            &canonical_cert,
+            &list_constructor,
+            list_import_index,
+            list_family_hash,
+        );
+        assert_fixture_imported_ref(
+            &canonical_cert,
+            &list_recursor.name,
+            list_import_index,
+            list_family_hash,
+        );
+        assert!(canonical_cert.term_table.iter().any(|term| {
+            matches!(
+                term,
+                TermNode::Const {
+                    global_ref: GlobalRef::LocalGenerated { name, .. },
+                    ..
+                } if canonical_cert.name_table[*name].as_dotted() == local_constructor
+            )
+        }));
+
+        let (_, consumer_verified) = verify_generated_reference_fixture_cert(
+            &canonical_cert,
+            &[&tag_verified, &list_verified],
+        );
+        assert_eq!(
+            consumer_verified.certificate_hash(),
+            canonical_cert.hashes.certificate_hash
+        );
+
+        let policy = ReferenceCheckerPolicy {
+            trust_mode: ReferenceTrustMode::HighTrust,
+            deny_custom_axioms: true,
+            ..ReferenceCheckerPolicy::default()
+        };
+        let ReferenceCheckResult::Checked(tag_checked) =
+            check_certificate(&tag_bytes, &ReferenceImportStore::default(), &policy)
+        else {
+            panic!("tag provider must pass the independent checker");
+        };
+        let tag_store = ReferenceImportStore::from_checked_modules([tag_checked.clone()])
+            .expect("tag checker store must build");
+        let ReferenceCheckResult::Checked(list_checked) =
+            check_certificate(&list_bytes, &tag_store, &policy)
+        else {
+            panic!("list provider must pass the independent checker");
+        };
+        let consumer_store =
+            ReferenceImportStore::from_checked_modules([tag_checked, list_checked])
+                .expect("consumer checker store must build");
+        let result = check_certificate(&canonical_bytes, &consumer_store, &policy);
+        assert!(
+            result.is_checked(),
+            "composed generated references must pass the independent checker: {result:?}"
+        );
+    }
+
+    #[test]
     fn eq_reasoning_fixture_uses_checked_std_logic_eq_builtin_bridge() {
         let logic_bytes = include_bytes!(
             "../../../testdata/package/proofs/vendor/npa-std/Std/Logic/Eq/certificate.npcert"
@@ -5142,6 +5625,7 @@ mod tests {
                 offset,
                 reason: Some(ReferenceCheckReason::NonCanonicalUvar),
                 reference: None,
+                structural_limit: None,
             }
         );
     }
@@ -5263,6 +5747,7 @@ mod tests {
                 offset,
                 reason: Some(ReferenceCheckReason::TrailingBytes),
                 reference: None,
+                structural_limit: None,
             }
         );
     }
@@ -5283,6 +5768,7 @@ mod tests {
                 offset: 1,
                 reason: Some(ReferenceCheckReason::InvalidUtf8),
                 reference: None,
+                structural_limit: None,
             }
         );
     }

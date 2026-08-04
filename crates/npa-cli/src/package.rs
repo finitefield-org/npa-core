@@ -19,6 +19,9 @@ use crate::package_gate_plan::run_package_gate_plan;
 use crate::package_hashes::run_package_check_hashes;
 use crate::package_high_trust::run_package_high_trust;
 use crate::package_index::run_package_index;
+use crate::package_interface_inventory::run_package_inventory_interface;
+use crate::package_interface_proposal_surface::run_package_check_interface_proposal_surface;
+use crate::package_interface_proposals::run_package_check_interface_proposals;
 use crate::package_l2_acceptance::run_package_validate_l2_acceptance;
 use crate::package_l2_acceptance_aggregate::run_package_aggregate_l2_acceptance;
 use crate::package_l2_namespace_transport::run_package_validate_l2_namespace_transport;
@@ -31,6 +34,7 @@ use crate::package_promotion_registry::{
     run_package_register_equivalent_promotion_origin,
     run_package_validate_promotion_origin_registry,
 };
+use crate::package_promotion_registry_reconcile::run_package_reconcile_promotion_origin_registry;
 use crate::package_publish::run_package_publish_plan;
 use crate::package_refactor_plan::run_package_refactor_plan;
 use crate::package_theorem_premise_report::run_package_theorem_premise_report;
@@ -122,6 +126,13 @@ pub fn load_package_root(
 pub fn run_package_command(command: PackageCommand) -> CommandResult {
     match command {
         PackageCommand::Check(options) => run_package_check(options),
+        PackageCommand::CheckInterfaceProposals(options) => {
+            run_package_check_interface_proposals(options)
+        }
+        PackageCommand::CheckInterfaceProposalSurface(options) => {
+            run_package_check_interface_proposal_surface(options)
+        }
+        PackageCommand::InventoryInterface(options) => run_package_inventory_interface(options),
         PackageCommand::BuildCerts(options) => run_package_build_certs(options),
         PackageCommand::AxiomReport(options) => run_package_axiom_report(options),
         PackageCommand::Index(options) => run_package_index(options),
@@ -150,6 +161,9 @@ pub fn run_package_command(command: PackageCommand) -> CommandResult {
         }
         PackageCommand::ValidatePromotionOriginRegistry(options) => {
             run_package_validate_promotion_origin_registry(options)
+        }
+        PackageCommand::ReconcilePromotionOriginRegistry(options) => {
+            run_package_reconcile_promotion_origin_registry(options)
         }
         PackageCommand::PreparePromotion(options) => run_package_prepare_promotion(*options),
         PackageCommand::MaterializePromotion(options) => {

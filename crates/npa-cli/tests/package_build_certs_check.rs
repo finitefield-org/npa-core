@@ -30,6 +30,10 @@ const FRONTEND_FAILURE_MESSAGE: &str =
     "unannotated Human lambda binder requires an expected function type";
 const FRONTEND_FAILURE_SOURCE: &str =
     "def product_enumeration_bad : Type := fun product => product\n";
+const UNIVERSE_ALIAS_FAILURE_SOURCE: &str = "\
+def FunctionAlias.{u} : forall (Carrier : Sort u), Sort max 1 u :=
+  fun Carrier => Prop -> Carrier
+";
 
 static NEXT_TEMP_DIR: AtomicUsize = AtomicUsize::new(0);
 static BUILD_CHECK_CACHE_TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -131,6 +135,48 @@ fn package_build_certs_frontend_failure_check_dependent_reports_source_context_w
         "modules[1].source",
         "Fixture/A/source.npa",
     );
+    assert_eq!(package_snapshot(&package), before);
+}
+
+#[test]
+fn package_build_certs_function_alias_universe_mismatch_is_structured_without_writes() {
+    let package = build_minimal_fixture("function-alias-universe-mismatch");
+    install_universe_alias_failure(&package, "Proofs/Ai/Basic/source.npa", "Proofs.Ai.Basic");
+    let before = package_snapshot(&package);
+
+    let result = run_package_build_certs(
+        build_certs_check(common_options(package.path(), true))
+            .with_modules(vec![Name::from_dotted("Proofs.Ai.Basic")]),
+    );
+
+    assert_eq!(result.exit_code(), CommandExitCode::PackageFailure);
+    assert!(result.artifacts.is_empty());
+    assert!(result
+        .diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.reason_code == "package_build_selection"));
+    let diagnostic = result
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.reason_code == "build_failed")
+        .expect("targeted build should retain the frontend failure");
+    assert_eq!(diagnostic.kind, DiagnosticKind::Build);
+    assert_eq!(diagnostic.reason_code, "build_failed");
+    assert_eq!(diagnostic.module.as_deref(), Some("Proofs.Ai.Basic"));
+    assert_eq!(diagnostic.path.as_deref(), Some("modules[0].source"));
+    assert_eq!(diagnostic.field.as_deref(), Some("kernel_handoff"));
+    assert_eq!(diagnostic.expected_value.as_deref(), Some("max 1 u"));
+    assert_eq!(
+        diagnostic.actual_value.as_deref(),
+        Some("declaration=FunctionAlias;inferred_level=imax 1 u;type_path=pi_body")
+    );
+    let source = diagnostic
+        .source
+        .as_ref()
+        .expect("universe mismatch should retain source context");
+    assert_eq!(source.path(), "Proofs/Ai/Basic/source.npa");
+    assert_eq!(source.declaration(), Some("FunctionAlias"));
+    assert_eq!(source.line(), Some(1));
     assert_eq!(package_snapshot(&package), before);
 }
 
@@ -1224,6 +1270,17 @@ fn assert_failure(
 fn install_frontend_failure(package: &TestPackage, source_path: &str, module_name: &str) {
     write_artifact(package, source_path, FRONTEND_FAILURE_SOURCE.as_bytes());
     let source_hash = format_package_hash(&package_file_hash(FRONTEND_FAILURE_SOURCE.as_bytes()));
+    replace_module_manifest_hash(package, module_name, "expected_source_hash", &source_hash);
+}
+
+fn install_universe_alias_failure(package: &TestPackage, source_path: &str, module_name: &str) {
+    write_artifact(
+        package,
+        source_path,
+        UNIVERSE_ALIAS_FAILURE_SOURCE.as_bytes(),
+    );
+    let source_hash =
+        format_package_hash(&package_file_hash(UNIVERSE_ALIAS_FAILURE_SOURCE.as_bytes()));
     replace_module_manifest_hash(package, module_name, "expected_source_hash", &source_hash);
 }
 

@@ -1,0 +1,23 @@
+schema = "npa.mathlib.interface_proposal.v1"
+proposal_id = "Mathlib.Fixture.Observed"
+proposal_revision = 1
+module = "Mathlib.Fixture.Observed"
+change_kind = "add"
+source_modules = []
+interface_status = "observed"
+proof_evidence = false
+summary = "A compact observed interface used by the read-only validator fixture."
+scope = "Only the fixture namespace is in scope; no implementation or proof is proposed."
+imports = []
+supersedes = []
+
+[[observations]]
+id = "fixture-layout"
+repository = "https://example.invalid/pinned-consumer"
+revision_kind = "git_commit"
+revision = "c5ea00351c28e24afc9f0f84379aa41082b1188f"
+license = "Apache-2.0"
+path = "Mathlib/Fixture/Observed.lean"
+source_module = "Mathlib.Fixture.Source"
+usage_kind = "module_layout"
+notes = "The URL is provenance metadata only; the validator must not dereference it."

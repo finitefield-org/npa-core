@@ -111,7 +111,7 @@ pub use human::{
 pub use human_diagnostic::{
     HumanDiagnostic, HumanDiagnosticConversionContext, HumanDiagnosticKind, HumanDiagnosticPayload,
     HumanDiagnosticPhase, HumanDiagnosticSeverity, HumanHoleGoal, HumanHoleGoalLocal, HumanResult,
-    HumanUnsolvedMeta, HumanUnsolvedMetaKind,
+    HumanUniverseMismatchContext, HumanUnsolvedMeta, HumanUnsolvedMetaKind,
 };
 pub use human_elaborator::{
     certificate_imports_for_human_core_module,

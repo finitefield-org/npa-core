@@ -36,7 +36,7 @@ let graph_error offset reason = Error (Graph_error { reason; offset })
 
 let max_import_candidates = Ext_import_store.max_import_candidates
 let max_import_candidate_bytes = Ext_bytes.max_certificate_bytes
-let max_import_depth = 1_024
+let max_import_depth = Ext_bytes.max_closure_modules - 1
 
 let prepare bytes =
   match Ext_checker.decode bytes with

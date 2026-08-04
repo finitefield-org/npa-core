@@ -3,16 +3,18 @@ set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
-echo "[1/3] Build performance harness (locked, offline)"
+echo "[1/4] Build performance harnesses (locked, offline)"
 cargo build --locked --offline -p npa-api --example bench_package_verifier
+cargo build --locked --offline -p npa-api --example bench_true_batching
 
-echo "[2/3] Verify deterministic observability contracts"
+echo "[2/4] Verify deterministic observability contracts"
 cargo test --locked --offline -p npa-api performance_measurement
 cargo test --locked --offline -p npa-api performance_gate
 cargo test --locked --offline -p npa-api tactic_batch_deterministic_counter_gate_covers_required_candidate_counts
+cargo test --locked --offline -p npa-cert prepared_candidate_chain_counters_cover_required_candidate_counts
 cargo test --locked --offline -p npa-kernel optional_work_meter
 
-echo "[3/3] Run compact checked-artifact fixture"
+echo "[3/4] Run compact checked-artifact fixture"
 source_identity="$(/usr/bin/git rev-parse HEAD)"
 if [[ -n "$(/usr/bin/git status --porcelain --untracked-files=normal)" ]]; then
   source_identity="${source_identity}-dirty"
@@ -46,3 +48,23 @@ fi
 
 echo "$performance_output"
 echo "performance report: $performance_path"
+
+echo "[4/4] Run proof-authoring true-batching fixtures"
+true_batching_output="$(target/debug/examples/bench_true_batching \
+  --source-identity "$source_identity" \
+  --warmup 1 \
+  --samples 3)"
+true_batching_path="$performance_dir/true-batching.json"
+printf '%s\n' "$true_batching_output" > "$true_batching_path"
+
+if [[ "$true_batching_output" != *'"schema":"npa.true-batching.elapsed.v0.1"'* ]] ||
+  [[ "$true_batching_output" != *'"elapsed_gate":"advisory","status":"passed"'* ]] ||
+  [[ "$true_batching_output" != *'"path":"certificate-producer","fixture":"accepted-chain","candidate_count":256'* ]] ||
+  [[ "$true_batching_output" != *'"prepared_chains":1,"name_index_rebuilds":1,"environment_clones":256,"copied_prefix_elements":0'* ]]; then
+  echo "true-batching fixture output did not match deterministic work contract" >&2
+  echo "$true_batching_output" >&2
+  exit 1
+fi
+
+echo "$true_batching_output"
+echo "true-batching report: $true_batching_path"

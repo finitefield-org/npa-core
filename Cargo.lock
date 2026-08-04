@@ -106,7 +106,7 @@ dependencies = [
 
 [[package]]
 name = "npa-cert"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "libc",
  "npa-kernel",
@@ -115,7 +115,7 @@ dependencies = [
 
 [[package]]
 name = "npa-checker-ref"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "libc",
  "npa-cert",
@@ -132,6 +132,7 @@ dependencies = [
  "npa-cert",
  "npa-checker-ref",
  "npa-frontend",
+ "npa-kernel",
  "npa-package",
  "sha2",
  "toml_edit",

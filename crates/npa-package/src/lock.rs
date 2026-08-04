@@ -1033,18 +1033,18 @@ fn lock_topological_order(
     resolved_entry_imports: &[Vec<PackageLockResolvedImport>],
 ) -> PackageLockResult<Vec<Name>> {
     let mut states = vec![LockVisitState::Unvisited; entries.len()];
-    let mut stack = Vec::<usize>::new();
-    let mut order = Vec::<Name>::new();
+    let mut order = Vec::<Name>::with_capacity(entries.len());
 
     for entry_index in 0..entries.len() {
-        visit_lock_entry(
-            entry_index,
-            entries,
-            resolved_entry_imports,
-            &mut states,
-            &mut stack,
-            &mut order,
-        )?;
+        if states[entry_index] == LockVisitState::Unvisited {
+            visit_lock_entry(
+                entry_index,
+                entries,
+                resolved_entry_imports,
+                &mut states,
+                &mut order,
+            )?;
+        }
     }
 
     Ok(order)
@@ -1055,45 +1055,51 @@ fn visit_lock_entry(
     entries: &[PackageLockEntry],
     resolved_entry_imports: &[Vec<PackageLockResolvedImport>],
     states: &mut [LockVisitState],
-    stack: &mut Vec<usize>,
     order: &mut Vec<Name>,
 ) -> PackageLockResult<()> {
-    match states[entry_index] {
-        LockVisitState::Visited => return Ok(()),
-        LockVisitState::Visiting => {
-            return Err(PackageLockError::lock_import_cycle(
-                format!("entries[{entry_index}].imports"),
-                lock_cycle_path(entries, stack, entry_index),
-            )
-            .with_module(entries[entry_index].module.as_dotted()));
-        }
-        LockVisitState::Unvisited => {}
-    }
-
     states[entry_index] = LockVisitState::Visiting;
-    stack.push(entry_index);
+    let mut frames = vec![LockVisitFrame {
+        entry_index,
+        next_import_index: 0,
+    }];
 
-    for import in &resolved_entry_imports[entry_index] {
-        if states[import.entry_index] == LockVisitState::Visiting {
-            return Err(PackageLockError::lock_import_cycle(
-                format!("entries[{entry_index}].imports"),
-                lock_cycle_path(entries, stack, import.entry_index),
-            )
-            .with_module(entries[entry_index].module.as_dotted()));
+    while let Some(frame) = frames.last() {
+        let entry_index = frame.entry_index;
+        let import_index = frame.next_import_index;
+        let Some(import) = resolved_entry_imports[entry_index].get(import_index) else {
+            frames.pop();
+            states[entry_index] = LockVisitState::Visited;
+            order.push(entries[entry_index].module.clone());
+            continue;
+        };
+        frames
+            .last_mut()
+            .expect("package-lock graph traversal has an active frame")
+            .next_import_index += 1;
+
+        match states[import.entry_index] {
+            LockVisitState::Unvisited => {
+                states[import.entry_index] = LockVisitState::Visiting;
+                frames.push(LockVisitFrame {
+                    entry_index: import.entry_index,
+                    next_import_index: 0,
+                });
+            }
+            LockVisitState::Visiting => {
+                let stack = frames
+                    .iter()
+                    .map(|frame| frame.entry_index)
+                    .collect::<Vec<_>>();
+                return Err(PackageLockError::lock_import_cycle(
+                    format!("entries[{entry_index}].imports"),
+                    lock_cycle_path(entries, &stack, import.entry_index),
+                )
+                .with_module(entries[entry_index].module.as_dotted()));
+            }
+            LockVisitState::Visited => {}
         }
-        visit_lock_entry(
-            import.entry_index,
-            entries,
-            resolved_entry_imports,
-            states,
-            stack,
-            order,
-        )?;
     }
 
-    stack.pop();
-    states[entry_index] = LockVisitState::Visited;
-    order.push(entries[entry_index].module.clone());
     Ok(())
 }
 
@@ -1115,6 +1121,12 @@ enum LockVisitState {
     Unvisited,
     Visiting,
     Visited,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LockVisitFrame {
+    entry_index: usize,
+    next_import_index: usize,
 }
 
 fn check_lock_import_export_hash(
