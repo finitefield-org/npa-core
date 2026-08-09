@@ -1617,13 +1617,13 @@ fn target_declaration_records(
                 certificate_decl
                     .dependencies
                     .iter()
-                    .filter_map(|dependency| match dependency.global_ref {
+                    .filter_map(|dependency| match dependency.global_ref() {
                         GlobalRef::Local { decl_index } => verified
                             .declarations()
-                            .get(decl_index)
+                            .get(*decl_index)
                             .map(|declaration| payload_name(verified, &declaration.decl)),
                         GlobalRef::LocalGenerated { name, .. } => {
-                            verified.name_table().get(name).map(Name::as_dotted)
+                            verified.name_table().get(*name).map(Name::as_dotted)
                         }
                         GlobalRef::Imported { .. } | GlobalRef::Builtin { .. } => None,
                     })

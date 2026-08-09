@@ -24,8 +24,7 @@ use npa_package::{
 
 use crate::{
     args::{
-        PackageAuditCacheMode, PackageBuildCertsOptions, PackageBuildCheckCacheMode,
-        PackageBuildSelection, PackageChecker, PackageCommonOptions, PackageExportSummaryOptions,
+        PackageAuditCacheMode, PackageChecker, PackageCommonOptions, PackageExportSummaryOptions,
         PackageLockInputMode, PackagePublishPlanOptions,
         PackageReconcilePromotionOriginRegistryOptions, PackageTimingMode,
         PackageValidatePromotionOriginRegistryOptions, PackageVerifierMemoMode,
@@ -39,6 +38,7 @@ use crate::{
         confined_governance_path, replace_governance_artifact_if_unchanged,
         write_governance_artifact, GovernanceOutputPolicy,
     },
+    package_api::v1::build_certs_check,
     package_artifacts::{
         load_package_audit_snapshot, PackageGeneratedArtifactReadMode, PACKAGE_AXIOM_REPORT_PATH,
         PACKAGE_LOCK_PATH, PACKAGE_THEOREM_INDEX_PATH,
@@ -1039,13 +1039,7 @@ fn root_gates(root: &Path) -> Vec<CommandResult> {
     vec![
         run_package_check(common.clone()),
         run_package_check_hashes(common.clone()),
-        run_package_build_certs(PackageBuildCertsOptions {
-            common: common.clone(),
-            check: true,
-            build_check_cache: PackageBuildCheckCacheMode::Off,
-            update_manifest_hashes: false,
-            selection: PackageBuildSelection::Full,
-        }),
+        run_package_build_certs(build_certs_check(common.clone())),
         run_package_verify_certs(PackageVerifyCertsOptions {
             common,
             checker: PackageChecker::Reference,

@@ -7,7 +7,8 @@ use npa_api::{
     JsonDocument, JsonValue, JsonValueKind, PerformanceMeasurementLabel,
     PERFORMANCE_CANDIDATE_DETAIL_LIMIT, PERFORMANCE_DECLARATION_DETAIL_LIMIT,
     PERFORMANCE_MEASUREMENTS_SCHEMA_V0_1, PERFORMANCE_MEASUREMENTS_SCHEMA_V0_2,
-    PERFORMANCE_MODULE_DETAIL_LIMIT, PERFORMANCE_WORKER_DETAIL_LIMIT,
+    PERFORMANCE_MEASUREMENTS_SCHEMA_V0_3, PERFORMANCE_MODULE_DETAIL_LIMIT,
+    PERFORMANCE_WORKER_DETAIL_LIMIT,
 };
 
 const V0_1_SCHEMA: &str = "npa.generated_artifact_release_manifest.v0.1";
@@ -16,6 +17,8 @@ const VALIDATION_SCHEMA: &str = "npa.generated_artifact_release_manifest.validat
 const COMMAND_RESULT_SCHEMA_V0_1: &str = "npa.package.command_result.v0.1";
 const COMMAND_RESULT_SCHEMA_V0_2: &str = "npa.package.command_result.v0.2";
 const COMMAND_RESULT_SCHEMA_V0_3: &str = "npa.package.command_result.v0.3";
+const COMMAND_RESULT_SCHEMA_V0_4: &str = "npa.package.command_result.v0.4";
+const KERNEL_FUEL_DIAGNOSTIC_SCHEMA_V0_1: &str = "npa.kernel-fuel-diagnostic.v0.1";
 const TIMINGS_SCHEMA_V0_1: &str = "npa.package.timings.v0.1";
 const TIMINGS_SCHEMA_V0_2: &str = "npa.package.timings.v0.2";
 const PACKAGE_LOCK_RELATIVE_PATH: &str = "generated/package-lock.json";
@@ -99,6 +102,32 @@ const DIAGNOSTIC_OPTIONAL_FIELDS_V0_3: &[&str] = &[
     "checker",
     "source",
     "conversion",
+];
+const DIAGNOSTIC_OPTIONAL_FIELDS_V0_4: &[&str] = &[
+    "module",
+    "path",
+    "field",
+    "expected_hash",
+    "actual_hash",
+    "expected_value",
+    "actual_value",
+    "checker",
+    "source",
+    "conversion",
+    "kernel_fuel",
+];
+
+const KERNEL_WORK_FIELDS: &[&str; 10] = &[
+    "check_calls",
+    "infer_calls",
+    "whnf_calls",
+    "defeq_calls",
+    "quick_equality_hits",
+    "beta_steps",
+    "delta_steps",
+    "iota_steps",
+    "zeta_steps",
+    "physical_reductions",
 ];
 
 type Object<'value, 'source> = BTreeMap<&'value str, &'value JsonValue<'source>>;
@@ -497,7 +526,7 @@ fn cli_version_is_valid(text: &str) -> bool {
     let fields = text.split('.').collect::<Vec<_>>();
     fields.len() == 3
         && fields[0] == "0"
-        && matches!(fields[1], "3" | "4" | "5" | "6" | "7")
+        && matches!(fields[1], "3" | "4" | "5" | "6" | "7" | "8")
         && !fields[2].is_empty()
         && fields[2].bytes().all(|byte| byte.is_ascii_digit())
         && (fields[2] == "0" || !fields[2].starts_with('0'))
@@ -577,7 +606,9 @@ fn validate_retained_manifest(
 }
 
 fn command_result_schema_for_cli(version: &str) -> &'static str {
-    if version.starts_with("0.6.") || version.starts_with("0.7.") {
+    if version.starts_with("0.8.") {
+        COMMAND_RESULT_SCHEMA_V0_4
+    } else if version.starts_with("0.6.") || version.starts_with("0.7.") {
         COMMAND_RESULT_SCHEMA_V0_3
     } else if version.starts_with("0.5.") {
         COMMAND_RESULT_SCHEMA_V0_2
@@ -596,7 +627,10 @@ fn validate_diagnostic_source(
         &source,
         &["path", "start_byte", "end_byte"],
         where_,
-        if schema == COMMAND_RESULT_SCHEMA_V0_3 {
+        if matches!(
+            schema,
+            COMMAND_RESULT_SCHEMA_V0_3 | COMMAND_RESULT_SCHEMA_V0_4
+        ) {
             &["declaration", "line", "column", "token"]
         } else {
             &["declaration"]
@@ -695,6 +729,572 @@ fn validate_diagnostic_conversion(
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+struct ValidatedKernelOperationFuel {
+    spent: u64,
+    overflowed: bool,
+}
+
+#[derive(Clone, Copy)]
+struct ValidatedKernelFuelDomain {
+    calls: u64,
+    exhausted_operation_fuel: u64,
+    overflowed: bool,
+}
+
+#[derive(Clone, Copy)]
+struct ValidatedKernelWork {
+    counters: [u64; KERNEL_WORK_FIELDS.len()],
+    overflowed: bool,
+}
+
+fn validate_kernel_operation_fuel(
+    raw: &JsonValue<'_>,
+    where_: &str,
+) -> Result<ValidatedKernelOperationFuel, ReleaseManifestValidationError> {
+    let fuel = require_object(raw, where_)?;
+    require_fields(
+        &fuel,
+        &["budget", "spent", "remaining", "exhausted", "overflowed"],
+        where_,
+        &[],
+    )?;
+    let budget = require_measurement_u64(value(&fuel, "budget"), &format!("{where_}.budget"))?;
+    let spent = require_measurement_u64(value(&fuel, "spent"), &format!("{where_}.spent"))?;
+    let remaining =
+        require_measurement_u64(value(&fuel, "remaining"), &format!("{where_}.remaining"))?;
+    if !require_bool(value(&fuel, "exhausted"), &format!("{where_}.exhausted"))? {
+        return Err(ReleaseManifestValidationError::new(format!(
+            "{where_}.exhausted must be true"
+        )));
+    }
+    let overflowed = require_bool(value(&fuel, "overflowed"), &format!("{where_}.overflowed"))?;
+    if !overflowed && spent.checked_add(remaining) != Some(budget) {
+        return Err(ReleaseManifestValidationError::new(format!(
+            "{where_} spent + remaining must equal budget"
+        )));
+    }
+    Ok(ValidatedKernelOperationFuel { spent, overflowed })
+}
+
+fn validate_kernel_fuel_domain(
+    raw: &JsonValue<'_>,
+    where_: &str,
+) -> Result<ValidatedKernelFuelDomain, ReleaseManifestValidationError> {
+    let fuel = require_object(raw, where_)?;
+    require_fields(
+        &fuel,
+        &[
+            "calls",
+            "logical_spent",
+            "successful_operation_fuel",
+            "exhausted_operation_fuel",
+            "overflowed",
+        ],
+        where_,
+        &[],
+    )?;
+    let calls = require_measurement_u64(value(&fuel, "calls"), &format!("{where_}.calls"))?;
+    let logical_spent = require_measurement_u64(
+        value(&fuel, "logical_spent"),
+        &format!("{where_}.logical_spent"),
+    )?;
+    let successful_operation_fuel = require_measurement_u64(
+        value(&fuel, "successful_operation_fuel"),
+        &format!("{where_}.successful_operation_fuel"),
+    )?;
+    let exhausted_operation_fuel = require_measurement_u64(
+        value(&fuel, "exhausted_operation_fuel"),
+        &format!("{where_}.exhausted_operation_fuel"),
+    )?;
+    let overflowed = require_bool(value(&fuel, "overflowed"), &format!("{where_}.overflowed"))?;
+    if !overflowed
+        && successful_operation_fuel.checked_add(exhausted_operation_fuel) != Some(logical_spent)
+    {
+        return Err(ReleaseManifestValidationError::new(format!(
+            "{where_} operation fuel totals must equal logical_spent"
+        )));
+    }
+    Ok(ValidatedKernelFuelDomain {
+        calls,
+        exhausted_operation_fuel,
+        overflowed,
+    })
+}
+
+fn validate_kernel_fuel_totals(
+    raw: &JsonValue<'_>,
+    where_: &str,
+) -> Result<(ValidatedKernelFuelDomain, ValidatedKernelFuelDomain), ReleaseManifestValidationError>
+{
+    let fuel = require_object(raw, where_)?;
+    require_fields(&fuel, &["whnf", "conversion"], where_, &[])?;
+    Ok((
+        validate_kernel_fuel_domain(value(&fuel, "whnf"), &format!("{where_}.whnf"))?,
+        validate_kernel_fuel_domain(value(&fuel, "conversion"), &format!("{where_}.conversion"))?,
+    ))
+}
+
+fn validate_kernel_work(
+    raw: &JsonValue<'_>,
+    where_: &str,
+) -> Result<ValidatedKernelWork, ReleaseManifestValidationError> {
+    let work = require_object(raw, where_)?;
+    let mut required = KERNEL_WORK_FIELDS.to_vec();
+    required.push("overflowed");
+    require_fields(&work, &required, where_, &[])?;
+    let mut counters = [0_u64; KERNEL_WORK_FIELDS.len()];
+    for (index, field) in KERNEL_WORK_FIELDS.iter().enumerate() {
+        counters[index] =
+            require_measurement_u64(value(&work, field), &format!("{where_}.{field}"))?;
+    }
+    let overflowed = require_bool(value(&work, "overflowed"), &format!("{where_}.overflowed"))?;
+    if !overflowed {
+        let reductions = counters[5]
+            .checked_add(counters[6])
+            .and_then(|sum| sum.checked_add(counters[7]))
+            .and_then(|sum| sum.checked_add(counters[8]));
+        if reductions != Some(counters[9]) {
+            return Err(ReleaseManifestValidationError::new(format!(
+                "{where_}.physical_reductions must equal beta + delta + iota + zeta"
+            )));
+        }
+    }
+    Ok(ValidatedKernelWork {
+        counters,
+        overflowed,
+    })
+}
+
+fn validate_kernel_hotset(
+    raw: &JsonValue<'_>,
+    where_: &str,
+    declaration_delta_steps: u64,
+    declaration_work_overflowed: bool,
+) -> Result<bool, ReleaseManifestValidationError> {
+    let summary = require_object(raw, where_)?;
+    require_fields(
+        &summary,
+        &[
+            "retained_names",
+            "capacity",
+            "entries",
+            "emitted",
+            "entry_limit",
+            "unretained_name_observations",
+            "overlong_name_observations",
+            "output_truncated",
+            "overflowed",
+        ],
+        where_,
+        &[],
+    )?;
+    let retained_names = require_measurement_u64(
+        value(&summary, "retained_names"),
+        &format!("{where_}.retained_names"),
+    )?;
+    let capacity =
+        require_measurement_u64(value(&summary, "capacity"), &format!("{where_}.capacity"))?;
+    let emitted =
+        require_measurement_u64(value(&summary, "emitted"), &format!("{where_}.emitted"))?;
+    let entry_limit = require_measurement_u64(
+        value(&summary, "entry_limit"),
+        &format!("{where_}.entry_limit"),
+    )?;
+    let unretained = require_measurement_u64(
+        value(&summary, "unretained_name_observations"),
+        &format!("{where_}.unretained_name_observations"),
+    )?;
+    let overlong = require_measurement_u64(
+        value(&summary, "overlong_name_observations"),
+        &format!("{where_}.overlong_name_observations"),
+    )?;
+    let output_truncated = require_bool(
+        value(&summary, "output_truncated"),
+        &format!("{where_}.output_truncated"),
+    )?;
+    let overflowed = require_bool(
+        value(&summary, "overflowed"),
+        &format!("{where_}.overflowed"),
+    )?;
+    if capacity != npa_kernel::KERNEL_DELTA_HOTSET_CAPACITY as u64
+        || retained_names > capacity
+        || entry_limit != npa_kernel::KERNEL_DELTA_HOTSET_ENTRY_LIMIT as u64
+        || emitted > entry_limit
+        || (unretained > 0 && retained_names != capacity)
+    {
+        return Err(ReleaseManifestValidationError::new(format!(
+            "{where_} disagrees with bounded hotset limits"
+        )));
+    }
+
+    let entries = require_array(value(&summary, "entries"), &format!("{where_}.entries"))?;
+    if emitted != u64::try_from(entries.len()).unwrap_or(u64::MAX)
+        || entries.len() > npa_kernel::KERNEL_DELTA_HOTSET_ENTRY_LIMIT
+    {
+        return Err(ReleaseManifestValidationError::new(format!(
+            "{where_}.emitted disagrees with entries or entry_limit"
+        )));
+    }
+    let mut names = BTreeSet::new();
+    let mut previous = None::<(u64, String)>;
+    let mut ordinary_entries = 0_u64;
+    let mut ordinary_count_sum = 0_u64;
+    let mut synthetic_present = false;
+    for (index, raw_entry) in entries.iter().enumerate() {
+        let entry_where = format!("{where_}.entries[{index}]");
+        let entry = require_object(raw_entry, &entry_where)?;
+        require_fields(&entry, &["constant", "count"], &entry_where, &[])?;
+        let constant = require_text(
+            value(&entry, "constant"),
+            &format!("{entry_where}.constant"),
+        )?;
+        let count =
+            require_measurement_u64(value(&entry, "count"), &format!("{entry_where}.count"))?;
+        if count == 0 {
+            return Err(ReleaseManifestValidationError::new(format!(
+                "{entry_where}.count must be positive"
+            )));
+        }
+        if !names.insert(constant) {
+            return Err(ReleaseManifestValidationError::new(format!(
+                "{entry_where}.constant is duplicated"
+            )));
+        }
+        if previous
+            .as_ref()
+            .is_some_and(|(previous_count, previous_name)| {
+                *previous_count < count
+                    || (*previous_count == count && previous_name.as_str() >= constant)
+            })
+        {
+            return Err(ReleaseManifestValidationError::new(format!(
+                "{where_}.entries are not in descending-count/ascending-name order"
+            )));
+        }
+        previous = Some((count, constant.to_owned()));
+        if constant == npa_kernel::KERNEL_DELTA_OVERLONG_NAME {
+            synthetic_present = true;
+            if count != overlong {
+                return Err(ReleaseManifestValidationError::new(format!(
+                    "{entry_where} synthetic count disagrees with overlong observations"
+                )));
+            }
+        } else {
+            if constant.len() > npa_kernel::KERNEL_DELTA_NAME_BYTE_LIMIT
+                || !npa_kernel::is_canonical_dotted_name(constant)
+            {
+                return Err(ReleaseManifestValidationError::new(format!(
+                    "{entry_where}.constant is not a bounded canonical name"
+                )));
+            }
+            ordinary_entries = ordinary_entries.checked_add(1).ok_or_else(|| {
+                ReleaseManifestValidationError::new(format!(
+                    "{where_} ordinary entry count overflowed"
+                ))
+            })?;
+            ordinary_count_sum = match ordinary_count_sum.checked_add(count) {
+                Some(sum) => sum,
+                None if overflowed => u64::MAX,
+                None => {
+                    return Err(ReleaseManifestValidationError::new(format!(
+                        "{where_} ordinary entry counts overflowed without overflow flag"
+                    )))
+                }
+            };
+        }
+    }
+    if ordinary_entries > retained_names || (synthetic_present && overlong == 0) {
+        return Err(ReleaseManifestValidationError::new(format!(
+            "{where_}.entries disagree with retained or overlong names"
+        )));
+    }
+    let candidate_count = retained_names + u64::from(overlong > 0);
+    if emitted > candidate_count || output_truncated != (emitted < candidate_count) {
+        return Err(ReleaseManifestValidationError::new(format!(
+            "{where_}.output_truncated disagrees with emitted candidates"
+        )));
+    }
+    if !overflowed && !declaration_work_overflowed {
+        let observed = ordinary_count_sum
+            .checked_add(unretained)
+            .and_then(|sum| sum.checked_add(overlong))
+            .ok_or_else(|| {
+                ReleaseManifestValidationError::new(format!(
+                    "{where_} observation counts overflowed without overflow flag"
+                ))
+            })?;
+        if observed > declaration_delta_steps
+            || (!output_truncated && observed != declaration_delta_steps)
+        {
+            return Err(ReleaseManifestValidationError::new(format!(
+                "{where_} observations disagree with declaration delta_steps"
+            )));
+        }
+    }
+    Ok(overflowed)
+}
+
+fn validate_kernel_fuel_diagnostic(
+    raw: &JsonValue<'_>,
+    where_: &str,
+    conversion: Option<&JsonValue<'_>>,
+) -> Result<(), ReleaseManifestValidationError> {
+    let diagnostic = require_object(raw, where_)?;
+    require_fields(
+        &diagnostic,
+        &[
+            "schema",
+            "trusted",
+            "proof_evidence",
+            "subsystem",
+            "resource",
+            "failed_operation",
+            "declaration",
+            "comparison_path",
+            "retained_delta_constants",
+            "overflowed",
+        ],
+        where_,
+        &[],
+    )?;
+    if value(&diagnostic, "schema").string_value() != Some(KERNEL_FUEL_DIAGNOSTIC_SCHEMA_V0_1) {
+        return Err(ReleaseManifestValidationError::new(format!(
+            "{where_}.schema is unsupported"
+        )));
+    }
+    if require_bool(value(&diagnostic, "trusted"), &format!("{where_}.trusted"))?
+        || require_bool(
+            value(&diagnostic, "proof_evidence"),
+            &format!("{where_}.proof_evidence"),
+        )?
+    {
+        return Err(ReleaseManifestValidationError::new(format!(
+            "{where_} must be untrusted and not proof evidence"
+        )));
+    }
+    if value(&diagnostic, "subsystem").string_value() != Some("fast_kernel") {
+        return Err(ReleaseManifestValidationError::new(format!(
+            "{where_}.subsystem is unsupported"
+        )));
+    }
+    let resource = require_text(
+        value(&diagnostic, "resource"),
+        &format!("{where_}.resource"),
+    )?;
+    if !matches!(resource, "conversion" | "whnf") {
+        return Err(ReleaseManifestValidationError::new(format!(
+            "{where_}.resource is unsupported"
+        )));
+    }
+
+    let failed_where = format!("{where_}.failed_operation");
+    let failed = require_object(value(&diagnostic, "failed_operation"), &failed_where)?;
+    require_fields(&failed, &["fuel", "work"], &failed_where, &[])?;
+    let operation_fuel =
+        validate_kernel_operation_fuel(value(&failed, "fuel"), &format!("{failed_where}.fuel"))?;
+    let operation_work =
+        validate_kernel_work(value(&failed, "work"), &format!("{failed_where}.work"))?;
+
+    let declaration_where = format!("{where_}.declaration");
+    let declaration = require_object(value(&diagnostic, "declaration"), &declaration_where)?;
+    require_fields(
+        &declaration,
+        &["fuel", "work", "overflowed"],
+        &declaration_where,
+        &[],
+    )?;
+    let (whnf_fuel, conversion_fuel) = validate_kernel_fuel_totals(
+        value(&declaration, "fuel"),
+        &format!("{declaration_where}.fuel"),
+    )?;
+    let declaration_work = validate_kernel_work(
+        value(&declaration, "work"),
+        &format!("{declaration_where}.work"),
+    )?;
+    let declaration_overflowed = require_bool(
+        value(&declaration, "overflowed"),
+        &format!("{declaration_where}.overflowed"),
+    )?;
+    let expected_declaration_overflowed =
+        declaration_work.overflowed || whnf_fuel.overflowed || conversion_fuel.overflowed;
+    if declaration_overflowed != expected_declaration_overflowed {
+        return Err(ReleaseManifestValidationError::new(format!(
+            "{declaration_where}.overflowed disagrees with declaration counters"
+        )));
+    }
+    if !operation_work.overflowed && !declaration_work.overflowed {
+        for (index, field) in KERNEL_WORK_FIELDS.iter().enumerate() {
+            if operation_work.counters[index] > declaration_work.counters[index] {
+                return Err(ReleaseManifestValidationError::new(format!(
+                    "{failed_where}.work.{field} exceeds declaration work"
+                )));
+            }
+        }
+    }
+
+    let path_where = format!("{where_}.comparison_path");
+    let path = require_object(value(&diagnostic, "comparison_path"), &path_where)?;
+    require_fields(&path, &["steps", "truncated"], &path_where, &[])?;
+    let steps = require_array(value(&path, "steps"), &format!("{path_where}.steps"))?;
+    if steps.len() > npa_kernel::KERNEL_COMPARISON_PATH_LIMIT {
+        return Err(ReleaseManifestValidationError::new(format!(
+            "{path_where}.steps exceeds the schema limit"
+        )));
+    }
+    for (index, raw_step) in steps.iter().enumerate() {
+        if !matches!(
+            raw_step.string_value(),
+            Some(
+                "app_function"
+                    | "app_argument"
+                    | "pi_domain"
+                    | "pi_body"
+                    | "lambda_domain"
+                    | "lambda_body"
+                    | "whnf_left"
+                    | "whnf_right"
+            )
+        ) {
+            return Err(ReleaseManifestValidationError::new(format!(
+                "{path_where}.steps[{index}] is unsupported"
+            )));
+        }
+    }
+    let path_truncated = require_bool(
+        value(&path, "truncated"),
+        &format!("{path_where}.truncated"),
+    )?;
+
+    let selected_fuel = if resource == "conversion" {
+        conversion_fuel
+    } else {
+        whnf_fuel
+    };
+    let other_fuel = if resource == "conversion" {
+        whnf_fuel
+    } else {
+        conversion_fuel
+    };
+    if selected_fuel.calls == 0 {
+        return Err(ReleaseManifestValidationError::new(format!(
+            "{declaration_where}.fuel.{resource}.calls must be positive"
+        )));
+    }
+    if !operation_fuel.overflowed
+        && !whnf_fuel.overflowed
+        && !conversion_fuel.overflowed
+        && (selected_fuel.exhausted_operation_fuel != operation_fuel.spent
+            || other_fuel.exhausted_operation_fuel != 0)
+    {
+        return Err(ReleaseManifestValidationError::new(format!(
+            "{declaration_where}.fuel disagrees with failed-operation resource fuel"
+        )));
+    }
+    match resource {
+        "conversion" => {
+            let conversion = conversion.ok_or_else(|| {
+                ReleaseManifestValidationError::new(format!(
+                    "{where_} conversion resource requires a conversion sibling"
+                ))
+            })?;
+            let conversion = require_object(conversion, &format!("{where_} sibling conversion"))?;
+            if value(&conversion, "outcome").string_value() != Some("fuel_exhausted") {
+                return Err(ReleaseManifestValidationError::new(format!(
+                    "{where_} conversion resource requires outcome fuel_exhausted"
+                )));
+            }
+        }
+        "whnf" => {
+            if conversion.is_some() || !steps.is_empty() || path_truncated {
+                return Err(ReleaseManifestValidationError::new(format!(
+                    "{where_} WHNF resource requires no conversion and an empty non-truncated path"
+                )));
+            }
+        }
+        _ => unreachable!("resource vocabulary was checked"),
+    }
+
+    let hotset_overflowed =
+        if value(&diagnostic, "retained_delta_constants").kind() == JsonValueKind::Null {
+            false
+        } else {
+            validate_kernel_hotset(
+                value(&diagnostic, "retained_delta_constants"),
+                &format!("{where_}.retained_delta_constants"),
+                declaration_work.counters[6],
+                declaration_work.overflowed,
+            )?
+        };
+    let overflowed = require_bool(
+        value(&diagnostic, "overflowed"),
+        &format!("{where_}.overflowed"),
+    )?;
+    let expected_overflowed = operation_fuel.overflowed
+        || operation_work.overflowed
+        || declaration_overflowed
+        || hotset_overflowed;
+    if overflowed != expected_overflowed {
+        return Err(ReleaseManifestValidationError::new(format!(
+            "{where_}.overflowed disagrees with nested overflow flags"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_accepted_kernel_measurement(
+    raw: &JsonValue<'_>,
+    where_: &str,
+) -> Result<(), ReleaseManifestValidationError> {
+    let kernel = require_object(raw, where_)?;
+    require_fields(
+        &kernel,
+        &[
+            "subsystem",
+            "outcome",
+            "fuel",
+            "work",
+            "retained_delta_constants",
+            "overflowed",
+        ],
+        where_,
+        &[],
+    )?;
+    if value(&kernel, "subsystem").string_value() != Some("fast_kernel")
+        || value(&kernel, "outcome").string_value() != Some("accepted")
+    {
+        return Err(ReleaseManifestValidationError::new(format!(
+            "{where_} has an unsupported subsystem or outcome"
+        )));
+    }
+    let (whnf, conversion) =
+        validate_kernel_fuel_totals(value(&kernel, "fuel"), &format!("{where_}.fuel"))?;
+    let work = validate_kernel_work(value(&kernel, "work"), &format!("{where_}.work"))?;
+    if value(&kernel, "retained_delta_constants").kind() == JsonValueKind::Null {
+        return Err(ReleaseManifestValidationError::new(format!(
+            "{where_}.retained_delta_constants must be present"
+        )));
+    }
+    let hotset_overflowed = validate_kernel_hotset(
+        value(&kernel, "retained_delta_constants"),
+        &format!("{where_}.retained_delta_constants"),
+        work.counters[6],
+        work.overflowed,
+    )?;
+    let overflowed = require_bool(
+        value(&kernel, "overflowed"),
+        &format!("{where_}.overflowed"),
+    )?;
+    if overflowed
+        != (whnf.overflowed || conversion.overflowed || work.overflowed || hotset_overflowed)
+    {
+        return Err(ReleaseManifestValidationError::new(format!(
+            "{where_}.overflowed disagrees with nested overflow flags"
+        )));
+    }
+    Ok(())
+}
+
 fn validate_command_result_shape<'value, 'source>(
     value_: &'value JsonValue<'source>,
     npa_cli_version: &str,
@@ -716,7 +1316,12 @@ fn validate_command_result_shape<'value, 'source>(
     let schema = value(&result, "schema").string_value();
     if !matches!(
         schema,
-        Some(COMMAND_RESULT_SCHEMA_V0_1 | COMMAND_RESULT_SCHEMA_V0_2 | COMMAND_RESULT_SCHEMA_V0_3)
+        Some(
+            COMMAND_RESULT_SCHEMA_V0_1
+                | COMMAND_RESULT_SCHEMA_V0_2
+                | COMMAND_RESULT_SCHEMA_V0_3
+                | COMMAND_RESULT_SCHEMA_V0_4
+        )
     ) {
         return Err(ReleaseManifestValidationError::new(
             "verification.command_result.schema is unsupported",
@@ -751,7 +1356,8 @@ fn validate_command_result_shape<'value, 'source>(
     let optional = match schema {
         Some(COMMAND_RESULT_SCHEMA_V0_1) => DIAGNOSTIC_OPTIONAL_FIELDS_V0_1,
         Some(COMMAND_RESULT_SCHEMA_V0_2) => DIAGNOSTIC_OPTIONAL_FIELDS_V0_2,
-        _ => DIAGNOSTIC_OPTIONAL_FIELDS_V0_3,
+        Some(COMMAND_RESULT_SCHEMA_V0_3) => DIAGNOSTIC_OPTIONAL_FIELDS_V0_3,
+        _ => DIAGNOSTIC_OPTIONAL_FIELDS_V0_4,
     };
     for (index, raw_diagnostic) in diagnostics.iter().enumerate() {
         let where_ = format!("verification.command_result.diagnostics[{index}]");
@@ -787,6 +1393,13 @@ fn validate_command_result_shape<'value, 'source>(
             validate_diagnostic_conversion(
                 value(&diagnostic, "conversion"),
                 &format!("{where_}.conversion"),
+            )?;
+        }
+        if diagnostic.contains_key("kernel_fuel") {
+            validate_kernel_fuel_diagnostic(
+                value(&diagnostic, "kernel_fuel"),
+                &format!("{where_}.kernel_fuel"),
+                diagnostic.get("conversion").copied(),
             )?;
         }
     }
@@ -899,15 +1512,17 @@ fn validate_performance_measurements(
 ) -> Result<(), ReleaseManifestValidationError> {
     const WHERE: &str = "verification.command_result.timings.measurements";
     let report = require_object(raw, WHERE)?;
-    let has_package_sharding_schema = match value(&report, "schema").string_value() {
-        Some(PERFORMANCE_MEASUREMENTS_SCHEMA_V0_1) => false,
-        Some(PERFORMANCE_MEASUREMENTS_SCHEMA_V0_2) => true,
-        _ => {
-            return Err(ReleaseManifestValidationError::new(format!(
-                "{WHERE}.schema is unsupported"
-            )))
-        }
-    };
+    let (has_package_sharding_schema, has_declaration_kernel) =
+        match value(&report, "schema").string_value() {
+            Some(PERFORMANCE_MEASUREMENTS_SCHEMA_V0_1) => (false, false),
+            Some(PERFORMANCE_MEASUREMENTS_SCHEMA_V0_2) => (true, false),
+            Some(PERFORMANCE_MEASUREMENTS_SCHEMA_V0_3) => (true, true),
+            _ => {
+                return Err(ReleaseManifestValidationError::new(format!(
+                    "{WHERE}.schema is unsupported"
+                )))
+            }
+        };
     let mut required_fields = vec![
         "schema",
         "trusted",
@@ -1065,18 +1680,30 @@ fn validate_performance_measurements(
             )?;
         }
     }
-    validate_measurement_records(
-        value(&report, "declarations"),
-        &format!("{WHERE}.declarations"),
-        &[
-            "module",
-            "declaration_index",
-            "declaration",
-            "term_nodes",
-            "elaboration_elapsed_ns",
-        ],
-        &["module", "declaration"],
-    )?;
+    let mut declaration_fields = vec![
+        "module",
+        "declaration_index",
+        "declaration",
+        "term_nodes",
+        "elaboration_elapsed_ns",
+    ];
+    if has_declaration_kernel {
+        declaration_fields.push("kernel");
+        validate_measurement_records_with_opaque(
+            value(&report, "declarations"),
+            &format!("{WHERE}.declarations"),
+            &declaration_fields,
+            &["module", "declaration"],
+            &["kernel"],
+        )?;
+    } else {
+        validate_measurement_records(
+            value(&report, "declarations"),
+            &format!("{WHERE}.declarations"),
+            &declaration_fields,
+            &["module", "declaration"],
+        )?;
+    }
     let declarations = require_array(
         value(&report, "declarations"),
         &format!("{WHERE}.declarations"),
@@ -1106,6 +1733,12 @@ fn validate_performance_measurements(
             )));
         }
         previous_declaration = Some(key);
+        if has_declaration_kernel && value(&object, "kernel").kind() != JsonValueKind::Null {
+            validate_accepted_kernel_measurement(
+                value(&object, "kernel"),
+                &format!("{where_}.kernel"),
+            )?;
+        }
     }
     validate_measurement_records(
         value(&report, "candidates"),
@@ -2723,14 +3356,18 @@ fn validate_manifest(
 #[cfg(test)]
 mod tests {
     use super::{
-        shell_words, validate_command_result_shape, validate_performance_measurements,
-        validate_timestamp, JsonDocument,
+        shell_words, validate_command_result_shape, validate_kernel_fuel_diagnostic,
+        validate_performance_measurements, validate_timestamp, JsonDocument,
     };
     use npa_api::{
-        performance_measurement_report_json, PerformanceMeasurementLabel,
-        PerformanceMeasurementMode, PerformanceMeasurementRecorder, PerformanceModuleMeasurement,
-        PerformancePackageShardCostModel, PerformancePackageShardMemoryModel,
-        PerformancePackageShardReductionReason, PerformancePackageShardingMeasurement,
+        performance_measurement_report_json, PerformanceAcceptedKernelMeasurement,
+        PerformanceAcceptedKernelOutcome, PerformanceDeclarationMeasurement,
+        PerformanceKernelDeltaHotsetSummary, PerformanceKernelFuelDomainTotals,
+        PerformanceKernelFuelTotals, PerformanceKernelSubsystem, PerformanceKernelWork,
+        PerformanceMeasurementLabel, PerformanceMeasurementMode, PerformanceMeasurementRecorder,
+        PerformanceModuleMeasurement, PerformancePackageShardCostModel,
+        PerformancePackageShardMemoryModel, PerformancePackageShardReductionReason,
+        PerformancePackageShardingMeasurement,
     };
 
     #[test]
@@ -2770,6 +3407,10 @@ mod tests {
         let valid = JsonDocument::parse(&json).unwrap();
         validate_performance_measurements(valid.root(), "summary").unwrap();
 
+        let legacy_v0_2 = legacy_performance_measurements_v0_2(&json);
+        let legacy = JsonDocument::parse(&legacy_v0_2).unwrap();
+        validate_performance_measurements(legacy.root(), "summary").unwrap();
+
         let legacy_v0_1 = legacy_performance_measurements_v0_1(&json);
         let legacy = JsonDocument::parse(&legacy_v0_1).unwrap();
         validate_performance_measurements(legacy.root(), "summary").unwrap();
@@ -2784,7 +3425,7 @@ mod tests {
         );
 
         let old_schema_with_new_shape = json.replacen(
-            "\"schema\":\"npa.performance.measurements.v0.2\"",
+            "\"schema\":\"npa.performance.measurements.v0.3\"",
             "\"schema\":\"npa.performance.measurements.v0.1\"",
             1,
         );
@@ -2895,28 +3536,609 @@ mod tests {
     }
 
     #[test]
+    fn common_measurement_v0_3_requires_and_strictly_validates_declaration_kernel() {
+        let mut recorder =
+            PerformanceMeasurementRecorder::new(PerformanceMeasurementMode::Detailed);
+        recorder.record_declaration(PerformanceDeclarationMeasurement {
+            module: "Fixture.Module".to_owned(),
+            declaration_index: 0,
+            declaration: "Fixture.Module.no_kernel".to_owned(),
+            term_nodes: 1,
+            elaboration_elapsed_ns: 2,
+            kernel: None,
+        });
+        recorder.record_declaration(PerformanceDeclarationMeasurement {
+            module: "Fixture.Module".to_owned(),
+            declaration_index: 1,
+            declaration: "Fixture.Module.accepted".to_owned(),
+            term_nodes: 3,
+            elaboration_elapsed_ns: 4,
+            kernel: Some(accepted_kernel_with_empty_hotset()),
+        });
+        let current = performance_measurement_report_json(&recorder.report().unwrap());
+        let document = JsonDocument::parse(&current).unwrap();
+        validate_performance_measurements(document.root(), "detailed").unwrap();
+        assert!(current.contains("\"kernel\":null"));
+        assert!(current.contains("\"subsystem\":\"fast_kernel\""));
+
+        let missing_nullable_kernel = current.replacen(",\"kernel\":null", "", 1);
+        let document = JsonDocument::parse(&missing_nullable_kernel).unwrap();
+        let error = validate_performance_measurements(document.root(), "detailed")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("missing field 'kernel'"), "{error}");
+
+        let relabeled = legacy_performance_measurements_v0_2(&current);
+        let document = JsonDocument::parse(&relabeled).unwrap();
+        let error = validate_performance_measurements(document.root(), "detailed")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unknown field 'kernel'"), "{error}");
+
+        for (changed, expected) in [
+            (
+                current.replace("\"subsystem\":\"fast_kernel\"", "\"subsystem\":\"other\""),
+                "unsupported subsystem or outcome",
+            ),
+            (
+                current.replace("\"outcome\":\"accepted\"", "\"outcome\":\"rejected\""),
+                "unsupported subsystem or outcome",
+            ),
+            (
+                current.replacen(
+                    "\"logical_spent\":10",
+                    "\"logical_spent\":11",
+                    1,
+                ),
+                "operation fuel totals",
+            ),
+            (
+                current.replacen(
+                    "\"physical_reductions\":21",
+                    "\"physical_reductions\":22",
+                    1,
+                ),
+                "physical_reductions",
+            ),
+            (
+                current.replace("\"capacity\":256", "\"capacity\":255"),
+                "bounded hotset limits",
+            ),
+            (
+                current.replace(
+                    "\"subsystem\":\"fast_kernel\"",
+                    "\"subsystem\":\"fast_kernel\",\"unknown\":0",
+                ),
+                "unknown field 'unknown'",
+            ),
+            (
+                current.replacen(
+                    "\"term_nodes\":1",
+                    "\"term_nodes\":1,\"unknown\":0",
+                    1,
+                ),
+                "unknown field 'unknown'",
+            ),
+            (
+                current.replace(
+                    "\"retained_delta_constants\":{\"retained_names\":0,\"capacity\":256,\"entries\":[],\"emitted\":0,\"entry_limit\":16,\"unretained_name_observations\":0,\"overlong_name_observations\":0,\"output_truncated\":false,\"overflowed\":false}",
+                    "\"retained_delta_constants\":null",
+                ),
+                "retained_delta_constants must be present",
+            ),
+        ] {
+            let document = JsonDocument::parse(&changed).unwrap();
+            let error = validate_performance_measurements(document.root(), "detailed")
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(expected), "expected {expected}: {error}");
+        }
+
+        let mut legacy_recorder =
+            PerformanceMeasurementRecorder::new(PerformanceMeasurementMode::Detailed);
+        legacy_recorder.record_declaration(PerformanceDeclarationMeasurement {
+            module: "Fixture.Module".to_owned(),
+            declaration_index: 0,
+            declaration: "Fixture.Module.legacy".to_owned(),
+            term_nodes: 1,
+            elaboration_elapsed_ns: 2,
+            kernel: None,
+        });
+        let legacy = performance_measurement_report_json(&legacy_recorder.report().unwrap())
+            .replace(",\"kernel\":null", "");
+        let legacy = legacy_performance_measurements_v0_2(&legacy);
+        let document = JsonDocument::parse(&legacy).unwrap();
+        validate_performance_measurements(document.root(), "detailed").unwrap();
+    }
+
+    #[test]
+    fn command_result_v0_4_kernel_fuel_accepts_conversion_and_whnf_exact_shapes() {
+        let conversion = valid_conversion_context_json();
+        let conversion_fuel = valid_conversion_fuel_json();
+        validate_kernel_fuel_json(&conversion_fuel, Some(conversion)).unwrap();
+
+        let whnf_fuel = valid_whnf_fuel_json();
+        validate_kernel_fuel_json(&whnf_fuel, None).unwrap();
+
+        let source = v0_4_command_result_with_fuel(&conversion_fuel, Some(conversion));
+        let document = JsonDocument::parse(&source).unwrap();
+        validate_command_result_shape(document.root(), "0.8.0").unwrap();
+
+        let relabeled = source.replacen(
+            "npa.package.command_result.v0.4",
+            "npa.package.command_result.v0.3",
+            1,
+        );
+        let relabeled = JsonDocument::parse(&relabeled).unwrap();
+        let error = validate_command_result_shape(relabeled.root(), "0.7.0")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unknown field 'kernel_fuel'"), "{error}");
+
+        let unknown_diagnostic = source.replacen(
+            "\"severity\":\"info\"",
+            "\"severity\":\"info\",\"unknown\":0",
+            1,
+        );
+        let document = JsonDocument::parse(&unknown_diagnostic).unwrap();
+        let error = validate_command_result_shape(document.root(), "0.8.0")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unknown field 'unknown'"), "{error}");
+    }
+
+    #[test]
+    fn command_result_v0_4_kernel_fuel_accepts_honest_overflow_and_synthetic_hotsets() {
+        let conversion = valid_conversion_context_json();
+        let operation_overflow = with_top_overflowed(
+            valid_conversion_fuel_json()
+                .replacen("\"remaining\":0", "\"remaining\":1", 1)
+                .replacen(
+                    "\"remaining\":1,\"exhausted\":true,\"overflowed\":false",
+                    "\"remaining\":1,\"exhausted\":true,\"overflowed\":true",
+                    1,
+                ),
+        );
+        validate_kernel_fuel_json(&operation_overflow, Some(conversion)).unwrap();
+
+        let synthetic = valid_conversion_fuel_with_hotset()
+            .replace(
+                "{\"constant\":\"MyProject.Residue.normalize\",\"count\":1720679}",
+                "{\"constant\":\"<overlong-name>\",\"count\":1720679}",
+            )
+            .replace(
+                "\"overlong_name_observations\":0,\"output_truncated\":false",
+                "\"overlong_name_observations\":1720679,\"output_truncated\":true",
+            );
+        validate_kernel_fuel_json(&synthetic, Some(conversion)).unwrap();
+
+        let saturated_hotset = with_top_overflowed(
+            valid_conversion_fuel_with_hotset()
+                .replace("\"count\":3100421", "\"count\":18446744073709551615")
+                .replace("\"count\":1720679", "\"count\":18446744073709551615")
+                .replace(
+                    "\"output_truncated\":false,\"overflowed\":false}",
+                    "\"output_truncated\":false,\"overflowed\":true}",
+                ),
+        );
+        validate_kernel_fuel_json(&saturated_hotset, Some(conversion)).unwrap();
+    }
+
+    #[test]
+    fn command_result_v0_4_kernel_fuel_rejects_numbers_arithmetic_and_cross_object_mismatches() {
+        let valid = valid_conversion_fuel_json();
+        let conversion = valid_conversion_context_json();
+        for (changed, expected) in [
+            (
+                valid.replacen("\"budget\":5000000", "\"budget\":-1", 1),
+                "nonnegative integer",
+            ),
+            (
+                valid.replacen("\"budget\":5000000", "\"budget\":1.5", 1),
+                "nonnegative integer",
+            ),
+            (
+                valid.replacen("\"budget\":5000000", "\"budget\":18446744073709551616", 1),
+                "u64 schema limit",
+            ),
+            (
+                valid.replacen("\"remaining\":0", "\"remaining\":1", 1),
+                "spent + remaining",
+            ),
+            (
+                valid.replacen("\"logical_spent\":18342", "\"logical_spent\":18343", 1),
+                "operation fuel totals",
+            ),
+            (
+                valid.replacen(
+                    "\"physical_reductions\":4821102",
+                    "\"physical_reductions\":4821103",
+                    1,
+                ),
+                "physical_reductions",
+            ),
+            (
+                valid.replacen("\"defeq_calls\":4187", "\"defeq_calls\":5000", 1),
+                "exceeds declaration work",
+            ),
+            (
+                valid.replacen("\"exhausted\":true", "\"exhausted\":false", 1),
+                "exhausted must be true",
+            ),
+            (
+                valid.replacen("\"calls\":27", "\"calls\":0", 1),
+                "calls must be positive",
+            ),
+            (
+                valid.replacen(
+                    "\"exhausted_operation_fuel\":5000000",
+                    "\"exhausted_operation_fuel\":4999999",
+                    1,
+                ),
+                "operation fuel totals",
+            ),
+            (
+                valid.replacen(
+                    "\"exhausted_operation_fuel\":0",
+                    "\"exhausted_operation_fuel\":1",
+                    1,
+                ),
+                "operation fuel totals",
+            ),
+            (
+                valid.replacen("\"overflowed\":false", "\"overflowed\":true", 3),
+                "overflowed disagrees",
+            ),
+        ] {
+            let error = validate_kernel_fuel_json(&changed, Some(conversion)).unwrap_err();
+            assert!(error.contains(expected), "expected {expected}: {error}");
+        }
+
+        let error = validate_kernel_fuel_json(&valid, None).unwrap_err();
+        assert!(error.contains("requires a conversion sibling"), "{error}");
+        let not_exhausted = conversion.replace("fuel_exhausted", "not_defeq");
+        let error = validate_kernel_fuel_json(&valid, Some(&not_exhausted)).unwrap_err();
+        assert!(error.contains("requires outcome fuel_exhausted"), "{error}");
+
+        let mut whnf_with_conversion = valid_whnf_fuel_json();
+        whnf_with_conversion =
+            whnf_with_conversion.replace("\"steps\":[]", "\"steps\":[\"app_argument\"]");
+        let error = validate_kernel_fuel_json(&whnf_with_conversion, Some(conversion)).unwrap_err();
+        assert!(error.contains("WHNF resource"), "{error}");
+    }
+
+    #[test]
+    fn command_result_v0_4_kernel_fuel_rejects_closed_vocabularies_and_bounds() {
+        let valid = valid_conversion_fuel_json();
+        let conversion = valid_conversion_context_json();
+        let mut unknown_top = valid.clone();
+        unknown_top.pop();
+        unknown_top.push_str(",\"unknown\":0}");
+        let long_name = "A".repeat(npa_kernel::KERNEL_DELTA_NAME_BYTE_LIMIT + 1);
+        let excessive_steps = std::iter::repeat_n(
+            "\"app_argument\"",
+            npa_kernel::KERNEL_COMPARISON_PATH_LIMIT + 1,
+        )
+        .collect::<Vec<_>>()
+        .join(",");
+        for (changed, expected) in [
+            (unknown_top, "unknown field 'unknown'"),
+            (
+                valid.replacen("\"budget\":5000000", "\"budget\":5000000,\"unknown\":0", 1),
+                "unknown field 'unknown'",
+            ),
+            (
+                valid.replacen(
+                    "\"failed_operation\":{\"fuel\"",
+                    "\"failed_operation\":{\"unknown\":0,\"fuel\"",
+                    1,
+                ),
+                "unknown field 'unknown'",
+            ),
+            (
+                valid.replacen(
+                    "\"work\":{\"check_calls\"",
+                    "\"work\":{\"unknown\":0,\"check_calls\"",
+                    1,
+                ),
+                "unknown field 'unknown'",
+            ),
+            (
+                valid.replacen(
+                    "\"declaration\":{\"fuel\"",
+                    "\"declaration\":{\"unknown\":0,\"fuel\"",
+                    1,
+                ),
+                "unknown field 'unknown'",
+            ),
+            (
+                valid.replacen("\"fuel\":{\"whnf\"", "\"fuel\":{\"unknown\":0,\"whnf\"", 1),
+                "unknown field 'unknown'",
+            ),
+            (
+                valid.replacen(
+                    "\"whnf\":{\"calls\"",
+                    "\"whnf\":{\"unknown\":0,\"calls\"",
+                    1,
+                ),
+                "unknown field 'unknown'",
+            ),
+            (
+                valid.replacen(
+                    "\"comparison_path\":{\"steps\"",
+                    "\"comparison_path\":{\"unknown\":0,\"steps\"",
+                    1,
+                ),
+                "unknown field 'unknown'",
+            ),
+            (
+                valid.replace(
+                    "npa.kernel-fuel-diagnostic.v0.1",
+                    "npa.kernel-fuel-diagnostic.v0.2",
+                ),
+                "schema is unsupported",
+            ),
+            (
+                valid.replacen("\"trusted\":false", "\"trusted\":true", 1),
+                "must be untrusted and not proof evidence",
+            ),
+            (
+                valid.replacen("\"proof_evidence\":false", "\"proof_evidence\":true", 1),
+                "must be untrusted and not proof evidence",
+            ),
+            (
+                valid.replace("\"subsystem\":\"fast_kernel\"", "\"subsystem\":\"other\""),
+                "subsystem is unsupported",
+            ),
+            (
+                valid.replace("\"resource\":\"conversion\"", "\"resource\":\"other\""),
+                "resource is unsupported",
+            ),
+            (
+                valid.replacen("\"app_argument\"", "\"unknown_step\"", 1),
+                "steps[0] is unsupported",
+            ),
+            (
+                valid.replace(
+                    "\"steps\":[\"app_argument\",\"pi_body\",\"whnf_left\",\"app_function\"]",
+                    &format!("\"steps\":[{excessive_steps}]"),
+                ),
+                "steps exceeds the schema limit",
+            ),
+            (
+                valid_conversion_fuel_with_hotset().replace("MyProject.Expr.eval", &long_name),
+                "bounded canonical name",
+            ),
+        ] {
+            let error = validate_kernel_fuel_json(&changed, Some(conversion)).unwrap_err();
+            assert!(error.contains(expected), "expected {expected}: {error}");
+        }
+    }
+
+    #[test]
+    fn command_result_v0_4_kernel_fuel_rejects_invalid_hotsets() {
+        let valid = valid_conversion_fuel_with_hotset();
+        let conversion = valid_conversion_context_json();
+        let duplicate = valid.replace("MyProject.Residue.normalize", "MyProject.Expr.eval");
+        let invalid_synthetic = valid.replace("MyProject.Residue.normalize", "<overlong-name>");
+        for (changed, expected) in [
+            (
+                valid.replace("\"capacity\":256", "\"capacity\":255"),
+                "bounded hotset limits",
+            ),
+            (
+                valid.replace("\"entry_limit\":16", "\"entry_limit\":15"),
+                "bounded hotset limits",
+            ),
+            (
+                valid.replace("\"emitted\":2", "\"emitted\":1"),
+                "emitted disagrees",
+            ),
+            (
+                valid.replacen("\"count\":3100421", "\"count\":0", 1),
+                "count must be positive",
+            ),
+            (duplicate, "constant is duplicated"),
+            (
+                valid.replacen("\"count\":3100421", "\"count\":1", 1),
+                "descending-count/ascending-name order",
+            ),
+            (
+                valid.replace("MyProject.Expr.eval", "Not..Canonical"),
+                "bounded canonical name",
+            ),
+            (invalid_synthetic, "synthetic count disagrees"),
+            (
+                valid.replace(
+                    "\"unretained_name_observations\":0",
+                    "\"unretained_name_observations\":1",
+                ),
+                "bounded hotset limits",
+            ),
+            (
+                valid.replace("\"output_truncated\":false", "\"output_truncated\":true"),
+                "output_truncated disagrees",
+            ),
+            (
+                valid.replacen("\"count\":3100421", "\"count\":3100420", 1),
+                "observations disagree",
+            ),
+            (
+                valid.replacen(
+                    "\"constant\":\"MyProject.Expr.eval\"",
+                    "\"constant\":\"MyProject.Expr.eval\",\"unknown\":0",
+                    1,
+                ),
+                "unknown field 'unknown'",
+            ),
+            (
+                valid.replacen(
+                    "\"retained_names\":2",
+                    "\"retained_names\":2,\"unknown\":0",
+                    1,
+                ),
+                "unknown field 'unknown'",
+            ),
+        ] {
+            let error = validate_kernel_fuel_json(&changed, Some(conversion)).unwrap_err();
+            assert!(error.contains(expected), "expected {expected}: {error}");
+        }
+    }
+
+    #[test]
     fn command_result_validator_accepts_integrated_timing_v0_2() {
         let mut recorder = PerformanceMeasurementRecorder::new(PerformanceMeasurementMode::Summary);
         recorder.add_counter(PerformanceMeasurementLabel::PackageModulesChecked, 2);
         let measurements =
             performance_measurement_report_json(&recorder.report().expect("enabled report"));
         let source = format!(
-            "{{\"schema\":\"npa.package.command_result.v0.3\",\"command\":\"package verify-certs\",\"root\":\".\",\"status\":\"passed\",\"diagnostics\":[{{\"kind\":\"GeneratedArtifact\",\"reason_code\":\"package_verified\",\"severity\":\"info\"}}],\"artifacts\":[],\"timings\":{{\"schema\":\"npa.package.timings.v0.2\",\"mode\":\"summary\",\"unit\":\"ms\",\"proof_evidence\":false,\"build_evidence\":false,\"trusted\":false,\"total_ms\":1,\"measurements\":{measurements}}}}}"
+            "{{\"schema\":\"npa.package.command_result.v0.4\",\"command\":\"package verify-certs\",\"root\":\".\",\"status\":\"passed\",\"diagnostics\":[{{\"kind\":\"GeneratedArtifact\",\"reason_code\":\"package_verified\",\"severity\":\"info\"}}],\"artifacts\":[],\"timings\":{{\"schema\":\"npa.package.timings.v0.2\",\"mode\":\"summary\",\"unit\":\"ms\",\"proof_evidence\":false,\"build_evidence\":false,\"trusted\":false,\"total_ms\":1,\"measurements\":{measurements}}}}}"
         );
         let document = JsonDocument::parse(&source).unwrap();
-        validate_command_result_shape(document.root(), "0.7.0").unwrap();
+        validate_command_result_shape(document.root(), "0.8.0").unwrap();
+
+        let historical_measurements = legacy_performance_measurements_v0_2(&measurements);
+        let historical_source = format!(
+            "{{\"schema\":\"npa.package.command_result.v0.3\",\"command\":\"package verify-certs\",\"root\":\".\",\"status\":\"passed\",\"diagnostics\":[{{\"kind\":\"GeneratedArtifact\",\"reason_code\":\"package_verified\",\"severity\":\"info\"}}],\"artifacts\":[],\"timings\":{{\"schema\":\"npa.package.timings.v0.2\",\"mode\":\"summary\",\"unit\":\"ms\",\"proof_evidence\":false,\"build_evidence\":false,\"trusted\":false,\"total_ms\":1,\"measurements\":{historical_measurements}}}}}"
+        );
+        let historical_document = JsonDocument::parse(&historical_source).unwrap();
+        validate_command_result_shape(historical_document.root(), "0.7.0").unwrap();
 
         let mismatched_measurements =
             measurements.replacen("\"mode\":\"summary\"", "\"mode\":\"detailed\"", 1);
         let mismatched_source = format!(
-            "{{\"schema\":\"npa.package.command_result.v0.3\",\"command\":\"package verify-certs\",\"root\":\".\",\"status\":\"passed\",\"diagnostics\":[{{\"kind\":\"GeneratedArtifact\",\"reason_code\":\"package_verified\",\"severity\":\"info\"}}],\"artifacts\":[],\"timings\":{{\"schema\":\"npa.package.timings.v0.2\",\"mode\":\"summary\",\"unit\":\"ms\",\"proof_evidence\":false,\"build_evidence\":false,\"trusted\":false,\"total_ms\":1,\"measurements\":{mismatched_measurements}}}}}"
+            "{{\"schema\":\"npa.package.command_result.v0.4\",\"command\":\"package verify-certs\",\"root\":\".\",\"status\":\"passed\",\"diagnostics\":[{{\"kind\":\"GeneratedArtifact\",\"reason_code\":\"package_verified\",\"severity\":\"info\"}}],\"artifacts\":[],\"timings\":{{\"schema\":\"npa.package.timings.v0.2\",\"mode\":\"summary\",\"unit\":\"ms\",\"proof_evidence\":false,\"build_evidence\":false,\"trusted\":false,\"total_ms\":1,\"measurements\":{mismatched_measurements}}}}}"
         );
         let mismatched_document = JsonDocument::parse(&mismatched_source).unwrap();
-        assert!(validate_command_result_shape(mismatched_document.root(), "0.7.0").is_err());
+        assert!(validate_command_result_shape(mismatched_document.root(), "0.8.0").is_err());
+    }
+
+    fn valid_conversion_context_json() -> &'static str {
+        "{\"phase\":\"definitional_equality\",\"outcome\":\"fuel_exhausted\",\"lhs_head\":\"application\",\"rhs_head\":\"constant:A.expected\",\"depth\":7}"
+    }
+
+    fn with_top_overflowed(mut fuel: String) -> String {
+        let position = fuel
+            .rfind("\"overflowed\":false")
+            .expect("top-level overflow marker");
+        fuel.replace_range(
+            position..position + "\"overflowed\":false".len(),
+            "\"overflowed\":true",
+        );
+        fuel
+    }
+
+    fn accepted_kernel_with_empty_hotset() -> PerformanceAcceptedKernelMeasurement {
+        PerformanceAcceptedKernelMeasurement {
+            subsystem: PerformanceKernelSubsystem::FastKernel,
+            outcome: PerformanceAcceptedKernelOutcome::Accepted,
+            fuel: PerformanceKernelFuelTotals {
+                whnf: PerformanceKernelFuelDomainTotals {
+                    calls: 1,
+                    logical_spent: 10,
+                    successful_operation_fuel: 10,
+                    exhausted_operation_fuel: 0,
+                    overflowed: false,
+                },
+                conversion: PerformanceKernelFuelDomainTotals {
+                    calls: 2,
+                    logical_spent: 20,
+                    successful_operation_fuel: 20,
+                    exhausted_operation_fuel: 0,
+                    overflowed: false,
+                },
+            },
+            work: PerformanceKernelWork {
+                check_calls: 1,
+                infer_calls: 2,
+                whnf_calls: 3,
+                defeq_calls: 4,
+                quick_equality_hits: 5,
+                beta_steps: 6,
+                delta_steps: 0,
+                iota_steps: 7,
+                zeta_steps: 8,
+                physical_reductions: 21,
+                overflowed: false,
+            },
+            retained_delta_constants: PerformanceKernelDeltaHotsetSummary {
+                retained_names: 0,
+                capacity: 256,
+                entries: Vec::new(),
+                emitted: 0,
+                entry_limit: 16,
+                unretained_name_observations: 0,
+                overlong_name_observations: 0,
+                output_truncated: false,
+                overflowed: false,
+            },
+            overflowed: false,
+        }
+    }
+
+    fn valid_conversion_fuel_json() -> String {
+        "{\"schema\":\"npa.kernel-fuel-diagnostic.v0.1\",\"trusted\":false,\"proof_evidence\":false,\"subsystem\":\"fast_kernel\",\"resource\":\"conversion\",\"failed_operation\":{\"fuel\":{\"budget\":5000000,\"spent\":5000000,\"remaining\":0,\"exhausted\":true,\"overflowed\":false},\"work\":{\"check_calls\":0,\"infer_calls\":0,\"whnf_calls\":9120,\"defeq_calls\":4187,\"quick_equality_hits\":203,\"beta_steps\":64,\"delta_steps\":4821031,\"iota_steps\":0,\"zeta_steps\":7,\"physical_reductions\":4821102,\"overflowed\":false}},\"declaration\":{\"fuel\":{\"whnf\":{\"calls\":114,\"logical_spent\":18342,\"successful_operation_fuel\":18342,\"exhausted_operation_fuel\":0,\"overflowed\":false},\"conversion\":{\"calls\":27,\"logical_spent\":5000218,\"successful_operation_fuel\":218,\"exhausted_operation_fuel\":5000000,\"overflowed\":false}},\"work\":{\"check_calls\":1,\"infer_calls\":12,\"whnf_calls\":9234,\"defeq_calls\":4214,\"quick_equality_hits\":210,\"beta_steps\":64,\"delta_steps\":4821100,\"iota_steps\":0,\"zeta_steps\":7,\"physical_reductions\":4821171,\"overflowed\":false},\"overflowed\":false},\"comparison_path\":{\"steps\":[\"app_argument\",\"pi_body\",\"whnf_left\",\"app_function\"],\"truncated\":false},\"retained_delta_constants\":null,\"overflowed\":false}"
+            .to_owned()
+    }
+
+    fn valid_whnf_fuel_json() -> String {
+        valid_conversion_fuel_json()
+            .replacen("\"resource\":\"conversion\"", "\"resource\":\"whnf\"", 1)
+            .replacen(
+                "\"calls\":114,\"logical_spent\":18342,\"successful_operation_fuel\":18342,\"exhausted_operation_fuel\":0",
+                "\"calls\":114,\"logical_spent\":5018342,\"successful_operation_fuel\":18342,\"exhausted_operation_fuel\":5000000",
+                1,
+            )
+            .replacen(
+                "\"calls\":27,\"logical_spent\":5000218,\"successful_operation_fuel\":218,\"exhausted_operation_fuel\":5000000",
+                "\"calls\":27,\"logical_spent\":218,\"successful_operation_fuel\":218,\"exhausted_operation_fuel\":0",
+                1,
+            )
+            .replace(
+                "\"steps\":[\"app_argument\",\"pi_body\",\"whnf_left\",\"app_function\"]",
+                "\"steps\":[]",
+            )
+    }
+
+    fn valid_conversion_fuel_with_hotset() -> String {
+        valid_conversion_fuel_json().replace(
+            "\"retained_delta_constants\":null",
+            "\"retained_delta_constants\":{\"retained_names\":2,\"capacity\":256,\"entries\":[{\"constant\":\"MyProject.Expr.eval\",\"count\":3100421},{\"constant\":\"MyProject.Residue.normalize\",\"count\":1720679}],\"emitted\":2,\"entry_limit\":16,\"unretained_name_observations\":0,\"overlong_name_observations\":0,\"output_truncated\":false,\"overflowed\":false}",
+        )
+    }
+
+    fn validate_kernel_fuel_json(fuel: &str, conversion: Option<&str>) -> Result<(), String> {
+        let fuel = JsonDocument::parse(fuel).expect("kernel-fuel test JSON");
+        let conversion = conversion.map(|conversion| {
+            JsonDocument::parse(conversion).expect("conversion-context test JSON")
+        });
+        validate_kernel_fuel_diagnostic(
+            fuel.root(),
+            "kernel_fuel",
+            conversion.as_ref().map(JsonDocument::root),
+        )
+        .map_err(|error| error.to_string())
+    }
+
+    fn v0_4_command_result_with_fuel(fuel: &str, conversion: Option<&str>) -> String {
+        let conversion = conversion
+            .map(|conversion| format!(",\"conversion\":{conversion}"))
+            .unwrap_or_default();
+        format!(
+            "{{\"schema\":\"npa.package.command_result.v0.4\",\"command\":\"package verify-certs\",\"root\":\".\",\"status\":\"passed\",\"diagnostics\":[{{\"kind\":\"KernelFuelExhausted\",\"reason_code\":\"kernel_fuel_exhausted\",\"severity\":\"info\"{conversion},\"kernel_fuel\":{fuel}}}],\"artifacts\":[]}}"
+        )
+    }
+
+    fn legacy_performance_measurements_v0_2(current: &str) -> String {
+        current.replacen(
+            "\"schema\":\"npa.performance.measurements.v0.3\"",
+            "\"schema\":\"npa.performance.measurements.v0.2\"",
+            1,
+        )
     }
 
     fn legacy_performance_measurements_v0_1(current: &str) -> String {
-        current
+        legacy_performance_measurements_v0_2(current)
             .replace(
                 ",\"package_sharding\":null,\"package_layers\":[],\"package_layer_details\":{\"attempted\":0,\"retained\":0,\"omitted\":0},\"package_shards\":[],\"package_shard_details\":{\"attempted\":0,\"retained\":0,\"omitted\":0}",
                 "",

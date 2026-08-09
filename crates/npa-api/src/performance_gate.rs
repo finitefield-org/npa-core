@@ -455,7 +455,7 @@ mod tests {
     };
 
     const FIXTURE: &str = r#"{"schema":"npa.performance.fixtures.v0.1","scenarios":[{"id":"compact","kind":"warmed-checked-artifact-verifier","package_root":"testdata/package/npa-std","verifier":"fast","cache_policy":"disabled","warmup":1,"samples":3,"notes":"fixture"}]}"#;
-    const BASELINE: &str = r#"{"schema":"npa.performance.baselines.v0.1","measurement_schema":"npa.performance.measurements.v0.2","scenarios":[{"id":"compact","status":"passed","module_count":1,"deterministic_counters":{"package.live_results":1,"package.modules_checked":1},"coverage":{"live_results_min":1,"proof_evidence_reduction_allowed":false}}],"update_policy":"manual"}"#;
+    const BASELINE: &str = r#"{"schema":"npa.performance.baselines.v0.1","measurement_schema":"npa.performance.measurements.v0.3","scenarios":[{"id":"compact","status":"passed","module_count":1,"deterministic_counters":{"package.live_results":1,"package.modules_checked":1},"coverage":{"live_results_min":1,"proof_evidence_reduction_allowed":false}}],"update_policy":"manual"}"#;
 
     #[test]
     fn fixture_selection_is_bound_to_explicit_arguments() {
@@ -495,6 +495,14 @@ mod tests {
             BASELINE.replace("package.modules_checked\":1", "package.modules_checked\":2");
         assert!(
             validate_performance_measurement_baseline(&mismatched, "compact", &report).is_err()
+        );
+
+        let historical = BASELINE.replace(
+            "npa.performance.measurements.v0.3",
+            "npa.performance.measurements.v0.2",
+        );
+        assert!(
+            validate_performance_measurement_baseline(&historical, "compact", &report).is_err()
         );
     }
 }

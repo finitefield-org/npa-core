@@ -12,7 +12,7 @@ use npa_kernel::{
 #[cfg(test)]
 use npa_tactic::check_current_decl_for_machine_tactic_from_verified_imports;
 use npa_tactic::{
-    check_current_decl_for_machine_tactic_from_verified_imports_with_kernel_profile,
+    check_current_decl_for_machine_tactic_from_verified_imports_with_kernel_profile_and_owner_pair,
     checked_decl_signature_canonical_bytes, CheckedCurrentDecl, MachineKernelProfile,
     MachineTacticDiagnostic, MachineTacticDiagnosticKind, VerifiedImportRef,
 };
@@ -62,6 +62,9 @@ pub struct CurrentDeclIndexEntry {
     pub core_decl: Decl,
     pub core_decl_hash: Hash,
     pub dependency_report: CurrentDeclDependencyReport,
+    pub owner_certificate_format: String,
+    pub owner_core_spec: String,
+    pub dependency_selective_fingerprint: Hash,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -97,9 +100,48 @@ pub struct CurrentDeclDependencyReport {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CurrentDeclDependencyEntry {
-    pub dependency_ref: MachineDependencyRefWire,
-    pub decl_interface_hash: Hash,
+pub enum CurrentDeclDependencyEntry {
+    Interface {
+        dependency_ref: MachineDependencyRefWire,
+        decl_interface_hash: Hash,
+    },
+    LocalImplementation {
+        dependency_ref: MachineDependencyRefWire,
+        decl_interface_hash: Hash,
+        decl_certificate_hash: Hash,
+    },
+}
+
+impl CurrentDeclDependencyEntry {
+    pub fn dependency_ref(&self) -> &MachineDependencyRefWire {
+        match self {
+            Self::Interface { dependency_ref, .. }
+            | Self::LocalImplementation { dependency_ref, .. } => dependency_ref,
+        }
+    }
+
+    pub fn decl_interface_hash(&self) -> Hash {
+        match self {
+            Self::Interface {
+                decl_interface_hash,
+                ..
+            }
+            | Self::LocalImplementation {
+                decl_interface_hash,
+                ..
+            } => *decl_interface_hash,
+        }
+    }
+
+    pub fn decl_certificate_hash(&self) -> Option<Hash> {
+        match self {
+            Self::Interface { .. } => None,
+            Self::LocalImplementation {
+                decl_certificate_hash,
+                ..
+            } => Some(*decl_certificate_hash),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -164,6 +206,12 @@ pub enum CheckedCurrentDeclProjectionError {
     ModulePrefixMismatch {
         module: Name,
         name: Name,
+    },
+    UnsupportedOwnerPair {
+        source_index: u64,
+    },
+    OwnerPairMismatch {
+        source_index: u64,
     },
     DependencyReportMismatch {
         source_index: u64,
@@ -288,7 +336,7 @@ pub fn project_checked_current_decl_context_with_kernel_profile(
             }
         })?;
 
-    let mut checked_current_decls = Vec::new();
+    let mut checked_current_decls: Vec<CheckedCurrentDecl> = Vec::new();
     let mut decl_index_table = Vec::new();
     let mut generated_decl_table = Vec::new();
     for source_index in 0..root_source_index {
@@ -296,6 +344,21 @@ pub fn project_checked_current_decl_context_with_kernel_profile(
             .remove(&source_index)
             .expect("prefix check guarantees decoded package exists");
         ensure_name_has_module_prefix(root_module, &decoded.signature.name)?;
+        if !matches!(
+            (
+                decoded.owner_certificate_format.as_str(),
+                decoded.owner_core_spec.as_str(),
+            ),
+            ("NPA-CERT-0.2.0", "NPA-Core-0.2.0") | ("NPA-CERT-0.3.0", "NPA-Core-0.3.0")
+        ) {
+            return Err(CheckedCurrentDeclProjectionError::UnsupportedOwnerPair { source_index });
+        }
+        if checked_current_decls.first().is_some_and(|first| {
+            first.owner_certificate_format() != decoded.owner_certificate_format
+                || first.owner_core_spec() != decoded.owner_core_spec
+        }) {
+            return Err(CheckedCurrentDeclProjectionError::OwnerPairMismatch { source_index });
+        }
 
         let core_decl = decoded.core_package.to_kernel_decl(
             root_module,
@@ -322,6 +385,7 @@ pub fn project_checked_current_decl_context_with_kernel_profile(
             &decoded.core_package,
             &decl_index_table,
             &generated_decl_table,
+            decoded.owner_certificate_format == "NPA-CERT-0.3.0",
         )?;
         if recomputed_report != decoded.dependency_report {
             return Err(
@@ -330,12 +394,14 @@ pub fn project_checked_current_decl_context_with_kernel_profile(
         }
 
         let checked =
-            check_current_decl_for_machine_tactic_from_verified_imports_with_kernel_profile(
+            check_current_decl_for_machine_tactic_from_verified_imports_with_kernel_profile_and_owner_pair(
                 kernel_profile,
                 &machine_tactic_imports,
                 &checked_current_decls,
                 source_index,
                 core_decl.clone(),
+                &decoded.owner_certificate_format,
+                &decoded.owner_core_spec,
             )
             .map_err(|diagnostic| {
                 CheckedCurrentDeclProjectionError::MachineTacticRejected {
@@ -358,6 +424,11 @@ pub fn project_checked_current_decl_context_with_kernel_profile(
                 CheckedCurrentDeclProjectionError::CheckedEnvFingerprintMismatch { source_index },
             );
         }
+        if decoded.dependency_selective_fingerprint != checked.dependency_selective_fingerprint() {
+            return Err(
+                CheckedCurrentDeclProjectionError::DependencyReportMismatch { source_index },
+            );
+        }
 
         let signature = decoded.signature;
         let core_decl_hash = checked.core_decl_hash();
@@ -374,6 +445,9 @@ pub fn project_checked_current_decl_context_with_kernel_profile(
             core_decl,
             core_decl_hash,
             dependency_report: recomputed_report,
+            owner_certificate_format: decoded.owner_certificate_format,
+            owner_core_spec: decoded.owner_core_spec,
+            dependency_selective_fingerprint: decoded.dependency_selective_fingerprint,
         };
         checked_current_decls.push(checked);
         decl_index_table.push(entry);
@@ -425,6 +499,9 @@ struct DecodedCheckedCurrentDeclPackage {
     signature_canonical_bytes: Vec<u8>,
     core_package: CoreDeclPackage,
     dependency_report: CurrentDeclDependencyReport,
+    owner_certificate_format: String,
+    owner_core_spec: String,
+    dependency_selective_fingerprint: Hash,
     prior_chain_fingerprint: Hash,
     checked_env_fingerprint: Hash,
     canonical_bytes: Vec<u8>,
@@ -442,13 +519,16 @@ fn decode_checked_current_decl_package(
     bytes: &[u8],
 ) -> Result<DecodedCheckedCurrentDeclPackage, CheckedCurrentDeclProjectionError> {
     let mut decoder = PackageDecoder::new(bytes);
-    decoder.tag("npa.machine-api.checked-current-decl-package.v5")?;
+    decoder.tag("npa.machine-api.checked-current-decl-package.v6")?;
     let source_index = decoder.u64()?;
     let signature_start = decoder.offset();
     let signature = decoder.checked_decl_signature()?;
     let signature_canonical_bytes = bytes[signature_start..decoder.offset()].to_vec();
     let core_package = decoder.core_decl_package()?;
     let dependency_report = decoder.current_decl_dependency_report()?;
+    let owner_certificate_format = decoder.string()?;
+    let owner_core_spec = decoder.string()?;
+    let dependency_selective_fingerprint = decoder.hash()?;
     let prior_chain_fingerprint = decoder.hash()?;
     let checked_env_fingerprint = decoder.hash()?;
     if !decoder.is_done() {
@@ -462,6 +542,9 @@ fn decode_checked_current_decl_package(
         signature_canonical_bytes,
         core_package,
         dependency_report,
+        owner_certificate_format,
+        owner_core_spec,
+        dependency_selective_fingerprint,
         prior_chain_fingerprint,
         checked_env_fingerprint,
         canonical_bytes: bytes.to_vec(),
@@ -1052,14 +1135,29 @@ impl<'a> PackageDecoder<'a> {
     fn current_decl_dependency_report(
         &mut self,
     ) -> Result<CurrentDeclDependencyReport, CheckedCurrentDeclProjectionError> {
-        self.tag("npa.machine-api.current-decl-dependency-report.v4")?;
+        self.tag("npa.machine-api.current-decl-dependency-report.v5")?;
         let dep_len = self.bounded_len()?;
         let mut direct_dependency_entries = Vec::with_capacity(dep_len);
         for _ in 0..dep_len {
-            self.tag("npa.machine-api.current-decl-dependency-entry.v1")?;
-            direct_dependency_entries.push(CurrentDeclDependencyEntry {
-                dependency_ref: self.machine_dependency_ref_wire()?,
-                decl_interface_hash: self.hash()?,
+            self.tag("npa.machine-api.current-decl-dependency-entry.v2")?;
+            let mode = self.byte()?;
+            let dependency_ref = self.machine_dependency_ref_wire()?;
+            let decl_interface_hash = self.hash()?;
+            direct_dependency_entries.push(match mode {
+                0 => CurrentDeclDependencyEntry::Interface {
+                    dependency_ref,
+                    decl_interface_hash,
+                },
+                1 => CurrentDeclDependencyEntry::LocalImplementation {
+                    dependency_ref,
+                    decl_interface_hash,
+                    decl_certificate_hash: self.hash()?,
+                },
+                _ => {
+                    return Err(CheckedCurrentDeclProjectionError::DecodeFailed {
+                        reason: "unknown current dependency mode",
+                    })
+                }
             });
         }
         let axiom_len = self.bounded_len()?;
@@ -2360,11 +2458,14 @@ fn sort_dedup_axiom_refs(entries: &mut Vec<MachineAxiomRefWire>) {
 
 fn encode_checked_current_decl_package(package: &DecodedCheckedCurrentDeclPackage) -> Vec<u8> {
     let mut out = Vec::new();
-    encode_string(&mut out, "npa.machine-api.checked-current-decl-package.v5");
+    encode_string(&mut out, "npa.machine-api.checked-current-decl-package.v6");
     encode_uvar(&mut out, package.source_index);
     out.extend(encode_checked_decl_signature(&package.signature));
     encode_core_decl_package_to(&mut out, &package.core_package);
     encode_current_decl_dependency_report_to(&mut out, &package.dependency_report);
+    encode_string(&mut out, &package.owner_certificate_format);
+    encode_string(&mut out, &package.owner_core_spec);
+    out.extend(package.dependency_selective_fingerprint);
     out.extend(package.prior_chain_fingerprint);
     out.extend(package.checked_env_fingerprint);
     out
@@ -2411,7 +2512,7 @@ fn encode_current_decl_dependency_report_to(
     out: &mut Vec<u8>,
     report: &CurrentDeclDependencyReport,
 ) {
-    encode_string(out, "npa.machine-api.current-decl-dependency-report.v4");
+    encode_string(out, "npa.machine-api.current-decl-dependency-report.v5");
     encode_uvar(out, report.direct_dependency_entries.len() as u64);
     for entry in &report.direct_dependency_entries {
         out.extend(encode_current_decl_dependency_entry(entry));
@@ -2424,9 +2525,27 @@ fn encode_current_decl_dependency_report_to(
 
 fn encode_current_decl_dependency_entry(entry: &CurrentDeclDependencyEntry) -> Vec<u8> {
     let mut out = Vec::new();
-    encode_string(&mut out, "npa.machine-api.current-decl-dependency-entry.v1");
-    out.extend(encode_machine_dependency_ref_wire(&entry.dependency_ref));
-    out.extend(entry.decl_interface_hash);
+    encode_string(&mut out, "npa.machine-api.current-decl-dependency-entry.v2");
+    match entry {
+        CurrentDeclDependencyEntry::Interface {
+            dependency_ref,
+            decl_interface_hash,
+        } => {
+            out.push(0);
+            out.extend(encode_machine_dependency_ref_wire(dependency_ref));
+            out.extend(decl_interface_hash);
+        }
+        CurrentDeclDependencyEntry::LocalImplementation {
+            dependency_ref,
+            decl_interface_hash,
+            decl_certificate_hash,
+        } => {
+            out.push(1);
+            out.extend(encode_machine_dependency_ref_wire(dependency_ref));
+            out.extend(decl_interface_hash);
+            out.extend(decl_certificate_hash);
+        }
+    }
     out
 }
 
@@ -2908,6 +3027,7 @@ fn encode_uvar(out: &mut Vec<u8>, mut value: u64) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn derive_dependency_report(
     root_module: &Name,
     source_index: u64,
@@ -2916,6 +3036,7 @@ fn derive_dependency_report(
     package: &CoreDeclPackage,
     prior_decls: &[CurrentDeclIndexEntry],
     generated: &[CurrentGeneratedDeclEntry],
+    include_local_implementations: bool,
 ) -> Result<CurrentDeclDependencyReport, CheckedCurrentDeclProjectionError> {
     let mut direct_dependency_entries = Vec::new();
     for global_ref in root_decl_global_refs(package)? {
@@ -2933,10 +3054,19 @@ fn derive_dependency_report(
         )?);
     }
     sort_dedup_dependency_entries(&mut direct_dependency_entries);
+    if include_local_implementations {
+        append_reached_local_implementations(
+            source_index,
+            prior_decls,
+            generated,
+            &mut direct_dependency_entries,
+        )?;
+        sort_dedup_dependency_entries(&mut direct_dependency_entries);
+    }
 
     let mut axiom_dependencies = Vec::new();
     for entry in &direct_dependency_entries {
-        match &entry.dependency_ref {
+        match entry.dependency_ref() {
             MachineDependencyRefWire::Imported {
                 module,
                 name,
@@ -2952,17 +3082,17 @@ fn derive_dependency_report(
                             source_index,
                             module: module.clone(),
                             name: name.clone(),
-                            decl_interface_hash: entry.decl_interface_hash,
+                            decl_interface_hash: entry.decl_interface_hash(),
                         },
                     )?;
                 let export =
-                    imported_export_by_name_hash(import_entry, name, &entry.decl_interface_hash)
+                    imported_export_by_name_hash(import_entry, name, &entry.decl_interface_hash())
                         .ok_or_else(|| {
                             CheckedCurrentDeclProjectionError::MissingImportedExport {
                                 source_index,
                                 module: module.clone(),
                                 name: name.clone(),
-                                decl_interface_hash: entry.decl_interface_hash,
+                                decl_interface_hash: entry.decl_interface_hash(),
                             }
                         })?;
                 for axiom in &export.axiom_dependencies {
@@ -3008,7 +3138,7 @@ fn derive_dependency_report(
             }
             MachineDependencyRefWire::Builtin { name } => {
                 if let Some(axiom) =
-                    builtin_axiom_ref_to_wire(source_index, name, entry.decl_interface_hash)?
+                    builtin_axiom_ref_to_wire(source_index, name, entry.decl_interface_hash())?
                 {
                     axiom_dependencies.push(axiom);
                 }
@@ -3021,6 +3151,164 @@ fn derive_dependency_report(
         direct_dependency_entries,
         axiom_dependencies,
     })
+}
+
+fn append_reached_local_implementations(
+    source_index: u64,
+    prior_decls: &[CurrentDeclIndexEntry],
+    generated: &[CurrentGeneratedDeclEntry],
+    entries: &mut Vec<CurrentDeclDependencyEntry>,
+) -> Result<(), CheckedCurrentDeclProjectionError> {
+    let mut pending = BTreeSet::new();
+    for entry in entries.iter() {
+        match entry.dependency_ref() {
+            MachineDependencyRefWire::CurrentModule {
+                source_index: dependency_source_index,
+                ..
+            } => {
+                pending.insert(*dependency_source_index);
+            }
+            MachineDependencyRefWire::CurrentGenerated {
+                parent_source_index,
+                ..
+            } => {
+                pending.insert(*parent_source_index);
+            }
+            MachineDependencyRefWire::Imported { .. }
+            | MachineDependencyRefWire::Builtin { .. } => {}
+        }
+    }
+
+    let by_name = prior_decls
+        .iter()
+        .map(|decl| (decl.signature.name.as_dotted(), decl.source_index))
+        .collect::<BTreeMap<_, _>>();
+    let generated_by_name = generated
+        .iter()
+        .map(|decl| (decl.generated_name.as_dotted(), decl.parent_source_index))
+        .collect::<BTreeMap<_, _>>();
+    let mut visited = BTreeSet::new();
+    while let Some(next) = pending.iter().next().copied() {
+        pending.remove(&next);
+        if !visited.insert(next) {
+            continue;
+        }
+        let prior = prior_decls
+            .iter()
+            .find(|decl| decl.source_index == next)
+            .ok_or(
+                CheckedCurrentDeclProjectionError::MissingCurrentDependency {
+                    source_index,
+                    dependency_source_index: next,
+                },
+            )?;
+        if is_opaque_current_decl(&prior.core_decl) {
+            entries.push(CurrentDeclDependencyEntry::LocalImplementation {
+                dependency_ref: MachineDependencyRefWire::CurrentModule {
+                    module: prior
+                        .signature
+                        .name
+                        .0
+                        .get(..prior.signature.name.0.len().saturating_sub(1))
+                        .map(|parts| Name(parts.to_vec()))
+                        .unwrap_or_else(|| Name(Vec::new())),
+                    name: prior.signature.name.clone(),
+                    source_index: prior.source_index,
+                },
+                decl_interface_hash: prior.signature.decl_interface_hash,
+                decl_certificate_hash: prior.core_decl_hash,
+            });
+        }
+
+        let mut referenced_names = BTreeSet::new();
+        collect_current_semantic_reference_names(&prior.core_decl, &mut referenced_names);
+        for name in referenced_names {
+            if let Some(index) = by_name.get(&name).or_else(|| generated_by_name.get(&name)) {
+                if *index < source_index {
+                    pending.insert(*index);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn is_opaque_current_decl(decl: &Decl) -> bool {
+    matches!(
+        decl,
+        Decl::Def {
+            reducibility: npa_kernel::Reducibility::Opaque,
+            ..
+        } | Decl::DefConstrained {
+            reducibility: npa_kernel::Reducibility::Opaque,
+            ..
+        }
+    )
+}
+
+fn collect_current_semantic_reference_names(decl: &Decl, names: &mut BTreeSet<String>) {
+    collect_expr_constant_names(decl.ty(), names);
+    match decl {
+        Decl::Def {
+            value,
+            reducibility,
+            ..
+        }
+        | Decl::DefConstrained {
+            value,
+            reducibility,
+            ..
+        } if matches!(
+            reducibility,
+            npa_kernel::Reducibility::Reducible | npa_kernel::Reducibility::Opaque
+        ) =>
+        {
+            collect_expr_constant_names(value, names)
+        }
+        Decl::Inductive { data, .. } => {
+            for constructor in &data.constructors {
+                collect_expr_constant_names(&constructor.ty, names);
+            }
+            if let Some(recursor) = &data.recursor {
+                collect_expr_constant_names(&recursor.ty, names);
+            }
+        }
+        Decl::MutualInductiveBlock { data, .. } => {
+            for inductive in &data.inductives {
+                for constructor in &inductive.constructors {
+                    collect_expr_constant_names(&constructor.ty, names);
+                }
+                if let Some(recursor) = &inductive.recursor {
+                    collect_expr_constant_names(&recursor.ty, names);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_expr_constant_names(expr: &Expr, names: &mut BTreeSet<String>) {
+    match expr {
+        Expr::Sort(_) | Expr::BVar(_) => {}
+        Expr::Const { name, .. } => {
+            names.insert(name.clone());
+        }
+        Expr::App(fun, arg) => {
+            collect_expr_constant_names(fun, names);
+            collect_expr_constant_names(arg, names);
+        }
+        Expr::Lam { ty, body, .. } | Expr::Pi { ty, body, .. } => {
+            collect_expr_constant_names(ty, names);
+            collect_expr_constant_names(body, names);
+        }
+        Expr::Let {
+            ty, value, body, ..
+        } => {
+            collect_expr_constant_names(ty, names);
+            collect_expr_constant_names(value, names);
+            collect_expr_constant_names(body, names);
+        }
+    }
 }
 
 fn root_decl_global_refs(
@@ -3156,7 +3444,7 @@ fn global_ref_to_dependency_entry(
                     decl_interface_hash: *decl_interface_hash,
                 },
             )?;
-            Ok(CurrentDeclDependencyEntry {
+            Ok(CurrentDeclDependencyEntry::Interface {
                 dependency_ref: MachineDependencyRefWire::Imported {
                     module: import_entry.key.module.clone(),
                     name,
@@ -3175,7 +3463,7 @@ fn global_ref_to_dependency_entry(
                         dependency_source_index: *decl_index as u64,
                     },
                 )?;
-            Ok(CurrentDeclDependencyEntry {
+            Ok(CurrentDeclDependencyEntry::Interface {
                 dependency_ref: MachineDependencyRefWire::CurrentModule {
                     module: root_module.clone(),
                     name: prior.signature.name.clone(),
@@ -3205,7 +3493,7 @@ fn global_ref_to_dependency_entry(
                         generated_name: generated_name.clone(),
                     }
                 })?;
-            Ok(CurrentDeclDependencyEntry {
+            Ok(CurrentDeclDependencyEntry::Interface {
                 dependency_ref: MachineDependencyRefWire::CurrentGenerated {
                     module: root_module.clone(),
                     generated_name,
@@ -3230,7 +3518,7 @@ fn global_ref_to_dependency_entry(
         } => {
             let name = package.name(*name)?.clone();
             ensure_builtin_ref(source_index, &name, *decl_interface_hash)?;
-            Ok(CurrentDeclDependencyEntry {
+            Ok(CurrentDeclDependencyEntry::Interface {
                 dependency_ref: MachineDependencyRefWire::Builtin { name },
                 decl_interface_hash: *decl_interface_hash,
             })
@@ -3462,14 +3750,12 @@ pub(crate) fn encode_checked_current_decl_package_for_test(
     source_index: u64,
     decl: Decl,
 ) -> Vec<u8> {
-    let cert = npa_cert::build_module_cert(
-        npa_cert::CoreModule {
-            name: root_module.clone(),
-            declarations: vec![decl.clone()],
-        },
-        &[],
-    )
-    .expect("test current declaration should build as a standalone certificate");
+    let module = npa_cert::CoreModule {
+        name: root_module.clone(),
+        declarations: vec![decl.clone()],
+    };
+    let cert = npa_cert::build_module_cert(module, &[])
+        .expect("test current declaration should build as a standalone certificate");
     let root_decl = cert
         .declarations
         .into_iter()
@@ -3494,6 +3780,7 @@ pub(crate) fn encode_checked_current_decl_package_for_test(
         &core_package,
         &[],
         &[],
+        checked.owner_certificate_format() == "NPA-CERT-0.3.0",
     )
     .expect("test current declaration dependency report should be derivable");
     let decoded = DecodedCheckedCurrentDeclPackage {
@@ -3507,6 +3794,9 @@ pub(crate) fn encode_checked_current_decl_package_for_test(
         signature_canonical_bytes: checked_decl_signature_canonical_bytes(checked.signature()),
         core_package,
         dependency_report,
+        owner_certificate_format: checked.owner_certificate_format().to_owned(),
+        owner_core_spec: checked.owner_core_spec().to_owned(),
+        dependency_selective_fingerprint: checked.dependency_selective_fingerprint(),
         prior_chain_fingerprint: checked.prior_chain_fingerprint(),
         checked_env_fingerprint: checked.checked_env_fingerprint(),
         canonical_bytes: Vec::new(),
@@ -4166,6 +4456,7 @@ mod tests {
             &core_package,
             prior_decls,
             generated,
+            checked.owner_certificate_format() == "NPA-CERT-0.3.0",
         )
         .unwrap();
         let decoded = DecodedCheckedCurrentDeclPackage {
@@ -4174,6 +4465,9 @@ mod tests {
             signature_canonical_bytes: checked_decl_signature_canonical_bytes(checked.signature()),
             core_package,
             dependency_report,
+            owner_certificate_format: checked.owner_certificate_format().to_owned(),
+            owner_core_spec: checked.owner_core_spec().to_owned(),
+            dependency_selective_fingerprint: checked.dependency_selective_fingerprint(),
             prior_chain_fingerprint: checked.prior_chain_fingerprint(),
             checked_env_fingerprint: checked.checked_env_fingerprint(),
             canonical_bytes: Vec::new(),
@@ -4475,6 +4769,9 @@ mod tests {
                 direct_dependency_entries: Vec::new(),
                 axiom_dependencies: Vec::new(),
             },
+            owner_certificate_format: "NPA-CERT-0.2.0".to_owned(),
+            owner_core_spec: "NPA-Core-0.2.0".to_owned(),
+            dependency_selective_fingerprint: [0; 32],
             prior_chain_fingerprint: [0; 32],
             checked_env_fingerprint: [0; 32],
             canonical_bytes: Vec::new(),
@@ -4531,7 +4828,7 @@ mod tests {
         assert_eq!(
             deps,
             &[
-                CurrentDeclDependencyEntry {
+                CurrentDeclDependencyEntry::Interface {
                     dependency_ref: MachineDependencyRefWire::Builtin {
                         name: Name::from_dotted("Nat"),
                     },
@@ -4540,7 +4837,7 @@ mod tests {
                     ))
                     .unwrap(),
                 },
-                CurrentDeclDependencyEntry {
+                CurrentDeclDependencyEntry::Interface {
                     dependency_ref: MachineDependencyRefWire::Builtin {
                         name: Name::from_dotted("Nat.zero"),
                     },
@@ -4594,13 +4891,114 @@ mod tests {
             .direct_dependency_entries;
         assert_eq!(deps.len(), 1);
         assert_eq!(
-            deps[0].dependency_ref,
+            *deps[0].dependency_ref(),
             MachineDependencyRefWire::CurrentModule {
                 module: root_module(),
                 name: Name::from_dotted("M.id"),
                 source_index: 0,
             }
         );
+    }
+
+    #[test]
+    fn opaque_current_chain_uses_v0_3_and_local_implementation_dependency() {
+        let imports = empty_import_context();
+        let mut opaque_package = id_core_package("M.id");
+        match &mut opaque_package.root_decl {
+            DeclPayload::Def { reducibility, .. } => {
+                *reducibility = CertReducibility::Opaque;
+            }
+            _ => unreachable!(),
+        }
+        let mut opaque_decl = id_decl("M.id");
+        match &mut opaque_decl {
+            Decl::Def { reducibility, .. } => *reducibility = Reducibility::Opaque,
+            _ => unreachable!(),
+        }
+        let opaque_bytes = package_bytes(0, opaque_package, opaque_decl, &imports, None);
+        let prior_context = project_checked_current_decl_context(
+            &root_module(),
+            1,
+            &imports,
+            &[CheckedCurrentDeclPackageInput {
+                bytes: &opaque_bytes,
+            }],
+        )
+        .unwrap();
+        assert_eq!(
+            prior_context.decl_index_table()[0].owner_certificate_format,
+            "NPA-CERT-0.3.0"
+        );
+
+        let alias_bytes = package_bytes(
+            1,
+            alias_core_package(),
+            alias_decl(),
+            &imports,
+            Some(&prior_context),
+        );
+        let context = project_checked_current_decl_context(
+            &root_module(),
+            2,
+            &imports,
+            &[
+                CheckedCurrentDeclPackageInput {
+                    bytes: &opaque_bytes,
+                },
+                CheckedCurrentDeclPackageInput {
+                    bytes: &alias_bytes,
+                },
+            ],
+        )
+        .unwrap();
+        let entries = &context.decl_index_table()[1]
+            .dependency_report
+            .direct_dependency_entries;
+        assert!(entries.iter().any(|entry| matches!(
+            entry,
+            CurrentDeclDependencyEntry::LocalImplementation {
+                dependency_ref: MachineDependencyRefWire::CurrentModule { source_index: 0, .. },
+                decl_certificate_hash,
+                ..
+            } if *decl_certificate_hash == context.decl_index_table()[0].core_decl_hash
+        )));
+        assert_eq!(
+            context.decl_index_table()[1].dependency_selective_fingerprint,
+            context.checked_current_decls()[1].dependency_selective_fingerprint()
+        );
+
+        let mut mismatched = decode_checked_current_decl_package(&alias_bytes).unwrap();
+        mismatched.owner_certificate_format = "NPA-CERT-0.2.0".to_owned();
+        mismatched.owner_core_spec = "NPA-Core-0.2.0".to_owned();
+        let mismatched_bytes = encode_checked_current_decl_package(&mismatched);
+        assert!(matches!(
+            project_checked_current_decl_context(
+                &root_module(),
+                2,
+                &imports,
+                &[
+                    CheckedCurrentDeclPackageInput {
+                        bytes: &opaque_bytes
+                    },
+                    CheckedCurrentDeclPackageInput {
+                        bytes: &mismatched_bytes
+                    },
+                ],
+            ),
+            Err(CheckedCurrentDeclProjectionError::OwnerPairMismatch { source_index: 1 })
+        ));
+
+        let mut stale_v5 = opaque_bytes.clone();
+        let tag = b"npa.machine-api.checked-current-decl-package.v6";
+        let offset = stale_v5
+            .windows(tag.len())
+            .position(|window| window == tag)
+            .unwrap();
+        stale_v5[offset + tag.len() - 1] = b'5';
+        assert!(matches!(
+            validate_checked_current_decl_package_bytes(&stale_v5),
+            Err(CheckedCurrentDeclProjectionError::DecodeFailed { .. })
+        ));
     }
 
     #[test]
@@ -4625,7 +5023,7 @@ mod tests {
         let report = &context.decl_index_table()[0].dependency_report;
         assert_eq!(report.direct_dependency_entries.len(), 1);
         assert_eq!(
-            report.direct_dependency_entries[0].dependency_ref,
+            *report.direct_dependency_entries[0].dependency_ref(),
             MachineDependencyRefWire::Imported {
                 module: Name::from_dotted("A"),
                 name: Name::from_dotted("A.T"),

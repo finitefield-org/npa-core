@@ -63,6 +63,19 @@ use crate::validation::{
 
 static NEXT_SESSION_LOCAL_ID: AtomicU64 = AtomicU64::new(1);
 
+fn checked_current_owner_pair(current: &MachineCheckedCurrentDeclContext) -> (String, String) {
+    current
+        .decl_index_table()
+        .first()
+        .map(|entry| {
+            (
+                entry.owner_certificate_format.clone(),
+                entry.owner_core_spec.clone(),
+            )
+        })
+        .unwrap_or_else(|| ("NPA-CERT-0.3.0".to_owned(), "NPA-Core-0.3.0".to_owned()))
+}
+
 const ROOT_FIELDS: &[FieldSpec] = &[
     FieldSpec::required("module", JsonFieldType::String),
     FieldSpec::required("theorem_name", JsonFieldType::String),
@@ -220,6 +233,8 @@ pub fn create_machine_session(
         &request,
         machine_tactic_kernel_profile(request.options.kernel_check_profile),
     )?;
+    let (owner_certificate_format, owner_core_spec) =
+        checked_current_owner_pair(&checked_current_decls);
     validate_current_collisions(&request.root, &import_context, &checked_current_decls)?;
 
     let mut options = request.options.clone();
@@ -238,11 +253,13 @@ pub fn create_machine_session(
     let machine_tactic_imports = machine_tactic_direct_import_refs(&import_context)?;
     let machine_tactic_options = machine_tactic_options(&options.tactic_options)?;
     let machine_tactic_kernel_profile = machine_tactic_kernel_profile(options.kernel_check_profile);
-    let tactic_env = MachineTacticEnv::new_with_kernel_profile(
+    let tactic_env = MachineTacticEnv::new_with_kernel_profile_and_owner_pair(
         machine_tactic_kernel_profile,
         machine_tactic_imports.clone(),
         checked_current_decls.checked_current_decls().to_vec(),
         machine_tactic_options.clone(),
+        &owner_certificate_format,
+        &owner_core_spec,
     )
     .map_err(option_semantic_error)?;
     options.tactic_options = tactic_options_request_from_machine_tactic(&tactic_env.options)?;
@@ -312,6 +329,8 @@ pub fn create_machine_session(
 
     let session_root_hash = session_root_hash(SessionRootHashInput {
         protocol_version: request.protocol_version,
+        owner_certificate_format: &owner_certificate_format,
+        owner_core_spec: &owner_core_spec,
         root: &checked_root.root,
         imports: &import_context,
         current: &checked_current_decls,
@@ -337,6 +356,8 @@ pub fn create_machine_session(
         session: MachineProofSession {
             session_id,
             protocol_version: request.protocol_version,
+            owner_certificate_format,
+            owner_core_spec,
             session_root_hash,
             root: checked_root.root,
             imports: import_context.direct_import_keys().to_vec(),
@@ -664,7 +685,7 @@ fn parse_checked_current_decl_item(
         path,
     )?;
     if required_string(&object, "encoding")
-        != "npa.machine-api.checked-current-decl-package.canonical.v5.hex"
+        != "npa.machine-api.checked-current-decl-package.canonical.v6.hex"
     {
         return Err(grammar_error(
             MachineApiErrorKind::InvalidCheckedCurrentDecl,
@@ -1554,6 +1575,9 @@ fn build_display_render_scope(
                 name,
                 source_index: entry.source_index,
                 decl_interface_hash: entry.signature.decl_interface_hash,
+                reducibility: npa_frontend::DefinitionReducibility::from_core_decl(
+                    &entry.core_decl,
+                ),
             }),
         );
     }
@@ -1623,6 +1647,7 @@ fn root_term_elab_context(
             source_index: entry.source_index,
             decl_interface_hash: entry.signature.decl_interface_hash,
             decl: entry.core_decl.clone(),
+            reducibility: npa_frontend::DefinitionReducibility::from_core_decl(&entry.core_decl),
         })
         .collect::<Vec<_>>();
     let frontend_generated_decls = current
@@ -1796,6 +1821,8 @@ fn root_theorem_type_axioms(
 
 struct SessionRootHashInput<'a> {
     protocol_version: MachineApiVersion,
+    owner_certificate_format: &'a str,
+    owner_core_spec: &'a str,
     root: &'a CheckedMachineProofRoot,
     imports: &'a MachineImportCertificateContext,
     current: &'a MachineCheckedCurrentDeclContext,
@@ -1809,8 +1836,10 @@ struct SessionRootHashInput<'a> {
 
 fn session_root_hash(input: SessionRootHashInput<'_>) -> Hash {
     let mut out = Vec::new();
-    encode_string(&mut out, "npa.machine-api.session-root.v1");
+    encode_string(&mut out, "npa.machine-api.session-root.v2");
     encode_string(&mut out, input.protocol_version.as_str());
+    encode_string(&mut out, input.owner_certificate_format);
+    encode_string(&mut out, input.owner_core_spec);
     out.extend(input.root.canonical_bytes());
     encode_import_certificate_context_to(&mut out, input.imports);
     out.extend(input.callable_table.table_hash());
@@ -1831,10 +1860,12 @@ fn encode_import_certificate_context_to(
     out: &mut Vec<u8>,
     imports: &MachineImportCertificateContext,
 ) {
-    encode_string(out, "npa.machine-api.session-import-context.v1");
+    encode_string(out, "npa.machine-api.session-import-context.v2");
     encode_list_len(out, imports.verified_modules().len());
     for entry in imports.verified_modules() {
         encode_verified_import_key(out, &entry.key);
+        encode_string(out, &entry.certificate_format);
+        encode_string(out, &entry.core_spec);
         encode_list_len(out, entry.certificate_import_table.len());
         for key in &entry.certificate_import_table {
             encode_verified_import_key(out, key);
@@ -2655,6 +2686,8 @@ mod tests {
             .session;
 
         assert_eq!(first.session_root_hash, second.session_root_hash);
+        assert_eq!(first.owner_certificate_format, "NPA-CERT-0.3.0");
+        assert_eq!(first.owner_core_spec, "NPA-Core-0.3.0");
         assert_ne!(first.session_id, second.session_id);
         assert_eq!(
             first.initial_snapshot.state_fingerprint,
@@ -2668,6 +2701,32 @@ mod tests {
         );
         assert_eq!(first.initial_snapshot.goals[0].target.machine, "Prop");
         assert_eq!(first.snapshots.len(), 1);
+
+        let tactic_options = machine_tactic_options(&first.options.tactic_options).unwrap();
+        let v0_3_env = MachineTacticEnv::new_with_kernel_profile_and_owner_pair(
+            machine_tactic_kernel_profile(first.options.kernel_check_profile),
+            Vec::new(),
+            Vec::new(),
+            tactic_options.clone(),
+            "NPA-CERT-0.3.0",
+            "NPA-Core-0.3.0",
+        )
+        .unwrap();
+        let v0_3_root = session_root_hash(SessionRootHashInput {
+            protocol_version: first.protocol_version,
+            owner_certificate_format: "NPA-CERT-0.3.0",
+            owner_core_spec: "NPA-Core-0.3.0",
+            root: &first.root,
+            imports: &first.import_certificate_context,
+            current: &first.checked_current_decls,
+            options: &first.options,
+            machine_tactic_options: &tactic_options,
+            resolved_eq_family: v0_3_env.eq_family.as_ref(),
+            resolved_nat_family: v0_3_env.nat_family.as_ref(),
+            callable_table: &first.machine_surface_callable_interface_table,
+            simp_registry_fingerprint: npa_tactic::simp_registry_hash(&v0_3_env.simp_registry),
+        });
+        assert_eq!(first.session_root_hash, v0_3_root);
     }
 
     #[test]
@@ -2812,7 +2871,7 @@ mod tests {
               "import_closure":[],
               "imports":[],
               "checked_current_decls":[{{
-                "encoding":"npa.machine-api.checked-current-decl-package.canonical.v5.hex",
+                "encoding":"npa.machine-api.checked-current-decl-package.canonical.v6.hex",
                 "bytes":"{current_hex}"
               }}],
               "options":{{

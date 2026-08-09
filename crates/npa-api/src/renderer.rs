@@ -1412,6 +1412,7 @@ fn display_entry_frontend_projection(
             name: name.clone(),
             source_index: *source_index,
             decl_interface_hash: *decl_interface_hash,
+            reducibility: npa_frontend::DefinitionReducibility::Reducible,
         }),
         MachineGlobalRefView::LocalGenerated {
             export_hash: None, ..
@@ -1474,6 +1475,7 @@ fn frontend_entry_matches_callable_ref(
                 name,
                 source_index,
                 decl_interface_hash,
+                ..
             },
             MachineSurfaceCallableRef::CurrentModule {
                 name: callable_name,
@@ -2011,6 +2013,7 @@ mod tests {
                 universe_params: Vec::new(),
                 ty,
             },
+            reducibility: npa_frontend::DefinitionReducibility::Reducible,
         }
     }
 
@@ -2075,6 +2078,7 @@ mod tests {
             export_hash: h(70),
             certificate_hash: None,
             exports: vec![npa_frontend::VerifiedExport {
+                reducibility: None,
                 name: Name::from_dotted("Hidden.Public"),
                 universe_params: Vec::new(),
                 ty: type0(),
@@ -2595,6 +2599,7 @@ mod tests {
             name: name.clone(),
             source_index: 0,
             decl_interface_hash: decl_hash,
+            reducibility: npa_frontend::DefinitionReducibility::Reducible,
         });
         let scope = MachineDisplayRenderScope::from_entries([display_entry]).unwrap();
         let table = MachineSurfaceCallableInterfaceTable::empty();
@@ -2613,6 +2618,7 @@ mod tests {
                 universe_params: vec!["u".to_owned()],
                 ty: Expr::sort(Level::succ(Level::param("u"))),
             },
+            reducibility: npa_frontend::DefinitionReducibility::Reducible,
         };
         let elab_context =
             MachineTermElabContext::from_verified_modules_and_current_decls_in_module(
@@ -2662,6 +2668,7 @@ mod tests {
             name: id_name.clone(),
             source_index: 0,
             decl_interface_hash: id_hash,
+            reducibility: npa_frontend::DefinitionReducibility::Reducible,
         });
         let scope = MachineDisplayRenderScope::from_entries(vec![display_entry]).unwrap();
         let renderer_table = MachineSurfaceCallableInterfaceTable::empty();
@@ -2681,6 +2688,7 @@ mod tests {
                 universe_params: Vec::new(),
                 ty: id_ty,
             },
+            reducibility: npa_frontend::DefinitionReducibility::Reducible,
         };
         let stale_table = MachineSurfaceCallableInterfaceTable::from_entries([
             MachineSurfaceCallableInterfaceEntry::new(

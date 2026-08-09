@@ -1,10 +1,11 @@
 //! Stable, versioned constructors for the programmatic package-command API.
 
 use crate::args::{
-    PackageArtifactLedgerAuditOptions, PackageAuditCacheMode, PackageBuildCertsOptions,
-    PackageBuildCheckCacheMode, PackageBuildSelection, PackageChecker, PackageCommonOptions,
-    PackageExternalCheckerOptions, PackageLockInputMode, PackageTheoremPremiseReportOptions,
-    PackageTimingMode, PackageVerifierMemoMode, PackageVerifyCertsOptions,
+    KernelFuelReportMode, PackageArtifactLedgerAuditOptions, PackageAuditCacheMode,
+    PackageBuildCertsOptions, PackageBuildCheckCacheMode, PackageBuildSelection, PackageChecker,
+    PackageCommonOptions, PackageExternalCheckerOptions, PackageLockInputMode,
+    PackageTheoremPremiseReportOptions, PackageTimingMode, PackageVerifierMemoMode,
+    PackageVerifyCertsOptions,
 };
 
 /// Version 1 of the semantic package-option construction contract.
@@ -12,10 +13,11 @@ pub mod v1 {
     use std::path::PathBuf;
 
     use super::{
-        PackageArtifactLedgerAuditOptions, PackageAuditCacheMode, PackageBuildCertsOptions,
-        PackageBuildCheckCacheMode, PackageBuildSelection, PackageChecker, PackageCommonOptions,
-        PackageExternalCheckerOptions, PackageLockInputMode, PackageTheoremPremiseReportOptions,
-        PackageTimingMode, PackageVerifierMemoMode, PackageVerifyCertsOptions,
+        KernelFuelReportMode, PackageArtifactLedgerAuditOptions, PackageAuditCacheMode,
+        PackageBuildCertsOptions, PackageBuildCheckCacheMode, PackageBuildSelection,
+        PackageChecker, PackageCommonOptions, PackageExternalCheckerOptions, PackageLockInputMode,
+        PackageTheoremPremiseReportOptions, PackageTimingMode, PackageVerifierMemoMode,
+        PackageVerifyCertsOptions,
     };
 
     /// Construct common package-command options with the requested root and output mode.
@@ -134,6 +136,8 @@ pub mod v1 {
             build_check_cache: PackageBuildCheckCacheMode::Off,
             update_manifest_hashes,
             selection: PackageBuildSelection::Full,
+            kernel_fuel_report: KernelFuelReportMode::Failure,
+            timings: PackageTimingMode::Off,
         }
     }
 }
@@ -201,6 +205,20 @@ impl PackageBuildCertsOptions {
     #[must_use]
     pub fn with_changed(mut self) -> Self {
         self.selection = PackageBuildSelection::Changed;
+        self
+    }
+
+    /// Set kernel fuel diagnostics without changing timing telemetry or any other option.
+    #[must_use]
+    pub fn with_kernel_fuel_report(mut self, mode: KernelFuelReportMode) -> Self {
+        self.kernel_fuel_report = mode;
+        self
+    }
+
+    /// Set package build timing telemetry without changing fuel diagnostics or any other option.
+    #[must_use]
+    pub fn with_timings(mut self, mode: PackageTimingMode) -> Self {
+        self.timings = mode;
         self
     }
 }

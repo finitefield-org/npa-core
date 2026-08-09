@@ -833,7 +833,7 @@ fn package_publish_plan_check_write_and_registry_mismatch_diagnostics() {
     )));
     assert!(stdout.contains("\"status\":\"passed\""));
     assert!(stdout.contains("\"artifacts\":[{\"kind\":\"package_publish_plan\""));
-    assert!(stdout.contains("\"schema\":\"npa.package.command_result.v0.3\""));
+    assert!(stdout.contains("\"schema\":\"npa.package.command_result.v0.4\""));
     assert_host_path_free(&stdout, &package);
     assert_eq!(package_file_hashes(package.path()), before_success_check);
 

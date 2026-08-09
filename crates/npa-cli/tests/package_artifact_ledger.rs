@@ -148,7 +148,7 @@ fn package_artifact_ledger_matching_audit_is_deterministic_and_read_only() {
     assert_eq!(snapshot(&root), before);
 
     let json = stdout(&first);
-    assert!(json.contains("\"schema\":\"npa.package.command_result.v0.3\""));
+    assert!(json.contains("\"schema\":\"npa.package.command_result.v0.4\""));
     assert!(json.contains("\"status\":\"passed\""));
     assert_eq!(json.matches("\"artifact_ledger_hash_match\"").count(), 10);
     assert!(

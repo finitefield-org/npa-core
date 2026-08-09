@@ -3,13 +3,15 @@ use std::sync::{Mutex, OnceLock};
 
 use npa_api::{clear_package_verification_process_memo, PerformanceMeasurementLabel};
 use npa_cli::args::{
-    PackageAxiomReportOptions, PackageChecker, PackageIndexOptions, PackageTimingMode,
+    KernelFuelReportMode, PackageAxiomReportOptions, PackageChecker, PackageIndexOptions,
+    PackageTimingMode,
 };
 use npa_cli::diagnostic::{
     CommandExitCode, PACKAGE_TIMINGS_SCHEMA_V0_1, PACKAGE_TIMINGS_SCHEMA_V0_2,
 };
-use npa_cli::package_api::v1::{common_options, verify_certs_full};
+use npa_cli::package_api::v1::{build_certs_check, common_options, verify_certs_full};
 use npa_cli::package_axiom_report::run_package_axiom_report;
+use npa_cli::package_build::run_package_build_certs;
 use npa_cli::package_index::run_package_index;
 use npa_cli::package_verify::run_package_verify_certs;
 
@@ -68,9 +70,10 @@ fn package_timings_verify_certs_detailed_json_has_stable_phase_fields() {
 
     assert_eq!(result.exit_code(), CommandExitCode::Success);
     let json = result.render_json();
+    assert!(json.starts_with("{\"schema\":\"npa.package.command_result.v0.4\""));
     assert_timing_header(&json, "detailed", PACKAGE_TIMINGS_SCHEMA_V0_2);
     assert!(json.contains("\"trusted\":false"));
-    assert!(json.contains("\"measurements\":{\"schema\":\"npa.performance.measurements.v0.2\""));
+    assert!(json.contains("\"measurements\":{\"schema\":\"npa.performance.measurements.v0.3\""));
     assert!(json.contains("\"modules\":[{"));
     assert!(json.contains("\"declaration_count\":"));
     for field in [
@@ -177,6 +180,83 @@ fn package_timings_verify_certs_summary_keeps_deterministic_aggregates_without_d
         ),
         2
     );
+}
+
+#[test]
+fn package_timings_build_summary_collects_aggregate_kernel_work_with_fuel_off() {
+    let result = run_package_build_certs(
+        build_certs_check(common_options(proofs_fixture_root(), true))
+            .with_modules(vec![npa_cert::Name::from_dotted("Proofs.Ai.Basic")])
+            .with_kernel_fuel_report(KernelFuelReportMode::Off)
+            .with_timings(PackageTimingMode::Summary),
+    );
+
+    assert_eq!(result.exit_code(), CommandExitCode::Success);
+    let measurements = result
+        .timings
+        .as_ref()
+        .and_then(|timings| timings.measurements.as_ref())
+        .expect("package build summary has common measurements");
+    assert!(measurements.declarations.is_empty());
+    assert!(counter(measurements, PerformanceMeasurementLabel::KernelCheckCalls) > 0);
+}
+
+#[test]
+fn package_timings_authoring_and_fast_verifier_share_declaration_identity_keys() {
+    let module = npa_cert::Name::from_dotted("Proofs.Ai.Basic");
+    let authoring = run_package_build_certs(
+        build_certs_check(common_options(proofs_fixture_root(), true))
+            .with_modules(vec![module.clone()])
+            .with_kernel_fuel_report(KernelFuelReportMode::Detailed)
+            .with_timings(PackageTimingMode::Detailed),
+    );
+    let verifier = run_with_fresh_process_memo(|| {
+        run_package_verify_certs(
+            verify_certs_full(
+                common_options(proofs_fixture_root(), true),
+                PackageChecker::Fast,
+            )
+            .with_timings(PackageTimingMode::Detailed),
+        )
+    });
+
+    assert_eq!(authoring.exit_code(), CommandExitCode::Success);
+    assert_eq!(verifier.exit_code(), CommandExitCode::Success);
+    let authoring_measurements = authoring
+        .timings
+        .as_ref()
+        .and_then(|timings| timings.measurements.as_ref())
+        .expect("authoring detailed measurements");
+    let verifier_measurements = verifier
+        .timings
+        .as_ref()
+        .and_then(|timings| timings.measurements.as_ref())
+        .expect("fast verifier detailed measurements");
+    let authoring_keys = declaration_identity_keys(
+        authoring_measurements
+            .declarations
+            .iter()
+            .filter(|declaration| declaration.module == module.as_dotted()),
+    );
+    let verifier_keys = declaration_identity_keys(
+        verifier_measurements
+            .declarations
+            .iter()
+            .filter(|declaration| declaration.module == module.as_dotted()),
+    );
+
+    assert!(!authoring_keys.is_empty());
+    assert_eq!(authoring_keys, verifier_keys);
+    assert!(authoring_measurements
+        .declarations
+        .iter()
+        .all(|declaration| declaration.kernel.is_some()));
+    let authoring_json = authoring.render_json();
+    assert!(authoring_json
+        .contains("\"measurements\":{\"schema\":\"npa.performance.measurements.v0.3\""));
+    assert!(authoring_json
+        .contains("\"kernel\":{\"subsystem\":\"fast_kernel\",\"outcome\":\"accepted\""));
+    assert!(authoring_json.contains("\"retained_delta_constants\":{"));
 }
 
 #[test]
@@ -290,6 +370,23 @@ fn counter(
         .expect("measurement counter is present")
 }
 
+fn declaration_identity_keys<'a>(
+    declarations: impl Iterator<Item = &'a npa_api::PerformanceDeclarationMeasurement>,
+) -> Vec<(String, u64, String, u64)> {
+    let mut keys = declarations
+        .map(|declaration| {
+            (
+                declaration.module.clone(),
+                declaration.declaration_index,
+                declaration.declaration.clone(),
+                declaration.term_nodes,
+            )
+        })
+        .collect::<Vec<_>>();
+    keys.sort();
+    keys
+}
+
 fn run_axiom_report(timings: PackageTimingMode) -> npa_cli::diagnostic::CommandResult {
     run_package_axiom_report(PackageAxiomReportOptions {
         common: common_options(fixture_root(), true),
@@ -372,6 +469,10 @@ fn strip_timings(json: &str) -> String {
 
 fn fixture_root() -> PathBuf {
     repo_root().join("testdata/package/npa-std")
+}
+
+fn proofs_fixture_root() -> PathBuf {
+    repo_root().join("testdata/package/proofs")
 }
 
 fn repo_root() -> PathBuf {

@@ -102,10 +102,10 @@ let check_semantics ?(trust_mode = Ext_import_store.Normal) store bytes =
                   bind (features decoded) (fun () ->
                       bind (imports trust_mode store decoded)
                         (fun import_environment ->
-                          bind (typecheck import_environment decoded)
-                            (fun checked_environment ->
-                              bind (axiom_report import_environment decoded)
-                                (fun () ->
+                          bind (axiom_report import_environment decoded)
+                            (fun () ->
+                              bind (typecheck import_environment decoded)
+                                (fun checked_environment ->
                                   bind (public_environment decoded)
                                     (fun public_environment ->
                                       Ok
@@ -134,6 +134,12 @@ let check_normal store policy bytes =
 
 let module_name checked =
   checked.semantic.decoded.Ext_cert.header.Ext_cert.module_name
+
+let input_certificate_format checked =
+  checked.semantic.decoded.Ext_cert.header.Ext_cert.format
+
+let input_core_spec checked =
+  checked.semantic.decoded.Ext_cert.header.Ext_cert.core_spec
 
 let export_hash checked =
   checked.semantic.decoded.Ext_cert.hashes.Ext_cert.export_hash

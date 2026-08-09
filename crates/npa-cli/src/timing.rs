@@ -55,6 +55,10 @@ impl PackageTimingCollector {
         self.mode.is_enabled()
     }
 
+    pub(crate) fn is_detailed(&self) -> bool {
+        self.mode == PackageTimingMode::Detailed
+    }
+
     pub(crate) fn measurement_mode(&self) -> PerformanceMeasurementMode {
         match self.mode {
             PackageTimingMode::Off => PerformanceMeasurementMode::Off,

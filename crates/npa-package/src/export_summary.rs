@@ -59,9 +59,9 @@ pub struct PackageVerifiedExportSummary {
     /// Exact package version copied from the validated package manifest.
     pub version: PackageVersion,
     /// Core specification profile copied from the package manifest.
-    pub core_spec: String,
+    pub package_core_profile: String,
     /// Canonical certificate format profile copied from the package manifest.
-    pub certificate_format: String,
+    pub package_certificate_profile: String,
     /// Exact generated package-lock file hash used for extraction.
     pub package_lock_hash: PackageHash,
     /// Deterministic module ordering used by [`Self::modules`].
@@ -108,6 +108,10 @@ pub struct PackageVerifiedExportSummaryModule {
     pub export_hash: PackageHash,
     /// Canonical certificate hash.
     pub certificate_hash: PackageHash,
+    /// Exact certificate format accepted for this verified module.
+    pub certificate_format: String,
+    /// Exact core specification accepted for this verified module.
+    pub core_spec: String,
     /// Canonical module axiom report hash.
     pub axiom_report_hash: PackageHash,
     /// Direct import identities declared by the certificate and package lock.
@@ -249,13 +253,13 @@ pub fn package_verified_export_summary_incremental_projection_plan(
     );
     push_reason(
         &mut full_reasons,
-        summary.core_spec != core_spec,
-        "core_spec_changed",
+        summary.package_core_profile != core_spec,
+        "package_core_profile_changed",
     );
     push_reason(
         &mut full_reasons,
-        summary.certificate_format != certificate_format,
-        "certificate_format_changed",
+        summary.package_certificate_profile != certificate_format,
+        "package_certificate_profile_changed",
     );
     push_reason(
         &mut full_reasons,
@@ -306,8 +310,11 @@ fn validate_verified_export_summary_shape_without_self_hash(
         ));
     }
     validate_package_identity(&summary.package, &summary.version)?;
-    validate_plain_string(&summary.core_spec, "core_spec")?;
-    validate_plain_string(&summary.certificate_format, "certificate_format")?;
+    validate_plain_string(&summary.package_core_profile, "package_core_profile")?;
+    validate_plain_string(
+        &summary.package_certificate_profile,
+        "package_certificate_profile",
+    )?;
     if summary.module_order != PACKAGE_VERIFIED_EXPORT_SUMMARY_MODULE_ORDER_TOPOLOGICAL {
         return Err(PackageArtifactError::invalid_enum_value(
             "module_order",
@@ -351,6 +358,11 @@ fn validate_summary_module(
     let path = format!("modules[{index}]");
     validate_module_name(&module.module, field_path(&path, "module"))?;
     validate_artifact_path(&module.certificate, field_path(&path, "certificate"))?;
+    validate_plain_string(
+        &module.certificate_format,
+        field_path(&path, "certificate_format"),
+    )?;
+    validate_plain_string(&module.core_spec, field_path(&path, "core_spec"))?;
     validate_import_identities(&module.direct_imports, &path)?;
     validate_global_refs(
         &module.exported_globals,
@@ -627,10 +639,13 @@ fn verified_export_summary_json_unchecked(
         ("schema", json_string(&summary.schema)),
         ("package", json_string(summary.package.as_str())),
         ("version", json_string(summary.version.as_str())),
-        ("core_spec", json_string(&summary.core_spec)),
         (
-            "certificate_format",
-            json_string(&summary.certificate_format),
+            "package_core_profile",
+            json_string(&summary.package_core_profile),
+        ),
+        (
+            "package_certificate_profile",
+            json_string(&summary.package_certificate_profile),
         ),
         ("package_lock_hash", hash_json(summary.package_lock_hash)),
         ("module_order", json_string(&summary.module_order)),
@@ -658,6 +673,11 @@ fn summary_module_json(module: &PackageVerifiedExportSummaryModule) -> String {
         ),
         ("export_hash", hash_json(module.export_hash)),
         ("certificate_hash", hash_json(module.certificate_hash)),
+        (
+            "certificate_format",
+            json_string(&module.certificate_format),
+        ),
+        ("core_spec", json_string(&module.core_spec)),
         ("axiom_report_hash", hash_json(module.axiom_report_hash)),
         (
             "direct_imports",
@@ -708,13 +728,22 @@ fn parse_verified_export_summary_value(
     value: &crate::json::JsonValue,
 ) -> PackageArtifactResult<PackageVerifiedExportSummary> {
     let members = expect_object(value, "$")?;
+    let schema = required_string(members, "$", "schema")?;
+    if schema != PACKAGE_VERIFIED_EXPORT_SUMMARY_SCHEMA {
+        return Err(PackageArtifactError::unsupported_schema(
+            "schema",
+            "schema",
+            PACKAGE_VERIFIED_EXPORT_SUMMARY_SCHEMA,
+            schema,
+        ));
+    }
     reject_unknown_fields("$", members, VERIFIED_EXPORT_SUMMARY_FIELDS)?;
     Ok(PackageVerifiedExportSummary {
-        schema: required_string(members, "$", "schema")?,
+        schema,
         package: PackageId::new(required_string(members, "$", "package")?),
         version: PackageVersion::new(required_string(members, "$", "version")?),
-        core_spec: required_string(members, "$", "core_spec")?,
-        certificate_format: required_string(members, "$", "certificate_format")?,
+        package_core_profile: required_string(members, "$", "package_core_profile")?,
+        package_certificate_profile: required_string(members, "$", "package_certificate_profile")?,
         package_lock_hash: required_hash(members, "$", "package_lock_hash")?,
         module_order: required_string(members, "$", "module_order")?,
         trusted: required_bool(members, "$", "trusted")?,
@@ -746,6 +775,8 @@ fn parse_summary_module(
         certificate_file_hash: required_hash(members, &path, "certificate_file_hash")?,
         export_hash: required_hash(members, &path, "export_hash")?,
         certificate_hash: required_hash(members, &path, "certificate_hash")?,
+        certificate_format: required_string(members, &path, "certificate_format")?,
+        core_spec: required_string(members, &path, "core_spec")?,
         axiom_report_hash: required_hash(members, &path, "axiom_report_hash")?,
         direct_imports: required_array(members, &path, "direct_imports")?
             .iter()
@@ -818,8 +849,8 @@ const VERIFIED_EXPORT_SUMMARY_FIELDS: &[&str] = &[
     "schema",
     "package",
     "version",
-    "core_spec",
-    "certificate_format",
+    "package_core_profile",
+    "package_certificate_profile",
     "package_lock_hash",
     "module_order",
     "trusted",
@@ -835,6 +866,8 @@ const VERIFIED_EXPORT_SUMMARY_MODULE_FIELDS: &[&str] = &[
     "certificate_file_hash",
     "export_hash",
     "certificate_hash",
+    "certificate_format",
+    "core_spec",
     "axiom_report_hash",
     "direct_imports",
     "exported_globals",
@@ -876,6 +909,35 @@ mod tests {
             .canonical_json()
             .unwrap()
             .contains("not proof evidence"));
+        assert_eq!(parsed.package_core_profile, "npa.core.v0.1");
+        assert_eq!(
+            parsed.package_certificate_profile,
+            "npa.certificate.canonical.v0.1"
+        );
+        assert_eq!(parsed.modules[0].core_spec, "npa.core.v0.2");
+        assert_eq!(
+            parsed.modules[0].certificate_format,
+            "npa.certificate.canonical.v0.2"
+        );
+        assert_eq!(parsed.modules[1].core_spec, "npa.core.v0.3");
+        assert_eq!(
+            parsed.modules[1].certificate_format,
+            "npa.certificate.canonical.v0.3"
+        );
+    }
+
+    #[test]
+    fn verified_export_summary_rejects_v0_1_before_interpreting_old_fields() {
+        let error = parse_package_verified_export_summary_json(
+            r#"{"schema":"npa.package.verified_export_summary.v0.1","core_spec":"old","certificate_format":"old"}"#,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error.reason_code,
+            PackageArtifactErrorReason::UnsupportedSchema
+        );
+        assert_eq!(error.field.as_deref(), Some("schema"));
     }
 
     #[test]
@@ -933,8 +995,8 @@ mod tests {
             schema: PACKAGE_VERIFIED_EXPORT_SUMMARY_SCHEMA.to_owned(),
             package: PackageId::new("fixture-package"),
             version: PackageVersion::new("0.1.0"),
-            core_spec: "npa.core.v0.1".to_owned(),
-            certificate_format: "npa.certificate.canonical.v0.1".to_owned(),
+            package_core_profile: "npa.core.v0.1".to_owned(),
+            package_certificate_profile: "npa.certificate.canonical.v0.1".to_owned(),
             package_lock_hash: hash(90),
             module_order: PACKAGE_VERIFIED_EXPORT_SUMMARY_MODULE_ORDER_TOPOLOGICAL.to_owned(),
             trusted: false,
@@ -953,6 +1015,8 @@ mod tests {
             export_hash: hash(12),
             axiom_report_hash: hash(13),
             certificate_hash: hash(14),
+            certificate_format: "npa.certificate.canonical.v0.2".to_owned(),
+            core_spec: "npa.core.v0.2".to_owned(),
             direct_imports: Vec::new(),
             exported_globals: vec![global("Fixture.A", "Fixture.A.id", 12, 14, 15)],
             module_axioms: Vec::new(),
@@ -969,6 +1033,8 @@ mod tests {
             export_hash: hash(22),
             axiom_report_hash: hash(23),
             certificate_hash: hash(24),
+            certificate_format: "npa.certificate.canonical.v0.3".to_owned(),
+            core_spec: "npa.core.v0.3".to_owned(),
             direct_imports: vec![PackageAuditImportIdentity {
                 module: module("Fixture.A"),
                 export_hash: hash(12),

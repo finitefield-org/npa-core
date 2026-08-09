@@ -2,6 +2,7 @@ type hash = string
 
 type certificate_version =
   | Current
+  | Compatibility
   | Previous
   | Legacy
 
@@ -96,10 +97,32 @@ type decl_payload =
       mutual_inductives : mutual_inductive_spec list;
     }
 
-type dependency_entry = {
-  dependency_global_ref : Ext_term.global_ref;
-  dependency_decl_interface_hash : hash;
-}
+type dependency_entry =
+  | Interface_dependency of {
+      dependency_global_ref : Ext_term.global_ref;
+      dependency_decl_interface_hash : hash;
+    }
+  | Local_implementation_dependency of {
+      dependency_global_ref : Ext_term.global_ref;
+      dependency_decl_interface_hash : hash;
+      dependency_decl_certificate_hash : hash;
+    }
+
+let dependency_global_ref = function
+  | Interface_dependency dependency -> dependency.dependency_global_ref
+  | Local_implementation_dependency dependency ->
+      dependency.dependency_global_ref
+
+let dependency_decl_interface_hash = function
+  | Interface_dependency dependency ->
+      dependency.dependency_decl_interface_hash
+  | Local_implementation_dependency dependency ->
+      dependency.dependency_decl_interface_hash
+
+let dependency_decl_certificate_hash = function
+  | Interface_dependency _ -> None
+  | Local_implementation_dependency dependency ->
+      Some dependency.dependency_decl_certificate_hash
 
 type axiom_ref = {
   axiom_global_ref : Ext_term.global_ref;
@@ -215,9 +238,13 @@ type decoded_module = {
   structural_cost : structural_cost option;
 }
 
-let current_format = "NPA-CERT-0.2.0"
+let current_format = "NPA-CERT-0.3.0"
 
-let current_core_spec = "NPA-Core-0.2.0"
+let current_core_spec = "NPA-Core-0.3.0"
+
+let compatibility_format = "NPA-CERT-0.2.0"
+
+let compatibility_core_spec = "NPA-Core-0.2.0"
 
 let previous_format = "NPA-CERT-0.1.2"
 
@@ -228,23 +255,29 @@ let legacy_format = "NPA-CERT-0.1"
 let legacy_core_spec = "NPA-Core-0.1"
 
 (* Kept as aliases for the legacy golden builders while the conformance corpus
-   exercises all three explicit versions. Production decoding never uses these
+   exercises all four explicit versions. Production decoding never uses these
    aliases to select a version. *)
 let expected_format = legacy_format
 
 let expected_core_spec = legacy_core_spec
 
 let version_encodes_export_universe_constraints = function
-  | Current | Previous -> true
+  | Current | Compatibility | Previous -> true
   | Legacy -> false
+
+let version_encodes_tagged_dependencies = function
+  | Current -> true
+  | Compatibility | Previous | Legacy -> false
 
 let format_of_version = function
   | Current -> current_format
+  | Compatibility -> compatibility_format
   | Previous -> previous_format
   | Legacy -> legacy_format
 
 let core_spec_of_version = function
   | Current -> current_core_spec
+  | Compatibility -> compatibility_core_spec
   | Previous -> previous_core_spec
   | Legacy -> legacy_core_spec
 
@@ -666,14 +699,48 @@ let decl_payload_kind payload =
   | InductiveDecl _ -> Inductive
   | MutualInductiveBlockDecl _ -> Mutual_inductive
 
-let read_dependency_entries section import_count declaration_count names reader =
+let read_dependency_entries version section import_count declaration_count names reader =
   read_vector section
     (fun current ->
-      bind (read_global_ref section import_count declaration_count names current)
-        (fun (dependency_global_ref, after_ref) ->
-          bind (read_hash section after_ref)
-            (fun (dependency_decl_interface_hash, next) ->
-              Ok ({ dependency_global_ref; dependency_decl_interface_hash }, next))))
+      let read_interface current =
+        bind (read_global_ref section import_count declaration_count names current)
+          (fun (dependency_global_ref, after_ref) ->
+            bind (read_hash section after_ref)
+              (fun (dependency_decl_interface_hash, next) ->
+                Ok
+                  ( Interface_dependency
+                      { dependency_global_ref; dependency_decl_interface_hash },
+                    next )))
+      in
+      if not (version_encodes_tagged_dependencies version) then read_interface current
+      else
+        let tag_offset = Ext_bytes.offset current in
+        match Ext_bytes.read_byte section current with
+        | Error error -> Error error
+        | Ok (0x00, after_tag) -> read_interface after_tag
+        | Ok (0x01, after_tag) -> (
+            match
+              read_global_ref section import_count declaration_count names
+                after_tag
+            with
+            | Error error -> Error error
+            | Ok (dependency_global_ref, after_ref) -> (
+                match read_hash section after_ref with
+                | Error error -> Error error
+                | Ok (dependency_decl_interface_hash, after_interface_hash) -> (
+                    match read_hash section after_interface_hash with
+                    | Error error -> Error error
+                    | Ok (dependency_decl_certificate_hash, next) ->
+                        Ok
+                          ( Local_implementation_dependency
+                              {
+                                dependency_global_ref;
+                                dependency_decl_interface_hash;
+                                dependency_decl_certificate_hash;
+                              },
+                            next ))))
+        | Ok (tag, _) ->
+            Ext_bytes.error section tag_offset (Ext_bytes.Unknown_tag tag))
     reader
 
 let read_axiom_refs section import_count declaration_count names reader =
@@ -686,7 +753,7 @@ let read_axiom_refs section import_count declaration_count names reader =
                   Ok ({ axiom_global_ref; axiom_name; axiom_decl_interface_hash }, next)))))
     reader
 
-let read_declarations import_count names levels terms reader =
+let read_declarations version import_count names levels terms reader =
   match
     Ext_bytes.read_count_with_limit Ext_bytes.Declarations
       Ext_bytes.Declarations_limit Ext_bytes.max_declarations reader
@@ -711,7 +778,7 @@ let read_declarations import_count names levels terms reader =
                   Ext_bytes.error Ext_bytes.Declarations offset Ext_bytes.Duplicate_declaration
                 else
                   bind
-                    (read_dependency_entries Ext_bytes.Declarations import_count declaration_count
+                    (read_dependency_entries version Ext_bytes.Declarations import_count declaration_count
                        name_values after_payload)
                     (fun (dependencies, after_dependencies) ->
                       bind
@@ -788,6 +855,8 @@ let read_header reader =
   | Ok (format, after_format) ->
       let version_and_core =
         if format = current_format then Some (Current, current_core_spec)
+        else if format = compatibility_format then
+          Some (Compatibility, compatibility_core_spec)
         else if format = previous_format then Some (Previous, previous_core_spec)
         else if format = legacy_format then Some (Legacy, legacy_core_spec)
         else None
@@ -1046,7 +1115,7 @@ let read_module_sections reader =
                       let term_array = Array.of_list term_table in
                       let level_array = Array.of_list level_table in
                       bind
-                        (read_declarations (List.length imports) names level_table term_table
+                        (read_declarations header.version (List.length imports) names level_table term_table
                            after_terms)
                         (fun (declaration_table, after_declarations) ->
                           bind
@@ -1360,7 +1429,7 @@ let mark_dependency_entries used import_count declaration_count section offset d
     (fun result dependency ->
       bind result (fun () ->
           mark_global_ref used import_count declaration_count section offset
-            dependency.dependency_global_ref))
+            (dependency_global_ref dependency)))
     (Ok ()) dependencies
 
 let mark_decl_payload used import_count declaration_count payload offset =

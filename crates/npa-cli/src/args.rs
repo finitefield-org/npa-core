@@ -5,6 +5,7 @@ use std::fmt;
 use std::path::PathBuf;
 
 use npa_cert::Name;
+use npa_frontend::HumanKernelFuelReportMode;
 
 /// Parsed top-level CLI action.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -329,6 +330,10 @@ pub struct PackageBuildCertsOptions {
     pub update_manifest_hashes: bool,
     /// Local-module build selection.
     pub selection: PackageBuildSelection,
+    /// Kernel fuel diagnostics emitted for package authoring.
+    pub kernel_fuel_report: KernelFuelReportMode,
+    /// Optional package build timing telemetry mode.
+    pub timings: PackageTimingMode,
 }
 
 /// Local-module selection for `package build-certs`.
@@ -367,6 +372,39 @@ impl PackageBuildCheckCacheMode {
         match self {
             Self::Off => false,
             Self::ReadThrough => true,
+        }
+    }
+}
+
+/// Kernel fuel diagnostics emitted by `package build-certs`.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum KernelFuelReportMode {
+    /// Disable fuel-report-specific diagnostics.
+    Off,
+    /// Emit bounded fuel diagnostics only when kernel fuel is exhausted.
+    Failure,
+    /// Collect detailed bounded diagnostics, including retained delta names.
+    Detailed,
+}
+
+impl KernelFuelReportMode {
+    /// Stable CLI spelling.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Failure => "failure",
+            Self::Detailed => "detailed",
+        }
+    }
+}
+
+impl From<KernelFuelReportMode> for HumanKernelFuelReportMode {
+    fn from(value: KernelFuelReportMode) -> Self {
+        match value {
+            KernelFuelReportMode::Off => Self::Off,
+            KernelFuelReportMode::Failure => Self::Failure,
+            KernelFuelReportMode::Detailed => Self::Detailed,
         }
     }
 }
@@ -1172,6 +1210,8 @@ pub enum UsageReason {
     UnsupportedBuildCheckCacheMode,
     /// Package timing telemetry mode is unsupported.
     UnsupportedTimingMode,
+    /// Kernel fuel-report mode is unsupported.
+    UnsupportedKernelFuelReportMode,
 }
 
 impl UsageReason {
@@ -1191,6 +1231,7 @@ impl UsageReason {
             Self::UnsupportedVerifierMemoMode => "unsupported_verifier_memo_mode",
             Self::UnsupportedBuildCheckCacheMode => "unsupported_build_check_cache_mode",
             Self::UnsupportedTimingMode => "unsupported_timing_mode",
+            Self::UnsupportedKernelFuelReportMode => "unsupported_kernel_fuel_report_mode",
         }
     }
 }
@@ -1892,6 +1933,8 @@ fn parse_package_build_certs_args(args: &[String]) -> Result<CliAction, CliUsage
     let mut update_manifest_hashes = false;
     let mut module_values = Vec::new();
     let mut changed = false;
+    let mut kernel_fuel_report = None::<KernelFuelReportMode>;
+    let mut timings = None::<PackageTimingMode>;
     let mut index = 0usize;
     while index < args.len() {
         match args[index].as_str() {
@@ -1983,6 +2026,47 @@ fn parse_package_build_certs_args(args: &[String]) -> Result<CliAction, CliUsage
                 changed = true;
                 index += 1;
             }
+            "--kernel-fuel-report" => {
+                if kernel_fuel_report.is_some() {
+                    return Err(
+                        flag_error("--kernel-fuel-report", UsageReason::DuplicateFlag)
+                            .with_command("package build-certs"),
+                    );
+                }
+                let value = flag_value(args, index, "--kernel-fuel-report", "package build-certs")?;
+                kernel_fuel_report = Some(parse_kernel_fuel_report_mode(value)?);
+                index += 2;
+            }
+            token if token.starts_with("--kernel-fuel-report=") => {
+                if kernel_fuel_report.is_some() {
+                    return Err(
+                        flag_error("--kernel-fuel-report", UsageReason::DuplicateFlag)
+                            .with_command("package build-certs"),
+                    );
+                }
+                let value =
+                    flag_equals_value(token, "--kernel-fuel-report", "package build-certs")?;
+                kernel_fuel_report = Some(parse_kernel_fuel_report_mode(value)?);
+                index += 1;
+            }
+            "--timings" => {
+                if timings.is_some() {
+                    return Err(flag_error("--timings", UsageReason::DuplicateFlag)
+                        .with_command("package build-certs"));
+                }
+                let value = flag_value(args, index, "--timings", "package build-certs")?;
+                timings = Some(parse_timing_mode(value, "package build-certs")?);
+                index += 2;
+            }
+            token if token.starts_with("--timings=") => {
+                if timings.is_some() {
+                    return Err(flag_error("--timings", UsageReason::DuplicateFlag)
+                        .with_command("package build-certs"));
+                }
+                let value = flag_equals_value(token, "--timings", "package build-certs")?;
+                timings = Some(parse_timing_mode(value, "package build-certs")?);
+                index += 1;
+            }
             token if token.starts_with("--changed=") => {
                 return Err(flag_error("--changed", UsageReason::UnsupportedFlag)
                     .with_command("package build-certs")
@@ -2011,6 +2095,8 @@ fn parse_package_build_certs_args(args: &[String]) -> Result<CliAction, CliUsage
             "--update-manifest-hashes",
             "--module",
             "--changed",
+            "--kernel-fuel-report",
+            "--timings",
         ],
     )?;
     if changed && !module_values.is_empty() {
@@ -2050,6 +2136,8 @@ fn parse_package_build_certs_args(args: &[String]) -> Result<CliAction, CliUsage
         build_check_cache,
         update_manifest_hashes,
         selection,
+        kernel_fuel_report: kernel_fuel_report.unwrap_or(KernelFuelReportMode::Failure),
+        timings: timings.unwrap_or(PackageTimingMode::Off),
     };
     if let Err(error) = validate_package_build_certs_options(&options) {
         return Err(package_build_validation_cli_error(&options, error));
@@ -4495,6 +4583,20 @@ fn parse_timing_mode(
     }
 }
 
+fn parse_kernel_fuel_report_mode(value: &str) -> Result<KernelFuelReportMode, CliUsageError> {
+    match value {
+        "off" => Ok(KernelFuelReportMode::Off),
+        "failure" => Ok(KernelFuelReportMode::Failure),
+        "detailed" => Ok(KernelFuelReportMode::Detailed),
+        other => Err(
+            CliUsageError::new(UsageReason::UnsupportedKernelFuelReportMode)
+                .with_command("package build-certs")
+                .with_flag("--kernel-fuel-report")
+                .with_value(other),
+        ),
+    }
+}
+
 fn parse_build_check_cache_mode(value: &str) -> Result<PackageBuildCheckCacheMode, CliUsageError> {
     match value {
         "off" => Ok(PackageBuildCheckCacheMode::Off),
@@ -4716,6 +4818,7 @@ fn is_unsupported_clr04_flag(flag: &str) -> bool {
             | "--verifier-memo"
             | "--build-check-cache"
             | "--jobs"
+            | "--kernel-fuel-report"
             | "--timings"
             | "--base"
             | "--scope"
@@ -4743,6 +4846,7 @@ fn is_unsupported_clr04_flag(flag: &str) -> bool {
         || flag.starts_with("--verifier-memo=")
         || flag.starts_with("--build-check-cache=")
         || flag.starts_with("--jobs=")
+        || flag.starts_with("--kernel-fuel-report=")
         || flag.starts_with("--timings=")
         || flag.starts_with("--base=")
         || flag.starts_with("--scope=")
@@ -4774,7 +4878,7 @@ pub fn render_help(topic: HelpTopic) -> &'static str {
             "Usage: npa package inventory-interface --ecosystem lean4-mathlib4 --root PATH --repository ID --revision SHA --license ID [--license-note TEXT] --path PATH... --declaration NAME... --json\n\nInventory selected Lean 4/mathlib4 source paths with a caller-supplied immutable pin. The adapter is token-level, read-only, network-free, emits npa.mathlib.interface_inventory.v1, never invokes Git, and never writes proposals or proof evidence."
         }
         HelpTopic::PackageBuildCerts => {
-            "Usage: npa package build-certs [--root PATH] [--json] [--check] [--build-check-cache off|read-through] [--update-manifest-hashes] [--module MODULE]... [--changed]\n\nRebuild package certificates. Build-check caching requires --check; for example: --check --build-check-cache read-through. --module and --changed select targeted authoring builds and are mutually exclusive. Targeted ordinary builds require --check; targeted writes require --update-manifest-hashes and rebuild the dependency-safe local dependent closure. Full build-certs --check and source-free verification remain required release gates. --update-manifest-hashes refreshes local module hash pins and declared metadata before rebuilding generated/package-lock.json."
+            "Usage: npa package build-certs [--root PATH] [--json] [--check] [--build-check-cache off|read-through] [--update-manifest-hashes] [--module MODULE]... [--changed] [--kernel-fuel-report off|failure|detailed] [--timings off|summary|detailed]\n\nRebuild package certificates. Kernel fuel reporting defaults to failure and timing telemetry defaults to off; the two selections are independent and neither changes proof acceptance. Build-check caching requires --check; for example: --check --build-check-cache read-through. --module and --changed select targeted authoring builds and are mutually exclusive. Targeted ordinary builds require --check; targeted writes require --update-manifest-hashes and rebuild the dependency-safe local dependent closure. Full build-certs --check and source-free verification remain required release gates. --update-manifest-hashes refreshes local module hash pins and declared metadata before rebuilding generated/package-lock.json."
         }
         HelpTopic::PackageAxiomReport => {
             "Usage: npa package axiom-report [--root PATH] [--json] [--check] [--timings off|summary|detailed]\n\nGenerate or check generated/axiom-report.json from source-free package certificate artifacts. Timing telemetry is informational and is not proof evidence."

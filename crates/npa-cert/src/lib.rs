@@ -12,6 +12,7 @@ mod declaration_closure;
 mod hash;
 mod inductive;
 mod kernel;
+mod local_transparency;
 mod producer;
 mod rebind;
 mod structural;
@@ -27,6 +28,7 @@ pub use inductive::{
     UnsupportedMvpRecursorProfileV1,
 };
 pub use kernel::{builtin_decl_interface_hash, verified_module_to_kernel_decls};
+pub use local_transparency::dependency_selective_fingerprint_canonical_bytes;
 pub use producer::*;
 pub use rebind::*;
 pub use structural::{
@@ -42,47 +44,82 @@ pub(crate) use binary::*;
 pub(crate) use canonical::*;
 pub(crate) use hash::*;
 pub(crate) use kernel::{
-    add_decl_to_env, add_referenced_builtins_to_env, builtin_is_axiom, cert_decl_to_kernel_decl,
-    core_features_from_builtins, expr_from_term, level_from_node, name_to_string,
-    reserved_core_primitive_name, source_decl_index_for_export_entry, universe_names,
+    add_current_module_decl_to_env, add_decl_to_env, add_referenced_builtins_to_env,
+    builtin_is_axiom, cert_decl_to_kernel_decl, core_features_from_builtins, expr_from_term,
+    level_from_node, name_to_string, reserved_core_primitive_name,
+    source_decl_index_for_export_entry, universe_names,
     verified_module_export_entry_to_kernel_decl, verified_module_referenced_builtin_names,
+};
+pub(crate) use local_transparency::{
+    complete_local_transparency_dependencies, local_transparency_dependencies,
+    validate_local_implementation_closure, validate_local_implementation_entries,
+    LocalTransparencyBudget,
 };
 pub(crate) use structural::*;
 pub(crate) use verify::*;
 
-pub(crate) const FORMAT: &str = "NPA-CERT-0.2.0";
-pub(crate) const CORE_SPEC: &str = "NPA-Core-0.2.0";
+pub(crate) const FORMAT: &str = "NPA-CERT-0.3.0";
+pub(crate) const CORE_SPEC: &str = "NPA-Core-0.3.0";
+pub(crate) const COMPAT_FORMAT: &str = "NPA-CERT-0.2.0";
+pub(crate) const COMPAT_CORE_SPEC: &str = "NPA-Core-0.2.0";
 pub(crate) const PREVIOUS_FORMAT: &str = "NPA-CERT-0.1.2";
 pub(crate) const PREVIOUS_CORE_SPEC: &str = "NPA-Core-0.1.2";
 pub(crate) const LEGACY_FORMAT: &str = "NPA-CERT-0.1";
 pub(crate) const LEGACY_CORE_SPEC: &str = "NPA-Core-0.1";
+pub(crate) const DECL_CERT_DOMAIN: &[u8] = b"NPA-DECL-CERT-0.3.0";
+pub(crate) const COMPAT_DECL_CERT_DOMAIN: &[u8] = b"NPA-DECL-CERT-0.1";
 pub(crate) const MODULE_EXPORT_DOMAIN: &[u8] = b"NPA-MODULE-EXPORT-0.2.0";
-pub(crate) const MODULE_CERT_DOMAIN: &[u8] = b"NPA-MODULE-CERT-0.2.0";
+pub(crate) const MODULE_CERT_DOMAIN: &[u8] = b"NPA-MODULE-CERT-0.3.0";
+pub(crate) const COMPAT_MODULE_CERT_DOMAIN: &[u8] = b"NPA-MODULE-CERT-0.2.0";
 pub(crate) const PREVIOUS_MODULE_EXPORT_DOMAIN: &[u8] = b"NPA-MODULE-EXPORT-0.1.2";
 pub(crate) const PREVIOUS_MODULE_CERT_DOMAIN: &[u8] = b"NPA-MODULE-CERT-0.1.2";
 pub(crate) const LEGACY_MODULE_EXPORT_DOMAIN: &[u8] = b"NPA-MODULE-EXPORT-0.1";
 pub(crate) const LEGACY_MODULE_CERT_DOMAIN: &[u8] = b"NPA-MODULE-CERT-0.1";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(non_camel_case_types)]
 pub(crate) enum CertificateFormatVersion {
-    Current,
-    Previous,
-    Legacy,
+    V0_3_0,
+    V0_2_0,
+    V0_1_2,
+    V0_1,
 }
 
 impl CertificateFormatVersion {
     pub(crate) fn encodes_export_universe_constraints(self) -> bool {
-        self != Self::Legacy
+        self != Self::V0_1
+    }
+
+    pub(crate) fn encodes_tagged_dependencies(self) -> bool {
+        self == Self::V0_3_0
+    }
+
+    pub(crate) fn declaration_certificate_domain(self) -> &'static [u8] {
+        match self {
+            Self::V0_3_0 => DECL_CERT_DOMAIN,
+            Self::V0_2_0 | Self::V0_1_2 | Self::V0_1 => COMPAT_DECL_CERT_DOMAIN,
+        }
+    }
+
+    pub(crate) fn module_certificate_domain(self) -> &'static [u8] {
+        match self {
+            Self::V0_3_0 => MODULE_CERT_DOMAIN,
+            Self::V0_2_0 => COMPAT_MODULE_CERT_DOMAIN,
+            Self::V0_1_2 => PREVIOUS_MODULE_CERT_DOMAIN,
+            Self::V0_1 => LEGACY_MODULE_CERT_DOMAIN,
+        }
     }
 }
 
 pub(crate) fn certificate_format_version(header: &CertHeader) -> Result<CertificateFormatVersion> {
     if header.format == FORMAT && header.core_spec == CORE_SPEC {
-        Ok(CertificateFormatVersion::Current)
+        Ok(CertificateFormatVersion::V0_3_0)
+    } else if header.format == COMPAT_FORMAT && header.core_spec == COMPAT_CORE_SPEC {
+        Ok(CertificateFormatVersion::V0_2_0)
     } else if header.format == PREVIOUS_FORMAT && header.core_spec == PREVIOUS_CORE_SPEC {
-        Ok(CertificateFormatVersion::Previous)
+        Ok(CertificateFormatVersion::V0_1_2)
     } else if header.format == LEGACY_FORMAT && header.core_spec == LEGACY_CORE_SPEC {
-        Ok(CertificateFormatVersion::Legacy)
+        Ok(CertificateFormatVersion::V0_1)
     } else {
         Err(CertError::UnsupportedFormat {
             format: header.format.clone(),
@@ -129,6 +166,39 @@ pub fn build_module_cert_from_import_refs_with_preferred_imports(
     )
 }
 
+/// Build an explicit v0.2 compatibility certificate.
+///
+/// New producers must use [`build_module_cert`] or one of its ordinary borrowed-import variants,
+/// which emit the current v0.3 format. This entry point exists only for frozen compatibility
+/// fixtures and validation of historical v0.2 producer identities.
+pub fn build_module_cert_v0_2_compat(
+    module: CoreModule,
+    imports: &[VerifiedModule],
+) -> Result<ModuleCert> {
+    let imports = imports.iter().collect::<Vec<_>>();
+    canonical::build_module_cert_v0_2_compat_from_import_refs_with_preferred_imports_impl(
+        module,
+        &imports,
+        &std::collections::BTreeMap::new(),
+    )
+}
+
+/// Build an explicit v0.2 compatibility certificate from borrowed imports.
+///
+/// The preferred-provider map has the same meaning as in
+/// [`build_module_cert_from_import_refs_with_preferred_imports`].
+pub fn build_module_cert_v0_2_compat_from_import_refs_with_preferred_imports(
+    module: CoreModule,
+    imports: &[&VerifiedModule],
+    preferred_imports: &std::collections::BTreeMap<Name, ImportEntry>,
+) -> Result<ModuleCert> {
+    canonical::build_module_cert_v0_2_compat_from_import_refs_with_preferred_imports_impl(
+        module,
+        imports,
+        preferred_imports,
+    )
+}
+
 /// Encode a module certificate as the canonical `.npcert` binary representation.
 ///
 /// The returned bytes are the exact bytes used by certificate verification and module hashing.
@@ -148,6 +218,15 @@ pub fn decode_module_cert(bytes: &[u8]) -> Result<ModuleCert> {
         return Err(CertError::DecodeError);
     }
     Ok(cert)
+}
+
+/// Decode and validate only the exact certificate format/core header pair and module name.
+///
+/// This does not validate the remaining certificate payload. Callers may use it to construct
+/// version-separated cache identities before performing full source-free verification.
+pub fn decode_module_cert_header(bytes: &[u8]) -> Result<CertHeader> {
+    ensure_certificate_byte_limit(bytes)?;
+    binary::decode_module_cert_header(bytes)
 }
 
 /// Decode a certificate and return the byte offset of each import entry.

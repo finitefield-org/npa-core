@@ -165,10 +165,10 @@ let run_cli_tests () =
   let zero_hash = "sha256:" ^ String.make 64 '0' in
   let version = Ext_cli.run [ "--version" ] in
   let expected_version =
-    "npa-checker-ext 0.2.0\n"
+    "npa-checker-ext 0.3.0\n"
     ^ "checker_build_hash " ^ Ext_result.checker_build_hash ^ "\n"
-    ^ "certificate_format NPA-CERT-0.2.0\n"
-    ^ "core_spec NPA-Core-0.2.0\n"
+    ^ "certificate_format NPA-CERT-0.3.0\n"
+    ^ "core_spec NPA-Core-0.3.0\n"
     ^ "implementation_profile ocaml-clean-room\n"
     ^ "project_directory checkers/npa-checker-ext/\n"
     ^ "feature_policy_contract m0-05:first-release-empty-core-feature-set\n"
@@ -231,7 +231,7 @@ let run_cli_tests () =
   in
   assert_int_equal "check shape exit" 1 check_shape.code;
   assert_equal "check shape stderr" "" check_shape.stderr;
-  assert_contains "check shape schema" "\"schema\": \"npa.independent-checker.checker_raw_result.v1\""
+  assert_contains "check shape schema" "\"schema\": \"npa.independent-checker.checker_raw_result.v2\""
     check_shape.stdout;
   assert_contains "check shape status" "\"status\": \"failed\"" check_shape.stdout;
   assert_contains "check shape error" "\"kind\": \"certificate_decode_error\""
@@ -698,9 +698,9 @@ let run_decoder_header_tests () =
         assert_bool (label ^ " version")
           (header.Ext_cert.version = expected_version)
   in
-  assert_versioned_header "current header"
+  assert_versioned_header "compatibility header"
     "../../testdata/certificates/security/mutual-inductive-constructor-universe-bound-v0.2.npcert"
-    Ext_cert.current_format Ext_cert.current_core_spec Ext_cert.Current;
+    Ext_cert.compatibility_format Ext_cert.compatibility_core_spec Ext_cert.Compatibility;
   assert_versioned_header "previous header"
     "../../testdata/package/npa-mathlib-downstream/vendor/npa-mathlib/Mathlib/Logic/Basic/certificate.npcert"
     Ext_cert.previous_format Ext_cert.previous_core_spec Ext_cert.Previous;
@@ -1080,7 +1080,7 @@ let run_decoder_declarations_tests () =
          variant_payloads)
   in
   (match
-     Ext_cert.read_declarations 0 variant_names simple_level_table simple_term_table
+     Ext_cert.read_declarations Ext_cert.Compatibility 0 variant_names simple_level_table simple_term_table
        (Ext_bytes.of_string variant_declarations)
    with
   | Error error ->
@@ -1102,7 +1102,7 @@ let run_decoder_declarations_tests () =
   assert_decode_error "duplicate declaration name" "noncanonical_encoding"
     Ext_bytes.Duplicate_declaration Ext_bytes.Declarations
     (String.length (encode_uvar_int 2 ^ minimal_axiom_decl))
-    (Ext_cert.read_declarations 0 [ make_name [ "A" ] ] simple_level_table simple_term_table
+    (Ext_cert.read_declarations Ext_cert.Compatibility 0 [ make_name [ "A" ] ] simple_level_table simple_term_table
        (Ext_bytes.of_string duplicate_declarations));
 
   let dangling_term_export =
@@ -1228,7 +1228,12 @@ let run_decoder_reachability_tests () =
     (Ext_cli.context_of_bytes
        (mutate_byte malformed_later_section
           (String.length malformed_later_section - 1))
-    = Ext_cli.empty_context);
+    =
+    {
+      Ext_cli.empty_context with
+      input_certificate_format = Some Ext_cert.expected_format;
+      input_core_spec = Some Ext_cert.expected_core_spec;
+    });
 
   let unused_level_prefix =
     encode_header [ "M" ] ^ encode_imports [] ^ encode_name_table [ [ "A" ] ]
@@ -1288,7 +1293,21 @@ let run_decoder_reachability_tests () =
 
   assert_decode_error "trailing bytes after hashes" "certificate_decode_error"
     Ext_bytes.Trailing_bytes Ext_bytes.Full_certificate (String.length minimal)
-    (Ext_cert.read_module (Ext_bytes.of_string (minimal ^ "x")))
+    (Ext_cert.read_module (Ext_bytes.of_string (minimal ^ "x")));
+  (match Ext_cli.context_of_bytes (minimal ^ "x") with
+  | {
+      Ext_cli.module_name = None;
+      certificate_hash = None;
+      input_certificate_format = Some format;
+      input_core_spec = Some core_spec;
+    } ->
+      assert_equal "trailing bytes diagnostic certificate format"
+        Ext_cert.expected_format format;
+      assert_equal "trailing bytes diagnostic core spec"
+        Ext_cert.expected_core_spec core_spec
+  | _ ->
+      failwith
+        "trailing bytes diagnostic context must preserve only the input pair")
 
 let encode_export_entry_full name_id kind_tag universe_params ty body type_hash body_hash
     reducibility opacity decl_interface_hash axiom_dependencies =
@@ -1401,7 +1420,8 @@ let assert_declaration_hashes label decoded =
         (hex_of_raw_hash interface_hash);
       let certificate_payload =
         assert_ok (prefix ^ " certificate payload")
-          (Ext_canonical.declaration_certificate_payload decoded.Ext_cert.name_table
+          (Ext_canonical.declaration_certificate_payload decoded.Ext_cert.header.Ext_cert.version
+             decoded.Ext_cert.name_table
              decoded.Ext_cert.level_table decoded.Ext_cert.term_table declaration.Ext_cert.payload
              interface_hash declaration.Ext_cert.dependencies declaration.Ext_cert.axiom_dependencies)
       in
@@ -1420,7 +1440,8 @@ let recompute_stored_declaration_hashes label decoded =
         let prefix = label ^ " decl " ^ string_of_int index in
         let interface_hash, certificate_hash =
           assert_ok (prefix ^ " recomputed hashes")
-            (Ext_canonical.declaration_hashes decoded.Ext_cert.name_table
+            (Ext_canonical.declaration_hashes decoded.Ext_cert.header.Ext_cert.version
+               decoded.Ext_cert.name_table
                decoded.Ext_cert.level_table decoded.Ext_cert.term_table declaration)
         in
         let hashes =
@@ -1482,7 +1503,8 @@ let assert_declaration_hash_rejects label expected_kind expected_reason decoded 
       in
       let expected_interface, expected_certificate =
         assert_ok (label ^ " recomputed mismatch hashes")
-          (Ext_canonical.declaration_hashes decoded.Ext_cert.name_table
+          (Ext_canonical.declaration_hashes decoded.Ext_cert.header.Ext_cert.version
+             decoded.Ext_cert.name_table
              decoded.Ext_cert.level_table decoded.Ext_cert.term_table declaration)
       in
       let expected_hash, actual_hash =
@@ -1777,9 +1799,16 @@ let theorem_payload_with_proof payload decl_proof =
 
 let mutate_first_dependency_hash declaration hash =
   match declaration.Ext_cert.dependencies with
-  | dependency :: rest ->
+  | Ext_cert.Interface_dependency dependency :: rest ->
       let dependency =
-        { dependency with Ext_cert.dependency_decl_interface_hash = hash }
+        Ext_cert.Interface_dependency
+          { dependency with dependency_decl_interface_hash = hash }
+      in
+      { declaration with Ext_cert.dependencies = dependency :: rest }
+  | Ext_cert.Local_implementation_dependency dependency :: rest ->
+      let dependency =
+        Ext_cert.Local_implementation_dependency
+          { dependency with dependency_decl_interface_hash = hash }
       in
       { declaration with Ext_cert.dependencies = dependency :: rest }
   | [] -> failwith "expected dependency fixture"
@@ -2552,10 +2581,11 @@ let declaration_with_dependencies declaration dependencies =
   { declaration with Ext_cert.dependencies = dependencies }
 
 let dependency_entry global_ref decl_interface_hash =
-  {
-    Ext_cert.dependency_global_ref = global_ref;
-    dependency_decl_interface_hash = decl_interface_hash;
-  }
+  Ext_cert.Interface_dependency
+    {
+      dependency_global_ref = global_ref;
+      dependency_decl_interface_hash = decl_interface_hash;
+    }
 
 let axiom_ref global_ref axiom_name axiom_decl_interface_hash =
   { Ext_cert.axiom_global_ref = global_ref; axiom_name; axiom_decl_interface_hash }
@@ -2755,7 +2785,9 @@ let run_structural_preflight_tests () =
     ]
   in
   let input =
-    open_in "../../testdata/certificate-structural-limits-maxima.tsv"
+    open_in
+      (Filename.concat (root_dir ())
+         "../../testdata/certificate-structural-limits-maxima.tsv")
   in
   let rec read_limits limits =
     match input_line input with
@@ -6011,7 +6043,8 @@ let run_hash_encoder_tests () =
   in
   assert_canonical_bytes "axiom declaration certificate payload"
     (axiom_iface_hash ^ encode_axiom_refs [])
-    (Ext_canonical.declaration_certificate_payload axiom_decoded.Ext_cert.name_table
+    (Ext_canonical.declaration_certificate_payload axiom_decoded.Ext_cert.header.Ext_cert.version
+       axiom_decoded.Ext_cert.name_table
        axiom_decoded.Ext_cert.level_table axiom_decoded.Ext_cert.term_table
        axiom_decl.Ext_cert.payload axiom_iface_hash axiom_decl.Ext_cert.dependencies
        axiom_decl.Ext_cert.axiom_dependencies);
@@ -6066,7 +6099,8 @@ let run_hash_encoder_tests () =
   assert_canonical_bytes "theorem declaration certificate payload"
     (theorem_iface_hash ^ theorem_proof_hash
     ^ encode_dependency_entries [ (imported_ref, hash_bytes 0x55) ])
-    (Ext_canonical.declaration_certificate_payload theorem_decoded.Ext_cert.name_table
+    (Ext_canonical.declaration_certificate_payload theorem_decoded.Ext_cert.header.Ext_cert.version
+       theorem_decoded.Ext_cert.name_table
        theorem_decoded.Ext_cert.level_table theorem_decoded.Ext_cert.term_table
        theorem_decl.Ext_cert.payload theorem_iface_hash theorem_decl.Ext_cert.dependencies
        theorem_decl.Ext_cert.axiom_dependencies);
@@ -6090,7 +6124,7 @@ let run_hash_encoder_tests () =
   let import_decoded = decode_module_bytes "import hash fixture" import_module in
   assert_canonical_bytes "import dependency payload"
     (encode_dependency_entries [ (imported_ref, hash_bytes 0x55) ])
-    (Ext_canonical.encode_dependency_entries Ext_bytes.Declarations 0
+    (Ext_canonical.encode_dependency_entries Ext_cert.Compatibility Ext_bytes.Declarations 0
        import_decoded.Ext_cert.name_table (first_declaration import_decoded).Ext_cert.dependencies);
   assert_canonical_bytes "import export payload" (encode_export_block [ import_export ])
     (Ext_canonical.encode_export_block import_decoded);
@@ -6161,9 +6195,9 @@ let run_hash_encoder_tests () =
   assert_versioned_reencoding "previous certificate"
     "../../testdata/package/npa-mathlib-downstream/vendor/npa-mathlib/Mathlib/Logic/Basic/certificate.npcert"
     Ext_cert.Previous;
-  assert_versioned_reencoding "current certificate"
+  assert_versioned_reencoding "compatibility certificate"
     "../../testdata/package/npa-mathlib-downstream/Downstream/MathlibBasic/certificate.npcert"
-    Ext_cert.Current
+    Ext_cert.Compatibility
 
 let run_checker_pipeline_tests () =
   let import_bytes =
@@ -6227,12 +6261,16 @@ let run_checker_pipeline_tests () =
       assert_equal "checker executable-shaped CLI stderr" "" cli.stderr;
       let assert_raw_identity label json =
         assert_contains (label ^ " schema")
-          "\"schema\": \"npa.independent-checker.checker_raw_result.v1\""
+          "\"schema\": \"npa.independent-checker.checker_raw_result.v2\""
           json;
         assert_contains (label ^ " checker id")
           "\"checker_id\": \"npa-checker-ext\"" json;
         assert_contains (label ^ " checker version")
-          "\"checker_version\": \"0.2.0\"" json;
+          "\"checker_version\": \"0.3.0\"" json;
+        assert_contains (label ^ " capability format")
+          "\"certificate_format\": \"NPA-CERT-0.3.0\"" json;
+        assert_contains (label ^ " capability core")
+          "\"core_spec\": \"NPA-Core-0.3.0\"" json;
         assert_contains (label ^ " checker build hash")
           ("\"checker_build_hash\": \"" ^ Ext_result.checker_build_hash ^ "\"")
           json
@@ -6242,6 +6280,10 @@ let run_checker_pipeline_tests () =
         "\"status\": \"checked\"" cli.stdout;
       assert_contains "checker executable-shaped CLI module"
         "\"module\": \"Downstream.MathlibBasic\"" cli.stdout;
+      assert_contains "checker compatibility input format"
+        "\"input_certificate_format\": \"NPA-CERT-0.2.0\"" cli.stdout;
+      assert_contains "checker compatibility input core"
+        "\"input_core_spec\": \"NPA-Core-0.2.0\"" cli.stdout;
       let policy_hash_mismatch =
         Ext_cli.run
           [
@@ -6271,6 +6313,80 @@ let run_checker_pipeline_tests () =
       let boundary_file name =
         read_binary_file (Filename.concat boundary_dir name)
       in
+      let check_v0_3_fixture name expected_module =
+        let bytes = boundary_file name in
+        let decoded = decode_module_bytes name bytes in
+        assert_bool (name ^ " current version")
+          (decoded.Ext_cert.header.Ext_cert.version = Ext_cert.Current);
+        assert_equal (name ^ " canonical bytes") bytes
+          (assert_ok (name ^ " canonical encode")
+             (Ext_canonical.encode_module_bytes decoded));
+        match
+          Ext_checker.check_high_trust [] Ext_axiom.default_policy bytes
+        with
+        | Ok checked ->
+            assert_equal (name ^ " module") expected_module
+              (Ext_name.to_string (Ext_checker.module_name checked));
+            assert_equal (name ^ " input format") "NPA-CERT-0.3.0"
+              (Ext_checker.input_certificate_format checked);
+            assert_equal (name ^ " input core") "NPA-Core-0.3.0"
+              (Ext_checker.input_core_spec checked);
+            let raw = Ext_cli.checked_result checked in
+            assert_contains (name ^ " raw capability format")
+              "\"certificate_format\": \"NPA-CERT-0.3.0\"" raw;
+            assert_contains (name ^ " raw input format")
+              "\"input_certificate_format\": \"NPA-CERT-0.3.0\"" raw
+        | Error _ -> failwith (name ^ ": expected successful v0.3 check")
+      in
+      check_v0_3_fixture "opaque-direct-v0.3.npcert"
+        "Conformance.OpaqueDirect";
+      check_v0_3_fixture "opaque-alias-chain-v0.3.npcert"
+        "Conformance.OpaqueAliasChain";
+      (match
+         Ext_checker.check_high_trust [] Ext_axiom.default_policy
+           (boundary_file "invalid-target-v0.3.npcert")
+       with
+      | Error (Ext_checker.Axiom_report_error error) ->
+          assert_equal "invalid target kind" "dependency_hash_mismatch"
+            (Ext_axiom.error_kind error);
+          assert_equal "invalid target reason" "target_not_opaque"
+            (Ext_axiom.error_reason_code error);
+          assert_bool "invalid target section"
+            (error.Ext_axiom.section = Ext_bytes.Declarations)
+      | _ -> failwith "invalid v0.3 implementation target must be rejected");
+      (match
+         Ext_checker.check_high_trust [] Ext_axiom.default_policy
+           (boundary_file "stale-implementation-hash-v0.3.npcert")
+       with
+      | Error (Ext_checker.Axiom_report_error error) ->
+          assert_equal "stale implementation hash kind"
+            "dependency_hash_mismatch" (Ext_axiom.error_kind error);
+          assert_equal "stale implementation hash reason"
+            "certificate_hash_mismatch" (Ext_axiom.error_reason_code error);
+          assert_bool "stale implementation hash section"
+            (error.Ext_axiom.section = Ext_bytes.Declarations)
+      | _ -> failwith "stale v0.3 implementation hash must be rejected");
+      (match
+         Ext_checker.check_high_trust [] Ext_axiom.default_policy
+           (boundary_file "legacy-empty-v0.1.npcert")
+       with
+      | Ok checked ->
+          assert_equal "compact legacy module" "Conformance.LegacyEmpty"
+            (Ext_name.to_string (Ext_checker.module_name checked));
+          assert_equal "compact legacy input format" "NPA-CERT-0.1"
+            (Ext_checker.input_certificate_format checked);
+          let raw = Ext_cli.checked_result checked in
+          assert_contains "compact legacy raw capability"
+            "\"certificate_format\": \"NPA-CERT-0.3.0\"" raw;
+          assert_contains "compact legacy raw input"
+            "\"input_certificate_format\": \"NPA-CERT-0.1\"" raw
+      | Error _ -> failwith "compact legacy fixture must remain accepted");
+      (match
+         Ext_checker.check_high_trust [] Ext_axiom.default_policy
+           (boundary_file "forbidden-axiom-v0.3.npcert")
+       with
+      | Error (Ext_checker.Axiom_policy_error _) -> ()
+      | _ -> failwith "v0.3 forbidden axiom fixture must reach policy denial");
       let bad_provider =
         boundary_file "unchecked-provider-bad-v0.2.npcert"
       in

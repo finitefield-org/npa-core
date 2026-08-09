@@ -1,9 +1,10 @@
 use std::path::PathBuf;
 
+use npa_api::PerformanceDeclarationMeasurement;
 use npa_cert::Name;
 use npa_cli::args::{
-    PackageAuditCacheMode, PackageBuildCheckCacheMode, PackageBuildSelection, PackageChecker,
-    PackageLockInputMode, PackageTimingMode, PackageVerifierMemoMode,
+    KernelFuelReportMode, PackageAuditCacheMode, PackageBuildCheckCacheMode, PackageBuildSelection,
+    PackageChecker, PackageLockInputMode, PackageTimingMode, PackageVerifierMemoMode,
 };
 use npa_cli::diagnostic::{CommandExitCode, DiagnosticKind};
 use npa_cli::package_api::v1::{
@@ -13,6 +14,37 @@ use npa_cli::package_api::v1::{
 };
 use npa_cli::package_build::run_package_build_certs;
 use npa_cli::package_verify::run_package_verify_certs;
+use npa_kernel::KernelWorkCounters;
+
+#[test]
+fn v0_8_public_break_shapes_are_complete_and_current() {
+    assert_eq!(env!("CARGO_PKG_VERSION"), "0.8.0");
+
+    let counters = KernelWorkCounters {
+        fuel: Default::default(),
+        ..KernelWorkCounters::default()
+    };
+    assert_eq!(counters.fuel, Default::default());
+
+    let compile_options = npa_frontend::HumanCompileOptions {
+        kernel_fuel_report: npa_frontend::HumanKernelFuelReportMode::Detailed,
+        ..npa_frontend::HumanCompileOptions::default()
+    };
+    assert_eq!(
+        compile_options.kernel_fuel_report,
+        npa_frontend::HumanKernelFuelReportMode::Detailed
+    );
+
+    let declaration = PerformanceDeclarationMeasurement {
+        module: "Fixture.Module".to_owned(),
+        declaration_index: 0,
+        declaration: "Fixture.Module.theorem".to_owned(),
+        term_nodes: 1,
+        elaboration_elapsed_ns: 2,
+        kernel: None,
+    };
+    assert!(declaration.kernel.is_none());
+}
 
 #[test]
 fn package_build_certs_selection_builders_replace_full_selection() {
@@ -126,6 +158,8 @@ fn package_api_v1_build_constructors_encode_check_write_and_refresh_modes() {
         assert_eq!(options.check, expected_check);
         assert_eq!(options.update_manifest_hashes, expected_refresh);
         assert_eq!(options.build_check_cache, PackageBuildCheckCacheMode::Off);
+        assert_eq!(options.kernel_fuel_report, KernelFuelReportMode::Failure);
+        assert_eq!(options.timings, PackageTimingMode::Off);
     }
 }
 
@@ -187,10 +221,79 @@ fn package_api_v1_build_builder_is_a_pure_setter() {
         base.with_build_check_cache(PackageBuildCheckCacheMode::ReadThrough),
         expected
     );
+
+    let base = build_certs_check(common_options("proofs", true));
+    let mut expected = base.clone();
+    expected.kernel_fuel_report = KernelFuelReportMode::Detailed;
+    assert_eq!(
+        base.clone()
+            .with_kernel_fuel_report(KernelFuelReportMode::Detailed),
+        expected
+    );
+
+    let mut expected = base.clone();
+    expected.timings = PackageTimingMode::Detailed;
+    assert_eq!(base.with_timings(PackageTimingMode::Detailed), expected);
+}
+
+#[test]
+fn package_api_v1_build_observation_builders_cover_all_mode_pairs_orthogonally() {
+    let base = build_certs_check(common_options("proofs", true));
+    let fuel_modes = [
+        KernelFuelReportMode::Off,
+        KernelFuelReportMode::Failure,
+        KernelFuelReportMode::Detailed,
+    ];
+    let timing_modes = [
+        PackageTimingMode::Off,
+        PackageTimingMode::Summary,
+        PackageTimingMode::Detailed,
+    ];
+
+    for fuel in fuel_modes {
+        for timings in timing_modes {
+            let selected = base
+                .clone()
+                .with_kernel_fuel_report(fuel)
+                .with_timings(timings);
+            assert_eq!(selected.kernel_fuel_report, fuel);
+            assert_eq!(selected.timings, timings);
+
+            let mut expected = base.clone();
+            expected.kernel_fuel_report = fuel;
+            expected.timings = timings;
+            assert_eq!(selected, expected);
+            assert_eq!(
+                base.clone()
+                    .with_timings(timings)
+                    .with_kernel_fuel_report(fuel),
+                expected
+            );
+        }
+    }
 }
 
 #[test]
 fn package_api_v1_mode_strings_and_external_matches_are_forward_compatible() {
+    assert_eq!(KernelFuelReportMode::Off.as_str(), "off");
+    assert_eq!(KernelFuelReportMode::Failure.as_str(), "failure");
+    assert_eq!(KernelFuelReportMode::Detailed.as_str(), "detailed");
+    for (cli, human) in [
+        (
+            KernelFuelReportMode::Off,
+            npa_frontend::HumanKernelFuelReportMode::Off,
+        ),
+        (
+            KernelFuelReportMode::Failure,
+            npa_frontend::HumanKernelFuelReportMode::Failure,
+        ),
+        (
+            KernelFuelReportMode::Detailed,
+            npa_frontend::HumanKernelFuelReportMode::Detailed,
+        ),
+    ] {
+        assert_eq!(npa_frontend::HumanKernelFuelReportMode::from(cli), human);
+    }
     assert_eq!(PackageLockInputMode::CheckedFile.as_str(), "checked");
     assert_eq!(
         PackageLockInputMode::ReconstructedInMemory.as_str(),

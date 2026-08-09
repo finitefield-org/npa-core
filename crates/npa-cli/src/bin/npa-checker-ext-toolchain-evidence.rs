@@ -171,7 +171,7 @@ fn main() {
     match result {
         Ok(output) => print!("{output}"),
         Err(error) => {
-            eprintln!("toolchain_v0_7_evidence: {error}");
+            eprintln!("toolchain_v0_8_evidence: {error}");
             std::process::exit(1);
         }
     }

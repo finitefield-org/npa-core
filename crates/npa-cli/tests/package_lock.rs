@@ -85,7 +85,7 @@ fn package_lock_check_succeeds_on_proof_corpus_fixture_json() {
     assert!(output.stderr.is_empty());
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
-        "{\"schema\":\"npa.package.command_result.v0.3\",\"command\":\"package lock check\",\"root\":\"testdata/package/proofs\",\"status\":\"passed\",\"diagnostics\":[],\"artifacts\":[]}\n"
+        "{\"schema\":\"npa.package.command_result.v0.4\",\"command\":\"package lock check\",\"root\":\"testdata/package/proofs\",\"status\":\"passed\",\"diagnostics\":[],\"artifacts\":[]}\n"
     );
 }
 
@@ -159,7 +159,7 @@ fn package_lock_write_creates_missing_lock_and_reports_json() {
     assert!(output.stderr.is_empty());
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
-        "{\"schema\":\"npa.package.command_result.v0.3\",\"command\":\"package lock write\",\"root\":\"<absolute-root>\",\"status\":\"passed\",\"diagnostics\":[],\"artifacts\":[]}\n"
+        "{\"schema\":\"npa.package.command_result.v0.4\",\"command\":\"package lock write\",\"root\":\"<absolute-root>\",\"status\":\"passed\",\"diagnostics\":[],\"artifacts\":[]}\n"
     );
     assert_eq!(fs::read_to_string(lock_path).unwrap(), expected_lock);
 }

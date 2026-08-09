@@ -488,6 +488,7 @@ fn is_reserved_spelling(value: &str) -> bool {
         || matches!(
             value,
             "import"
+                | "opaque"
                 | "def"
                 | "theorem"
                 | "fun"
@@ -1064,7 +1065,7 @@ mod tests {
 
     #[test]
     fn token_only_api_preserves_spelling_and_trivia() {
-        let tokens = lex_machine_surface_tokens("Std.unsafe.Type -- doc\nnotation \"x\"")
+        let tokens = lex_machine_surface_tokens("Std.unsafe.Type -- opaque audit hit\nopaque def")
             .expect("token-only lexing should preserve unsupported surface fragments");
         let got = tokens
             .iter()
@@ -1080,11 +1081,11 @@ mod tests {
                 (MachineSurfaceTokenKind::Dot, "."),
                 (MachineSurfaceTokenKind::Reserved, "Type"),
                 (MachineSurfaceTokenKind::Whitespace, " "),
-                (MachineSurfaceTokenKind::Comment, "-- doc"),
+                (MachineSurfaceTokenKind::Comment, "-- opaque audit hit"),
                 (MachineSurfaceTokenKind::Whitespace, "\n"),
-                (MachineSurfaceTokenKind::Reserved, "notation"),
+                (MachineSurfaceTokenKind::Reserved, "opaque"),
                 (MachineSurfaceTokenKind::Whitespace, " "),
-                (MachineSurfaceTokenKind::StringLiteral, "\"x\""),
+                (MachineSurfaceTokenKind::Reserved, "def"),
             ]
         );
         assert_eq!(tokens[4].span, Span::new(FileId(0), 11, 15));

@@ -780,6 +780,7 @@ fn load_reference_summary_cache_or_verify(
             &loaded.snapshot.validated,
             &loaded.snapshot.package_lock_manifest,
             &cached_summaries,
+            &keyed_entries,
         );
         return Ok(PackageReferenceSummaryCacheRun {
             report,
@@ -1016,6 +1017,7 @@ fn reference_report_from_cached_summaries(
     validated: &ValidatedPackageManifest,
     lock: &PackageLockManifest,
     summaries: &[PackageCheckerSummary],
+    keyed_entries: &BTreeMap<npa_cert::Name, PackageReferenceSummaryKeyedEntry>,
 ) -> PackageVerificationReport {
     let summaries_by_module = summaries
         .iter()
@@ -1025,9 +1027,12 @@ fn reference_report_from_cached_summaries(
         .entries
         .iter()
         .filter_map(|entry| {
-            summaries_by_module
-                .get(&entry.module)
-                .map(|summary| PackageModuleVerificationResult {
+            summaries_by_module.get(&entry.module).map(|summary| {
+                let key_input = &keyed_entries
+                    .get(&entry.module)
+                    .expect("cached summary has its exact v0.2 key input")
+                    .key_input;
+                PackageModuleVerificationResult {
                     module: summary.module.clone(),
                     checker_mode: PackageVerificationMode::Reference,
                     status: PackageModuleVerificationStatus::Passed,
@@ -1035,8 +1040,11 @@ fn reference_report_from_cached_summaries(
                     export_hash: summary.export_hash,
                     axiom_report_hash: summary.axiom_report_hash,
                     certificate_hash: summary.certificate_hash,
+                    certificate_format: Some(key_input.module_certificate_format.clone()),
+                    core_spec: Some(key_input.module_core_spec.clone()),
                     error: None,
-                })
+                }
+            })
         })
         .collect::<Vec<_>>();
     PackageVerificationReport {

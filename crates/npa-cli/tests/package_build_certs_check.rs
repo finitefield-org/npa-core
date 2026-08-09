@@ -5,11 +5,14 @@ use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
+use npa_api::{PerformanceMeasurementLabel, PerformanceMeasurementReport};
 use npa_cert::{AxiomPolicy, Name, VerifiedModule};
-use npa_cli::args::PackageBuildCheckCacheMode;
+use npa_cli::args::{KernelFuelReportMode, PackageBuildCheckCacheMode, PackageTimingMode};
 use npa_cli::diagnostic::{CommandExitCode, CommandResult, DiagnosticKind};
 use npa_cli::package::PACKAGE_MANIFEST_PATH;
-use npa_cli::package_api::v1::{build_certs_check, common_options, refresh_artifacts_check};
+use npa_cli::package_api::v1::{
+    build_certs_check, build_certs_write, common_options, refresh_artifacts_check,
+};
 use npa_cli::package_build::{
     run_package_build_certs, run_package_build_certs_check,
     run_package_build_certs_check_with_cache,
@@ -19,9 +22,11 @@ use npa_frontend::{
     HumanCompileOptions, HumanImportedSourceInterface,
 };
 use npa_package::{
-    build_package_lock_from_package_root, format_package_hash, package_file_hash,
-    parse_and_validate_manifest_str, parse_package_build_check_result_entry_json,
-    PackageBuildCheckCachedStatus, PackageHash, PackagePath, PACKAGE_BUILD_CHECK_CACHE_LAYOUT_DIR,
+    build_package_lock_from_package_root, format_package_hash, package_build_check_cache_key,
+    package_build_check_result_entry_json, package_file_hash, parse_and_validate_manifest_str,
+    parse_package_build_check_result_entry_json, PackageBuildCheckCachedStatus, PackageHash,
+    PackagePath, PACKAGE_BUILD_CHECK_CACHE_LAYOUT_DIR, PACKAGE_BUILD_CHECK_CACHE_SCHEMA,
+    PACKAGE_BUILD_CHECK_RESULT_SCHEMA,
 };
 
 const ZERO_HASH: &str = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
@@ -37,6 +42,17 @@ def FunctionAlias.{u} : forall (Carrier : Sort u), Sort max 1 u :=
 
 static NEXT_TEMP_DIR: AtomicUsize = AtomicUsize::new(0);
 static BUILD_CHECK_CACHE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+const FUEL_MODES: [KernelFuelReportMode; 3] = [
+    KernelFuelReportMode::Off,
+    KernelFuelReportMode::Failure,
+    KernelFuelReportMode::Detailed,
+];
+const TIMING_MODES: [PackageTimingMode; 3] = [
+    PackageTimingMode::Off,
+    PackageTimingMode::Summary,
+    PackageTimingMode::Detailed,
+];
 
 struct BuildCheckCacheGuard {
     _lock: MutexGuard<'static, ()>,
@@ -201,7 +217,7 @@ fn package_build_certs_frontend_failure_check_cli_json_is_exact_and_private() {
     assert_eq!(
         stdout,
         format!(
-            "{{\"schema\":\"npa.package.command_result.v0.3\",\"command\":\"package build-certs\",\"root\":\"<absolute-root>\",\"status\":\"failed\",\"diagnostics\":[{{\"kind\":\"Build\",\"reason_code\":\"build_failed\",\"severity\":\"error\",\"module\":\"Proofs.Ai.Basic\",\"path\":\"modules[0].source\",\"field\":\"elaborator\",\"actual_value\":\"{FRONTEND_FAILURE_MESSAGE}\",\"source\":{{\"path\":\"Proofs/Ai/Basic/source.npa\",\"start_byte\":{start},\"end_byte\":{end},\"declaration\":\"product_enumeration_bad\",\"line\":1,\"column\":{},\"token\":\"product\"}}}}],\"artifacts\":[]}}\n",
+            "{{\"schema\":\"npa.package.command_result.v0.4\",\"command\":\"package build-certs\",\"root\":\"<absolute-root>\",\"status\":\"failed\",\"diagnostics\":[{{\"kind\":\"Build\",\"reason_code\":\"build_failed\",\"severity\":\"error\",\"module\":\"Proofs.Ai.Basic\",\"path\":\"modules[0].source\",\"field\":\"elaborator\",\"actual_value\":\"{FRONTEND_FAILURE_MESSAGE}\",\"source\":{{\"path\":\"Proofs/Ai/Basic/source.npa\",\"start_byte\":{start},\"end_byte\":{end},\"declaration\":\"product_enumeration_bad\",\"line\":1,\"column\":{},\"token\":\"product\"}}}}],\"artifacts\":[]}}\n",
             start + 1
         )
     );
@@ -755,7 +771,7 @@ fn package_build_certs_check_cli_succeeds_json() {
     assert!(output.stderr.is_empty());
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
-        "{\"schema\":\"npa.package.command_result.v0.3\",\"command\":\"package build-certs\",\"root\":\"<absolute-root>\",\"status\":\"passed\",\"diagnostics\":[],\"artifacts\":[]}\n"
+        "{\"schema\":\"npa.package.command_result.v0.4\",\"command\":\"package build-certs\",\"root\":\"<absolute-root>\",\"status\":\"passed\",\"diagnostics\":[],\"artifacts\":[]}\n"
     );
 }
 
@@ -784,6 +800,200 @@ fn package_build_certs_check_read_through_writes_then_hits_cache() {
         &second,
         "mode=read-through;hits=1;misses=0;stale=0;schema_misses=0;written=0;live_builds=1;trusted=false;build_evidence=false",
     );
+}
+
+#[test]
+fn package_build_certs_check_leaf_observation_mode_matrix_preserves_artifacts() {
+    let package = build_minimal_fixture("leaf-observation-mode-matrix");
+    let before = package_snapshot(&package);
+
+    for fuel in FUEL_MODES {
+        for timings in TIMING_MODES {
+            let result = run_package_build_certs(
+                build_certs_check(common_options(package.path(), true))
+                    .with_kernel_fuel_report(fuel)
+                    .with_timings(timings),
+            );
+
+            assert_eq!(result.exit_code(), CommandExitCode::Success);
+            assert_build_observation_mode(&result, fuel, timings, 1);
+            assert_eq!(package_snapshot(&package), before);
+        }
+    }
+}
+
+#[test]
+fn package_build_certs_check_interface_observation_mode_matrix_preserves_artifacts() {
+    let package = build_synthetic_local_import_fixture("interface-observation-mode-matrix");
+    let before = package_snapshot(&package);
+
+    for fuel in FUEL_MODES {
+        for timings in TIMING_MODES {
+            let result = run_package_build_certs(
+                build_certs_check(common_options(package.path(), true))
+                    .with_kernel_fuel_report(fuel)
+                    .with_timings(timings),
+            );
+
+            assert_eq!(result.exit_code(), CommandExitCode::Success);
+            assert_build_observation_mode(&result, fuel, timings, 2);
+            assert_eq!(package_snapshot(&package), before);
+        }
+    }
+}
+
+#[test]
+fn package_build_certs_build_check_cache_modes_do_not_change_identity() {
+    let _guard = build_check_cache_guard();
+    let package = build_minimal_fixture("cache-observation-modes");
+    let package_before = package_snapshot(&package);
+    let mut expected_entries = None;
+
+    for fuel in FUEL_MODES {
+        for timings in TIMING_MODES {
+            let result = run_package_build_certs(
+                build_certs_check(common_options(package.path(), true))
+                    .with_build_check_cache(PackageBuildCheckCacheMode::ReadThrough)
+                    .with_kernel_fuel_report(fuel)
+                    .with_timings(timings),
+            );
+            assert_eq!(result.exit_code(), CommandExitCode::Success);
+            if let Some(entries) = &expected_entries {
+                assert_build_check_cache_summary(
+                    &result,
+                    "mode=read-through;hits=1;misses=0;stale=0;schema_misses=0;written=0;live_builds=1;trusted=false;build_evidence=false",
+                );
+                assert_eq!(&build_check_cache_entries(), entries);
+            } else {
+                assert_build_check_cache_summary(
+                    &result,
+                    "mode=read-through;hits=0;misses=1;stale=0;schema_misses=0;written=1;live_builds=1;trusted=false;build_evidence=false",
+                );
+                expected_entries = Some(build_check_cache_entries());
+            }
+            assert_eq!(package_snapshot(&package), package_before);
+        }
+    }
+}
+
+#[test]
+fn package_build_certs_v0_8_identity_misses_v0_7_cache_without_relabeling() {
+    let _guard = build_check_cache_guard();
+    let package = build_minimal_fixture("cache-version-migration");
+    let initial = run_build_check_read_through(&package);
+    assert_eq!(initial.exit_code(), CommandExitCode::Success);
+    let mut current = build_check_cache_entries()
+        .pop()
+        .expect("current cache entry");
+    assert_eq!(current.schema, PACKAGE_BUILD_CHECK_RESULT_SCHEMA);
+    assert_eq!(current.key_input.schema, PACKAGE_BUILD_CHECK_CACHE_SCHEMA);
+    assert_eq!(current.key_input.tool_version, "0.8.0");
+
+    clear_build_check_cache();
+    current.key_input.tool_version = "0.7.0".to_owned();
+    current.key_input.tool_build_hash = package_file_hash(
+        b"schema=npa.package.build_check_tool_identity.v0.1\ncommand=package build-certs\nversion=0.7.0\n",
+    );
+    current.cache_key = package_build_check_cache_key(&current.key_input);
+    fs::create_dir_all(build_check_cache_dir()).unwrap();
+    fs::write(
+        build_check_cache_dir().join(format!("{}.json", current.cache_key)),
+        package_build_check_result_entry_json(&current),
+    )
+    .unwrap();
+
+    let rebuilt = run_build_check_read_through(&package);
+    assert_eq!(rebuilt.exit_code(), CommandExitCode::Success);
+    assert_build_check_cache_summary(
+        &rebuilt,
+        "mode=read-through;hits=0;misses=1;stale=0;schema_misses=0;written=1;live_builds=1;trusted=false;build_evidence=false",
+    );
+    let entries = build_check_cache_entries();
+    assert_eq!(entries.len(), 2);
+    assert!(entries.iter().all(|entry| {
+        entry.schema == PACKAGE_BUILD_CHECK_RESULT_SCHEMA
+            && entry.key_input.schema == PACKAGE_BUILD_CHECK_CACHE_SCHEMA
+    }));
+    assert_eq!(
+        entries
+            .iter()
+            .map(|entry| entry.key_input.tool_version.as_str())
+            .collect::<std::collections::BTreeSet<_>>(),
+        std::collections::BTreeSet::from(["0.7.0", "0.8.0"]),
+    );
+}
+
+#[test]
+fn package_build_certs_targeted_check_uses_shared_observation_coordinator() {
+    let package = build_synthetic_local_import_fixture("targeted-observations");
+    let result = run_package_build_certs(
+        build_certs_check(common_options(package.path(), true))
+            .with_modules(vec![Name::from_dotted("Fixture.B")])
+            .with_kernel_fuel_report(KernelFuelReportMode::Detailed)
+            .with_timings(PackageTimingMode::Detailed),
+    );
+
+    assert_eq!(result.exit_code(), CommandExitCode::Success);
+    assert_build_observation_mode(
+        &result,
+        KernelFuelReportMode::Detailed,
+        PackageTimingMode::Detailed,
+        1,
+    );
+}
+
+#[test]
+fn package_build_certs_changed_no_rebuild_success_is_finalized_once() {
+    let package = build_minimal_fixture("changed-no-rebuild-observations");
+    init_git_package(&package, true);
+    let result = run_package_build_certs(
+        build_certs_check(common_options(package.path(), true))
+            .with_changed()
+            .with_timings(PackageTimingMode::Detailed),
+    );
+
+    assert_eq!(result.exit_code(), CommandExitCode::Success);
+    let timings = result.timings.as_ref().expect("early success has timings");
+    let measurements = timings
+        .measurements
+        .as_ref()
+        .expect("early success has finalized common measurements");
+    assert!(measurements.declarations.is_empty());
+    assert_eq!(result.render_json().matches("\"timings\":").count(), 1);
+}
+
+#[test]
+fn package_build_certs_validation_failure_is_finalized_once() {
+    let package = build_minimal_fixture("validation-failure-observations");
+    let result = run_package_build_certs(
+        build_certs_write(common_options(package.path(), true))
+            .with_modules(vec![Name::from_dotted("Proofs.Ai.Basic")])
+            .with_timings(PackageTimingMode::Summary),
+    );
+
+    assert_eq!(result.exit_code(), CommandExitCode::UsageOrInternal);
+    assert!(result.timings.is_some());
+    assert_eq!(result.render_json().matches("\"timings\":").count(), 1);
+}
+
+#[test]
+fn package_build_certs_frontend_failure_is_finalized_once() {
+    let package = build_minimal_fixture("frontend-failure-observations");
+    install_frontend_failure(&package, "Proofs/Ai/Basic/source.npa", "Proofs.Ai.Basic");
+    let result = run_package_build_certs(
+        build_certs_check(common_options(package.path(), true))
+            .with_kernel_fuel_report(KernelFuelReportMode::Detailed)
+            .with_timings(PackageTimingMode::Detailed),
+    );
+
+    assert_eq!(result.exit_code(), CommandExitCode::PackageFailure);
+    let measurements = result
+        .timings
+        .as_ref()
+        .and_then(|timings| timings.measurements.as_ref())
+        .expect("frontend failure has finalized common measurements");
+    assert!(measurements.declarations.is_empty());
+    assert_eq!(result.render_json().matches("\"timings\":").count(), 1);
 }
 
 #[test]
@@ -1164,6 +1374,85 @@ fn package_build_certs_refresh_check_accepts_proofs_fixture_import_order() {
 }
 
 #[test]
+fn fixed_proofs_package_fuel_modes_are_byte_and_identity_neutral_with_timings_off() {
+    let _guard = build_check_cache_guard();
+    let root = repo_root().join("testdata/package/proofs");
+    let before = path_snapshot(&root);
+    let expected_declaration_hashes = package_declaration_hashes(&root);
+    let manifest_source = fs::read_to_string(root.join(PACKAGE_MANIFEST_PATH)).unwrap();
+    let validated = parse_and_validate_manifest_str(&manifest_source).unwrap();
+    let expected_lock = build_package_lock_from_package_root(
+        &validated,
+        &root,
+        PackagePath::new(PACKAGE_MANIFEST_PATH),
+    )
+    .unwrap()
+    .canonical_json()
+    .unwrap();
+    assert_eq!(
+        fs::read(root.join(LOCK_PATH)).unwrap(),
+        expected_lock.as_bytes()
+    );
+
+    let mut expected_json = None;
+    let mut expected_cache_entries = None;
+    for fuel in FUEL_MODES {
+        let cache_before = build_check_cache_entries();
+        let result = run_package_build_certs(
+            build_certs_check(common_options(&root, true))
+                .with_build_check_cache(PackageBuildCheckCacheMode::Off)
+                .with_kernel_fuel_report(fuel)
+                .with_timings(PackageTimingMode::Off),
+        );
+
+        assert_eq!(result.exit_code(), CommandExitCode::Success);
+        assert!(result.diagnostics.is_empty());
+        assert!(result.timings.is_none());
+        assert!(result
+            .diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.kernel_fuel.is_none()));
+        let json = result.render_json();
+        if let Some(expected) = &expected_json {
+            assert_eq!(&json, expected);
+        } else {
+            expected_json = Some(json);
+        }
+        assert_eq!(path_snapshot(&root), before);
+        assert_eq!(
+            package_declaration_hashes(&root),
+            expected_declaration_hashes
+        );
+        let lock = build_package_lock_from_package_root(
+            &validated,
+            &root,
+            PackagePath::new(PACKAGE_MANIFEST_PATH),
+        )
+        .unwrap()
+        .canonical_json()
+        .unwrap();
+        assert_eq!(lock, expected_lock);
+        assert_eq!(build_check_cache_entries(), cache_before);
+
+        let cached_result = run_package_build_certs(
+            build_certs_check(common_options(&root, true))
+                .with_build_check_cache(PackageBuildCheckCacheMode::ReadThrough)
+                .with_kernel_fuel_report(fuel)
+                .with_timings(PackageTimingMode::Off),
+        );
+        assert_eq!(cached_result.exit_code(), CommandExitCode::Success);
+        let entries = build_check_cache_entries();
+        if let Some(expected) = &expected_cache_entries {
+            assert_eq!(&entries, expected);
+        } else {
+            assert!(!entries.is_empty());
+            expected_cache_entries = Some(entries);
+        }
+        assert_eq!(path_snapshot(&root), before);
+    }
+}
+
+#[test]
 fn package_build_certs_check_accepts_legacy_std_producer_profile_fixture() {
     let result = run_package_build_certs_check(common_options(
         repo_root().join("testdata/package/npa-std"),
@@ -1190,6 +1479,49 @@ fn run_refresh_check(package: &TestPackage) -> npa_cli::diagnostic::CommandResul
         package.path(),
         true,
     )))
+}
+
+fn assert_build_observation_mode(
+    result: &CommandResult,
+    fuel: KernelFuelReportMode,
+    timings: PackageTimingMode,
+    expected_declarations: usize,
+) {
+    let Some(command_timings) = result.timings.as_ref() else {
+        assert_eq!(timings, PackageTimingMode::Off);
+        return;
+    };
+    assert_ne!(timings, PackageTimingMode::Off);
+    let measurements = command_timings
+        .measurements
+        .as_ref()
+        .expect("enabled build timings include common measurements");
+    assert!(measurement_counter(measurements, PerformanceMeasurementLabel::KernelCheckCalls) > 0);
+    if timings == PackageTimingMode::Detailed {
+        assert_eq!(measurements.declarations.len(), expected_declarations);
+        assert_eq!(
+            measurements.declaration_details.attempted,
+            u64::try_from(expected_declarations).unwrap()
+        );
+        assert!(measurements.declarations.iter().all(|declaration| {
+            declaration.term_nodes > 0
+                && declaration.kernel.is_some() == (fuel == KernelFuelReportMode::Detailed)
+        }));
+    } else {
+        assert!(measurements.declarations.is_empty());
+    }
+}
+
+fn measurement_counter(
+    measurements: &PerformanceMeasurementReport,
+    label: PerformanceMeasurementLabel,
+) -> u64 {
+    measurements
+        .counters
+        .iter()
+        .find(|counter| counter.label == label)
+        .map(|counter| counter.value)
+        .expect("kernel counter is present")
 }
 
 fn build_check_cache_guard() -> BuildCheckCacheGuard {
@@ -1327,6 +1659,10 @@ fn frontend_failure_binder_range() -> (u32, u32) {
 }
 
 fn package_snapshot(package: &TestPackage) -> BTreeMap<String, Option<Vec<u8>>> {
+    path_snapshot(package.path())
+}
+
+fn path_snapshot(root: &Path) -> BTreeMap<String, Option<Vec<u8>>> {
     fn visit(root: &Path, current: &Path, snapshot: &mut BTreeMap<String, Option<Vec<u8>>>) {
         let mut entries = fs::read_dir(current)
             .unwrap()
@@ -1350,8 +1686,45 @@ fn package_snapshot(package: &TestPackage) -> BTreeMap<String, Option<Vec<u8>>> 
     }
 
     let mut snapshot = BTreeMap::new();
-    visit(package.path(), package.path(), &mut snapshot);
+    visit(root, root, &mut snapshot);
     snapshot
+}
+
+fn package_declaration_hashes(root: &Path) -> BTreeMap<String, Vec<npa_cert::DeclHashes>> {
+    fn visit(
+        root: &Path,
+        current: &Path,
+        hashes: &mut BTreeMap<String, Vec<npa_cert::DeclHashes>>,
+    ) {
+        let mut entries = fs::read_dir(current)
+            .unwrap()
+            .map(|entry| entry.unwrap())
+            .collect::<Vec<_>>();
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let path = entry.path();
+            if path.is_dir() {
+                visit(root, &path, hashes);
+            } else if path.extension().and_then(|extension| extension.to_str()) == Some("npcert") {
+                let certificate = npa_cert::decode_module_cert(&fs::read(&path).unwrap()).unwrap();
+                hashes.insert(
+                    path.strip_prefix(root)
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned(),
+                    certificate
+                        .declarations
+                        .into_iter()
+                        .map(|declaration| declaration.hashes)
+                        .collect(),
+                );
+            }
+        }
+    }
+
+    let mut hashes = BTreeMap::new();
+    visit(root, root, &mut hashes);
+    hashes
 }
 
 fn init_git_package(package: &TestPackage, commit: bool) {

@@ -1553,12 +1553,12 @@ pub const FAILURE_MEMORY_SCHEMA: &str = "npa.failure_memory.v1";
 pub const FAILURE_MEMORY_KEY_HASH_DOMAIN: &str = "npa.failure-memory.key-hash.v1";
 pub const FAILURE_MEMORY_CANDIDATE_SHAPE_HASH_DOMAIN: &str =
     "npa.failure-memory.candidate-shape-hash.v1";
-pub const MINIMAL_FAILING_ARTIFACT_SCHEMA: &str = "npa.minimal_failing_artifact.v1";
+pub const MINIMAL_FAILING_ARTIFACT_SCHEMA: &str = "npa.minimal_failing_artifact.v2";
 pub const MINIMAL_FAILING_ARTIFACT_HASH_DOMAIN: &str =
-    "npa.machine-api.minimal-failing-artifact.hash.v1";
-pub const FOCUSED_REPLAY_FAILURE_ARTIFACT_SCHEMA: &str = "npa.focused_replay_failure_artifact.v1";
+    "npa.machine-api.minimal-failing-artifact.hash.v2";
+pub const FOCUSED_REPLAY_FAILURE_ARTIFACT_SCHEMA: &str = "npa.focused_replay_failure_artifact.v2";
 pub const FOCUSED_REPLAY_FAILURE_ARTIFACT_HASH_DOMAIN: &str =
-    "npa.machine-api.focused-replay-failure-artifact.hash.v1";
+    "npa.machine-api.focused-replay-failure-artifact.hash.v2";
 pub const FOCUSED_REPLAY_FAILURE_EXCLUDED_FIELDS: &[&str] = &[
     "raw_prompts",
     "model_completions",
@@ -2051,6 +2051,8 @@ pub struct MinimalFailingArtifactImportExport {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MinimalFailingArtifactImport {
     pub module: String,
+    pub certificate_format: String,
+    pub core_spec: String,
     pub export_hash: Hash,
     pub certificate_hash: Hash,
     pub visible: bool,
@@ -2066,6 +2068,9 @@ pub struct MinimalFailingArtifactCheckedCurrentDecl {
     pub type_hash: Hash,
     pub decl_interface_hash: Hash,
     pub core_decl_hash: Hash,
+    pub owner_certificate_format: String,
+    pub owner_core_spec: String,
+    pub dependency_selective_fingerprint: Hash,
     pub prior_chain_fingerprint: Hash,
     pub checked_env_fingerprint: Hash,
 }
@@ -2105,6 +2110,8 @@ pub struct MinimalFailingArtifact {
     pub artifact_hash: Hash,
     pub sidecar_only: bool,
     pub proof_acceptance_state: MinimalFailingArtifactProofAcceptanceState,
+    pub owner_certificate_format: String,
+    pub owner_core_spec: String,
     pub state_fingerprint: Hash,
     pub goal_id: GoalId,
     pub goal_fingerprint: Hash,
@@ -2739,6 +2746,8 @@ pub fn build_minimal_failing_artifact(
         artifact_hash: [0; 32],
         sidecar_only: true,
         proof_acceptance_state: MinimalFailingArtifactProofAcceptanceState::DiagnosticOnly,
+        owner_certificate_format: state.env.owner_certificate_format.clone(),
+        owner_core_spec: state.env.owner_core_spec.clone(),
         state_fingerprint: state.fingerprint,
         goal_id,
         goal_fingerprint: proof_candidate_goal_fingerprint(state.fingerprint, goal_id),
@@ -2816,6 +2825,8 @@ pub fn build_focused_replay_failure_artifact_from_tactic_batch(
         artifact_hash: [0; 32],
         sidecar_only: true,
         proof_acceptance_state: MinimalFailingArtifactProofAcceptanceState::DiagnosticOnly,
+        owner_certificate_format: input.state.env.owner_certificate_format.clone(),
+        owner_core_spec: input.state.env.owner_core_spec.clone(),
         state_fingerprint: input.state.fingerprint,
         goal_id: input.goal_id,
         goal_fingerprint: proof_candidate_goal_fingerprint(input.state.fingerprint, input.goal_id),
@@ -2848,6 +2859,21 @@ pub fn validate_minimal_failing_artifact_identity(
     if !artifact.sidecar_only
         || artifact.proof_acceptance_state
             != MinimalFailingArtifactProofAcceptanceState::DiagnosticOnly
+    {
+        return Err(MinimalFailingArtifactError::ProofAcceptanceStateClaim);
+    }
+    let supported_owner = matches!(
+        (
+            artifact.owner_certificate_format.as_str(),
+            artifact.owner_core_spec.as_str(),
+        ),
+        ("NPA-CERT-0.2.0", "NPA-Core-0.2.0") | ("NPA-CERT-0.3.0", "NPA-Core-0.3.0")
+    );
+    if !supported_owner
+        || artifact.checked_current_decls.iter().any(|decl| {
+            decl.owner_certificate_format != artifact.owner_certificate_format
+                || decl.owner_core_spec != artifact.owner_core_spec
+        })
     {
         return Err(MinimalFailingArtifactError::ProofAcceptanceStateClaim);
     }
@@ -2913,6 +2939,8 @@ pub fn build_focused_replay_failure_artifact(
     let import_identity_hash =
         focused_replay_import_identity_hash(&minimal_failing_artifact.imports);
     let checked_current_decl_interface_hash = focused_replay_checked_current_decl_interface_hash(
+        &minimal_failing_artifact.owner_certificate_format,
+        &minimal_failing_artifact.owner_core_spec,
         &minimal_failing_artifact.checked_current_decls,
     );
 
@@ -3023,6 +3051,8 @@ pub fn validate_focused_replay_failure_artifact_identity(
     }
     let actual_checked_current_decl_interface_hash =
         focused_replay_checked_current_decl_interface_hash(
+            &artifact.minimal_failing_artifact.owner_certificate_format,
+            &artifact.minimal_failing_artifact.owner_core_spec,
             &artifact.minimal_failing_artifact.checked_current_decls,
         );
     if artifact
@@ -3147,6 +3177,8 @@ pub fn minimal_failing_artifact_canonical_bytes(
     repair_encode_string(&mut out, MINIMAL_FAILING_ARTIFACT_SCHEMA);
     minimal_failing_encode_bool(&mut out, artifact.sidecar_only);
     repair_encode_string(&mut out, artifact.proof_acceptance_state.as_str());
+    repair_encode_string(&mut out, &artifact.owner_certificate_format);
+    repair_encode_string(&mut out, &artifact.owner_core_spec);
     out.extend_from_slice(&artifact.state_fingerprint);
     repair_encode_u64(&mut out, artifact.goal_id.0);
     out.extend_from_slice(&artifact.goal_fingerprint);
@@ -3154,6 +3186,8 @@ pub fn minimal_failing_artifact_canonical_bytes(
     repair_encode_len(&mut out, artifact.imports.len());
     for import in &artifact.imports {
         repair_encode_string(&mut out, &import.module);
+        repair_encode_string(&mut out, &import.certificate_format);
+        repair_encode_string(&mut out, &import.core_spec);
         out.extend_from_slice(&import.export_hash);
         out.extend_from_slice(&import.certificate_hash);
         minimal_failing_encode_bool(&mut out, import.visible);
@@ -3182,6 +3216,9 @@ pub fn minimal_failing_artifact_canonical_bytes(
         out.extend_from_slice(&decl.type_hash);
         out.extend_from_slice(&decl.decl_interface_hash);
         out.extend_from_slice(&decl.core_decl_hash);
+        repair_encode_string(&mut out, &decl.owner_certificate_format);
+        repair_encode_string(&mut out, &decl.owner_core_spec);
+        out.extend_from_slice(&decl.dependency_selective_fingerprint);
         out.extend_from_slice(&decl.prior_chain_fingerprint);
         out.extend_from_slice(&decl.checked_env_fingerprint);
     }
@@ -3254,10 +3291,12 @@ fn focused_replay_declaration_interface_hash(
 
 fn focused_replay_import_identity_hash(imports: &[MinimalFailingArtifactImport]) -> Hash {
     let mut out = Vec::new();
-    repair_encode_string(&mut out, "focused_replay.import_identity.v1");
+    repair_encode_string(&mut out, "focused_replay.import_identity.v2");
     repair_encode_len(&mut out, imports.len());
     for import in imports {
         repair_encode_string(&mut out, &import.module);
+        repair_encode_string(&mut out, &import.certificate_format);
+        repair_encode_string(&mut out, &import.core_spec);
         out.extend_from_slice(&import.export_hash);
         out.extend_from_slice(&import.certificate_hash);
         minimal_failing_encode_bool(&mut out, import.visible);
@@ -3275,16 +3314,20 @@ fn focused_replay_import_identity_hash(imports: &[MinimalFailingArtifactImport])
         }
     }
     minimal_failing_hash_with_domain(
-        "npa.machine-api.focused-replay.import-identity.hash.v1",
+        "npa.machine-api.focused-replay.import-identity.hash.v2",
         &out,
     )
 }
 
 fn focused_replay_checked_current_decl_interface_hash(
+    owner_certificate_format: &str,
+    owner_core_spec: &str,
     decls: &[MinimalFailingArtifactCheckedCurrentDecl],
 ) -> Hash {
     let mut out = Vec::new();
-    repair_encode_string(&mut out, "focused_replay.checked_current_decls.v1");
+    repair_encode_string(&mut out, "focused_replay.checked_current_decls.v2");
+    repair_encode_string(&mut out, owner_certificate_format);
+    repair_encode_string(&mut out, owner_core_spec);
     repair_encode_len(&mut out, decls.len());
     for decl in decls {
         repair_encode_u64(&mut out, decl.source_index);
@@ -3296,11 +3339,14 @@ fn focused_replay_checked_current_decl_interface_hash(
         out.extend_from_slice(&decl.type_hash);
         out.extend_from_slice(&decl.decl_interface_hash);
         out.extend_from_slice(&decl.core_decl_hash);
+        repair_encode_string(&mut out, &decl.owner_certificate_format);
+        repair_encode_string(&mut out, &decl.owner_core_spec);
+        out.extend_from_slice(&decl.dependency_selective_fingerprint);
         out.extend_from_slice(&decl.prior_chain_fingerprint);
         out.extend_from_slice(&decl.checked_env_fingerprint);
     }
     minimal_failing_hash_with_domain(
-        "npa.machine-api.focused-replay.checked-current-decls.hash.v1",
+        "npa.machine-api.focused-replay.checked-current-decls.hash.v2",
         &out,
     )
 }
@@ -3441,6 +3487,8 @@ fn minimal_failing_artifact_imports(
         .iter()
         .map(|import| MinimalFailingArtifactImport {
             module: import.module().as_dotted(),
+            certificate_format: import.certificate_format().to_owned(),
+            core_spec: import.core_spec().to_owned(),
             export_hash: import.export_hash(),
             certificate_hash: import.certificate_hash(),
             visible: import.is_visible(),
@@ -3476,6 +3524,9 @@ fn minimal_failing_artifact_checked_current_decls(
                 type_hash: core_expr_hash(signature.ty()),
                 decl_interface_hash: signature.decl_interface_hash(),
                 core_decl_hash: decl.core_decl_hash(),
+                owner_certificate_format: decl.owner_certificate_format().to_owned(),
+                owner_core_spec: decl.owner_core_spec().to_owned(),
+                dependency_selective_fingerprint: decl.dependency_selective_fingerprint(),
                 prior_chain_fingerprint: decl.prior_chain_fingerprint(),
                 checked_env_fingerprint: decl.checked_env_fingerprint(),
             }
@@ -5218,6 +5269,35 @@ pub fn run_machine_tactic_request_in_sessions<'session>(
     run_machine_tactic_request_parsed(session, request)
 }
 
+fn machine_session_owner_pair_is_consistent(session: &MachineProofSession) -> bool {
+    let supported = matches!(
+        (
+            session.owner_certificate_format.as_str(),
+            session.owner_core_spec.as_str(),
+        ),
+        ("NPA-CERT-0.2.0", "NPA-Core-0.2.0") | ("NPA-CERT-0.3.0", "NPA-Core-0.3.0")
+    );
+    if !supported {
+        return false;
+    }
+    let expected = session
+        .checked_current_decls
+        .checked_current_decls()
+        .first()
+        .map(|decl| (decl.owner_certificate_format(), decl.owner_core_spec()))
+        .unwrap_or(("NPA-CERT-0.3.0", "NPA-Core-0.3.0"));
+    session.owner_certificate_format == expected.0
+        && session.owner_core_spec == expected.1
+        && session
+            .checked_current_decls
+            .checked_current_decls()
+            .iter()
+            .all(|decl| {
+                decl.owner_certificate_format() == expected.0
+                    && decl.owner_core_spec() == expected.1
+            })
+}
+
 pub fn run_machine_tactic_batch_request(
     source: &str,
     session: &mut MachineProofSession,
@@ -5579,6 +5659,8 @@ pub fn machine_tactic_environment_hash(session: &MachineProofSession) -> Hash {
     );
     let statement_hash = session.root.theorem_type_core_hash;
     proof_candidate_environment_hash(
+        &session.owner_certificate_format,
+        &session.owner_core_spec,
         import_closure_hash,
         axiom_policy_hash,
         feature_profile_hash,
@@ -6154,6 +6236,14 @@ fn run_machine_tactic_request_parsed(
     session: &mut MachineProofSession,
     request: MachineTacticRunRequest<'_>,
 ) -> Result<MachineTacticRunResponse, Box<MachineTacticRunError>> {
+    if !machine_session_owner_pair_is_consistent(session) {
+        return Err(plain_error(
+            MachineApiErrorKind::InvalidMachineProofState,
+            MachineApiDiagnosticPhase::SnapshotLookup,
+            "session owner certificate/core pair does not match its checked-current chain",
+            RunErrorCorrelation::default(),
+        ));
+    }
     if session.snapshots.session_id() != &session.session_id {
         return Err(plain_error(
             MachineApiErrorKind::InvalidMachineProofState,
@@ -6347,6 +6437,14 @@ fn run_machine_tactic_batch_request_parsed(
 ) -> Result<MachineTacticBatchResponse, Box<MachineTacticBatchError>> {
     let mut batching_measurement =
         TrueBatchingMeasurementScope::new(measurement, batch_index, request.candidates.len());
+    if !machine_session_owner_pair_is_consistent(session) {
+        return Err(batch_plain_error(
+            MachineApiErrorKind::InvalidMachineProofState,
+            MachineApiDiagnosticPhase::SnapshotLookup,
+            "session owner certificate/core pair does not match its checked-current chain",
+            None,
+        ));
+    }
     if session.snapshots.session_id() != &session.session_id {
         return Err(batch_plain_error(
             MachineApiErrorKind::InvalidMachineProofState,
@@ -10655,12 +10753,23 @@ mod tests {
             .expect("fresh focused replay artifact should validate");
 
         let base_hash = first.artifact_hash;
+        let mut changed_owner = first.clone();
+        changed_owner
+            .minimal_failing_artifact
+            .owner_certificate_format = "NPA-CERT-0.2.0".to_owned();
+        changed_owner.minimal_failing_artifact.owner_core_spec = "NPA-Core-0.2.0".to_owned();
+        assert_ne!(
+            focused_replay_failure_artifact_hash(&changed_owner).unwrap(),
+            base_hash
+        );
         let mut changed_import = first.clone();
         changed_import
             .minimal_failing_artifact
             .imports
             .push(MinimalFailingArtifactImport {
                 module: "Proofs.Ai.Import".to_owned(),
+                certificate_format: "NPA-CERT-0.2.0".to_owned(),
+                core_spec: "NPA-Core-0.2.0".to_owned(),
                 export_hash: [1; 32],
                 certificate_hash: [2; 32],
                 visible: true,
@@ -12133,6 +12242,32 @@ mod tests {
                 "machine tactic api must not contain fallback marker {needle:?}"
             );
         }
+    }
+
+    #[test]
+    fn machine_tactic_rejects_mismatched_session_owner_pair_before_execution() {
+        let mut session = create_machine_session(&minimal_session_json("Prop"))
+            .unwrap()
+            .session;
+        let state_fingerprint = session.initial_snapshot.state_fingerprint;
+        session.owner_certificate_format = "NPA-CERT-0.2.0".to_owned();
+        session.owner_core_spec = "NPA-Core-0.2.0".to_owned();
+        let request = run_json(
+            &session,
+            state_fingerprint,
+            r#"{"kind":"exact","term":{"source":"Prop"}}"#,
+        );
+
+        let error = run_machine_tactic_request(&request, &mut session)
+            .expect_err("a session owner pair must agree with its checked-current chain");
+        assert_eq!(
+            error.diagnostic.kind,
+            MachineApiErrorKind::InvalidMachineProofState
+        );
+        assert_eq!(
+            error.diagnostic.phase,
+            MachineApiDiagnosticPhase::SnapshotLookup
+        );
     }
 
     #[test]
@@ -13859,8 +13994,9 @@ mod tests {
     fn tactic_batch_prepared_path_matches_repeated_legacy_single_candidate_matrix() {
         // The checked-in bytes were produced at commit 2a38c722c by this same
         // repeated public single-candidate construction, before prepared
-        // snapshots existed. The live construction catches projection drift;
-        // the frozen bytes keep the reference independent of this code path.
+        // snapshots existed. ODS-08 deliberately invalidates those identity
+        // bytes; the live repeated path must still equal prepared execution,
+        // while the frozen pre-migration oracle must remain stale.
         for fixture in legacy_batch_oracle_fixtures() {
             let session = create_machine_session(&minimal_session_json(fixture.theorem_type))
                 .unwrap()
@@ -13887,10 +14023,14 @@ mod tests {
                 panic!("invalid JSON oracle for {}: {error:?}", fixture.name)
             });
 
-            assert_eq!(legacy_json, frozen_json, "legacy fixture {}", fixture.name);
             assert_eq!(
-                prepared_json, frozen_json,
-                "prepared fixture {}",
+                prepared_json, legacy_json,
+                "prepared and repeated-single fixture {}",
+                fixture.name
+            );
+            assert_ne!(
+                legacy_json, frozen_json,
+                "pre-ODS-08 fixture must be stale for {}",
                 fixture.name
             );
             assert_eq!(

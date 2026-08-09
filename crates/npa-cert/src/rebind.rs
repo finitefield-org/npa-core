@@ -132,7 +132,7 @@ impl From<CertError> for ModuleCertImportRebindError {
 
 /// Rebind strict certificate hashes for export-stable local imports of one canonical certificate.
 ///
-/// The operation accepts only current-format canonical bytes with manifest-qualified module,
+/// The operation accepts v0.2 compatibility and v0.3 canonical bytes with manifest-qualified module,
 /// export, axiom-report, and old certificate hashes. Every certificate import must have one exact
 /// live-verified mapping. External identities are immutable; local export changes are returned as
 /// a source-rebuild outcome. Rebound bytes are structurally audited and live source-free verified
@@ -144,7 +144,11 @@ pub fn rebind_module_cert_import_certificate_hashes(
     policy: &AxiomPolicy,
 ) -> std::result::Result<ModuleCertImportRebindOutcome, ModuleCertImportRebindError> {
     let previous = verify_module_cert_hashes(previous_bytes)?;
-    if certificate_format_version(&previous.header)? != CertificateFormatVersion::Current {
+    let version = certificate_format_version(&previous.header)?;
+    if !matches!(
+        version,
+        CertificateFormatVersion::V0_2_0 | CertificateFormatVersion::V0_3_0
+    ) {
         return Ok(ModuleCertImportRebindOutcome::IneligibleFormat {
             format: previous.header.format,
             core_spec: previous.header.core_spec,
@@ -247,8 +251,8 @@ pub fn rebind_module_cert_import_certificate_hashes(
     }
 
     rebound.hashes.certificate_hash = hash_with_domain(
-        MODULE_CERT_DOMAIN,
-        &encode_module_cert_without_certificate_hash(&rebound),
+        version.module_certificate_domain(),
+        &encode_module_cert_without_certificate_hash_for_header(&rebound)?,
     );
     if !matches_rebind_structural_mask(&previous, &rebound, &changed_imports) {
         return Err(ModuleCertImportRebindError::StructuralAuditMismatch);

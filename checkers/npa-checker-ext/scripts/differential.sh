@@ -26,7 +26,7 @@ cargo test --locked --offline -q --manifest-path "$ROOT/Cargo.toml" -p npa-cert 
 cargo build --locked --offline -q --manifest-path "$ROOT/Cargo.toml" -p npa-api \
   --example validate_checker_raw
 
-TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/npa-checker-ext-differential.XXXXXX")
+TMP_DIR=$(mktemp -d "$ROOT/target/npa-checker-ext-differential.XXXXXX")
 trap 'rm -rf "$TMP_DIR"' EXIT HUP INT TERM
 
 GENERATED_FIXTURES="$TMP_DIR/generated"
@@ -138,10 +138,15 @@ run_case_with_policy() {
     return 1
   fi
 
-  for field in status module certificate_hash export_hash axiom_report_hash kind reason_code section
+  for field in certificate_format core_spec input_certificate_format input_core_spec status module certificate_hash export_hash axiom_report_hash kind reason_code section
   do
     compare_field "$label" "$field" "$reference_json" "$external_json"
   done
+  if [ "$(json_string_field "$external_json" certificate_format)" != "NPA-CERT-0.3.0" ] ||
+     [ "$(json_string_field "$external_json" core_spec)" != "NPA-Core-0.3.0" ]; then
+    echo "$label: external checker advertised stale capability metadata" >&2
+    return 1
+  fi
   compare_field "$label" status "$reference_json" "$fast_json"
   if [ "$(json_string_field "$fast_json" status)" = "checked" ]; then
     for field in module certificate_hash export_hash axiom_report_hash
@@ -422,10 +427,17 @@ run_case_with_policy policy-name-order-violation \
 "$ROOT/target/debug/examples/validate_checker_raw" \
   "$TMP_DIR"/*.reference.json "$TMP_DIR"/*.external*.json
 
-NPA_CHECKER_EXT_BINARY_PATH="$EXT_ROOT/_build/npa-checker-ext" \
-  cargo test --locked --offline -q --manifest-path "$ROOT/Cargo.toml" -p npa-cli \
-    --test package_verify_certs \
-    package_verify_external_real_ocaml_checker_closes_source_free_import_dag \
-    -- --ignored --exact
+case "$(uname -s)" in
+  Linux)
+    NPA_CHECKER_EXT_BINARY_PATH="$EXT_ROOT/_build/npa-checker-ext" \
+      cargo test --locked --offline -q --manifest-path "$ROOT/Cargo.toml" -p npa-cli \
+        --test package_verify_certs \
+        package_verify_external_real_ocaml_checker_closes_source_free_import_dag \
+        -- --ignored --exact
+    ;;
+  *)
+    echo "live package adoption: skipped (kernel-sealed executable descriptors require Linux)"
+    ;;
+esac
 
 "$EXT_ROOT/scripts/source-free-trace.sh"

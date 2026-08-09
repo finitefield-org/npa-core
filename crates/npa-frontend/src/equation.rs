@@ -5756,6 +5756,7 @@ mod tests {
     fn equation_options() -> HumanCompileOptions {
         HumanCompileOptions {
             enable_equation_compiler: true,
+            kernel_fuel_report: crate::HumanKernelFuelReportMode::Off,
             ..HumanCompileOptions::default()
         }
     }

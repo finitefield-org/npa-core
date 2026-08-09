@@ -12,6 +12,7 @@ use crate::types::{
     GlobalRef, Hash, LevelId, LevelNode, ModuleCert, Name, NameId, Result, TermId, TermNode,
     UniverseConstraintSpec, VerifiedModule,
 };
+use crate::CertificateFormatVersion;
 
 const BUILTIN_NAT: &str = "Nat";
 const BUILTIN_NAT_ZERO: &str = "Nat.zero";
@@ -850,6 +851,44 @@ pub(crate) fn add_decl_to_env(env: &mut Env, decl: Decl) -> Result<()> {
             return Err(CertError::UnknownDependency {
                 name: Name::from_dotted(decl.name()),
             });
+        }
+    }
+    Ok(())
+}
+
+/// Check a current-module declaration with its declared reducibility, then
+/// expose a v0.3 opaque body only in the environment used by later local
+/// declarations.
+///
+/// The source/certificate `Decl` is never rewritten. Compatibility formats
+/// and every non-opaque declaration retain the ordinary kernel view.
+pub(crate) fn add_current_module_decl_to_env(
+    env: &mut Env,
+    decl: Decl,
+    version: CertificateFormatVersion,
+) -> Result<()> {
+    let local_opaque_name = if version == CertificateFormatVersion::V0_3_0 {
+        match &decl {
+            Decl::Def {
+                name,
+                reducibility: Reducibility::Opaque,
+                ..
+            }
+            | Decl::DefConstrained {
+                name,
+                reducibility: Reducibility::Opaque,
+                ..
+            } => Some(name.clone()),
+            _ => None,
+        }
+    } else {
+        None
+    };
+
+    add_decl_to_env(env, decl)?;
+    if let Some(name) = local_opaque_name {
+        if !env.expose_checked_opaque_definition(&name) {
+            return Err(CertError::DecodeError);
         }
     }
     Ok(())

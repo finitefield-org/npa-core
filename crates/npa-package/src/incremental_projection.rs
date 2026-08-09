@@ -579,6 +579,8 @@ mod tests {
                     certificate_file_hash: entry.certificate_file_hash,
                     export_hash: entry.export_hash,
                     certificate_hash: entry.certificate_hash,
+                    certificate_format: self.certificate_format.clone(),
+                    core_spec: self.core_spec.clone(),
                     axiom_report_hash: entry.axiom_report_hash,
                     direct_imports: entry
                         .imports
@@ -598,8 +600,8 @@ mod tests {
                 schema: PACKAGE_VERIFIED_EXPORT_SUMMARY_SCHEMA.to_owned(),
                 package: self.package.clone(),
                 version: self.version.clone(),
-                core_spec: self.core_spec.clone(),
-                certificate_format: self.certificate_format.clone(),
+                package_core_profile: self.core_spec.clone(),
+                package_certificate_profile: self.certificate_format.clone(),
                 package_lock_hash: self.lock_ref.file_hash,
                 module_order: PACKAGE_VERIFIED_EXPORT_SUMMARY_MODULE_ORDER_TOPOLOGICAL.to_owned(),
                 trusted: false,

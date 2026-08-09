@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::MachineSurfaceCallableInterfaceTable;
-use crate::{FileId, Span};
+use crate::{DefinitionReducibility, FileId, Span};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MachineModule {
@@ -13,7 +13,7 @@ pub struct MachineModule {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MachineItem {
     Import { module: MachineName, span: Span },
-    Def(MachineDecl),
+    Def(MachineDefinitionDecl),
     Theorem(MachineDecl),
 }
 
@@ -21,9 +21,17 @@ impl MachineItem {
     pub fn span(&self) -> Span {
         match self {
             Self::Import { span, .. } => *span,
-            Self::Def(decl) | Self::Theorem(decl) => decl.span,
+            Self::Def(definition) => definition.declaration.span,
+            Self::Theorem(decl) => decl.span,
         }
     }
+}
+
+/// Machine Surface definition together with its source-selected reducibility.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MachineDefinitionDecl {
+    pub declaration: MachineDecl,
+    pub reducibility: DefinitionReducibility,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -281,6 +289,7 @@ pub struct MachineCheckedCurrentDecl {
     pub source_index: u64,
     pub decl_interface_hash: npa_cert::Hash,
     pub decl: npa_kernel::Decl,
+    pub reducibility: DefinitionReducibility,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -306,6 +315,7 @@ pub enum MachineGlobalScopeEntry {
         name: npa_cert::Name,
         source_index: u64,
         decl_interface_hash: npa_cert::Hash,
+        reducibility: DefinitionReducibility,
     },
     CurrentGenerated {
         name: npa_cert::Name,
@@ -589,6 +599,7 @@ impl MachineTermElabContext {
                     name: entry_name,
                     source_index: entry_source_index,
                     decl_interface_hash: entry_decl_interface_hash,
+                    ..
                 } if entry_name == name
                     && *entry_source_index == source_index
                     && entry_decl_interface_hash == decl_interface_hash
@@ -660,6 +671,7 @@ fn name_is_in_module(name: &npa_cert::Name, module: &npa_cert::ModuleName) -> bo
 pub struct MachineKernelEnvView {
     pub(crate) env: npa_kernel::Env,
     decl_interface_hashes: BTreeMap<String, BTreeSet<npa_cert::Hash>>,
+    opaque_definition_names: BTreeSet<String>,
 }
 
 impl MachineKernelEnvView {
@@ -667,6 +679,7 @@ impl MachineKernelEnvView {
         Self {
             env,
             decl_interface_hashes: BTreeMap::new(),
+            opaque_definition_names: BTreeSet::new(),
         }
     }
 
@@ -685,6 +698,7 @@ impl MachineKernelEnvView {
         Self {
             env: npa_kernel::Env::new(),
             decl_interface_hashes: BTreeMap::new(),
+            opaque_definition_names: BTreeSet::new(),
         }
     }
 
@@ -703,6 +717,14 @@ impl MachineKernelEnvView {
         self.decl_interface_hashes
             .get(name)
             .is_some_and(|hashes| hashes.contains(hash))
+    }
+
+    pub(crate) fn add_opaque_definition_name(&mut self, name: &npa_cert::Name) {
+        self.opaque_definition_names.insert(name.as_dotted());
+    }
+
+    pub(crate) fn opaque_definition_names(&self) -> &BTreeSet<String> {
+        &self.opaque_definition_names
     }
 }
 

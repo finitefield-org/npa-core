@@ -104,6 +104,9 @@ impl MachineImportCertificateContext {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VerifiedModuleContextEntry {
     pub key: VerifiedImportKey,
+    /// Exact format/core pair decoded and verified from the certificate header.
+    pub certificate_format: String,
+    pub core_spec: String,
     pub certificate_bytes: Vec<u8>,
     pub certificate_import_table: Vec<VerifiedImportKey>,
     pub decoded_name_table: Vec<Name>,
@@ -456,6 +459,8 @@ fn project_verified_module(
 
     Ok(VerifiedModuleContextEntry {
         key,
+        certificate_format: verified_module.certificate_format().to_owned(),
+        core_spec: verified_module.core_spec().to_owned(),
         certificate_bytes: record.certificate_bytes.clone(),
         certificate_import_table: record.imports.clone(),
         decoded_name_table: verified_module.name_table().to_vec(),
@@ -1064,6 +1069,36 @@ mod tests {
         assert_ne!(entry.export_signature_summary_hash, [0; 32]);
         assert_ne!(entry.certified_env_decl_hashes_summary_hash, [0; 32]);
         assert_ne!(entry.axiom_report_hash, [0; 32]);
+    }
+
+    #[test]
+    fn import_projection_keeps_opaque_reducibility_without_exporting_body() {
+        let (bytes, verified) = cert_bytes(
+            CoreModule {
+                name: Name::from_dotted("Test.Opaque"),
+                declarations: vec![Decl::Def {
+                    name: "Test.Opaque.hidden".to_owned(),
+                    universe_params: Vec::new(),
+                    ty: Expr::sort(Level::succ(Level::zero())),
+                    value: Expr::sort(Level::zero()),
+                    reducibility: npa_kernel::Reducibility::Opaque,
+                }],
+            },
+            &[],
+        );
+        let key = key_from_verified(&verified);
+        let context = project_import_certificate_context(
+            &[input_from_verified(&verified, &bytes)],
+            std::slice::from_ref(&key),
+            &AxiomPolicy::high_trust(),
+        )
+        .unwrap();
+        let export = &context.verified_modules()[0].export_block[0];
+
+        assert_eq!(export.kind, ExportKind::Def);
+        assert_eq!(export.reducibility, Some(CertReducibility::Opaque));
+        assert_eq!(export.body, None);
+        assert_eq!(export.body_hash, None);
     }
 
     #[test]

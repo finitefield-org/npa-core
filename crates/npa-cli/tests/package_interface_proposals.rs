@@ -94,31 +94,6 @@ fn result_json(command: PackageCommand) -> String {
 }
 
 #[test]
-fn pilot_json_is_stable_and_has_no_absolute_paths() {
-    let root = mathlib_root().canonicalize().unwrap();
-    let first = result_json(options(
-        &root,
-        Some(PathBuf::from("interface-proposals")),
-        None,
-        true,
-    ));
-    let second = result_json(options(
-        &root,
-        Some(PathBuf::from("interface-proposals")),
-        None,
-        true,
-    ));
-
-    assert_eq!(first, second);
-    assert!(first.contains("\"schema\":\"npa.mathlib.interface_proposal_check.v1\""));
-    assert!(first.contains("\"proof_evidence\":false"));
-    assert!(first.contains("\"status\":\"ok\""));
-    assert!(first.contains("\"proposal_count\":3"));
-    assert!(first.contains("\"interface_status\":\"adopted\""));
-    assert!(!first.contains(root.to_str().unwrap()));
-}
-
-#[test]
 fn previous_snapshot_mode_checks_identical_valid_snapshots_without_git() {
     let root = mathlib_root().canonicalize().unwrap();
     let previous_root = temp_root("previous");

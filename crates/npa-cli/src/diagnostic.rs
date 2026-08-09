@@ -7,7 +7,11 @@ use npa_api::{performance_measurement_report_json, PerformanceMeasurementReport}
 use crate::args::CliUsageError;
 
 /// Stable schema string for package command results.
-pub const PACKAGE_COMMAND_RESULT_SCHEMA: &str = "npa.package.command_result.v0.3";
+pub const PACKAGE_COMMAND_RESULT_SCHEMA: &str = "npa.package.command_result.v0.4";
+/// Stable schema string for bounded, untrusted kernel fuel diagnostics.
+pub const KERNEL_FUEL_DIAGNOSTIC_SCHEMA: &str = "npa.kernel-fuel-diagnostic.v0.1";
+
+const KERNEL_FUEL_DIAGNOSTIC_MAX_JSON_BYTES: usize = 64 * 1024;
 /// Stable schema string for optional package timing telemetry.
 pub const PACKAGE_TIMINGS_SCHEMA_V0_1: &str = "npa.package.timings.v0.1";
 /// Timing schema for commands embedding the common measurement block.
@@ -274,6 +278,297 @@ fn valid_kernel_head(head: &str) -> bool {
     })
 }
 
+/// Command-owned counters for the fuel-owning failed kernel operation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CommandKernelFuelOperationCounters {
+    /// Operation fuel budget.
+    pub budget: u64,
+    /// Fuel consumed by the operation.
+    pub spent: u64,
+    /// Fuel remaining when the operation completed.
+    pub remaining: u64,
+    /// Whether the operation exhausted its budget.
+    pub exhausted: bool,
+    /// Whether any counter arithmetic overflowed.
+    pub overflowed: bool,
+}
+
+/// Command-owned declaration aggregate for one kernel fuel domain.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CommandKernelFuelDomainTotals {
+    /// Number of fuel-owning operations in the domain.
+    pub calls: u64,
+    /// Total logical fuel consumed in the domain.
+    pub logical_spent: u64,
+    /// Fuel consumed by successful operations.
+    pub successful_operation_fuel: u64,
+    /// Fuel consumed by the exhausted operation.
+    pub exhausted_operation_fuel: u64,
+    /// Whether any domain counter arithmetic overflowed.
+    pub overflowed: bool,
+}
+
+/// Command-owned declaration fuel totals separated by resource domain.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CommandKernelFuelTotals {
+    /// Weak-head-normal-form fuel totals.
+    pub whnf: CommandKernelFuelDomainTotals,
+    /// Definitional-equality conversion fuel totals.
+    pub conversion: CommandKernelFuelDomainTotals,
+}
+
+/// Command-owned bounded kernel work snapshot.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CommandKernelWorkSnapshot {
+    /// Type-check calls.
+    pub check_calls: u64,
+    /// Type-inference calls.
+    pub infer_calls: u64,
+    /// Weak-head-normal-form calls.
+    pub whnf_calls: u64,
+    /// Definitional-equality calls.
+    pub defeq_calls: u64,
+    /// Fast syntactic-equality hits.
+    pub quick_equality_hits: u64,
+    /// Beta reductions.
+    pub beta_steps: u64,
+    /// Delta reductions.
+    pub delta_steps: u64,
+    /// Iota reductions.
+    pub iota_steps: u64,
+    /// Zeta reductions.
+    pub zeta_steps: u64,
+    /// Total physical reductions.
+    pub physical_reductions: u64,
+    /// Whether any work counter arithmetic overflowed.
+    pub overflowed: bool,
+}
+
+/// Command-owned failed-operation fuel and work projection.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CommandKernelOperationWork {
+    /// Failed-operation fuel counters.
+    pub fuel: CommandKernelFuelOperationCounters,
+    /// Failed-operation work counters.
+    pub work: CommandKernelWorkSnapshot,
+}
+
+/// Command-owned declaration-scope fuel and work projection.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CommandKernelDeclarationWork {
+    /// Declaration fuel totals.
+    pub fuel: CommandKernelFuelTotals,
+    /// Declaration work counters.
+    pub work: CommandKernelWorkSnapshot,
+    /// Whether any declaration counter arithmetic overflowed.
+    pub overflowed: bool,
+}
+
+/// Command-owned bounded structural comparison path.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CommandKernelComparisonPath {
+    /// Stable snake-case comparison branches.
+    pub steps: Vec<String>,
+    /// Whether earlier collection or output pruning omitted path steps.
+    pub truncated: bool,
+}
+
+/// Command-owned retained delta-constant entry.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CommandKernelDeltaHotsetEntry {
+    /// Canonical constant name or the stable overlong-name bucket.
+    pub constant: String,
+    /// Observed delta-reduction count.
+    pub count: u64,
+}
+
+/// Command-owned bounded retained delta-constant summary.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CommandKernelDeltaHotsetSummary {
+    /// Number of retained ordinary constant names.
+    pub retained_names: u64,
+    /// Maximum retained ordinary constant names.
+    pub capacity: u64,
+    /// Canonically ordered emitted entries.
+    pub entries: Vec<CommandKernelDeltaHotsetEntry>,
+    /// Number of entries emitted after output pruning.
+    pub emitted: u64,
+    /// Maximum entries selected before byte-size pruning.
+    pub entry_limit: u64,
+    /// Observations for names outside the retained set.
+    pub unretained_name_observations: u64,
+    /// Observations for overlong names.
+    pub overlong_name_observations: u64,
+    /// Whether entry selection or byte-size pruning omitted output.
+    pub output_truncated: bool,
+    /// Whether any hotset counter arithmetic overflowed.
+    pub overflowed: bool,
+}
+
+/// Command-owned, bounded, untrusted kernel fuel diagnostic.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CommandKernelFuelDiagnostic {
+    /// Stable producer subsystem.
+    pub subsystem: String,
+    /// Exhausted fuel resource.
+    pub resource: String,
+    /// Failed-operation counters.
+    pub failed_operation: CommandKernelOperationWork,
+    /// Declaration-scope counters.
+    pub declaration: CommandKernelDeclarationWork,
+    /// Bounded structural comparison path.
+    pub comparison_path: CommandKernelComparisonPath,
+    /// Optional detailed retained delta-constant summary.
+    pub retained_delta_constants: Option<CommandKernelDeltaHotsetSummary>,
+    /// Whether any component counter arithmetic overflowed.
+    pub overflowed: bool,
+}
+
+impl CommandKernelFuelDiagnostic {
+    pub(crate) fn from_frontend(value: &npa_frontend::HumanKernelFuelDiagnostic) -> Self {
+        Self {
+            subsystem: value.subsystem.clone(),
+            resource: value.resource.clone(),
+            failed_operation: CommandKernelOperationWork {
+                fuel: command_kernel_fuel_operation_counters(&value.failed_operation.fuel),
+                work: command_kernel_work_snapshot(&value.failed_operation.work),
+            },
+            declaration: CommandKernelDeclarationWork {
+                fuel: CommandKernelFuelTotals {
+                    whnf: command_kernel_fuel_domain_totals(&value.declaration.fuel.whnf),
+                    conversion: command_kernel_fuel_domain_totals(
+                        &value.declaration.fuel.conversion,
+                    ),
+                },
+                work: command_kernel_work_snapshot(&value.declaration.work),
+                overflowed: value.declaration.overflowed,
+            },
+            comparison_path: CommandKernelComparisonPath {
+                steps: value.comparison_path.steps.clone(),
+                truncated: value.comparison_path.truncated,
+            },
+            retained_delta_constants: value.retained_delta_constants.as_ref().map(|summary| {
+                CommandKernelDeltaHotsetSummary {
+                    retained_names: summary.retained_names,
+                    capacity: summary.capacity,
+                    entries: summary
+                        .entries
+                        .iter()
+                        .map(|entry| CommandKernelDeltaHotsetEntry {
+                            constant: entry.constant.clone(),
+                            count: entry.count,
+                        })
+                        .collect(),
+                    emitted: summary.emitted,
+                    entry_limit: summary.entry_limit,
+                    unretained_name_observations: summary.unretained_name_observations,
+                    overlong_name_observations: summary.overlong_name_observations,
+                    output_truncated: summary.output_truncated,
+                    overflowed: summary.overflowed,
+                }
+            }),
+            overflowed: value.overflowed,
+        }
+    }
+
+    fn render_human(&self) -> String {
+        let failed = &self.failed_operation;
+        let declaration = &self.declaration;
+        let path = if self.comparison_path.steps.is_empty() {
+            "<root>".to_owned()
+        } else {
+            self.comparison_path
+                .steps
+                .iter()
+                .map(|step| step.replace('_', "."))
+                .collect::<Vec<_>>()
+                .join(" > ")
+        };
+        let mut output = format!(
+            "kernel fuel:\n  subsystem: {}\n  resource: {}\n  failed operation: budget={} spent={} remaining={}\n  work: defeq_calls={} whnf_calls={} beta={} delta={} iota={} zeta={}\n  declaration: conversion_spent={} whnf_spent={} physical_reductions={}\n  path: {}\n  path truncated: {}\n  overflowed: {}",
+            self.subsystem,
+            self.resource,
+            failed.fuel.budget,
+            failed.fuel.spent,
+            failed.fuel.remaining,
+            failed.work.defeq_calls,
+            failed.work.whnf_calls,
+            failed.work.beta_steps,
+            failed.work.delta_steps,
+            failed.work.iota_steps,
+            failed.work.zeta_steps,
+            declaration.fuel.conversion.logical_spent,
+            declaration.fuel.whnf.logical_spent,
+            declaration.work.physical_reductions,
+            path,
+            self.comparison_path.truncated,
+            self.overflowed,
+        );
+        if let Some(summary) = &self.retained_delta_constants {
+            output.push_str("\n  retained delta constants:");
+            for entry in &summary.entries {
+                write!(output, "\n    {}: {}", entry.constant, entry.count)
+                    .expect("write to String cannot fail");
+            }
+            write!(
+                output,
+                "\n  retained names: {}/{}; emitted: {}/{}; unretained observations: {};\n    overlong observations: {}; output truncated: {}",
+                summary.retained_names,
+                summary.capacity,
+                summary.emitted,
+                summary.entry_limit,
+                summary.unretained_name_observations,
+                summary.overlong_name_observations,
+                summary.output_truncated,
+            )
+            .expect("write to String cannot fail");
+        }
+        output
+    }
+}
+
+fn command_kernel_fuel_operation_counters(
+    value: &npa_frontend::HumanKernelFuelOperationCounters,
+) -> CommandKernelFuelOperationCounters {
+    CommandKernelFuelOperationCounters {
+        budget: value.budget,
+        spent: value.spent,
+        remaining: value.remaining,
+        exhausted: value.exhausted,
+        overflowed: value.overflowed,
+    }
+}
+
+fn command_kernel_fuel_domain_totals(
+    value: &npa_frontend::HumanKernelFuelDomainTotals,
+) -> CommandKernelFuelDomainTotals {
+    CommandKernelFuelDomainTotals {
+        calls: value.calls,
+        logical_spent: value.logical_spent,
+        successful_operation_fuel: value.successful_operation_fuel,
+        exhausted_operation_fuel: value.exhausted_operation_fuel,
+        overflowed: value.overflowed,
+    }
+}
+
+fn command_kernel_work_snapshot(
+    value: &npa_frontend::HumanKernelWorkSnapshot,
+) -> CommandKernelWorkSnapshot {
+    CommandKernelWorkSnapshot {
+        check_calls: value.check_calls,
+        infer_calls: value.infer_calls,
+        whnf_calls: value.whnf_calls,
+        defeq_calls: value.defeq_calls,
+        quick_equality_hits: value.quick_equality_hits,
+        beta_steps: value.beta_steps,
+        delta_steps: value.delta_steps,
+        iota_steps: value.iota_steps,
+        zeta_steps: value.zeta_steps,
+        physical_reductions: value.physical_reductions,
+        overflowed: value.overflowed,
+    }
+}
+
 impl CommandDiagnosticSourceContext {
     /// Build source context for a nonempty path and non-reversed byte range.
     pub fn new(path: impl Into<String>, start_byte: u32, end_byte: u32) -> Option<Self> {
@@ -392,6 +687,8 @@ pub struct CommandDiagnostic {
     pub source: Option<CommandDiagnosticSourceContext>,
     /// Bounded kernel conversion context, when available.
     pub conversion: Option<CommandDiagnosticConversionContext>,
+    /// Bounded, untrusted kernel fuel diagnostic, when available.
+    pub kernel_fuel: Option<CommandKernelFuelDiagnostic>,
 }
 
 impl CommandDiagnostic {
@@ -411,6 +708,7 @@ impl CommandDiagnostic {
             checker: None,
             source: None,
             conversion: None,
+            kernel_fuel: None,
         }
     }
 
@@ -430,6 +728,7 @@ impl CommandDiagnostic {
             checker: None,
             source: None,
             conversion: None,
+            kernel_fuel: None,
         }
     }
 
@@ -483,6 +782,13 @@ impl CommandDiagnostic {
         self
     }
 
+    /// Attach a bounded, untrusted kernel fuel diagnostic.
+    #[must_use]
+    pub fn with_kernel_fuel(mut self, kernel_fuel: CommandKernelFuelDiagnostic) -> Self {
+        self.kernel_fuel = Some(kernel_fuel);
+        self
+    }
+
     /// Attach expected and actual hash values.
     pub fn with_hashes(
         mut self,
@@ -522,6 +828,7 @@ impl CommandDiagnostic {
             checker: None,
             source: None,
             conversion: None,
+            kernel_fuel: None,
         }
     }
 
@@ -547,6 +854,7 @@ impl CommandDiagnostic {
             checker: None,
             source: None,
             conversion: None,
+            kernel_fuel: None,
         };
         if kind == DiagnosticKind::HashMismatch {
             diagnostic.expected_hash = error.expected_value.clone();
@@ -614,6 +922,10 @@ impl CommandDiagnostic {
         }
         if let Some(actual) = &self.actual_hash {
             message.push_str(&format!(" actual_hash={actual}"));
+        }
+        if let Some(kernel_fuel) = &self.kernel_fuel {
+            message.push('\n');
+            message.push_str(&kernel_fuel.render_human());
         }
         message
     }
@@ -1734,6 +2046,10 @@ fn push_diagnostics_json(output: &mut String, diagnostics: &[CommandDiagnostic])
             output.push_str(",\"conversion\":");
             push_command_diagnostic_conversion_json(output, conversion);
         }
+        if let Some(kernel_fuel) = &diagnostic.kernel_fuel {
+            output.push_str(",\"kernel_fuel\":");
+            output.push_str(&command_kernel_fuel_json(kernel_fuel));
+        }
         output.push('}');
     }
     output.push(']');
@@ -1767,6 +2083,347 @@ fn push_command_diagnostic_conversion_json(
         output,
         "depth",
         &JsonValue::U128(u128::from(conversion.depth)),
+        false,
+    );
+    output.push('}');
+}
+
+fn command_kernel_fuel_json(diagnostic: &CommandKernelFuelDiagnostic) -> String {
+    command_kernel_fuel_json_with_limit(diagnostic, KERNEL_FUEL_DIAGNOSTIC_MAX_JSON_BYTES)
+}
+
+fn command_kernel_fuel_json_with_limit(
+    diagnostic: &CommandKernelFuelDiagnostic,
+    limit: usize,
+) -> String {
+    let mut minimum = diagnostic.clone();
+    if let Some(summary) = minimum.retained_delta_constants.as_mut() {
+        if !summary.entries.is_empty() {
+            summary.entries.clear();
+            summary.emitted = 0;
+            summary.output_truncated = true;
+        }
+    }
+    if minimum.comparison_path.steps.len() > 2 {
+        let last = minimum.comparison_path.steps.pop().unwrap();
+        minimum.comparison_path.steps.truncate(1);
+        minimum.comparison_path.steps.push(last);
+        minimum.comparison_path.truncated = true;
+    }
+    let mut minimum_json = String::new();
+    push_command_kernel_fuel_json(&mut minimum_json, &minimum);
+    assert!(
+        minimum_json.len() <= limit,
+        "fixed kernel fuel diagnostic scalars and two path endpoints must fit the JSON limit"
+    );
+
+    let mut bounded = diagnostic.clone();
+    loop {
+        let mut output = String::new();
+        push_command_kernel_fuel_json(&mut output, &bounded);
+        if output.len() <= limit {
+            return output;
+        }
+        if let Some(summary) = bounded.retained_delta_constants.as_mut() {
+            if summary.entries.pop().is_some() {
+                summary.emitted = u64::try_from(summary.entries.len()).unwrap_or(u64::MAX);
+                summary.output_truncated = true;
+                continue;
+            }
+        }
+        if bounded.comparison_path.steps.len() > 2 {
+            let middle = bounded.comparison_path.steps.len() / 2;
+            bounded.comparison_path.steps.remove(middle);
+            bounded.comparison_path.truncated = true;
+            continue;
+        }
+        unreachable!("preflight established that the pruned kernel fuel diagnostic fits");
+    }
+}
+
+fn push_command_kernel_fuel_json(output: &mut String, diagnostic: &CommandKernelFuelDiagnostic) {
+    output.push('{');
+    push_json_pair(
+        output,
+        "schema",
+        &JsonValue::String(KERNEL_FUEL_DIAGNOSTIC_SCHEMA),
+        true,
+    );
+    push_json_pair(output, "trusted", &JsonValue::Bool(false), false);
+    push_json_pair(output, "proof_evidence", &JsonValue::Bool(false), false);
+    push_json_pair(
+        output,
+        "subsystem",
+        &JsonValue::String(&diagnostic.subsystem),
+        false,
+    );
+    push_json_pair(
+        output,
+        "resource",
+        &JsonValue::String(&diagnostic.resource),
+        false,
+    );
+    output.push_str(",\"failed_operation\":{");
+    output.push_str("\"fuel\":");
+    push_command_kernel_operation_fuel_json(output, &diagnostic.failed_operation.fuel);
+    output.push_str(",\"work\":");
+    push_command_kernel_work_json(output, &diagnostic.failed_operation.work);
+    output.push('}');
+    output.push_str(",\"declaration\":{");
+    output.push_str("\"fuel\":{");
+    output.push_str("\"whnf\":");
+    push_command_kernel_domain_fuel_json(output, &diagnostic.declaration.fuel.whnf);
+    output.push_str(",\"conversion\":");
+    push_command_kernel_domain_fuel_json(output, &diagnostic.declaration.fuel.conversion);
+    output.push('}');
+    output.push_str(",\"work\":");
+    push_command_kernel_work_json(output, &diagnostic.declaration.work);
+    push_json_pair(
+        output,
+        "overflowed",
+        &JsonValue::Bool(diagnostic.declaration.overflowed),
+        false,
+    );
+    output.push('}');
+    output.push_str(",\"comparison_path\":{");
+    output.push_str("\"steps\":[");
+    for (index, step) in diagnostic.comparison_path.steps.iter().enumerate() {
+        if index > 0 {
+            output.push(',');
+        }
+        push_json_string(output, step);
+    }
+    output.push(']');
+    push_json_pair(
+        output,
+        "truncated",
+        &JsonValue::Bool(diagnostic.comparison_path.truncated),
+        false,
+    );
+    output.push('}');
+    output.push_str(",\"retained_delta_constants\":");
+    if let Some(summary) = &diagnostic.retained_delta_constants {
+        push_command_kernel_hotset_json(output, summary);
+    } else {
+        output.push_str("null");
+    }
+    push_json_pair(
+        output,
+        "overflowed",
+        &JsonValue::Bool(diagnostic.overflowed),
+        false,
+    );
+    output.push('}');
+}
+
+fn push_command_kernel_operation_fuel_json(
+    output: &mut String,
+    fuel: &CommandKernelFuelOperationCounters,
+) {
+    output.push('{');
+    push_json_pair(
+        output,
+        "budget",
+        &JsonValue::U128(u128::from(fuel.budget)),
+        true,
+    );
+    push_json_pair(
+        output,
+        "spent",
+        &JsonValue::U128(u128::from(fuel.spent)),
+        false,
+    );
+    push_json_pair(
+        output,
+        "remaining",
+        &JsonValue::U128(u128::from(fuel.remaining)),
+        false,
+    );
+    push_json_pair(output, "exhausted", &JsonValue::Bool(fuel.exhausted), false);
+    push_json_pair(
+        output,
+        "overflowed",
+        &JsonValue::Bool(fuel.overflowed),
+        false,
+    );
+    output.push('}');
+}
+
+fn push_command_kernel_domain_fuel_json(output: &mut String, fuel: &CommandKernelFuelDomainTotals) {
+    output.push('{');
+    push_json_pair(
+        output,
+        "calls",
+        &JsonValue::U128(u128::from(fuel.calls)),
+        true,
+    );
+    push_json_pair(
+        output,
+        "logical_spent",
+        &JsonValue::U128(u128::from(fuel.logical_spent)),
+        false,
+    );
+    push_json_pair(
+        output,
+        "successful_operation_fuel",
+        &JsonValue::U128(u128::from(fuel.successful_operation_fuel)),
+        false,
+    );
+    push_json_pair(
+        output,
+        "exhausted_operation_fuel",
+        &JsonValue::U128(u128::from(fuel.exhausted_operation_fuel)),
+        false,
+    );
+    push_json_pair(
+        output,
+        "overflowed",
+        &JsonValue::Bool(fuel.overflowed),
+        false,
+    );
+    output.push('}');
+}
+
+fn push_command_kernel_work_json(output: &mut String, work: &CommandKernelWorkSnapshot) {
+    output.push('{');
+    push_json_pair(
+        output,
+        "check_calls",
+        &JsonValue::U128(u128::from(work.check_calls)),
+        true,
+    );
+    push_json_pair(
+        output,
+        "infer_calls",
+        &JsonValue::U128(u128::from(work.infer_calls)),
+        false,
+    );
+    push_json_pair(
+        output,
+        "whnf_calls",
+        &JsonValue::U128(u128::from(work.whnf_calls)),
+        false,
+    );
+    push_json_pair(
+        output,
+        "defeq_calls",
+        &JsonValue::U128(u128::from(work.defeq_calls)),
+        false,
+    );
+    push_json_pair(
+        output,
+        "quick_equality_hits",
+        &JsonValue::U128(u128::from(work.quick_equality_hits)),
+        false,
+    );
+    push_json_pair(
+        output,
+        "beta_steps",
+        &JsonValue::U128(u128::from(work.beta_steps)),
+        false,
+    );
+    push_json_pair(
+        output,
+        "delta_steps",
+        &JsonValue::U128(u128::from(work.delta_steps)),
+        false,
+    );
+    push_json_pair(
+        output,
+        "iota_steps",
+        &JsonValue::U128(u128::from(work.iota_steps)),
+        false,
+    );
+    push_json_pair(
+        output,
+        "zeta_steps",
+        &JsonValue::U128(u128::from(work.zeta_steps)),
+        false,
+    );
+    push_json_pair(
+        output,
+        "physical_reductions",
+        &JsonValue::U128(u128::from(work.physical_reductions)),
+        false,
+    );
+    push_json_pair(
+        output,
+        "overflowed",
+        &JsonValue::Bool(work.overflowed),
+        false,
+    );
+    output.push('}');
+}
+
+fn push_command_kernel_hotset_json(output: &mut String, summary: &CommandKernelDeltaHotsetSummary) {
+    output.push('{');
+    push_json_pair(
+        output,
+        "retained_names",
+        &JsonValue::U128(u128::from(summary.retained_names)),
+        true,
+    );
+    push_json_pair(
+        output,
+        "capacity",
+        &JsonValue::U128(u128::from(summary.capacity)),
+        false,
+    );
+    output.push_str(",\"entries\":[");
+    for (index, entry) in summary.entries.iter().enumerate() {
+        if index > 0 {
+            output.push(',');
+        }
+        output.push('{');
+        push_json_pair(
+            output,
+            "constant",
+            &JsonValue::String(&entry.constant),
+            true,
+        );
+        push_json_pair(
+            output,
+            "count",
+            &JsonValue::U128(u128::from(entry.count)),
+            false,
+        );
+        output.push('}');
+    }
+    output.push(']');
+    push_json_pair(
+        output,
+        "emitted",
+        &JsonValue::U128(u128::from(summary.emitted)),
+        false,
+    );
+    push_json_pair(
+        output,
+        "entry_limit",
+        &JsonValue::U128(u128::from(summary.entry_limit)),
+        false,
+    );
+    push_json_pair(
+        output,
+        "unretained_name_observations",
+        &JsonValue::U128(u128::from(summary.unretained_name_observations)),
+        false,
+    );
+    push_json_pair(
+        output,
+        "overlong_name_observations",
+        &JsonValue::U128(u128::from(summary.overlong_name_observations)),
+        false,
+    );
+    push_json_pair(
+        output,
+        "output_truncated",
+        &JsonValue::Bool(summary.output_truncated),
+        false,
+    );
+    push_json_pair(
+        output,
+        "overflowed",
+        &JsonValue::Bool(summary.overflowed),
         false,
     );
     output.push('}');
@@ -1896,9 +2553,14 @@ fn push_json_string(output: &mut String, value: &str) {
 #[cfg(test)]
 mod tests {
     use super::{
-        CommandDiagnostic, CommandDiagnosticConversionContext, CommandDiagnosticSourceContext,
-        CommandResult, CommandTimingMetric, CommandTimings, DiagnosticKind,
-        PACKAGE_TIMINGS_SCHEMA_V0_2,
+        command_kernel_fuel_json, command_kernel_fuel_json_with_limit,
+        push_command_kernel_fuel_json, CommandDiagnostic, CommandDiagnosticConversionContext,
+        CommandDiagnosticSourceContext, CommandKernelComparisonPath, CommandKernelDeclarationWork,
+        CommandKernelDeltaHotsetEntry, CommandKernelDeltaHotsetSummary,
+        CommandKernelFuelDiagnostic, CommandKernelFuelDomainTotals,
+        CommandKernelFuelOperationCounters, CommandKernelFuelTotals, CommandKernelOperationWork,
+        CommandKernelWorkSnapshot, CommandResult, CommandTimingMetric, CommandTimings,
+        DiagnosticKind, KERNEL_FUEL_DIAGNOSTIC_MAX_JSON_BYTES, PACKAGE_TIMINGS_SCHEMA_V0_2,
     };
     use npa_api::{
         PerformanceMeasurementMode, PerformanceMeasurementRecorder, PerformanceModuleMeasurement,
@@ -1946,11 +2608,401 @@ mod tests {
         let result = CommandResult::failed("package build-certs", ".", vec![diagnostic]);
         assert_eq!(
             result.render_json(),
-            "{\"schema\":\"npa.package.command_result.v0.3\",\"command\":\"package build-certs\",\"root\":\".\",\"status\":\"failed\",\"diagnostics\":[{\"kind\":\"Build\",\"reason_code\":\"build_failed\",\"severity\":\"error\",\"field\":\"elaborator\",\"actual_value\":\"failure\",\"source\":{\"path\":\"Proofs/A/source.npa\",\"start_byte\":10,\"end_byte\":11,\"declaration\":\"A.term\",\"line\":3,\"column\":5,\"token\":\"x\"},\"conversion\":{\"phase\":\"definitional_equality\",\"outcome\":\"not_defeq\",\"lhs_head\":\"application\",\"rhs_head\":\"constant:A.expected\",\"depth\":7}}],\"artifacts\":[]}"
+            "{\"schema\":\"npa.package.command_result.v0.4\",\"command\":\"package build-certs\",\"root\":\".\",\"status\":\"failed\",\"diagnostics\":[{\"kind\":\"Build\",\"reason_code\":\"build_failed\",\"severity\":\"error\",\"field\":\"elaborator\",\"actual_value\":\"failure\",\"source\":{\"path\":\"Proofs/A/source.npa\",\"start_byte\":10,\"end_byte\":11,\"declaration\":\"A.term\",\"line\":3,\"column\":5,\"token\":\"x\"},\"conversion\":{\"phase\":\"definitional_equality\",\"outcome\":\"not_defeq\",\"lhs_head\":\"application\",\"rhs_head\":\"constant:A.expected\",\"depth\":7}}],\"artifacts\":[]}"
         );
         assert_eq!(
             result.render_human(),
             "package build-certs: failed\nerror Build build_failed field=elaborator source=Proofs/A/source.npa:byte[10..11] line=3 column=5 declaration=A.term token=\"x\" conversion=phase:definitional_equality,outcome:not_defeq,lhs:application,rhs:constant:A.expected,depth:7 actual=failure"
+        );
+    }
+
+    #[test]
+    fn command_diagnostic_conversion_fuel_renderers_are_byte_exact() {
+        let fuel = conversion_fuel_fixture(None);
+        let conversion = CommandDiagnosticConversionContext::new(
+            "definitional_equality",
+            "fuel_exhausted",
+            "application",
+            "constant:A.expected",
+            7,
+        )
+        .unwrap();
+        let diagnostic = CommandDiagnostic::error(DiagnosticKind::Build, "build_failed")
+            .with_field("kernel_handoff")
+            .with_conversion(conversion)
+            .with_kernel_fuel(fuel);
+        let result = CommandResult::failed("package build-certs", ".", vec![diagnostic]);
+        assert_eq!(
+            result.render_json(),
+            format!(
+                "{{\"schema\":\"npa.package.command_result.v0.4\",\"command\":\"package build-certs\",\"root\":\".\",\"status\":\"failed\",\"diagnostics\":[{{\"kind\":\"Build\",\"reason_code\":\"build_failed\",\"severity\":\"error\",\"field\":\"kernel_handoff\",\"conversion\":{{\"phase\":\"definitional_equality\",\"outcome\":\"fuel_exhausted\",\"lhs_head\":\"application\",\"rhs_head\":\"constant:A.expected\",\"depth\":7}},\"kernel_fuel\":{}}}],\"artifacts\":[]}}",
+                expected_conversion_fuel_json("null")
+            )
+        );
+        assert_eq!(
+            result.render_human(),
+            "package build-certs: failed\nerror Build build_failed field=kernel_handoff conversion=phase:definitional_equality,outcome:fuel_exhausted,lhs:application,rhs:constant:A.expected,depth:7\nkernel fuel:\n  subsystem: fast_kernel\n  resource: conversion\n  failed operation: budget=5000000 spent=5000000 remaining=0\n  work: defeq_calls=4187 whnf_calls=9120 beta=64 delta=4821031 iota=0 zeta=7\n  declaration: conversion_spent=5000218 whnf_spent=18342 physical_reductions=4821171\n  path: app.argument > pi.body > whnf.left > app.function\n  path truncated: false\n  overflowed: false"
+        );
+    }
+
+    #[test]
+    fn rollout_exhaustion_fixture_json_is_same_mode_repeatable_and_mode_neutral() {
+        let detailed_hotset = CommandKernelDeltaHotsetSummary {
+            retained_names: 2,
+            capacity: 256,
+            entries: vec![
+                CommandKernelDeltaHotsetEntry {
+                    constant: "Observed.AliasArg".to_owned(),
+                    count: 2,
+                },
+                CommandKernelDeltaHotsetEntry {
+                    constant: "Observed.AliasExpected2".to_owned(),
+                    count: 1,
+                },
+            ],
+            emitted: 2,
+            entry_limit: 16,
+            unretained_name_observations: 0,
+            overlong_name_observations: 0,
+            output_truncated: false,
+            overflowed: false,
+        };
+        let modes = [
+            ("off", None),
+            ("failure", Some(rollout_exhaustion_fuel_fixture(None))),
+            (
+                "detailed",
+                Some(rollout_exhaustion_fuel_fixture(Some(detailed_hotset))),
+            ),
+        ];
+        let mut expected_primary = None;
+
+        for (mode, fuel) in modes {
+            let conversion = CommandDiagnosticConversionContext::new(
+                "declaration_value",
+                "fuel_exhausted",
+                "pi",
+                "pi",
+                2,
+            )
+            .unwrap();
+            let mut diagnostic = CommandDiagnostic::error(DiagnosticKind::Build, "build_failed")
+                .with_field("kernel_handoff")
+                .with_conversion(conversion);
+            if let Some(fuel) = fuel {
+                diagnostic = diagnostic.with_kernel_fuel(fuel);
+            }
+            let result = CommandResult::failed("package build-certs", ".", vec![diagnostic]);
+            let first = result.render_json();
+            let second = result.render_json();
+            assert_eq!(first.as_bytes(), second.as_bytes(), "mode={mode}");
+
+            let mut primary = result.clone();
+            primary.diagnostics[0].kernel_fuel = None;
+            if let Some(expected) = &expected_primary {
+                assert_eq!(&primary, expected, "mode={mode}");
+            } else {
+                expected_primary = Some(primary);
+            }
+            assert_eq!(result.status, super::CommandStatus::Failed);
+            assert!(!first.contains("\"timings\":"), "mode={mode}");
+            assert_eq!(first.contains("\"kernel_fuel\":"), mode != "off");
+            assert_eq!(
+                first.contains("\"retained_delta_constants\":null"),
+                mode == "failure"
+            );
+            assert_eq!(
+                first.contains("Observed.AliasExpected2"),
+                mode == "detailed"
+            );
+        }
+    }
+
+    #[test]
+    fn command_diagnostic_whnf_fuel_has_no_conversion_and_renders_root_path() {
+        let mut fuel = conversion_fuel_fixture(None);
+        fuel.resource = "whnf".to_owned();
+        fuel.comparison_path.steps.clear();
+        let diagnostic = CommandDiagnostic::error(DiagnosticKind::Build, "build_failed")
+            .with_field("kernel_handoff")
+            .with_kernel_fuel(fuel);
+        let result = CommandResult::failed("package build-certs", ".", vec![diagnostic]);
+        let expected_fuel = expected_conversion_fuel_json("null")
+            .replacen("\"resource\":\"conversion\"", "\"resource\":\"whnf\"", 1)
+            .replace(
+                "\"steps\":[\"app_argument\",\"pi_body\",\"whnf_left\",\"app_function\"]",
+                "\"steps\":[]",
+            );
+        assert_eq!(
+            result.render_json(),
+            format!(
+                "{{\"schema\":\"npa.package.command_result.v0.4\",\"command\":\"package build-certs\",\"root\":\".\",\"status\":\"failed\",\"diagnostics\":[{{\"kind\":\"Build\",\"reason_code\":\"build_failed\",\"severity\":\"error\",\"field\":\"kernel_handoff\",\"kernel_fuel\":{expected_fuel}}}],\"artifacts\":[]}}"
+            )
+        );
+        assert_eq!(
+            result.render_human(),
+            "package build-certs: failed\nerror Build build_failed field=kernel_handoff\nkernel fuel:\n  subsystem: fast_kernel\n  resource: whnf\n  failed operation: budget=5000000 spent=5000000 remaining=0\n  work: defeq_calls=4187 whnf_calls=9120 beta=64 delta=4821031 iota=0 zeta=7\n  declaration: conversion_spent=5000218 whnf_spent=18342 physical_reductions=4821171\n  path: <root>\n  path truncated: false\n  overflowed: false"
+        );
+    }
+
+    #[test]
+    fn command_kernel_fuel_frontend_projection_preserves_bounded_payload() {
+        let frontend = npa_frontend::HumanKernelFuelDiagnostic {
+            subsystem: "fast_kernel".to_owned(),
+            resource: "whnf".to_owned(),
+            failed_operation: npa_frontend::HumanKernelOperationWork {
+                fuel: npa_frontend::HumanKernelFuelOperationCounters {
+                    budget: 9,
+                    spent: 9,
+                    remaining: 0,
+                    exhausted: true,
+                    overflowed: false,
+                },
+                work: npa_frontend::HumanKernelWorkSnapshot {
+                    check_calls: 1,
+                    infer_calls: 2,
+                    whnf_calls: 3,
+                    defeq_calls: 4,
+                    quick_equality_hits: 5,
+                    beta_steps: 6,
+                    delta_steps: 7,
+                    iota_steps: 8,
+                    zeta_steps: 9,
+                    physical_reductions: 30,
+                    overflowed: false,
+                },
+            },
+            declaration: npa_frontend::HumanKernelDeclarationWork {
+                fuel: npa_frontend::HumanKernelFuelTotals {
+                    whnf: npa_frontend::HumanKernelFuelDomainTotals {
+                        calls: 1,
+                        logical_spent: 9,
+                        successful_operation_fuel: 0,
+                        exhausted_operation_fuel: 9,
+                        overflowed: false,
+                    },
+                    conversion: npa_frontend::HumanKernelFuelDomainTotals {
+                        calls: 0,
+                        logical_spent: 0,
+                        successful_operation_fuel: 0,
+                        exhausted_operation_fuel: 0,
+                        overflowed: false,
+                    },
+                },
+                work: npa_frontend::HumanKernelWorkSnapshot {
+                    check_calls: 1,
+                    infer_calls: 2,
+                    whnf_calls: 3,
+                    defeq_calls: 4,
+                    quick_equality_hits: 5,
+                    beta_steps: 6,
+                    delta_steps: 7,
+                    iota_steps: 8,
+                    zeta_steps: 9,
+                    physical_reductions: 30,
+                    overflowed: false,
+                },
+                overflowed: false,
+            },
+            comparison_path: npa_frontend::HumanKernelComparisonPath {
+                steps: Vec::new(),
+                truncated: false,
+            },
+            retained_delta_constants: Some(npa_frontend::HumanKernelDeltaHotsetSummary {
+                retained_names: 0,
+                capacity: 256,
+                entries: Vec::new(),
+                emitted: 0,
+                entry_limit: 16,
+                unretained_name_observations: 0,
+                overlong_name_observations: 0,
+                output_truncated: false,
+                overflowed: false,
+            }),
+            overflowed: false,
+        };
+
+        let projected = CommandKernelFuelDiagnostic::from_frontend(&frontend);
+        assert_eq!(projected.subsystem, frontend.subsystem);
+        assert_eq!(projected.resource, frontend.resource);
+        assert_eq!(projected.failed_operation.fuel.spent, 9);
+        assert_eq!(projected.failed_operation.work.physical_reductions, 30);
+        assert_eq!(projected.declaration.fuel.whnf.exhausted_operation_fuel, 9);
+        assert_eq!(projected.declaration.fuel.conversion.calls, 0);
+        assert!(projected.comparison_path.steps.is_empty());
+        assert_eq!(
+            projected
+                .retained_delta_constants
+                .as_ref()
+                .map(|summary| summary.capacity),
+            Some(256)
+        );
+        assert!(!projected.overflowed);
+    }
+
+    #[test]
+    fn command_diagnostic_detailed_hotset_and_present_empty_hotset_are_byte_exact() {
+        let hotset = CommandKernelDeltaHotsetSummary {
+            retained_names: 2,
+            capacity: 256,
+            entries: vec![
+                CommandKernelDeltaHotsetEntry {
+                    constant: "MyProject.Expr.eval".to_owned(),
+                    count: 3_100_421,
+                },
+                CommandKernelDeltaHotsetEntry {
+                    constant: "MyProject.Residue.normalize".to_owned(),
+                    count: 1_720_679,
+                },
+            ],
+            emitted: 2,
+            entry_limit: 16,
+            unretained_name_observations: 0,
+            overlong_name_observations: 0,
+            output_truncated: false,
+            overflowed: false,
+        };
+        let detailed = conversion_fuel_fixture(Some(hotset));
+        assert_eq!(
+            command_kernel_fuel_json(&detailed),
+            expected_conversion_fuel_json(
+                "{\"retained_names\":2,\"capacity\":256,\"entries\":[{\"constant\":\"MyProject.Expr.eval\",\"count\":3100421},{\"constant\":\"MyProject.Residue.normalize\",\"count\":1720679}],\"emitted\":2,\"entry_limit\":16,\"unretained_name_observations\":0,\"overlong_name_observations\":0,\"output_truncated\":false,\"overflowed\":false}"
+            )
+        );
+        assert_eq!(
+            detailed.render_human(),
+            "kernel fuel:\n  subsystem: fast_kernel\n  resource: conversion\n  failed operation: budget=5000000 spent=5000000 remaining=0\n  work: defeq_calls=4187 whnf_calls=9120 beta=64 delta=4821031 iota=0 zeta=7\n  declaration: conversion_spent=5000218 whnf_spent=18342 physical_reductions=4821171\n  path: app.argument > pi.body > whnf.left > app.function\n  path truncated: false\n  overflowed: false\n  retained delta constants:\n    MyProject.Expr.eval: 3100421\n    MyProject.Residue.normalize: 1720679\n  retained names: 2/256; emitted: 2/16; unretained observations: 0;\n    overlong observations: 0; output truncated: false"
+        );
+
+        let empty_hotset = CommandKernelDeltaHotsetSummary {
+            retained_names: 0,
+            capacity: 256,
+            entries: Vec::new(),
+            emitted: 0,
+            entry_limit: 16,
+            unretained_name_observations: 0,
+            overlong_name_observations: 0,
+            output_truncated: false,
+            overflowed: false,
+        };
+        let empty = conversion_fuel_fixture(Some(empty_hotset));
+        assert_eq!(
+            command_kernel_fuel_json(&empty),
+            expected_conversion_fuel_json(
+                "{\"retained_names\":0,\"capacity\":256,\"entries\":[],\"emitted\":0,\"entry_limit\":16,\"unretained_name_observations\":0,\"overlong_name_observations\":0,\"output_truncated\":false,\"overflowed\":false}"
+            )
+        );
+        assert!(empty.render_human().ends_with(
+            "  retained delta constants:\n  retained names: 0/256; emitted: 0/16; unretained observations: 0;\n    overlong observations: 0; output truncated: false"
+        ));
+    }
+
+    #[test]
+    fn command_kernel_fuel_json_prunes_hotset_then_path_deterministically() {
+        let mut diagnostic = conversion_fuel_fixture(Some(CommandKernelDeltaHotsetSummary {
+            retained_names: 4,
+            capacity: 256,
+            entries: (0_u64..4)
+                .map(|index| CommandKernelDeltaHotsetEntry {
+                    constant: format!("Fixture.{}.Entry{index}", "A".repeat(220)),
+                    count: 4 - index,
+                })
+                .collect(),
+            emitted: 4,
+            entry_limit: 16,
+            unretained_name_observations: 0,
+            overlong_name_observations: 0,
+            output_truncated: false,
+            overflowed: false,
+        }));
+        diagnostic.comparison_path.steps = vec![
+            "app_function".to_owned(),
+            "app_argument".to_owned(),
+            "pi_domain".to_owned(),
+            "pi_body".to_owned(),
+            "whnf_left".to_owned(),
+            "whnf_right".to_owned(),
+        ];
+
+        let mut one_hotset_entry_removed = diagnostic.clone();
+        let summary = one_hotset_entry_removed
+            .retained_delta_constants
+            .as_mut()
+            .unwrap();
+        summary.entries.pop().expect("fixture has a canonical tail");
+        summary.emitted = 3;
+        summary.output_truncated = true;
+        let mut one_hotset_entry_removed_json = String::new();
+        push_command_kernel_fuel_json(
+            &mut one_hotset_entry_removed_json,
+            &one_hotset_entry_removed,
+        );
+        assert_eq!(
+            command_kernel_fuel_json_with_limit(&diagnostic, one_hotset_entry_removed_json.len()),
+            one_hotset_entry_removed_json,
+            "the canonical hotset tail must be the first pruned entry"
+        );
+
+        let mut no_entries = diagnostic.clone();
+        let summary = no_entries.retained_delta_constants.as_mut().unwrap();
+        summary.entries.clear();
+        summary.emitted = 0;
+        summary.output_truncated = true;
+        let mut no_entries_json = String::new();
+        push_command_kernel_fuel_json(&mut no_entries_json, &no_entries);
+        assert_eq!(
+            command_kernel_fuel_json_with_limit(&diagnostic, no_entries_json.len()),
+            no_entries_json,
+            "hotset entries must be removed before any path step"
+        );
+
+        let mut one_middle_step_removed = no_entries.clone();
+        one_middle_step_removed.comparison_path.steps.remove(3);
+        one_middle_step_removed.comparison_path.truncated = true;
+        let mut one_middle_step_removed_json = String::new();
+        push_command_kernel_fuel_json(&mut one_middle_step_removed_json, &one_middle_step_removed);
+        assert_eq!(
+            command_kernel_fuel_json_with_limit(&diagnostic, one_middle_step_removed_json.len()),
+            one_middle_step_removed_json,
+            "the first path prune must remove steps.len() / 2"
+        );
+
+        let mut endpoints = no_entries;
+        endpoints.comparison_path.steps = vec!["app_function".to_owned(), "whnf_right".to_owned()];
+        endpoints.comparison_path.truncated = true;
+        let mut endpoints_json = String::new();
+        push_command_kernel_fuel_json(&mut endpoints_json, &endpoints);
+        let first = command_kernel_fuel_json_with_limit(&diagnostic, endpoints_json.len());
+        let second = command_kernel_fuel_json_with_limit(&diagnostic, endpoints_json.len());
+        assert_eq!(first, endpoints_json);
+        assert_eq!(second, first);
+        assert_eq!(first.matches("app_function").count(), 1);
+        assert_eq!(first.matches("whnf_right").count(), 1);
+        assert!(first.contains("\"truncated\":true"));
+        assert!(first.contains("\"output_truncated\":true"));
+        assert!(
+            command_kernel_fuel_json(&diagnostic).len() <= KERNEL_FUEL_DIAGNOSTIC_MAX_JSON_BYTES
+        );
+    }
+
+    #[test]
+    fn command_result_v0_4_omits_fuel_for_unrelated_and_incapable_commands() {
+        let result = CommandResult::failed(
+            "package build-certs",
+            ".",
+            vec![CommandDiagnostic::error(
+                DiagnosticKind::Build,
+                "build_failed",
+            )],
+        );
+        assert_eq!(
+            result.render_json(),
+            "{\"schema\":\"npa.package.command_result.v0.4\",\"command\":\"package build-certs\",\"root\":\".\",\"status\":\"failed\",\"diagnostics\":[{\"kind\":\"Build\",\"reason_code\":\"build_failed\",\"severity\":\"error\"}],\"artifacts\":[]}"
+        );
+        let incapable = CommandResult::passed("package check-hashes", ".");
+        assert_eq!(
+            incapable.render_json(),
+            "{\"schema\":\"npa.package.command_result.v0.4\",\"command\":\"package check-hashes\",\"root\":\".\",\"status\":\"passed\",\"diagnostics\":[],\"artifacts\":[]}"
         );
     }
 
@@ -1989,5 +3041,161 @@ mod tests {
             result.render_human(),
             "package verify-certs: passed\ntimings: mode=detailed checker_ms=2 total_ms=3\ntiming module: B checker_elapsed_ns=19 scope=retained\ntiming module: C checker_elapsed_ns=19 scope=retained\ntiming module: A checker_elapsed_ns=7 scope=retained"
         );
+    }
+
+    fn conversion_fuel_fixture(
+        retained_delta_constants: Option<CommandKernelDeltaHotsetSummary>,
+    ) -> CommandKernelFuelDiagnostic {
+        CommandKernelFuelDiagnostic {
+            subsystem: "fast_kernel".to_owned(),
+            resource: "conversion".to_owned(),
+            failed_operation: CommandKernelOperationWork {
+                fuel: CommandKernelFuelOperationCounters {
+                    budget: 5_000_000,
+                    spent: 5_000_000,
+                    remaining: 0,
+                    exhausted: true,
+                    overflowed: false,
+                },
+                work: CommandKernelWorkSnapshot {
+                    check_calls: 0,
+                    infer_calls: 0,
+                    whnf_calls: 9_120,
+                    defeq_calls: 4_187,
+                    quick_equality_hits: 203,
+                    beta_steps: 64,
+                    delta_steps: 4_821_031,
+                    iota_steps: 0,
+                    zeta_steps: 7,
+                    physical_reductions: 4_821_102,
+                    overflowed: false,
+                },
+            },
+            declaration: CommandKernelDeclarationWork {
+                fuel: CommandKernelFuelTotals {
+                    whnf: CommandKernelFuelDomainTotals {
+                        calls: 114,
+                        logical_spent: 18_342,
+                        successful_operation_fuel: 18_342,
+                        exhausted_operation_fuel: 0,
+                        overflowed: false,
+                    },
+                    conversion: CommandKernelFuelDomainTotals {
+                        calls: 27,
+                        logical_spent: 5_000_218,
+                        successful_operation_fuel: 218,
+                        exhausted_operation_fuel: 5_000_000,
+                        overflowed: false,
+                    },
+                },
+                work: CommandKernelWorkSnapshot {
+                    check_calls: 1,
+                    infer_calls: 12,
+                    whnf_calls: 9_234,
+                    defeq_calls: 4_214,
+                    quick_equality_hits: 210,
+                    beta_steps: 64,
+                    delta_steps: 4_821_100,
+                    iota_steps: 0,
+                    zeta_steps: 7,
+                    physical_reductions: 4_821_171,
+                    overflowed: false,
+                },
+                overflowed: false,
+            },
+            comparison_path: CommandKernelComparisonPath {
+                steps: ["app_argument", "pi_body", "whnf_left", "app_function"]
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect(),
+                truncated: false,
+            },
+            retained_delta_constants,
+            overflowed: false,
+        }
+    }
+
+    fn rollout_exhaustion_fuel_fixture(
+        retained_delta_constants: Option<CommandKernelDeltaHotsetSummary>,
+    ) -> CommandKernelFuelDiagnostic {
+        CommandKernelFuelDiagnostic {
+            subsystem: "fast_kernel".to_owned(),
+            resource: "conversion".to_owned(),
+            failed_operation: CommandKernelOperationWork {
+                fuel: CommandKernelFuelOperationCounters {
+                    budget: 7,
+                    spent: 7,
+                    remaining: 0,
+                    exhausted: true,
+                    overflowed: false,
+                },
+                work: CommandKernelWorkSnapshot {
+                    check_calls: 0,
+                    infer_calls: 0,
+                    whnf_calls: 4,
+                    defeq_calls: 3,
+                    quick_equality_hits: 1,
+                    beta_steps: 0,
+                    delta_steps: 1,
+                    iota_steps: 0,
+                    zeta_steps: 0,
+                    physical_reductions: 1,
+                    overflowed: false,
+                },
+            },
+            declaration: CommandKernelDeclarationWork {
+                fuel: CommandKernelFuelTotals {
+                    whnf: CommandKernelFuelDomainTotals {
+                        calls: 8,
+                        logical_spent: 8,
+                        successful_operation_fuel: 8,
+                        exhausted_operation_fuel: 0,
+                        overflowed: false,
+                    },
+                    conversion: CommandKernelFuelDomainTotals {
+                        calls: 3,
+                        logical_spent: 15,
+                        successful_operation_fuel: 8,
+                        exhausted_operation_fuel: 7,
+                        overflowed: false,
+                    },
+                },
+                work: CommandKernelWorkSnapshot {
+                    check_calls: 3,
+                    infer_calls: 14,
+                    whnf_calls: 16,
+                    defeq_calls: 5,
+                    quick_equality_hits: 1,
+                    beta_steps: 0,
+                    delta_steps: 3,
+                    iota_steps: 0,
+                    zeta_steps: 0,
+                    physical_reductions: 3,
+                    overflowed: false,
+                },
+                overflowed: false,
+            },
+            comparison_path: CommandKernelComparisonPath {
+                steps: ["pi_body", "whnf_right"].map(str::to_owned).to_vec(),
+                truncated: false,
+            },
+            retained_delta_constants,
+            overflowed: false,
+        }
+    }
+
+    fn expected_conversion_fuel_json(retained_delta_constants: &str) -> String {
+        concat!(
+            "{\"schema\":\"npa.kernel-fuel-diagnostic.v0.1\",\"trusted\":false,\"proof_evidence\":false,",
+            "\"subsystem\":\"fast_kernel\",\"resource\":\"conversion\",",
+            "\"failed_operation\":{\"fuel\":{\"budget\":5000000,\"spent\":5000000,\"remaining\":0,\"exhausted\":true,\"overflowed\":false},",
+            "\"work\":{\"check_calls\":0,\"infer_calls\":0,\"whnf_calls\":9120,\"defeq_calls\":4187,\"quick_equality_hits\":203,\"beta_steps\":64,\"delta_steps\":4821031,\"iota_steps\":0,\"zeta_steps\":7,\"physical_reductions\":4821102,\"overflowed\":false}},",
+            "\"declaration\":{\"fuel\":{\"whnf\":{\"calls\":114,\"logical_spent\":18342,\"successful_operation_fuel\":18342,\"exhausted_operation_fuel\":0,\"overflowed\":false},",
+            "\"conversion\":{\"calls\":27,\"logical_spent\":5000218,\"successful_operation_fuel\":218,\"exhausted_operation_fuel\":5000000,\"overflowed\":false}},",
+            "\"work\":{\"check_calls\":1,\"infer_calls\":12,\"whnf_calls\":9234,\"defeq_calls\":4214,\"quick_equality_hits\":210,\"beta_steps\":64,\"delta_steps\":4821100,\"iota_steps\":0,\"zeta_steps\":7,\"physical_reductions\":4821171,\"overflowed\":false},\"overflowed\":false},",
+            "\"comparison_path\":{\"steps\":[\"app_argument\",\"pi_body\",\"whnf_left\",\"app_function\"],\"truncated\":false},",
+            "\"retained_delta_constants\":$HOTSET$,\"overflowed\":false}"
+        )
+        .replace("$HOTSET$", retained_delta_constants)
     }
 }

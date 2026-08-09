@@ -1,3 +1,7 @@
+// DiagnosedKernelError intentionally carries a bounded operational report;
+// boxing the public error again would add indirection to every kernel failure.
+#![allow(clippy::result_large_err)]
+
 pub mod builtins;
 pub mod context;
 pub mod decl;
@@ -22,8 +26,14 @@ pub use decl::{
     RecursorRules, Reducibility,
 };
 pub use diagnostic::{
-    DiagnosedKernelError, KernelComparisonOutcome, KernelConversionContext,
-    KernelDiagnosticContext, KernelDiagnosticPhase, KernelExprHead,
+    DiagnosedKernelError, KernelComparisonOutcome, KernelComparisonPath, KernelComparisonPathStep,
+    KernelConversionContext, KernelDeclarationWork, KernelDeltaHotsetEntry,
+    KernelDeltaHotsetSummary, KernelDiagnosedAdmission, KernelDiagnosticContext,
+    KernelDiagnosticOptions, KernelDiagnosticPhase, KernelDiagnosticSubsystem, KernelExprHead,
+    KernelFuelDiagnostic, KernelFuelReportMode, KernelFuelResource, KernelOperationWork,
+    KERNEL_COMPARISON_PATH_LIMIT, KERNEL_COMPARISON_PATH_PREFIX_LIMIT,
+    KERNEL_COMPARISON_PATH_SUFFIX_LIMIT, KERNEL_DELTA_HOTSET_CAPACITY,
+    KERNEL_DELTA_HOTSET_ENTRY_LIMIT, KERNEL_DELTA_NAME_BYTE_LIMIT, KERNEL_DELTA_OVERLONG_NAME,
 };
 pub use env::Env;
 pub use error::{Error, ResourceLimitKind, Result};
@@ -35,7 +45,10 @@ pub use level::{
 pub use memo::{KernelExecutionOptions, KernelMemoMode, KERNEL_MEMO_LIMITS_V1};
 pub use name::{is_canonical_dotted_name, is_canonical_name_component};
 pub use positivity::{approved_nested_functor, ApprovedNestedFunctor, APPROVED_NESTED_FUNCTORS};
-pub use work::{KernelWorkCounterSink, KernelWorkCounters};
+pub use work::{
+    KernelFuelDomainTotals, KernelFuelOperationCounters, KernelFuelTotals, KernelWorkCounterSink,
+    KernelWorkCounters, KernelWorkSnapshot,
+};
 
 #[cfg(test)]
 mod tests {
@@ -101,6 +114,227 @@ mod tests {
     }
 
     #[test]
+    fn diagnosed_declaration_options_cover_every_decl_variant_mode_neutrally() {
+        let constraint = UniverseConstraint::le(Level::param("u"), Level::param("u"));
+        let list = list_inductive();
+        let mutual = even_odd_mutual_block();
+        let declarations = vec![
+            (
+                "axiom",
+                Decl::Axiom {
+                    name: "Observed.Axiom".to_owned(),
+                    universe_params: vec![],
+                    ty: nat(),
+                },
+                Some("Observed.Axiom"),
+            ),
+            (
+                "constrained axiom",
+                Decl::AxiomConstrained {
+                    name: "Observed.ConstrainedAxiom".to_owned(),
+                    universe_params: vec!["u".to_owned()],
+                    universe_constraints: vec![constraint.clone()],
+                    ty: nat(),
+                },
+                Some("Observed.ConstrainedAxiom"),
+            ),
+            (
+                "definition",
+                Decl::Def {
+                    name: "Observed.Def".to_owned(),
+                    universe_params: vec![],
+                    ty: nat(),
+                    value: nat_zero(),
+                    reducibility: Reducibility::Reducible,
+                },
+                Some("Observed.Def"),
+            ),
+            (
+                "constrained definition",
+                Decl::DefConstrained {
+                    name: "Observed.ConstrainedDef".to_owned(),
+                    universe_params: vec!["u".to_owned()],
+                    universe_constraints: vec![constraint.clone()],
+                    ty: nat(),
+                    value: nat_zero(),
+                    reducibility: Reducibility::Reducible,
+                },
+                Some("Observed.ConstrainedDef"),
+            ),
+            (
+                "theorem",
+                Decl::Theorem {
+                    name: "Observed.Theorem".to_owned(),
+                    universe_params: vec![],
+                    ty: nat(),
+                    proof: nat_zero(),
+                },
+                Some("Observed.Theorem"),
+            ),
+            (
+                "constrained theorem",
+                Decl::TheoremConstrained {
+                    name: "Observed.ConstrainedTheorem".to_owned(),
+                    universe_params: vec!["u".to_owned()],
+                    universe_constraints: vec![constraint],
+                    ty: nat(),
+                    proof: nat_zero(),
+                },
+                Some("Observed.ConstrainedTheorem"),
+            ),
+            (
+                "inductive",
+                Decl::Inductive {
+                    name: list.name.clone(),
+                    universe_params: list.universe_params.clone(),
+                    ty: Expr::sort(list.sort.clone()),
+                    data: Box::new(list),
+                },
+                Some("List"),
+            ),
+            (
+                "constructor replay",
+                Decl::Constructor {
+                    name: "Observed.ConstructorReplay".to_owned(),
+                    universe_params: vec![],
+                    ty: nat(),
+                    inductive: "Observed".to_owned(),
+                },
+                None,
+            ),
+            (
+                "recursor replay",
+                Decl::Recursor {
+                    name: "Observed.RecursorReplay".to_owned(),
+                    universe_params: vec![],
+                    ty: nat(),
+                    inductive: "Observed".to_owned(),
+                    rules: RecursorRules::new(0, 0),
+                },
+                None,
+            ),
+            (
+                "mutual inductive block",
+                Decl::MutualInductiveBlock {
+                    name: mutual.name.clone(),
+                    universe_params: mutual.universe_params.clone(),
+                    data: Box::new(mutual),
+                },
+                Some("Even"),
+            ),
+        ];
+
+        for (label, declaration, inserted_name) in declarations {
+            for mode in [
+                KernelFuelReportMode::Off,
+                KernelFuelReportMode::Failure,
+                KernelFuelReportMode::Detailed,
+            ] {
+                let mut env = Env::with_builtins().unwrap();
+                let admission = env
+                    .add_decl_diagnosed_with_options(
+                        declaration.clone(),
+                        KernelDiagnosticOptions { fuel_report: mode },
+                    )
+                    .unwrap_or_else(|error| panic!("{label} failed in {mode:?}: {error:?}"));
+                if mode == KernelFuelReportMode::Detailed {
+                    let work = admission.declaration_work().unwrap();
+                    if inserted_name.is_some() {
+                        assert!(work.work.infer_calls > 0, "{label}");
+                        assert!(work.fuel.whnf.calls > 0, "{label}");
+                    } else {
+                        assert_eq!(
+                            work,
+                            &KernelDeclarationWork::from_snapshot(KernelWorkSnapshot::zero())
+                        );
+                    }
+                    let hotset = admission.retained_delta_constants().unwrap();
+                    assert_eq!(hotset.retained_names, 0, "{label}");
+                    assert!(hotset.entries.is_empty(), "{label}");
+                } else {
+                    assert!(admission.declaration_work().is_none(), "{label}");
+                    assert!(admission.retained_delta_constants().is_none(), "{label}");
+                }
+                match inserted_name {
+                    Some(name) => assert!(env.decl(name).is_some(), "{label}"),
+                    None => {
+                        assert!(env.decl(declaration.name()).is_none(), "{label}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn diagnosed_declaration_off_with_scalar_sink_uses_local_memo_off_meter() {
+        let sink = KernelWorkCounterSink::default();
+        let mut env = Env::with_execution_options_and_work_counter_sink(
+            KernelExecutionOptions::ephemeral_memo(),
+            sink.clone(),
+        );
+        let admission = env
+            .add_decl_diagnosed_with_options(
+                Decl::Axiom {
+                    name: "Observed.SinkAxiom".to_owned(),
+                    universe_params: vec![],
+                    ty: Expr::sort(Level::zero()),
+                },
+                KernelDiagnosticOptions::default(),
+            )
+            .unwrap();
+
+        assert!(admission.declaration_work().is_none());
+        assert!(admission.retained_delta_constants().is_none());
+        let counters = sink.snapshot();
+        assert_eq!(counters.infer_calls, 1);
+        assert_eq!(counters.whnf_calls, 1);
+        assert_eq!(counters.memo_ineligible_diagnosed, 1);
+        assert_eq!(counters.memo_eligible_calls, 0);
+    }
+
+    #[test]
+    fn ordinary_opaque_definition_stays_opaque_until_checked_view_is_exposed() {
+        let mut env = Env::with_builtins().unwrap();
+        env.add_def("hidden", vec![], nat(), nat_zero(), Reducibility::Opaque)
+            .unwrap();
+
+        assert!(!env
+            .is_defeq(
+                &Ctx::new(),
+                &[],
+                &Expr::konst("hidden", vec![]),
+                &nat_zero(),
+            )
+            .unwrap());
+        assert!(env.expose_checked_opaque_definition("hidden"));
+        assert!(env
+            .is_defeq(
+                &Ctx::new(),
+                &[],
+                &Expr::konst("hidden", vec![]),
+                &nat_zero(),
+            )
+            .unwrap());
+    }
+
+    #[test]
+    fn failed_opaque_body_check_inserts_no_definition_to_expose() {
+        let mut env = Env::with_builtins().unwrap();
+        assert!(matches!(
+            env.add_def(
+                "bad_hidden",
+                vec![],
+                nat(),
+                Expr::sort(Level::zero()),
+                Reducibility::Opaque,
+            ),
+            Err(Error::TypeMismatch { .. })
+        ));
+        assert!(env.decl("bad_hidden").is_none());
+        assert!(!env.expose_checked_opaque_definition("bad_hidden"));
+    }
+
+    #[test]
     fn optional_work_meter_preserves_kernel_result() {
         let mut env = Env::with_builtins().unwrap();
         let term = nat_zero();
@@ -118,6 +352,12 @@ mod tests {
         assert!(counters.logical_fuel > 0);
         assert_eq!(counters.successful_fuel, counters.logical_fuel);
         assert_eq!(counters.exhausted_fuel, 0);
+        assert_eq!(counters.fuel.conversion.calls, 1);
+        assert_eq!(
+            counters.fuel.conversion.logical_spent,
+            counters.logical_fuel
+        );
+        assert_eq!(counters.fuel.whnf.calls, 0);
 
         let beta = Expr::app(Expr::lam("x", nat(), Expr::bvar(0)), nat_zero());
         env.whnf_with_work_counters(&Ctx::new(), &[], &beta, Some(&mut counters))
@@ -160,6 +400,11 @@ mod tests {
         assert_eq!(counters.physical_reductions, 5);
         assert_eq!(counters.context_lookups, 1);
         assert_eq!(counters.context_shifts, 1);
+        assert_eq!(counters.fuel.whnf.calls, 5);
+        assert_eq!(
+            counters.logical_fuel,
+            counters.fuel.whnf.logical_spent + counters.fuel.conversion.logical_spent
+        );
     }
 
     #[test]
@@ -2154,6 +2399,36 @@ mod tests {
         let err = env.add_inductive(bad_result_inductive()).unwrap_err();
 
         assert!(matches!(err, Error::InvalidInductive(_)));
+        assert!(env.decl("BadResult").is_none());
+    }
+
+    #[test]
+    fn diagnosed_recursor_mismatch_retains_conversion_context() {
+        let data = bad_result_inductive();
+        let ordinary_error = Env::new().add_inductive(data.clone()).unwrap_err();
+        let mut env = Env::new();
+        let error = env
+            .add_decl_diagnosed_with_options(
+                Decl::Inductive {
+                    name: data.name.clone(),
+                    universe_params: data.universe_params.clone(),
+                    ty: Expr::sort(data.sort.clone()),
+                    data: Box::new(data),
+                },
+                KernelDiagnosticOptions {
+                    fuel_report: KernelFuelReportMode::Failure,
+                },
+            )
+            .unwrap_err();
+
+        assert_eq!(error.error(), &ordinary_error);
+        let context = error.context().unwrap();
+        assert_eq!(context.phase(), KernelDiagnosticPhase::InductiveRecursor);
+        assert_eq!(
+            context.conversion().unwrap().outcome(),
+            KernelComparisonOutcome::NotDefEq
+        );
+        assert!(context.kernel_fuel().is_none());
         assert!(env.decl("BadResult").is_none());
     }
 

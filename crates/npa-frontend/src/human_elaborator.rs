@@ -8,26 +8,30 @@ use crate::{
     elaborator::{
         certificate_import_refs_and_providers_for_module_refs, certificate_import_refs_for_module,
         combined_verified_module_refs, kernel_env_from_verified_imports,
+        kernel_env_from_verified_imports_observed,
     },
     machine_callable_profile_from_human_binders, parse_human_module_with_source_interfaces,
-    resolve_human_module_with_source_interfaces, HumanBinder, HumanBinderKind, HumanCompileOptions,
-    HumanDeclValue, HumanDiagnostic, HumanDiagnosticConversionContext, HumanDiagnosticKind,
-    HumanDiagnosticPayload, HumanDiagnosticPhase, HumanExpr, HumanGeneratedDeclarationKind,
-    HumanGlobalRef, HumanGlobalScopeEntry, HumanHoleGoal, HumanHoleGoalLocal, HumanImplicitMode,
-    HumanImportedSourceInterface, HumanItem, HumanLevel, HumanName, HumanResolvedName,
-    HumanResolvedNameUse, HumanResolvedNotationEntry, HumanResolvedNotationUse, HumanResult,
-    HumanSourceDeclarationKind, HumanSourceDeclarationMetadata, HumanSourceInterface,
+    resolve_human_module_with_source_interfaces, DefinitionReducibility, HumanBinder,
+    HumanBinderKind, HumanCompilationObservations, HumanCompileOptions, HumanDeclValue,
+    HumanDeclarationObservation, HumanDiagnostic, HumanDiagnosticConversionContext,
+    HumanDiagnosticKind, HumanDiagnosticPayload, HumanDiagnosticPhase, HumanExpr,
+    HumanGeneratedDeclarationKind, HumanGlobalRef, HumanGlobalScopeEntry, HumanHoleGoal,
+    HumanHoleGoalLocal, HumanImplicitMode, HumanImportedSourceInterface, HumanItem,
+    HumanKernelDeclarationSummary, HumanKernelFuelDiagnostic, HumanLevel, HumanName,
+    HumanResolvedName, HumanResolvedNameUse, HumanResolvedNotationEntry, HumanResolvedNotationUse,
+    HumanResult, HumanSourceDeclarationKind, HumanSourceDeclarationMetadata, HumanSourceInterface,
     HumanTacticScript, HumanTypeclassClassMetadata, HumanTypeclassInstanceMetadata,
     HumanTypeclassSearchOutput, HumanTypeclassSearchPolicy, HumanTypeclassSearchStatus,
     HumanUniverseMismatchContext, HumanUnsolvedMeta, HumanUnsolvedMetaKind, MachineBinder,
     MachineCallableBinderVisibility, MachineCheckedCurrentDecl, MachineCheckedCurrentGeneratedDecl,
     MachineDecl, MachineDiagnosticKind, MachineLevel, MachineLocalDecl, MachineName, MachineTerm,
     MachineUniverseParam, ResolvedHumanModule, Span, VerifiedImport,
+    HUMAN_DECLARATION_OBSERVATION_LIMIT,
 };
 use npa_kernel::{
     eq_inductive, eq_rec_type, nat_inductive, subst, Binder, ConstructorDecl, Ctx, Decl,
-    DiagnosedKernelError, Env, Error, Expr, InductiveDecl, Level, RecursorDecl, Reducibility,
-    UniverseConstraint, UniverseContext,
+    DiagnosedKernelError, Env, Error, Expr, InductiveDecl, KernelDiagnosticOptions,
+    KernelWorkCounterSink, Level, RecursorDecl, Reducibility, UniverseConstraint, UniverseContext,
 };
 
 const MAX_HUMAN_IMPLICIT_INSERTION_STEPS: usize = 64;
@@ -35,6 +39,286 @@ const MAX_HUMAN_TYPECLASS_DIAGNOSTIC_CANDIDATES: usize = 32;
 const MAX_HUMAN_UNIVERSE_MISMATCH_STEPS: usize = 64;
 const MAX_HUMAN_UNIVERSE_DOMAIN_DEFEQ_FUEL: usize = 100_000;
 const MAX_HUMAN_UNIVERSE_LEVEL_RENDER_NODES: usize = 64;
+
+#[derive(Clone)]
+struct HumanKernelObservation {
+    diagnostic_options: KernelDiagnosticOptions,
+    work_counter_sink: Option<KernelWorkCounterSink>,
+}
+
+impl HumanKernelObservation {
+    fn new(
+        options: &HumanCompileOptions,
+        work_counter_sink: Option<&KernelWorkCounterSink>,
+    ) -> Self {
+        Self {
+            diagnostic_options: KernelDiagnosticOptions {
+                fuel_report: options.kernel_fuel_report.into(),
+            },
+            work_counter_sink: work_counter_sink.cloned(),
+        }
+    }
+
+    fn off() -> Self {
+        Self::new(&HumanCompileOptions::default(), None)
+    }
+
+    fn work_counter_sink(&self) -> Option<&KernelWorkCounterSink> {
+        self.work_counter_sink.as_ref()
+    }
+}
+
+#[derive(Clone, Debug)]
+struct HumanDeclarationTimer {
+    enabled: bool,
+    started: Option<Instant>,
+    elapsed_ns: u128,
+    overflowed: bool,
+}
+
+impl HumanDeclarationTimer {
+    fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            started: enabled.then(Instant::now),
+            elapsed_ns: 0,
+            overflowed: false,
+        }
+    }
+
+    fn pause(&mut self) {
+        let Some(started) = self.started.take() else {
+            return;
+        };
+        let elapsed = started.elapsed().as_nanos();
+        match self.elapsed_ns.checked_add(elapsed) {
+            Some(total) => self.elapsed_ns = total,
+            None => {
+                self.elapsed_ns = u128::MAX;
+                self.overflowed = true;
+            }
+        }
+    }
+
+    fn resume(&mut self) {
+        if self.enabled && self.started.is_none() {
+            self.started = Some(Instant::now());
+        }
+    }
+
+    fn finish(mut self) -> (u64, bool) {
+        self.pause();
+        match u64::try_from(self.elapsed_ns) {
+            Ok(elapsed_ns) => (elapsed_ns, self.overflowed),
+            Err(_) => (u64::MAX, true),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct HumanPendingCompilationObservations {
+    enabled: bool,
+    declarations: Vec<HumanDeclarationObservation>,
+    attempted: u64,
+    omitted: u64,
+    overflowed: bool,
+}
+
+impl HumanPendingCompilationObservations {
+    fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            declarations: Vec::new(),
+            attempted: 0,
+            omitted: 0,
+            overflowed: false,
+        }
+    }
+
+    fn record(
+        &mut self,
+        declaration_index: usize,
+        declaration: &Decl,
+        elapsed: (u64, bool),
+        kernel: Option<HumanKernelDeclarationSummary>,
+    ) {
+        if !self.enabled {
+            return;
+        }
+
+        self.attempted = match self.attempted.checked_add(1) {
+            Some(attempted) => attempted,
+            None => {
+                self.overflowed = true;
+                u64::MAX
+            }
+        };
+        let declaration_index = match u64::try_from(declaration_index) {
+            Ok(index) => index,
+            Err(_) => {
+                self.overflowed = true;
+                u64::MAX
+            }
+        };
+        self.overflowed |= elapsed.1 || kernel.as_ref().is_some_and(|summary| summary.overflowed);
+
+        self.declarations.push(HumanDeclarationObservation {
+            declaration_index,
+            declaration: declaration.name().to_owned(),
+            term_nodes: 0,
+            elaboration_elapsed_ns: elapsed.0,
+            kernel,
+        });
+    }
+
+    fn finish(
+        mut self,
+        certificate: &npa_cert::ModuleCert,
+        span: Span,
+    ) -> HumanResult<HumanCompilationObservations> {
+        if !self.enabled {
+            return Ok(HumanCompilationObservations::default());
+        }
+        let certificate_attempted = match u64::try_from(certificate.declarations.len()) {
+            Ok(attempted) => attempted,
+            Err(_) => {
+                self.overflowed = true;
+                u64::MAX
+            }
+        };
+        if certificate_attempted != self.attempted {
+            return Err(human_observation_invariant_diagnostic(
+                span,
+                "final Core and certificate declaration counts differ",
+            ));
+        }
+
+        let mut pending_by_name = BTreeMap::new();
+        for observation in std::mem::take(&mut self.declarations) {
+            if pending_by_name
+                .insert(observation.declaration.clone(), observation)
+                .is_some()
+            {
+                return Err(human_observation_invariant_diagnostic(
+                    span,
+                    "final Core declaration names are not unique",
+                ));
+            }
+        }
+
+        self.omitted = 0;
+        let mut previous_key: Option<(u64, String)> = None;
+        for (declaration_index, certificate_declaration) in
+            certificate.declarations.iter().enumerate()
+        {
+            let certificate_name = human_certificate_declaration_name(
+                &certificate.name_table,
+                certificate_declaration,
+            )
+            .ok_or_else(|| {
+                human_observation_invariant_diagnostic(
+                    span,
+                    "certificate declaration name is absent from the canonical name table",
+                )
+            })?;
+            let mut observation = pending_by_name.remove(&certificate_name).ok_or_else(|| {
+                human_observation_invariant_diagnostic(
+                    span,
+                    "certificate declaration is absent from final Core observations",
+                )
+            })?;
+            observation.declaration_index = match u64::try_from(declaration_index) {
+                Ok(index) => index,
+                Err(_) => {
+                    self.overflowed = true;
+                    u64::MAX
+                }
+            };
+            let key = (
+                observation.declaration_index,
+                observation.declaration.clone(),
+            );
+            if previous_key
+                .as_ref()
+                .is_some_and(|previous| previous >= &key)
+            {
+                return Err(human_observation_invariant_diagnostic(
+                    span,
+                    "retained declaration keys are not unique and canonically ordered",
+                ));
+            }
+            previous_key = Some(key);
+
+            let (term_nodes, overflowed) = human_certificate_declaration_term_nodes(
+                &certificate.term_table,
+                certificate_declaration,
+            );
+            observation.term_nodes = term_nodes;
+            self.overflowed |= overflowed;
+            if self.declarations.len() < HUMAN_DECLARATION_OBSERVATION_LIMIT {
+                self.declarations.push(observation);
+            } else {
+                self.omitted = match self.omitted.checked_add(1) {
+                    Some(omitted) => omitted,
+                    None => {
+                        self.overflowed = true;
+                        u64::MAX
+                    }
+                };
+            }
+        }
+        if !pending_by_name.is_empty() {
+            return Err(human_observation_invariant_diagnostic(
+                span,
+                "final Core declaration is absent from the certificate",
+            ));
+        }
+
+        if !self.overflowed
+            && self.attempted
+                != u64::try_from(self.declarations.len())
+                    .ok()
+                    .and_then(|retained| retained.checked_add(self.omitted))
+                    .unwrap_or(u64::MAX)
+        {
+            return Err(human_observation_invariant_diagnostic(
+                span,
+                "declaration observation accounting is inconsistent",
+            ));
+        }
+
+        Ok(HumanCompilationObservations {
+            declarations: self.declarations,
+            attempted: self.attempted,
+            omitted: self.omitted,
+            overflowed: self.overflowed,
+        })
+    }
+}
+
+struct HumanObservedCoreModule {
+    core_module: npa_cert::CoreModule,
+    observations: HumanPendingCompilationObservations,
+}
+
+#[derive(Debug)]
+struct HumanBuiltCertificateObservationRunnerOutput {
+    certificate: npa_cert::ModuleCert,
+    source_interface: HumanSourceInterface,
+    observations: HumanCompilationObservations,
+}
+
+impl HumanBuiltCertificateObservationRunnerOutput {
+    fn into_parts(
+        self,
+    ) -> (
+        npa_cert::ModuleCert,
+        HumanSourceInterface,
+        HumanCompilationObservations,
+    ) {
+        (self.certificate, self.source_interface, self.observations)
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HumanCoreCompileOutput {
@@ -50,9 +334,21 @@ pub struct HumanCertificateCompileOutput {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HumanObservedCertificateCompileOutput {
+    pub output: HumanCertificateCompileOutput,
+    pub observations: HumanCompilationObservations,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HumanBuiltCertificateCompileOutput {
     pub certificate: npa_cert::ModuleCert,
     pub source_interface: HumanSourceInterface,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HumanObservedBuiltCertificateCompileOutput {
+    pub output: HumanBuiltCertificateCompileOutput,
+    pub observations: HumanCompilationObservations,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -61,8 +357,16 @@ pub struct HumanBuiltCertificateOnlyCompileOutput {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HumanObservedBuiltCertificateOnlyCompileOutput {
+    pub output: HumanBuiltCertificateOnlyCompileOutput,
+    pub observations: HumanCompilationObservations,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HumanProofStartCore {
     pub module: npa_cert::ModuleName,
+    pub owner_certificate_format: String,
+    pub owner_core_spec: String,
     pub theorem_name: npa_cert::Name,
     pub source_index: u64,
     pub universe_params: Vec<String>,
@@ -112,6 +416,7 @@ pub struct HumanProofStartCoreWithProofsRequest<'a> {
 #[derive(Clone, Debug)]
 pub struct HumanTacticTermElabContext {
     env: Env,
+    imported_opaque_globals: BTreeSet<String>,
     global_scope: HumanTacticGlobalScope,
     notation_entries: Vec<HumanResolvedNotationEntry>,
     signatures: BTreeMap<String, HumanCallableSignature>,
@@ -172,22 +477,46 @@ fn elaborate_human_module_with_available_imports(
     available_imports: &[VerifiedImport],
     options: &HumanCompileOptions,
 ) -> HumanResult<npa_cert::CoreModule> {
+    elaborate_human_module_with_available_imports_observed(
+        module_name,
+        &module,
+        direct_imports,
+        available_imports,
+        options,
+        None,
+        false,
+    )
+    .map(|output| output.core_module)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn elaborate_human_module_with_available_imports_observed(
+    module_name: npa_cert::ModuleName,
+    module: &ResolvedHumanModule,
+    direct_imports: &[VerifiedImport],
+    available_imports: &[VerifiedImport],
+    options: &HumanCompileOptions,
+    work_counter_sink: Option<&KernelWorkCounterSink>,
+    collect_declaration_details: bool,
+) -> HumanResult<HumanObservedCoreModule> {
     let span = module.module.span;
-    let plans = notation_candidate_plans(&module, options.max_notation_candidates)
+    let plans = notation_candidate_plans(module, options.max_notation_candidates)
         .map_err(|diagnostic| diagnostic.with_default_phase(HumanDiagnosticPhase::Elaborator))?;
     let mut first_error = None;
     let mut success = None;
 
     for plan in plans {
-        match elaborate_human_module_with_notation_plan(
+        match elaborate_human_module_with_notation_plan_observed(
             module_name.clone(),
-            &module,
+            module,
             direct_imports,
             available_imports,
             &plan,
             options,
+            work_counter_sink,
+            collect_declaration_details,
         ) {
-            Ok(core) if success.is_none() => success = Some(core),
+            Ok(output) if success.is_none() => success = Some(output),
             Ok(_) => {
                 return Err(HumanDiagnostic::error(
                     HumanDiagnosticKind::AmbiguousNotation,
@@ -202,8 +531,8 @@ fn elaborate_human_module_with_available_imports(
         }
     }
 
-    if let Some(core) = success {
-        Ok(core)
+    if let Some(output) = success {
+        Ok(output)
     } else if let Some(err) = first_error {
         Err(err.with_default_phase(HumanDiagnosticPhase::Elaborator))
     } else {
@@ -259,7 +588,10 @@ fn elaborate_human_proof_start_core(
         }
     }
 
-    if let Some(core) = success {
+    if let Some(mut core) = success {
+        let (certificate_format, core_spec) = human_module_owner_pair();
+        core.owner_certificate_format = certificate_format.to_owned();
+        core.owner_core_spec = core_spec.to_owned();
         Ok(core)
     } else if let Some(err) = first_error {
         Err(err.with_default_phase(HumanDiagnosticPhase::Elaborator))
@@ -318,7 +650,10 @@ fn elaborate_human_proof_start_core_with_by_proofs(
         }
     }
 
-    if let Some(core) = success {
+    if let Some(mut core) = success {
+        let (certificate_format, core_spec) = human_module_owner_pair();
+        core.owner_certificate_format = certificate_format.to_owned();
+        core.owner_core_spec = core_spec.to_owned();
         Ok(core)
     } else if let Some(err) = first_error {
         Err(err.with_default_phase(HumanDiagnosticPhase::Elaborator))
@@ -346,10 +681,17 @@ fn prepare_human_proof_start_core_with_notation_plan(
         verified_imports,
         notation_plan,
         options,
+        None,
     )?
     .with_current_module_prefix(module_name.clone());
     let lowered = lowering.lower_proof_start(&module_name, theorem_name, module)?;
-    let elaborator = HumanBidirectionalElaborator::new(module, verified_imports, verified_imports)?;
+    let elaborator = HumanBidirectionalElaborator::new(
+        module,
+        verified_imports,
+        verified_imports,
+        options,
+        None,
+    )?;
     let proof = elaborator.elaborate_proof_start_core(module_name.clone(), lowered)?;
     Ok(prefix_human_current_decl_identities_for_machine_bridge(
         &module_name,
@@ -372,6 +714,7 @@ fn prepare_human_proof_start_core_with_notation_plan_and_by_proofs(
         verified_imports,
         notation_plan,
         options,
+        None,
     )?
     .with_current_module_prefix(module_name.clone());
     let lowered = lowering.lower_proof_start_with_core_proofs(
@@ -380,7 +723,13 @@ fn prepare_human_proof_start_core_with_notation_plan_and_by_proofs(
         module,
         by_proofs,
     )?;
-    let elaborator = HumanBidirectionalElaborator::new(module, verified_imports, verified_imports)?;
+    let elaborator = HumanBidirectionalElaborator::new(
+        module,
+        verified_imports,
+        verified_imports,
+        options,
+        None,
+    )?;
     let proof = elaborator.elaborate_proof_start_core(module_name.clone(), lowered)?;
     Ok(prefix_human_current_decl_identities_for_machine_bridge(
         &module_name,
@@ -593,8 +942,13 @@ pub fn search_human_typeclass_from_source(
             .with_phase(HumanDiagnosticPhase::Elaborator)
         })?;
 
-    let mut env_builder =
-        HumanImplicitInserter::new(&search_module, verified_imports, verified_imports, options)?;
+    let mut env_builder = HumanImplicitInserter::new(
+        &search_module,
+        verified_imports,
+        verified_imports,
+        options,
+        None,
+    )?;
     for decl in core_module.declarations {
         env_builder.add_kernel_decl(decl, span)?;
     }
@@ -819,7 +1173,31 @@ pub fn compile_human_source_to_certificate_output_with_source_interfaces(
     imported_source_interfaces: &[HumanImportedSourceInterface],
     options: &HumanCompileOptions,
 ) -> HumanResult<HumanCertificateCompileOutput> {
-    compile_human_source_to_certificate_output_with_source_interfaces_and_axiom_policy(
+    compile_human_source_to_observed_certificate_output_with_source_interfaces(
+        file_id,
+        module_name,
+        source,
+        verified_modules,
+        imported_source_interfaces,
+        options,
+        None,
+        false,
+    )
+    .map(|observed| observed.output)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn compile_human_source_to_observed_certificate_output_with_source_interfaces(
+    file_id: crate::FileId,
+    module_name: npa_cert::ModuleName,
+    source: &str,
+    verified_modules: &[npa_cert::VerifiedModule],
+    imported_source_interfaces: &[HumanImportedSourceInterface],
+    options: &HumanCompileOptions,
+    work_counter_sink: Option<&KernelWorkCounterSink>,
+    collect_declaration_details: bool,
+) -> HumanResult<HumanObservedCertificateCompileOutput> {
+    compile_human_source_to_observed_certificate_output_with_source_interfaces_and_axiom_policy(
         file_id,
         module_name,
         source,
@@ -827,6 +1205,8 @@ pub fn compile_human_source_to_certificate_output_with_source_interfaces(
         imported_source_interfaces,
         options,
         &npa_cert::AxiomPolicy::normal(),
+        work_counter_sink,
+        collect_declaration_details,
     )
 }
 
@@ -839,8 +1219,34 @@ pub fn compile_human_source_to_certificate_output_with_source_interfaces_and_axi
     options: &HumanCompileOptions,
     axiom_policy: &npa_cert::AxiomPolicy,
 ) -> HumanResult<HumanCertificateCompileOutput> {
+    compile_human_source_to_observed_certificate_output_with_source_interfaces_and_axiom_policy(
+        file_id,
+        module_name,
+        source,
+        verified_modules,
+        imported_source_interfaces,
+        options,
+        axiom_policy,
+        None,
+        false,
+    )
+    .map(|observed| observed.output)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn compile_human_source_to_observed_certificate_output_with_source_interfaces_and_axiom_policy(
+    file_id: crate::FileId,
+    module_name: npa_cert::ModuleName,
+    source: &str,
+    verified_modules: &[npa_cert::VerifiedModule],
+    imported_source_interfaces: &[HumanImportedSourceInterface],
+    options: &HumanCompileOptions,
+    axiom_policy: &npa_cert::AxiomPolicy,
+    work_counter_sink: Option<&KernelWorkCounterSink>,
+    collect_declaration_details: bool,
+) -> HumanResult<HumanObservedCertificateCompileOutput> {
     let verified_module_refs = verified_modules.iter().collect::<Vec<_>>();
-    compile_human_source_to_certificate_output_with_import_refs_and_axiom_policy(
+    compile_human_source_to_observed_certificate_output_with_import_refs_and_axiom_policy(
         file_id,
         module_name,
         source,
@@ -848,6 +1254,8 @@ pub fn compile_human_source_to_certificate_output_with_source_interfaces_and_axi
         imported_source_interfaces,
         options,
         axiom_policy,
+        work_counter_sink,
+        collect_declaration_details,
     )
 }
 
@@ -860,7 +1268,33 @@ pub fn compile_human_source_to_certificate_output_with_import_refs_and_axiom_pol
     options: &HumanCompileOptions,
     axiom_policy: &npa_cert::AxiomPolicy,
 ) -> HumanResult<HumanCertificateCompileOutput> {
-    compile_human_source_to_certificate_output_with_available_import_refs_and_axiom_policy(
+    compile_human_source_to_observed_certificate_output_with_import_refs_and_axiom_policy(
+        file_id,
+        module_name,
+        source,
+        verified_modules,
+        imported_source_interfaces,
+        options,
+        axiom_policy,
+        None,
+        false,
+    )
+    .map(|observed| observed.output)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn compile_human_source_to_observed_certificate_output_with_import_refs_and_axiom_policy(
+    file_id: crate::FileId,
+    module_name: npa_cert::ModuleName,
+    source: &str,
+    verified_modules: &[&npa_cert::VerifiedModule],
+    imported_source_interfaces: &[HumanImportedSourceInterface],
+    options: &HumanCompileOptions,
+    axiom_policy: &npa_cert::AxiomPolicy,
+    work_counter_sink: Option<&KernelWorkCounterSink>,
+    collect_declaration_details: bool,
+) -> HumanResult<HumanObservedCertificateCompileOutput> {
+    compile_human_source_to_observed_certificate_output_with_available_import_refs_and_axiom_policy(
         file_id,
         module_name,
         source,
@@ -869,6 +1303,8 @@ pub fn compile_human_source_to_certificate_output_with_import_refs_and_axiom_pol
         imported_source_interfaces,
         options,
         axiom_policy,
+        work_counter_sink,
+        collect_declaration_details,
     )
 }
 
@@ -884,15 +1320,51 @@ pub fn compile_human_source_to_certificate_output_with_available_import_refs_and
     options: &HumanCompileOptions,
     axiom_policy: &npa_cert::AxiomPolicy,
 ) -> HumanResult<HumanCertificateCompileOutput> {
-    let built = compile_human_source_to_built_certificate_output_with_available_import_refs(
+    compile_human_source_to_observed_certificate_output_with_available_import_refs_and_axiom_policy(
         file_id,
-        module_name.clone(),
+        module_name,
         source,
         direct_verified_modules,
         available_verified_modules,
         imported_source_interfaces,
         options,
-    )?;
+        axiom_policy,
+        None,
+        false,
+    )
+    .map(|observed| observed.output)
+}
+
+// Direct and transitively available imports stay explicit at this public boundary.
+#[allow(clippy::too_many_arguments)]
+pub fn compile_human_source_to_observed_certificate_output_with_available_import_refs_and_axiom_policy(
+    file_id: crate::FileId,
+    module_name: npa_cert::ModuleName,
+    source: &str,
+    direct_verified_modules: &[&npa_cert::VerifiedModule],
+    available_verified_modules: &[&npa_cert::VerifiedModule],
+    imported_source_interfaces: &[HumanImportedSourceInterface],
+    options: &HumanCompileOptions,
+    axiom_policy: &npa_cert::AxiomPolicy,
+    work_counter_sink: Option<&KernelWorkCounterSink>,
+    collect_declaration_details: bool,
+) -> HumanResult<HumanObservedCertificateCompileOutput> {
+    let observed_built =
+        compile_human_source_to_observed_built_certificate_output_with_available_import_refs(
+            file_id,
+            module_name.clone(),
+            source,
+            direct_verified_modules,
+            available_verified_modules,
+            imported_source_interfaces,
+            options,
+            work_counter_sink,
+            collect_declaration_details,
+        )?;
+    let HumanObservedBuiltCertificateCompileOutput {
+        output: built,
+        observations,
+    } = observed_built;
     let certificate_imports =
         combined_verified_module_refs(direct_verified_modules, available_verified_modules);
     let verified_module = npa_cert::verify_built_module_cert_with_import_refs(
@@ -908,10 +1380,13 @@ pub fn compile_human_source_to_certificate_output_with_available_import_refs_and
         )
         .with_phase(HumanDiagnosticPhase::CertificateHandoff)
     })?;
-    Ok(HumanCertificateCompileOutput {
-        certificate: built.certificate,
-        verified_module,
-        source_interface: built.source_interface,
+    Ok(HumanObservedCertificateCompileOutput {
+        output: HumanCertificateCompileOutput {
+            certificate: built.certificate,
+            verified_module,
+            source_interface: built.source_interface,
+        },
+        observations,
     })
 }
 
@@ -923,7 +1398,31 @@ pub fn compile_human_source_to_built_certificate_output_with_import_refs(
     imported_source_interfaces: &[HumanImportedSourceInterface],
     options: &HumanCompileOptions,
 ) -> HumanResult<HumanBuiltCertificateCompileOutput> {
-    compile_human_source_to_built_certificate_output_with_available_import_refs(
+    compile_human_source_to_observed_built_certificate_output_with_import_refs(
+        file_id,
+        module_name,
+        source,
+        verified_modules,
+        imported_source_interfaces,
+        options,
+        None,
+        false,
+    )
+    .map(|observed| observed.output)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn compile_human_source_to_observed_built_certificate_output_with_import_refs(
+    file_id: crate::FileId,
+    module_name: npa_cert::ModuleName,
+    source: &str,
+    verified_modules: &[&npa_cert::VerifiedModule],
+    imported_source_interfaces: &[HumanImportedSourceInterface],
+    options: &HumanCompileOptions,
+    work_counter_sink: Option<&KernelWorkCounterSink>,
+    collect_declaration_details: bool,
+) -> HumanResult<HumanObservedBuiltCertificateCompileOutput> {
+    compile_human_source_to_observed_built_certificate_output_with_available_import_refs(
         file_id,
         module_name,
         source,
@@ -931,6 +1430,8 @@ pub fn compile_human_source_to_built_certificate_output_with_import_refs(
         verified_modules,
         imported_source_interfaces,
         options,
+        work_counter_sink,
+        collect_declaration_details,
     )
 }
 
@@ -943,6 +1444,67 @@ pub fn compile_human_source_to_built_certificate_output_with_available_import_re
     imported_source_interfaces: &[HumanImportedSourceInterface],
     options: &HumanCompileOptions,
 ) -> HumanResult<HumanBuiltCertificateCompileOutput> {
+    compile_human_source_to_observed_built_certificate_output_with_available_import_refs(
+        file_id,
+        module_name,
+        source,
+        direct_verified_modules,
+        available_verified_modules,
+        imported_source_interfaces,
+        options,
+        None,
+        false,
+    )
+    .map(|observed| observed.output)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn compile_human_source_to_observed_built_certificate_output_with_available_import_refs(
+    file_id: crate::FileId,
+    module_name: npa_cert::ModuleName,
+    source: &str,
+    direct_verified_modules: &[&npa_cert::VerifiedModule],
+    available_verified_modules: &[&npa_cert::VerifiedModule],
+    imported_source_interfaces: &[HumanImportedSourceInterface],
+    options: &HumanCompileOptions,
+    work_counter_sink: Option<&KernelWorkCounterSink>,
+    collect_declaration_details: bool,
+) -> HumanResult<HumanObservedBuiltCertificateCompileOutput> {
+    let (certificate, source_interface, observations) =
+        compile_human_source_to_built_certificate_observation_runner(
+            file_id,
+            module_name,
+            source,
+            direct_verified_modules,
+            available_verified_modules,
+            imported_source_interfaces,
+            options,
+            work_counter_sink,
+            collect_declaration_details,
+        )?
+        .into_parts();
+    let source_interface = source_interface_with_certificate_hashes(source_interface, &certificate);
+    Ok(HumanObservedBuiltCertificateCompileOutput {
+        output: HumanBuiltCertificateCompileOutput {
+            certificate,
+            source_interface,
+        },
+        observations,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compile_human_source_to_built_certificate_observation_runner(
+    file_id: crate::FileId,
+    module_name: npa_cert::ModuleName,
+    source: &str,
+    direct_verified_modules: &[&npa_cert::VerifiedModule],
+    available_verified_modules: &[&npa_cert::VerifiedModule],
+    imported_source_interfaces: &[HumanImportedSourceInterface],
+    options: &HumanCompileOptions,
+    work_counter_sink: Option<&KernelWorkCounterSink>,
+    collect_declaration_details: bool,
+) -> HumanResult<HumanBuiltCertificateObservationRunnerOutput> {
     let direct_verified_imports: Vec<_> = direct_verified_modules
         .iter()
         .map(|module| VerifiedImport::from(*module))
@@ -960,24 +1522,26 @@ pub fn compile_human_source_to_built_certificate_output_with_available_import_re
         imported_source_interfaces,
         options,
     )?;
-    let source_interface = resolved.state.source_interfaces.current.clone();
     let active_import_indices = active_human_import_indices(&resolved, &direct_verified_imports)
         .map_err(|diagnostic| diagnostic.with_default_phase(HumanDiagnosticPhase::Resolver))?;
-    let core = elaborate_human_module_with_available_imports(
+    let observed_core = elaborate_human_module_with_available_imports_observed(
         module_name,
-        resolved,
+        &resolved,
         &direct_verified_imports,
         &available_verified_imports,
         options,
+        work_counter_sink,
+        collect_declaration_details,
     )
     .map_err(|diagnostic| diagnostic.with_default_phase(HumanDiagnosticPhase::Elaborator))?;
+    let source_interface = resolved.state.source_interfaces.current;
     drop(direct_verified_imports);
     drop(available_verified_imports);
     let verified_modules =
         combined_verified_module_refs(direct_verified_modules, available_verified_modules);
     let (certificate_imports, preferred_imports) =
         certificate_import_refs_and_providers_for_module_refs(
-            &core,
+            &observed_core.core_module,
             &active_import_indices,
             &verified_modules,
             file_id,
@@ -987,7 +1551,7 @@ pub fn compile_human_source_to_built_certificate_output_with_available_import_re
                 .with_phase(HumanDiagnosticPhase::CertificateHandoff)
         })?;
     let cert = npa_cert::build_module_cert_from_import_refs_with_preferred_imports(
-        core,
+        observed_core.core_module,
         &certificate_imports,
         &preferred_imports,
     )
@@ -999,10 +1563,13 @@ pub fn compile_human_source_to_built_certificate_output_with_available_import_re
         )
         .with_phase(HumanDiagnosticPhase::CertificateHandoff)
     })?;
-    let source_interface = source_interface_with_certificate_hashes(source_interface, &cert);
-    Ok(HumanBuiltCertificateCompileOutput {
+    let observations = observed_core
+        .observations
+        .finish(&cert, source_span(file_id, source))?;
+    Ok(HumanBuiltCertificateObservationRunnerOutput {
         certificate: cert,
         source_interface,
+        observations,
     })
 }
 
@@ -1014,7 +1581,31 @@ pub fn compile_human_source_to_built_certificate_only_with_import_refs(
     imported_source_interfaces: &[HumanImportedSourceInterface],
     options: &HumanCompileOptions,
 ) -> HumanResult<HumanBuiltCertificateOnlyCompileOutput> {
-    compile_human_source_to_built_certificate_only_with_available_import_refs(
+    compile_human_source_to_observed_built_certificate_only_with_import_refs(
+        file_id,
+        module_name,
+        source,
+        verified_modules,
+        imported_source_interfaces,
+        options,
+        None,
+        false,
+    )
+    .map(|observed| observed.output)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn compile_human_source_to_observed_built_certificate_only_with_import_refs(
+    file_id: crate::FileId,
+    module_name: npa_cert::ModuleName,
+    source: &str,
+    verified_modules: &[&npa_cert::VerifiedModule],
+    imported_source_interfaces: &[HumanImportedSourceInterface],
+    options: &HumanCompileOptions,
+    work_counter_sink: Option<&KernelWorkCounterSink>,
+    collect_declaration_details: bool,
+) -> HumanResult<HumanObservedBuiltCertificateOnlyCompileOutput> {
+    compile_human_source_to_observed_built_certificate_only_with_available_import_refs(
         file_id,
         module_name,
         source,
@@ -1022,6 +1613,8 @@ pub fn compile_human_source_to_built_certificate_only_with_import_refs(
         verified_modules,
         imported_source_interfaces,
         options,
+        work_counter_sink,
+        collect_declaration_details,
     )
 }
 
@@ -1034,66 +1627,175 @@ pub fn compile_human_source_to_built_certificate_only_with_available_import_refs
     imported_source_interfaces: &[HumanImportedSourceInterface],
     options: &HumanCompileOptions,
 ) -> HumanResult<HumanBuiltCertificateOnlyCompileOutput> {
-    let direct_verified_imports: Vec<_> = direct_verified_modules
-        .iter()
-        .map(|module| VerifiedImport::from(*module))
-        .collect();
-    let available_verified_imports: Vec<_> = available_verified_modules
-        .iter()
-        .map(|module| VerifiedImport::from(*module))
-        .collect();
-    let parsed =
-        parse_human_module_with_source_interfaces(file_id, source, imported_source_interfaces)?;
-    let resolved = resolve_human_module_with_source_interfaces(
-        module_name.clone(),
-        parsed,
-        &direct_verified_imports,
+    compile_human_source_to_observed_built_certificate_only_with_available_import_refs(
+        file_id,
+        module_name,
+        source,
+        direct_verified_modules,
+        available_verified_modules,
         imported_source_interfaces,
         options,
-    )?;
-    let active_import_indices = active_human_import_indices(&resolved, &direct_verified_imports)
-        .map_err(|diagnostic| diagnostic.with_default_phase(HumanDiagnosticPhase::Resolver))?;
-    let core = elaborate_human_module_with_available_imports(
-        module_name,
-        resolved,
-        &direct_verified_imports,
-        &available_verified_imports,
-        options,
+        None,
+        false,
     )
-    .map_err(|diagnostic| diagnostic.with_default_phase(HumanDiagnosticPhase::Elaborator))?;
-    drop(direct_verified_imports);
-    drop(available_verified_imports);
-    let verified_modules =
-        combined_verified_module_refs(direct_verified_modules, available_verified_modules);
-    let (certificate_imports, preferred_imports) =
-        certificate_import_refs_and_providers_for_module_refs(
-            &core,
-            &active_import_indices,
-            &verified_modules,
+    .map(|observed| observed.output)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn compile_human_source_to_observed_built_certificate_only_with_available_import_refs(
+    file_id: crate::FileId,
+    module_name: npa_cert::ModuleName,
+    source: &str,
+    direct_verified_modules: &[&npa_cert::VerifiedModule],
+    available_verified_modules: &[&npa_cert::VerifiedModule],
+    imported_source_interfaces: &[HumanImportedSourceInterface],
+    options: &HumanCompileOptions,
+    work_counter_sink: Option<&KernelWorkCounterSink>,
+    collect_declaration_details: bool,
+) -> HumanResult<HumanObservedBuiltCertificateOnlyCompileOutput> {
+    let (certificate, _, observations) =
+        compile_human_source_to_built_certificate_observation_runner(
             file_id,
-        )
-        .map_err(|err| {
-            human_certificate_import_diagnostic(source_span(file_id, source), err)
-                .with_phase(HumanDiagnosticPhase::CertificateHandoff)
-        })?;
-    let cert = npa_cert::build_module_cert_from_import_refs_with_preferred_imports(
-        core,
-        &certificate_imports,
-        &preferred_imports,
+            module_name,
+            source,
+            direct_verified_modules,
+            available_verified_modules,
+            imported_source_interfaces,
+            options,
+            work_counter_sink,
+            collect_declaration_details,
+        )?
+        .into_parts();
+    Ok(HumanObservedBuiltCertificateOnlyCompileOutput {
+        output: HumanBuiltCertificateOnlyCompileOutput { certificate },
+        observations,
+    })
+}
+
+fn human_observation_invariant_diagnostic(span: Span, detail: &str) -> HumanDiagnostic {
+    HumanDiagnostic::error(
+        HumanDiagnosticKind::KernelRejected,
+        span,
+        format!("Human declaration observation invariant failed: {detail}"),
     )
-    .map_err(|err| {
-        HumanDiagnostic::error(
-            HumanDiagnosticKind::KernelRejected,
-            source_span(file_id, source),
-            format!("certificate certificate handoff rejected Human source: {err:?}"),
-        )
-        .with_phase(HumanDiagnosticPhase::CertificateHandoff)
-    })?;
-    Ok(HumanBuiltCertificateOnlyCompileOutput { certificate: cert })
+    .with_phase(HumanDiagnosticPhase::CertificateHandoff)
+}
+
+fn human_certificate_declaration_name(
+    name_table: &[npa_cert::Name],
+    declaration: &npa_cert::DeclCert,
+) -> Option<String> {
+    let name = match &declaration.decl {
+        npa_cert::DeclPayload::Axiom { name, .. }
+        | npa_cert::DeclPayload::AxiomConstrained { name, .. }
+        | npa_cert::DeclPayload::Def { name, .. }
+        | npa_cert::DeclPayload::DefConstrained { name, .. }
+        | npa_cert::DeclPayload::Theorem { name, .. }
+        | npa_cert::DeclPayload::TheoremConstrained { name, .. }
+        | npa_cert::DeclPayload::Inductive { name, .. }
+        | npa_cert::DeclPayload::InductiveConstrained { name, .. }
+        | npa_cert::DeclPayload::MutualInductiveBlock { name, .. } => *name,
+    };
+    name_table.get(name).map(npa_cert::Name::as_dotted)
+}
+
+// Keep this crate-local traversal aligned with
+// package_verifier::certificate_declaration_term_nodes. KFH-13 adds the
+// cross-producer equality fixture once both observation producers exist.
+fn human_certificate_declaration_term_nodes(
+    term_table: &[npa_cert::TermNode],
+    declaration: &npa_cert::DeclCert,
+) -> (u64, bool) {
+    let mut pending = human_certificate_declaration_term_roots(&declaration.decl);
+    let mut visited = BTreeSet::new();
+    while let Some(term_id) = pending.pop() {
+        if !visited.insert(term_id) {
+            continue;
+        }
+        let Some(node) = term_table.get(term_id) else {
+            continue;
+        };
+        match node {
+            npa_cert::TermNode::App(function, argument) => {
+                pending.push(*function);
+                pending.push(*argument);
+            }
+            npa_cert::TermNode::Lam { ty, body } | npa_cert::TermNode::Pi { ty, body } => {
+                pending.push(*ty);
+                pending.push(*body);
+            }
+            npa_cert::TermNode::Let { ty, value, body } => {
+                pending.push(*ty);
+                pending.push(*value);
+                pending.push(*body);
+            }
+            npa_cert::TermNode::Sort(_)
+            | npa_cert::TermNode::BVar(_)
+            | npa_cert::TermNode::Const { .. } => {}
+        }
+    }
+    match u64::try_from(visited.len()) {
+        Ok(count) => (count, false),
+        Err(_) => (u64::MAX, true),
+    }
+}
+
+fn human_certificate_declaration_term_roots(
+    declaration: &npa_cert::DeclPayload,
+) -> Vec<npa_cert::TermId> {
+    match declaration {
+        npa_cert::DeclPayload::Axiom { ty, .. }
+        | npa_cert::DeclPayload::AxiomConstrained { ty, .. } => vec![*ty],
+        npa_cert::DeclPayload::Def { ty, value, .. }
+        | npa_cert::DeclPayload::DefConstrained { ty, value, .. } => vec![*ty, *value],
+        npa_cert::DeclPayload::Theorem { ty, proof, .. }
+        | npa_cert::DeclPayload::TheoremConstrained { ty, proof, .. } => vec![*ty, *proof],
+        npa_cert::DeclPayload::Inductive {
+            params,
+            indices,
+            constructors,
+            recursor,
+            ..
+        }
+        | npa_cert::DeclPayload::InductiveConstrained {
+            params,
+            indices,
+            constructors,
+            recursor,
+            ..
+        } => params
+            .iter()
+            .chain(indices)
+            .map(|binder| binder.ty)
+            .chain(constructors.iter().map(|constructor| constructor.ty))
+            .chain(recursor.iter().map(|recursor| recursor.ty))
+            .collect(),
+        npa_cert::DeclPayload::MutualInductiveBlock { inductives, .. } => inductives
+            .iter()
+            .flat_map(|inductive| {
+                inductive
+                    .params
+                    .iter()
+                    .chain(&inductive.indices)
+                    .map(|binder| binder.ty)
+                    .chain(
+                        inductive
+                            .constructors
+                            .iter()
+                            .map(|constructor| constructor.ty),
+                    )
+                    .chain(inductive.recursor.iter().map(|recursor| recursor.ty))
+            })
+            .collect(),
+    }
 }
 
 fn source_span(file_id: crate::FileId, source: &str) -> Span {
     Span::new(file_id, 0, source.len() as u32)
+}
+
+fn human_module_owner_pair() -> (&'static str, &'static str) {
+    ("NPA-CERT-0.3.0", "NPA-Core-0.3.0")
 }
 
 fn source_interface_with_certificate_hashes(
@@ -1101,32 +1803,33 @@ fn source_interface_with_certificate_hashes(
     cert: &npa_cert::ModuleCert,
 ) -> HumanSourceInterface {
     let module_name = source_interface.module.clone();
-    let export_hashes: BTreeMap<_, _> = cert
+    let export_facts: BTreeMap<_, _> = cert
         .export_block
         .iter()
         .map(|entry| {
             (
                 cert.name_table[entry.name].clone(),
-                entry.decl_interface_hash,
+                (entry.decl_interface_hash, entry.reducibility),
             )
         })
         .collect();
 
     for decl in &mut source_interface.declarations {
         let name = npa_cert::Name(decl.name.parts.clone());
-        if let Some(hash) = export_hashes
+        if let Some((hash, reducibility)) = export_facts
             .get(&name)
-            .or_else(|| export_hashes.get(&prefixed_human_current_name(&module_name, &name)))
+            .or_else(|| export_facts.get(&prefixed_human_current_name(&module_name, &name)))
         {
             decl.decl_interface_hash = Some(*hash);
+            decl.definition_reducibility = reducibility.map(DefinitionReducibility::from_cert);
         }
     }
 
     for generated in &mut source_interface.generated_declarations {
         let name = npa_cert::Name(generated.name.parts.clone());
-        if let Some(hash) = export_hashes
+        if let Some((hash, _)) = export_facts
             .get(&name)
-            .or_else(|| export_hashes.get(&prefixed_human_current_name(&module_name, &name)))
+            .or_else(|| export_facts.get(&prefixed_human_current_name(&module_name, &name)))
         {
             generated.decl_interface_hash = Some(*hash);
         }
@@ -1134,17 +1837,17 @@ fn source_interface_with_certificate_hashes(
 
     for class in &mut source_interface.typeclass_classes {
         let name = npa_cert::Name(class.name.parts.clone());
-        if let Some(hash) = export_hashes
+        if let Some((hash, _)) = export_facts
             .get(&name)
-            .or_else(|| export_hashes.get(&prefixed_human_current_name(&module_name, &name)))
+            .or_else(|| export_facts.get(&prefixed_human_current_name(&module_name, &name)))
         {
             class.decl_interface_hash = Some(*hash);
         }
         for field in &mut class.fields {
             let name = npa_cert::Name(field.projection.parts.clone());
-            if let Some(hash) = export_hashes
+            if let Some((hash, _)) = export_facts
                 .get(&name)
-                .or_else(|| export_hashes.get(&prefixed_human_current_name(&module_name, &name)))
+                .or_else(|| export_facts.get(&prefixed_human_current_name(&module_name, &name)))
             {
                 field.decl_interface_hash = Some(*hash);
             }
@@ -1153,9 +1856,9 @@ fn source_interface_with_certificate_hashes(
 
     for instance in &mut source_interface.typeclass_instances {
         let name = npa_cert::Name(instance.name.parts.clone());
-        if let Some(hash) = export_hashes
+        if let Some((hash, _)) = export_facts
             .get(&name)
-            .or_else(|| export_hashes.get(&prefixed_human_current_name(&module_name, &name)))
+            .or_else(|| export_facts.get(&prefixed_human_current_name(&module_name, &name)))
         {
             instance.decl_interface_hash = Some(*hash);
         }
@@ -1363,6 +2066,7 @@ impl HumanTacticTermElabContext {
     pub fn from_request(request: HumanTacticTermElabContextRequest<'_>) -> HumanResult<Self> {
         let span = Span::empty(crate::FileId(0));
         let mut env = Env::new();
+        let observation = HumanKernelObservation::off();
         let mut seen_imports = BTreeSet::new();
         let mut imports = Vec::new();
         for import in request
@@ -1379,7 +2083,13 @@ impl HumanTacticTermElabContext {
                 imports.push(import);
             }
         }
-        add_human_kernel_imports_to_env(&mut env, &imports, span)?;
+        add_human_kernel_imports_to_env(&mut env, &imports, span, &observation)?;
+        let imported_opaque_globals = imports
+            .iter()
+            .flat_map(|import| import.exports.iter())
+            .filter(|export| export.reducibility == Some(npa_cert::CertReducibility::Opaque))
+            .map(|export| export.name.as_dotted())
+            .collect::<BTreeSet<_>>();
 
         for decl in request.checked_current_decls {
             add_human_kernel_decl_to_env(
@@ -1387,7 +2097,21 @@ impl HumanTacticTermElabContext {
                 decl.decl.clone(),
                 span,
                 "Human tactic checked current declaration",
+                &observation,
             )?;
+            if decl.reducibility == DefinitionReducibility::Opaque
+                && !env.expose_checked_opaque_definition(decl.decl.name())
+            {
+                return Err(HumanDiagnostic::error(
+                    HumanDiagnosticKind::KernelRejected,
+                    span,
+                    format!(
+                        "checked opaque current declaration {} could not be exposed in the Human tactic environment",
+                        decl.decl.name()
+                    ),
+                )
+                .with_phase(HumanDiagnosticPhase::KernelHandoff));
+            }
         }
 
         let global_scope = human_tactic_global_scope(request.direct_imports, &request);
@@ -1401,6 +2125,7 @@ impl HumanTacticTermElabContext {
 
         Ok(Self {
             env,
+            imported_opaque_globals,
             global_scope,
             notation_entries,
             signatures,
@@ -1422,6 +2147,7 @@ fn add_human_kernel_imports_to_env(
     env: &mut Env,
     imports: &[&VerifiedImport],
     span: Span,
+    observation: &HumanKernelObservation,
 ) -> HumanResult<()> {
     let mut pending = imports
         .iter()
@@ -1441,7 +2167,13 @@ fn add_human_kernel_imports_to_env(
                 next.push(decl);
                 continue;
             }
-            add_human_kernel_decl_to_env(env, decl, span, "Human tactic import environment")?;
+            add_human_kernel_decl_to_env(
+                env,
+                decl,
+                span,
+                "Human tactic import environment",
+                observation,
+            )?;
             progressed = true;
         }
 
@@ -1469,6 +2201,7 @@ fn add_human_kernel_imports_to_env(
         imports.iter().copied(),
         span,
         "Human tactic import environment",
+        observation,
     )?;
 
     Ok(())
@@ -1478,14 +2211,24 @@ fn human_kernel_env_from_verified_imports(
     active_imports: &[&VerifiedImport],
     available_imports: &[VerifiedImport],
     span: Span,
+    observation: &HumanKernelObservation,
 ) -> HumanResult<Env> {
-    kernel_env_from_verified_imports(
-        active_imports.iter().copied(),
-        available_imports,
-        true,
-        span,
-    )
-    .map_err(|diagnostic| {
+    let build = match observation.work_counter_sink() {
+        Some(sink) => kernel_env_from_verified_imports_observed(
+            active_imports.iter().copied(),
+            available_imports,
+            true,
+            span,
+            Some(sink),
+        ),
+        None => kernel_env_from_verified_imports(
+            active_imports.iter().copied(),
+            available_imports,
+            true,
+            span,
+        ),
+    };
+    build.map_err(|diagnostic| {
         let kind = match diagnostic.kind {
             MachineDiagnosticKind::MissingVerifiedImport => {
                 HumanDiagnosticKind::MissingVerifiedImport
@@ -1501,13 +2244,6 @@ fn human_kernel_env_from_verified_imports(
         HumanDiagnostic::error(kind, diagnostic.primary_span, diagnostic.message)
             .with_phase(HumanDiagnosticPhase::KernelHandoff)
     })
-}
-
-fn add_human_inductive_to_env(env: &mut Env, mut data: InductiveDecl) -> npa_kernel::Result<()> {
-    if data.name == "Eq" {
-        data.recursor = None;
-    }
-    env.add_inductive(data)
 }
 
 fn human_decl_waits_for_pending_import(
@@ -1536,6 +2272,7 @@ fn add_human_kernel_decl_to_env(
     decl: Decl,
     span: Span,
     context: &str,
+    observation: &HumanKernelObservation,
 ) -> HumanResult<()> {
     if let Some(existing) = env.decl(decl.name()) {
         if existing == &decl {
@@ -1552,71 +2289,8 @@ fn add_human_kernel_decl_to_env(
         .with_phase(HumanDiagnosticPhase::KernelHandoff));
     }
 
-    add_referenced_builtin_decls_to_human_env(env, &decl, span, context)?;
-
-    match decl {
-        Decl::Axiom {
-            name,
-            universe_params,
-            ty,
-        } => env.add_axiom(name, universe_params, ty),
-        Decl::AxiomConstrained {
-            name,
-            universe_params,
-            universe_constraints,
-            ty,
-        } => {
-            env.add_axiom_with_universe_constraints(name, universe_params, universe_constraints, ty)
-        }
-        Decl::Def {
-            name,
-            universe_params,
-            ty,
-            value,
-            reducibility,
-        } => env.add_def(name, universe_params, ty, value, reducibility),
-        Decl::DefConstrained {
-            name,
-            universe_params,
-            universe_constraints,
-            ty,
-            value,
-            reducibility,
-        } => env.add_def_with_universe_constraints(
-            name,
-            universe_params,
-            universe_constraints,
-            ty,
-            value,
-            reducibility,
-        ),
-        Decl::Theorem {
-            name,
-            universe_params,
-            ty,
-            proof,
-        } => env.add_theorem(name, universe_params, ty, proof),
-        Decl::TheoremConstrained {
-            name,
-            universe_params,
-            universe_constraints,
-            ty,
-            proof,
-        } => env.add_theorem_with_universe_constraints(
-            name,
-            universe_params,
-            universe_constraints,
-            ty,
-            proof,
-        ),
-        Decl::Inductive { data, .. } => add_human_inductive_to_env(env, *data),
-        Decl::MutualInductiveBlock { data, .. } => env.add_mutual_inductive(*data),
-        Decl::Constructor { .. } | Decl::Recursor { .. } => Ok(()),
-    }
-    .map_err(|err| {
-        human_kernel_decl_diagnostic(span, err, context)
-            .with_phase(HumanDiagnosticPhase::KernelHandoff)
-    })
+    add_referenced_builtin_decls_to_human_env(env, &decl, span, context, observation)?;
+    add_auxiliary_human_kernel_decl(env, decl, span, context, observation)
 }
 
 fn human_tactic_global_scope(
@@ -2403,14 +3077,17 @@ fn elaborate_human_tactic_term_infer_with_plan(
     })
 }
 
-fn elaborate_human_module_with_notation_plan(
+#[allow(clippy::too_many_arguments)]
+fn elaborate_human_module_with_notation_plan_observed(
     module_name: npa_cert::ModuleName,
     module: &ResolvedHumanModule,
     direct_imports: &[VerifiedImport],
     available_imports: &[VerifiedImport],
     notation_plan: &[usize],
     options: &HumanCompileOptions,
-) -> HumanResult<npa_cert::CoreModule> {
+    work_counter_sink: Option<&KernelWorkCounterSink>,
+    collect_declaration_details: bool,
+) -> HumanResult<HumanObservedCoreModule> {
     let span = module.module.span;
     let mut lowering = HumanToMachineLowering::new(
         module,
@@ -2418,22 +3095,29 @@ fn elaborate_human_module_with_notation_plan(
         available_imports,
         notation_plan,
         options,
+        work_counter_sink,
     )
     .map_err(|diagnostic| diagnostic.with_default_phase(HumanDiagnosticPhase::Elaborator))?;
     let machine_module = lowering
         .lower_module(module)
         .map_err(|diagnostic| diagnostic.with_default_phase(HumanDiagnosticPhase::Elaborator))?;
-    HumanBidirectionalElaborator::new(module, direct_imports, available_imports)
-        .map_err(|diagnostic| diagnostic.with_default_phase(HumanDiagnosticPhase::Elaborator))?
-        .elaborate_module(module_name, machine_module)
-        .map_err(|diagnostic| {
-            if diagnostic.primary_span == Span::empty(crate::FileId(0)) {
-                HumanDiagnostic::error(diagnostic.kind, span, diagnostic.message)
-                    .with_default_phase(HumanDiagnosticPhase::Elaborator)
-            } else {
-                diagnostic.with_default_phase(HumanDiagnosticPhase::Elaborator)
-            }
-        })
+    HumanBidirectionalElaborator::new(
+        module,
+        direct_imports,
+        available_imports,
+        options,
+        work_counter_sink,
+    )
+    .map_err(|diagnostic| diagnostic.with_default_phase(HumanDiagnosticPhase::Elaborator))?
+    .elaborate_module_observed(module_name, machine_module, collect_declaration_details)
+    .map_err(|diagnostic| {
+        if diagnostic.primary_span == Span::empty(crate::FileId(0)) {
+            HumanDiagnostic::error(diagnostic.kind, span, diagnostic.message)
+                .with_default_phase(HumanDiagnosticPhase::Elaborator)
+        } else {
+            diagnostic.with_default_phase(HumanDiagnosticPhase::Elaborator)
+        }
+    })
 }
 
 fn elaborate_human_module_with_by_proofs(
@@ -2502,13 +3186,14 @@ fn elaborate_human_module_with_notation_plan_and_by_proofs(
         verified_imports,
         notation_plan,
         options,
+        None,
     )
     .map_err(|diagnostic| diagnostic.with_default_phase(HumanDiagnosticPhase::Elaborator))?
     .with_current_module_prefix(module_name.clone());
     let machine_module = lowering
         .lower_module_with_core_proofs(module, by_proofs)
         .map_err(|diagnostic| diagnostic.with_default_phase(HumanDiagnosticPhase::Elaborator))?;
-    HumanBidirectionalElaborator::new(module, verified_imports, verified_imports)
+    HumanBidirectionalElaborator::new(module, verified_imports, verified_imports, options, None)
         .map_err(|diagnostic| diagnostic.with_default_phase(HumanDiagnosticPhase::Elaborator))?
         .elaborate_module(module_name, machine_module)
         .map_err(|diagnostic| {
@@ -2598,7 +3283,8 @@ fn human_proof_start_notation_use_count(
             | HumanItem::NamespaceStart { .. }
             | HumanItem::NamespaceEnd { .. }
             | HumanItem::Notation(_) => {}
-            HumanItem::Def(decl) => {
+            HumanItem::Def(definition) => {
+                let decl = &definition.declaration;
                 let metadata = declarations.next().ok_or_else(|| {
                     HumanDiagnostic::not_implemented(decl.span, "Human declaration metadata")
                 })?;
@@ -2769,7 +3455,7 @@ fn human_expr_notation_use_count(expr: &HumanExpr) -> usize {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum HumanLoweredDeclKind {
-    Def,
+    Def(DefinitionReducibility),
     Theorem,
 }
 
@@ -2781,9 +3467,15 @@ struct HumanLoweredModule {
 #[derive(Clone, Debug)]
 enum HumanLoweredItem {
     Import,
-    Def(MachineDecl),
+    Def {
+        decl: MachineDecl,
+        reducibility: DefinitionReducibility,
+    },
     Theorem(MachineDecl),
-    TheoremCoreProof { decl: Decl, span: Span },
+    TheoremCoreProof {
+        decl: Decl,
+        span: Span,
+    },
     Axiom(HumanLoweredAxiomDecl),
     Inductive(HumanLoweredInductiveDecl),
 }
@@ -4180,6 +4872,7 @@ fn human_local_context_from_machine(locals: &[MachineLocalDecl]) -> HumanLocalCo
 
 struct HumanBidirectionalElaborator {
     env: Env,
+    observation: HumanKernelObservation,
 }
 
 impl HumanBidirectionalElaborator {
@@ -4187,12 +4880,16 @@ impl HumanBidirectionalElaborator {
         module: &ResolvedHumanModule,
         direct_imports: &[VerifiedImport],
         available_imports: &[VerifiedImport],
+        options: &HumanCompileOptions,
+        work_counter_sink: Option<&KernelWorkCounterSink>,
     ) -> HumanResult<Self> {
+        let observation = HumanKernelObservation::new(options, work_counter_sink);
         let active_imports = active_human_imports(module, direct_imports)?;
         let mut env = human_kernel_env_from_verified_imports(
             &active_imports,
             available_imports,
             module.module.span,
+            &observation,
         )?;
         let builtin_names = human_referenced_builtin_names(module);
         add_human_builtin_decls_for_names(
@@ -4200,61 +4897,96 @@ impl HumanBidirectionalElaborator {
             &builtin_names,
             module.module.span,
             "Human resolved builtin",
+            &observation,
         )?;
 
-        Ok(Self { env })
+        Ok(Self { env, observation })
     }
 
     fn from_tactic_context(context: &HumanTacticTermElabContext) -> Self {
         Self {
             env: context.env.clone(),
+            observation: HumanKernelObservation::off(),
         }
     }
 
     fn elaborate_module(
-        mut self,
+        self,
         module_name: npa_cert::ModuleName,
         module: HumanLoweredModule,
     ) -> HumanResult<npa_cert::CoreModule> {
+        self.elaborate_module_observed(module_name, module, false)
+            .map(|output| output.core_module)
+    }
+
+    fn elaborate_module_observed(
+        mut self,
+        module_name: npa_cert::ModuleName,
+        module: HumanLoweredModule,
+        collect_declaration_details: bool,
+    ) -> HumanResult<HumanObservedCoreModule> {
         let mut declarations = Vec::new();
+        let mut observations =
+            HumanPendingCompilationObservations::new(collect_declaration_details);
 
         for item in module.items {
             match item {
                 HumanLoweredItem::Import => {}
-                HumanLoweredItem::Def(decl) => {
+                HumanLoweredItem::Def { decl, reducibility } => {
                     let span = decl.span;
-                    let decl = self.elaborate_decl(decl, HumanLoweredDeclKind::Def)?;
-                    self.add_kernel_decl(decl.clone(), span)?;
+                    let mut timer = HumanDeclarationTimer::new(collect_declaration_details);
+                    let decl =
+                        self.elaborate_decl(decl, HumanLoweredDeclKind::Def(reducibility))?;
+                    let kernel =
+                        self.add_kernel_decl_observed(decl.clone(), span, Some(&mut timer))?;
+                    let elapsed = timer.finish();
+                    self.expose_local_opaque_definition(&decl, span)?;
+                    observations.record(declarations.len(), &decl, elapsed, kernel);
                     declarations.push(decl);
                 }
                 HumanLoweredItem::Theorem(decl) => {
                     let span = decl.span;
+                    let mut timer = HumanDeclarationTimer::new(collect_declaration_details);
                     let decl = self.elaborate_decl(decl, HumanLoweredDeclKind::Theorem)?;
-                    self.add_kernel_decl(decl.clone(), span)?;
+                    let kernel =
+                        self.add_kernel_decl_observed(decl.clone(), span, Some(&mut timer))?;
+                    observations.record(declarations.len(), &decl, timer.finish(), kernel);
                     declarations.push(decl);
                 }
                 HumanLoweredItem::TheoremCoreProof { decl, span } => {
-                    self.add_kernel_decl(decl.clone(), span)?;
+                    let mut timer = HumanDeclarationTimer::new(collect_declaration_details);
+                    let kernel =
+                        self.add_kernel_decl_observed(decl.clone(), span, Some(&mut timer))?;
+                    observations.record(declarations.len(), &decl, timer.finish(), kernel);
                     declarations.push(decl);
                 }
                 HumanLoweredItem::Axiom(decl) => {
                     let span = decl.span;
+                    let mut timer = HumanDeclarationTimer::new(collect_declaration_details);
                     let decl = self.elaborate_axiom_decl(decl)?;
-                    self.add_kernel_decl(decl.clone(), span)?;
+                    let kernel =
+                        self.add_kernel_decl_observed(decl.clone(), span, Some(&mut timer))?;
+                    observations.record(declarations.len(), &decl, timer.finish(), kernel);
                     declarations.push(decl);
                 }
                 HumanLoweredItem::Inductive(decl) => {
                     let span = decl.span;
-                    let decl = self.elaborate_inductive_decl(decl)?;
-                    self.add_kernel_decl(decl.clone(), span)?;
+                    let mut timer = HumanDeclarationTimer::new(collect_declaration_details);
+                    let decl = self.elaborate_inductive_decl(decl, Some(&mut timer))?;
+                    let kernel =
+                        self.add_kernel_decl_observed(decl.clone(), span, Some(&mut timer))?;
+                    observations.record(declarations.len(), &decl, timer.finish(), kernel);
                     declarations.push(decl);
                 }
             }
         }
 
-        Ok(npa_cert::CoreModule {
-            name: module_name,
-            declarations,
+        Ok(HumanObservedCoreModule {
+            core_module: npa_cert::CoreModule {
+                name: module_name,
+                declarations,
+            },
+            observations,
         })
     }
 
@@ -4268,10 +5000,12 @@ impl HumanBidirectionalElaborator {
         for item in proof_start.prior_items {
             match item {
                 HumanLoweredItem::Import => {}
-                HumanLoweredItem::Def(decl) => {
+                HumanLoweredItem::Def { decl, reducibility } => {
                     let span = decl.span;
-                    let decl = self.elaborate_decl(decl, HumanLoweredDeclKind::Def)?;
+                    let decl =
+                        self.elaborate_decl(decl, HumanLoweredDeclKind::Def(reducibility))?;
                     self.add_kernel_decl(decl.clone(), span)?;
+                    self.expose_local_opaque_definition(&decl, span)?;
                     prior_declarations.push(decl);
                 }
                 HumanLoweredItem::Theorem(decl) => {
@@ -4292,7 +5026,7 @@ impl HumanBidirectionalElaborator {
                 }
                 HumanLoweredItem::Inductive(decl) => {
                     let span = decl.span;
-                    let decl = self.elaborate_inductive_decl(decl)?;
+                    let decl = self.elaborate_inductive_decl(decl, None)?;
                     self.add_kernel_decl(decl.clone(), span)?;
                     prior_declarations.push(decl);
                 }
@@ -4305,6 +5039,8 @@ impl HumanBidirectionalElaborator {
 
         Ok(HumanProofStartCore {
             module: module_name,
+            owner_certificate_format: "NPA-CERT-0.2.0".to_owned(),
+            owner_core_spec: "NPA-Core-0.2.0".to_owned(),
             theorem_name,
             source_index: proof_start.source_index,
             universe_params,
@@ -4370,7 +5106,11 @@ impl HumanBidirectionalElaborator {
         })
     }
 
-    fn elaborate_inductive_decl(&self, decl: HumanLoweredInductiveDecl) -> HumanResult<Decl> {
+    fn elaborate_inductive_decl(
+        &self,
+        decl: HumanLoweredInductiveDecl,
+        mut timer: Option<&mut HumanDeclarationTimer>,
+    ) -> HumanResult<Decl> {
         let delta: Vec<_> = decl
             .universe_params
             .iter()
@@ -4396,17 +5136,25 @@ impl HumanBidirectionalElaborator {
         let head_ty = human_inductive_head_type(&params, &indices, sort.clone());
         let name = decl.name.as_dotted();
 
+        if let Some(timer) = timer.as_mut() {
+            timer.pause();
+        }
         let mut temporary = Self {
             env: self.env.clone(),
+            observation: self.observation.clone(),
         };
-        temporary.add_kernel_decl(
+        let temporary_admission = temporary.add_kernel_decl(
             Decl::Axiom {
                 name: name.clone(),
                 universe_params: delta.clone(),
                 ty: head_ty.clone(),
             },
             decl.span,
-        )?;
+        );
+        if let Some(timer) = timer.as_mut() {
+            timer.resume();
+        }
+        temporary_admission?;
 
         let mut constructors = Vec::with_capacity(decl.constructors.len());
         for constructor in &decl.constructors {
@@ -4464,12 +5212,15 @@ impl HumanBidirectionalElaborator {
         let universe_params = delta;
 
         Ok(match kind {
-            HumanLoweredDeclKind::Def => Decl::Def {
+            HumanLoweredDeclKind::Def(reducibility) => Decl::Def {
                 name,
                 universe_params,
                 ty: closed_ty,
                 value: closed_value,
-                reducibility: Reducibility::Reducible,
+                reducibility: match reducibility {
+                    DefinitionReducibility::Reducible => Reducibility::Reducible,
+                    DefinitionReducibility::Opaque => Reducibility::Opaque,
+                },
             },
             HumanLoweredDeclKind::Theorem => Decl::Theorem {
                 name,
@@ -4813,9 +5564,18 @@ impl HumanBidirectionalElaborator {
     }
 
     fn add_kernel_decl(&mut self, decl: Decl, span: Span) -> HumanResult<()> {
+        self.add_kernel_decl_observed(decl, span, None).map(|_| ())
+    }
+
+    fn add_kernel_decl_observed(
+        &mut self,
+        decl: Decl,
+        span: Span,
+        mut timer: Option<&mut HumanDeclarationTimer>,
+    ) -> HumanResult<Option<HumanKernelDeclarationSummary>> {
         if let Some(existing) = self.env.decl(decl.name()) {
             if existing == &decl {
-                return Ok(());
+                return Ok(None);
             }
             return Err(HumanDiagnostic::error(
                 HumanDiagnosticKind::KernelRejected,
@@ -4828,21 +5588,52 @@ impl HumanBidirectionalElaborator {
             .with_phase(HumanDiagnosticPhase::KernelHandoff));
         }
 
-        add_referenced_builtin_decls_to_human_env(
+        if let Some(timer) = timer.as_mut() {
+            timer.pause();
+        }
+        let builtin_result = add_referenced_builtin_decls_to_human_env(
             &mut self.env,
             &decl,
             span,
             "Human declaration handoff",
-        )?;
+            &self.observation,
+        );
+        if let Some(timer) = timer.as_mut() {
+            timer.resume();
+        }
+        builtin_result?;
 
         let diagnostic_context = HumanKernelDeclDiagnosticContext::from_decl(&decl);
-        if let Err(err) = self.env.add_decl_diagnosed(decl) {
-            return Err(human_diagnosed_kernel_decl_diagnostic(
+        let admission = self
+            .env
+            .add_decl_diagnosed_with_options(decl, self.observation.diagnostic_options)
+            .map_err(|err| {
+                human_diagnosed_kernel_decl_diagnostic(
+                    span,
+                    &self.env,
+                    err,
+                    "Human declaration handoff",
+                    diagnostic_context.as_ref(),
+                )
+                .with_phase(HumanDiagnosticPhase::KernelHandoff)
+            })?;
+        if let Some(timer) = timer.as_mut() {
+            timer.pause();
+        }
+        Ok(HumanKernelDeclarationSummary::from_admission(&admission))
+    }
+
+    fn expose_local_opaque_definition(&mut self, decl: &Decl, span: Span) -> HumanResult<()> {
+        if DefinitionReducibility::from_core_decl(decl) == DefinitionReducibility::Opaque
+            && !self.env.expose_checked_opaque_definition(decl.name())
+        {
+            return Err(HumanDiagnostic::error(
+                HumanDiagnosticKind::KernelRejected,
                 span,
-                &self.env,
-                err,
-                "Human declaration handoff",
-                diagnostic_context.as_ref(),
+                format!(
+                    "checked opaque definition {} could not be exposed in the local Human environment",
+                    decl.name()
+                ),
             )
             .with_phase(HumanDiagnosticPhase::KernelHandoff));
         }
@@ -4950,6 +5741,8 @@ impl HumanLoweringLocalContext {
 #[derive(Clone)]
 struct HumanImplicitInserter {
     env: Env,
+    observation: HumanKernelObservation,
+    imported_opaque_globals: BTreeSet<String>,
     signatures: BTreeMap<String, HumanCallableSignature>,
     imported_source_interfaces: Vec<HumanImportedSourceInterface>,
     typeclass_classes: Vec<HumanTypeclassClassMetadata>,
@@ -5032,15 +5825,28 @@ impl HumanImplicitInserter {
         direct_imports: &[VerifiedImport],
         available_imports: &[VerifiedImport],
         options: &HumanCompileOptions,
+        work_counter_sink: Option<&KernelWorkCounterSink>,
     ) -> HumanResult<Self> {
+        let observation = HumanKernelObservation::new(options, work_counter_sink);
         let active_imports = active_human_imports(module, direct_imports)?;
         let env = human_kernel_env_from_verified_imports(
             &active_imports,
             available_imports,
             module.module.span,
+            &observation,
         )?;
+        let imported_opaque_globals = active_imports
+            .iter()
+            .copied()
+            .chain(available_imports.iter())
+            .flat_map(|import| import.exports.iter())
+            .filter(|export| export.reducibility == Some(npa_cert::CertReducibility::Opaque))
+            .map(|export| export.name.as_dotted())
+            .collect();
         let mut inserter = Self {
             env,
+            observation,
+            imported_opaque_globals,
             signatures: BTreeMap::new(),
             imported_source_interfaces: module.state.source_interfaces.imports.clone(),
             typeclass_classes: human_typeclass_classes(module),
@@ -5060,6 +5866,8 @@ impl HumanImplicitInserter {
     fn from_tactic_context(context: &HumanTacticTermElabContext) -> Self {
         Self {
             env: context.env.clone(),
+            observation: HumanKernelObservation::off(),
+            imported_opaque_globals: context.imported_opaque_globals.clone(),
             signatures: context.signatures.clone(),
             imported_source_interfaces: Vec::new(),
             typeclass_classes: Vec::new(),
@@ -5085,6 +5893,7 @@ impl HumanImplicitInserter {
             &builtin_names,
             module.module.span,
             "Human implicit builtin",
+            &self.observation,
         )?;
         for name in builtin_names {
             let dotted = name.as_dotted();
@@ -5144,12 +5953,15 @@ impl HumanImplicitInserter {
         let name = decl.name.as_dotted();
         let universe_params = delta.clone();
         let core_decl = match kind {
-            HumanLoweredDeclKind::Def => Decl::Def {
+            HumanLoweredDeclKind::Def(reducibility) => Decl::Def {
                 name: name.clone(),
                 universe_params,
                 ty: closed_ty,
                 value: closed_value,
-                reducibility: Reducibility::Reducible,
+                reducibility: match reducibility {
+                    DefinitionReducibility::Reducible => Reducibility::Reducible,
+                    DefinitionReducibility::Opaque => Reducibility::Opaque,
+                },
             },
             HumanLoweredDeclKind::Theorem => Decl::Theorem {
                 name: name.clone(),
@@ -5158,7 +5970,20 @@ impl HumanImplicitInserter {
                 proof: closed_value,
             },
         };
-        self.add_kernel_decl(core_decl, decl.span)?;
+        self.add_kernel_decl(core_decl.clone(), decl.span)?;
+        if DefinitionReducibility::from_core_decl(&core_decl) == DefinitionReducibility::Opaque
+            && !self.env.expose_checked_opaque_definition(core_decl.name())
+        {
+            return Err(HumanDiagnostic::error(
+                HumanDiagnosticKind::KernelRejected,
+                decl.span,
+                format!(
+                    "checked opaque definition {} could not be exposed in the Human implicit environment",
+                    core_decl.name()
+                ),
+            )
+            .with_phase(HumanDiagnosticPhase::KernelHandoff));
+        }
         self.signatures.insert(
             name,
             HumanCallableSignature {
@@ -6343,19 +7168,34 @@ impl HumanImplicitInserter {
             &decl,
             span,
             "Human implicit environment",
+            &self.observation,
         )?;
 
         let decl = prepare_human_decl_for_diagnosed_admission(decl);
         let diagnostic_context = HumanKernelDeclDiagnosticContext::from_decl(&decl);
-        if let Err(err) = self.env.add_decl_diagnosed(decl) {
-            return Err(human_diagnosed_kernel_decl_diagnostic(
+        if let Err(err) = self
+            .env
+            .add_decl_diagnosed_with_options(decl, self.observation.diagnostic_options)
+        {
+            let mut diagnostic = human_diagnosed_kernel_decl_diagnostic(
                 span,
                 &self.env,
                 err,
                 "Human implicit environment",
                 diagnostic_context.as_ref(),
             )
-            .with_phase(HumanDiagnosticPhase::KernelHandoff));
+            .with_phase(HumanDiagnosticPhase::KernelHandoff);
+            if diagnostic.kind == HumanDiagnosticKind::TypeMismatch {
+                let payload = diagnostic
+                    .payload
+                    .get_or_insert_with(|| Box::new(HumanDiagnosticPayload::default()));
+                payload
+                    .related_declarations
+                    .extend(self.imported_opaque_globals.iter().cloned());
+                payload.related_declarations.sort();
+                payload.related_declarations.dedup();
+            }
+            return Err(diagnostic);
         }
         Ok(())
     }
@@ -6389,11 +7229,12 @@ fn add_referenced_builtin_decls_to_human_env(
     decl: &Decl,
     span: Span,
     context: &str,
+    observation: &HumanKernelObservation,
 ) -> HumanResult<()> {
     let mut names = BTreeSet::new();
     collect_const_names_from_human_decl(&mut names, decl);
     remove_human_decl_owned_const_names(&mut names, decl);
-    add_human_builtin_decls_for_names(env, &names, span, context)
+    add_human_builtin_decls_for_names(env, &names, span, context, observation)
 }
 
 fn prepare_human_decl_for_diagnosed_admission(mut decl: Decl) -> Decl {
@@ -6405,15 +7246,46 @@ fn prepare_human_decl_for_diagnosed_admission(mut decl: Decl) -> Decl {
     decl
 }
 
+fn add_auxiliary_human_kernel_decl(
+    env: &mut Env,
+    decl: Decl,
+    span: Span,
+    context: &str,
+    observation: &HumanKernelObservation,
+) -> HumanResult<()> {
+    let decl = prepare_human_decl_for_diagnosed_admission(decl);
+    let diagnostic_context = HumanKernelDeclDiagnosticContext::from_decl(&decl);
+    env.add_decl_diagnosed_with_options(decl, observation.diagnostic_options)
+        .map(|_| ())
+        .map_err(|error| {
+            human_diagnosed_kernel_decl_diagnostic(
+                span,
+                env,
+                error,
+                context,
+                diagnostic_context.as_ref(),
+            )
+            .with_phase(HumanDiagnosticPhase::KernelHandoff)
+        })
+}
+
 #[derive(Clone, Debug)]
 struct HumanKernelDeclDiagnosticContext {
     declaration_name: String,
+    related_declarations: Vec<String>,
     universe_params: Vec<String>,
     universe_constraints: Vec<UniverseConstraint>,
 }
 
 impl HumanKernelDeclDiagnosticContext {
     fn from_decl(decl: &Decl) -> Option<Self> {
+        let mut related_declarations = BTreeSet::new();
+        collect_const_names_from_human_decl(&mut related_declarations, decl);
+        remove_human_decl_owned_const_names(&mut related_declarations, decl);
+        let related_declarations = related_declarations
+            .into_iter()
+            .map(|name| name.as_dotted())
+            .collect::<Vec<_>>();
         match decl {
             Decl::Def {
                 name,
@@ -6436,6 +7308,7 @@ impl HumanKernelDeclDiagnosticContext {
                 ..
             } => Some(Self {
                 declaration_name: name.clone(),
+                related_declarations,
                 universe_params: universe_params.clone(),
                 universe_constraints: decl.universe_constraints().to_vec(),
             }),
@@ -6599,6 +7472,7 @@ fn add_human_builtin_eq_rec_import_bridge<'a>(
     imports: impl IntoIterator<Item = &'a VerifiedImport>,
     span: Span,
     context: &str,
+    observation: &HumanKernelObservation,
 ) -> HumanResult<()> {
     let needs_eq_rec = imports.into_iter().any(|import| {
         import
@@ -6618,6 +7492,7 @@ fn add_human_builtin_eq_rec_import_bridge<'a>(
         ]),
         span,
         context,
+        observation,
     )
 }
 
@@ -6739,6 +7614,7 @@ fn add_human_builtin_decls_for_names(
     names: &BTreeSet<npa_cert::Name>,
     span: Span,
     context: &str,
+    observation: &HumanKernelObservation,
 ) -> HumanResult<()> {
     let needs_nat = names.iter().any(|name| {
         let name = name.as_dotted();
@@ -6750,27 +7626,47 @@ fn add_human_builtin_decls_for_names(
     });
     let needs_eq_rec = names.iter().any(|name| name.as_dotted() == "Eq.rec");
     if needs_nat && env.decl("Nat").is_none() {
-        env.add_inductive(nat_inductive()).map_err(|err| {
-            human_kernel_decl_diagnostic(span, err, context)
-                .with_phase(HumanDiagnosticPhase::KernelHandoff)
-        })?;
+        let data = nat_inductive();
+        add_auxiliary_human_kernel_decl(
+            env,
+            Decl::Inductive {
+                name: data.name.clone(),
+                universe_params: data.universe_params.clone(),
+                ty: Expr::sort(data.sort.clone()),
+                data: Box::new(data),
+            },
+            span,
+            context,
+            observation,
+        )?;
     }
     if needs_eq && env.decl("Eq").is_none() {
-        env.add_inductive(eq_inductive()).map_err(|err| {
-            human_kernel_decl_diagnostic(span, err, context)
-                .with_phase(HumanDiagnosticPhase::KernelHandoff)
-        })?;
+        let data = eq_inductive();
+        add_auxiliary_human_kernel_decl(
+            env,
+            Decl::Inductive {
+                name: data.name.clone(),
+                universe_params: data.universe_params.clone(),
+                ty: Expr::sort(data.sort.clone()),
+                data: Box::new(data),
+            },
+            span,
+            context,
+            observation,
+        )?;
     }
     if needs_eq_rec && env.decl("Eq.rec").is_none() {
-        env.add_axiom(
-            "Eq.rec",
-            vec!["u".to_owned(), "v".to_owned()],
-            eq_rec_type(Level::param("u"), Level::param("v")),
-        )
-        .map_err(|err| {
-            human_kernel_decl_diagnostic(span, err, context)
-                .with_phase(HumanDiagnosticPhase::KernelHandoff)
-        })?;
+        add_auxiliary_human_kernel_decl(
+            env,
+            Decl::Axiom {
+                name: "Eq.rec".to_owned(),
+                universe_params: vec!["u".to_owned(), "v".to_owned()],
+                ty: eq_rec_type(Level::param("u"), Level::param("v")),
+            },
+            span,
+            context,
+            observation,
+        )?;
     }
     Ok(())
 }
@@ -6873,6 +7769,10 @@ fn human_diagnosed_kernel_decl_diagnostic(
             )
         })
     });
+    let kernel_fuel = error
+        .context()
+        .and_then(|diagnostic| diagnostic.kernel_fuel())
+        .map(HumanKernelFuelDiagnostic::from_kernel);
     let conversion_failure = matches!(
         error.error(),
         Error::TypeMismatch { .. }
@@ -6882,7 +7782,12 @@ fn human_diagnosed_kernel_decl_diagnostic(
             }
     );
     if !conversion_failure {
-        return human_kernel_decl_diagnostic(span, error.into_error(), &scoped_context);
+        let diagnostic = human_kernel_decl_diagnostic(span, error.into_error(), &scoped_context);
+        return match kernel_fuel {
+            Some(kernel_fuel) => diagnostic
+                .with_payload(HumanDiagnosticPayload::default().with_kernel_fuel(kernel_fuel)),
+            None => diagnostic,
+        };
     }
     let kind = if matches!(error.error(), Error::TypeMismatch { .. }) {
         HumanDiagnosticKind::TypeMismatch
@@ -6895,6 +7800,17 @@ fn human_diagnosed_kernel_decl_diagnostic(
         }
         _ => None,
     };
+    let mut related_declarations = declaration_context
+        .map(|context| context.related_declarations.clone())
+        .unwrap_or_default();
+    if let Error::TypeMismatch { expected, actual } = error.error() {
+        let mut names = BTreeSet::new();
+        collect_const_names_from_human_expr(&mut names, expected);
+        collect_const_names_from_human_expr(&mut names, actual);
+        related_declarations.extend(names.into_iter().map(|name| name.as_dotted()));
+        related_declarations.sort();
+        related_declarations.dedup();
+    }
     let wording = universe_mismatch.as_ref().map_or_else(
         || {
             conversion
@@ -6916,6 +7832,8 @@ fn human_diagnosed_kernel_decl_diagnostic(
         HumanDiagnosticPayload {
             conversion,
             universe_mismatch,
+            related_declarations,
+            kernel_fuel,
             ..HumanDiagnosticPayload::default()
         },
     )
@@ -7568,6 +8486,7 @@ impl<'a> HumanToMachineLowering<'a> {
         available_imports: &[VerifiedImport],
         notation_plan: &'a [usize],
         options: &HumanCompileOptions,
+        work_counter_sink: Option<&KernelWorkCounterSink>,
     ) -> HumanResult<Self> {
         Ok(Self {
             name_uses: module.resolved_names.iter(),
@@ -7578,6 +8497,7 @@ impl<'a> HumanToMachineLowering<'a> {
                 direct_imports,
                 available_imports,
                 options,
+                work_counter_sink,
             )?,
             meta_store: HumanMetaStore::default(),
             current_module_prefix: None,
@@ -7641,7 +8561,8 @@ impl<'a> HumanToMachineLowering<'a> {
                     let _ = (module, span);
                     lowered_items.push(HumanLoweredItem::Import);
                 }
-                HumanItem::Def(decl) => {
+                HumanItem::Def(definition) => {
+                    let decl = &definition.declaration;
                     let metadata = declarations.next().ok_or_else(|| {
                         HumanDiagnostic::not_implemented(decl.span, "Human declaration metadata")
                     })?;
@@ -7649,9 +8570,12 @@ impl<'a> HumanToMachineLowering<'a> {
                     let lowered = self.implicit_inserter.insert_decl(
                         lowered,
                         metadata,
-                        HumanLoweredDeclKind::Def,
+                        HumanLoweredDeclKind::Def(definition.reducibility),
                     )?;
-                    lowered_items.push(HumanLoweredItem::Def(lowered));
+                    lowered_items.push(HumanLoweredItem::Def {
+                        decl: lowered,
+                        reducibility: definition.reducibility,
+                    });
                     source_index += 1;
                 }
                 HumanItem::EquationDef(decl) => {
@@ -7745,9 +8669,12 @@ impl<'a> HumanToMachineLowering<'a> {
                         let lowered = self.implicit_inserter.insert_decl(
                             lowered,
                             field_metadata,
-                            HumanLoweredDeclKind::Def,
+                            HumanLoweredDeclKind::Def(DefinitionReducibility::Reducible),
                         )?;
-                        lowered_items.push(HumanLoweredItem::Def(lowered));
+                        lowered_items.push(HumanLoweredItem::Def {
+                            decl: lowered,
+                            reducibility: DefinitionReducibility::Reducible,
+                        });
                     }
                     source_index += 1;
                 }
@@ -7759,9 +8686,12 @@ impl<'a> HumanToMachineLowering<'a> {
                     let lowered = self.implicit_inserter.insert_decl(
                         lowered,
                         metadata,
-                        HumanLoweredDeclKind::Def,
+                        HumanLoweredDeclKind::Def(DefinitionReducibility::Reducible),
                     )?;
-                    lowered_items.push(HumanLoweredItem::Def(lowered));
+                    lowered_items.push(HumanLoweredItem::Def {
+                        decl: lowered,
+                        reducibility: DefinitionReducibility::Reducible,
+                    });
                     source_index += 1;
                 }
                 HumanItem::Open { .. }
@@ -7802,7 +8732,8 @@ impl<'a> HumanToMachineLowering<'a> {
                     let _ = (module, span);
                     prior_items.push(HumanLoweredItem::Import);
                 }
-                HumanItem::Def(decl) => {
+                HumanItem::Def(definition) => {
+                    let decl = &definition.declaration;
                     let metadata = declarations.next().ok_or_else(|| {
                         HumanDiagnostic::not_implemented(decl.span, "Human declaration metadata")
                     })?;
@@ -7817,9 +8748,12 @@ impl<'a> HumanToMachineLowering<'a> {
                     let lowered = self.implicit_inserter.insert_decl(
                         lowered,
                         metadata,
-                        HumanLoweredDeclKind::Def,
+                        HumanLoweredDeclKind::Def(definition.reducibility),
                     )?;
-                    prior_items.push(HumanLoweredItem::Def(lowered));
+                    prior_items.push(HumanLoweredItem::Def {
+                        decl: lowered,
+                        reducibility: definition.reducibility,
+                    });
                     source_index += 1;
                 }
                 HumanItem::EquationDef(decl) => {
@@ -7968,9 +8902,12 @@ impl<'a> HumanToMachineLowering<'a> {
                         let lowered = self.implicit_inserter.insert_decl(
                             lowered,
                             field_metadata,
-                            HumanLoweredDeclKind::Def,
+                            HumanLoweredDeclKind::Def(DefinitionReducibility::Reducible),
                         )?;
-                        prior_items.push(HumanLoweredItem::Def(lowered));
+                        prior_items.push(HumanLoweredItem::Def {
+                            decl: lowered,
+                            reducibility: DefinitionReducibility::Reducible,
+                        });
                     }
                     source_index += 1;
                 }
@@ -7989,9 +8926,12 @@ impl<'a> HumanToMachineLowering<'a> {
                     let lowered = self.implicit_inserter.insert_decl(
                         lowered,
                         metadata,
-                        HumanLoweredDeclKind::Def,
+                        HumanLoweredDeclKind::Def(DefinitionReducibility::Reducible),
                     )?;
-                    prior_items.push(HumanLoweredItem::Def(lowered));
+                    prior_items.push(HumanLoweredItem::Def {
+                        decl: lowered,
+                        reducibility: DefinitionReducibility::Reducible,
+                    });
                     source_index += 1;
                 }
                 HumanItem::Open { .. }
@@ -10074,9 +11014,111 @@ mod tests {
     use crate::{FileId, HumanDiagnosticKind, MachineDiagnosticKind};
     use npa_kernel::{
         eq, eq_refl, eq_refl_type, eq_type, nat, type0, Decl, DiagnosedKernelError, Error, Expr,
-        KernelComparisonOutcome, KernelConversionContext, KernelDiagnosticContext,
-        KernelDiagnosticPhase, KernelExprHead, Level, Reducibility,
+        KernelComparisonOutcome, KernelComparisonPath, KernelComparisonPathStep,
+        KernelConversionContext, KernelDeclarationWork, KernelDiagnosticContext,
+        KernelDiagnosticOptions, KernelDiagnosticPhase, KernelExprHead, KernelFuelDiagnostic,
+        KernelFuelDomainTotals, KernelFuelOperationCounters, KernelFuelReportMode,
+        KernelFuelResource, KernelFuelTotals, KernelOperationWork, KernelWorkCounterSink,
+        KernelWorkSnapshot, Level, Reducibility,
     };
+
+    fn test_kernel_fuel_diagnostic(resource: KernelFuelResource) -> KernelFuelDiagnostic {
+        let exhausted_domain = KernelFuelDomainTotals {
+            calls: 1,
+            logical_spent: 7,
+            successful_operation_fuel: 0,
+            exhausted_operation_fuel: 7,
+            overflowed: false,
+        };
+        let fuel = if resource == KernelFuelResource::Conversion {
+            KernelFuelTotals {
+                whnf: KernelFuelDomainTotals::default(),
+                conversion: exhausted_domain,
+            }
+        } else {
+            KernelFuelTotals {
+                whnf: exhausted_domain,
+                conversion: KernelFuelDomainTotals::default(),
+            }
+        };
+        KernelFuelDiagnostic::new(
+            resource,
+            KernelOperationWork {
+                fuel: KernelFuelOperationCounters {
+                    budget: 7,
+                    spent: 7,
+                    remaining: 0,
+                    exhausted: true,
+                    overflowed: false,
+                },
+                work: KernelWorkSnapshot {
+                    defeq_calls: 2,
+                    whnf_calls: 3,
+                    fuel,
+                    ..KernelWorkSnapshot::zero()
+                },
+            },
+            KernelDeclarationWork::from_snapshot(KernelWorkSnapshot {
+                check_calls: 1,
+                infer_calls: 2,
+                defeq_calls: 2,
+                whnf_calls: 3,
+                fuel,
+                ..KernelWorkSnapshot::zero()
+            }),
+            if resource == KernelFuelResource::Conversion {
+                KernelComparisonPath {
+                    steps: vec![
+                        KernelComparisonPathStep::PiDomain,
+                        KernelComparisonPathStep::WhnfRight,
+                    ],
+                    truncated: false,
+                }
+            } else {
+                KernelComparisonPath::empty()
+            },
+            None,
+        )
+    }
+
+    fn run_human_observation_fixture(
+        source: &str,
+        options: &HumanCompileOptions,
+        work_counter_sink: Option<&KernelWorkCounterSink>,
+        collect_declaration_details: bool,
+    ) -> HumanResult<HumanBuiltCertificateObservationRunnerOutput> {
+        compile_human_source_to_built_certificate_observation_runner(
+            FileId(0),
+            npa_cert::Name::from_dotted("Test"),
+            source,
+            &[],
+            &[],
+            &[],
+            options,
+            work_counter_sink,
+            collect_declaration_details,
+        )
+    }
+
+    fn assert_successful_observations(
+        observations: &HumanCompilationObservations,
+        fuel_mode: crate::HumanKernelFuelReportMode,
+        collect_declaration_details: bool,
+    ) {
+        if !collect_declaration_details {
+            assert_eq!(observations, &HumanCompilationObservations::default());
+            return;
+        }
+
+        assert_eq!(observations.attempted, 1);
+        assert_eq!(observations.declarations.len(), 1);
+        assert_eq!(observations.omitted, 0);
+        assert!(!observations.overflowed);
+        assert_eq!(
+            observations.declarations[0].kernel.is_some(),
+            fuel_mode == crate::HumanKernelFuelReportMode::Detailed
+        );
+    }
 
     fn hash(seed: u8) -> npa_cert::Hash {
         [seed; 32]
@@ -10131,6 +11173,7 @@ mod tests {
             .map(|(index, (name, universe_params))| {
                 let name = npa_cert::Name::from_dotted(name);
                 crate::VerifiedExport {
+                    reducibility: None,
                     universe_params: universe_params
                         .iter()
                         .map(|param| param.to_string())
@@ -10164,6 +11207,72 @@ mod tests {
             kernel_decls,
             kernel_decl_dependencies: BTreeMap::new(),
         }
+    }
+
+    #[test]
+    fn human_opaque_definition_is_locally_transparent_and_matches_machine_certificate() {
+        let human_source = "opaque def Test.hidden (P : Prop) : Prop := P\ntheorem Test.same (P : Prop) (p : P) : Test.hidden P := p";
+        let output = compile_human_source_to_certificate_output_with_source_interfaces(
+            FileId(0),
+            npa_cert::Name::from_dotted("Test"),
+            human_source,
+            &[],
+            &[],
+            &HumanCompileOptions::default(),
+        )
+        .expect("later Human declarations should see a checked local opaque body");
+        assert_eq!(output.certificate.header.format, "NPA-CERT-0.3.0");
+        assert_eq!(output.certificate.header.core_spec, "NPA-Core-0.3.0");
+        assert_eq!(
+            output.source_interface.declarations[0].definition_reducibility,
+            Some(DefinitionReducibility::Opaque)
+        );
+        assert!(matches!(
+            output.certificate.declarations[0].decl,
+            npa_cert::DeclPayload::Def {
+                reducibility: npa_cert::CertReducibility::Opaque,
+                ..
+            }
+        ));
+
+        let machine = crate::compile_machine_source_to_certificate(
+            FileId(0),
+            npa_cert::Name::from_dotted("Test"),
+            human_source,
+            &[],
+            &crate::MachineCompileOptions::default(),
+        )
+        .expect("equivalent Machine source should certify");
+        assert_eq!(
+            output.certificate, machine,
+            "equivalent Human and Machine sources must produce the same certificate"
+        );
+
+        let imported_interface = HumanImportedSourceInterface {
+            module: npa_cert::Name::from_dotted("Test"),
+            export_hash: output.verified_module.export_hash(),
+            certificate_hash: Some(output.verified_module.certificate_hash()),
+            source_interface: output.source_interface,
+        };
+        let error = compile_human_source_to_certificate_output_with_source_interfaces(
+            FileId(1),
+            npa_cert::Name::from_dotted("Client"),
+            "import Test\ntheorem Client.bad (P : Prop) (p : P) : Test.hidden P := p",
+            std::slice::from_ref(&output.verified_module),
+            std::slice::from_ref(&imported_interface),
+            &HumanCompileOptions::default(),
+        )
+        .expect_err("an imported opaque body must not participate in conversion");
+        assert_eq!(error.kind, HumanDiagnosticKind::TypeMismatch);
+        assert!(
+            error.payload.as_ref().is_some_and(|payload| {
+                payload
+                    .related_declarations
+                    .iter()
+                    .any(|name| name == "Test.hidden")
+            }),
+            "opaque conversion diagnostic must retain the declaration context: {error:?}"
+        );
     }
 
     fn nat_import() -> VerifiedImport {
@@ -10863,6 +11972,7 @@ instance Nat.add_alt_inst : Add Nat where
                 max_depth: 0,
                 ..HumanTypeclassSearchPolicy::default()
             },
+            kernel_fuel_report: crate::HumanKernelFuelReportMode::Off,
             ..HumanCompileOptions::default()
         };
         let budget = search_human_typeclass_from_source(
@@ -11292,6 +12402,7 @@ def use (n : Sort 2) : Sort 2 := n + Type",
     fn human_notation_candidate_count_limit_rejects_before_elaboration() {
         let options = HumanCompileOptions {
             max_notation_candidates: 1,
+            kernel_fuel_report: crate::HumanKernelFuelReportMode::Off,
             ..HumanCompileOptions::default()
         };
         let err = compile_human_source_to_core(
@@ -11662,7 +12773,7 @@ inductive FunctionAliasWrapper.{u} (Carrier : Sort u) : Sort max 1 u where
     }
 
     #[test]
-    fn diagnosed_kernel_conversion_projects_only_bounded_context() {
+    fn human_diagnosed_kernel_type_mismatch_preserves_bounded_conversion_context() {
         let error = DiagnosedKernelError::new(Error::TypeMismatch {
             expected: Expr::app(
                 Expr::konst("Expected", Vec::new()),
@@ -11705,6 +12816,618 @@ inductive FunctionAliasWrapper.{u} (Carrier : Sort u) : Sort max 1 u where
         assert_eq!(conversion.lhs_head(), "application");
         assert_eq!(conversion.rhs_head(), "constant:Actual");
         assert_eq!(conversion.depth(), 4);
+        assert!(diagnostic
+            .payload
+            .as_deref()
+            .and_then(|payload| payload.kernel_fuel.as_ref())
+            .is_none());
+    }
+
+    #[test]
+    fn human_diagnosed_kernel_conversion_resource_projects_bounded_fuel_and_context() {
+        let span = Span::new(FileId(8), 5, 19);
+        let error = DiagnosedKernelError::new(Error::ResourceLimit {
+            kind: npa_kernel::ResourceLimitKind::Conversion,
+        })
+        .with_context(
+            KernelDiagnosticContext::new(KernelDiagnosticPhase::DeclarationValue)
+                .with_conversion(KernelConversionContext::new(
+                    KernelComparisonOutcome::FuelExhausted,
+                    KernelExprHead::Pi,
+                    KernelExprHead::Constant("Alias".to_owned()),
+                    2,
+                ))
+                .with_kernel_fuel(test_kernel_fuel_diagnostic(KernelFuelResource::Conversion)),
+        );
+
+        let diagnostic = human_diagnosed_kernel_decl_diagnostic(
+            span,
+            &Env::new(),
+            error,
+            "Human declaration handoff",
+            None,
+        );
+
+        assert_eq!(diagnostic.kind, HumanDiagnosticKind::KernelRejected);
+        assert_eq!(diagnostic.primary_span, span);
+        let conversion = diagnostic
+            .payload
+            .as_deref()
+            .and_then(|payload| payload.conversion.as_ref())
+            .unwrap();
+        assert_eq!(conversion.outcome(), "fuel_exhausted");
+        assert_eq!(conversion.lhs_head(), "pi");
+        assert_eq!(conversion.rhs_head(), "constant:Alias");
+        assert_eq!(conversion.depth(), 2);
+        let fuel = diagnostic
+            .payload
+            .as_deref()
+            .and_then(|payload| payload.kernel_fuel.as_ref())
+            .unwrap();
+        assert_eq!(fuel.subsystem, "fast_kernel");
+        assert_eq!(fuel.resource, "conversion");
+        assert_eq!(fuel.failed_operation.fuel.budget, 7);
+        assert_eq!(fuel.failed_operation.fuel.spent, 7);
+        assert_eq!(
+            fuel.comparison_path.steps,
+            ["pi_domain".to_owned(), "whnf_right".to_owned()]
+        );
+    }
+
+    #[test]
+    fn human_diagnosed_kernel_standalone_whnf_keeps_span_without_conversion() {
+        let span = Span::new(FileId(9), 12, 34);
+        let error = DiagnosedKernelError::new(Error::ResourceLimit {
+            kind: npa_kernel::ResourceLimitKind::Whnf,
+        })
+        .with_context(
+            KernelDiagnosticContext::new(KernelDiagnosticPhase::DeclarationType)
+                .with_kernel_fuel(test_kernel_fuel_diagnostic(KernelFuelResource::Whnf)),
+        );
+
+        let diagnostic = human_diagnosed_kernel_decl_diagnostic(
+            span,
+            &Env::new(),
+            error,
+            "Human declaration handoff",
+            None,
+        );
+
+        assert_eq!(diagnostic.primary_span, span);
+        let payload = diagnostic.payload.as_deref().unwrap();
+        assert!(payload.conversion.is_none());
+        let fuel = payload.kernel_fuel.as_ref().unwrap();
+        assert_eq!(fuel.resource, "whnf");
+        assert!(fuel.comparison_path.steps.is_empty());
+        assert!(!fuel.comparison_path.truncated);
+    }
+
+    #[test]
+    fn human_diagnosed_kernel_nonresource_error_has_no_synthetic_fuel() {
+        let diagnostic = human_diagnosed_kernel_decl_diagnostic(
+            Span::empty(FileId(3)),
+            &Env::new(),
+            DiagnosedKernelError::new(Error::InvalidBVar(0)),
+            "Human declaration handoff",
+            None,
+        );
+
+        assert!(diagnostic
+            .payload
+            .as_deref()
+            .and_then(|payload| payload.kernel_fuel.as_ref())
+            .is_none());
+    }
+
+    #[test]
+    fn human_diagnosed_kernel_detailed_success_projects_bounded_summary() {
+        let mut env = Env::with_builtins().unwrap();
+        let admission = env
+            .add_decl_diagnosed_with_options(
+                Decl::Axiom {
+                    name: "Observed.FrontendAxiom".to_owned(),
+                    universe_params: vec![],
+                    ty: Expr::sort(Level::zero()),
+                },
+                KernelDiagnosticOptions {
+                    fuel_report: KernelFuelReportMode::Detailed,
+                },
+            )
+            .unwrap();
+        let summary = crate::HumanKernelDeclarationSummary::from_admission(&admission).unwrap();
+
+        assert_eq!(summary.subsystem, "fast_kernel");
+        assert_eq!(summary.outcome, "accepted");
+        assert!(summary.work.infer_calls > 0);
+        assert!(
+            summary.retained_delta_constants.entries.len()
+                <= npa_kernel::KERNEL_DELTA_HOTSET_ENTRY_LIMIT
+        );
+    }
+
+    #[test]
+    fn human_diagnosed_kernel_auxiliary_builtin_uses_selected_mode_and_sink() {
+        let sink = KernelWorkCounterSink::default();
+        let options = HumanCompileOptions {
+            kernel_fuel_report: crate::HumanKernelFuelReportMode::Failure,
+            ..HumanCompileOptions::default()
+        };
+        let observation = HumanKernelObservation::new(&options, Some(&sink));
+        assert_eq!(
+            observation.diagnostic_options.fuel_report,
+            KernelFuelReportMode::Failure
+        );
+        let mut env =
+            human_kernel_env_from_verified_imports(&[], &[], Span::empty(FileId(4)), &observation)
+                .unwrap();
+        add_human_builtin_decls_for_names(
+            &mut env,
+            &BTreeSet::from([npa_cert::Name::from_dotted("Nat")]),
+            Span::empty(FileId(4)),
+            "Human resolved builtin",
+            &observation,
+        )
+        .unwrap();
+
+        assert!(env.decl("Nat").is_some());
+        let counters = sink.snapshot();
+        assert!(counters.infer_calls > 0);
+        assert!(counters.fuel.whnf.calls > 0);
+    }
+
+    #[test]
+    fn observation_known_certificate_uses_exact_canonical_term_dag_counts() {
+        let source = "\
+axiom A : Type
+def id (x : A) : A := x";
+        let options = HumanCompileOptions {
+            kernel_fuel_report: crate::HumanKernelFuelReportMode::Detailed,
+            ..HumanCompileOptions::default()
+        };
+
+        let observed = run_human_observation_fixture(source, &options, None, true).unwrap();
+        let without_details = run_human_observation_fixture(source, &options, None, false).unwrap();
+
+        assert_eq!(observed.certificate, without_details.certificate);
+        assert_eq!(
+            without_details.observations,
+            HumanCompilationObservations::default()
+        );
+        assert_eq!(observed.observations.attempted, 2);
+        assert_eq!(observed.observations.omitted, 0);
+        assert!(!observed.observations.overflowed);
+        assert_eq!(
+            observed
+                .observations
+                .declarations
+                .iter()
+                .map(|observation| (
+                    observation.declaration_index,
+                    observation.declaration.as_str(),
+                    observation.term_nodes,
+                ))
+                .collect::<Vec<_>>(),
+            vec![(0, "A", 1), (1, "id", 4)]
+        );
+        assert!(observed
+            .observations
+            .declarations
+            .iter()
+            .all(|observation| observation.kernel.is_some()));
+    }
+
+    #[test]
+    fn observation_detail_collection_preserves_the_ordinary_core_module() {
+        let source = "\
+axiom A : Type
+def id (x : A) : A := x";
+        let options = HumanCompileOptions {
+            kernel_fuel_report: crate::HumanKernelFuelReportMode::Detailed,
+            ..HumanCompileOptions::default()
+        };
+        let module_name = npa_cert::Name::from_dotted("Test");
+        let parsed = parse_human_module_with_source_interfaces(FileId(0), source, &[]).unwrap();
+        let resolved = resolve_human_module_with_source_interfaces(
+            module_name.clone(),
+            parsed,
+            &[],
+            &[],
+            &options,
+        )
+        .unwrap();
+
+        let observed = elaborate_human_module_with_available_imports_observed(
+            module_name.clone(),
+            &resolved,
+            &[],
+            &[],
+            &options,
+            None,
+            true,
+        )
+        .unwrap();
+        let ordinary =
+            compile_human_source_to_core(FileId(0), module_name, source, &[], &options).unwrap();
+
+        assert_eq!(observed.core_module, ordinary);
+        assert_eq!(observed.observations.attempted, 2);
+    }
+
+    #[test]
+    fn observation_includes_generated_declarations_present_in_final_core() {
+        let source = "\
+inductive Nat : Type where
+| zero : Nat
+axiom Nat.add : Nat -> Nat -> Nat
+class Add (A : Type) where
+  add : A -> A -> A
+instance Nat.add_inst : Add Nat where
+  add := Nat.add";
+
+        let observed =
+            run_human_observation_fixture(source, &HumanCompileOptions::default(), None, true)
+                .unwrap();
+        let names = observed
+            .observations
+            .declarations
+            .iter()
+            .map(|observation| observation.declaration.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(observed.observations.attempted, names.len() as u64);
+        assert!(names.contains(&"Add"));
+        assert!(names.contains(&"Add.add"));
+        assert!(names.contains(&"Nat.add_inst"));
+        assert!(observed
+            .observations
+            .declarations
+            .iter()
+            .all(|observation| observation.kernel.is_none()));
+        assert_eq!(
+            observed
+                .observations
+                .declarations
+                .iter()
+                .map(|observation| observation.declaration_index)
+                .collect::<Vec<_>>(),
+            (0..names.len() as u64).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn observation_notation_elaboration_keeps_only_unique_plan_details_and_all_plan_work() {
+        let multi_plan_source = "\
+def add_bad (n m : Type) : Type := n
+def add_ok (n m : Sort 2) : Sort 2 := n
+infixl:65 \" + \" => add_bad
+infixl:65 \" + \" => add_ok
+def use (n : Sort 2) : Sort 2 := n + Type";
+        let successful_plan_source = "\
+def add_bad (n m : Type) : Type := n
+def add_ok (n m : Sort 2) : Sort 2 := n
+infixl:65 \" + \" => add_ok
+def use (n : Sort 2) : Sort 2 := n + Type";
+        let options = HumanCompileOptions {
+            kernel_fuel_report: crate::HumanKernelFuelReportMode::Detailed,
+            ..HumanCompileOptions::default()
+        };
+        let multi_sink = KernelWorkCounterSink::default();
+        let single_sink = KernelWorkCounterSink::default();
+
+        let multi =
+            run_human_observation_fixture(multi_plan_source, &options, Some(&multi_sink), true)
+                .unwrap();
+        let single = run_human_observation_fixture(
+            successful_plan_source,
+            &options,
+            Some(&single_sink),
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(multi.certificate, single.certificate);
+        assert_eq!(multi.observations.attempted, 3);
+        assert_eq!(multi.observations.declarations.len(), 3);
+        for (multi, single) in multi
+            .observations
+            .declarations
+            .iter()
+            .zip(&single.observations.declarations)
+        {
+            assert_eq!(multi.declaration_index, single.declaration_index);
+            assert_eq!(multi.declaration, single.declaration);
+            assert_eq!(multi.term_nodes, single.term_nodes);
+            assert_eq!(multi.kernel, single.kernel);
+        }
+        let multi_work = multi_sink.snapshot();
+        let single_work = single_sink.snapshot();
+        assert!(multi_work.check_calls > single_work.check_calls);
+        assert!(multi_work.infer_calls > single_work.infer_calls);
+    }
+
+    #[test]
+    fn observation_ambiguous_notation_aggregates_both_executed_plans() {
+        let ambiguous_source = "\
+def add_a (n m : Sort 2) : Sort 2 := n
+def add_b (n m : Sort 2) : Sort 2 := m
+infixl:65 \" + \" => add_a
+infixl:65 \" + \" => add_b
+def use (n : Sort 2) : Sort 2 := n + Type";
+        let single_plan_source = "\
+def add_a (n m : Sort 2) : Sort 2 := n
+def add_b (n m : Sort 2) : Sort 2 := m
+infixl:65 \" + \" => add_a
+def use (n : Sort 2) : Sort 2 := n + Type";
+        let options = HumanCompileOptions::default();
+        let ambiguous_sink = KernelWorkCounterSink::default();
+        let single_sink = KernelWorkCounterSink::default();
+
+        let error =
+            run_human_observation_fixture(ambiguous_source, &options, Some(&ambiguous_sink), true)
+                .expect_err("two successful notation plans should remain ambiguous");
+        run_human_observation_fixture(single_plan_source, &options, Some(&single_sink), true)
+            .unwrap();
+
+        assert_eq!(error.kind, HumanDiagnosticKind::AmbiguousNotation);
+        let ambiguous_work = ambiguous_sink.snapshot();
+        let single_work = single_sink.snapshot();
+        assert!(ambiguous_work.check_calls > single_work.check_calls);
+        assert!(ambiguous_work.infer_calls > single_work.infer_calls);
+    }
+
+    #[test]
+    fn observation_all_failed_notation_returns_the_exact_first_plan_diagnostic() {
+        let source = "\
+def add_a (n m : Type) : Type := n
+def add_b (n m : Prop) : Prop := n
+infixl:65 \" + \" => add_a
+infixl:65 \" + \" => add_b
+def use (n : Sort 2) : Sort 2 := n + Type";
+        let options = HumanCompileOptions::default();
+        let module_name = npa_cert::Name::from_dotted("Test");
+        let parsed = parse_human_module_with_source_interfaces(FileId(0), source, &[]).unwrap();
+        let resolved = resolve_human_module_with_source_interfaces(
+            module_name.clone(),
+            parsed,
+            &[],
+            &[],
+            &options,
+        )
+        .unwrap();
+        let plans = notation_candidate_plans(&resolved, options.max_notation_candidates).unwrap();
+
+        let first_error = match elaborate_human_module_with_notation_plan_observed(
+            module_name.clone(),
+            &resolved,
+            &[],
+            &[],
+            &plans[0],
+            &options,
+            None,
+            true,
+        ) {
+            Ok(_) => panic!("first notation plan should fail"),
+            Err(error) => error,
+        };
+        let aggregate_error = match elaborate_human_module_with_available_imports_observed(
+            module_name,
+            &resolved,
+            &[],
+            &[],
+            &options,
+            None,
+            true,
+        ) {
+            Ok(_) => panic!("all notation plans should fail"),
+            Err(error) => error,
+        };
+
+        assert_eq!(aggregate_error, first_error);
+    }
+
+    #[test]
+    fn observation_cap_counts_omissions_and_propagates_omitted_kernel_overflow() {
+        let mut env = Env::with_builtins().unwrap();
+        let admission = env
+            .add_decl_diagnosed_with_options(
+                Decl::Axiom {
+                    name: "Observed.OverflowSource".to_owned(),
+                    universe_params: vec![],
+                    ty: Expr::sort(Level::zero()),
+                },
+                KernelDiagnosticOptions {
+                    fuel_report: KernelFuelReportMode::Detailed,
+                },
+            )
+            .unwrap();
+        let mut overflowed_summary =
+            HumanKernelDeclarationSummary::from_admission(&admission).unwrap();
+        overflowed_summary.overflowed = true;
+
+        let mut observations = HumanPendingCompilationObservations::new(true);
+        let mut declarations = Vec::new();
+        for index in 0..=HUMAN_DECLARATION_OBSERVATION_LIMIT {
+            let declaration = if index == 0 {
+                Decl::Axiom {
+                    name: "Observed.Consumer".to_owned(),
+                    universe_params: vec![],
+                    ty: Expr::konst("Observed.Declaration2048", vec![]),
+                }
+            } else {
+                Decl::Axiom {
+                    name: format!("Observed.Declaration{index:04}"),
+                    universe_params: vec![],
+                    ty: Expr::sort(Level::zero()),
+                }
+            };
+            let kernel = (index == 0).then(|| overflowed_summary.clone());
+            observations.record(index, &declaration, (0, false), kernel);
+            declarations.push(declaration);
+        }
+        let certificate = npa_cert::build_module_cert(
+            npa_cert::CoreModule {
+                name: npa_cert::Name::from_dotted("Observed"),
+                declarations,
+            },
+            &[],
+        )
+        .unwrap();
+        let observations = observations
+            .finish(&certificate, Span::empty(FileId(0)))
+            .unwrap();
+
+        assert_eq!(
+            observations.declarations.len(),
+            HUMAN_DECLARATION_OBSERVATION_LIMIT
+        );
+        assert_eq!(observations.attempted, 2_049);
+        assert_eq!(observations.omitted, 1);
+        assert!(observations.overflowed);
+        assert_eq!(
+            observations.declarations.last().unwrap().declaration_index,
+            2_047
+        );
+        assert_eq!(
+            observations.declarations.last().unwrap().declaration,
+            "Observed.Declaration2048"
+        );
+        assert!(!observations
+            .declarations
+            .iter()
+            .any(|observation| observation.declaration == "Observed.Consumer"));
+    }
+
+    #[test]
+    fn observed_certificate_output_families_match_unobserved_outputs_for_every_mode() {
+        let (_, imported_source_interface, verified_import) =
+            verified_human_import("Lib", "axiom A : Type");
+        let direct_imports = [&verified_import];
+        let available_imports = [&verified_import];
+        let imported_source_interfaces = [imported_source_interface];
+        let source = "\
+import Lib
+def use (x : A) : A := x";
+        let fuel_modes = [
+            crate::HumanKernelFuelReportMode::Off,
+            crate::HumanKernelFuelReportMode::Failure,
+            crate::HumanKernelFuelReportMode::Detailed,
+        ];
+
+        for fuel_mode in fuel_modes {
+            let options = HumanCompileOptions {
+                kernel_fuel_report: fuel_mode,
+                ..HumanCompileOptions::default()
+            };
+            for collect_declaration_details in [false, true] {
+                let ordinary_certificate_only =
+                    compile_human_source_to_built_certificate_only_with_available_import_refs(
+                        FileId(1),
+                        npa_cert::Name::from_dotted("Consumer"),
+                        source,
+                        &direct_imports,
+                        &available_imports,
+                        &imported_source_interfaces,
+                        &options,
+                    )
+                    .unwrap();
+                let certificate_only_sink = KernelWorkCounterSink::default();
+                let observed_certificate_only =
+                    compile_human_source_to_observed_built_certificate_only_with_available_import_refs(
+                        FileId(1),
+                        npa_cert::Name::from_dotted("Consumer"),
+                        source,
+                        &direct_imports,
+                        &available_imports,
+                        &imported_source_interfaces,
+                        &options,
+                        Some(&certificate_only_sink),
+                        collect_declaration_details,
+                    )
+                    .unwrap();
+                assert_eq!(observed_certificate_only.output, ordinary_certificate_only);
+                assert_successful_observations(
+                    &observed_certificate_only.observations,
+                    fuel_mode,
+                    collect_declaration_details,
+                );
+                assert!(certificate_only_sink.snapshot().check_calls > 0);
+
+                let ordinary_built =
+                    compile_human_source_to_built_certificate_output_with_available_import_refs(
+                        FileId(1),
+                        npa_cert::Name::from_dotted("Consumer"),
+                        source,
+                        &direct_imports,
+                        &available_imports,
+                        &imported_source_interfaces,
+                        &options,
+                    )
+                    .unwrap();
+                let built_sink = KernelWorkCounterSink::default();
+                let observed_built =
+                    compile_human_source_to_observed_built_certificate_output_with_available_import_refs(
+                        FileId(1),
+                        npa_cert::Name::from_dotted("Consumer"),
+                        source,
+                        &direct_imports,
+                        &available_imports,
+                        &imported_source_interfaces,
+                        &options,
+                        Some(&built_sink),
+                        collect_declaration_details,
+                    )
+                    .unwrap();
+                assert_eq!(observed_built.output, ordinary_built);
+                assert_successful_observations(
+                    &observed_built.observations,
+                    fuel_mode,
+                    collect_declaration_details,
+                );
+                assert!(built_sink.snapshot().check_calls > 0);
+
+                let ordinary_verified = compile_human_source_to_certificate_output_with_available_import_refs_and_axiom_policy(
+                    FileId(1),
+                    npa_cert::Name::from_dotted("Consumer"),
+                    source,
+                    &direct_imports,
+                    &available_imports,
+                    &imported_source_interfaces,
+                    &options,
+                    &npa_cert::AxiomPolicy::normal(),
+                )
+                .unwrap();
+                let verified_sink = KernelWorkCounterSink::default();
+                let observed_verified = compile_human_source_to_observed_certificate_output_with_available_import_refs_and_axiom_policy(
+                    FileId(1),
+                    npa_cert::Name::from_dotted("Consumer"),
+                    source,
+                    &direct_imports,
+                    &available_imports,
+                    &imported_source_interfaces,
+                    &options,
+                    &npa_cert::AxiomPolicy::normal(),
+                    Some(&verified_sink),
+                    collect_declaration_details,
+                )
+                .unwrap();
+                assert_eq!(observed_verified.output, ordinary_verified);
+                assert_successful_observations(
+                    &observed_verified.observations,
+                    fuel_mode,
+                    collect_declaration_details,
+                );
+                assert!(verified_sink.snapshot().check_calls > 0);
+
+                assert_eq!(
+                    observed_certificate_only.output.certificate,
+                    observed_built.output.certificate
+                );
+                assert_eq!(
+                    observed_built.output.certificate,
+                    observed_verified.output.certificate
+                );
+            }
+        }
     }
 
     #[test]
@@ -11890,12 +13613,14 @@ theorem bad (n : Nat) : Eq.{1} Nat n n := Eq.refl n",
                 source_index: 0,
                 decl_interface_hash: hash(42),
                 decl: id_decl,
+                reducibility: DefinitionReducibility::Reducible,
             },
             MachineCheckedCurrentDecl {
                 name: unit_name.clone(),
                 source_index: 1,
                 decl_interface_hash: hash(43),
                 decl: unit_decl,
+                reducibility: DefinitionReducibility::Reducible,
             },
         ];
         let current_generated_decls = vec![MachineCheckedCurrentGeneratedDecl {
@@ -12001,6 +13726,41 @@ def foo : forall (A : Type), Type := fun A => A",
         assert_eq!(
             prepared.proof.theorem_name,
             npa_cert::Name::from_dotted("Api.Target.target")
+        );
+    }
+
+    #[test]
+    fn human_proof_start_retains_opaque_definition_metadata_and_local_body() {
+        let source = "opaque def hidden (P : Prop) : Prop := P\ntheorem target (P : Prop) (p : P) : hidden P := by simp-lite";
+        let prepared = prepare_human_proof_start_core_with_source_interfaces(
+            FileId(82),
+            npa_cert::Name::from_dotted("Api.OpaqueStart"),
+            npa_cert::Name::from_dotted("Api.OpaqueStart.target"),
+            source,
+            &[],
+            &[],
+            &HumanCompileOptions::default(),
+        )
+        .expect("proof start should use a local body for the preceding opaque definition");
+
+        assert_eq!(prepared.proof.owner_certificate_format, "NPA-CERT-0.3.0");
+        assert_eq!(prepared.proof.owner_core_spec, "NPA-Core-0.3.0");
+        assert!(matches!(
+            prepared.proof.prior_declarations[0],
+            Decl::Def {
+                reducibility: npa_kernel::Reducibility::Opaque,
+                ..
+            }
+        ));
+        let metadata = &prepared.source_interface.declarations[0];
+        assert_eq!(
+            metadata.definition_reducibility,
+            Some(DefinitionReducibility::Opaque)
+        );
+        assert_eq!(metadata.span.start.0, 0);
+        assert_eq!(
+            &source[metadata.span.start.0 as usize..metadata.span.end.0 as usize],
+            "opaque def hidden (P : Prop) : Prop := P"
         );
     }
 

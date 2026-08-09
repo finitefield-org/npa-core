@@ -589,7 +589,7 @@ pub fn declaration_dependency_closure(
             for global in decl
                 .dependencies
                 .iter()
-                .map(|dependency| &dependency.global_ref)
+                .map(|dependency| dependency.global_ref())
                 .chain(
                     decl.axiom_dependencies
                         .iter()
@@ -796,7 +796,7 @@ pub fn normalized_declaration_closure_projection(
         let mut dependencies = declaration
             .dependencies
             .iter()
-            .map(|dependency| context.global_bytes(&dependency.global_ref))
+            .map(|dependency| context.global_bytes(dependency.global_ref()))
             .collect::<Result<Vec<_>, _>>()?;
         dependencies.sort();
         put_vec_bytes(&mut bytes, &dependencies);
@@ -1858,8 +1858,8 @@ fn put_u64(out: &mut Vec<u8>, value: u64) {
 mod tests {
     use super::*;
     use crate::{
-        build_module_cert, encode_module_cert, verify_module_cert, AxiomPolicy, CoreModule,
-        VerifierSession,
+        build_module_cert, build_module_cert_from_import_refs_with_preferred_imports,
+        encode_module_cert, verify_module_cert, AxiomPolicy, CoreModule, VerifierSession,
     };
     use npa_kernel::{Decl, Expr, Level, Reducibility};
 
@@ -1965,6 +1965,77 @@ mod tests {
             DeclarationClosureRole::Support
         );
         assert_ne!(closure.declaration_closure_hash, [0; 32]);
+    }
+
+    #[test]
+    fn declaration_closure_and_normalized_projection_traverse_local_implementation_edges() {
+        let cert = build_module_cert_from_import_refs_with_preferred_imports(
+            CoreModule {
+                name: Name::from_dotted("Fixture.OpaqueClosure"),
+                declarations: vec![
+                    Decl::Def {
+                        name: "hidden".to_owned(),
+                        universe_params: vec!["u".to_owned()],
+                        ty: identity_type(),
+                        value: identity_value(),
+                        reducibility: Reducibility::Opaque,
+                    },
+                    Decl::Def {
+                        name: "alias".to_owned(),
+                        universe_params: vec!["u".to_owned()],
+                        ty: identity_type(),
+                        value: Expr::konst("hidden", vec![Level::param("u")]),
+                        reducibility: Reducibility::Reducible,
+                    },
+                ],
+            },
+            &[],
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        let bytes = encode_module_cert(&cert).unwrap();
+        let module =
+            verify_module_cert(&bytes, &mut VerifierSession::new(), &AxiomPolicy::normal())
+                .unwrap();
+        assert!(
+            module
+                .declarations()
+                .iter()
+                .flat_map(|decl| &decl.dependencies)
+                .any(|dependency| dependency.kind()
+                    == crate::DependencyEntryKind::LocalImplementation)
+        );
+
+        let root = export_identity(&module, "alias");
+        let modules = BTreeMap::from([(module.module().clone(), module)]);
+        let closure = declaration_dependency_closure(
+            &modules,
+            &BTreeSet::from([root]),
+            &ValidatedSourceDeclarationFamilies::default(),
+            &BTreeMap::new(),
+            DeclarationClosureLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            closure
+                .declarations
+                .iter()
+                .map(|row| row.identity.name.as_dotted())
+                .collect::<Vec<_>>(),
+            vec!["alias", "hidden"]
+        );
+        let hidden = closure
+            .declarations
+            .iter()
+            .find(|row| row.identity.name.as_dotted() == "hidden")
+            .unwrap();
+        assert_eq!(hidden.role, DeclarationClosureRole::Support);
+        assert_eq!(hidden.export_body_hash, None);
+
+        let projection =
+            normalized_declaration_closure_projection(&modules, &closure, &BTreeMap::new())
+                .unwrap();
+        assert_ne!(normalized_declaration_closure_hash(&projection), [0; 32]);
     }
 
     #[test]

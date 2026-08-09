@@ -1,8 +1,9 @@
 use crate::{
     lex,
     machine::{MachineDecl, MachineUniverseParam},
-    FileId, MachineBinder, MachineDiagnostic, MachineDiagnosticKind, MachineItem, MachineLevel,
-    MachineModule, MachineName, MachineTerm, Result, Span, Token, TokenKind,
+    DefinitionReducibility, FileId, MachineBinder, MachineDefinitionDecl, MachineDiagnostic,
+    MachineDiagnosticKind, MachineItem, MachineLevel, MachineModule, MachineName, MachineTerm,
+    Result, Span, Token, TokenKind,
 };
 
 pub fn parse_machine_module(file_id: FileId, source: &str) -> Result<MachineModule> {
@@ -30,7 +31,13 @@ struct Parser {
 
 impl Parser {
     fn new(tokens: Vec<Token>) -> Self {
-        Self { tokens, pos: 0 }
+        Self {
+            tokens: tokens
+                .into_iter()
+                .filter(|token| !matches!(token.kind, TokenKind::Comment))
+                .collect(),
+            pos: 0,
+        }
     }
 
     fn parse_module(&mut self, file_id: FileId, source_len: u32) -> Result<MachineModule> {
@@ -52,11 +59,20 @@ impl Parser {
                 }
                 TokenKind::Def => {
                     saw_non_import = true;
-                    MachineItem::Def(self.parse_decl()?)
+                    let start = self.expect_def()?;
+                    MachineItem::Def(MachineDefinitionDecl {
+                        declaration: self.parse_decl_after_keyword(start)?,
+                        reducibility: DefinitionReducibility::Reducible,
+                    })
+                }
+                TokenKind::Opaque => {
+                    saw_non_import = true;
+                    self.parse_opaque_definition()?
                 }
                 TokenKind::Theorem => {
                     saw_non_import = true;
-                    MachineItem::Theorem(self.parse_decl()?)
+                    let start = self.expect_theorem()?;
+                    MachineItem::Theorem(self.parse_decl_after_keyword(start)?)
                 }
                 TokenKind::Open
                 | TokenKind::Namespace
@@ -107,17 +123,27 @@ impl Parser {
         Ok(MachineItem::Import { module, span })
     }
 
-    fn parse_decl(&mut self) -> Result<MachineDecl> {
-        let start = match self.peek_kind() {
-            TokenKind::Def => self.expect_def()?,
-            TokenKind::Theorem => self.expect_theorem()?,
-            _ => {
-                return Err(MachineDiagnostic::parse(
-                    self.peek_span(),
-                    "expected def or theorem",
-                ));
-            }
-        };
+    fn parse_opaque_definition(&mut self) -> Result<MachineItem> {
+        let opaque = self.expect_opaque()?;
+        if matches!(self.peek_kind(), TokenKind::Opaque) {
+            return Err(MachineDiagnostic::duplicate_opaque_modifier(
+                opaque.join(self.peek_span()),
+            ));
+        }
+        if !matches!(self.peek_kind(), TokenKind::Def) {
+            return Err(MachineDiagnostic::opaque_modifier_not_followed_by_def(
+                opaque.join(self.peek_span()),
+                token_description(self.peek_kind()),
+            ));
+        }
+        self.expect_def()?;
+        Ok(MachineItem::Def(MachineDefinitionDecl {
+            declaration: self.parse_decl_after_keyword(opaque)?,
+            reducibility: DefinitionReducibility::Opaque,
+        }))
+    }
+
+    fn parse_decl_after_keyword(&mut self, start: Span) -> Result<MachineDecl> {
         let name = self.parse_name()?;
         let universe_params = self.parse_optional_universe_params()?;
         let mut binders = Vec::new();
@@ -582,6 +608,10 @@ impl Parser {
         self.expect_unit(TokenKindName::Import, "expected import")
     }
 
+    fn expect_opaque(&mut self) -> Result<Span> {
+        self.expect_unit(TokenKindName::Opaque, "expected opaque")
+    }
+
     fn expect_def(&mut self) -> Result<Span> {
         self.expect_unit(TokenKindName::Def, "expected def")
     }
@@ -670,6 +700,7 @@ impl Parser {
 fn reserved_name_component_spelling(kind: &TokenKind) -> Option<&'static str> {
     Some(match kind {
         TokenKind::Import => "import",
+        TokenKind::Opaque => "opaque",
         TokenKind::Def => "def",
         TokenKind::Theorem => "theorem",
         TokenKind::Fun => "fun",
@@ -699,6 +730,7 @@ fn reserved_name_component_spelling(kind: &TokenKind) -> Option<&'static str> {
 #[derive(Clone, Copy)]
 enum TokenKindName {
     Import,
+    Opaque,
     Def,
     Theorem,
     Fun,
@@ -725,6 +757,7 @@ impl TokenKindName {
         matches!(
             (self, kind),
             (Self::Import, TokenKind::Import)
+                | (Self::Opaque, TokenKind::Opaque)
                 | (Self::Def, TokenKind::Def)
                 | (Self::Theorem, TokenKind::Theorem)
                 | (Self::Fun, TokenKind::Fun)
@@ -745,6 +778,17 @@ impl TokenKindName {
                 | (Self::FatArrow, TokenKind::FatArrow)
                 | (Self::At, TokenKind::At)
         )
+    }
+}
+
+fn token_description(kind: &TokenKind) -> &'static str {
+    match kind {
+        TokenKind::Theorem => "`theorem`",
+        TokenKind::Axiom => "`axiom`",
+        TokenKind::Inductive => "`inductive`",
+        TokenKind::Opaque => "another `opaque`",
+        TokenKind::Eof => "end of file",
+        _ => "a non-`def` token",
     }
 }
 
@@ -776,7 +820,13 @@ mod tests {
     fn item_snapshot(item: &MachineItem) -> String {
         match item {
             MachineItem::Import { module, .. } => format!("import {}", module.as_dotted()),
-            MachineItem::Def(decl) => format!("def {}", decl_snapshot(decl)),
+            MachineItem::Def(definition) => {
+                let keyword = match definition.reducibility {
+                    DefinitionReducibility::Reducible => "def",
+                    DefinitionReducibility::Opaque => "opaque def",
+                };
+                format!("{keyword} {}", decl_snapshot(&definition.declaration))
+            }
             MachineItem::Theorem(decl) => format!("theorem {}", decl_snapshot(decl)),
         }
     }
@@ -914,9 +964,10 @@ mod tests {
     fn parses_reserved_spellings_after_dot_as_name_components() {
         let module = parse("def Test.kw.{u} : M.Type := M.match.{succ u}");
 
-        let MachineItem::Def(decl) = &module.items[0] else {
+        let MachineItem::Def(definition) = &module.items[0] else {
             panic!("expected def item");
         };
+        let decl = &definition.declaration;
         assert_eq!(decl.name.as_dotted(), "Test.kw");
 
         let MachineTerm::Ident { name, .. } = &decl.ty else {
@@ -943,14 +994,71 @@ mod tests {
     fn parses_def_id() {
         let module = parse("def Test.id.{u} (A : Sort u) (x : A) : A := x");
 
-        let MachineItem::Def(decl) = &module.items[0] else {
+        let MachineItem::Def(definition) = &module.items[0] else {
             panic!("expected def item");
         };
+        let decl = &definition.declaration;
+        assert_eq!(definition.reducibility, DefinitionReducibility::Reducible);
         assert_eq!(decl.name.as_dotted(), "Test.id");
         assert_eq!(decl.universe_params[0].name, "u");
         assert_eq!(decl.binders.len(), 2);
         assert_eq!(ident_name(&decl.ty), "A");
         assert_eq!(ident_name(&decl.value), "x");
+    }
+
+    #[test]
+    fn parses_opaque_definition_with_comments_layout_and_complete_span() {
+        let source = "opaque -- modifier comment\n def Test.id.{u}\n (A : Sort u) (x : A) : A := x";
+        let module = parse(source);
+        let MachineItem::Def(definition) = &module.items[0] else {
+            panic!("expected opaque def item");
+        };
+        assert_eq!(definition.reducibility, DefinitionReducibility::Opaque);
+        assert_eq!(definition.declaration.name.as_dotted(), "Test.id");
+        assert_eq!(definition.declaration.universe_params[0].name, "u");
+        assert_eq!(definition.declaration.binders.len(), 2);
+        assert_eq!(
+            definition.declaration.span,
+            Span::new(FileId(0), 0, source.len() as u32)
+        );
+        assert_eq!(
+            module_snapshot(&module),
+            module_snapshot(&parse(
+                "opaque def Test.id.{u} (A : Sort u) (x : A) : A := x"
+            ))
+        );
+        assert_eq!(
+            module_snapshot(&module),
+            vec!["opaque def Test.id.{u}[A:Sort(u),x:A]:=A := x"]
+        );
+    }
+
+    #[test]
+    fn reports_focused_opaque_modifier_diagnostics() {
+        for (source, following) in [
+            ("opaque theorem T : Prop := Prop", "`theorem`"),
+            ("opaque axiom A : Prop", "`axiom`"),
+            ("opaque inductive I : Type", "`inductive`"),
+        ] {
+            let diagnostic = parse_machine_module(FileId(0), source).unwrap_err();
+            assert_eq!(
+                diagnostic.kind,
+                MachineDiagnosticKind::OpaqueModifierNotFollowedByDef
+            );
+            assert!(diagnostic.message.contains(following));
+        }
+        assert_eq!(
+            parse_err("opaque opaque def T : Prop := Prop"),
+            MachineDiagnosticKind::DuplicateOpaqueModifier
+        );
+        assert_eq!(
+            parse_err("opaque"),
+            MachineDiagnosticKind::OpaqueModifierNotFollowedByDef
+        );
+        assert_eq!(
+            parse_err("def opaque : Prop := Prop"),
+            MachineDiagnosticKind::ParseError
+        );
     }
 
     #[test]
@@ -1006,9 +1114,10 @@ mod tests {
             "def Test.f : forall (A : Sort 1), A := fun (A : Sort 1) => let x : A := (x : A) in x",
         );
 
-        let MachineItem::Def(decl) = &module.items[0] else {
+        let MachineItem::Def(definition) = &module.items[0] else {
             panic!("expected def item");
         };
+        let decl = &definition.declaration;
         assert!(matches!(decl.ty, MachineTerm::Pi { .. }));
         let MachineTerm::Lam { body, .. } = &decl.value else {
             panic!("expected lambda value");
@@ -1212,8 +1321,8 @@ def Test.f : forall (A : Sort 1), A := fun (A : Sort 1) => let x : A := (x : A) 
     }
 
     #[test]
-    fn rejects_comments_and_string_literals_as_machine_surface_syntax() {
-        assert_eq!(parse_err("-- doc"), MachineDiagnosticKind::ParseError);
+    fn accepts_comments_as_trivia_and_rejects_string_literals() {
+        assert!(parse("-- opaque audit hit").items.is_empty());
         assert_eq!(
             parse_err("def Test.x : Prop := \"x\""),
             MachineDiagnosticKind::ParseError

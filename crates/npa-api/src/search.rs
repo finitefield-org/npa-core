@@ -11992,11 +11992,11 @@ mod tests {
         );
         assert_eq!(
             format_hash_string(&first_fields.query_fingerprint),
-            "sha256:5823ed1b23d68ee836bc8c7fc970f2177b821316c210b38a31f95402d19758f6"
+            "sha256:cbeeb0aa5a6f2f5c5b92f9cc4b7e979b6708c281bdbf2c9e93ae0d12ff9f4e55"
         );
         assert_eq!(
             format_hash_string(&first_fields.theorem_index_fingerprint),
-            "sha256:76c9a3cb4074d9afc7e42a222611112c6650ed5725f55b603bd0a272654959d6"
+            "sha256:f029d673950ce2dd62ace06f0066bc32582942913d177ba64d2fe835f6ccd041"
         );
         assert_eq!(first_fields.results, second_fields.results);
         assert_eq!(first_fields.results.len(), 1);

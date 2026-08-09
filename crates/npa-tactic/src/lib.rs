@@ -13,7 +13,8 @@ use npa_kernel::expr::collect_apps;
 use npa_kernel::level::{ensure_level_wf, levels_eq, normalize_level};
 use npa_kernel::subst::{instantiate, shift, subst_levels_expr};
 use npa_kernel::{
-    Ctx, Decl, Env, Expr, Level, ResourceLimitKind, UniverseConstraint, UniverseConstraintRelation,
+    Ctx, Decl, Env, Expr, Level, Reducibility, ResourceLimitKind, UniverseConstraint,
+    UniverseConstraintRelation,
 };
 use sha2::{Digest, Sha256};
 
@@ -1787,6 +1788,8 @@ pub struct VerifiedImportRef {
     module: ModuleName,
     export_hash: Hash,
     certificate_hash: Hash,
+    certificate_format: String,
+    core_spec: String,
     visible: bool,
     exports: Vec<VerifiedExportSignature>,
     certified_env_decls: Vec<Decl>,
@@ -1854,6 +1857,8 @@ impl VerifiedImportRef {
             module: module.module().clone(),
             export_hash: module.export_hash(),
             certificate_hash: module.certificate_hash(),
+            certificate_format: module.certificate_format().to_owned(),
+            core_spec: module.core_spec().to_owned(),
             visible: true,
             exports,
             certified_env_decls,
@@ -1879,6 +1884,14 @@ impl VerifiedImportRef {
 
     pub fn certificate_hash(&self) -> Hash {
         self.certificate_hash
+    }
+
+    pub fn certificate_format(&self) -> &str {
+        &self.certificate_format
+    }
+
+    pub fn core_spec(&self) -> &str {
+        &self.core_spec
     }
 
     pub fn is_visible(&self) -> bool {
@@ -1943,6 +1956,65 @@ pub struct CheckedCurrentDecl {
     signature: CheckedDeclSignature,
     core_decl: Decl,
     core_decl_hash: Hash,
+    dependency_selective_fingerprint: Hash,
+    owner_certificate_format: String,
+    owner_core_spec: String,
+    prior_chain_fingerprint: Hash,
+    checked_env_fingerprint: Hash,
+}
+
+const OWNER_CERTIFICATE_FORMAT_V0_2: &str = "NPA-CERT-0.2.0";
+const OWNER_CORE_SPEC_V0_2: &str = "NPA-Core-0.2.0";
+const OWNER_CERTIFICATE_FORMAT_V0_3: &str = "NPA-CERT-0.3.0";
+const OWNER_CORE_SPEC_V0_3: &str = "NPA-Core-0.3.0";
+
+fn is_opaque_core_definition(decl: &Decl) -> bool {
+    matches!(
+        decl,
+        Decl::Def {
+            reducibility: Reducibility::Opaque,
+            ..
+        } | Decl::DefConstrained {
+            reducibility: Reducibility::Opaque,
+            ..
+        }
+    )
+}
+
+fn selected_owner_pair(current: &[CheckedCurrentDecl], _additional: &[Decl]) -> (String, String) {
+    if let Some(first) = current.first() {
+        return (
+            first.owner_certificate_format.clone(),
+            first.owner_core_spec.clone(),
+        );
+    }
+    (
+        OWNER_CERTIFICATE_FORMAT_V0_3.to_owned(),
+        OWNER_CORE_SPEC_V0_3.to_owned(),
+    )
+}
+
+fn validate_owner_pair(certificate_format: &str, core_spec: &str) -> Result<()> {
+    if matches!(
+        (certificate_format, core_spec),
+        (OWNER_CERTIFICATE_FORMAT_V0_2, OWNER_CORE_SPEC_V0_2)
+            | (OWNER_CERTIFICATE_FORMAT_V0_3, OWNER_CORE_SPEC_V0_3)
+    ) {
+        Ok(())
+    } else {
+        Err(MachineTacticDiagnostic::new(
+            MachineTacticDiagnosticKind::InvalidCurrentDeclOrder,
+            format!("unsupported current-module owner pair {certificate_format}/{core_spec}"),
+        ))
+    }
+}
+
+struct CheckedCurrentDeclIdentity {
+    decl_interface_hash: Hash,
+    core_decl_hash: Hash,
+    dependency_selective_fingerprint: Hash,
+    owner_certificate_format: String,
+    owner_core_spec: String,
     prior_chain_fingerprint: Hash,
     checked_env_fingerprint: Hash,
 }
@@ -1951,19 +2023,20 @@ impl CheckedCurrentDecl {
     fn from_checked_parts(
         source_index: u64,
         core_decl: Decl,
-        decl_interface_hash: Hash,
-        core_decl_hash: Hash,
-        prior_chain_fingerprint: Hash,
-        checked_env_fingerprint: Hash,
+        identity: CheckedCurrentDeclIdentity,
     ) -> Self {
-        let signature = CheckedDeclSignature::from_core_decl(&core_decl, decl_interface_hash);
+        let signature =
+            CheckedDeclSignature::from_core_decl(&core_decl, identity.decl_interface_hash);
         Self {
             source_index,
             signature,
             core_decl,
-            core_decl_hash,
-            prior_chain_fingerprint,
-            checked_env_fingerprint,
+            core_decl_hash: identity.core_decl_hash,
+            dependency_selective_fingerprint: identity.dependency_selective_fingerprint,
+            owner_certificate_format: identity.owner_certificate_format,
+            owner_core_spec: identity.owner_core_spec,
+            prior_chain_fingerprint: identity.prior_chain_fingerprint,
+            checked_env_fingerprint: identity.checked_env_fingerprint,
         }
     }
 
@@ -1981,6 +2054,18 @@ impl CheckedCurrentDecl {
 
     pub fn core_decl_hash(&self) -> Hash {
         self.core_decl_hash
+    }
+
+    pub fn dependency_selective_fingerprint(&self) -> Hash {
+        self.dependency_selective_fingerprint
+    }
+
+    pub fn owner_certificate_format(&self) -> &str {
+        &self.owner_certificate_format
+    }
+
+    pub fn owner_core_spec(&self) -> &str {
+        &self.owner_core_spec
     }
 
     pub fn prior_chain_fingerprint(&self) -> Hash {
@@ -3560,6 +3645,8 @@ impl Default for MachineTacticOptions {
 #[derive(Clone, Debug)]
 pub struct MachineTacticEnv {
     pub kernel_profile: MachineKernelProfile,
+    pub owner_certificate_format: String,
+    pub owner_core_spec: String,
     pub imports: Vec<VerifiedImportRef>,
     pub checked_current_decls: Vec<CheckedCurrentDecl>,
     pub simp_registry: SimpRegistry,
@@ -3611,6 +3698,30 @@ pub fn check_current_decl_for_machine_tactic_from_verified_imports_with_kernel_p
     source_index: u64,
     decl: Decl,
 ) -> Result<CheckedCurrentDecl> {
+    let (owner_certificate_format, owner_core_spec) =
+        selected_owner_pair(checked_prior_current_decls, std::slice::from_ref(&decl));
+    check_current_decl_for_machine_tactic_from_verified_imports_with_kernel_profile_and_owner_pair(
+        kernel_profile,
+        imports,
+        checked_prior_current_decls,
+        source_index,
+        decl,
+        &owner_certificate_format,
+        &owner_core_spec,
+    )
+}
+
+#[doc(hidden)]
+pub fn check_current_decl_for_machine_tactic_from_verified_imports_with_kernel_profile_and_owner_pair(
+    kernel_profile: MachineKernelProfile,
+    imports: &[VerifiedImportRef],
+    checked_prior_current_decls: &[CheckedCurrentDecl],
+    source_index: u64,
+    decl: Decl,
+    owner_certificate_format: &str,
+    owner_core_spec: &str,
+) -> Result<CheckedCurrentDecl> {
+    validate_owner_pair(owner_certificate_format, owner_core_spec)?;
     if source_index != checked_prior_current_decls.len() as u64 {
         return Err(MachineTacticDiagnostic::new(
             MachineTacticDiagnosticKind::InvalidCurrentDeclOrder,
@@ -3646,11 +3757,13 @@ pub fn check_current_decl_for_machine_tactic_from_verified_imports_with_kernel_p
     }
 
     let canonical_imports = canonicalize_imports(imports.to_vec());
-    let mut env = MachineTacticEnv::new_with_kernel_profile(
+    let mut env = MachineTacticEnv::new_with_kernel_profile_and_owner_pair(
         kernel_profile,
         canonical_imports.clone(),
         checked_prior_current_decls.to_vec(),
         MachineTacticOptions::default(),
+        owner_certificate_format,
+        owner_core_spec,
     )?;
     add_decl_to_kernel_env(&mut env.kernel_env, decl.clone()).map_err(|err| {
         MachineTacticDiagnostic::new(
@@ -3661,19 +3774,31 @@ pub fn check_current_decl_for_machine_tactic_from_verified_imports_with_kernel_p
             ),
         )
     })?;
-    let decl_hashes =
-        certificate_current_decl_hashes(&canonical_imports, checked_prior_current_decls, &decl)?;
+    let evidence = certificate_current_decl_hashes(
+        &canonical_imports,
+        checked_prior_current_decls,
+        &decl,
+        owner_certificate_format,
+        owner_core_spec,
+    )?;
     Ok(CheckedCurrentDecl::from_checked_parts(
         source_index,
         decl,
-        decl_hashes.decl_interface_hash,
-        decl_hashes.decl_certificate_hash,
-        checked_current_chain_fingerprint(checked_prior_current_decls),
-        checked_env_fingerprint_with_kernel_profile(
-            kernel_profile,
-            &canonical_imports,
-            checked_prior_current_decls,
-        ),
+        CheckedCurrentDeclIdentity {
+            decl_interface_hash: evidence.hashes.decl_interface_hash,
+            core_decl_hash: evidence.hashes.decl_certificate_hash,
+            dependency_selective_fingerprint: evidence.dependency_selective_fingerprint,
+            owner_certificate_format: owner_certificate_format.to_owned(),
+            owner_core_spec: owner_core_spec.to_owned(),
+            prior_chain_fingerprint: checked_current_chain_fingerprint(checked_prior_current_decls),
+            checked_env_fingerprint: checked_env_fingerprint_with_kernel_profile(
+                kernel_profile,
+                &canonical_imports,
+                checked_prior_current_decls,
+                owner_certificate_format,
+                owner_core_spec,
+            ),
+        },
     ))
 }
 
@@ -3697,6 +3822,28 @@ impl MachineTacticEnv {
         checked_current_decls: Vec<CheckedCurrentDecl>,
         options: MachineTacticOptions,
     ) -> Result<Self> {
+        let (owner_certificate_format, owner_core_spec) =
+            selected_owner_pair(&checked_current_decls, &[]);
+        Self::new_with_kernel_profile_and_owner_pair(
+            kernel_profile,
+            imports,
+            checked_current_decls,
+            options,
+            &owner_certificate_format,
+            &owner_core_spec,
+        )
+    }
+
+    #[doc(hidden)]
+    pub fn new_with_kernel_profile_and_owner_pair(
+        kernel_profile: MachineKernelProfile,
+        imports: Vec<VerifiedImportRef>,
+        checked_current_decls: Vec<CheckedCurrentDecl>,
+        options: MachineTacticOptions,
+        owner_certificate_format: &str,
+        owner_core_spec: &str,
+    ) -> Result<Self> {
+        validate_owner_pair(owner_certificate_format, owner_core_spec)?;
         validate_options(&options)?;
         let imports = canonicalize_imports(imports);
         validate_imports(&imports)?;
@@ -3725,11 +3872,24 @@ impl MachineTacticEnv {
                     ),
                 ));
             }
-            let expected_decl_hashes =
-                certificate_current_decl_hashes(&imports, &normalized_current, &checked.core_decl)?;
+            if checked.owner_certificate_format != owner_certificate_format
+                || checked.owner_core_spec != owner_core_spec
+            {
+                return Err(MachineTacticDiagnostic::new(
+                    MachineTacticDiagnosticKind::CurrentDeclSignatureMismatch,
+                    format!("checked current declaration {} has a mismatched owner certificate/core pair", checked.core_decl.name()),
+                ));
+            }
+            let evidence = certificate_current_decl_hashes(
+                &imports,
+                &normalized_current,
+                &checked.core_decl,
+                owner_certificate_format,
+                owner_core_spec,
+            )?;
             let expected_signature = CheckedDeclSignature::from_core_decl(
                 &checked.core_decl,
-                expected_decl_hashes.decl_interface_hash,
+                evidence.hashes.decl_interface_hash,
             );
             if checked.signature != expected_signature {
                 return Err(MachineTacticDiagnostic::new(
@@ -3745,7 +3905,10 @@ impl MachineTacticEnv {
                     &checked_decl_signature_canonical_bytes(&checked.signature),
                 ));
             }
-            if checked.core_decl_hash != expected_decl_hashes.decl_certificate_hash {
+            if checked.core_decl_hash != evidence.hashes.decl_certificate_hash
+                || checked.dependency_selective_fingerprint
+                    != evidence.dependency_selective_fingerprint
+            {
                 return Err(MachineTacticDiagnostic::new(
                     MachineTacticDiagnosticKind::CurrentDeclSignatureMismatch,
                     format!(
@@ -3760,6 +3923,8 @@ impl MachineTacticEnv {
                 kernel_profile,
                 &imports,
                 &normalized_current,
+                owner_certificate_format,
+                owner_core_spec,
             );
             if checked.prior_chain_fingerprint != prior_chain {
                 return Err(MachineTacticDiagnostic::new(
@@ -3813,6 +3978,14 @@ impl MachineTacticEnv {
                             )
                         },
                     )?;
+                    if is_opaque_core_definition(&normalized.core_decl)
+                        && !kernel_env.expose_checked_opaque_definition(normalized.core_decl.name())
+                    {
+                        return Err(MachineTacticDiagnostic::new(
+                            MachineTacticDiagnosticKind::UncheckedCurrentDecl,
+                            format!("checked opaque current declaration {} could not be exposed in the private local environment", normalized.core_decl.name()),
+                        ));
+                    }
                     env_decl_hashes.insert(name, hash);
                 }
             }
@@ -3847,6 +4020,8 @@ impl MachineTacticEnv {
         let options_fingerprint = machine_tactic_options_hash(&options);
         let mut env = Self {
             kernel_profile,
+            owner_certificate_format: owner_certificate_format.to_owned(),
+            owner_core_spec: owner_core_spec.to_owned(),
             imports,
             checked_current_decls: normalized_current,
             simp_registry,
@@ -18495,6 +18670,7 @@ fn machine_term_elab_context(
             source_index: decl.source_index,
             decl_interface_hash: decl.signature.decl_interface_hash(),
             decl: decl.core_decl.clone(),
+            reducibility: npa_frontend::DefinitionReducibility::from_core_decl(&decl.core_decl),
         })
         .collect::<Vec<_>>();
     let mut current_generated_decls = Vec::new();
@@ -19772,11 +19948,19 @@ fn saturating_u32_from_usize(value: usize) -> u32 {
     u32::try_from(value).unwrap_or(u32::MAX)
 }
 
+struct CurrentDeclCertificateEvidence {
+    hashes: DeclHashes,
+    dependency_selective_fingerprint: Hash,
+}
+
 fn certificate_current_decl_hashes(
     imports: &[VerifiedImportRef],
     checked_prior_current_decls: &[CheckedCurrentDecl],
     decl: &Decl,
-) -> Result<DeclHashes> {
+    owner_certificate_format: &str,
+    owner_core_spec: &str,
+) -> Result<CurrentDeclCertificateEvidence> {
+    validate_owner_pair(owner_certificate_format, owner_core_spec)?;
     let module_name = infer_current_module_name(decl)?;
     let declarations = checked_prior_current_decls
         .iter()
@@ -19784,13 +19968,28 @@ fn certificate_current_decl_hashes(
         .chain(std::iter::once(decl.clone()))
         .collect::<Vec<_>>();
     let verified_imports = certificate_imports_for_current_decl_hashes(imports, &declarations)?;
-    let cert = npa_cert::build_module_cert(
-        CoreModule {
-            name: module_name,
-            declarations,
-        },
-        &verified_imports,
-    )
+    let module = CoreModule {
+        name: module_name,
+        declarations,
+    };
+    if owner_certificate_format == OWNER_CERTIFICATE_FORMAT_V0_2
+        && module.declarations.iter().any(is_opaque_core_definition)
+    {
+        return Err(MachineTacticDiagnostic::new(
+            MachineTacticDiagnosticKind::UncheckedCurrentDecl,
+            "opaque current declarations require the exact v0.3 owner pair",
+        ));
+    }
+    let cert = if owner_certificate_format == OWNER_CERTIFICATE_FORMAT_V0_3 {
+        let refs = verified_imports.iter().collect::<Vec<_>>();
+        npa_cert::build_module_cert_from_import_refs_with_preferred_imports(
+            module,
+            &refs,
+            &BTreeMap::new(),
+        )
+    } else {
+        npa_cert::build_module_cert_v0_2_compat(module, &verified_imports)
+    }
     .map_err(|err| {
         MachineTacticDiagnostic::new(
             MachineTacticDiagnosticKind::UncheckedCurrentDecl,
@@ -19803,7 +20002,15 @@ fn certificate_current_decl_hashes(
     let target_name = Name::from_dotted(decl.name());
     for cert_decl in &cert.declarations {
         if decl_payload_name(&cert, &cert_decl.decl)? == target_name {
-            return Ok(cert_decl.hashes.clone());
+            return Ok(CurrentDeclCertificateEvidence {
+                hashes: cert_decl.hashes.clone(),
+                dependency_selective_fingerprint: hash_with_domain(
+                    "npa.machine-tactic.current.dependency-selective.v1",
+                    &npa_cert::dependency_selective_fingerprint_canonical_bytes(
+                        &cert_decl.dependencies,
+                    ),
+                ),
+            });
         }
     }
     Err(MachineTacticDiagnostic::new(
@@ -20289,23 +20496,32 @@ fn checked_current_chain_fingerprint(checked_current_decls: &[CheckedCurrentDecl
         encode_u64_to(&mut out, decl.source_index);
         encode_hash_to(&mut out, &checked_decl_signature_hash(&decl.signature));
         encode_hash_to(&mut out, &decl.core_decl_hash);
+        encode_string_to(&mut out, &decl.owner_certificate_format);
+        encode_string_to(&mut out, &decl.owner_core_spec);
+        encode_hash_to(&mut out, &decl.dependency_selective_fingerprint);
         encode_hash_to(&mut out, &decl.prior_chain_fingerprint);
         encode_hash_to(&mut out, &decl.checked_env_fingerprint);
     }
-    hash_with_domain("npa.machine-tactic.current.prior-chain.v1", &out)
+    hash_with_domain("npa.machine-tactic.current.prior-chain.v2", &out)
 }
 
 fn checked_env_fingerprint_with_kernel_profile(
     kernel_profile: MachineKernelProfile,
     imports: &[VerifiedImportRef],
     checked_current_decls: &[CheckedCurrentDecl],
+    owner_certificate_format: &str,
+    owner_core_spec: &str,
 ) -> Hash {
     let mut out = Vec::new();
+    encode_string_to(&mut out, owner_certificate_format);
+    encode_string_to(&mut out, owner_core_spec);
     encode_list_len_to(&mut out, imports.len());
     for import in imports {
         encode_name_to(&mut out, &import.module);
         encode_hash_to(&mut out, &import.export_hash);
         encode_hash_to(&mut out, &import.certificate_hash);
+        encode_string_to(&mut out, &import.certificate_format);
+        encode_string_to(&mut out, &import.core_spec);
         let mut export_signature_hashes = import
             .exports
             .iter()
@@ -20330,10 +20546,13 @@ fn checked_env_fingerprint_with_kernel_profile(
         encode_u64_to(&mut out, decl.source_index);
         encode_hash_to(&mut out, &checked_decl_signature_hash(&decl.signature));
         encode_hash_to(&mut out, &decl.core_decl_hash);
+        encode_string_to(&mut out, &decl.owner_certificate_format);
+        encode_string_to(&mut out, &decl.owner_core_spec);
+        encode_hash_to(&mut out, &decl.dependency_selective_fingerprint);
         encode_hash_to(&mut out, &decl.checked_env_fingerprint);
     }
     encode_hash_to(&mut out, &kernel_check_profile_hash(kernel_profile));
-    hash_with_domain("npa.machine-tactic.current.checked-env.v1", &out)
+    hash_with_domain("npa.machine-tactic.current.checked-env.v2", &out)
 }
 
 fn machine_term_source_canonical_bytes_from_frontend(frontend_canonical_bytes: &[u8]) -> Vec<u8> {
@@ -20673,11 +20892,15 @@ pub fn machine_proof_delta_hash(delta: &MachineProofDelta) -> Hash {
 
 fn machine_tactic_env_hash(env: &MachineTacticEnv) -> Hash {
     let mut out = Vec::new();
+    encode_string_to(&mut out, &env.owner_certificate_format);
+    encode_string_to(&mut out, &env.owner_core_spec);
     encode_list_len_to(&mut out, env.imports.len());
     for import in &env.imports {
         encode_name_to(&mut out, &import.module);
         encode_hash_to(&mut out, &import.export_hash);
         encode_hash_to(&mut out, &import.certificate_hash);
+        encode_string_to(&mut out, &import.certificate_format);
+        encode_string_to(&mut out, &import.core_spec);
         encode_list_len_to(&mut out, import.exports.len());
         for export in &import.exports {
             encode_name_to(&mut out, &export.name);
@@ -20698,13 +20921,16 @@ fn machine_tactic_env_hash(env: &MachineTacticEnv) -> Hash {
         encode_hash_to(&mut out, &decl.prior_chain_fingerprint);
         encode_hash_to(&mut out, &decl.checked_env_fingerprint);
         encode_hash_to(&mut out, &decl.core_decl_hash);
+        encode_string_to(&mut out, &decl.owner_certificate_format);
+        encode_string_to(&mut out, &decl.owner_core_spec);
+        encode_hash_to(&mut out, &decl.dependency_selective_fingerprint);
     }
     encode_hash_to(&mut out, &simp_registry_hash(&env.simp_registry));
     encode_option_resolved_eq_to(&mut out, env.eq_family.as_ref());
     encode_option_resolved_nat_to(&mut out, env.nat_family.as_ref());
     encode_hash_to(&mut out, &env.options_fingerprint);
     encode_hash_to(&mut out, &kernel_check_profile_hash(env.kernel_profile));
-    hash_with_domain("npa.machine-tactic.machine-tactic-env.v1", &out)
+    hash_with_domain("npa.machine-tactic.machine-tactic-env.v2", &out)
 }
 
 fn machine_proof_state_hash(state: &MachineProofState) -> Hash {
@@ -23794,10 +24020,15 @@ mod tests {
         let checked = CheckedCurrentDecl::from_checked_parts(
             3,
             parent_decl,
-            interface_hash,
-            core_decl_hash,
-            [9; 32],
-            [10; 32],
+            CheckedCurrentDeclIdentity {
+                decl_interface_hash: interface_hash,
+                core_decl_hash,
+                dependency_selective_fingerprint: [9; 32],
+                owner_certificate_format: OWNER_CERTIFICATE_FORMAT_V0_2.to_owned(),
+                owner_core_spec: OWNER_CORE_SPEC_V0_2.to_owned(),
+                prior_chain_fingerprint: [10; 32],
+                checked_env_fingerprint: [11; 32],
+            },
         );
         let current = vec![checked];
 
@@ -23829,6 +24060,108 @@ mod tests {
         .expect("current generated recursor should resolve through parent interface hash");
         assert_eq!(rec.signature.name(), &Name::from_dotted("Nat.rec"));
         assert_eq!(rec.origin, zero.origin);
+    }
+
+    #[test]
+    fn opaque_checked_current_is_private_reducible_but_import_remains_bodyless() {
+        let v0_2_empty = MachineTacticEnv::new_with_kernel_profile_and_owner_pair(
+            MachineKernelProfile::BuiltinNatEqRec,
+            Vec::new(),
+            Vec::new(),
+            MachineTacticOptions::default(),
+            OWNER_CERTIFICATE_FORMAT_V0_2,
+            OWNER_CORE_SPEC_V0_2,
+        )
+        .unwrap();
+        let v0_3_empty = MachineTacticEnv::new_with_kernel_profile_and_owner_pair(
+            MachineKernelProfile::BuiltinNatEqRec,
+            Vec::new(),
+            Vec::new(),
+            MachineTacticOptions::default(),
+            OWNER_CERTIFICATE_FORMAT_V0_3,
+            OWNER_CORE_SPEC_V0_3,
+        )
+        .unwrap();
+        assert_ne!(v0_2_empty.env_fingerprint, v0_3_empty.env_fingerprint);
+        let current_state = start_machine_proof(
+            trivial_spec(),
+            Vec::new(),
+            Vec::new(),
+            MachineTacticOptions::default(),
+        )
+        .unwrap();
+        let mut v0_3_state = current_state.clone();
+        v0_3_state.env = v0_3_empty;
+        v0_3_state.fingerprint = machine_proof_state_hash(&v0_3_state);
+        assert_eq!(current_state.fingerprint, v0_3_state.fingerprint);
+
+        let opaque_decl = Decl::Def {
+            name: "OpaqueCurrent.hidden".to_owned(),
+            universe_params: Vec::new(),
+            ty: Expr::sort(Level::succ(Level::zero())),
+            value: Expr::sort(Level::zero()),
+            reducibility: Reducibility::Opaque,
+        };
+        let checked = check_current_decl_for_machine_tactic_from_verified_imports(
+            &[],
+            &[],
+            0,
+            opaque_decl.clone(),
+        )
+        .expect("opaque current declaration should check under v0.3");
+        assert_eq!(
+            checked.owner_certificate_format(),
+            OWNER_CERTIFICATE_FORMAT_V0_3
+        );
+        assert!(matches!(
+            checked.core_decl(),
+            Decl::Def {
+                reducibility: Reducibility::Opaque,
+                ..
+            }
+        ));
+        let local_env =
+            MachineTacticEnv::new(Vec::new(), vec![checked], MachineTacticOptions::default())
+                .unwrap();
+        assert!(local_env
+            .kernel_env()
+            .is_defeq(
+                &Ctx::new(),
+                &[],
+                &Expr::konst("OpaqueCurrent.hidden", Vec::new()),
+                &Expr::sort(Level::zero()),
+            )
+            .unwrap());
+
+        let cert = npa_cert::build_module_cert_from_import_refs_with_preferred_imports(
+            CoreModule {
+                name: Name::from_dotted("OpaqueCurrent"),
+                declarations: vec![opaque_decl],
+            },
+            &[],
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        let bytes = npa_cert::encode_module_cert(&cert).unwrap();
+        let mut verifier = npa_cert::VerifierSession::new();
+        let verified =
+            npa_cert::verify_module_cert(&bytes, &mut verifier, &npa_cert::AxiomPolicy::normal())
+                .unwrap();
+        let imported_env = MachineTacticEnv::new(
+            vec![VerifiedImportRef::from_verified_module(&verified).unwrap()],
+            Vec::new(),
+            MachineTacticOptions::default(),
+        )
+        .unwrap();
+        assert!(!imported_env
+            .kernel_env()
+            .is_defeq(
+                &Ctx::new(),
+                &[],
+                &Expr::konst("OpaqueCurrent.hidden", Vec::new()),
+                &Expr::sort(Level::zero()),
+            )
+            .unwrap());
     }
 
     #[test]

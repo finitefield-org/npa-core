@@ -1,18 +1,18 @@
-let schema = "npa.independent-checker.checker_raw_result.v1"
+let schema = "npa.independent-checker.checker_raw_result.v2"
 
 let checker_id = "npa-checker-ext"
 
-let checker_version = "0.2.0"
+let checker_version = "0.3.0"
 
-let certificate_format = "NPA-CERT-0.2.0"
+let certificate_format = "NPA-CERT-0.3.0"
 
-let core_spec = "NPA-Core-0.2.0"
+let core_spec = "NPA-Core-0.3.0"
 
 let implementation_profile = "ocaml-clean-room"
 
 let project_directory = "checkers/npa-checker-ext/"
 
-let cli_contract = "m0-04:first-release-cli"
+let cli_contract = "ods-11:raw-result-v2"
 
 let feature_policy_contract = "m0-05:first-release-empty-core-feature-set"
 
@@ -148,14 +148,22 @@ let render_error error =
 
 let wire_hash hash = "sha256:" ^ Ext_sha256.to_hex (Bytes.of_string hash)
 
-let identity_fields status =
+let identity_fields ?input_pair status =
   "  \"schema\": " ^ json_string schema ^ ",\n"
   ^ "  \"checker_id\": " ^ json_string checker_id ^ ",\n"
   ^ "  \"checker_version\": " ^ json_string checker_version ^ ",\n"
   ^ "  \"checker_build_hash\": " ^ json_string checker_build_hash ^ ",\n"
+  ^ "  \"certificate_format\": " ^ json_string certificate_format ^ ",\n"
+  ^ "  \"core_spec\": " ^ json_string core_spec ^ ",\n"
+  ^ (match input_pair with
+    | None -> ""
+    | Some (input_certificate_format, input_core_spec) ->
+        "  \"input_certificate_format\": "
+        ^ json_string input_certificate_format
+        ^ ",\n  \"input_core_spec\": " ^ json_string input_core_spec ^ ",\n")
   ^ "  \"status\": " ^ json_string status
 
-let render_failed ?module_name ?certificate_hash error =
+let render_failed ?input_pair ?module_name ?certificate_hash error =
   let context =
     (match module_name with
     | None -> ""
@@ -165,12 +173,16 @@ let render_failed ?module_name ?certificate_hash error =
     | None -> ""
     | Some hash -> ",\n  \"certificate_hash\": " ^ json_string hash
   in
-  "{\n" ^ identity_fields "failed" ^ context ^ ",\n"
+  "{\n"
+  ^ identity_fields ?input_pair "failed"
+  ^ context ^ ",\n"
   ^ "  \"error\": " ^ render_error error ^ "\n}\n"
 
-let render_checked ~module_name ~certificate_hash ~export_hash
-    ~axiom_report_hash =
-  "{\n" ^ identity_fields "checked"
+let render_checked ~input_certificate_format ~input_core_spec ~module_name
+    ~certificate_hash ~export_hash ~axiom_report_hash =
+  "{\n"
+  ^ identity_fields ~input_pair:(input_certificate_format, input_core_spec)
+      "checked"
   ^ ",\n  \"module\": " ^ json_string module_name
   ^ ",\n  \"certificate_hash\": " ^ json_string certificate_hash
   ^ ",\n  \"export_hash\": " ^ json_string export_hash

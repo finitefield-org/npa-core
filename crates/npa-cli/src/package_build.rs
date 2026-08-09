@@ -12,21 +12,27 @@ use std::{
     time::Instant,
 };
 
-use npa_api::{build_legacy_std_package_module_cert, LEGACY_STD_PACKAGE_PRODUCER_PROFILE};
+use npa_api::{
+    build_legacy_std_package_module_cert, PerformanceAcceptedKernelMeasurement,
+    PerformanceDeclarationMeasurement, PerformanceMeasurementRecorder,
+    LEGACY_STD_PACKAGE_PRODUCER_PROFILE,
+};
 use npa_cert::{
     AxiomPolicy, ModuleCert, ModuleCertImportRebindError, ModuleCertImportRebindOutcome,
     ModuleCertRebindExpectedIdentity, ModuleCertRebindImport, ModuleCertRebindImportOrigin, Name,
     VerifiedModule, VerifierSession,
 };
 use npa_frontend::{
-    compile_human_source_to_built_certificate_only_with_available_import_refs,
-    compile_human_source_to_built_certificate_output_with_available_import_refs,
-    compile_human_source_to_certificate_output_with_available_import_refs_and_axiom_policy,
+    compile_human_source_to_observed_built_certificate_only_with_available_import_refs,
+    compile_human_source_to_observed_built_certificate_output_with_available_import_refs,
+    compile_human_source_to_observed_certificate_output_with_available_import_refs_and_axiom_policy,
     parse_human_module, parse_human_module_with_source_interfaces,
-    resolve_human_module_with_source_interfaces, FileId, HumanCompileOptions,
-    HumanImportedSourceInterface, HumanItem, HumanName, HumanSourceDeclarationKind,
-    HumanSourceDeclarationMetadata, HumanSourceInterface, HumanUniverseParam, Span, VerifiedImport,
+    resolve_human_module_with_source_interfaces, FileId, HumanCompilationObservations,
+    HumanCompileOptions, HumanImportedSourceInterface, HumanItem, HumanName,
+    HumanSourceDeclarationKind, HumanSourceDeclarationMetadata, HumanSourceInterface,
+    HumanUniverseParam, Span, VerifiedImport,
 };
+use npa_kernel::KernelWorkCounterSink;
 use npa_package::{
     build_package_lock_from_artifacts,
     build_package_lock_from_artifacts_allowing_local_hash_updates, format_package_hash,
@@ -47,16 +53,18 @@ use npa_package::{
 use toml_edit::{DocumentMut, InlineTable, Table, Value};
 
 use crate::args::{
-    validate_package_build_certs_options, PackageBuildCertsOptions, PackageBuildCheckCacheMode,
-    PackageBuildOptionsValidationError, PackageBuildSelection, PackageCommonOptions,
+    validate_package_build_certs_options, KernelFuelReportMode, PackageBuildCertsOptions,
+    PackageBuildCheckCacheMode, PackageBuildOptionsValidationError, PackageBuildSelection,
+    PackageCommonOptions, PackageTimingMode,
 };
 use crate::diagnostic::{
     CommandDiagnostic, CommandDiagnosticConversionContext, CommandDiagnosticSourceContext,
-    CommandResult, DiagnosticKind,
+    CommandKernelFuelDiagnostic, CommandResult, DiagnosticKind,
 };
 use crate::fs::{join_package_path, render_package_path};
 use crate::package::{load_package_root, LoadedPackageRoot, PACKAGE_MANIFEST_PATH};
 use crate::package_verify::changed_package_paths;
+use crate::timing::PackageTimingCollector;
 
 const COMMAND: &str = "package build-certs";
 const PACKAGE_LOCK_PATH: &str = "generated/package-lock.json";
@@ -64,6 +72,89 @@ const TARGETED_EXTERNAL_IMPORT_LIMIT: usize = 65_536;
 const TARGETED_EXTERNAL_DEPENDENCY_EDGE_LIMIT: usize = 1_048_576;
 const TARGETED_EXTERNAL_CERTIFICATE_BYTES_LIMIT: usize = 256 * 1024 * 1024;
 static NEXT_TEMPORARY_WRITE: AtomicUsize = AtomicUsize::new(0);
+
+/// Operation-scoped observation state shared by every package-build path.
+///
+/// The coordinator is intentionally finalized only by `run_package_build_certs`
+/// so validation failures, cache/no-rebuild successes, and every build mode all
+/// attach timing observations through the same command-result boundary.
+struct PackageBuildObservationCoordinator {
+    kernel_fuel_report: KernelFuelReportMode,
+    timings: PackageTimingCollector,
+    measurements: Option<PerformanceMeasurementRecorder>,
+    kernel_work_counter_sink: Option<KernelWorkCounterSink>,
+}
+
+impl PackageBuildObservationCoordinator {
+    fn new(kernel_fuel_report: KernelFuelReportMode, timing_mode: PackageTimingMode) -> Self {
+        let timings = PackageTimingCollector::new(timing_mode);
+        let measurement_mode = timings.measurement_mode();
+        let timing_enabled = timings.is_enabled();
+        Self {
+            kernel_fuel_report,
+            timings,
+            measurements: timing_enabled
+                .then(|| PerformanceMeasurementRecorder::new(measurement_mode)),
+            kernel_work_counter_sink: timing_enabled.then(KernelWorkCounterSink::default),
+        }
+    }
+
+    fn compile_options(&self) -> HumanCompileOptions {
+        HumanCompileOptions {
+            kernel_fuel_report: self.kernel_fuel_report.into(),
+            ..HumanCompileOptions::default()
+        }
+    }
+
+    fn kernel_work_counter_sink(&self) -> Option<&KernelWorkCounterSink> {
+        self.kernel_work_counter_sink.as_ref()
+    }
+
+    fn collect_declaration_details(&self) -> bool {
+        self.timings.is_detailed()
+    }
+
+    fn record_declaration_batch(
+        &mut self,
+        module: &Name,
+        observations: HumanCompilationObservations,
+    ) {
+        let include_kernel =
+            self.timings.is_detailed() && self.kernel_fuel_report == KernelFuelReportMode::Detailed;
+        let declarations = observations
+            .declarations
+            .into_iter()
+            .map(|observation| PerformanceDeclarationMeasurement {
+                module: module.as_dotted(),
+                declaration_index: observation.declaration_index,
+                declaration: observation.declaration,
+                term_nodes: observation.term_nodes,
+                elaboration_elapsed_ns: observation.elaboration_elapsed_ns,
+                kernel: include_kernel
+                    .then_some(observation.kernel.as_ref())
+                    .flatten()
+                    .and_then(PerformanceAcceptedKernelMeasurement::from_frontend),
+            })
+            .collect();
+        if let Some(measurements) = self.measurements.as_mut() {
+            measurements.record_declaration_batch(
+                observations.attempted,
+                observations.overflowed,
+                declarations,
+            );
+        }
+    }
+
+    fn finish(mut self, result: CommandResult) -> CommandResult {
+        if let Some(mut measurements) = self.measurements.take() {
+            if let Some(sink) = &self.kernel_work_counter_sink {
+                measurements.observe_kernel_work_counters(sink.snapshot());
+            }
+            self.timings.observe_measurements(measurements.report());
+        }
+        self.timings.finish_result(result)
+    }
+}
 
 #[derive(Clone, Debug)]
 struct CertificateArtifactBuffer {
@@ -89,6 +180,8 @@ struct PackageCertificateBuild {
 struct LocalCertificateBuildIdentity {
     module_index: usize,
     source_hash: PackageHash,
+    output_certificate_format: String,
+    output_core_spec: String,
 }
 
 #[derive(Clone, Debug)]
@@ -360,6 +453,16 @@ impl PackageBuildSelectionPlan {
 
 /// Run `package build-certs`.
 pub fn run_package_build_certs(options: PackageBuildCertsOptions) -> CommandResult {
+    let mut observations =
+        PackageBuildObservationCoordinator::new(options.kernel_fuel_report, options.timings);
+    let result = run_package_build_certs_with_observations(options, &mut observations);
+    observations.finish(result)
+}
+
+fn run_package_build_certs_with_observations(
+    options: PackageBuildCertsOptions,
+    observations: &mut PackageBuildObservationCoordinator,
+) -> CommandResult {
     if let Err(error) = validate_package_build_certs_options(&options) {
         return CommandResult::failed(
             COMMAND,
@@ -368,18 +471,28 @@ pub fn run_package_build_certs(options: PackageBuildCertsOptions) -> CommandResu
         );
     }
     if !matches!(options.selection, PackageBuildSelection::Full) {
-        return run_targeted_package_build_certs(options);
+        return run_targeted_package_build_certs(options, observations);
     }
     if options.update_manifest_hashes {
         if options.check {
-            return run_package_build_certs_refresh_check(options.common);
+            return run_package_build_certs_refresh_check_with_observations(
+                options.common,
+                observations,
+            );
         }
-        return run_package_build_certs_refresh_write(options.common);
+        return run_package_build_certs_refresh_write_with_observations(
+            options.common,
+            observations,
+        );
     }
     if options.check {
-        return run_package_build_certs_check_with_cache(options.common, options.build_check_cache);
+        return run_package_build_certs_check_with_cache_and_observations(
+            options.common,
+            options.build_check_cache,
+            observations,
+        );
     }
-    run_package_build_certs_write(options.common)
+    run_package_build_certs_write_with_observations(options.common, observations)
 }
 
 fn package_build_validation_diagnostic(
@@ -411,7 +524,10 @@ fn package_build_validation_diagnostic(
     }
 }
 
-fn run_targeted_package_build_certs(options: PackageBuildCertsOptions) -> CommandResult {
+fn run_targeted_package_build_certs(
+    options: PackageBuildCertsOptions,
+    observations: &mut PackageBuildObservationCoordinator,
+) -> CommandResult {
     let loaded = match load_package_root(&options.common.root, COMMAND) {
         Ok(loaded) => loaded,
         Err(result) => return result,
@@ -438,6 +554,7 @@ fn run_targeted_package_build_certs(options: PackageBuildCertsOptions) -> Comman
             false,
             false,
             Some(&selected_external),
+            observations,
         ) {
             return targeted_failed(&loaded, selection_diagnostic, *diagnostic);
         }
@@ -450,7 +567,8 @@ fn run_targeted_package_build_certs(options: PackageBuildCertsOptions) -> Comman
         if let Some(diagnostic) = check_targeted_refresh_mode_targets(&loaded, &plan) {
             return targeted_failed(&loaded, selection_diagnostic, diagnostic);
         }
-        let build = match build_package_certificates_targeted_refresh(&loaded, &plan) {
+        let build = match build_package_certificates_targeted_refresh(&loaded, &plan, observations)
+        {
             Ok(build) => build,
             Err(diagnostic) => {
                 return targeted_failed(&loaded, selection_diagnostic, *diagnostic);
@@ -474,7 +592,7 @@ fn run_targeted_package_build_certs(options: PackageBuildCertsOptions) -> Comman
             );
         }
     } else {
-        let build = match build_package_certificates_targeted_check(&loaded, &plan) {
+        let build = match build_package_certificates_targeted_check(&loaded, &plan, observations) {
             Ok(build) => build,
             Err(diagnostic) => {
                 return targeted_failed(&loaded, selection_diagnostic, *diagnostic);
@@ -685,7 +803,10 @@ fn check_targeted_refresh_mode_targets(
     None
 }
 
-fn run_package_build_certs_refresh_check(options: PackageCommonOptions) -> CommandResult {
+fn run_package_build_certs_refresh_check_with_observations(
+    options: PackageCommonOptions,
+    observations: &mut PackageBuildObservationCoordinator,
+) -> CommandResult {
     let loaded = match load_package_root(&options.root, COMMAND) {
         Ok(loaded) => loaded,
         Err(result) => return result,
@@ -695,7 +816,7 @@ fn run_package_build_certs_refresh_check(options: PackageCommonOptions) -> Comma
         return CommandResult::failed(COMMAND, loaded.root_display, vec![diagnostic]);
     }
 
-    let build = match build_package_certificates_refresh(&loaded) {
+    let build = match build_package_certificates_refresh(&loaded, observations) {
         Ok(build) => build,
         Err(diagnostic) => {
             return CommandResult::failed(COMMAND, loaded.root_display, vec![*diagnostic]);
@@ -712,14 +833,22 @@ fn run_package_build_certs_refresh_check(options: PackageCommonOptions) -> Comma
 fn build_package_certificates_targeted_check(
     loaded: &LoadedPackageRoot,
     plan: &PackageBuildSelectionPlan,
+    observations: &mut PackageBuildObservationCoordinator,
 ) -> Result<PackageCertificateCheckBuild, Box<CommandDiagnostic>> {
     let selected_external = plan
         .support_external
         .union(&plan.changed_external)
         .copied()
         .collect::<BTreeSet<_>>();
-    let (local_modules, _artifacts, _stats) =
-        build_targeted_refresh_inputs(loaded, plan, false, false, false, Some(&selected_external))?;
+    let (local_modules, _artifacts, _stats) = build_targeted_refresh_inputs(
+        loaded,
+        plan,
+        false,
+        false,
+        false,
+        Some(&selected_external),
+        observations,
+    )?;
     let mut local_certificates = Vec::new();
     for identity in &local_modules {
         let module = &loaded.validated.manifest().modules[identity.module_index];
@@ -781,6 +910,8 @@ fn build_package_certificates_targeted_check(
             local_certificates.push(LocalCertificateBuildIdentity {
                 module_index: identity.module_index,
                 source_hash: identity.source_hash,
+                output_certificate_format: certificate.header.format.clone(),
+                output_core_spec: certificate.header.core_spec.clone(),
             });
             return Ok(PackageCertificateCheckBuild {
                 local_certificates,
@@ -791,6 +922,8 @@ fn build_package_certificates_targeted_check(
         local_certificates.push(LocalCertificateBuildIdentity {
             module_index: identity.module_index,
             source_hash: identity.source_hash,
+            output_certificate_format: certificate.header.format.clone(),
+            output_core_spec: certificate.header.core_spec.clone(),
         });
     }
     Ok(PackageCertificateCheckBuild {
@@ -803,9 +936,10 @@ fn build_package_certificates_targeted_check(
 fn build_package_certificates_targeted_refresh(
     loaded: &LoadedPackageRoot,
     plan: &PackageBuildSelectionPlan,
+    observations: &mut PackageBuildObservationCoordinator,
 ) -> Result<PackageCertificateRefreshBuild, Box<CommandDiagnostic>> {
     let (local_modules, unchanged_artifacts, targeted_refresh_stats) =
-        build_targeted_refresh_inputs(loaded, plan, true, true, true, None)?;
+        build_targeted_refresh_inputs(loaded, plan, true, true, true, None, observations)?;
     let refreshed_manifest_source =
         refresh_manifest_hash_fields(&loaded.manifest_source, &local_modules)?;
     let refreshed_validated = parse_and_validate_refreshed_manifest(&refreshed_manifest_source)?;
@@ -833,6 +967,7 @@ fn build_targeted_refresh_inputs(
     refresh_metadata: bool,
     interface_aware: bool,
     selected_external: Option<&BTreeSet<usize>>,
+    observations: &mut PackageBuildObservationCoordinator,
 ) -> Result<
     (
         Vec<LocalModuleRefreshIdentity>,
@@ -895,13 +1030,17 @@ fn build_targeted_refresh_inputs(
         Some(&plan.seeds),
         interface_aware,
         &mut targeted_refresh_stats,
+        observations,
     ) {
         return Err(Box::new(diagnostic));
     }
     Ok((local_modules, artifacts, targeted_refresh_stats))
 }
 
-fn run_package_build_certs_refresh_write(options: PackageCommonOptions) -> CommandResult {
+fn run_package_build_certs_refresh_write_with_observations(
+    options: PackageCommonOptions,
+    observations: &mut PackageBuildObservationCoordinator,
+) -> CommandResult {
     let loaded = match load_package_root(&options.root, COMMAND) {
         Ok(loaded) => loaded,
         Err(result) => return result,
@@ -911,7 +1050,7 @@ fn run_package_build_certs_refresh_write(options: PackageCommonOptions) -> Comma
         return CommandResult::failed(COMMAND, loaded.root_display, vec![diagnostic]);
     }
 
-    let build = match build_package_certificates_refresh(&loaded) {
+    let build = match build_package_certificates_refresh(&loaded, observations) {
         Ok(build) => build,
         Err(diagnostic) => {
             return CommandResult::failed(COMMAND, loaded.root_display, vec![*diagnostic]);
@@ -927,6 +1066,7 @@ fn run_package_build_certs_refresh_write(options: PackageCommonOptions) -> Comma
 
 fn build_package_certificates_refresh(
     loaded: &LoadedPackageRoot,
+    observations: &mut PackageBuildObservationCoordinator,
 ) -> Result<PackageCertificateRefreshBuild, Box<CommandDiagnostic>> {
     let policy = axiom_policy_for_package(loaded);
     let import_use_counts = package_build_import_use_counts(loaded);
@@ -978,6 +1118,7 @@ fn build_package_certificates_refresh(
         None,
         false,
         &mut ignored_targeted_stats,
+        observations,
     ) {
         return Err(Box::new(diagnostic));
     }
@@ -1634,13 +1775,24 @@ fn manifest_refresh_failed(
 /// generated canonical certificate bytes through `npa-cert`, and compares the
 /// results to the manifest and checked-in artifacts. It does not write files.
 pub fn run_package_build_certs_check(options: PackageCommonOptions) -> CommandResult {
-    run_package_build_certs_check_with_cache(options, PackageBuildCheckCacheMode::Off)
+    run_package_build_certs(crate::package_api::v1::build_certs_check(options))
 }
 
 /// Run no-write certificate rebuild checking with optional read-through cache metadata.
 pub fn run_package_build_certs_check_with_cache(
     options: PackageCommonOptions,
     build_check_cache: PackageBuildCheckCacheMode,
+) -> CommandResult {
+    run_package_build_certs(
+        crate::package_api::v1::build_certs_check(options)
+            .with_build_check_cache(build_check_cache),
+    )
+}
+
+fn run_package_build_certs_check_with_cache_and_observations(
+    options: PackageCommonOptions,
+    build_check_cache: PackageBuildCheckCacheMode,
+    observations: &mut PackageBuildObservationCoordinator,
 ) -> CommandResult {
     let loaded = match load_package_root(&options.root, COMMAND) {
         Ok(loaded) => loaded,
@@ -1666,7 +1818,7 @@ pub fn run_package_build_certs_check_with_cache(
         None
     };
 
-    let build = match build_package_certificates_check(&loaded) {
+    let build = match build_package_certificates_check(&loaded, observations) {
         Ok(build) => build,
         Err(diagnostic) => {
             return CommandResult::failed(COMMAND, loaded.root_display, vec![*diagnostic]);
@@ -1709,6 +1861,13 @@ pub fn run_package_build_certs_check_with_cache(
 /// only command-owned certificate artifacts and the generated package lock. No
 /// target file is touched until every module has built successfully.
 pub fn run_package_build_certs_write(options: PackageCommonOptions) -> CommandResult {
+    run_package_build_certs(crate::package_api::v1::build_certs_write(options))
+}
+
+fn run_package_build_certs_write_with_observations(
+    options: PackageCommonOptions,
+    observations: &mut PackageBuildObservationCoordinator,
+) -> CommandResult {
     let loaded = match load_package_root(&options.root, COMMAND) {
         Ok(loaded) => loaded,
         Err(result) => return result,
@@ -1718,7 +1877,7 @@ pub fn run_package_build_certs_write(options: PackageCommonOptions) -> CommandRe
         return CommandResult::failed(COMMAND, loaded.root_display, vec![diagnostic]);
     }
 
-    let build = match build_package_certificates(&loaded) {
+    let build = match build_package_certificates(&loaded, observations) {
         Ok(build) => build,
         Err(diagnostic) => {
             return CommandResult::failed(COMMAND, loaded.root_display, vec![*diagnostic]);
@@ -1853,6 +2012,7 @@ fn forbidden_local_certificate_write_reason(
 
 fn build_package_certificates(
     loaded: &LoadedPackageRoot,
+    observations: &mut PackageBuildObservationCoordinator,
 ) -> Result<PackageCertificateBuild, Box<CommandDiagnostic>> {
     let policy = axiom_policy_for_package(loaded);
     let import_use_counts = package_build_import_use_counts(loaded);
@@ -1881,6 +2041,7 @@ fn build_package_certificates(
         &mut verified_modules_by_module,
         &mut artifacts,
         &mut local_certificates,
+        observations,
     ) {
         return Err(Box::new(diagnostic));
     }
@@ -1930,6 +2091,7 @@ fn axiom_policy_for_package(loaded: &LoadedPackageRoot) -> AxiomPolicy {
 
 fn build_package_certificates_check(
     loaded: &LoadedPackageRoot,
+    observations: &mut PackageBuildObservationCoordinator,
 ) -> Result<PackageCertificateCheckBuild, Box<CommandDiagnostic>> {
     let policy = axiom_policy_for_package(loaded);
     let import_use_counts = package_build_import_use_counts(loaded);
@@ -1957,6 +2119,7 @@ fn build_package_certificates_check(
         &mut verified_modules_by_module,
         &mut lock_entries,
         &mut local_certificates,
+        observations,
     ) {
         return Ok(PackageCertificateCheckBuild {
             local_certificates,
@@ -2378,6 +2541,7 @@ fn load_external_imports_for_check(
     None
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_local_modules_for_check(
     loaded: &LoadedPackageRoot,
     policy: &AxiomPolicy,
@@ -2386,8 +2550,9 @@ fn build_local_modules_for_check(
     verified_modules_by_module: &mut BTreeMap<Name, Arc<VerifiedModule>>,
     lock_entries: &mut Vec<PackageLockEntry>,
     local_certificates: &mut Vec<LocalCertificateBuildIdentity>,
+    observations: &mut PackageBuildObservationCoordinator,
 ) -> Option<CommandDiagnostic> {
-    let compile_options = HumanCompileOptions::default();
+    let compile_options = observations.compile_options();
     let progress_filter = std::env::var("NPA_PACKAGE_BUILD_CERTS_PROGRESS").ok();
     let check_hashes = std::env::var_os("NPA_SKIP_PACKAGE_BUILD_HASH_CHECKS").is_none();
     for &module_index in &loaded.validated.graph().topological_order {
@@ -2446,34 +2611,35 @@ fn build_local_modules_for_check(
             .map(Arc::as_ref)
             .collect::<Vec<_>>();
 
-        let built =
-            if module.producer_profile.as_deref() == Some(LEGACY_STD_PACKAGE_PRODUCER_PROFILE) {
-                let (certificate, generated_bytes, verified, source_interface) =
-                    match build_legacy_std_package_certificate(
-                        module_index,
-                        module,
-                        &source,
-                        &direct_verified_module_refs,
-                        policy,
-                    ) {
-                        Ok(output) => output,
-                        Err(diagnostic) => return Some(*diagnostic),
-                    };
-                LocalModuleCheckBuild::Verified {
-                    certificate,
-                    generated_bytes,
-                    verified: Box::new(verified),
-                    source_interface: Box::new(source_interface),
-                }
-            } else if remaining_uses == 0 {
-                if progress {
-                    eprintln!(
-                        "package build-certs check: compile certificate-only {}",
-                        module_progress_name
-                    );
-                }
-                let output =
-                    match compile_human_source_to_built_certificate_only_with_available_import_refs(
+        let built = if module.producer_profile.as_deref()
+            == Some(LEGACY_STD_PACKAGE_PRODUCER_PROFILE)
+        {
+            let (certificate, generated_bytes, verified, source_interface) =
+                match build_legacy_std_package_certificate(
+                    module_index,
+                    module,
+                    &source,
+                    &direct_verified_module_refs,
+                    policy,
+                ) {
+                    Ok(output) => output,
+                    Err(diagnostic) => return Some(*diagnostic),
+                };
+            LocalModuleCheckBuild::Verified {
+                certificate,
+                generated_bytes,
+                verified: Box::new(verified),
+                source_interface: Box::new(source_interface),
+            }
+        } else if remaining_uses == 0 {
+            if progress {
+                eprintln!(
+                    "package build-certs check: compile certificate-only {}",
+                    module_progress_name
+                );
+            }
+            let observed =
+                    match compile_human_source_to_observed_built_certificate_only_with_available_import_refs(
                         file_id,
                         module.module.clone(),
                         &source,
@@ -2481,6 +2647,8 @@ fn build_local_modules_for_check(
                         &available_verified_module_refs,
                         &direct_source_interfaces,
                         &compile_options,
+                        observations.kernel_work_counter_sink(),
+                        observations.collect_declaration_details(),
                     ) {
                         Ok(output) => output,
                         Err(error) => {
@@ -2494,41 +2662,43 @@ fn build_local_modules_for_check(
                             ));
                         }
                     };
-                if progress {
-                    eprintln!(
-                        "package build-certs check: encode certificate-only {} after {:.3}s",
-                        module_progress_name,
-                        progress_started_at.elapsed().as_secs_f64()
+            observations.record_declaration_batch(&module.module, observed.observations);
+            let output = observed.output;
+            if progress {
+                eprintln!(
+                    "package build-certs check: encode certificate-only {} after {:.3}s",
+                    module_progress_name,
+                    progress_started_at.elapsed().as_secs_f64()
+                );
+            }
+            let generated_bytes = match npa_cert::encode_module_cert(&output.certificate) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    return Some(
+                        CommandDiagnostic::error(
+                            DiagnosticKind::Build,
+                            "certificate_encode_failed",
+                        )
+                        .with_module(module.module.as_dotted())
+                        .with_path(format!("modules[{module_index}].certificate"))
+                        .with_actual_value(format!("{error:?}")),
                     );
                 }
-                let generated_bytes = match npa_cert::encode_module_cert(&output.certificate) {
-                    Ok(bytes) => bytes,
-                    Err(error) => {
-                        return Some(
-                            CommandDiagnostic::error(
-                                DiagnosticKind::Build,
-                                "certificate_encode_failed",
-                            )
-                            .with_module(module.module.as_dotted())
-                            .with_path(format!("modules[{module_index}].certificate"))
-                            .with_actual_value(format!("{error:?}")),
-                        );
-                    }
-                };
-                LocalModuleCheckBuild::Unverified {
-                    certificate: output.certificate,
-                    generated_bytes,
-                    source_interface: None,
-                }
-            } else {
-                if progress {
-                    eprintln!(
-                        "package build-certs check: compile with interface {}",
-                        module_progress_name
-                    );
-                }
-                let output =
-                match compile_human_source_to_built_certificate_output_with_available_import_refs(
+            };
+            LocalModuleCheckBuild::Unverified {
+                certificate: output.certificate,
+                generated_bytes,
+                source_interface: None,
+            }
+        } else {
+            if progress {
+                eprintln!(
+                    "package build-certs check: compile with interface {}",
+                    module_progress_name
+                );
+            }
+            let observed =
+                match compile_human_source_to_observed_built_certificate_output_with_available_import_refs(
                     file_id,
                     module.module.clone(),
                     &source,
@@ -2536,6 +2706,8 @@ fn build_local_modules_for_check(
                     &available_verified_module_refs,
                     &direct_source_interfaces,
                     &compile_options,
+                    observations.kernel_work_counter_sink(),
+                    observations.collect_declaration_details(),
                 ) {
                     Ok(output) => output,
                     Err(error) => {
@@ -2549,35 +2721,39 @@ fn build_local_modules_for_check(
                         ));
                     }
                 };
-                if progress {
-                    eprintln!(
-                        "package build-certs check: encode with interface {} after {:.3}s",
-                        module_progress_name,
-                        progress_started_at.elapsed().as_secs_f64()
+            observations.record_declaration_batch(&module.module, observed.observations);
+            let output = observed.output;
+            if progress {
+                eprintln!(
+                    "package build-certs check: encode with interface {} after {:.3}s",
+                    module_progress_name,
+                    progress_started_at.elapsed().as_secs_f64()
+                );
+            }
+            let generated_bytes = match npa_cert::encode_module_cert(&output.certificate) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    return Some(
+                        CommandDiagnostic::error(
+                            DiagnosticKind::Build,
+                            "certificate_encode_failed",
+                        )
+                        .with_module(module.module.as_dotted())
+                        .with_path(format!("modules[{module_index}].certificate"))
+                        .with_actual_value(format!("{error:?}")),
                     );
                 }
-                let generated_bytes = match npa_cert::encode_module_cert(&output.certificate) {
-                    Ok(bytes) => bytes,
-                    Err(error) => {
-                        return Some(
-                            CommandDiagnostic::error(
-                                DiagnosticKind::Build,
-                                "certificate_encode_failed",
-                            )
-                            .with_module(module.module.as_dotted())
-                            .with_path(format!("modules[{module_index}].certificate"))
-                            .with_actual_value(format!("{error:?}")),
-                        );
-                    }
-                };
-                LocalModuleCheckBuild::Unverified {
-                    certificate: output.certificate,
-                    generated_bytes,
-                    source_interface: Some(Box::new(output.source_interface)),
-                }
             };
+            LocalModuleCheckBuild::Unverified {
+                certificate: output.certificate,
+                generated_bytes,
+                source_interface: Some(Box::new(output.source_interface)),
+            }
+        };
         let certificate = built.certificate();
         let generated_bytes = built.generated_bytes();
+        let output_certificate_format = certificate.header.format.clone();
+        let output_core_spec = certificate.header.core_spec.clone();
 
         if let Some(diagnostic) =
             check_generated_axiom_policy(loaded, module_index, module, certificate)
@@ -2624,6 +2800,8 @@ fn build_local_modules_for_check(
             local_certificates.push(LocalCertificateBuildIdentity {
                 module_index,
                 source_hash,
+                output_certificate_format: certificate.header.format.clone(),
+                output_core_spec: certificate.header.core_spec.clone(),
             });
             return Some(diagnostic);
         }
@@ -2794,6 +2972,8 @@ fn build_local_modules_for_check(
         local_certificates.push(LocalCertificateBuildIdentity {
             module_index,
             source_hash,
+            output_certificate_format,
+            output_core_spec,
         });
     }
     None
@@ -2906,6 +3086,7 @@ fn load_checked_local_module_for_refresh(
     available_modules: &mut BTreeMap<Name, RefreshAvailableModule>,
     verified_modules_by_module: &mut BTreeMap<Name, Arc<VerifiedModule>>,
     artifacts: &mut Vec<CertificateArtifactBuffer>,
+    compile_options: &HumanCompileOptions,
 ) -> Option<CommandDiagnostic> {
     let module = &loaded.validated.manifest().modules[module_index];
     let support_source = if require_current_source {
@@ -3008,6 +3189,7 @@ fn load_checked_local_module_for_refresh(
             available_modules,
             &certificate,
             &verified,
+            compile_options,
         ) {
             Ok(source_interface) => source_interface,
             Err(diagnostic) => return Some(*diagnostic),
@@ -3047,6 +3229,7 @@ fn load_checked_local_module_for_refresh(
     None
 }
 
+#[allow(clippy::too_many_arguments)]
 fn checked_local_support_source_interface(
     loaded: &LoadedPackageRoot,
     module_index: usize,
@@ -3055,6 +3238,7 @@ fn checked_local_support_source_interface(
     available_modules: &mut BTreeMap<Name, RefreshAvailableModule>,
     certificate: &ModuleCert,
     verified: &VerifiedModule,
+    compile_options: &HumanCompileOptions,
 ) -> Result<HumanImportedSourceInterface, Box<CommandDiagnostic>> {
     let file_id = FileId(u32::try_from(module_index).map_err(|_| {
         Box::new(
@@ -3093,7 +3277,7 @@ fn checked_local_support_source_interface(
         parsed,
         &verified_imports,
         &direct_source_interfaces,
-        &HumanCompileOptions::default(),
+        compile_options,
     )
     .map_err(|error| {
         Box::new(frontend_build_failed(
@@ -3164,6 +3348,7 @@ fn build_refresh_module_from_source(
     available_verified_module_refs: &[&VerifiedModule],
     direct_source_interfaces: &[HumanImportedSourceInterface],
     policy: &AxiomPolicy,
+    observations: &mut PackageBuildObservationCoordinator,
 ) -> Result<RefreshModuleBuildOutput, Box<CommandDiagnostic>> {
     let (certificate, generated_bytes, verified, source_interface) = if module
         .producer_profile
@@ -3178,16 +3363,19 @@ fn build_refresh_module_from_source(
             policy,
         )?
     } else {
-        let output =
-            compile_human_source_to_certificate_output_with_available_import_refs_and_axiom_policy(
+        let compile_options = observations.compile_options();
+        let observed =
+            compile_human_source_to_observed_certificate_output_with_available_import_refs_and_axiom_policy(
                 file_id,
                 module.module.clone(),
                 source,
                 direct_verified_module_refs,
                 available_verified_module_refs,
                 direct_source_interfaces,
-                &HumanCompileOptions::default(),
+                &compile_options,
                 policy,
+                observations.kernel_work_counter_sink(),
+                observations.collect_declaration_details(),
             )
             .map_err(|error| {
                 Box::new(frontend_build_failed(
@@ -3199,6 +3387,8 @@ fn build_refresh_module_from_source(
                     error,
                 ))
             })?;
+        observations.record_declaration_batch(&module.module, observed.observations);
+        let output = observed.output;
         let generated_bytes =
             npa_cert::encode_module_cert(&output.certificate).map_err(|error| {
                 Box::new(
@@ -3239,6 +3429,7 @@ fn qualify_dependent_refresh(
     verified_modules_by_module: &BTreeMap<Name, Arc<VerifiedModule>>,
     local_module_names: &BTreeSet<Name>,
     stats: &mut TargetedRefreshStats,
+    compile_options: &HumanCompileOptions,
 ) -> Result<QualifiedDependentRefresh, Box<CommandDiagnostic>> {
     if source_hash != module.expected_source_hash {
         return Ok(QualifiedDependentRefresh::Fallback("source_hash"));
@@ -3279,6 +3470,7 @@ fn qualify_dependent_refresh(
         direct_verified_modules,
         direct_source_interfaces,
         &previous,
+        compile_options,
     ) else {
         return Ok(QualifiedDependentRefresh::Fallback("source_interface"));
     };
@@ -3366,6 +3558,7 @@ fn reconstruct_qualified_source_interface(
     direct_verified_modules: &[Arc<VerifiedModule>],
     direct_source_interfaces: &[HumanImportedSourceInterface],
     certificate: &ModuleCert,
+    compile_options: &HumanCompileOptions,
 ) -> Option<(Vec<Name>, HumanSourceInterface)> {
     let parsed =
         parse_human_module_with_source_interfaces(file_id, source, direct_source_interfaces)
@@ -3404,7 +3597,7 @@ fn reconstruct_qualified_source_interface(
         parsed,
         &verified_imports,
         direct_source_interfaces,
-        &HumanCompileOptions::default(),
+        compile_options,
     )
     .ok()?;
     Some((source_imports, resolved.state.source_interfaces.current))
@@ -3426,7 +3619,9 @@ fn build_local_modules_for_refresh(
     targeted_seeds: Option<&BTreeSet<usize>>,
     interface_aware: bool,
     targeted_stats: &mut TargetedRefreshStats,
+    observations: &mut PackageBuildObservationCoordinator,
 ) -> Option<CommandDiagnostic> {
+    let compile_options = observations.compile_options();
     let local_module_names = loaded
         .validated
         .manifest()
@@ -3450,6 +3645,7 @@ fn build_local_modules_for_refresh(
                 available_modules,
                 verified_modules_by_module,
                 unchanged_artifacts,
+                &compile_options,
             ) {
                 return Some(diagnostic);
             }
@@ -3511,6 +3707,7 @@ fn build_local_modules_for_refresh(
                 verified_modules_by_module,
                 &local_module_names,
                 targeted_stats,
+                &compile_options,
             ) {
                 Ok(qualified) => Some(qualified),
                 Err(diagnostic) => return Some(*diagnostic),
@@ -3570,6 +3767,7 @@ fn build_local_modules_for_refresh(
                         &available_verified_module_refs,
                         &direct_source_interfaces,
                         policy,
+                        observations,
                     ) {
                         Ok(output) => output,
                         Err(diagnostic) => return Some(*diagnostic),
@@ -3850,6 +4048,7 @@ fn verified_declaration_kind(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_local_modules(
     loaded: &LoadedPackageRoot,
     policy: &AxiomPolicy,
@@ -3858,8 +4057,9 @@ fn build_local_modules(
     verified_modules_by_module: &mut BTreeMap<Name, Arc<VerifiedModule>>,
     artifacts: &mut Vec<CertificateArtifactBuffer>,
     local_certificates: &mut Vec<LocalCertificateBuild>,
+    observations: &mut PackageBuildObservationCoordinator,
 ) -> Option<CommandDiagnostic> {
-    let compile_options = HumanCompileOptions::default();
+    let compile_options = observations.compile_options();
     for &module_index in &loaded.validated.graph().topological_order {
         let module = &loaded.validated.manifest().modules[module_index];
         let source = match read_source(loaded, module_index, module) {
@@ -3905,8 +4105,8 @@ fn build_local_modules(
                 Err(diagnostic) => return Some(*diagnostic),
             }
         } else {
-            let output =
-                match compile_human_source_to_certificate_output_with_available_import_refs_and_axiom_policy(
+            let observed =
+                match compile_human_source_to_observed_certificate_output_with_available_import_refs_and_axiom_policy(
                     file_id,
                     module.module.clone(),
                     &source,
@@ -3915,6 +4115,8 @@ fn build_local_modules(
                     &direct_source_interfaces,
                     &compile_options,
                     policy,
+                    observations.kernel_work_counter_sink(),
+                    observations.collect_declaration_details(),
                 ) {
                     Ok(output) => output,
                     Err(error) => {
@@ -3928,6 +4130,8 @@ fn build_local_modules(
                         ));
                     }
                 };
+            observations.record_declaration_batch(&module.module, observed.observations);
+            let output = observed.output;
             let generated_bytes = match npa_cert::encode_module_cert(&output.certificate) {
                 Ok(bytes) => bytes,
                 Err(error) => {
@@ -5150,8 +5354,10 @@ fn package_build_check_cache_key_inputs(
                 schema: PACKAGE_BUILD_CHECK_CACHE_SCHEMA.to_owned(),
                 tool_version: env!("CARGO_PKG_VERSION").to_owned(),
                 tool_build_hash: package_build_check_tool_build_hash(),
-                core_spec: manifest.core_spec.clone(),
-                certificate_format: manifest.certificate_format.clone(),
+                package_core_profile: manifest.core_spec.clone(),
+                package_certificate_profile: manifest.certificate_format.clone(),
+                output_certificate_format: certificate.output_certificate_format.clone(),
+                output_core_spec: certificate.output_core_spec.clone(),
                 module: module.module.clone(),
                 source_hash: certificate.source_hash,
                 expected_source_hash: module.expected_source_hash,
@@ -5627,6 +5833,9 @@ pub(crate) fn fallback_imported_source_interface(
         .iter()
         .map(|export| HumanSourceDeclarationMetadata {
             kind: HumanSourceDeclarationKind::Imported,
+            definition_reducibility: export
+                .reducibility
+                .map(npa_frontend::DefinitionReducibility::from_cert),
             name: HumanName::new(export.name.0.clone(), empty_span),
             universe_params: export
                 .universe_params
@@ -5691,6 +5900,11 @@ fn frontend_build_failed(
             )
         })
     });
+    let kernel_fuel = error
+        .payload
+        .as_ref()
+        .and_then(|payload| payload.kernel_fuel.as_ref())
+        .map(CommandKernelFuelDiagnostic::from_frontend);
     let universe_mismatch = error.payload.as_ref().and_then(|payload| {
         payload.universe_mismatch.as_ref().map(|mismatch| {
             (
@@ -5716,6 +5930,9 @@ fn frontend_build_failed(
     }
     if let Some(conversion) = conversion {
         diagnostic = diagnostic.with_conversion(conversion);
+    }
+    if let Some(kernel_fuel) = kernel_fuel {
+        diagnostic = diagnostic.with_kernel_fuel(kernel_fuel);
     }
 
     match frontend_source_context(
@@ -5825,7 +6042,10 @@ fn frontend_containing_declaration(
 
 fn named_human_item(item: &HumanItem) -> Option<(&HumanName, Span)> {
     match item {
-        HumanItem::Def(decl) | HumanItem::Theorem(decl) => Some((&decl.name, decl.span)),
+        HumanItem::Def(definition) => {
+            Some((&definition.declaration.name, definition.declaration.span))
+        }
+        HumanItem::Theorem(decl) => Some((&decl.name, decl.span)),
         HumanItem::EquationDef(decl) => Some((&decl.name, decl.span)),
         HumanItem::Axiom(decl) => Some((&decl.name, decl.span)),
         HumanItem::Inductive(decl) => Some((&decl.name, decl.span)),

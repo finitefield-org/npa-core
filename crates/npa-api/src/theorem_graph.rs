@@ -6,7 +6,7 @@ use npa_cert::{
 };
 use sha2::{Digest, Sha256};
 
-const CERTIFICATE_THEOREM_GRAPH_HASH_TAG: &[u8] = b"npa.certificate-theorem-graph.v1";
+const CERTIFICATE_THEOREM_GRAPH_HASH_TAG: &[u8] = b"npa.certificate-theorem-graph.v2";
 const CERTIFICATE_THEOREM_GRAPH_QUERY_FEATURES_HASH_TAG: &[u8] =
     b"npa.certificate-theorem-graph.query-features.v1";
 
@@ -110,6 +110,12 @@ pub enum CertificateTheoremGraphError {
     MalformedNodeMetadata {
         node: Box<CertificateTheoremGraphNodeId>,
     },
+    MalformedDefinitionVisibility {
+        node: Box<CertificateTheoremGraphNodeId>,
+    },
+    UnsupportedExtractorVersion {
+        actual: CertificateTheoremGraphExtractorVersion,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -187,6 +193,7 @@ pub struct CertificateTheoremGraphImportBinding {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum CertificateTheoremGraphExtractorVersion {
     CertificateGraphV1,
+    CertificateGraphV2,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -217,7 +224,26 @@ pub struct CertificateTheoremGraphNode {
     pub type_hash: Option<Hash>,
     pub proof_hash: Option<Hash>,
     pub body_hash: Option<Hash>,
+    pub definition_reducibility: Option<CertReducibility>,
+    pub definition_body_visibility: Option<DefinitionBodyVisibility>,
     pub metadata: CertificateTheoremGraphNodeMetadata,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum DefinitionBodyVisibility {
+    Exported,
+    CheckedNotExported,
+    Unavailable,
+}
+
+impl DefinitionBodyVisibility {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Exported => "exported",
+            Self::CheckedNotExported => "checked_not_exported",
+            Self::Unavailable => "unavailable",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -427,18 +453,18 @@ pub fn extract_certificate_theorem_graph_from_cert(
         insert_node(
             &mut state.nodes,
             local_decl_node(cert, &state.export_by_name, decl_index, decl)?,
-        );
+        )?;
 
         for dependency in &decl.dependencies {
             let target = graph_node_for_global_ref(
                 cert,
                 &state.export_by_name,
                 &state.import_modules,
-                &dependency.global_ref,
-                Some(dependency.decl_interface_hash),
+                dependency.global_ref(),
+                Some(dependency.decl_interface_hash()),
                 None,
             )?;
-            insert_node(&mut state.nodes, target.clone());
+            insert_node(&mut state.nodes, target.clone())?;
             state.edges.insert(CertificateTheoremGraphEdge {
                 from: source.clone(),
                 to: target.id,
@@ -483,13 +509,18 @@ pub fn extract_certificate_theorem_graph_from_cert(
         source_module: cert.header.module.clone(),
         source_export_hash: cert.hashes.export_hash,
         source_certificate_hash: cert.hashes.certificate_hash,
-        extractor_version: CertificateTheoremGraphExtractorVersion::CertificateGraphV1,
+        extractor_version: CertificateTheoremGraphExtractorVersion::CertificateGraphV2,
         imports,
         nodes: state.nodes.into_values().collect(),
         edges: state.edges.into_iter().collect(),
         graph_hash: [0; 32],
     };
     snapshot.graph_hash = certificate_theorem_graph_snapshot_hash(&snapshot);
+    validate_certificate_theorem_graph_snapshot_contract(
+        &snapshot,
+        snapshot.graph_hash,
+        CertificateTheoremGraphSnapshotValidationOptions::default(),
+    )?;
     Ok(snapshot)
 }
 
@@ -674,6 +705,16 @@ fn validate_certificate_theorem_graph_snapshot_contract(
     graph_snapshot_hash: Hash,
     options: CertificateTheoremGraphSnapshotValidationOptions<'_>,
 ) -> Result<CertificateTheoremGraphValidatedSnapshot, CertificateTheoremGraphError> {
+    if snapshot.extractor_version != CertificateTheoremGraphExtractorVersion::CertificateGraphV2 {
+        return Err(CertificateTheoremGraphError::UnsupportedExtractorVersion {
+            actual: snapshot.extractor_version,
+        });
+    }
+
+    for node in &snapshot.nodes {
+        validate_certificate_theorem_graph_definition_visibility(node)?;
+    }
+
     let actual_hash = certificate_theorem_graph_snapshot_hash(snapshot);
     if snapshot.graph_hash != actual_hash {
         return Err(CertificateTheoremGraphError::GraphSnapshotHashMismatch {
@@ -744,6 +785,52 @@ fn validate_certificate_theorem_graph_snapshot_contract(
         graph_snapshot_hash: actual_hash,
         verified_identities,
     })
+}
+
+fn validate_certificate_theorem_graph_definition_visibility(
+    node: &CertificateTheoremGraphNode,
+) -> Result<(), CertificateTheoremGraphError> {
+    let valid = match (
+        node.kind,
+        &node.id.scope,
+        node.definition_reducibility,
+        node.definition_body_visibility,
+        node.body_hash,
+    ) {
+        (
+            CertificateTheoremGraphNodeKind::Definition,
+            CertificateTheoremGraphNodeScope::Local
+            | CertificateTheoremGraphNodeScope::Imported { .. },
+            Some(CertReducibility::Reducible),
+            Some(DefinitionBodyVisibility::Exported),
+            Some(_),
+        ) => true,
+        (
+            CertificateTheoremGraphNodeKind::Definition,
+            CertificateTheoremGraphNodeScope::Local,
+            Some(CertReducibility::Opaque),
+            Some(DefinitionBodyVisibility::CheckedNotExported),
+            None,
+        ) => true,
+        (
+            CertificateTheoremGraphNodeKind::Definition,
+            CertificateTheoremGraphNodeScope::Imported { .. },
+            Some(CertReducibility::Opaque),
+            Some(DefinitionBodyVisibility::Unavailable),
+            None,
+        ) => true,
+        (kind, _, None, None, _) if kind != CertificateTheoremGraphNodeKind::Definition => true,
+        _ => false,
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(
+            CertificateTheoremGraphError::MalformedDefinitionVisibility {
+                node: Box::new(node.id.clone()),
+            },
+        )
+    }
 }
 
 fn validate_certificate_theorem_graph_query_features_hash(
@@ -1442,7 +1529,7 @@ fn add_generated_node_and_type_edges(
         to: generated.id.clone(),
         kind: CertificateTheoremGraphEdgeKind::GeneratedDeclaration,
     });
-    insert_node(&mut state.nodes, generated.clone());
+    insert_node(&mut state.nodes, generated.clone())?;
     add_term_edges(
         state,
         &generated.id,
@@ -1465,7 +1552,7 @@ fn add_axiom_edge(
         Some(axiom.decl_interface_hash),
         Some(CertificateTheoremGraphNodeKind::Axiom),
     )?;
-    insert_node(&mut state.nodes, target.clone());
+    insert_node(&mut state.nodes, target.clone())?;
     state.edges.insert(CertificateTheoremGraphEdge {
         from: source.clone(),
         to: target.id,
@@ -1492,7 +1579,7 @@ fn add_term_edges(
             None,
             None,
         )?;
-        insert_node(&mut state.nodes, target.clone());
+        insert_node(&mut state.nodes, target.clone())?;
         state.edges.insert(CertificateTheoremGraphEdge {
             from: source.clone(),
             to: target.id,
@@ -1565,12 +1652,25 @@ fn local_decl_node(
         ),
         _ => None,
     };
+    let (definition_reducibility, definition_body_visibility) = match &decl.decl {
+        DeclPayload::Def { reducibility, .. }
+        | DeclPayload::DefConstrained { reducibility, .. } => (
+            Some(*reducibility),
+            Some(match reducibility {
+                CertReducibility::Reducible => DefinitionBodyVisibility::Exported,
+                CertReducibility::Opaque => DefinitionBodyVisibility::CheckedNotExported,
+            }),
+        ),
+        _ => (None, None),
+    };
     Ok(CertificateTheoremGraphNode {
         id: local_decl_node_id(cert, decl_index)?,
         kind: decl_payload_node_kind(&decl.decl),
         type_hash,
         proof_hash,
         body_hash,
+        definition_reducibility,
+        definition_body_visibility,
         metadata: CertificateTheoremGraphNodeMetadata::default(),
     })
 }
@@ -1598,6 +1698,8 @@ fn local_generated_node(
         type_hash: Some(entry.type_hash),
         proof_hash: None,
         body_hash: entry.body_hash,
+        definition_reducibility: None,
+        definition_body_visibility: None,
         metadata: CertificateTheoremGraphNodeMetadata::default(),
     })
 }
@@ -1627,6 +1729,8 @@ fn graph_node_for_global_ref(
                 type_hash: None,
                 proof_hash: None,
                 body_hash: None,
+                definition_reducibility: None,
+                definition_body_visibility: None,
                 metadata: CertificateTheoremGraphNodeMetadata::default(),
             })
         }
@@ -1667,6 +1771,13 @@ fn graph_node_for_global_ref(
                 type_hash: Some(import_export.type_hash),
                 proof_hash: None,
                 body_hash: import_export.body_hash,
+                definition_reducibility: import_export.reducibility,
+                definition_body_visibility: import_export.reducibility.map(|reducibility| {
+                    match reducibility {
+                        CertReducibility::Reducible => DefinitionBodyVisibility::Exported,
+                        CertReducibility::Opaque => DefinitionBodyVisibility::Unavailable,
+                    }
+                }),
                 metadata: CertificateTheoremGraphNodeMetadata::default(),
             })
         }
@@ -1730,21 +1841,52 @@ fn imported_export<'a>(
 fn insert_node(
     nodes: &mut BTreeMap<CertificateTheoremGraphNodeId, CertificateTheoremGraphNode>,
     node: CertificateTheoremGraphNode,
-) {
-    nodes
-        .entry(node.id.clone())
-        .and_modify(|existing| {
-            if existing.kind == CertificateTheoremGraphNodeKind::Unknown
-                && node.kind != CertificateTheoremGraphNodeKind::Unknown
-            {
-                existing.kind = node.kind;
-            }
-            existing.type_hash = existing.type_hash.or(node.type_hash);
-            existing.proof_hash = existing.proof_hash.or(node.proof_hash);
-            existing.body_hash = existing.body_hash.or(node.body_hash);
-            merge_node_metadata(&mut existing.metadata, node.metadata.clone());
-        })
-        .or_insert(node);
+) -> Result<(), CertificateTheoremGraphError> {
+    if let Some(existing) = nodes.get_mut(&node.id) {
+        let definition_reducibility = merge_optional_definition_field(
+            existing.definition_reducibility,
+            node.definition_reducibility,
+        );
+        let definition_body_visibility = merge_optional_definition_field(
+            existing.definition_body_visibility,
+            node.definition_body_visibility,
+        );
+        let (Some(definition_reducibility), Some(definition_body_visibility)) =
+            (definition_reducibility, definition_body_visibility)
+        else {
+            return Err(
+                CertificateTheoremGraphError::MalformedDefinitionVisibility {
+                    node: Box::new(node.id),
+                },
+            );
+        };
+        existing.definition_reducibility = definition_reducibility;
+        existing.definition_body_visibility = definition_body_visibility;
+        if existing.kind == CertificateTheoremGraphNodeKind::Unknown
+            && node.kind != CertificateTheoremGraphNodeKind::Unknown
+        {
+            existing.kind = node.kind;
+        }
+        existing.type_hash = existing.type_hash.or(node.type_hash);
+        existing.proof_hash = existing.proof_hash.or(node.proof_hash);
+        existing.body_hash = existing.body_hash.or(node.body_hash);
+        merge_node_metadata(&mut existing.metadata, node.metadata);
+    } else {
+        nodes.insert(node.id.clone(), node);
+    }
+    Ok(())
+}
+
+fn merge_optional_definition_field<T: Copy + Eq>(
+    existing: Option<T>,
+    incoming: Option<T>,
+) -> Option<Option<T>> {
+    match (existing, incoming) {
+        (None, None) => Some(None),
+        (Some(value), None) | (None, Some(value)) => Some(Some(value)),
+        (Some(left), Some(right)) if left == right => Some(Some(left)),
+        (Some(_), Some(_)) => None,
+    }
 }
 
 fn merge_node_metadata(
@@ -1848,6 +1990,17 @@ fn encode_node(out: &mut Vec<u8>, node: &CertificateTheoremGraphNode) {
     encode_optional_hash(out, node.type_hash);
     encode_optional_hash(out, node.proof_hash);
     encode_optional_hash(out, node.body_hash);
+    out.push(match node.definition_reducibility {
+        None => 0,
+        Some(CertReducibility::Reducible) => 1,
+        Some(CertReducibility::Opaque) => 2,
+    });
+    out.push(match node.definition_body_visibility {
+        None => 0,
+        Some(DefinitionBodyVisibility::Exported) => 1,
+        Some(DefinitionBodyVisibility::CheckedNotExported) => 2,
+        Some(DefinitionBodyVisibility::Unavailable) => 3,
+    });
     encode_node_metadata(out, &node.metadata);
 }
 
@@ -1947,6 +2100,7 @@ fn node_kind_tag(kind: CertificateTheoremGraphNodeKind) -> u8 {
 fn extractor_version_tag(version: CertificateTheoremGraphExtractorVersion) -> u8 {
     match version {
         CertificateTheoremGraphExtractorVersion::CertificateGraphV1 => 0,
+        CertificateTheoremGraphExtractorVersion::CertificateGraphV2 => 1,
     }
 }
 
@@ -2013,11 +2167,20 @@ mod tests {
         fixture_module(
             CoreModule {
                 name: Name::from_dotted("Base"),
-                declarations: vec![Decl::Axiom {
-                    name: "Base.P".to_owned(),
-                    universe_params: Vec::new(),
-                    ty: Expr::sort(Level::zero()),
-                }],
+                declarations: vec![
+                    Decl::Axiom {
+                        name: "Base.P".to_owned(),
+                        universe_params: Vec::new(),
+                        ty: Expr::sort(Level::zero()),
+                    },
+                    Decl::Def {
+                        name: "Base.OpaqueType".to_owned(),
+                        universe_params: Vec::new(),
+                        ty: Expr::sort(Level::succ(Level::zero())),
+                        value: Expr::sort(Level::zero()),
+                        reducibility: Reducibility::Opaque,
+                    },
+                ],
             },
             &[],
         )
@@ -2065,6 +2228,20 @@ mod tests {
                         universe_params: Vec::new(),
                         ty: id_p_type(),
                         value: id_p_proof(),
+                        reducibility: Reducibility::Reducible,
+                    },
+                    Decl::Def {
+                        name: "Client.opaqueIdP".to_owned(),
+                        universe_params: Vec::new(),
+                        ty: id_p_type(),
+                        value: id_p_proof(),
+                        reducibility: Reducibility::Opaque,
+                    },
+                    Decl::Def {
+                        name: "Client.copyOpaqueType".to_owned(),
+                        universe_params: Vec::new(),
+                        ty: Expr::sort(Level::succ(Level::zero())),
+                        value: Expr::konst("Base.OpaqueType", vec![]),
                         reducibility: Reducibility::Reducible,
                     },
                     Decl::Theorem {
@@ -2291,6 +2468,183 @@ mod tests {
     }
 
     #[test]
+    fn theorem_graph_snapshot_rejects_v1_before_hash_comparison() {
+        let (mut snapshot, _) = graph_contract_fixture();
+        snapshot.extractor_version = CertificateTheoremGraphExtractorVersion::CertificateGraphV1;
+        snapshot.graph_hash = test_hash(99);
+
+        let err = validate_certificate_theorem_graph_snapshot_sidecar(
+            CertificateTheoremGraphSnapshotSidecar::Inline {
+                snapshot: &snapshot,
+                graph_snapshot_hash: test_hash(98),
+            },
+            CertificateTheoremGraphSnapshotValidationOptions::default(),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            err,
+            CertificateTheoremGraphError::UnsupportedExtractorVersion {
+                actual: CertificateTheoremGraphExtractorVersion::CertificateGraphV1,
+            }
+        );
+    }
+
+    #[test]
+    fn theorem_graph_definition_visibility_canonical_tags_cover_valid_matrix() {
+        let (snapshot, _) = graph_contract_fixture();
+        let local_reducible = snapshot
+            .nodes
+            .iter()
+            .find(|node| node.id.name.as_dotted() == "Client.idP")
+            .unwrap()
+            .clone();
+        let local_opaque = snapshot
+            .nodes
+            .iter()
+            .find(|node| node.id.name.as_dotted() == "Client.opaqueIdP")
+            .unwrap()
+            .clone();
+        let imported_opaque = snapshot
+            .nodes
+            .iter()
+            .find(|node| node.id.name.as_dotted() == "Base.OpaqueType")
+            .unwrap()
+            .clone();
+
+        let canonical_tag_suffix = |node: &CertificateTheoremGraphNode| {
+            let mut bytes = Vec::new();
+            encode_node(&mut bytes, node);
+            bytes[bytes.len() - 4..].to_vec()
+        };
+        assert_eq!(canonical_tag_suffix(&local_reducible), [1, 1, 0, 0]);
+        assert_eq!(canonical_tag_suffix(&local_opaque), [2, 2, 0, 0]);
+        assert_eq!(canonical_tag_suffix(&imported_opaque), [2, 3, 0, 0]);
+
+        let mut imported_reducible = imported_opaque;
+        imported_reducible.definition_reducibility = Some(CertReducibility::Reducible);
+        imported_reducible.definition_body_visibility = Some(DefinitionBodyVisibility::Exported);
+        imported_reducible.body_hash = Some(test_hash(66));
+        assert!(
+            validate_certificate_theorem_graph_definition_visibility(&imported_reducible).is_ok()
+        );
+        assert_eq!(canonical_tag_suffix(&imported_reducible), [1, 1, 0, 0]);
+    }
+
+    #[test]
+    fn theorem_graph_rejects_invalid_definition_visibility_combinations() {
+        let (snapshot, _) = graph_contract_fixture();
+        let definition = snapshot
+            .nodes
+            .iter()
+            .find(|node| node.id.name.as_dotted() == "Client.idP")
+            .unwrap()
+            .clone();
+
+        let mut invalid = Vec::new();
+        let mut missing_visibility = definition.clone();
+        missing_visibility.definition_body_visibility = None;
+        invalid.push(missing_visibility);
+        let mut opaque_with_hash = definition.clone();
+        opaque_with_hash.definition_reducibility = Some(CertReducibility::Opaque);
+        opaque_with_hash.definition_body_visibility =
+            Some(DefinitionBodyVisibility::CheckedNotExported);
+        invalid.push(opaque_with_hash);
+        let mut builtin_definition = definition.clone();
+        builtin_definition.id.scope = CertificateTheoremGraphNodeScope::Builtin;
+        invalid.push(builtin_definition);
+        let mut generated_definition = definition;
+        generated_definition.id.scope = CertificateTheoremGraphNodeScope::LocalGenerated {
+            source_decl_index: 0,
+        };
+        invalid.push(generated_definition);
+
+        for node in invalid {
+            assert!(matches!(
+                validate_certificate_theorem_graph_definition_visibility(&node),
+                Err(CertificateTheoremGraphError::MalformedDefinitionVisibility { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn theorem_graph_non_definition_kinds_require_definition_fields_to_be_absent() {
+        let (snapshot, _) = graph_contract_fixture();
+        let template = snapshot
+            .nodes
+            .iter()
+            .find(|node| node.id.name.as_dotted() == "Client.thmP")
+            .unwrap()
+            .clone();
+
+        for kind in [
+            CertificateTheoremGraphNodeKind::Axiom,
+            CertificateTheoremGraphNodeKind::Theorem,
+            CertificateTheoremGraphNodeKind::Inductive,
+            CertificateTheoremGraphNodeKind::Constructor,
+            CertificateTheoremGraphNodeKind::Recursor,
+            CertificateTheoremGraphNodeKind::Builtin,
+            CertificateTheoremGraphNodeKind::Unknown,
+        ] {
+            let mut node = template.clone();
+            node.kind = kind;
+            node.definition_reducibility = None;
+            node.definition_body_visibility = None;
+            assert!(validate_certificate_theorem_graph_definition_visibility(&node).is_ok());
+
+            node.definition_reducibility = Some(CertReducibility::Reducible);
+            node.definition_body_visibility = Some(DefinitionBodyVisibility::Exported);
+            assert!(matches!(
+                validate_certificate_theorem_graph_definition_visibility(&node),
+                Err(CertificateTheoremGraphError::MalformedDefinitionVisibility { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn theorem_graph_definition_field_merge_is_order_independent_and_rejects_conflicts() {
+        let (snapshot, _) = graph_contract_fixture();
+        let complete = snapshot
+            .nodes
+            .iter()
+            .find(|node| node.id.name.as_dotted() == "Client.idP")
+            .unwrap()
+            .clone();
+        let mut partial = complete.clone();
+        partial.definition_reducibility = None;
+        partial.definition_body_visibility = None;
+
+        for (first, second) in [
+            (partial.clone(), complete.clone()),
+            (complete.clone(), partial.clone()),
+        ] {
+            let mut nodes = BTreeMap::new();
+            insert_node(&mut nodes, first).unwrap();
+            insert_node(&mut nodes, second).unwrap();
+            let merged = nodes.values().next().unwrap();
+            assert_eq!(
+                merged.definition_reducibility,
+                complete.definition_reducibility
+            );
+            assert_eq!(
+                merged.definition_body_visibility,
+                complete.definition_body_visibility
+            );
+        }
+
+        let mut conflicting = complete.clone();
+        conflicting.definition_reducibility = Some(CertReducibility::Opaque);
+        conflicting.definition_body_visibility = Some(DefinitionBodyVisibility::CheckedNotExported);
+        conflicting.body_hash = None;
+        let mut nodes = BTreeMap::new();
+        insert_node(&mut nodes, complete).unwrap();
+        assert!(matches!(
+            insert_node(&mut nodes, conflicting),
+            Err(CertificateTheoremGraphError::MalformedDefinitionVisibility { .. })
+        ));
+    }
+
+    #[test]
     fn theorem_graph_snapshot_rejects_same_name_different_theorem_identity() {
         let (mut snapshot, identities) = graph_contract_fixture();
         let node = snapshot
@@ -2352,6 +2706,8 @@ mod tests {
             type_hash: None,
             proof_hash: None,
             body_hash: None,
+            definition_reducibility: None,
+            definition_body_visibility: None,
             metadata: CertificateTheoremGraphNodeMetadata::default(),
         });
         snapshot.graph_hash = certificate_theorem_graph_snapshot_hash(&snapshot);
@@ -2446,6 +2802,53 @@ mod tests {
 
         let def = first.node(&node_id_by_name(&first, "Client.idP")).unwrap();
         assert!(def.body_hash.is_some());
+        assert_eq!(
+            def.definition_reducibility,
+            Some(CertReducibility::Reducible)
+        );
+        assert_eq!(
+            def.definition_body_visibility,
+            Some(DefinitionBodyVisibility::Exported)
+        );
+        let local_opaque = first
+            .node(&node_id_by_name(&first, "Client.opaqueIdP"))
+            .unwrap();
+        assert_eq!(
+            local_opaque.kind,
+            CertificateTheoremGraphNodeKind::Definition
+        );
+        assert_eq!(local_opaque.body_hash, None);
+        assert_eq!(
+            local_opaque.definition_reducibility,
+            Some(CertReducibility::Opaque)
+        );
+        assert_eq!(
+            local_opaque.definition_body_visibility,
+            Some(DefinitionBodyVisibility::CheckedNotExported)
+        );
+        let imported_opaque = first
+            .node(&node_id_by_name(&first, "Base.OpaqueType"))
+            .unwrap();
+        assert_eq!(
+            imported_opaque.kind,
+            CertificateTheoremGraphNodeKind::Definition
+        );
+        assert_eq!(imported_opaque.body_hash, None);
+        assert_eq!(
+            imported_opaque.definition_reducibility,
+            Some(CertReducibility::Opaque)
+        );
+        assert_eq!(
+            imported_opaque.definition_body_visibility,
+            Some(DefinitionBodyVisibility::Unavailable)
+        );
+        assert!(first
+            .nodes
+            .iter()
+            .filter(|node| { node.kind != CertificateTheoremGraphNodeKind::Definition })
+            .all(|node| {
+                node.definition_reducibility.is_none() && node.definition_body_visibility.is_none()
+            }));
         assert!(first.edges.iter().any(|edge| {
             edge.from == def.id
                 && edge.to == imported_axiom
@@ -2533,8 +2936,18 @@ mod tests {
             CertificateTheoremGraphError::ImportCertificateHashMissing { .. }
         ));
 
-        let mut cert = decode_module_cert(&client.bytes).unwrap();
-        cert.declarations[0].dependencies[0].decl_interface_hash = [7; 32];
+        let cert = decode_module_cert(&client.bytes).unwrap();
+        let dependency_hash = cert.declarations[0].dependencies[0].decl_interface_hash();
+        let mut duplicated_hashes = Vec::with_capacity(dependency_hash.len() * 2);
+        duplicated_hashes.extend(dependency_hash);
+        duplicated_hashes.extend(dependency_hash);
+        let mut mismatched_dependency_bytes = client.bytes.clone();
+        let duplicated_hash_offset = mismatched_dependency_bytes
+            .windows(duplicated_hashes.len())
+            .position(|window| window == duplicated_hashes)
+            .expect("imported dependency must encode its interface hash twice");
+        mismatched_dependency_bytes[duplicated_hash_offset + dependency_hash.len()] ^= 1;
+        let cert = decode_module_cert(&mismatched_dependency_bytes).unwrap();
         let err = extract_certificate_theorem_graph_from_cert(
             &cert,
             std::slice::from_ref(&base.verified),

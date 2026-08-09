@@ -1,20 +1,24 @@
 use npa_cert::{
     build_module_cert, build_module_cert_from_checked_candidates, canonical_import_env_keys,
-    canonical_import_export_views, check_core_decl_candidates, encode_module_cert,
-    initial_env_fingerprint, post_env_fingerprint, precheck_core_decl_candidate,
-    prior_chain_fingerprint, prior_chain_fingerprint_canonical_bytes,
-    producer_checked_decl_interface, producer_env_fingerprint,
-    producer_env_fingerprint_canonical_bytes, producer_import_env_key,
+    canonical_import_export_views, check_core_decl_candidates,
+    check_core_decl_candidates_with_measurement, encode_module_cert, initial_env_fingerprint,
+    post_env_fingerprint, precheck_core_decl_candidate, prior_chain_fingerprint,
+    prior_chain_fingerprint_canonical_bytes, producer_checked_decl_interface,
+    producer_env_fingerprint, producer_env_fingerprint_canonical_bytes, producer_import_env_key,
     producer_limits_canonical_bytes, producer_limits_hash, producer_lookup_env, stricter_or_equal,
     validate_candidate_batch_imports, validate_prior_current_decls, verify_module_cert,
     AxiomPolicy, AxiomRef, CandidateBatch, CandidateBatchResult, CandidateHashPreview,
-    CandidateStatus, CertError, CheckedDeclCandidate, CoreDeclCandidate, CoreModule, GlobalRef,
-    ModuleCert, Name, ProducerCheckedDeclInterface, ProducerEnvFingerprintBytes,
+    CandidateStatus, CertError, CertReducibility, CheckedDeclCandidate, CoreDeclCandidate,
+    CoreModule, DeclPayload, DependencyEntryKind, GlobalRef, ModuleCert, Name,
+    ProducerBatchMeasurement, ProducerCheckedDeclInterface, ProducerEnvFingerprintBytes,
     ProducerImportEnvKey, ProducerLimitKind, ProducerLimits, ProducerPriorChainBytes,
     ProducerPriorChainEntry, ProducerProfile, ProducerTokenHashField, VerifiedModule,
     VerifierSession,
 };
-use npa_kernel::{Decl, Env, Error as KernelError, Expr, Level, Reducibility, ResourceLimitKind};
+use npa_kernel::{
+    Decl, Env, Error as KernelError, Expr, KernelExecutionOptions, Level, Reducibility,
+    ResourceLimitKind,
+};
 
 fn trivial_axiom(name: &str) -> Decl {
     Decl::Axiom {
@@ -278,6 +282,41 @@ fn accepted_tokens(result: CandidateBatchResult) -> Vec<CheckedDeclCandidate> {
         .collect()
 }
 
+fn opaque_id(name: &str, value: Expr) -> Decl {
+    Decl::Def {
+        name: name.to_owned(),
+        universe_params: vec!["u".to_owned()],
+        ty: id_type("A", "x"),
+        value,
+        reducibility: Reducibility::Opaque,
+    }
+}
+
+fn id_theorem(name: &str, proof: &str) -> Decl {
+    Decl::Theorem {
+        name: name.to_owned(),
+        universe_params: vec!["u".to_owned()],
+        ty: id_type("A", "x"),
+        proof: Expr::konst(proof, vec![Level::param("u")]),
+    }
+}
+
+fn checked_tokens(declarations: Vec<Decl>) -> Vec<CheckedDeclCandidate> {
+    let declaration_count = declarations.len() as u32;
+    accepted_tokens(
+        check_core_decl_candidates(CandidateBatch {
+            imports: &[],
+            prior_current_decls: &[],
+            candidates: declarations
+                .into_iter()
+                .map(|declaration| CoreDeclCandidate { declaration })
+                .collect(),
+            limits: generous_limits_with_declarations(declaration_count),
+        })
+        .unwrap(),
+    )
+}
+
 fn prior_entry(
     decl_interface_hash: [u8; 32],
     decl_certificate_hash: [u8; 32],
@@ -478,6 +517,323 @@ fn check_core_decl_candidates_accepts_import_and_builtin_references() {
     };
     let builtin_tokens = accepted_tokens(check_core_decl_candidates(builtin_batch).unwrap());
     assert!(builtin_tokens[0].limit_profile_hash_matches());
+}
+
+fn opaque_alias_body_chain(value: Expr) -> Vec<Decl> {
+    vec![
+        Decl::Def {
+            name: "hidden_type".to_owned(),
+            universe_params: vec![],
+            ty: Expr::sort(Level::succ(Level::zero())),
+            value,
+            reducibility: Reducibility::Opaque,
+        },
+        Decl::Def {
+            name: "alias_type".to_owned(),
+            universe_params: vec![],
+            ty: Expr::sort(Level::succ(Level::zero())),
+            value: Expr::konst("hidden_type", vec![]),
+            reducibility: Reducibility::Reducible,
+        },
+        Decl::Axiom {
+            name: "hidden_witness".to_owned(),
+            universe_params: vec![],
+            ty: Expr::konst("alias_type", vec![]),
+        },
+        Decl::Theorem {
+            name: "uses_hidden_witness".to_owned(),
+            universe_params: vec![],
+            ty: Expr::sort(Level::zero()),
+            proof: Expr::konst("hidden_witness", vec![]),
+        },
+    ]
+}
+
+#[test]
+fn producer_opaque_candidate_chain_uses_local_view_and_builds_v0_3_certificate() {
+    let declarations = opaque_alias_body_chain(Expr::sort(Level::zero()));
+    let tokens = checked_tokens(declarations);
+
+    assert!(tokens[0].local_implementation_dependencies().is_empty());
+    assert!(tokens[1]
+        .local_implementation_dependencies()
+        .iter()
+        .any(|dependency| {
+            dependency.kind() == DependencyEntryKind::LocalImplementation
+                && matches!(dependency.global_ref(), GlobalRef::Local { decl_index: 0 })
+        }));
+    assert!(tokens[3]
+        .local_implementation_dependencies()
+        .iter()
+        .any(|dependency| {
+            dependency.kind() == DependencyEntryKind::LocalImplementation
+                && matches!(dependency.global_ref(), GlobalRef::Local { decl_index: 0 })
+        }));
+
+    let cert = build_module_cert_from_checked_candidates(
+        Name::from_dotted("Producer.OpaqueLocalView"),
+        &[],
+        &tokens,
+    )
+    .unwrap();
+    assert_eq!(cert.header.format, "NPA-CERT-0.3.0");
+    assert!(matches!(
+        cert.declarations[0].decl,
+        DeclPayload::Def {
+            reducibility: CertReducibility::Opaque,
+            ..
+        }
+    ));
+    let bytes = encode_module_cert(&cert).unwrap();
+    let mut session = VerifierSession::new();
+    verify_module_cert(&bytes, &mut session, &AxiomPolicy::normal()).unwrap();
+}
+
+#[test]
+fn producer_alias_chain_body_mutation_rechecks_and_rejects_dependent_token() {
+    let old_tokens = checked_tokens(opaque_alias_body_chain(Expr::sort(Level::zero())));
+    let changed_hidden = Decl::Def {
+        name: "hidden_type".to_owned(),
+        universe_params: vec![],
+        ty: Expr::sort(Level::succ(Level::zero())),
+        value: Expr::pi("x", Expr::sort(Level::zero()), Expr::sort(Level::zero())),
+        reducibility: Reducibility::Opaque,
+    };
+    let changed_hidden_token = checked_tokens(vec![changed_hidden]).remove(0);
+    let rebound_chain = std::iter::once(changed_hidden_token)
+        .chain(old_tokens.into_iter().skip(1))
+        .collect::<Vec<_>>();
+    let mut measurement = ProducerBatchMeasurement::default();
+    let error = check_core_decl_candidates_with_measurement(
+        CandidateBatch {
+            imports: &[],
+            prior_current_decls: &rebound_chain,
+            candidates: vec![],
+            limits: generous_limits_with_declarations(4),
+        },
+        &mut measurement,
+    )
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        CertError::Kernel(KernelError::TypeMismatch { .. })
+    ));
+    assert!(measurement.dependency_rechecks > 0);
+    assert_eq!(measurement.prior_chain_rebinds, 0);
+}
+
+#[test]
+fn producer_stable_theorem_interface_rebinds_unrelated_suffix_without_recheck() {
+    let old_declarations = vec![
+        opaque_id("hidden", id_value("A", "x")),
+        id_theorem("stable_spec", "hidden"),
+        id_theorem("uses_stable_spec", "stable_spec"),
+    ];
+    let old_tokens = checked_tokens(old_declarations.clone());
+    let changed_hidden = opaque_id("hidden", id_value_with_beta_redex());
+    let changed_hidden_token = checked_tokens(vec![changed_hidden.clone()]).remove(0);
+    let rebound_chain = std::iter::once(changed_hidden_token)
+        .chain(old_tokens.into_iter().skip(1))
+        .collect::<Vec<_>>();
+    let after = id_theorem("after_rebind", "uses_stable_spec");
+    let mut measurement = ProducerBatchMeasurement::default();
+    let rebound_result = check_core_decl_candidates_with_measurement(
+        CandidateBatch {
+            imports: &[],
+            prior_current_decls: &rebound_chain,
+            candidates: vec![CoreDeclCandidate {
+                declaration: after.clone(),
+            }],
+            limits: generous_limits_with_declarations(4),
+        },
+        &mut measurement,
+    )
+    .unwrap();
+    let rebound_after = accepted_tokens(rebound_result).remove(0);
+
+    let fresh_chain_tokens = checked_tokens(vec![
+        changed_hidden.clone(),
+        old_declarations[1].clone(),
+        old_declarations[2].clone(),
+    ]);
+    let rebound_cert = build_module_cert_from_checked_candidates(
+        Name::from_dotted("Producer.ReboundStableInterface"),
+        &[],
+        &rebound_chain,
+    )
+    .unwrap();
+    let fresh_cert = build_module_cert_from_checked_candidates(
+        Name::from_dotted("Producer.ReboundStableInterface"),
+        &[],
+        &fresh_chain_tokens,
+    )
+    .unwrap();
+    assert_eq!(
+        encode_module_cert(&rebound_cert).unwrap(),
+        encode_module_cert(&fresh_cert).unwrap()
+    );
+
+    let fresh_after = checked_tokens(vec![
+        changed_hidden,
+        old_declarations[1].clone(),
+        old_declarations[2].clone(),
+        after,
+    ])
+    .remove(3);
+    assert_eq!(measurement.dependency_rechecks, 1);
+    assert_eq!(measurement.prior_chain_rebinds, 1);
+    assert_eq!(
+        rebound_after.prior_chain_fingerprint(),
+        fresh_after.prior_chain_fingerprint()
+    );
+    assert_eq!(
+        rebound_after.dependency_fingerprint(),
+        fresh_after.dependency_fingerprint()
+    );
+    assert_eq!(
+        rebound_after.decl_certificate_hash(),
+        fresh_after.decl_certificate_hash()
+    );
+}
+
+#[test]
+fn producer_unrelated_body_reuse_counts_safe_rebind_only() {
+    let independent = Decl::Theorem {
+        name: "independent".to_owned(),
+        universe_params: vec!["u".to_owned()],
+        ty: id_type("A", "x"),
+        proof: id_value("A", "x"),
+    };
+    let old_tokens = checked_tokens(vec![
+        opaque_id("unrelated_hidden", id_value("A", "x")),
+        independent,
+    ]);
+    let changed = checked_tokens(vec![opaque_id(
+        "unrelated_hidden",
+        id_value_with_beta_redex(),
+    )])
+    .remove(0);
+    let rebound_chain = vec![changed, old_tokens[1].clone()];
+    let mut measurement = ProducerBatchMeasurement::default();
+    check_core_decl_candidates_with_measurement(
+        CandidateBatch {
+            imports: &[],
+            prior_current_decls: &rebound_chain,
+            candidates: vec![],
+            limits: generous_limits_with_declarations(2),
+        },
+        &mut measurement,
+    )
+    .unwrap();
+
+    assert_eq!(measurement.dependency_rechecks, 0);
+    assert_eq!(measurement.prior_chain_rebinds, 1);
+}
+
+#[test]
+fn producer_candidate_precheck_is_identical_with_memo_off_and_on_local_opaque_view() {
+    let candidate = CoreDeclCandidate {
+        declaration: Decl::Theorem {
+            name: "uses_hidden_witness".to_owned(),
+            universe_params: vec![],
+            ty: Expr::sort(Level::zero()),
+            proof: Expr::konst("hidden_witness", vec![]),
+        },
+    };
+    let check = |options| {
+        let mut env = Env::with_execution_options(options);
+        env.add_def(
+            "hidden_type",
+            vec![],
+            Expr::sort(Level::succ(Level::zero())),
+            Expr::sort(Level::zero()),
+            Reducibility::Opaque,
+        )
+        .unwrap();
+        assert!(env.expose_checked_opaque_definition("hidden_type"));
+        env.add_axiom("hidden_witness", vec![], Expr::konst("hidden_type", vec![]))
+            .unwrap();
+        precheck_core_decl_candidate(&env, &candidate, &generous_limits())
+    };
+
+    assert_eq!(
+        check(KernelExecutionOptions::memo_off()),
+        check(KernelExecutionOptions::ephemeral_memo())
+    );
+    assert!(check(KernelExecutionOptions::memo_off()).is_ok());
+}
+
+#[test]
+fn producer_selected_v0_3_pair_survives_rejected_opaque_candidate() {
+    let result = check_core_decl_candidates(CandidateBatch {
+        imports: &[],
+        prior_current_decls: &[],
+        candidates: vec![
+            CoreDeclCandidate {
+                declaration: trivial_axiom("PlainAccepted"),
+            },
+            CoreDeclCandidate {
+                declaration: Decl::Def {
+                    name: "BadOpaque".to_owned(),
+                    universe_params: vec![],
+                    ty: Expr::sort(Level::zero()),
+                    value: Expr::sort(Level::zero()),
+                    reducibility: Reducibility::Opaque,
+                },
+            },
+        ],
+        limits: generous_limits_with_declarations(2),
+    })
+    .unwrap();
+    let first = match &result.statuses[0] {
+        CandidateStatus::Accepted(token) => token.clone(),
+        CandidateStatus::Rejected(error) => panic!("unexpected rejection: {error:?}"),
+    };
+    assert!(matches!(result.statuses[1], CandidateStatus::Rejected(_)));
+
+    let cert = build_module_cert_from_checked_candidates(
+        Name::from_dotted("Producer.RejectedOpaquePair"),
+        &[],
+        &[first],
+    )
+    .unwrap();
+    assert_eq!(cert.header.format, "NPA-CERT-0.3.0");
+}
+
+#[test]
+fn producer_plain_prior_token_is_already_current_before_late_opaque_candidate() {
+    let plain = checked_tokens(vec![trivial_axiom("PlainPrior")]).remove(0);
+    let opaque = Decl::Def {
+        name: "LateOpaque".to_owned(),
+        universe_params: vec![],
+        ty: Expr::sort(Level::succ(Level::zero())),
+        value: Expr::sort(Level::zero()),
+        reducibility: Reducibility::Opaque,
+    };
+    let mut measurement = ProducerBatchMeasurement::default();
+    let result = check_core_decl_candidates_with_measurement(
+        CandidateBatch {
+            imports: &[],
+            prior_current_decls: std::slice::from_ref(&plain),
+            candidates: vec![CoreDeclCandidate {
+                declaration: opaque,
+            }],
+            limits: generous_limits_with_declarations(2),
+        },
+        &mut measurement,
+    )
+    .unwrap();
+    let opaque = accepted_tokens(result).remove(0);
+    assert_eq!(measurement.dependency_rechecks, 0);
+
+    let cert = build_module_cert_from_checked_candidates(
+        Name::from_dotted("Producer.LateOpaqueUpgrade"),
+        &[],
+        &[plain, opaque],
+    )
+    .unwrap();
+    assert_eq!(cert.header.format, "NPA-CERT-0.3.0");
 }
 
 #[test]
@@ -947,6 +1303,8 @@ fn build_module_cert_from_checked_candidates_builds_verifiable_certificate() {
     )
     .unwrap();
     assert_eq!(cert.declarations.len(), 2);
+    assert_eq!(cert.header.format, "NPA-CERT-0.3.0");
+    assert_eq!(cert.header.core_spec, "NPA-Core-0.3.0");
 
     let bytes = encode_module_cert(&cert).unwrap();
     let mut session = VerifierSession::new();

@@ -450,8 +450,8 @@ fn analyze_theorem(
         .iter()
         .map(|dependency| {
             Ok(VerifiedTheoremGlobalDependency {
-                global_ref: dependency.global_ref.clone(),
-                decl_interface_hash: dependency.decl_interface_hash,
+                global_ref: dependency.global_ref().clone(),
+                decl_interface_hash: dependency.decl_interface_hash(),
                 kind: resolve_dependency_kind(module, imports, dependency)?,
             })
         })
@@ -721,7 +721,7 @@ fn resolve_dependency_kind(
     imports: &[&VerifiedModule],
     dependency: &crate::DependencyEntry,
 ) -> std::result::Result<VerifiedTheoremGlobalDependencyKind, VerifiedTheoremPremiseAnalysisError> {
-    match &dependency.global_ref {
+    match dependency.global_ref() {
         GlobalRef::Builtin {
             name,
             decl_interface_hash,
@@ -730,7 +730,7 @@ fn resolve_dependency_kind(
                 .name_table
                 .get(*name)
                 .ok_or_else(|| invalid_verified_module(None))?;
-            if *decl_interface_hash != dependency.decl_interface_hash
+            if *decl_interface_hash != dependency.decl_interface_hash()
                 || builtin_decl_interface_hash(name) != Some(*decl_interface_hash)
             {
                 return Err(invalid_verified_module(None));
@@ -746,7 +746,7 @@ fn resolve_dependency_kind(
                 .declarations
                 .get(*decl_index)
                 .ok_or_else(|| invalid_verified_module(None))?;
-            if decl.hashes.decl_interface_hash != dependency.decl_interface_hash {
+            if decl.hashes.decl_interface_hash != dependency.decl_interface_hash() {
                 return Err(invalid_verified_module(None));
             }
             Ok(decl_payload_kind(&decl.decl))
@@ -757,7 +757,7 @@ fn resolve_dependency_kind(
                 .iter()
                 .find(|entry| {
                     entry.name == *name
-                        && entry.decl_interface_hash == dependency.decl_interface_hash
+                        && entry.decl_interface_hash == dependency.decl_interface_hash()
                 })
                 .ok_or_else(|| invalid_verified_module(None))?;
             export_kind(entry.kind).ok_or_else(|| invalid_verified_module(None))
@@ -767,7 +767,7 @@ fn resolve_dependency_kind(
             name,
             decl_interface_hash,
         } => {
-            if *decl_interface_hash != dependency.decl_interface_hash {
+            if *decl_interface_hash != dependency.decl_interface_hash() {
                 return Err(invalid_verified_module(None));
             }
             let imported = imports
@@ -885,11 +885,12 @@ fn analysis_error(
 
 #[cfg(test)]
 mod tests {
-    use npa_kernel::{prop, Decl, Expr, Level, UniverseConstraint};
+    use npa_kernel::{prop, Decl, Expr, Level, Reducibility, UniverseConstraint};
 
     use super::*;
     use crate::{
-        build_module_cert, verify_built_module_cert_with_import_refs, AxiomPolicy, CoreModule,
+        build_module_cert, build_module_cert_from_import_refs_with_preferred_imports,
+        verify_built_module_cert_with_import_refs, AxiomPolicy, CoreModule,
     };
 
     fn identity_statement() -> Expr {
@@ -985,6 +986,48 @@ mod tests {
         assert_eq!(
             analysis.global_dependencies[0].kind,
             VerifiedTheoremGlobalDependencyKind::Theorem
+        );
+    }
+
+    #[test]
+    fn theorem_premise_dependency_resolver_accepts_local_opaque_implementation() {
+        let cert = build_module_cert_from_import_refs_with_preferred_imports(
+            CoreModule {
+                name: Name::from_dotted("Premise.Test"),
+                declarations: vec![
+                    Decl::Def {
+                        name: "opaque_identity".to_owned(),
+                        universe_params: vec![],
+                        ty: identity_statement(),
+                        value: identity_proof(),
+                        reducibility: Reducibility::Opaque,
+                    },
+                    Decl::Def {
+                        name: "uses_opaque_identity".to_owned(),
+                        universe_params: vec![],
+                        ty: identity_statement(),
+                        value: Expr::konst("opaque_identity", vec![]),
+                        reducibility: Reducibility::Reducible,
+                    },
+                ],
+            },
+            &[],
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        let module =
+            verify_built_module_cert_with_import_refs(&cert, &[], &AxiomPolicy::normal()).unwrap();
+        let dependency = module
+            .declarations()
+            .iter()
+            .flat_map(|decl| &decl.dependencies)
+            .find(|dependency| dependency.kind() == crate::DependencyEntryKind::LocalImplementation)
+            .unwrap();
+
+        assert!(matches!(dependency.global_ref(), GlobalRef::Local { .. }));
+        assert_eq!(
+            resolve_dependency_kind(&module, &[], dependency).unwrap(),
+            VerifiedTheoremGlobalDependencyKind::Definition
         );
     }
 

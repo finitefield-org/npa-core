@@ -11,6 +11,9 @@ pub enum MachineDiagnosticSeverity {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MachineDiagnosticKind {
     ParseError,
+    OpaqueModifierNotFollowedByDef,
+    DuplicateOpaqueModifier,
+    UnsupportedOpaqueDefinition,
     UnsupportedItem,
     UnsupportedSyntax,
     ImportAfterItem,
@@ -121,6 +124,33 @@ impl MachineDiagnostic {
             MachineDiagnosticKind::UnsupportedSyntax,
             primary_span,
             format!("unsupported Machine Surface syntax: {}", syntax.into()),
+        )
+    }
+
+    pub fn opaque_modifier_not_followed_by_def(
+        primary_span: Span,
+        following: impl Into<String>,
+    ) -> Self {
+        Self::error(
+            MachineDiagnosticKind::OpaqueModifierNotFollowedByDef,
+            primary_span,
+            format!("`opaque` may only modify `def`; found {}", following.into()),
+        )
+    }
+
+    pub fn duplicate_opaque_modifier(primary_span: Span) -> Self {
+        Self::error(
+            MachineDiagnosticKind::DuplicateOpaqueModifier,
+            primary_span,
+            "duplicate `opaque` modifier before `def`",
+        )
+    }
+
+    pub fn unsupported_opaque_definition(primary_span: Span) -> Self {
+        Self::error(
+            MachineDiagnosticKind::UnsupportedOpaqueDefinition,
+            primary_span,
+            "opaque definitions are parsed but not yet supported by Machine Surface compilation",
         )
     }
 

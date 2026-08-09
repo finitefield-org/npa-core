@@ -15,9 +15,9 @@ use std::{
 };
 
 use npa_cert::{
-    build_module_cert, decode_module_cert, verify_module_cert, AxiomPolicy, AxiomRef, CertError,
-    CoreModule, DeclCert, DeclPayload, ExportEntry, ExportKind, GlobalRef, Hash, ImportEntry,
-    ModuleCert, Name, TermId, TermNode, TrustMode, VerifiedModule, VerifierSession,
+    build_module_cert_v0_2_compat, decode_module_cert, verify_module_cert, AxiomPolicy, AxiomRef,
+    CertError, CoreModule, DeclCert, DeclPayload, ExportEntry, ExportKind, GlobalRef, Hash,
+    ImportEntry, ModuleCert, Name, TermId, TermNode, TrustMode, VerifiedModule, VerifierSession,
 };
 use npa_kernel::{eq_inductive, level::normalize_level, nat_inductive, type0, Decl, Expr, Level};
 use npa_tactic::{
@@ -1373,7 +1373,7 @@ pub fn build_legacy_std_package_module_cert(
         "Std.Nat.Basic" => legacy_std_nat_basic_core_module(),
         _ => return None,
     };
-    Some(build_module_cert(core, imports))
+    Some(build_module_cert_v0_2_compat(core, imports))
 }
 
 fn legacy_std_logic_eq_core_module() -> CoreModule {

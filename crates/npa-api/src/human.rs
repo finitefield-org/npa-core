@@ -1718,6 +1718,9 @@ fn human_lsp_diagnostic_data(
         candidates: payload
             .map(|payload| payload.candidates.clone())
             .unwrap_or_default(),
+        related_declarations: payload
+            .map(|payload| payload.related_declarations.clone())
+            .unwrap_or_default(),
         hole_goals: payload
             .map(|payload| {
                 payload
@@ -1753,6 +1756,16 @@ fn human_lsp_diagnostic_kind_code(kind: &npa_frontend::HumanDiagnosticKind) -> &
     match kind {
         npa_frontend::HumanDiagnosticKind::NotImplemented => "not_implemented",
         npa_frontend::HumanDiagnosticKind::ParseError => "parse_error",
+        npa_frontend::HumanDiagnosticKind::OpaqueModifierNotFollowedByDef => {
+            "opaque_modifier_not_followed_by_def"
+        }
+        npa_frontend::HumanDiagnosticKind::DuplicateOpaqueModifier => "duplicate_opaque_modifier",
+        npa_frontend::HumanDiagnosticKind::UnsupportedOpaqueEquationDefinition => {
+            "unsupported_opaque_equation_definition"
+        }
+        npa_frontend::HumanDiagnosticKind::UnsupportedOpaqueDefinition => {
+            "unsupported_opaque_definition"
+        }
         npa_frontend::HumanDiagnosticKind::ImportAfterItem => "import_after_item",
         npa_frontend::HumanDiagnosticKind::UnsupportedSyntax => "unsupported_syntax",
         npa_frontend::HumanDiagnosticKind::ImportResolutionError => "import_resolution_error",
@@ -5086,7 +5099,7 @@ fn human_dependency_entry_to_index(
     dependency: &DependencyEntry,
 ) -> Result<HumanTheoremDependency, HumanTheoremIndexError> {
     let module = owner.verified_module();
-    match &dependency.global_ref {
+    match dependency.global_ref() {
         GlobalRef::Local { decl_index } => {
             let decl = module.declarations().get(*decl_index).ok_or_else(|| {
                 HumanTheoremIndexError::MissingDeclaration {
@@ -5100,7 +5113,7 @@ fn human_dependency_entry_to_index(
                 module: Some(owner.module().clone()),
                 export_hash: Some(owner.export_hash()),
                 source_index: None,
-                decl_interface_hash: Some(dependency.decl_interface_hash),
+                decl_interface_hash: Some(dependency.decl_interface_hash()),
             })
         }
         GlobalRef::LocalGenerated { name, .. } => Ok(HumanTheoremDependency {
@@ -5109,7 +5122,7 @@ fn human_dependency_entry_to_index(
             module: Some(owner.module().clone()),
             export_hash: Some(owner.export_hash()),
             source_index: None,
-            decl_interface_hash: Some(dependency.decl_interface_hash),
+            decl_interface_hash: Some(dependency.decl_interface_hash()),
         }),
         GlobalRef::Imported {
             import_index,
@@ -5768,6 +5781,13 @@ fn build_human_document_incremental_cache(
     prior: Option<&HumanDocumentIncrementalCache>,
 ) -> HumanDocumentIncrementalCache {
     let import_interface_hash = human_document_import_interface_hash(document, collection);
+    let (owner_certificate_format, owner_core_spec) = ("NPA-CERT-0.3.0", "NPA-Core-0.3.0");
+    let canonical_checked_current = human_document_checked_current_facts(
+        document,
+        collection,
+        owner_certificate_format,
+        owner_core_spec,
+    );
     let mut declarations = Vec::new();
     if let Some(source_interface) = &collection.source_interface {
         for (source_index, decl) in source_interface
@@ -5779,9 +5799,31 @@ fn build_human_document_incremental_cache(
             let source_decl_hash = human_document_source_decl_hash(document, decl);
             let resolved_decl_hash =
                 human_document_resolved_decl_hash(import_interface_hash, source_decl_hash, decl);
-            let core_decl_hash = human_document_core_decl_hash(resolved_decl_hash, decl);
+            let fallback_core_decl_hash = human_document_core_decl_hash(resolved_decl_hash, decl);
+            let canonical_fact = canonical_checked_current
+                .as_ref()
+                .and_then(|facts| facts.get(source_index));
+            let core_decl_hash = canonical_fact
+                .map(|fact| fact.core_decl_hash)
+                .unwrap_or(fallback_core_decl_hash);
+            let dependency_selective_fingerprint = canonical_fact
+                .map(|fact| fact.dependency_selective_fingerprint)
+                .unwrap_or_else(|| {
+                    human_document_dependency_selective_fingerprint(
+                        owner_certificate_format,
+                        owner_core_spec,
+                        import_interface_hash,
+                        core_decl_hash,
+                        decl,
+                    )
+                });
             declarations.push(HumanDocumentIncrementalDeclCacheEntry {
                 source_index: source_index as u64,
+                definition_reducibility: decl.definition_reducibility,
+                owner_certificate_format: owner_certificate_format.to_owned(),
+                owner_core_spec: owner_core_spec.to_owned(),
+                dependency_selective_fingerprint,
+                dependency_selective_fingerprint_is_canonical: canonical_fact.is_some(),
                 source_decl_hash,
                 resolved_decl_hash,
                 core_decl_hash,
@@ -5803,6 +5845,8 @@ fn build_human_document_incremental_cache(
                 .take_while(|(current, previous)| {
                     current.source_index == previous.source_index
                         && current.source_decl_hash == previous.source_decl_hash
+                        && current.owner_certificate_format == previous.owner_certificate_format
+                        && current.owner_core_spec == previous.owner_core_spec
                 })
                 .count()
         })
@@ -5816,6 +5860,24 @@ fn build_human_document_incremental_cache(
             current.resolved_decl_hash = previous.resolved_decl_hash;
             current.core_decl_hash = previous.core_decl_hash;
             current.reuse = HumanDocumentIncrementalDeclReuse::Reused;
+        }
+        for (current, previous) in declarations
+            .iter_mut()
+            .zip(&prior.declarations)
+            .skip(reused_prefix_len)
+        {
+            let rebound_and_revalidated = current.dependency_selective_fingerprint_is_canonical
+                && previous.dependency_selective_fingerprint_is_canonical;
+            if rebound_and_revalidated
+                && current.source_index == previous.source_index
+                && current.owner_certificate_format == previous.owner_certificate_format
+                && current.owner_core_spec == previous.owner_core_spec
+                && current.core_decl_hash == previous.core_decl_hash
+                && current.dependency_selective_fingerprint
+                    == previous.dependency_selective_fingerprint
+            {
+                current.reuse = HumanDocumentIncrementalDeclReuse::Reused;
+            }
         }
     }
 
@@ -5835,6 +5897,96 @@ fn build_human_document_incremental_cache(
         recomputed_from: suffix_changed.then_some(reused_prefix_len as u64),
         declarations,
     }
+}
+
+#[derive(Clone, Copy)]
+struct HumanDocumentCheckedCurrentFact {
+    core_decl_hash: Hash,
+    dependency_selective_fingerprint: Hash,
+}
+
+fn human_document_checked_current_facts(
+    document: &HumanDocumentSnapshot,
+    collection: &HumanSessionDocumentCollection,
+    owner_certificate_format: &str,
+    owner_core_spec: &str,
+) -> Option<Vec<HumanDocumentCheckedCurrentFact>> {
+    // A synthetic final proof target lets the ordinary proof-start bridge
+    // produce the exact qualified prior chain without accepting a proof term.
+    // Incomplete earlier proof blocks and unchecked axioms return `None`, so
+    // their authoring cache remains conservative and cannot use suffix reuse.
+    let verified_imports = document
+        .verified_modules
+        .iter()
+        .map(npa_frontend::VerifiedImport::from)
+        .collect::<Vec<_>>();
+    let frontend_options = npa_frontend::HumanCompileOptions::from(&document.options);
+    let source_interface = collection.source_interface.as_ref()?;
+    let mut probe_suffix = 0_u64;
+    let probe_name = loop {
+        let candidate = format!("NpaDocumentCacheProbe{probe_suffix}");
+        if !source_interface
+            .declarations
+            .iter()
+            .any(|decl| decl.name.as_dotted() == candidate)
+        {
+            break candidate;
+        }
+        probe_suffix = probe_suffix.checked_add(1)?;
+    };
+    let mut probe_source = document.source.clone();
+    if !probe_source.ends_with('\n') {
+        probe_source.push('\n');
+    }
+    probe_source.push_str(&format!("theorem {probe_name} : Prop := by simp-lite"));
+    let mut theorem_parts = document.current_module.0.clone();
+    theorem_parts.push(probe_name);
+    let prepared = npa_frontend::prepare_human_proof_start_core_with_source_interfaces(
+        document.file_id,
+        document.current_module.clone(),
+        npa_cert::Name(theorem_parts),
+        &probe_source,
+        &verified_imports,
+        &document.imported_source_interfaces,
+        &frontend_options,
+    )
+    .ok()?;
+    if prepared.proof.owner_certificate_format != owner_certificate_format
+        || prepared.proof.owner_core_spec != owner_core_spec
+    {
+        return None;
+    }
+    let source_declaration_count = source_interface
+        .declarations
+        .iter()
+        .filter(|decl| decl.kind != npa_frontend::HumanSourceDeclarationKind::Imported)
+        .count();
+    if prepared.proof.prior_declarations.len() != source_declaration_count {
+        return None;
+    }
+    let imports =
+        active_human_verified_import_refs(&document.verified_modules, &collection.active_imports)
+            .ok()?;
+    let mut checked = Vec::with_capacity(prepared.proof.prior_declarations.len());
+    let mut facts = Vec::with_capacity(prepared.proof.prior_declarations.len());
+    for (source_index, decl) in prepared.proof.prior_declarations.into_iter().enumerate() {
+        let current = npa_tactic::check_current_decl_for_machine_tactic_from_verified_imports_with_kernel_profile_and_owner_pair(
+            document.options.kernel_profile,
+            &imports,
+            &checked,
+            source_index as u64,
+            decl,
+            owner_certificate_format,
+            owner_core_spec,
+        )
+        .ok()?;
+        facts.push(HumanDocumentCheckedCurrentFact {
+            core_decl_hash: current.core_decl_hash(),
+            dependency_selective_fingerprint: current.dependency_selective_fingerprint(),
+        });
+        checked.push(current);
+    }
+    Some(facts)
 }
 
 fn reuse_human_document_incremental_prefix(
@@ -5872,7 +6024,7 @@ fn human_document_import_interface_hash(
     collection: &HumanSessionDocumentCollection,
 ) -> Hash {
     let mut out = Vec::new();
-    human_encode_string(&mut out, "npa.human-api.document-import-interface.v1");
+    human_encode_string(&mut out, "npa.human-api.document-import-interface.v2");
     human_encode_name(&mut out, &document.current_module);
     human_encode_uvar(&mut out, document.file_id.0 as u64);
     human_encode_human_api_options(&mut out, &document.options);
@@ -5881,6 +6033,8 @@ fn human_document_import_interface_hash(
         human_encode_name(&mut out, verified.module());
         out.extend(verified.export_hash());
         out.extend(verified.certificate_hash());
+        human_encode_string(&mut out, verified.certificate_format());
+        human_encode_string(&mut out, verified.core_spec());
     }
     human_encode_list_len(&mut out, document.imported_source_interfaces.len());
     for interface in &document.imported_source_interfaces {
@@ -5898,7 +6052,7 @@ fn human_document_source_decl_hash(
     decl: &npa_frontend::HumanSourceDeclarationMetadata,
 ) -> Hash {
     let mut out = Vec::new();
-    human_encode_string(&mut out, "npa.human-api.document-source-decl.v1");
+    human_encode_string(&mut out, "npa.human-api.document-source-decl.v2");
     human_encode_string(&mut out, human_source_declaration_kind_str(decl.kind));
     human_encode_human_name(&mut out, &decl.name);
     human_encode_span(&mut out, decl.span);
@@ -5921,7 +6075,7 @@ fn human_document_resolved_decl_hash(
     decl: &npa_frontend::HumanSourceDeclarationMetadata,
 ) -> Hash {
     let mut out = Vec::new();
-    human_encode_string(&mut out, "npa.human-api.document-resolved-decl.v1");
+    human_encode_string(&mut out, "npa.human-api.document-resolved-decl.v2");
     out.extend(import_interface_hash);
     out.extend(source_decl_hash);
     human_encode_source_decl_metadata(&mut out, decl, false);
@@ -5933,9 +6087,26 @@ fn human_document_core_decl_hash(
     decl: &npa_frontend::HumanSourceDeclarationMetadata,
 ) -> Hash {
     let mut out = Vec::new();
-    human_encode_string(&mut out, "npa.human-api.document-core-decl.v1");
+    human_encode_string(&mut out, "npa.human-api.document-core-decl.v2");
     out.extend(resolved_decl_hash);
     human_encode_option_hash(&mut out, decl.decl_interface_hash.as_ref());
+    human_sha256(&out)
+}
+
+fn human_document_dependency_selective_fingerprint(
+    owner_certificate_format: &str,
+    owner_core_spec: &str,
+    import_interface_hash: Hash,
+    core_decl_hash: Hash,
+    decl: &npa_frontend::HumanSourceDeclarationMetadata,
+) -> Hash {
+    let mut out = Vec::new();
+    human_encode_string(&mut out, "npa.human-api.document-dependency-selective.v1");
+    human_encode_string(&mut out, owner_certificate_format);
+    human_encode_string(&mut out, owner_core_spec);
+    out.extend(import_interface_hash);
+    out.extend(core_decl_hash);
+    human_encode_source_decl_metadata(&mut out, decl, false);
     human_sha256(&out)
 }
 
@@ -6086,6 +6257,11 @@ fn human_encode_source_decl_metadata(
     include_span: bool,
 ) {
     human_encode_string(out, human_source_declaration_kind_str(decl.kind));
+    match decl.definition_reducibility {
+        None => out.push(0x00),
+        Some(npa_frontend::DefinitionReducibility::Reducible) => out.push(0x01),
+        Some(npa_frontend::DefinitionReducibility::Opaque) => out.push(0x02),
+    }
     human_encode_human_name(out, &decl.name);
     human_encode_list_len(out, decl.universe_params.len());
     for param in &decl.universe_params {
@@ -6308,6 +6484,8 @@ fn start_human_proof_from_prepared(
 ) -> Result<HumanStartProofOk, HumanStartProofError> {
     let machine_tactic_imports =
         active_human_verified_import_refs(verified_modules, &prepared.active_imports)?;
+    let owner_certificate_format = prepared.proof.owner_certificate_format.clone();
+    let owner_core_spec = prepared.proof.owner_core_spec.clone();
     let mut checked_current_decls = Vec::with_capacity(prepared.proof.prior_declarations.len());
     for (source_index, decl) in prepared
         .proof
@@ -6317,12 +6495,14 @@ fn start_human_proof_from_prepared(
         .enumerate()
     {
         let checked =
-            npa_tactic::check_current_decl_for_machine_tactic_from_verified_imports_with_kernel_profile(
+            npa_tactic::check_current_decl_for_machine_tactic_from_verified_imports_with_kernel_profile_and_owner_pair(
                 options.kernel_profile,
                 &machine_tactic_imports,
                 &checked_current_decls,
                 source_index as u64,
                 decl,
+                &owner_certificate_format,
+                &owner_core_spec,
             )?;
         checked_current_decls.push(checked);
     }
@@ -6353,15 +6533,21 @@ fn human_build_and_verify_certificate(
     certificate_imports: &[npa_cert::VerifiedModule],
     source: HumanCurrentModuleSource<'_>,
 ) -> Result<npa_cert::ModuleCert, HumanCompileError> {
-    let certificate =
-        npa_cert::build_module_cert(core_module, certificate_imports).map_err(|err| {
-            npa_frontend::HumanDiagnostic::error(
-                npa_frontend::HumanDiagnosticKind::KernelRejected,
-                human_source_span(source),
-                format!("certificate certificate handoff rejected Human by proof source: {err:?}"),
-            )
-            .with_phase(npa_frontend::HumanDiagnosticPhase::CertificateHandoff)
-        })?;
+    let certificate_import_refs = certificate_imports.iter().collect::<Vec<_>>();
+    let preferred_imports = BTreeMap::new();
+    let certificate = npa_cert::build_module_cert_from_import_refs_with_preferred_imports(
+        core_module,
+        &certificate_import_refs,
+        &preferred_imports,
+    )
+    .map_err(|err| {
+        npa_frontend::HumanDiagnostic::error(
+            npa_frontend::HumanDiagnosticKind::KernelRejected,
+            human_source_span(source),
+            format!("certificate certificate handoff rejected Human by proof source: {err:?}"),
+        )
+        .with_phase(npa_frontend::HumanDiagnosticPhase::CertificateHandoff)
+    })?;
     let bytes = npa_cert::encode_module_cert(&certificate).map_err(|err| {
         npa_frontend::HumanDiagnostic::error(
             npa_frontend::HumanDiagnosticKind::KernelRejected,
@@ -6437,32 +6623,34 @@ fn human_source_interface_with_certificate_hashes(
     cert: &npa_cert::ModuleCert,
 ) -> npa_frontend::HumanSourceInterface {
     let module_name = source_interface.module.clone();
-    let export_hashes: BTreeMap<_, _> = cert
+    let export_facts: BTreeMap<_, _> = cert
         .export_block
         .iter()
         .map(|entry| {
             (
                 cert.name_table[entry.name].clone(),
-                entry.decl_interface_hash,
+                (entry.decl_interface_hash, entry.reducibility),
             )
         })
         .collect();
 
     for decl in &mut source_interface.declarations {
         let name = npa_cert::Name(decl.name.parts.clone());
-        if let Some(hash) = export_hashes
+        if let Some((hash, reducibility)) = export_facts
             .get(&name)
-            .or_else(|| export_hashes.get(&human_prefixed_current_name(&module_name, &name)))
+            .or_else(|| export_facts.get(&human_prefixed_current_name(&module_name, &name)))
         {
             decl.decl_interface_hash = Some(*hash);
+            decl.definition_reducibility =
+                reducibility.map(npa_frontend::DefinitionReducibility::from_cert);
         }
     }
 
     for generated in &mut source_interface.generated_declarations {
         let name = npa_cert::Name(generated.name.parts.clone());
-        if let Some(hash) = export_hashes
+        if let Some((hash, _)) = export_facts
             .get(&name)
-            .or_else(|| export_hashes.get(&human_prefixed_current_name(&module_name, &name)))
+            .or_else(|| export_facts.get(&human_prefixed_current_name(&module_name, &name)))
         {
             generated.decl_interface_hash = Some(*hash);
         }
@@ -6470,17 +6658,17 @@ fn human_source_interface_with_certificate_hashes(
 
     for class in &mut source_interface.typeclass_classes {
         let name = npa_cert::Name(class.name.parts.clone());
-        if let Some(hash) = export_hashes
+        if let Some((hash, _)) = export_facts
             .get(&name)
-            .or_else(|| export_hashes.get(&human_prefixed_current_name(&module_name, &name)))
+            .or_else(|| export_facts.get(&human_prefixed_current_name(&module_name, &name)))
         {
             class.decl_interface_hash = Some(*hash);
         }
         for field in &mut class.fields {
             let name = npa_cert::Name(field.projection.parts.clone());
-            if let Some(hash) = export_hashes
+            if let Some((hash, _)) = export_facts
                 .get(&name)
-                .or_else(|| export_hashes.get(&human_prefixed_current_name(&module_name, &name)))
+                .or_else(|| export_facts.get(&human_prefixed_current_name(&module_name, &name)))
             {
                 field.decl_interface_hash = Some(*hash);
             }
@@ -6489,9 +6677,9 @@ fn human_source_interface_with_certificate_hashes(
 
     for instance in &mut source_interface.typeclass_instances {
         let name = npa_cert::Name(instance.name.parts.clone());
-        if let Some(hash) = export_hashes
+        if let Some((hash, _)) = export_facts
             .get(&name)
-            .or_else(|| export_hashes.get(&human_prefixed_current_name(&module_name, &name)))
+            .or_else(|| export_facts.get(&human_prefixed_current_name(&module_name, &name)))
         {
             instance.decl_interface_hash = Some(*hash);
         }
@@ -6829,6 +7017,7 @@ pub fn check_human_tactic_term(
             source_index: decl.source_index(),
             decl_interface_hash: decl.signature().decl_interface_hash(),
             decl: decl.core_decl().clone(),
+            reducibility: npa_frontend::DefinitionReducibility::from_core_decl(decl.core_decl()),
         })
         .collect::<Vec<_>>();
     let current_generated_decls =
@@ -9998,6 +10187,136 @@ axiom P : Prop",
     }
 
     #[test]
+    fn human_document_incremental_reducibility_change_invalidates_cache_identity() {
+        let mut store = HumanProofSessionStore::new();
+        let created = create_human_session(
+            &mut store,
+            HumanSessionCreateRequest {
+                current_module: npa_cert::Name::from_dotted("Api.HumanIncrementalOpaque"),
+                current_source: HumanCurrentModuleSource {
+                    file_id: npa_frontend::FileId(83),
+                    source: "def hidden (P : Prop) : Prop := P\ndef later (P : Prop) : Prop := hidden P",
+                },
+                verified_modules: &[],
+                imported_source_interfaces: &[],
+                options: human_api_default_compile_options(),
+            },
+        )
+        .expect("initial reducible Human document should be cached");
+        assert!(created.incremental_cache.declarations.iter().all(|entry| {
+            entry.owner_certificate_format == "NPA-CERT-0.3.0"
+                && entry.owner_core_spec == "NPA-Core-0.3.0"
+                && entry.dependency_selective_fingerprint_is_canonical
+        }));
+
+        let updated = update_human_document(
+            &mut store,
+            HumanDocumentUpdateRequest {
+                session_id: created.session_id.clone(),
+                current_module: npa_cert::Name::from_dotted("Api.HumanIncrementalOpaque"),
+                current_source: HumanCurrentModuleSource {
+                    file_id: npa_frontend::FileId(83),
+                    source: "opaque def hidden (P : Prop) : Prop := P\ndef later (P : Prop) : Prop := hidden P",
+                },
+                verified_modules: &[],
+                imported_source_interfaces: &[],
+                options: human_api_default_compile_options(),
+            },
+        )
+        .expect("opaque modifier change should rebuild the Human document cache");
+
+        assert_eq!(updated.incremental_cache.reused_prefix_len, 0);
+        assert_eq!(updated.incremental_cache.recomputed_from, Some(0));
+        assert_eq!(
+            updated.incremental_cache.declarations[0].definition_reducibility,
+            Some(npa_frontend::DefinitionReducibility::Opaque)
+        );
+        assert!(updated.incremental_cache.declarations.iter().all(|entry| {
+            entry.owner_certificate_format == "NPA-CERT-0.3.0"
+                && entry.owner_core_spec == "NPA-Core-0.3.0"
+                && entry.dependency_selective_fingerprint_is_canonical
+                && entry.reuse == HumanDocumentIncrementalDeclReuse::Fresh
+        }));
+        assert_ne!(
+            updated.incremental_cache.declarations[0].source_decl_hash,
+            created.incremental_cache.declarations[0].source_decl_hash
+        );
+        assert_ne!(
+            updated.incremental_cache.declarations[0].core_decl_hash,
+            created.incremental_cache.declarations[0].core_decl_hash
+        );
+    }
+
+    #[test]
+    fn human_document_incremental_selectively_reuses_unreached_opaque_body_change() {
+        let initial_source = "opaque def hidden (P Q : Prop) : Prop := P\ndef independent (R : Prop) : Prop := R\ndef dependent (P Q : Prop) : Prop := hidden P Q";
+        let updated_source = "opaque def hidden (P Q : Prop) : Prop := Q\ndef independent (R : Prop) : Prop := R\ndef dependent (P Q : Prop) : Prop := hidden P Q";
+        let mut store = HumanProofSessionStore::new();
+        let created = create_human_session(
+            &mut store,
+            HumanSessionCreateRequest {
+                current_module: npa_cert::Name::from_dotted("Api.HumanIncrementalSelective"),
+                current_source: HumanCurrentModuleSource {
+                    file_id: npa_frontend::FileId(84),
+                    source: initial_source,
+                },
+                verified_modules: &[],
+                imported_source_interfaces: &[],
+                options: human_api_default_compile_options(),
+            },
+        )
+        .expect("initial opaque dependency document should be cached");
+        assert!(created
+            .incremental_cache
+            .declarations
+            .iter()
+            .all(|entry| entry.dependency_selective_fingerprint_is_canonical));
+
+        let updated = update_human_document(
+            &mut store,
+            HumanDocumentUpdateRequest {
+                session_id: created.session_id,
+                current_module: npa_cert::Name::from_dotted("Api.HumanIncrementalSelective"),
+                current_source: HumanCurrentModuleSource {
+                    file_id: npa_frontend::FileId(84),
+                    source: updated_source,
+                },
+                verified_modules: &[],
+                imported_source_interfaces: &[],
+                options: human_api_default_compile_options(),
+            },
+        )
+        .expect("opaque body edit should rebuild and rebind the checked-current chain");
+
+        assert_eq!(updated.incremental_cache.reused_prefix_len, 0);
+        assert_eq!(
+            updated
+                .incremental_cache
+                .declarations
+                .iter()
+                .map(|entry| entry.reuse)
+                .collect::<Vec<_>>(),
+            vec![
+                HumanDocumentIncrementalDeclReuse::Fresh,
+                HumanDocumentIncrementalDeclReuse::Reused,
+                HumanDocumentIncrementalDeclReuse::Fresh,
+            ]
+        );
+        assert_ne!(
+            updated.incremental_cache.declarations[0].core_decl_hash,
+            created.incremental_cache.declarations[0].core_decl_hash
+        );
+        assert_eq!(
+            updated.incremental_cache.declarations[1].dependency_selective_fingerprint,
+            created.incremental_cache.declarations[1].dependency_selective_fingerprint
+        );
+        assert_ne!(
+            updated.incremental_cache.declarations[2].dependency_selective_fingerprint,
+            created.incremental_cache.declarations[2].dependency_selective_fingerprint
+        );
+    }
+
+    #[test]
     fn human_incremental_reused_prefix_still_verifies_via_certificate() {
         let (verified, source_interface) = verified_human_import(
             "Lib.HumanIncrementalVerify",
@@ -12115,6 +12434,7 @@ axiom hp : P",
         source_interface.source_interface.declarations.push(
             npa_frontend::HumanSourceDeclarationMetadata {
                 kind: npa_frontend::HumanSourceDeclarationKind::Theorem,
+                definition_reducibility: None,
                 name: human_name("fake_external", 0, 13),
                 universe_params: Vec::new(),
                 binders: Vec::new(),
@@ -13887,6 +14207,102 @@ theorem open_goal : forall (A : Type), Type := by
         assert_eq!(payload.hole_goals.len(), 1);
         assert_eq!(payload.hole_goals[0].context[0].name, "A");
         assert_eq!(payload.hole_goals[0].target.as_deref(), Some("Type"));
+    }
+
+    #[test]
+    fn human_tactic_opaque_definition_remains_transparent_in_proof_start_and_by_tactics() {
+        let module = npa_cert::Name::from_dotted("Api.HumanOpaqueProof");
+        let source = "opaque def hidden (P : Prop) : Prop := P\ntheorem target (P : Prop) (p : P) : hidden P := by\n  intro P\n  intro p\n  exact p";
+        let options = human_api_default_compile_options();
+        let started = start_human_proof(HumanStartProofRequest {
+            current_module: module.clone(),
+            theorem_name: npa_cert::Name::from_dotted("Api.HumanOpaqueProof.target"),
+            current_source: HumanCurrentModuleSource {
+                file_id: npa_frontend::FileId(0),
+                source,
+            },
+            verified_modules: &[],
+            imported_source_interfaces: &[],
+            options: options.clone(),
+        })
+        .expect("proof-start should retain the local opaque checking view");
+        assert_eq!(started.state.env.owner_certificate_format, "NPA-CERT-0.3.0");
+        assert_eq!(started.state.env.owner_core_spec, "NPA-Core-0.3.0");
+        assert!(matches!(
+            started.state.env.checked_current_decls[0].core_decl(),
+            Decl::Def {
+                reducibility: npa_kernel::Reducibility::Opaque,
+                ..
+            }
+        ));
+
+        let machine_core = npa_frontend::compile_machine_source_to_core(
+            npa_frontend::FileId(0),
+            module.clone(),
+            "opaque def Api.HumanOpaqueProof.hidden (P : Prop) : Prop := P\ntheorem Api.HumanOpaqueProof.target (P : Prop) (p : P) : Api.HumanOpaqueProof.hidden P := p",
+            &[],
+            &npa_frontend::MachineCompileOptions::default(),
+        )
+        .expect("equivalent Machine proof-start core should elaborate");
+        let machine_checked = npa_tactic::check_current_decl_for_machine_tactic_from_verified_imports_with_kernel_profile_and_owner_pair(
+            options.kernel_profile,
+            &[],
+            &[],
+            0,
+            machine_core.declarations[0].clone(),
+            "NPA-CERT-0.3.0",
+            "NPA-Core-0.3.0",
+        )
+        .expect("equivalent Machine opaque definition should produce a checked-current token");
+        let Decl::Theorem {
+            universe_params,
+            ty,
+            ..
+        } = &machine_core.declarations[1]
+        else {
+            panic!("expected equivalent Machine theorem")
+        };
+        let machine_state = npa_tactic::start_machine_proof_with_kernel_profile(
+            options.kernel_profile,
+            npa_tactic::MachineProofSpec {
+                module: module.clone(),
+                theorem_name: npa_cert::Name::from_dotted("Api.HumanOpaqueProof.target"),
+                source_index: 1,
+                universe_params: universe_params.clone(),
+                theorem_type: ty.clone(),
+            },
+            Vec::new(),
+            vec![machine_checked],
+            options.tactic_options.clone(),
+        )
+        .expect("equivalent Machine proof state should start");
+        assert_eq!(
+            started.state.env.checked_current_decls,
+            machine_state.env.checked_current_decls
+        );
+        assert_eq!(
+            started.state.env.env_fingerprint,
+            machine_state.env.env_fingerprint
+        );
+        assert_eq!(started.state.fingerprint, machine_state.fingerprint);
+
+        let compiled = compile_human_source_to_certificate(HumanCompileCertificateRequest {
+            current_module: module,
+            current_source: HumanCurrentModuleSource {
+                file_id: npa_frontend::FileId(0),
+                source,
+            },
+            verified_modules: &[],
+            imported_source_interfaces: &[],
+            options,
+        })
+        .expect("Human by tactics should use the local opaque body");
+        assert_eq!(compiled.certificate.header.format, "NPA-CERT-0.3.0");
+        assert_eq!(compiled.certificate.header.core_spec, "NPA-Core-0.3.0");
+        assert_eq!(
+            compiled.source_interface.declarations[0].definition_reducibility,
+            Some(npa_frontend::DefinitionReducibility::Opaque)
+        );
     }
 
     #[test]

@@ -1,6 +1,7 @@
 # Promotion-Origin Registry Reconciliation Command
 
-Status: implemented in `npa-cli 0.7.x`; v1 contract frozen on 2026-08-02.
+Status: introduced in historical `npa-cli 0.7.x`, implemented in current
+`npa-cli 0.8.x`; v1 contract frozen on 2026-08-02.
 
 Date: 2026-07-28
 
@@ -691,7 +692,9 @@ user must not delete or steal the transaction journal.
 
 ## Command result and diagnostics
 
-Successful JSON uses `npa.package.command_result.v0.3`. Artifacts include:
+The historical 0.7 introduction emitted
+`npa.package.command_result.v0.3`; current 0.8 writers use the shared
+`npa.package.command_result.v0.4` envelope. Artifacts include:
 
 - input registry file hash;
 - proposed or written registry file and self-hash;

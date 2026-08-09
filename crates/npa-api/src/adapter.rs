@@ -605,7 +605,9 @@ pub fn map_frontend_diagnostic_kind(
     use MachineApiErrorKind as Api;
 
     match diagnostic.kind {
-        Frontend::ParseError => Api::MachineTermParseError,
+        Frontend::ParseError
+        | Frontend::OpaqueModifierNotFollowedByDef
+        | Frontend::DuplicateOpaqueModifier => Api::MachineTermParseError,
         Frontend::UnsupportedSyntax
         | Frontend::UnsupportedItem
         | Frontend::ImportAfterItem
@@ -622,7 +624,8 @@ pub fn map_frontend_diagnostic_kind(
         | Frontend::KernelRejected
         | Frontend::ExpectedSort
         | Frontend::TooManyArguments
-        | Frontend::TooFewArguments => Api::MachineTermElaborationError,
+        | Frontend::TooFewArguments
+        | Frontend::UnsupportedOpaqueDefinition => Api::MachineTermElaborationError,
         Frontend::UnknownGlobalName
         | Frontend::ShortGlobalName
         | Frontend::AmbiguousGlobalName

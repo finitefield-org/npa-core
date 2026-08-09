@@ -869,19 +869,23 @@ fn validate_registry_shape(
         }
     }
     let mut previous_event_version = None;
-    let mut previous_target = None;
+    let mut previous_target: Option<CatalogTargetProjection> = None;
     for (index, event) in registry.catalog_change_events.iter().enumerate() {
         validate_event(event, index)?;
         if previous_event_version
             .as_ref()
             .is_some_and(|version| !version_is_strictly_greater(&event.target.version, version))
-            || previous_target
-                .as_ref()
-                .is_some_and(|projection| projection != &event.previous_target)
+            || previous_target.as_ref().is_some_and(|projection| {
+                projection != &event.previous_target
+                    && !version_is_strictly_greater(
+                        &event.previous_target.version,
+                        &projection.version,
+                    )
+            })
         {
             return Err(PackageArtifactError::non_canonical(
                 "catalog_change_events",
-                "strict chained target versions",
+                "strict chained target versions or validated version-only gap",
             ));
         }
         previous_event_version = Some(event.target.version.clone());
@@ -1899,6 +1903,26 @@ mod tests {
             projection("0.2.4", 8),
             projection("0.3.0", 30),
         );
+        validate_promotion_origin_registry_v3_transition(&first, &second).unwrap();
+    }
+
+    #[test]
+    fn accepts_catalog_event_after_unrecorded_version_only_snapshot() {
+        let v2 = empty_v2();
+        let migrated = migrate_promotion_origin_registry_v2_to_v3(&v2).unwrap();
+        let first = append_empty_event(
+            &migrated,
+            package_file_hash(v2.canonical_json().unwrap().as_bytes()),
+            projection("0.2.1", 1),
+            projection("0.2.6", 8),
+        );
+        let second = append_empty_event(
+            &first,
+            package_file_hash(first.canonical_json().unwrap().as_bytes()),
+            projection("0.2.7", 9),
+            projection("0.2.8", 10),
+        );
+
         validate_promotion_origin_registry_v3_transition(&first, &second).unwrap();
     }
 

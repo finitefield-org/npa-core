@@ -20,7 +20,8 @@ use crate::{
     ReferencePublicEnvironment, ReferencePublicExport, ReferencePublicInductiveGroup,
     ReferencePublicInductiveLayout, ReferencePublicRecursorLayout, ReferenceResolvedImport,
     ReferenceStructuralClosureSummary, ReferenceStructuralIdentity, ReferenceStructuralLimitKind,
-    ReferenceTrustMode, REFERENCE_CERTIFICATE_FORMAT, REFERENCE_CORE_SPEC,
+    ReferenceTrustMode, REFERENCE_CERTIFICATE_FORMAT, REFERENCE_COMPAT_CERTIFICATE_FORMAT,
+    REFERENCE_COMPAT_CORE_SPEC, REFERENCE_COMPAT_MODULE_CERT_DOMAIN, REFERENCE_CORE_SPEC,
     REFERENCE_LEGACY_CERTIFICATE_FORMAT, REFERENCE_LEGACY_CORE_SPEC,
     REFERENCE_LEGACY_MODULE_CERT_DOMAIN, REFERENCE_LEGACY_MODULE_EXPORT_DOMAIN,
     REFERENCE_MODULE_CERT_DOMAIN, REFERENCE_MODULE_EXPORT_DOMAIN,
@@ -79,6 +80,10 @@ fn reference_certificate_format_version(
 ) -> Option<ReferenceCertificateFormatVersion> {
     if header.format == REFERENCE_CERTIFICATE_FORMAT && header.core_spec == REFERENCE_CORE_SPEC {
         Some(ReferenceCertificateFormatVersion::Current)
+    } else if header.format == REFERENCE_COMPAT_CERTIFICATE_FORMAT
+        && header.core_spec == REFERENCE_COMPAT_CORE_SPEC
+    {
+        Some(ReferenceCertificateFormatVersion::Compatibility)
     } else if header.format == REFERENCE_PREVIOUS_CERTIFICATE_FORMAT
         && header.core_spec == REFERENCE_PREVIOUS_CORE_SPEC
     {
@@ -224,6 +229,53 @@ struct ExpectedAxiomDeclaration<'a> {
     index: usize,
     payload: &'a DeclPayload,
     offset: usize,
+}
+
+#[derive(Default)]
+struct ReferenceLocalTransparencyBudget {
+    certificate_expanded_nodes: usize,
+}
+
+impl ReferenceLocalTransparencyBudget {
+    fn charge(
+        &mut self,
+        root_expanded_nodes: &mut usize,
+        depth: usize,
+        offset: usize,
+    ) -> DecodeResult<()> {
+        if depth > MAX_STRUCTURAL_DEPTH {
+            return Err(reference_limit(
+                ReferenceCertificateSection::Declarations,
+                offset,
+                ReferenceStructuralLimitKind::StructuralDepth,
+                MAX_STRUCTURAL_DEPTH,
+            ));
+        }
+        *root_expanded_nodes = root_expanded_nodes
+            .saturating_add(1)
+            .min(MAX_ROOT_EXPANDED_NODES + 1);
+        if *root_expanded_nodes > MAX_ROOT_EXPANDED_NODES {
+            return Err(reference_limit(
+                ReferenceCertificateSection::Declarations,
+                offset,
+                ReferenceStructuralLimitKind::RootExpandedNodes,
+                MAX_ROOT_EXPANDED_NODES,
+            ));
+        }
+        self.certificate_expanded_nodes = self
+            .certificate_expanded_nodes
+            .saturating_add(1)
+            .min(MAX_CERTIFICATE_EXPANDED_NODES + 1);
+        if self.certificate_expanded_nodes > MAX_CERTIFICATE_EXPANDED_NODES {
+            return Err(reference_limit(
+                ReferenceCertificateSection::Declarations,
+                offset,
+                ReferenceStructuralLimitKind::CertificateExpandedNodes,
+                MAX_CERTIFICATE_EXPANDED_NODES,
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl DecodedModuleCertificate {
@@ -695,6 +747,8 @@ impl DecodedModuleCertificate {
         let cost = self.structural_preflight()?.certificate_expansion;
         let structural_closure = build_current_reference_closure(self, cost, imports)?;
         Ok(ReferenceCheckedModule::new(
+            self.header.format.clone(),
+            self.header.core_spec.clone(),
             ReferenceModuleIdentity::new(
                 self.header.module.clone(),
                 self.hashes.export_hash,
@@ -1114,6 +1168,7 @@ impl DecodedModuleCertificate {
             ReferenceCertificateSection::AxiomReport,
             0,
         )?;
+        let mut local_transparency_budget = ReferenceLocalTransparencyBudget::default();
 
         if self.axiom_report.per_declaration.len() != self.declarations.len() {
             return Err(ReferenceCheckError::axiom_report(
@@ -1128,6 +1183,7 @@ impl DecodedModuleCertificate {
                 decl_index,
                 &declaration.value.decl,
                 declaration.offset,
+                &mut local_transparency_budget,
             )?;
             if expected_dependencies != declaration.value.dependencies {
                 return Err(ReferenceCheckError::axiom_report(
@@ -1192,17 +1248,27 @@ impl DecodedModuleCertificate {
     }
 
     fn verify_hashes(&self, bytes: &[u8]) -> DecodeResult<()> {
+        let version = reference_certificate_format_version(&self.header).ok_or_else(|| {
+            ReferenceCheckError::malformed(
+                ReferenceCertificateSection::HeaderFormat,
+                0,
+                ReferenceCheckReason::FormatMismatch,
+            )
+        })?;
         let level_hashes = self.compute_level_hashes()?;
         let term_hashes = self.compute_term_hashes(&level_hashes)?;
         for declaration in &self.declarations {
             let expected = compute_decl_hashes(
+                version,
                 &declaration.value.decl,
                 &declaration.value.dependencies,
                 &declaration.value.axiom_dependencies,
-                &self.term_table,
-                &level_hashes,
-                &term_hashes,
-                &self.name_table,
+                DeclHashTables {
+                    terms: &self.term_table,
+                    level_hashes: &level_hashes,
+                    term_hashes: &term_hashes,
+                    names: &self.name_table,
+                },
             )?;
             if expected.decl_interface_hash != declaration.value.hashes.decl_interface_hash {
                 return Err(ReferenceCheckError::hash_mismatch(
@@ -1234,19 +1300,17 @@ impl DecodedModuleCertificate {
             .iter()
             .map(|entry| entry.value.clone())
             .collect::<Vec<_>>();
-        let version = reference_certificate_format_version(&self.header).ok_or_else(|| {
-            ReferenceCheckError::malformed(
-                ReferenceCertificateSection::HeaderFormat,
-                0,
-                ReferenceCheckReason::FormatMismatch,
-            )
-        })?;
         self.verify_export_format_compatibility(&expected_export_block, version)?;
         let (export_domain, export_bytes, cert_domain) = match version {
             ReferenceCertificateFormatVersion::Current => (
                 REFERENCE_MODULE_EXPORT_DOMAIN,
                 encode_export_block(&expected_export_block),
                 REFERENCE_MODULE_CERT_DOMAIN,
+            ),
+            ReferenceCertificateFormatVersion::Compatibility => (
+                REFERENCE_MODULE_EXPORT_DOMAIN,
+                encode_export_block(&expected_export_block),
+                REFERENCE_COMPAT_MODULE_CERT_DOMAIN,
             ),
             ReferenceCertificateFormatVersion::Previous => (
                 REFERENCE_PREVIOUS_MODULE_EXPORT_DOMAIN,
@@ -1328,7 +1392,19 @@ impl DecodedModuleCertificate {
         decl_index: usize,
         decl: &DeclPayload,
         offset: usize,
+        local_transparency_budget: &mut ReferenceLocalTransparencyBudget,
     ) -> DecodeResult<Vec<DependencyEntry>> {
+        if reference_certificate_format_version(&self.header)
+            == Some(ReferenceCertificateFormatVersion::Current)
+        {
+            return self.expected_dependencies_v0_3(
+                imports,
+                decl_index,
+                decl,
+                offset,
+                local_transparency_budget,
+            );
+        }
         let mut refs = BTreeSet::new();
         for term in decl_term_ids(decl) {
             collect_global_refs_from_term(&self.term_table, term, &mut refs)?;
@@ -1358,9 +1434,187 @@ impl DecodedModuleCertificate {
                 Ok(DependencyEntry {
                     global_ref,
                     decl_interface_hash,
+                    decl_certificate_hash: None,
+                    kind: DependencyEntryKind::Interface,
                 })
             })
             .collect()
+    }
+
+    fn expected_dependencies_v0_3(
+        &self,
+        imports: &ReferenceImportEnvironment,
+        decl_index: usize,
+        decl: &DeclPayload,
+        offset: usize,
+        budget: &mut ReferenceLocalTransparencyBudget,
+    ) -> DecodeResult<Vec<DependencyEntry>> {
+        let actual = &self.declarations[decl_index].value.dependencies;
+        let mut actual_implementation_indices = BTreeSet::new();
+        for dependency in actual
+            .iter()
+            .filter(|entry| entry.kind == DependencyEntryKind::LocalImplementation)
+        {
+            let GlobalRef::Local {
+                decl_index: target_index,
+            } = dependency.global_ref
+            else {
+                return Err(ReferenceCheckError::local_implementation_dependency(
+                    ReferenceCertificateSection::Declarations,
+                    offset,
+                    ReferenceCheckReason::WrongReferenceKind,
+                ));
+            };
+            let Some(target) = self.declarations.get(target_index) else {
+                return Err(ReferenceCheckError::local_implementation_dependency(
+                    ReferenceCertificateSection::Declarations,
+                    offset,
+                    ReferenceCheckReason::TargetNotEarlier,
+                ));
+            };
+            if target_index >= decl_index {
+                return Err(ReferenceCheckError::local_implementation_dependency(
+                    ReferenceCertificateSection::Declarations,
+                    offset,
+                    ReferenceCheckReason::TargetNotEarlier,
+                ));
+            }
+            if !is_opaque_definition(&target.value.decl) {
+                return Err(ReferenceCheckError::local_implementation_dependency(
+                    ReferenceCertificateSection::Declarations,
+                    offset,
+                    ReferenceCheckReason::TargetNotOpaque,
+                ));
+            }
+            if dependency.decl_interface_hash != target.value.hashes.decl_interface_hash {
+                return Err(ReferenceCheckError::local_implementation_dependency(
+                    ReferenceCertificateSection::Declarations,
+                    offset,
+                    ReferenceCheckReason::InterfaceHashMismatch,
+                ));
+            }
+            if dependency.decl_certificate_hash != Some(target.value.hashes.decl_certificate_hash) {
+                return Err(ReferenceCheckError::local_implementation_dependency(
+                    ReferenceCertificateSection::Declarations,
+                    offset,
+                    ReferenceCheckReason::CertificateHashMismatch,
+                ));
+            }
+            actual_implementation_indices.insert(target_index);
+        }
+
+        let mut root_expanded_nodes = 0usize;
+        let mut direct_refs = scan_local_transparency_term_roots(
+            root_term_ids(decl),
+            1,
+            &self.term_table,
+            budget,
+            &mut root_expanded_nodes,
+            offset,
+        )?;
+        let allow_self = matches!(
+            decl,
+            DeclPayload::Inductive { .. }
+                | DeclPayload::InductiveConstrained { .. }
+                | DeclPayload::MutualInductiveBlock { .. }
+        );
+        direct_refs.retain(|global_ref, _| {
+            !matches!(
+                global_ref,
+                GlobalRef::Local { decl_index: target }
+                    | GlobalRef::LocalGenerated { decl_index: target, .. }
+                    if allow_self && *target == decl_index
+            )
+        });
+
+        let mut pending = BTreeMap::new();
+        for (global_ref, depth) in &direct_refs {
+            queue_earlier_local_reference(global_ref, *depth, decl_index, &mut pending);
+        }
+        let mut visited = BTreeSet::new();
+        let mut opaque_definition_indices = BTreeSet::new();
+        while let Some((target_index, reference_depth)) =
+            pending.iter().next().map(|(index, depth)| (*index, *depth))
+        {
+            pending.remove(&target_index);
+            if !visited.insert(target_index) {
+                continue;
+            }
+            let Some(target) = self.declarations.get(target_index) else {
+                continue;
+            };
+            if is_opaque_definition(&target.value.decl) {
+                opaque_definition_indices.insert(target_index);
+            }
+            let references = scan_local_transparency_term_roots(
+                locally_visible_term_ids(&target.value.decl),
+                reference_depth.saturating_add(1),
+                &self.term_table,
+                budget,
+                &mut root_expanded_nodes,
+                offset,
+            )?;
+            for (global_ref, depth) in references {
+                queue_earlier_local_reference(&global_ref, depth, decl_index, &mut pending);
+            }
+        }
+
+        if opaque_definition_indices
+            .difference(&actual_implementation_indices)
+            .next()
+            .is_some()
+        {
+            return Err(ReferenceCheckError::local_implementation_dependency(
+                ReferenceCertificateSection::Declarations,
+                offset,
+                ReferenceCheckReason::MissingImplementationDependency,
+            ));
+        }
+        if actual_implementation_indices
+            .difference(&opaque_definition_indices)
+            .next()
+            .is_some()
+        {
+            return Err(ReferenceCheckError::local_implementation_dependency(
+                ReferenceCertificateSection::Declarations,
+                offset,
+                ReferenceCheckReason::SurplusImplementationDependency,
+            ));
+        }
+
+        let mut expected = BTreeSet::new();
+        for global_ref in direct_refs.into_keys() {
+            if matches!(
+                &global_ref,
+                GlobalRef::Local { decl_index: target }
+                    if opaque_definition_indices.contains(target)
+            ) {
+                continue;
+            }
+            expected.insert(DependencyEntry {
+                decl_interface_hash: self.interface_hash_for_global_ref(
+                    imports,
+                    decl_index,
+                    &global_ref,
+                    offset,
+                )?,
+                global_ref,
+                decl_certificate_hash: None,
+                kind: DependencyEntryKind::Interface,
+            });
+        }
+        for target_index in opaque_definition_indices {
+            let target = &self.declarations[target_index].value;
+            expected.insert(DependencyEntry {
+                global_ref: GlobalRef::Local {
+                    decl_index: target_index,
+                },
+                decl_interface_hash: target.hashes.decl_interface_hash,
+                decl_certificate_hash: Some(target.hashes.decl_certificate_hash),
+                kind: DependencyEntryKind::LocalImplementation,
+            });
+        }
+        Ok(expected.into_iter().collect())
     }
 
     fn expected_core_features(&self) -> DecodeResult<Vec<ReferenceCoreFeature>> {
@@ -4083,8 +4337,10 @@ impl<'a> TypeChecker<'a> {
                 universe_params: self.cert.name_ids_to_names(universe_params),
                 universe_constraints: self.signature_universe_constraints(&decl.decl)?,
                 ty: self.terms[*ty].clone(),
-                value: (*reducibility == CertReducibility::Reducible)
-                    .then(|| self.terms[*value].clone()),
+                value: (*reducibility == CertReducibility::Reducible
+                    || reference_certificate_format_version(&self.cert.header)
+                        == Some(ReferenceCertificateFormatVersion::Current))
+                .then(|| self.terms[*value].clone()),
             },
             DeclPayload::Theorem {
                 universe_params,
@@ -9572,6 +9828,14 @@ enum Opacity {
 struct DependencyEntry {
     global_ref: GlobalRef,
     decl_interface_hash: ReferenceHash,
+    decl_certificate_hash: Option<ReferenceHash>,
+    kind: DependencyEntryKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DependencyEntryKind {
+    Interface,
+    LocalImplementation,
 }
 
 impl Ord for DependencyEntry {
@@ -9722,7 +9986,7 @@ impl<'a> Decoder<'a> {
         let name_table = self.name_table()?;
         let level_table = self.level_table()?;
         let term_table = self.term_table()?;
-        let declarations = self.declarations()?;
+        let declarations = self.declarations(version)?;
         let export_block = self.export_block(version)?;
         let mut axiom_report = self.axiom_report()?;
         if self.has_core_feature_report() {
@@ -9764,6 +10028,7 @@ impl<'a> Decoder<'a> {
         let format = self.string(ReferenceCertificateSection::HeaderFormat)?;
         let format_offset = self.offset;
         if format != REFERENCE_CERTIFICATE_FORMAT
+            && format != REFERENCE_COMPAT_CERTIFICATE_FORMAT
             && format != REFERENCE_PREVIOUS_CERTIFICATE_FORMAT
             && format != REFERENCE_LEGACY_CERTIFICATE_FORMAT
         {
@@ -9776,11 +10041,17 @@ impl<'a> Decoder<'a> {
         let core_spec = self.string(ReferenceCertificateSection::HeaderCoreSpec)?;
         let core_matches_current =
             format == REFERENCE_CERTIFICATE_FORMAT && core_spec == REFERENCE_CORE_SPEC;
+        let core_matches_compat = format == REFERENCE_COMPAT_CERTIFICATE_FORMAT
+            && core_spec == REFERENCE_COMPAT_CORE_SPEC;
         let core_matches_previous = format == REFERENCE_PREVIOUS_CERTIFICATE_FORMAT
             && core_spec == REFERENCE_PREVIOUS_CORE_SPEC;
         let core_matches_legacy = format == REFERENCE_LEGACY_CERTIFICATE_FORMAT
             && core_spec == REFERENCE_LEGACY_CORE_SPEC;
-        if !core_matches_current && !core_matches_previous && !core_matches_legacy {
+        if !core_matches_current
+            && !core_matches_compat
+            && !core_matches_previous
+            && !core_matches_legacy
+        {
             return Err(ReferenceCheckError::malformed(
                 ReferenceCertificateSection::HeaderCoreSpec,
                 self.offset,
@@ -9915,7 +10186,10 @@ impl<'a> Decoder<'a> {
         Ok(terms)
     }
 
-    fn declarations(&mut self) -> DecodeResult<Vec<Located<DeclCert>>> {
+    fn declarations(
+        &mut self,
+        version: ReferenceCertificateFormatVersion,
+    ) -> DecodeResult<Vec<Located<DeclCert>>> {
         let len = self.bounded_len_for(
             ReferenceCertificateSection::Declarations,
             ReferenceStructuralLimitKind::Declarations,
@@ -9926,7 +10200,7 @@ impl<'a> Decoder<'a> {
             let offset = self.offset;
             let decl = self.decl_payload()?;
             let dependencies =
-                self.dependency_entries(ReferenceCertificateSection::Declarations)?;
+                self.dependency_entries(ReferenceCertificateSection::Declarations, version)?;
             let axiom_dependencies = self.axiom_refs(ReferenceCertificateSection::Declarations)?;
             let decl_interface_hash_offset = self.offset;
             let decl_interface_hash = self.hash(ReferenceCertificateSection::Declarations)?;
@@ -10321,13 +10595,33 @@ impl<'a> Decoder<'a> {
     fn dependency_entries(
         &mut self,
         section: ReferenceCertificateSection,
+        version: ReferenceCertificateFormatVersion,
     ) -> DecodeResult<Vec<DependencyEntry>> {
         let len = self.bounded_len(section)?;
         let mut entries = self.allocate_vec(len, section)?;
         for _ in 0..len {
+            let kind = if version.encodes_tagged_dependencies() {
+                match self.byte(section)? {
+                    0x00 => DependencyEntryKind::Interface,
+                    0x01 => DependencyEntryKind::LocalImplementation,
+                    tag => {
+                        return Err(ReferenceCheckError::malformed(
+                            section,
+                            self.offset.saturating_sub(1),
+                            ReferenceCheckReason::UnknownTag { tag },
+                        ));
+                    }
+                }
+            } else {
+                DependencyEntryKind::Interface
+            };
             entries.push(DependencyEntry {
                 global_ref: self.global_ref(section)?,
                 decl_interface_hash: self.hash(section)?,
+                decl_certificate_hash: (kind == DependencyEntryKind::LocalImplementation)
+                    .then(|| self.hash(section))
+                    .transpose()?,
+                kind,
             });
         }
         Ok(entries)
@@ -10660,8 +10954,15 @@ fn import_order_key(
 }
 
 fn dependency_entry_order_key(entry: &DependencyEntry) -> Vec<u8> {
-    let mut out = global_ref_order_key(&entry.global_ref);
+    let mut out = vec![match entry.kind {
+        DependencyEntryKind::Interface => 0x00,
+        DependencyEntryKind::LocalImplementation => 0x01,
+    }];
+    out.extend(global_ref_order_key(&entry.global_ref));
     out.extend(entry.decl_interface_hash);
+    if let Some(hash) = entry.decl_certificate_hash {
+        out.extend(hash);
+    }
     out
 }
 
@@ -10822,16 +11123,21 @@ struct ComputedDeclHashes {
     certificate_has_dependency_material: bool,
 }
 
+struct DeclHashTables<'a> {
+    terms: &'a [Located<TermNode>],
+    level_hashes: &'a [ReferenceHash],
+    term_hashes: &'a [ReferenceHash],
+    names: &'a [Located<ReferenceModuleName>],
+}
+
 fn compute_decl_hashes(
+    version: ReferenceCertificateFormatVersion,
     decl: &DeclPayload,
     dependencies: &[DependencyEntry],
     axiom_dependencies: &[AxiomRef],
-    term_table: &[Located<TermNode>],
-    level_hashes: &[ReferenceHash],
-    term_hashes: &[ReferenceHash],
-    names: &[Located<ReferenceModuleName>],
+    tables: DeclHashTables<'_>,
 ) -> DecodeResult<ComputedDeclHashes> {
-    let interface_dependencies = interface_dependencies_for_decl(decl, dependencies, term_table)?;
+    let interface_dependencies = interface_dependencies_for_decl(decl, dependencies, tables.terms)?;
     let is_axiom = matches!(
         decl,
         DeclPayload::Axiom { .. } | DeclPayload::AxiomConstrained { .. }
@@ -10859,19 +11165,24 @@ fn compute_decl_hashes(
             decl,
             &interface_dependencies,
             axiom_dependencies,
-            level_hashes,
-            term_hashes,
-            names,
+            tables.level_hashes,
+            tables.term_hashes,
+            tables.names,
         )?,
     );
     let certificate_hash = hash_with_domain(
-        b"NPA-DECL-CERT-0.1",
+        if version == ReferenceCertificateFormatVersion::Current {
+            b"NPA-DECL-CERT-0.3.0"
+        } else {
+            b"NPA-DECL-CERT-0.1"
+        },
         &decl_certificate_payload(
+            version,
             decl,
             interface_hash,
             dependencies,
             axiom_dependencies,
-            term_hashes,
+            tables.term_hashes,
         )?,
     );
     Ok(ComputedDeclHashes {
@@ -11135,6 +11446,7 @@ fn encode_universe_constraint_spec_ids_to(
 }
 
 fn decl_certificate_payload(
+    version: ReferenceCertificateFormatVersion,
     decl: &DeclPayload,
     interface_hash: ReferenceHash,
     dependencies: &[DependencyEntry],
@@ -11149,20 +11461,20 @@ fn decl_certificate_payload(
         }
         DeclPayload::Def { value, .. } | DeclPayload::DefConstrained { value, .. } => {
             out.extend(term_hashes[*value]);
-            encode_dependency_entries_to(&mut out, dependencies);
+            encode_dependency_entries_with_format_to(&mut out, dependencies, version);
             encode_axiom_refs_to(&mut out, axiom_dependencies);
         }
         DeclPayload::Inductive { .. } | DeclPayload::InductiveConstrained { .. } => {
-            encode_dependency_entries_to(&mut out, dependencies);
+            encode_dependency_entries_with_format_to(&mut out, dependencies, version);
             encode_axiom_refs_to(&mut out, axiom_dependencies);
         }
         DeclPayload::MutualInductiveBlock { .. } => {
-            encode_dependency_entries_to(&mut out, dependencies);
+            encode_dependency_entries_with_format_to(&mut out, dependencies, version);
             encode_axiom_refs_to(&mut out, axiom_dependencies);
         }
         DeclPayload::Theorem { proof, .. } | DeclPayload::TheoremConstrained { proof, .. } => {
             out.extend(term_hashes[*proof]);
-            encode_dependency_entries_to(&mut out, dependencies);
+            encode_dependency_entries_with_format_to(&mut out, dependencies, version);
         }
     }
     Ok(out)
@@ -11180,7 +11492,14 @@ fn interface_dependencies_for_decl(
     Ok(dependencies
         .iter()
         .filter(|dependency| refs.contains(&dependency.global_ref))
-        .cloned()
+        .map(|dependency| DependencyEntry {
+            global_ref: dependency.global_ref.clone(),
+            decl_interface_hash: dependency.decl_interface_hash,
+            decl_certificate_hash: None,
+            kind: DependencyEntryKind::Interface,
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
         .collect())
 }
 
@@ -11292,6 +11611,103 @@ fn decl_term_ids(decl: &DeclPayload) -> Vec<usize> {
             })
             .collect(),
     }
+}
+
+fn root_term_ids(decl: &DeclPayload) -> Vec<usize> {
+    decl_term_ids(decl)
+}
+
+fn locally_visible_term_ids(decl: &DeclPayload) -> Vec<usize> {
+    match decl {
+        DeclPayload::Def { ty, value, .. } | DeclPayload::DefConstrained { ty, value, .. } => {
+            vec![*ty, *value]
+        }
+        DeclPayload::Theorem { ty, .. } | DeclPayload::TheoremConstrained { ty, .. } => vec![*ty],
+        _ => root_term_ids(decl),
+    }
+}
+
+fn is_opaque_definition(decl: &DeclPayload) -> bool {
+    matches!(
+        decl,
+        DeclPayload::Def {
+            reducibility: CertReducibility::Opaque,
+            ..
+        } | DeclPayload::DefConstrained {
+            reducibility: CertReducibility::Opaque,
+            ..
+        }
+    )
+}
+
+fn queue_earlier_local_reference(
+    global_ref: &GlobalRef,
+    depth: usize,
+    current_decl_index: usize,
+    pending: &mut BTreeMap<usize, usize>,
+) {
+    let target = match global_ref {
+        GlobalRef::Local { decl_index } | GlobalRef::LocalGenerated { decl_index, .. } => {
+            *decl_index
+        }
+        GlobalRef::Imported { .. } | GlobalRef::Builtin { .. } => return,
+    };
+    if target < current_decl_index {
+        pending
+            .entry(target)
+            .and_modify(|existing| *existing = (*existing).min(depth))
+            .or_insert(depth);
+    }
+}
+
+fn scan_local_transparency_term_roots(
+    mut roots: Vec<usize>,
+    base_depth: usize,
+    terms: &[Located<TermNode>],
+    budget: &mut ReferenceLocalTransparencyBudget,
+    root_expanded_nodes: &mut usize,
+    offset: usize,
+) -> DecodeResult<BTreeMap<GlobalRef, usize>> {
+    roots.sort_unstable();
+    let mut pending = roots
+        .into_iter()
+        .rev()
+        .map(|root| (root, base_depth))
+        .collect::<Vec<_>>();
+    let mut references = BTreeMap::new();
+    while let Some((term_id, depth)) = pending.pop() {
+        budget.charge(root_expanded_nodes, depth, offset)?;
+        let node = terms.get(term_id).ok_or_else(|| {
+            ReferenceCheckError::malformed(
+                ReferenceCertificateSection::TermTable,
+                offset,
+                ReferenceCheckReason::DanglingReference,
+            )
+        })?;
+        match &node.value {
+            TermNode::Sort(_) | TermNode::BVar(_) => {}
+            TermNode::Const { global_ref, .. } => {
+                references
+                    .entry(global_ref.clone())
+                    .and_modify(|existing: &mut usize| *existing = (*existing).min(depth))
+                    .or_insert(depth);
+            }
+            TermNode::App(fun, arg) => {
+                pending.push((*arg, depth.saturating_add(1)));
+                pending.push((*fun, depth.saturating_add(1)));
+            }
+            TermNode::Lam { ty, body } | TermNode::Pi { ty, body } => {
+                pending.push((*body, depth.saturating_add(1)));
+                pending.push((*ty, depth.saturating_add(1)));
+            }
+            TermNode::Let { ty, value, body } => {
+                pending.push((*body, depth.saturating_add(1)));
+                pending.push((*value, depth.saturating_add(1)));
+                pending.push((*ty, depth.saturating_add(1)));
+            }
+        }
+    }
+    Ok(references)
 }
 
 fn decl_universe_params(decl: &DeclPayload) -> &[usize] {
@@ -11496,7 +11912,7 @@ fn enforce_axiom_policy_name(
     let require_allowlist = policy.deny_custom_axioms
         || policy.trust_mode == ReferenceTrustMode::HighTrust
         || !policy.allowed_axioms.is_empty();
-    if !require_allowlist || is_standard_exception {
+    if !require_allowlist || (is_standard_exception && policy.allow_standard_axiom_exceptions) {
         return Ok(());
     }
 
@@ -11686,6 +12102,29 @@ fn encode_dependency_entries_to(out: &mut Vec<u8>, entries: &[DependencyEntry]) 
     }
 }
 
+fn encode_dependency_entries_with_format_to(
+    out: &mut Vec<u8>,
+    entries: &[DependencyEntry],
+    version: ReferenceCertificateFormatVersion,
+) {
+    if !version.encodes_tagged_dependencies() {
+        encode_dependency_entries_to(out, entries);
+        return;
+    }
+    encode_uvar_to(out, entries.len() as u64);
+    for entry in entries {
+        out.push(match entry.kind {
+            DependencyEntryKind::Interface => 0x00,
+            DependencyEntryKind::LocalImplementation => 0x01,
+        });
+        encode_global_ref_to(out, &entry.global_ref);
+        out.extend(entry.decl_interface_hash);
+        if let Some(hash) = entry.decl_certificate_hash {
+            out.extend(hash);
+        }
+    }
+}
+
 fn encode_axiom_refs_to(out: &mut Vec<u8>, axioms: &[AxiomRef]) {
     encode_uvar_to(out, axioms.len() as u64);
     for axiom in axioms {
@@ -11836,6 +12275,36 @@ fn encode_uvar_to(out: &mut Vec<u8>, mut value: u64) {
             break;
         }
     }
+}
+
+#[cfg(test)]
+pub(crate) fn reject_missing_v0_3_implementation_after_hash_check_impl(
+    bytes: &[u8],
+) -> ReferenceCheckError {
+    let mut cert = decode_module_certificate(bytes).expect("v0.3 test certificate decodes");
+    cert.verify_hashes(bytes)
+        .expect("v0.3 test certificate hashes verify before semantic forgery");
+    let declaration = cert
+        .declarations
+        .iter_mut()
+        .find(|declaration| {
+            declaration
+                .value
+                .dependencies
+                .iter()
+                .any(|entry| entry.kind == DependencyEntryKind::LocalImplementation)
+        })
+        .expect("v0.3 test certificate has an implementation dependency");
+    declaration
+        .value
+        .dependencies
+        .retain(|entry| entry.kind != DependencyEntryKind::LocalImplementation);
+    let policy = ReferenceCheckerPolicy::default();
+    let imports = cert
+        .build_import_environment(&ReferenceImportStore::default(), &policy)
+        .expect("v0.3 test certificate has no unresolved imports");
+    cert.verify_axiom_report(&imports, &policy)
+        .expect_err("missing implementation dependency must be rejected")
 }
 
 #[cfg(test)]

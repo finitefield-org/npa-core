@@ -4,12 +4,13 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use npa_api::{PerformanceMeasurementLabel, PerformanceMeasurementReport};
 use npa_cert::{AxiomPolicy, Name, VerifiedModule, VerifierSession};
-use npa_cli::args::PackageChecker;
-use npa_cli::diagnostic::{CommandExitCode, DiagnosticKind};
+use npa_cli::args::{KernelFuelReportMode, PackageChecker, PackageTimingMode};
+use npa_cli::diagnostic::{CommandExitCode, CommandResult, DiagnosticKind};
 use npa_cli::package::PACKAGE_MANIFEST_PATH;
 use npa_cli::package_api::v1::{
-    audit_artifact_ledger_modules, common_options, refresh_artifacts_check,
+    audit_artifact_ledger_modules, build_certs_write, common_options, refresh_artifacts_check,
     refresh_artifacts_write, verify_certs_full,
 };
 use npa_cli::package_artifact_ledger::run_package_artifact_ledger_audit;
@@ -37,6 +38,17 @@ const FRONTEND_FAILURE_SOURCE: &str =
     "def product_enumeration_bad : Type := fun product => product\n";
 
 static NEXT_TEMP_DIR: AtomicUsize = AtomicUsize::new(0);
+
+const FUEL_MODES: [KernelFuelReportMode; 3] = [
+    KernelFuelReportMode::Off,
+    KernelFuelReportMode::Failure,
+    KernelFuelReportMode::Detailed,
+];
+const TIMING_MODES: [PackageTimingMode; 3] = [
+    PackageTimingMode::Off,
+    PackageTimingMode::Summary,
+    PackageTimingMode::Detailed,
+];
 
 struct TestPackage {
     path: PathBuf,
@@ -68,6 +80,46 @@ impl TestPackage {
 impl Drop for TestPackage {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+#[test]
+fn package_build_certs_write_observation_mode_matrix_preserves_artifacts_and_lock() {
+    let package = build_local_import_fixture("write-observation-mode-matrix");
+    let before = package_snapshot(&package);
+
+    for fuel in FUEL_MODES {
+        for timings in TIMING_MODES {
+            let result = run_package_build_certs(
+                build_certs_write(common_options(package.path(), true))
+                    .with_kernel_fuel_report(fuel)
+                    .with_timings(timings),
+            );
+
+            assert_eq!(result.exit_code(), CommandExitCode::Success);
+            assert_build_observation_mode(&result, fuel, timings, 2);
+            assert_eq!(package_snapshot(&package), before);
+        }
+    }
+}
+
+#[test]
+fn package_build_certs_source_rebuild_refresh_observation_mode_matrix_is_read_only() {
+    let package = build_local_import_fixture("refresh-observation-mode-matrix");
+    let before = package_snapshot(&package);
+
+    for fuel in FUEL_MODES {
+        for timings in TIMING_MODES {
+            let result = run_package_build_certs(
+                refresh_artifacts_check(common_options(package.path(), true))
+                    .with_kernel_fuel_report(fuel)
+                    .with_timings(timings),
+            );
+
+            assert_eq!(result.exit_code(), CommandExitCode::Success);
+            assert_build_observation_mode(&result, fuel, timings, 2);
+            assert_eq!(package_snapshot(&package), before);
+        }
     }
 }
 
@@ -165,7 +217,7 @@ fn package_build_certs_write_cli_succeeds_json() {
     assert!(output.stderr.is_empty());
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
-        "{\"schema\":\"npa.package.command_result.v0.3\",\"command\":\"package build-certs\",\"root\":\"<absolute-root>\",\"status\":\"passed\",\"diagnostics\":[],\"artifacts\":[]}\n"
+        "{\"schema\":\"npa.package.command_result.v0.4\",\"command\":\"package build-certs\",\"root\":\"<absolute-root>\",\"status\":\"passed\",\"diagnostics\":[],\"artifacts\":[]}\n"
     );
 }
 
@@ -1113,6 +1165,49 @@ fn run_refresh_write(package: &TestPackage) -> npa_cli::diagnostic::CommandResul
         package.path(),
         true,
     )))
+}
+
+fn assert_build_observation_mode(
+    result: &CommandResult,
+    fuel: KernelFuelReportMode,
+    timings: PackageTimingMode,
+    expected_declarations: usize,
+) {
+    let Some(command_timings) = result.timings.as_ref() else {
+        assert_eq!(timings, PackageTimingMode::Off);
+        return;
+    };
+    assert_ne!(timings, PackageTimingMode::Off);
+    let measurements = command_timings
+        .measurements
+        .as_ref()
+        .expect("enabled build timings include common measurements");
+    assert!(measurement_counter(measurements, PerformanceMeasurementLabel::KernelCheckCalls) > 0);
+    if timings == PackageTimingMode::Detailed {
+        assert_eq!(measurements.declarations.len(), expected_declarations);
+        assert_eq!(
+            measurements.declaration_details.attempted,
+            u64::try_from(expected_declarations).unwrap()
+        );
+        assert!(measurements.declarations.iter().all(|declaration| {
+            declaration.term_nodes > 0
+                && declaration.kernel.is_some() == (fuel == KernelFuelReportMode::Detailed)
+        }));
+    } else {
+        assert!(measurements.declarations.is_empty());
+    }
+}
+
+fn measurement_counter(
+    measurements: &PerformanceMeasurementReport,
+    label: PerformanceMeasurementLabel,
+) -> u64 {
+    measurements
+        .counters
+        .iter()
+        .find(|counter| counter.label == label)
+        .map(|counter| counter.value)
+        .expect("kernel counter is present")
 }
 
 fn install_metadata_target(package: &TestPackage, existing: Option<&str>) -> PathBuf {

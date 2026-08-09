@@ -1,12 +1,14 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
-use npa_kernel::{Ctx, Decl, Env, Error, Expr, Level};
+use npa_kernel::{Ctx, Decl, Env, Error, Expr, Level, Reducibility};
 use sha2::{Digest, Sha256};
 
 use crate::{
     encode_axiom_refs_to, encode_name_to, encode_uvar_to, hash_with_domain, union_axioms, AxiomRef,
-    CertError, CoreModule, DeclHashes, ExportEntry, Hash, ModuleCert, ModuleName,
-    ProducerLimitKind, ProducerTokenHashField, VerifiedModule,
+    CertError, CertificateFormatVersion, CoreModule, DeclHashes, DependencyEntry,
+    DependencyEntryKind, ExportEntry, Hash, ModuleCert, ModuleName, ProducerLimitKind,
+    ProducerTokenHashField, VerifiedModule,
 };
 
 /// Sidecar-only producer classification for audit and diagnostics.
@@ -225,6 +227,39 @@ pub struct ProducerPriorChainBytes {
     pub checked_decls: Vec<ProducerPriorChainEntry>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ProducerPriorChainSnapshot {
+    previous: Option<Arc<Self>>,
+    entry: ProducerPriorChainEntry,
+    len: usize,
+}
+
+impl ProducerPriorChainSnapshot {
+    fn append(previous: Option<Arc<Self>>, entry: ProducerPriorChainEntry) -> Option<Arc<Self>> {
+        let len = previous.as_ref().map_or(1, |snapshot| snapshot.len + 1);
+        Some(Arc::new(Self {
+            previous,
+            entry,
+            len,
+        }))
+    }
+
+    fn entries(snapshot: &Option<Arc<Self>>) -> Vec<ProducerPriorChainEntry> {
+        let mut entries = Vec::with_capacity(snapshot.as_ref().map_or(0, |snapshot| snapshot.len));
+        let mut current = snapshot.as_deref();
+        while let Some(snapshot) = current {
+            entries.push(snapshot.entry.clone());
+            current = snapshot.previous.as_deref();
+        }
+        entries.reverse();
+        entries
+    }
+
+    fn from_entries(entries: &[ProducerPriorChainEntry]) -> Option<Arc<Self>> {
+        entries.iter().cloned().fold(None, Self::append)
+    }
+}
+
 /// Producer lookup environment for dependency and axiom recomputation.
 ///
 /// `import_exports` has the same order as `CandidateBatch.imports` and
@@ -319,6 +354,15 @@ pub fn prior_chain_fingerprint(chain: &ProducerPriorChainBytes) -> Hash {
     hash_with_domain(
         b"NPA-PRODUCER-CHAIN-0.1",
         &prior_chain_fingerprint_canonical_bytes(chain),
+    )
+}
+
+/// Return the body-sensitive dependency fingerprint used for producer token
+/// cache reuse.
+pub fn producer_dependency_selective_fingerprint(dependencies: &[DependencyEntry]) -> Hash {
+    hash_with_domain(
+        b"NPA-PRODUCER-DEPENDENCY-SELECTIVE-0.1",
+        &crate::dependency_selective_fingerprint_canonical_bytes(dependencies),
     )
 }
 
@@ -438,10 +482,13 @@ pub fn post_env_fingerprint(
 pub fn validate_prior_current_decls(
     batch: &CandidateBatch<'_>,
 ) -> Result<Vec<ProducerCheckedDeclInterface>, CertError> {
+    let version = producer_token_chain_version(batch.prior_current_decls);
     Ok(validate_checked_decl_chain(
         batch.imports,
         batch.prior_current_decls,
         Some(&batch.limits),
+        version,
+        None,
     )?
     .checked_decls)
 }
@@ -458,14 +505,17 @@ pub fn build_module_cert_from_checked_candidates(
     imports: &[VerifiedModule],
     checked_decls: &[CheckedDeclCandidate],
 ) -> Result<ModuleCert, CertError> {
-    let chain = validate_checked_decl_chain(imports, checked_decls, None)?;
-    crate::build_module_cert(
-        CoreModule {
-            name: module_name,
-            declarations: chain.declarations,
-        },
-        imports,
-    )
+    let version = producer_token_chain_version(checked_decls);
+    let chain = validate_checked_decl_chain(imports, checked_decls, None, version, None)?;
+    let module = CoreModule {
+        name: module_name,
+        declarations: chain.declarations,
+    };
+    if chain.version == CertificateFormatVersion::V0_3_0 {
+        crate::build_module_cert(module, imports)
+    } else {
+        crate::build_module_cert_v0_2_compat(module, imports)
+    }
 }
 
 /// Precheck a single producer candidate against an existing kernel environment under limits.
@@ -523,22 +573,30 @@ fn check_core_decl_candidates_impl(
 ) -> Result<CandidateBatchResult, CertError> {
     ensure_candidate_batch_schema(&batch)?;
     let direct_imports = validate_candidate_batch_imports(&batch)?;
-    let checked_decls = validate_prior_current_decls(&batch)?;
-    let checked_decl_sources: Vec<_> = batch
-        .prior_current_decls
-        .iter()
-        .map(|token| token.declaration.clone())
-        .collect();
-    let prior_chain_entries: Vec<_> = batch
-        .prior_current_decls
-        .iter()
-        .map(|token| ProducerPriorChainEntry {
-            decl_interface_hash: token.decl_interface_hash,
-            decl_certificate_hash: token.decl_certificate_hash,
-            pre_env_fingerprint: token.pre_env_fingerprint,
-            post_env_fingerprint: token.post_env_fingerprint,
-        })
-        .collect();
+    let version = if producer_token_chain_version(batch.prior_current_decls)
+        == CertificateFormatVersion::V0_3_0
+        || producer_chain_version(
+            batch
+                .candidates
+                .iter()
+                .map(|candidate| &candidate.declaration),
+        ) == CertificateFormatVersion::V0_3_0
+    {
+        CertificateFormatVersion::V0_3_0
+    } else {
+        CertificateFormatVersion::V0_2_0
+    };
+    let validated = validate_checked_decl_chain(
+        batch.imports,
+        batch.prior_current_decls,
+        Some(&batch.limits),
+        version,
+        measurement.as_deref_mut(),
+    )?;
+    let checked_decls = validated.checked_decls;
+    let checked_decl_sources = validated.declarations;
+    let prior_chain_entries = validated.prior_chain_entries;
+    let rebound_tokens = validated.tokens;
     let (current_env_fingerprint, initial_bytes_hashed) =
         producer_env_fingerprint_from_slices(&direct_imports, &checked_decls, None);
     if let Some(measurement) = measurement.as_deref_mut() {
@@ -547,19 +605,17 @@ fn check_core_decl_candidates_impl(
     let mut env = producer_base_env(batch.imports)?;
     let import_export_names = import_export_names(batch.imports)?;
     let mut checked_public_name_set = BTreeSet::new();
-    let mut added_prior_sources = Vec::with_capacity(batch.prior_current_decls.len());
-    for token in batch.prior_current_decls {
+    for token in &rebound_tokens {
         add_referenced_builtins_for_decl_with_indexes(
             &mut env,
             &import_export_names,
             &checked_public_name_set,
             &token.declaration,
         )?;
-        crate::add_decl_to_env(&mut env, token.declaration.clone())?;
+        crate::add_current_module_decl_to_env(&mut env, token.declaration.clone(), version)?;
         checked_public_name_set.extend(checked_public_names(std::slice::from_ref(
             &token.declaration,
         )));
-        added_prior_sources.push(token.declaration.clone());
     }
     let lookup_env =
         producer_lookup_env_for_sources(batch.imports, &checked_decls, &checked_decl_sources)?;
@@ -567,16 +623,19 @@ fn check_core_decl_candidates_impl(
         measurement.prepared_chains = 1;
         measurement.name_index_rebuilds = 1;
     }
+    let prior_chain_snapshot = ProducerPriorChainSnapshot::from_entries(&prior_chain_entries);
     let mut prepared = PreparedCandidateChain {
         env,
         direct_imports,
         lookup_env,
         checked_decl_sources,
         prior_chain_entries,
+        prior_chain_snapshot,
         current_env_fingerprint,
         import_export_names,
         checked_public_names: checked_public_name_set,
         limits: batch.limits,
+        version,
     };
 
     let mut statuses = Vec::with_capacity(batch.candidates.len());
@@ -678,10 +737,14 @@ pub struct CandidateBatch<'a> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CheckedDeclCandidate {
     declaration: Decl,
+    version: CertificateFormatVersion,
     preview_hashes: CandidateHashPreview,
+    local_implementation_dependencies: Vec<DependencyEntry>,
+    dependency_fingerprint: Hash,
     pre_env_fingerprint: Hash,
     post_env_fingerprint: Hash,
     prior_chain_fingerprint: Hash,
+    prior_chain_snapshot: Option<Arc<ProducerPriorChainSnapshot>>,
     limits: ProducerLimits,
     limit_profile_hash: Hash,
     decl_interface_hash: Hash,
@@ -692,6 +755,17 @@ impl CheckedDeclCandidate {
     /// Return non-authoritative preview hashes captured while checking this token.
     pub fn preview_hashes(&self) -> CandidateHashPreview {
         self.preview_hashes
+    }
+
+    /// Return the ordered current-module opaque implementations reached by
+    /// this declaration's local transparency closure.
+    pub fn local_implementation_dependencies(&self) -> &[DependencyEntry] {
+        &self.local_implementation_dependencies
+    }
+
+    /// Return the dependency-selective fingerprint used for cache reuse.
+    pub fn dependency_fingerprint(&self) -> Hash {
+        self.dependency_fingerprint
     }
 
     /// Return the producer environment fingerprint before this declaration was accepted.
@@ -806,6 +880,12 @@ pub struct ProducerBatchMeasurement {
     pub candidates_accepted: u64,
     /// Candidate declarations rejected.
     pub candidates_rejected: u64,
+    /// Cached prior declarations whose semantic dependencies changed and were
+    /// checked again under their original bounded admission limits.
+    pub dependency_rechecks: u64,
+    /// Cached prior declarations safely rebound to a changed full prior chain
+    /// without a dependency recheck.
+    pub prior_chain_rebinds: u64,
 }
 
 struct AcceptedCandidate {
@@ -813,6 +893,7 @@ struct AcceptedCandidate {
     interface: ProducerCheckedDeclInterface,
     prior_chain_entry: ProducerPriorChainEntry,
     post_env_fingerprint: Hash,
+    prior_chain_snapshot: Option<Arc<ProducerPriorChainSnapshot>>,
     declaration: Decl,
     env: Env,
 }
@@ -823,10 +904,12 @@ struct PreparedCandidateChain {
     lookup_env: ProducerLookupEnv,
     checked_decl_sources: Vec<Decl>,
     prior_chain_entries: Vec<ProducerPriorChainEntry>,
+    prior_chain_snapshot: Option<Arc<ProducerPriorChainSnapshot>>,
     current_env_fingerprint: Hash,
     import_export_names: BTreeSet<ModuleName>,
     checked_public_names: BTreeSet<ModuleName>,
     limits: ProducerLimits,
+    version: CertificateFormatVersion,
 }
 
 impl PreparedCandidateChain {
@@ -849,6 +932,7 @@ impl PreparedCandidateChain {
         self.lookup_env.checked_decls.push(accepted.interface);
         self.checked_decl_sources.push(accepted.declaration);
         self.prior_chain_entries.push(accepted.prior_chain_entry);
+        self.prior_chain_snapshot = accepted.prior_chain_snapshot;
         self.current_env_fingerprint = accepted.post_env_fingerprint;
         accepted.token
     }
@@ -857,11 +941,15 @@ impl PreparedCandidateChain {
 struct ResolvedCoreDeclCandidate {
     interface: ProducerCheckedDeclInterface,
     hashes: DeclHashes,
+    dependencies: Vec<DependencyEntry>,
 }
 
 struct ValidatedTokenChain {
     checked_decls: Vec<ProducerCheckedDeclInterface>,
     declarations: Vec<Decl>,
+    tokens: Vec<CheckedDeclCandidate>,
+    prior_chain_entries: Vec<ProducerPriorChainEntry>,
+    version: CertificateFormatVersion,
 }
 
 fn check_candidate_in_batch(
@@ -873,7 +961,13 @@ fn check_candidate_in_batch(
     ensure_no_unresolved_metavariable(&declaration)?;
     ensure_candidate_schema_limits(&declaration, &context.limits)?;
 
-    let resolved = resolve_core_decl_candidate(&context.lookup_env, &declaration)?;
+    let resolved = resolve_core_decl_candidate(
+        &context.lookup_env,
+        &context.checked_decl_sources,
+        &context.prior_chain_entries,
+        &declaration,
+        context.version,
+    )?;
 
     let mut candidate_env = context.env.clone();
     if let Some(measurement) = measurement.as_deref_mut() {
@@ -901,7 +995,7 @@ fn check_candidate_in_batch(
     )?;
 
     let mut next_env = candidate_env;
-    crate::add_decl_to_env(&mut next_env, declaration.clone())?;
+    crate::add_current_module_decl_to_env(&mut next_env, declaration.clone(), context.version)?;
 
     let (post_env_fingerprint, env_bytes_hashed) = producer_env_fingerprint_from_slices(
         &context.direct_imports,
@@ -917,17 +1011,24 @@ fn check_candidate_in_batch(
             .saturating_add(chain_bytes_hashed);
     }
     let limit_profile_hash = producer_limits_hash(&context.limits);
+    let local_implementation_dependencies =
+        local_implementation_dependencies(&resolved.dependencies);
+    let dependency_fingerprint = producer_dependency_selective_fingerprint(&resolved.dependencies);
     let token = CheckedDeclCandidate {
         declaration: declaration.clone(),
+        version: context.version,
         preview_hashes: CandidateHashPreview {
             type_hash: None,
             body_hash: None,
             decl_interface_hash: Some(resolved.hashes.decl_interface_hash),
             decl_certificate_hash: Some(resolved.hashes.decl_certificate_hash),
         },
+        local_implementation_dependencies,
+        dependency_fingerprint,
         pre_env_fingerprint: context.current_env_fingerprint,
         post_env_fingerprint,
         prior_chain_fingerprint,
+        prior_chain_snapshot: context.prior_chain_snapshot.clone(),
         limits: context.limits,
         limit_profile_hash,
         decl_interface_hash: resolved.hashes.decl_interface_hash,
@@ -939,12 +1040,17 @@ fn check_candidate_in_batch(
         pre_env_fingerprint: context.current_env_fingerprint,
         post_env_fingerprint,
     };
+    let prior_chain_snapshot = ProducerPriorChainSnapshot::append(
+        context.prior_chain_snapshot.clone(),
+        prior_chain_entry.clone(),
+    );
 
     Ok(AcceptedCandidate {
         token,
         interface: resolved.interface,
         prior_chain_entry,
         post_env_fingerprint,
+        prior_chain_snapshot,
         declaration,
         env: next_env,
     })
@@ -952,28 +1058,213 @@ fn check_candidate_in_batch(
 
 fn resolve_core_decl_candidate(
     lookup_env: &ProducerLookupEnv,
+    checked_decl_sources: &[Decl],
+    prior_chain_entries: &[ProducerPriorChainEntry],
     declaration: &Decl,
+    version: CertificateFormatVersion,
 ) -> Result<ResolvedCoreDeclCandidate, CertError> {
     // This is the producer boundary where name-based kernel declarations become hash-bound
     // certificate references for dependency and private token hashes.
-    let (interface, hashes) =
-        crate::canonical_producer_checked_decl_hashes(declaration, lookup_env)?;
-    Ok(ResolvedCoreDeclCandidate { interface, hashes })
+    let local_implementation_dependencies = if version == CertificateFormatVersion::V0_3_0 {
+        producer_local_implementation_dependencies(
+            declaration,
+            checked_decl_sources,
+            prior_chain_entries,
+        )?
+    } else {
+        Vec::new()
+    };
+    let resolved = crate::canonical_producer_checked_decl_for_version(
+        declaration,
+        lookup_env,
+        version,
+        &local_implementation_dependencies,
+    )?;
+    Ok(ResolvedCoreDeclCandidate {
+        interface: resolved.interface,
+        hashes: resolved.hashes,
+        dependencies: resolved.dependencies,
+    })
+}
+
+fn producer_chain_version<'a>(
+    declarations: impl IntoIterator<Item = &'a Decl>,
+) -> CertificateFormatVersion {
+    if declarations.into_iter().next().is_some() {
+        CertificateFormatVersion::V0_3_0
+    } else {
+        CertificateFormatVersion::V0_2_0
+    }
+}
+
+fn producer_token_chain_version(tokens: &[CheckedDeclCandidate]) -> CertificateFormatVersion {
+    if tokens.is_empty()
+        || tokens
+            .iter()
+            .any(|token| token.version == CertificateFormatVersion::V0_3_0)
+        || tokens
+            .iter()
+            .any(|token| is_opaque_definition(&token.declaration))
+    {
+        CertificateFormatVersion::V0_3_0
+    } else {
+        CertificateFormatVersion::V0_2_0
+    }
+}
+
+fn is_opaque_definition(declaration: &Decl) -> bool {
+    matches!(
+        declaration,
+        Decl::Def {
+            reducibility: Reducibility::Opaque,
+            ..
+        } | Decl::DefConstrained {
+            reducibility: Reducibility::Opaque,
+            ..
+        }
+    )
+}
+
+fn producer_local_implementation_dependencies(
+    declaration: &Decl,
+    checked_decl_sources: &[Decl],
+    prior_chain_entries: &[ProducerPriorChainEntry],
+) -> Result<Vec<DependencyEntry>, CertError> {
+    if checked_decl_sources.len() != prior_chain_entries.len() {
+        return Err(CertError::DecodeError);
+    }
+    let mut local_names = BTreeMap::new();
+    for (decl_index, declaration) in checked_decl_sources.iter().enumerate() {
+        for name in checked_public_names(std::slice::from_ref(declaration)) {
+            if local_names.insert(name.clone(), decl_index).is_some() {
+                return Err(CertError::DuplicateName { name });
+            }
+        }
+    }
+
+    let mut root_names = BTreeSet::new();
+    collect_const_names_from_decl(&mut root_names, declaration);
+    let mut pending = root_names
+        .into_iter()
+        .filter_map(|name| local_names.get(&name).copied())
+        .collect::<BTreeSet<_>>();
+    let mut visited = BTreeSet::new();
+    let mut dependencies = BTreeSet::new();
+    while let Some(decl_index) = pending.iter().next().copied() {
+        pending.remove(&decl_index);
+        if !visited.insert(decl_index) {
+            continue;
+        }
+        let referenced = checked_decl_sources
+            .get(decl_index)
+            .ok_or(CertError::DecodeError)?;
+        if is_opaque_definition(referenced) {
+            let entry = prior_chain_entries
+                .get(decl_index)
+                .ok_or(CertError::DecodeError)?;
+            dependencies.insert(DependencyEntry::from_decoded_local_implementation(
+                crate::GlobalRef::Local { decl_index },
+                entry.decl_interface_hash,
+                entry.decl_certificate_hash,
+            ));
+        }
+
+        let mut referenced_names = BTreeSet::new();
+        collect_const_names_from_referenced_decl(&mut referenced_names, referenced);
+        pending.extend(
+            referenced_names
+                .into_iter()
+                .filter_map(|name| local_names.get(&name).copied())
+                .filter(|index| !visited.contains(index)),
+        );
+    }
+    Ok(dependencies.into_iter().collect())
+}
+
+fn collect_const_names_from_referenced_decl(names: &mut BTreeSet<ModuleName>, decl: &Decl) {
+    match decl {
+        Decl::Axiom { ty, .. } | Decl::AxiomConstrained { ty, .. } => {
+            collect_const_names_from_expr(names, ty);
+        }
+        Decl::Def { ty, value, .. } | Decl::DefConstrained { ty, value, .. } => {
+            collect_const_names_from_expr(names, ty);
+            collect_const_names_from_expr(names, value);
+        }
+        Decl::Theorem { ty, .. } | Decl::TheoremConstrained { ty, .. } => {
+            collect_const_names_from_expr(names, ty);
+        }
+        Decl::Inductive { .. } | Decl::MutualInductiveBlock { .. } => {
+            collect_const_names_from_decl(names, decl);
+        }
+        Decl::Constructor { ty, .. } | Decl::Recursor { ty, .. } => {
+            collect_const_names_from_expr(names, ty);
+        }
+    }
+}
+
+fn local_implementation_dependencies(dependencies: &[DependencyEntry]) -> Vec<DependencyEntry> {
+    dependencies
+        .iter()
+        .filter(|dependency| dependency.kind() == DependencyEntryKind::LocalImplementation)
+        .cloned()
+        .collect()
+}
+
+fn stored_local_implementations_are_valid(
+    stored: &[DependencyEntry],
+    checked_decl_sources: &[Decl],
+    stored_prior_chain: &[ProducerPriorChainEntry],
+) -> bool {
+    stored.windows(2).all(|pair| pair[0] < pair[1])
+        && stored.iter().all(|dependency| {
+            let crate::GlobalRef::Local { decl_index } = dependency.global_ref() else {
+                return false;
+            };
+            let Some(source) = checked_decl_sources.get(*decl_index) else {
+                return false;
+            };
+            let Some(entry) = stored_prior_chain.get(*decl_index) else {
+                return false;
+            };
+            dependency.kind() == DependencyEntryKind::LocalImplementation
+                && is_opaque_definition(source)
+                && dependency.decl_interface_hash() == entry.decl_interface_hash
+                && dependency.decl_certificate_hash() == Some(entry.decl_certificate_hash)
+        })
+}
+
+fn prior_chain_shapes_match(
+    stored: &[ProducerPriorChainEntry],
+    current: &[ProducerPriorChainEntry],
+) -> bool {
+    stored.len() == current.len()
+        && stored.iter().zip(current).all(|(stored, current)| {
+            stored.decl_interface_hash == current.decl_interface_hash
+                && stored.pre_env_fingerprint == current.pre_env_fingerprint
+                && stored.post_env_fingerprint == current.post_env_fingerprint
+        })
 }
 
 fn validate_checked_decl_chain(
     imports: &[VerifiedModule],
     tokens: &[CheckedDeclCandidate],
     reusable_limits: Option<&ProducerLimits>,
+    version: CertificateFormatVersion,
+    mut measurement: Option<&mut ProducerBatchMeasurement>,
 ) -> Result<ValidatedTokenChain, CertError> {
     let direct_imports = canonical_import_env_keys(imports)?;
     let mut checked_decls = Vec::with_capacity(tokens.len());
     let mut declarations = Vec::with_capacity(tokens.len());
+    let mut rebound_tokens = Vec::with_capacity(tokens.len());
     let mut prior_chain_entries = Vec::with_capacity(tokens.len());
+    let mut prior_chain_snapshot = None;
     let mut expected_pre_env_fingerprint = producer_env_fingerprint(&ProducerEnvFingerprintBytes {
         direct_imports: direct_imports.clone(),
         checked_decls: vec![],
     });
+    let mut env = producer_base_env(imports)?;
+    let import_export_names = import_export_names(imports)?;
+    let mut checked_public_name_set = BTreeSet::new();
 
     for (token_index, token) in tokens.iter().enumerate() {
         ensure_token_hash(
@@ -983,15 +1274,27 @@ fn validate_checked_decl_chain(
             token.pre_env_fingerprint,
         )?;
 
-        let expected_prior_chain_fingerprint = prior_chain_fingerprint(&ProducerPriorChainBytes {
-            checked_decls: prior_chain_entries.clone(),
+        let stored_prior_chain_entries =
+            ProducerPriorChainSnapshot::entries(&token.prior_chain_snapshot);
+        let stored_prior_chain_fingerprint = prior_chain_fingerprint(&ProducerPriorChainBytes {
+            checked_decls: stored_prior_chain_entries.clone(),
         });
         ensure_token_hash(
             token_index,
             ProducerTokenHashField::PriorChainFingerprint,
-            expected_prior_chain_fingerprint,
+            stored_prior_chain_fingerprint,
             token.prior_chain_fingerprint,
         )?;
+        if !prior_chain_shapes_match(&stored_prior_chain_entries, &prior_chain_entries) {
+            return Err(CertError::ProducerTokenHashMismatch {
+                token_index,
+                field: ProducerTokenHashField::PriorChainFingerprint,
+                expected: prior_chain_fingerprint(&ProducerPriorChainBytes {
+                    checked_decls: prior_chain_entries.clone(),
+                }),
+                actual: token.prior_chain_fingerprint,
+            });
+        }
 
         ensure_token_hash(
             token_index,
@@ -1002,22 +1305,104 @@ fn validate_checked_decl_chain(
         if reusable_limits.is_some_and(|limits| !token.limits_are_reusable_under(limits)) {
             return Err(CertError::ProducerTokenLimitTooLoose { token_index });
         }
+        if token.version != CertificateFormatVersion::V0_3_0
+            && !token.local_implementation_dependencies.is_empty()
+        {
+            return Err(CertError::ProducerTokenHashMismatch {
+                token_index,
+                field: ProducerTokenHashField::DependencyFingerprint,
+                expected: producer_dependency_selective_fingerprint(&[]),
+                actual: token.dependency_fingerprint,
+            });
+        }
 
         let lookup_env = producer_lookup_env_for_sources(imports, &checked_decls, &declarations)?;
-        let resolved = resolve_core_decl_candidate(&lookup_env, &token.declaration)?;
+        let resolved = resolve_core_decl_candidate(
+            &lookup_env,
+            &declarations,
+            &prior_chain_entries,
+            &token.declaration,
+            version,
+        )?;
+        let current_local_implementations =
+            local_implementation_dependencies(&resolved.dependencies);
+        if !stored_local_implementations_are_valid(
+            &token.local_implementation_dependencies,
+            &declarations,
+            &stored_prior_chain_entries,
+        ) {
+            return Err(CertError::ProducerTokenHashMismatch {
+                token_index,
+                field: ProducerTokenHashField::DependencyFingerprint,
+                expected: producer_dependency_selective_fingerprint(&resolved.dependencies),
+                actual: token.dependency_fingerprint,
+            });
+        }
+        let stored_resolved = crate::canonical_producer_checked_decl_for_version(
+            &token.declaration,
+            &lookup_env,
+            token.version,
+            &token.local_implementation_dependencies,
+        )?;
+        let expected_stored_dependency_fingerprint =
+            producer_dependency_selective_fingerprint(&stored_resolved.dependencies);
+        ensure_token_hash(
+            token_index,
+            ProducerTokenHashField::DependencyFingerprint,
+            expected_stored_dependency_fingerprint,
+            token.dependency_fingerprint,
+        )?;
 
         ensure_token_hash(
             token_index,
             ProducerTokenHashField::DeclInterfaceHash,
-            resolved.hashes.decl_interface_hash,
+            stored_resolved.hashes.decl_interface_hash,
             token.decl_interface_hash,
         )?;
         ensure_token_hash(
             token_index,
             ProducerTokenHashField::DeclCertificateHash,
-            resolved.hashes.decl_certificate_hash,
+            stored_resolved.hashes.decl_certificate_hash,
             token.decl_certificate_hash,
         )?;
+
+        let current_dependency_fingerprint =
+            producer_dependency_selective_fingerprint(&resolved.dependencies);
+        let dependency_changed = current_dependency_fingerprint != token.dependency_fingerprint;
+        let version_changed = token.version != version;
+        let prior_chain_changed = stored_prior_chain_entries != prior_chain_entries;
+
+        add_referenced_builtins_for_decl_with_indexes(
+            &mut env,
+            &import_export_names,
+            &checked_public_name_set,
+            &token.declaration,
+        )?;
+        if dependency_changed || version_changed {
+            if let Some(measurement) = measurement.as_deref_mut() {
+                measurement.dependency_rechecks = measurement.dependency_rechecks.saturating_add(1);
+            }
+            ensure_candidate_schema_limits(&token.declaration, &token.limits)?;
+            let mut whnf_fuel = fuel_to_usize(
+                token.limits.max_reduction_steps,
+                ProducerLimitKind::MaxReductionSteps,
+            )?;
+            let mut conversion_fuel = fuel_to_usize(
+                token.limits.max_conversion_steps,
+                ProducerLimitKind::MaxConversionSteps,
+            )?;
+            precheck_decl_with_fuel(
+                &env,
+                &token.declaration,
+                &mut whnf_fuel,
+                &mut conversion_fuel,
+            )?;
+        } else if prior_chain_changed {
+            if let Some(measurement) = measurement.as_deref_mut() {
+                measurement.prior_chain_rebinds = measurement.prior_chain_rebinds.saturating_add(1);
+            }
+        }
+        crate::add_current_module_decl_to_env(&mut env, token.declaration.clone(), version)?;
 
         let mut next_checked_decls = checked_decls.clone();
         next_checked_decls.push(resolved.interface.clone());
@@ -1033,20 +1418,45 @@ fn validate_checked_decl_chain(
             token.post_env_fingerprint,
         )?;
 
-        prior_chain_entries.push(ProducerPriorChainEntry {
+        let prior_chain_entry = ProducerPriorChainEntry {
             decl_interface_hash: resolved.hashes.decl_interface_hash,
             decl_certificate_hash: resolved.hashes.decl_certificate_hash,
             pre_env_fingerprint: expected_pre_env_fingerprint,
             post_env_fingerprint: expected_post_env_fingerprint,
+        };
+        let mut rebound = token.clone();
+        rebound.preview_hashes.decl_interface_hash = Some(resolved.hashes.decl_interface_hash);
+        rebound.preview_hashes.decl_certificate_hash = Some(resolved.hashes.decl_certificate_hash);
+        rebound.local_implementation_dependencies = current_local_implementations;
+        rebound.dependency_fingerprint = current_dependency_fingerprint;
+        rebound.version = version;
+        rebound.pre_env_fingerprint = expected_pre_env_fingerprint;
+        rebound.post_env_fingerprint = expected_post_env_fingerprint;
+        rebound.prior_chain_snapshot = prior_chain_snapshot.clone();
+        rebound.prior_chain_fingerprint = prior_chain_fingerprint(&ProducerPriorChainBytes {
+            checked_decls: prior_chain_entries.clone(),
         });
+        rebound.decl_interface_hash = resolved.hashes.decl_interface_hash;
+        rebound.decl_certificate_hash = resolved.hashes.decl_certificate_hash;
+
+        prior_chain_snapshot =
+            ProducerPriorChainSnapshot::append(prior_chain_snapshot, prior_chain_entry.clone());
+        prior_chain_entries.push(prior_chain_entry);
         checked_decls.push(resolved.interface);
         declarations.push(token.declaration.clone());
+        checked_public_name_set.extend(checked_public_names(std::slice::from_ref(
+            &token.declaration,
+        )));
+        rebound_tokens.push(rebound);
         expected_pre_env_fingerprint = expected_post_env_fingerprint;
     }
 
     Ok(ValidatedTokenChain {
         checked_decls,
         declarations,
+        tokens: rebound_tokens,
+        prior_chain_entries,
+        version,
     })
 }
 
@@ -2006,36 +2416,43 @@ mod tests {
     ) -> Result<CandidateBatchResult, CertError> {
         ensure_candidate_batch_schema(&batch)?;
         let direct_imports = validate_candidate_batch_imports(&batch)?;
-        let mut checked_decls = validate_prior_current_decls(&batch)?;
-        let mut checked_decl_sources = batch
-            .prior_current_decls
-            .iter()
-            .map(|token| token.declaration.clone())
-            .collect::<Vec<_>>();
-        let mut prior_chain_entries = batch
-            .prior_current_decls
-            .iter()
-            .map(|token| ProducerPriorChainEntry {
-                decl_interface_hash: token.decl_interface_hash,
-                decl_certificate_hash: token.decl_certificate_hash,
-                pre_env_fingerprint: token.pre_env_fingerprint,
-                post_env_fingerprint: token.post_env_fingerprint,
-            })
-            .collect::<Vec<_>>();
+        let version = if producer_token_chain_version(batch.prior_current_decls)
+            == CertificateFormatVersion::V0_3_0
+            || producer_chain_version(
+                batch
+                    .candidates
+                    .iter()
+                    .map(|candidate| &candidate.declaration),
+            ) == CertificateFormatVersion::V0_3_0
+        {
+            CertificateFormatVersion::V0_3_0
+        } else {
+            CertificateFormatVersion::V0_2_0
+        };
+        let validated = validate_checked_decl_chain(
+            batch.imports,
+            batch.prior_current_decls,
+            Some(&batch.limits),
+            version,
+            None,
+        )?;
+        let mut checked_decls = validated.checked_decls;
+        let mut checked_decl_sources = validated.declarations;
+        let mut prior_chain_entries = validated.prior_chain_entries;
         let mut current_env_fingerprint = producer_env_fingerprint(&ProducerEnvFingerprintBytes {
             direct_imports: direct_imports.clone(),
             checked_decls: checked_decls.clone(),
         });
         let mut env = producer_base_env(batch.imports)?;
-        let mut added_prior_sources = Vec::with_capacity(batch.prior_current_decls.len());
-        for token in batch.prior_current_decls {
+        let mut added_prior_sources = Vec::with_capacity(validated.tokens.len());
+        for token in &validated.tokens {
             add_referenced_builtins_for_decl(
                 &mut env,
                 batch.imports,
                 &added_prior_sources,
                 &token.declaration,
             )?;
-            crate::add_decl_to_env(&mut env, token.declaration.clone())?;
+            crate::add_current_module_decl_to_env(&mut env, token.declaration.clone(), version)?;
             added_prior_sources.push(token.declaration.clone());
         }
 
@@ -2051,6 +2468,7 @@ mod tests {
                 current_env_fingerprint,
                 &batch.limits,
                 candidate,
+                version,
             ) {
                 Ok(accepted) => {
                     env = accepted.env;
@@ -2077,13 +2495,20 @@ mod tests {
         pre_env_fingerprint: Hash,
         limits: &ProducerLimits,
         candidate: &CoreDeclCandidate,
+        version: CertificateFormatVersion,
     ) -> Result<AcceptedCandidate, CertError> {
         let declaration = candidate.declaration.clone();
         ensure_no_unresolved_metavariable(&declaration)?;
         ensure_candidate_schema_limits(&declaration, limits)?;
         let lookup_env =
             producer_lookup_env_for_sources(imports, checked_decls, checked_decl_sources)?;
-        let resolved = resolve_core_decl_candidate(&lookup_env, &declaration)?;
+        let resolved = resolve_core_decl_candidate(
+            &lookup_env,
+            checked_decl_sources,
+            prior_chain_entries,
+            &declaration,
+            version,
+        )?;
 
         let mut candidate_env = env.clone();
         add_referenced_builtins_for_decl(
@@ -2107,7 +2532,7 @@ mod tests {
             &mut conversion_fuel,
         )?;
         let mut next_env = candidate_env;
-        crate::add_decl_to_env(&mut next_env, declaration.clone())?;
+        crate::add_current_module_decl_to_env(&mut next_env, declaration.clone(), version)?;
 
         let mut next_checked_decls = checked_decls.to_vec();
         next_checked_decls.push(resolved.interface.clone());
@@ -2118,32 +2543,45 @@ mod tests {
         let prior_chain_fingerprint = prior_chain_fingerprint(&ProducerPriorChainBytes {
             checked_decls: prior_chain_entries.to_vec(),
         });
+        let local_implementation_dependencies =
+            local_implementation_dependencies(&resolved.dependencies);
+        let dependency_fingerprint =
+            producer_dependency_selective_fingerprint(&resolved.dependencies);
+        let prior_chain_snapshot = ProducerPriorChainSnapshot::from_entries(prior_chain_entries);
         let token = CheckedDeclCandidate {
             declaration: declaration.clone(),
+            version,
             preview_hashes: CandidateHashPreview {
                 type_hash: None,
                 body_hash: None,
                 decl_interface_hash: Some(resolved.hashes.decl_interface_hash),
                 decl_certificate_hash: Some(resolved.hashes.decl_certificate_hash),
             },
+            local_implementation_dependencies,
+            dependency_fingerprint,
             pre_env_fingerprint,
             post_env_fingerprint,
             prior_chain_fingerprint,
+            prior_chain_snapshot: prior_chain_snapshot.clone(),
             limits: *limits,
             limit_profile_hash: producer_limits_hash(limits),
             decl_interface_hash: resolved.hashes.decl_interface_hash,
             decl_certificate_hash: resolved.hashes.decl_certificate_hash,
         };
+        let prior_chain_entry = ProducerPriorChainEntry {
+            decl_interface_hash: resolved.hashes.decl_interface_hash,
+            decl_certificate_hash: resolved.hashes.decl_certificate_hash,
+            pre_env_fingerprint,
+            post_env_fingerprint,
+        };
+        let next_prior_chain_snapshot =
+            ProducerPriorChainSnapshot::append(prior_chain_snapshot, prior_chain_entry.clone());
         Ok(AcceptedCandidate {
-            prior_chain_entry: ProducerPriorChainEntry {
-                decl_interface_hash: resolved.hashes.decl_interface_hash,
-                decl_certificate_hash: resolved.hashes.decl_certificate_hash,
-                pre_env_fingerprint,
-                post_env_fingerprint,
-            },
+            prior_chain_entry,
             token,
             interface: resolved.interface,
             post_env_fingerprint,
+            prior_chain_snapshot: next_prior_chain_snapshot,
             declaration,
             env: next_env,
         })
@@ -2157,15 +2595,19 @@ mod tests {
                 universe_params: vec![],
                 ty: Expr::sort(Level::zero()),
             },
+            version: CertificateFormatVersion::V0_2_0,
             preview_hashes: CandidateHashPreview {
                 type_hash: None,
                 body_hash: None,
                 decl_interface_hash: None,
                 decl_certificate_hash: None,
             },
+            local_implementation_dependencies: vec![],
+            dependency_fingerprint: producer_dependency_selective_fingerprint(&[]),
             pre_env_fingerprint: zero,
             post_env_fingerprint: zero,
             prior_chain_fingerprint: zero,
+            prior_chain_snapshot: None,
             limits,
             limit_profile_hash,
             decl_interface_hash: zero,
@@ -2196,6 +2638,57 @@ mod tests {
         }
     }
 
+    fn opaque_dependency_declarations(value: Expr) -> Vec<Decl> {
+        vec![
+            Decl::Def {
+                name: "hidden_type".to_owned(),
+                universe_params: vec![],
+                ty: Expr::sort(Level::succ(Level::zero())),
+                value,
+                reducibility: Reducibility::Opaque,
+            },
+            Decl::Def {
+                name: "alias_type".to_owned(),
+                universe_params: vec![],
+                ty: Expr::sort(Level::succ(Level::zero())),
+                value: Expr::konst("hidden_type", vec![]),
+                reducibility: Reducibility::Reducible,
+            },
+        ]
+    }
+
+    fn accepted_candidate_tokens(declarations: Vec<Decl>) -> Vec<CheckedDeclCandidate> {
+        let result = check_core_decl_candidates(CandidateBatch {
+            imports: &[],
+            prior_current_decls: &[],
+            candidates: declarations
+                .into_iter()
+                .map(|declaration| CoreDeclCandidate { declaration })
+                .collect(),
+            limits: opaque_candidate_limits(),
+        })
+        .unwrap();
+        result
+            .statuses
+            .into_iter()
+            .map(|status| match status {
+                CandidateStatus::Accepted(token) => token,
+                CandidateStatus::Rejected(error) => panic!("unexpected rejection: {error:?}"),
+            })
+            .collect()
+    }
+
+    fn opaque_candidate_limits() -> ProducerLimits {
+        ProducerLimits {
+            max_declarations: 8,
+            max_expr_nodes: 64,
+            max_level_nodes: 16,
+            max_name_components: 8,
+            max_reduction_steps: 64,
+            max_conversion_steps: 64,
+        }
+    }
+
     fn valid_prior_token(
         declaration: Decl,
         token_limits: ProducerLimits,
@@ -2213,8 +2706,15 @@ mod tests {
             checked_decls: checked_before.to_vec(),
         });
         let lookup_env = producer_lookup_env(imports, checked_before).unwrap();
-        let (interface, hashes) =
-            crate::canonical_producer_checked_decl_hashes(&declaration, &lookup_env).unwrap();
+        let resolved = crate::canonical_producer_checked_decl_for_version(
+            &declaration,
+            &lookup_env,
+            CertificateFormatVersion::V0_2_0,
+            &[],
+        )
+        .unwrap();
+        let interface = resolved.interface;
+        let hashes = resolved.hashes;
         let mut checked_after = checked_before.to_vec();
         checked_after.push(interface.clone());
         let post_env_fingerprint = producer_env_fingerprint(&ProducerEnvFingerprintBytes {
@@ -2226,15 +2726,21 @@ mod tests {
         });
         let token = CheckedDeclCandidate {
             declaration,
+            version: CertificateFormatVersion::V0_2_0,
             preview_hashes: CandidateHashPreview {
                 type_hash: Some(hash(0x91)),
                 body_hash: Some(hash(0x92)),
                 decl_interface_hash: Some(hash(0x93)),
                 decl_certificate_hash: Some(hash(0x94)),
             },
+            local_implementation_dependencies: vec![],
+            dependency_fingerprint: producer_dependency_selective_fingerprint(
+                &resolved.dependencies,
+            ),
             pre_env_fingerprint,
             post_env_fingerprint,
             prior_chain_fingerprint,
+            prior_chain_snapshot: ProducerPriorChainSnapshot::from_entries(prior_chain_before),
             limits: token_limits,
             limit_profile_hash: producer_limits_hash(&token_limits),
             decl_interface_hash: hashes.decl_interface_hash,
@@ -2650,6 +3156,127 @@ mod tests {
         assert_eq!(streamed_chain_bytes, reference_chain_bytes);
         assert_eq!(streamed_chain_hash, prior_chain_fingerprint(&chain_input));
         assert_eq!(chain_bytes_hashed, reference_chain_bytes.len() as u64);
+    }
+
+    #[test]
+    fn producer_dependency_fingerprint_forgery_rejects() {
+        let mut tokens =
+            accepted_candidate_tokens(opaque_dependency_declarations(Expr::sort(Level::zero())));
+        tokens[1].dependency_fingerprint = hash(0xa1);
+        let error = validate_prior_current_decls(&CandidateBatch {
+            imports: &[],
+            prior_current_decls: &tokens,
+            candidates: vec![],
+            limits: opaque_candidate_limits(),
+        })
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            CertError::ProducerTokenHashMismatch {
+                token_index: 1,
+                field: ProducerTokenHashField::DependencyFingerprint,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn producer_local_implementation_hash_forgery_rejects() {
+        let mut tokens =
+            accepted_candidate_tokens(opaque_dependency_declarations(Expr::sort(Level::zero())));
+        let dependency = tokens[1].local_implementation_dependencies[0].clone();
+        tokens[1].local_implementation_dependencies[0] =
+            DependencyEntry::from_decoded_local_implementation(
+                dependency.global_ref().clone(),
+                dependency.decl_interface_hash(),
+                hash(0xa2),
+            );
+        let error = validate_prior_current_decls(&CandidateBatch {
+            imports: &[],
+            prior_current_decls: &tokens,
+            candidates: vec![],
+            limits: opaque_candidate_limits(),
+        })
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            CertError::ProducerTokenHashMismatch {
+                token_index: 1,
+                field: ProducerTokenHashField::DependencyFingerprint,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn producer_reducibility_marker_forgery_rejects() {
+        let mut tokens =
+            accepted_candidate_tokens(opaque_dependency_declarations(Expr::sort(Level::zero())));
+        match &mut tokens[0].declaration {
+            Decl::Def { reducibility, .. } => *reducibility = Reducibility::Reducible,
+            _ => panic!("expected definition"),
+        }
+        assert!(matches!(
+            validate_prior_current_decls(&CandidateBatch {
+                imports: &[],
+                prior_current_decls: &tokens,
+                candidates: vec![],
+                limits: opaque_candidate_limits(),
+            }),
+            Err(CertError::ProducerTokenHashMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn prepared_candidate_chain_matches_reference_for_opaque_and_rebound_cache() {
+        let declarations = opaque_dependency_declarations(Expr::sort(Level::zero()));
+        let limits = opaque_candidate_limits();
+        let direct_candidates = declarations
+            .iter()
+            .cloned()
+            .map(|declaration| CoreDeclCandidate { declaration })
+            .collect::<Vec<_>>();
+        let optimized = check_core_decl_candidates(CandidateBatch {
+            imports: &[],
+            prior_current_decls: &[],
+            candidates: direct_candidates.clone(),
+            limits,
+        })
+        .unwrap();
+        let reference = check_core_decl_candidates_reference(CandidateBatch {
+            imports: &[],
+            prior_current_decls: &[],
+            candidates: direct_candidates,
+            limits,
+        })
+        .unwrap();
+        assert_eq!(optimized, reference);
+
+        let old_tokens = accepted_candidate_tokens(declarations);
+        let changed = accepted_candidate_tokens(opaque_dependency_declarations(Expr::pi(
+            "x",
+            Expr::sort(Level::zero()),
+            Expr::sort(Level::zero()),
+        )));
+        let rebound = vec![changed[0].clone(), old_tokens[1].clone()];
+        let candidate = CoreDeclCandidate {
+            declaration: prior_axiom("AfterRebound"),
+        };
+        let optimized = check_core_decl_candidates(CandidateBatch {
+            imports: &[],
+            prior_current_decls: &rebound,
+            candidates: vec![candidate.clone()],
+            limits,
+        })
+        .unwrap();
+        let reference = check_core_decl_candidates_reference(CandidateBatch {
+            imports: &[],
+            prior_current_decls: &rebound,
+            candidates: vec![candidate],
+            limits,
+        })
+        .unwrap();
+        assert_eq!(optimized, reference);
     }
 
     #[test]

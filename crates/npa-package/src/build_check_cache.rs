@@ -18,14 +18,14 @@ use crate::{
 };
 
 /// Cache key input schema for package build-check result entries.
-pub const PACKAGE_BUILD_CHECK_CACHE_SCHEMA: &str = "npa.package.build_check_cache.v0.1";
+pub const PACKAGE_BUILD_CHECK_CACHE_SCHEMA: &str = "npa.package.build_check_cache.v0.2";
 
 /// Cache result entry schema for package build-check outcomes.
-pub const PACKAGE_BUILD_CHECK_RESULT_SCHEMA: &str = "npa.package.build_check_result.v0.1";
+pub const PACKAGE_BUILD_CHECK_RESULT_SCHEMA: &str = "npa.package.build_check_result.v0.2";
 
 /// Default local package build-check result-store layout.
 pub const PACKAGE_BUILD_CHECK_CACHE_LAYOUT_DIR: &str =
-    "target/npa-package-audit-cache/build-check-v0.1";
+    "target/npa-package-audit-cache/build-check-v0.2";
 
 /// Direct import identity included in package build-check cache keys.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -47,10 +47,14 @@ pub struct PackageBuildCheckCacheKeyInput {
     pub tool_version: String,
     /// Deterministic hash of the build-check tool identity material.
     pub tool_build_hash: PackageHash,
-    /// Core specification profile from the package manifest.
-    pub core_spec: String,
-    /// Canonical certificate format profile from the package manifest.
-    pub certificate_format: String,
+    /// Core profile from the package manifest.
+    pub package_core_profile: String,
+    /// Certificate profile from the package manifest.
+    pub package_certificate_profile: String,
+    /// Exact certificate format emitted by the build.
+    pub output_certificate_format: String,
+    /// Exact core specification emitted by the build.
+    pub output_core_spec: String,
     /// Built module name.
     pub module: Name,
     /// Exact hash of the source bytes used for the live build.
@@ -150,6 +154,16 @@ pub fn parse_package_build_check_result_entry_json(
     source: &str,
 ) -> PackageArtifactResult<PackageBuildCheckResultEntry> {
     let root = parse_artifact_json(source)?;
+    let members = expect_object(&root, "$")?;
+    let schema = required_string(members, "$", "schema")?;
+    if schema != PACKAGE_BUILD_CHECK_RESULT_SCHEMA {
+        return Err(PackageArtifactError::unsupported_schema(
+            "schema",
+            "schema",
+            PACKAGE_BUILD_CHECK_RESULT_SCHEMA,
+            schema,
+        ));
+    }
     let entry = parse_result_entry_value(&root)?;
     validate_package_build_check_result_entry(&entry)?;
     let canonical = package_build_check_result_entry_json(&entry);
@@ -214,8 +228,19 @@ fn validate_cache_key_input(input: &PackageBuildCheckCacheKeyInput) -> PackageAr
         ));
     }
     validate_plain_string(&input.tool_version, "key_input.tool_version")?;
-    validate_plain_string(&input.core_spec, "key_input.core_spec")?;
-    validate_plain_string(&input.certificate_format, "key_input.certificate_format")?;
+    validate_plain_string(
+        &input.package_core_profile,
+        "key_input.package_core_profile",
+    )?;
+    validate_plain_string(
+        &input.package_certificate_profile,
+        "key_input.package_certificate_profile",
+    )?;
+    validate_plain_string(
+        &input.output_certificate_format,
+        "key_input.output_certificate_format",
+    )?;
+    validate_plain_string(&input.output_core_spec, "key_input.output_core_spec")?;
     validate_module_name(&input.module, "key_input.module")?;
     for (index, import) in input.direct_imports.iter().enumerate() {
         validate_module_name(
@@ -277,8 +302,19 @@ fn cache_key_input_json(input: &PackageBuildCheckCacheKeyInput) -> String {
         ("schema", json_string(&input.schema)),
         ("tool_version", json_string(&input.tool_version)),
         ("tool_build_hash", hash_json(input.tool_build_hash)),
-        ("core_spec", json_string(&input.core_spec)),
-        ("certificate_format", json_string(&input.certificate_format)),
+        (
+            "package_core_profile",
+            json_string(&input.package_core_profile),
+        ),
+        (
+            "package_certificate_profile",
+            json_string(&input.package_certificate_profile),
+        ),
+        (
+            "output_certificate_format",
+            json_string(&input.output_certificate_format),
+        ),
+        ("output_core_spec", json_string(&input.output_core_spec)),
         ("module", json_string(&input.module.as_dotted())),
         ("source_hash", hash_json(input.source_hash)),
         (
@@ -393,8 +429,10 @@ fn parse_cache_key_input(
         schema: required_string(members, path, "schema")?,
         tool_version: required_string(members, path, "tool_version")?,
         tool_build_hash: required_hash(members, path, "tool_build_hash")?,
-        core_spec: required_string(members, path, "core_spec")?,
-        certificate_format: required_string(members, path, "certificate_format")?,
+        package_core_profile: required_string(members, path, "package_core_profile")?,
+        package_certificate_profile: required_string(members, path, "package_certificate_profile")?,
+        output_certificate_format: required_string(members, path, "output_certificate_format")?,
+        output_core_spec: required_string(members, path, "output_core_spec")?,
         module: required_name(members, path, "module")?,
         source_hash: required_hash(members, path, "source_hash")?,
         expected_source_hash: required_hash(members, path, "expected_source_hash")?,
@@ -478,8 +516,10 @@ const CACHE_KEY_INPUT_FIELDS: &[&str] = &[
     "schema",
     "tool_version",
     "tool_build_hash",
-    "core_spec",
-    "certificate_format",
+    "package_core_profile",
+    "package_certificate_profile",
+    "output_certificate_format",
+    "output_core_spec",
     "module",
     "source_hash",
     "expected_source_hash",
@@ -623,6 +663,45 @@ mod tests {
         assert!(json.contains("\"build_evidence\":false"));
     }
 
+    #[test]
+    fn package_build_check_cache_key_changes_for_exact_output_pair() {
+        let input = fixture_key_input();
+        let mut changed_format = input.clone();
+        changed_format.output_certificate_format = "NPA-CERT-0.3.0".to_owned();
+        let mut changed_core = input.clone();
+        changed_core.output_core_spec = "NPA-Core-0.3.0".to_owned();
+
+        assert_ne!(
+            package_build_check_cache_key(&input),
+            package_build_check_cache_key(&changed_format)
+        );
+        assert_ne!(
+            package_build_check_cache_key(&input),
+            package_build_check_cache_key(&changed_core)
+        );
+    }
+
+    #[test]
+    fn package_build_check_v0_1_persistent_entry_is_a_schema_miss() {
+        let json = package_build_check_result_entry_json(&fixture_result_entry(
+            PackageBuildCheckCachedStatus::Accepted,
+        ));
+        let old = json
+            .replacen(
+                PACKAGE_BUILD_CHECK_RESULT_SCHEMA,
+                "npa.package.build_check_result.v0.1",
+                1,
+            )
+            .replace("package_core_profile", "core_spec")
+            .replace("package_certificate_profile", "certificate_format");
+
+        let error = parse_package_build_check_result_entry_json(&old).unwrap_err();
+        assert_eq!(
+            error.reason_code,
+            PackageArtifactErrorReason::UnsupportedSchema
+        );
+    }
+
     fn fixture_result_entry(status: PackageBuildCheckCachedStatus) -> PackageBuildCheckResultEntry {
         let key_input = fixture_key_input();
         PackageBuildCheckResultEntry {
@@ -642,8 +721,10 @@ mod tests {
             schema: PACKAGE_BUILD_CHECK_CACHE_SCHEMA.to_owned(),
             tool_version: "0.1.0".to_owned(),
             tool_build_hash: hash(1),
-            core_spec: "npa.core.v0.1".to_owned(),
-            certificate_format: "npa.certificate.canonical.v0.1".to_owned(),
+            package_core_profile: "npa.core.v0.1".to_owned(),
+            package_certificate_profile: "npa.certificate.canonical.v0.1".to_owned(),
+            output_certificate_format: "NPA-CERT-0.2.0".to_owned(),
+            output_core_spec: "NPA-Core-0.2.0".to_owned(),
             module: module("Fixture.Target"),
             source_hash: hash(2),
             expected_source_hash: hash(2),

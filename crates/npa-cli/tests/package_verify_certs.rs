@@ -527,6 +527,7 @@ fn package_verify_certs_in_process_modes_enforce_read_scope_and_package_root_no_
     }
 }
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
 #[test]
 fn package_verify_external_reads_only_checked_and_explicit_policy_inputs() {
     let mut package =
@@ -1490,7 +1491,7 @@ fn package_verify_certs_fast_cli_succeeds_with_json_and_human_provenance() {
     assert_eq!(output.status.code(), Some(0));
     assert!(output.stderr.is_empty());
     let stdout = String::from_utf8(output.stdout).unwrap();
-    assert!(stdout.contains("\"schema\":\"npa.package.command_result.v0.3\""));
+    assert!(stdout.contains("\"schema\":\"npa.package.command_result.v0.4\""));
     assert!(stdout.contains("\"command\":\"package verify-certs\""));
     assert!(stdout.contains("\"status\":\"passed\""));
     assert!(stdout.contains("\"kind\":\"FastVerifier\""));
@@ -1515,6 +1516,7 @@ fn package_verify_certs_fast_cli_succeeds_with_json_and_human_provenance() {
     assert!(human_stdout.contains("actual=mode=checked;hash=sha256:"));
 }
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
 #[test]
 fn package_verify_external_succeeds_with_explicit_policy_registry_imports_and_no_source() {
     let package =
@@ -1719,7 +1721,7 @@ fn package_verify_external_real_ocaml_checker_closes_source_free_import_dag() {
             format_package_hash(&entry.axiom_report_hash)
         )));
         assert!(machine.contains(&format!(
-            "\"checker\":{{\"binary_hash\":\"{}\",\"binary_id\":\"npa-checker-ext-macos-aarch64\",\"build_hash\":\"{}\",\"id\":\"npa-checker-ext\",\"profile\":\"external\",\"version\":\"0.2.0\"}}",
+            "\"checker\":{{\"binary_hash\":\"{}\",\"binary_id\":\"npa-checker-ext-macos-aarch64\",\"build_hash\":\"{}\",\"id\":\"npa-checker-ext\",\"profile\":\"external\",\"version\":\"0.3.0\"}}",
             fixture.binary_hash, fixture.build_hash
         )));
         assert!(machine.contains(&format!(
@@ -1737,9 +1739,11 @@ fn package_verify_external_real_ocaml_checker_closes_source_free_import_dag() {
         let raw_hex = json_string_field_for_test(&machine, "raw_checker_output_hex");
         let raw = String::from_utf8(decode_lower_hex_for_test(raw_hex)).unwrap();
         assert!(raw.ends_with('\n'));
-        assert!(raw.contains("\"schema\": \"npa.independent-checker.checker_raw_result.v1\""));
+        assert!(raw.contains("\"schema\": \"npa.independent-checker.checker_raw_result.v2\""));
         assert!(raw.contains("\"checker_id\": \"npa-checker-ext\""));
-        assert!(raw.contains("\"checker_version\": \"0.2.0\""));
+        assert!(raw.contains("\"checker_version\": \"0.3.0\""));
+        assert!(raw.contains("\"certificate_format\": \"NPA-CERT-0.3.0\""));
+        assert!(raw.contains("\"core_spec\": \"NPA-Core-0.3.0\""));
         assert!(raw.contains(&format!(
             "\"checker_build_hash\": \"{}\"",
             fixture.build_hash
@@ -2201,7 +2205,9 @@ fn package_verify_certs_local_hit_marks_proof_evidence_false_and_follow_up() {
         .expect("module diagnostic");
     assert_eq!(
         module.actual_value.as_deref(),
-        Some("status=passed;evidence=local-audit-cache;proof_evidence=false")
+        Some(
+            "status=passed;evidence=local-audit-cache;proof_evidence=false;certificate_format=NPA-CERT-0.3.0;core_spec=NPA-Core-0.3.0"
+        )
     );
     let summary = audit_cache_summary(&local);
     assert!(summary.contains("mode=local-hit"));
@@ -2281,7 +2287,9 @@ fn package_verify_certs_local_hit_live_checks_cached_dependency_needed_by_live_d
     assert!(!summary.contains("live_checked=0"));
     assert!(local.diagnostics.iter().all(|diagnostic| {
         diagnostic.actual_value.as_deref()
-            != Some("status=passed;evidence=local-audit-cache;proof_evidence=false")
+            != Some(
+                "status=passed;evidence=local-audit-cache;proof_evidence=false;certificate_format=NPA-CERT-0.3.0;core_spec=NPA-Core-0.3.0",
+            )
     }));
     assert!(local
         .diagnostics
@@ -2614,7 +2622,9 @@ fn package_verify_certs_disk_memo_writes_hits_and_delete_reruns_live() {
         .expect("module diagnostic");
     assert_eq!(
         module.actual_value.as_deref(),
-        Some("status=passed;evidence=disk-verifier-memo;proof_evidence=false")
+        Some(
+            "status=passed;evidence=disk-verifier-memo;proof_evidence=false;certificate_format=NPA-CERT-0.3.0;core_spec=NPA-Core-0.3.0"
+        )
     );
 
     clear_disk_memo();
@@ -2670,15 +2680,15 @@ fn package_verify_certs_cache_aware_disk_memo_live_checks_dirty_reverse_dependen
     assert!(summary.contains("cached=1"), "{summary}");
     assert_eq!(
         module_actual_value(&cached, "Proofs.Ai.Basic"),
-        "status=passed;evidence=disk-verifier-memo;proof_evidence=false"
+        "status=passed;evidence=disk-verifier-memo;proof_evidence=false;certificate_format=NPA-CERT-0.3.0;core_spec=NPA-Core-0.3.0"
     );
     assert_eq!(
         module_actual_value(&cached, "Proofs.Ai.EqReasoning"),
-        "status=passed;evidence=live-checker;proof_evidence=true"
+        "status=passed;evidence=live-checker;proof_evidence=true;certificate_format=NPA-CERT-0.3.0;core_spec=NPA-Core-0.3.0"
     );
     assert_eq!(
         module_actual_value(&cached, "Proofs.Ai.Analysis.AbstractMetricTopology"),
-        "status=passed;evidence=live-checker;proof_evidence=true"
+        "status=passed;evidence=live-checker;proof_evidence=true;certificate_format=NPA-CERT-0.3.0;core_spec=NPA-Core-0.3.0"
     );
 }
 
@@ -2744,7 +2754,9 @@ fn package_verify_certs_persistent_cache_read_through_writes_hits_and_delete_rer
         .expect("module diagnostic");
     assert_eq!(
         module.actual_value.as_deref(),
-        Some("status=passed;evidence=live-checker;proof_evidence=true")
+        Some(
+            "status=passed;evidence=live-checker;proof_evidence=true;certificate_format=NPA-CERT-0.3.0;core_spec=NPA-Core-0.3.0"
+        )
     );
     assert_eq!(
         without_disk_memo_summary_and_timings(second.clone()),
@@ -3855,6 +3867,10 @@ fn write_external_runner_fixture(
             {{
               "profile":"external",
               "checker_id":"npa-checker-ext",
+              "checker_version":"0.1.0",
+              "raw_result_schema":"npa.independent-checker.checker_raw_result.v1",
+              "certificate_format":"NPA-CERT-0.2.0",
+              "core_spec":"NPA-Core-0.2.0",
               "binary_id":"npa-checker-ext-macos-aarch64",
               "binary_hash":"{}",
               "build_hash":"{}",
@@ -3966,6 +3982,22 @@ fn write_real_external_runner_fixture(
             &format_hash_string(&binary_hash),
         )
         .replace(&format_hash_string(&test_hash(0x55)), build_hash)
+        .replace(
+            "\"checker_version\":\"0.1.0\"",
+            "\"checker_version\":\"0.3.0\"",
+        )
+        .replace(
+            "\"raw_result_schema\":\"npa.independent-checker.checker_raw_result.v1\"",
+            "\"raw_result_schema\":\"npa.independent-checker.checker_raw_result.v2\"",
+        )
+        .replace(
+            "\"certificate_format\":\"NPA-CERT-0.2.0\"",
+            "\"certificate_format\":\"NPA-CERT-0.3.0\"",
+        )
+        .replace(
+            "\"core_spec\":\"NPA-Core-0.2.0\"",
+            "\"core_spec\":\"NPA-Core-0.3.0\"",
+        )
         .replace(
             &format_hash_string(&old_axiom_policy_hash),
             &format_hash_string(&axiom_policy_hash),

@@ -6,6 +6,11 @@ live release evidence. The Rust `release_manifest_validator` integration test
 requires every positive and named negative fixture to retain its deterministic
 classification or rejection.
 
+`valid-v0.2-current.json` is the exact current host/result compatibility
+fixture (`npa-cli 0.8.x` with `npa.package.command_result.v0.4`). The other
+`valid-v0.2-*` fixtures retain historical 0.3/v0.1 release evidence and are
+used as immutable compatibility inputs.
+
 `valid-v0.2-external.json` intentionally uses an illustrative external checker
 version `0.1.0`. That value exercises the v0.2 schema; it does not describe the
 current binary, select executable bytes, or prove compatibility with

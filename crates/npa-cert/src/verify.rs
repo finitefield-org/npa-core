@@ -284,8 +284,9 @@ fn verify_decoded_module_cert_checks_inner<'a>(
     add_referenced_imports_to_env(&mut env, cert, &imports)?;
     add_referenced_builtins_to_env(&mut env, &builtin_refs)?;
 
+    let version = certificate_format_version(&cert.header)?;
     for decl in &cert.declarations {
-        add_decl_to_env(&mut env, cert_decl_to_kernel_decl(cert, decl)?)?;
+        add_current_module_decl_to_env(&mut env, cert_decl_to_kernel_decl(cert, decl)?, version)?;
     }
     drop(env);
 
@@ -311,6 +312,8 @@ fn verified_module_from_cert(
     structural_closure: StructuralClosureSummary,
 ) -> VerifiedModule {
     VerifiedModule {
+        certificate_format: cert.header.format.clone(),
+        core_spec: cert.header.core_spec.clone(),
         module: cert.header.module.clone(),
         imports: cert.imports.clone(),
         name_table: cert.name_table.clone(),
@@ -341,6 +344,8 @@ fn verified_module_from_owned_cert(
         hashes,
     } = cert;
     VerifiedModule {
+        certificate_format: header.format,
+        core_spec: header.core_spec,
         module: header.module,
         imports,
         name_table,
@@ -670,7 +675,7 @@ fn collect_dependency_entry_names(
     names: &mut BTreeSet<Name>,
 ) -> Result<()> {
     for dependency in dependencies {
-        collect_global_ref_names(cert, &dependency.global_ref, names)?;
+        collect_global_ref_names(cert, dependency.global_ref(), names)?;
     }
     Ok(())
 }
@@ -1003,15 +1008,19 @@ fn collect_level_reachable(
 fn verify_hashes(cert: &ModuleCert) -> Result<()> {
     let level_hashes = compute_level_hashes(&cert.level_table, &cert.name_table)?;
     let term_hashes = compute_term_hashes(&cert.term_table, &level_hashes)?;
+    let version = certificate_format_version(&cert.header)?;
     for decl in &cert.declarations {
         let expected = compute_decl_hashes(
+            version,
             &decl.decl,
             &decl.dependencies,
             &decl.axiom_dependencies,
-            &cert.term_table,
-            &level_hashes,
-            &term_hashes,
-            &cert.name_table,
+            DeclHashTables {
+                terms: &cert.term_table,
+                level_hashes: &level_hashes,
+                term_hashes: &term_hashes,
+                names: &cert.name_table,
+            },
         )?;
         if expected.decl_interface_hash != decl.hashes.decl_interface_hash {
             return Err(CertError::HashMismatch {
@@ -1031,22 +1040,27 @@ fn verify_hashes(cert: &ModuleCert) -> Result<()> {
 
     let expected_export_block =
         build_export_block(&cert.declarations, &cert.term_table, &term_hashes)?;
-    let version = certificate_format_version(&cert.header)?;
     verify_export_format_compatibility(cert, &expected_export_block, version)?;
     let (export_domain, export_bytes, cert_domain, cert_bytes) = match version {
-        CertificateFormatVersion::Current => (
+        CertificateFormatVersion::V0_3_0 => (
             MODULE_EXPORT_DOMAIN,
             encode_export_block(&expected_export_block),
-            MODULE_CERT_DOMAIN,
-            encode_module_cert_without_certificate_hash(cert),
+            version.module_certificate_domain(),
+            encode_module_cert_without_certificate_hash_for_header(cert)?,
         ),
-        CertificateFormatVersion::Previous => (
+        CertificateFormatVersion::V0_2_0 => (
+            MODULE_EXPORT_DOMAIN,
+            encode_export_block(&expected_export_block),
+            COMPAT_MODULE_CERT_DOMAIN,
+            encode_module_cert_without_certificate_hash_v0_2_compat(cert),
+        ),
+        CertificateFormatVersion::V0_1_2 => (
             PREVIOUS_MODULE_EXPORT_DOMAIN,
             encode_export_block_previous(&expected_export_block),
             PREVIOUS_MODULE_CERT_DOMAIN,
             encode_module_cert_without_certificate_hash_for_header(cert)?,
         ),
-        CertificateFormatVersion::Legacy => (
+        CertificateFormatVersion::V0_1 => (
             LEGACY_MODULE_EXPORT_DOMAIN,
             encode_export_block_legacy(&expected_export_block),
             LEGACY_MODULE_CERT_DOMAIN,
@@ -1091,7 +1105,7 @@ fn verify_export_format_compatibility(
     expected_export_block: &ExportBlock,
     version: CertificateFormatVersion,
 ) -> Result<()> {
-    if version == CertificateFormatVersion::Legacy {
+    if version == CertificateFormatVersion::V0_1 {
         if let Some(entry) = expected_export_block
             .iter()
             .find(|entry| !entry.universe_constraints.is_empty())
@@ -1126,7 +1140,18 @@ fn verify_declaration_order(cert: &ModuleCert) -> Result<()> {
         .map(|(decl_index, decl)| {
             let mut deps = BTreeSet::new();
             for dependency in &decl.dependencies {
-                match &dependency.global_ref {
+                if dependency.kind() == DependencyEntryKind::LocalImplementation {
+                    if let GlobalRef::Local {
+                        decl_index: dependency_index,
+                    } = dependency.global_ref()
+                    {
+                        if *dependency_index < decl_index {
+                            deps.insert(*dependency_index);
+                        }
+                    }
+                    continue;
+                }
+                match dependency.global_ref() {
                     GlobalRef::Local {
                         decl_index: dependency_index,
                     } => {
@@ -1440,7 +1465,7 @@ fn add_referenced_imports_to_env(
     let mut refs = BTreeSet::new();
     for decl in &cert.declarations {
         for dependency in &decl.dependencies {
-            refs.insert(dependency.global_ref.clone());
+            refs.insert(dependency.global_ref().clone());
         }
     }
     for global_ref in refs {
@@ -1471,7 +1496,7 @@ pub(crate) fn add_verified_module_referenced_imports_to_env(
     let mut refs = BTreeSet::new();
     for decl in &module.declarations {
         for dependency in &decl.dependencies {
-            refs.insert(dependency.global_ref.clone());
+            refs.insert(dependency.global_ref().clone());
         }
     }
     for global_ref in refs {
@@ -1981,9 +2006,18 @@ fn module_exports_dependency(
 fn verify_dependencies_and_axioms(cert: &ModuleCert, imports: &[&VerifiedModule]) -> Result<()> {
     let mut previous_axioms: Vec<Vec<AxiomRef>> = Vec::new();
     let mut expected_reports = Vec::new();
+    let version = certificate_format_version(&cert.header)?;
+    let mut local_transparency_budget = LocalTransparencyBudget::default();
 
     for (decl_index, decl) in cert.declarations.iter().enumerate() {
-        let expected_deps = expected_dependencies_for_decl(cert, imports, decl_index, &decl.decl)?;
+        let expected_deps = expected_dependencies_for_decl_with_budget(
+            cert,
+            imports,
+            decl_index,
+            &decl.decl,
+            version,
+            &mut local_transparency_budget,
+        )?;
         if expected_deps != decl.dependencies {
             return Err(CertError::AxiomReportMismatch {
                 decl: Some(decl_name_as_name(cert, decl_index)?),
@@ -2837,12 +2871,69 @@ fn contains_const(expr: &Expr, needle: &str) -> bool {
     false
 }
 
+#[cfg(test)]
 pub(crate) fn expected_dependencies_for_decl(
     cert: &ModuleCert,
     imports: &[&VerifiedModule],
     decl_index: usize,
     decl: &DeclPayload,
 ) -> Result<Vec<DependencyEntry>> {
+    let version = certificate_format_version(&cert.header)?;
+    expected_dependencies_for_decl_with_budget(
+        cert,
+        imports,
+        decl_index,
+        decl,
+        version,
+        &mut LocalTransparencyBudget::default(),
+    )
+}
+
+fn expected_dependencies_for_decl_with_budget(
+    cert: &ModuleCert,
+    imports: &[&VerifiedModule],
+    decl_index: usize,
+    decl: &DeclPayload,
+    version: CertificateFormatVersion,
+    budget: &mut LocalTransparencyBudget,
+) -> Result<Vec<DependencyEntry>> {
+    if version == CertificateFormatVersion::V0_3_0 {
+        let actual_implementation_indices = validate_local_implementation_entries(
+            decl_index,
+            &cert
+                .declarations
+                .get(decl_index)
+                .ok_or(CertError::DecodeError)?
+                .dependencies,
+            &cert.declarations,
+        )?;
+        let closure = local_transparency_dependencies(
+            version,
+            decl_index,
+            decl,
+            &cert.declarations,
+            &cert.term_table,
+            budget,
+        )?;
+        validate_local_implementation_closure(
+            decl_index,
+            &actual_implementation_indices,
+            &closure.opaque_definition_indices,
+        )?;
+        for dependency in &closure.interface_dependencies {
+            let expected_hash =
+                interface_hash_for_global_ref(cert, imports, decl_index, dependency.global_ref())?;
+            if dependency.decl_interface_hash() != expected_hash {
+                return Err(CertError::HashMismatch {
+                    object: HashObject::DeclInterface,
+                    expected: dependency.decl_interface_hash(),
+                    actual: expected_hash,
+                });
+            }
+        }
+        return complete_local_transparency_dependencies(&closure, decl_index, &cert.declarations);
+    }
+
     let mut refs = BTreeSet::new();
     for term in decl_term_ids(decl) {
         collect_global_refs_from_term(cert, term, &mut refs)?;
@@ -2870,10 +2961,7 @@ pub(crate) fn expected_dependencies_for_decl(
         .map(|global_ref| {
             let decl_interface_hash =
                 interface_hash_for_global_ref(cert, imports, decl_index, &global_ref)?;
-            Ok(DependencyEntry {
-                global_ref,
-                decl_interface_hash,
-            })
+            DependencyEntry::checked_interface(global_ref, decl_interface_hash)
         })
         .collect()
 }
@@ -2889,7 +2977,7 @@ pub(crate) fn expected_axioms_for_decl(
     let mut direct = BTreeSet::new();
     let mut transitive = BTreeSet::new();
     for dependency in dependencies {
-        match &dependency.global_ref {
+        match dependency.global_ref() {
             GlobalRef::Builtin {
                 name,
                 decl_interface_hash,
@@ -2897,7 +2985,7 @@ pub(crate) fn expected_axioms_for_decl(
                 let name_value = cert.name_table.get(*name).ok_or(CertError::DecodeError)?;
                 if builtin_is_axiom(name_value) {
                     let axiom = AxiomRef {
-                        global_ref: dependency.global_ref.clone(),
+                        global_ref: dependency.global_ref().clone(),
                         name: *name,
                         decl_interface_hash: *decl_interface_hash,
                     };
@@ -2924,10 +3012,10 @@ pub(crate) fn expected_axioms_for_decl(
                 decl_interface_hash,
             } => {
                 let entry =
-                    imported_export_entry_for_global_ref(cert, imports, &dependency.global_ref)?;
+                    imported_export_entry_for_global_ref(cert, imports, dependency.global_ref())?;
                 if entry.kind == ExportKind::Axiom {
                     direct.insert(AxiomRef {
-                        global_ref: dependency.global_ref.clone(),
+                        global_ref: dependency.global_ref().clone(),
                         name: *name,
                         decl_interface_hash: *decl_interface_hash,
                     });

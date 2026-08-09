@@ -28,60 +28,60 @@ use crate::{
 };
 
 /// Cache key input schema for package audit result entries.
-pub const PACKAGE_AUDIT_CACHE_SCHEMA: &str = "npa.package.audit_cache.v0.1";
+pub const PACKAGE_AUDIT_CACHE_SCHEMA: &str = "npa.package.audit_cache.v0.2";
 
 /// Cache result entry schema for package audit checker outcomes.
-pub const PACKAGE_AUDIT_RESULT_SCHEMA: &str = "npa.package.audit_result.v0.1";
+pub const PACKAGE_AUDIT_RESULT_SCHEMA: &str = "npa.package.audit_result.v0.2";
 
 /// Process-local package audit memo key schema.
 ///
 /// These keys are never serialized as proof evidence. They use the same
 /// deterministic identity material as audit cache entries, but the schema keeps
 /// process-local memoization disjoint from disk-backed cache artifacts.
-pub const PACKAGE_AUDIT_PROCESS_MEMO_SCHEMA: &str = "npa.package.audit_process_memo.v0.1";
+pub const PACKAGE_AUDIT_PROCESS_MEMO_SCHEMA: &str = "npa.package.audit_process_memo.v0.2";
 
 /// Disk-backed package verifier memo key schema.
 ///
 /// This local-only memo uses the same deterministic key material as the
 /// process-local verifier memo, but the schema keeps it separate from
 /// process-only keys and from package audit result-store entries.
-pub const PACKAGE_AUDIT_DISK_MEMO_SCHEMA: &str = "npa.package.audit_disk_memo.v0.1";
+pub const PACKAGE_AUDIT_DISK_MEMO_SCHEMA: &str = "npa.package.audit_disk_memo.v0.2";
 
 /// Disk-backed package verifier memo result schema.
-pub const PACKAGE_AUDIT_DISK_MEMO_RESULT_SCHEMA: &str = "npa.package.audit_disk_memo_result.v0.1";
+pub const PACKAGE_AUDIT_DISK_MEMO_RESULT_SCHEMA: &str = "npa.package.audit_disk_memo_result.v0.2";
 
 /// Disk-backed reference checker summary cache key schema.
-pub const PACKAGE_REFERENCE_SUMMARY_CACHE_SCHEMA: &str = "npa.package.reference_summary_cache.v0.1";
+pub const PACKAGE_REFERENCE_SUMMARY_CACHE_SCHEMA: &str = "npa.package.reference_summary_cache.v0.2";
 
 /// Disk-backed reference checker summary cache entry schema.
 pub const PACKAGE_REFERENCE_SUMMARY_CACHE_ENTRY_SCHEMA: &str =
-    "npa.package.reference_summary_cache_entry.v0.1";
+    "npa.package.reference_summary_cache_entry.v0.2";
 
 /// Disk-backed import-context export-data cache key schema.
 pub const PACKAGE_IMPORT_CONTEXT_EXPORT_CACHE_SCHEMA: &str =
-    "npa.package.import_context_export_cache.v0.1";
+    "npa.package.import_context_export_cache.v0.2";
 
 /// Disk-backed import-context export-data cache entry schema.
 pub const PACKAGE_IMPORT_CONTEXT_EXPORT_CACHE_ENTRY_SCHEMA: &str =
-    "npa.package.import_context_export_cache_entry.v0.1";
+    "npa.package.import_context_export_cache_entry.v0.2";
 
 /// Verified export summary schema reserved for the package audit acceleration plan.
-pub const PACKAGE_VERIFIED_EXPORT_SUMMARY_SCHEMA: &str = "npa.package.verified_export_summary.v0.1";
+pub const PACKAGE_VERIFIED_EXPORT_SUMMARY_SCHEMA: &str = "npa.package.verified_export_summary.v0.2";
 
 /// Default local package audit result-store layout.
-pub const PACKAGE_AUDIT_CACHE_LAYOUT_DIR: &str = "target/npa-package-audit-cache/results-v0.1";
+pub const PACKAGE_AUDIT_CACHE_LAYOUT_DIR: &str = "target/npa-package-audit-cache/results-v0.2";
 
 /// Default local disk-backed verifier memo layout.
 pub const PACKAGE_AUDIT_DISK_MEMO_LAYOUT_DIR: &str =
-    "target/npa-package-audit-cache/verifier-memo-v0.1";
+    "target/npa-package-audit-cache/verifier-memo-v0.2";
 
 /// Default local disk-backed reference checker summary cache layout.
 pub const PACKAGE_REFERENCE_SUMMARY_CACHE_LAYOUT_DIR: &str =
-    "target/npa-package-audit-cache/reference-summary-v0.1";
+    "target/npa-package-audit-cache/reference-summary-v0.2";
 
 /// Default local disk-backed import-context export-data cache layout.
 pub const PACKAGE_IMPORT_CONTEXT_EXPORT_CACHE_LAYOUT_DIR: &str =
-    "target/npa-package-audit-cache/import-context-export-v0.1";
+    "target/npa-package-audit-cache/import-context-export-v0.2";
 
 /// Checker identity included in package audit cache keys.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -122,10 +122,14 @@ pub struct PackageAuditCacheKeyInput {
     pub package_version: PackageVersion,
     /// Package-lock schema string covered by this cache identity.
     pub package_lock_schema: String,
-    /// Core specification profile.
-    pub core_spec: String,
-    /// Canonical certificate format profile.
-    pub certificate_format: String,
+    /// Core profile from the package manifest.
+    pub package_core_profile: String,
+    /// Certificate profile from the package manifest.
+    pub package_certificate_profile: String,
+    /// Exact certificate format decoded from the checked module.
+    pub module_certificate_format: String,
+    /// Exact core specification decoded from the checked module.
+    pub module_core_spec: String,
     /// Exact hash of the checked package lock bytes.
     pub package_lock_hash: PackageHash,
     /// Exact hash of the package audit policy material.
@@ -243,8 +247,10 @@ pub struct PackageImportContextExportData {
     pub certificate_hash: PackageHash,
     /// Dependency axiom-report hash from the package lock.
     pub axiom_report_hash: PackageHash,
-    /// Certificate format profile used to materialize the dependency context.
+    /// Exact certificate format decoded from the dependency certificate.
     pub certificate_format: String,
+    /// Exact core specification decoded from the dependency certificate.
+    pub core_spec: String,
 }
 
 /// Import-context export-data cache key input.
@@ -258,10 +264,14 @@ pub struct PackageImportContextExportCacheKeyInput {
     pub package_version: PackageVersion,
     /// Package lock schema string.
     pub package_lock_schema: String,
-    /// Core specification profile.
-    pub core_spec: String,
-    /// Certificate format profile.
-    pub certificate_format: String,
+    /// Core profile from the package manifest.
+    pub package_core_profile: String,
+    /// Certificate profile from the package manifest.
+    pub package_certificate_profile: String,
+    /// Exact certificate format selected for the owner module.
+    pub owner_certificate_format: String,
+    /// Exact core specification selected for the owner module.
+    pub owner_core_spec: String,
     /// Verifier policy hash for the materialized import context.
     pub checker_policy_hash: PackageHash,
     /// Owner module whose direct import context is cached.
@@ -413,6 +423,7 @@ pub fn parse_package_audit_result_entry_json(
     source: &str,
 ) -> PackageArtifactResult<PackageAuditResultEntry> {
     let root = parse_artifact_json(source)?;
+    require_root_schema(&root, PACKAGE_AUDIT_RESULT_SCHEMA)?;
     let entry = parse_result_entry_value(&root)?;
     validate_package_audit_result_entry(&entry)?;
     let canonical = package_audit_result_entry_json(&entry);
@@ -430,6 +441,7 @@ pub fn parse_package_audit_disk_memo_result_entry_json(
     source: &str,
 ) -> PackageArtifactResult<PackageAuditResultEntry> {
     let root = parse_artifact_json(source)?;
+    require_root_schema(&root, PACKAGE_AUDIT_DISK_MEMO_RESULT_SCHEMA)?;
     let entry = parse_result_entry_value(&root)?;
     validate_package_audit_disk_memo_result_entry(&entry)?;
     let canonical = package_audit_disk_memo_result_entry_json(&entry);
@@ -447,6 +459,7 @@ pub fn parse_package_reference_summary_cache_entry_json(
     source: &str,
 ) -> PackageArtifactResult<PackageReferenceSummaryCacheEntry> {
     let root = parse_artifact_json(source)?;
+    require_root_schema(&root, PACKAGE_REFERENCE_SUMMARY_CACHE_ENTRY_SCHEMA)?;
     let entry = parse_reference_summary_cache_entry_value(&root)?;
     validate_package_reference_summary_cache_entry(&entry)?;
     let canonical = package_reference_summary_cache_entry_json(&entry);
@@ -465,6 +478,7 @@ pub fn parse_package_import_context_export_cache_entry_json(
     source: &str,
 ) -> PackageArtifactResult<PackageImportContextExportCacheEntry> {
     let root = parse_artifact_json(source)?;
+    require_root_schema(&root, PACKAGE_IMPORT_CONTEXT_EXPORT_CACHE_ENTRY_SCHEMA)?;
     let entry = parse_import_context_export_cache_entry_value(&root)?;
     validate_package_import_context_export_cache_entry(&entry)?;
     let canonical = package_import_context_export_cache_entry_json(&entry);
@@ -475,6 +489,17 @@ pub fn parse_package_import_context_export_cache_entry_json(
         ));
     }
     Ok(entry)
+}
+
+fn require_root_schema(root: &crate::json::JsonValue, expected: &str) -> PackageArtifactResult<()> {
+    let members = expect_object(root, "$")?;
+    let actual = required_string(members, "$", "schema")?;
+    if actual != expected {
+        return Err(PackageArtifactError::unsupported_schema(
+            "schema", "schema", expected, actual,
+        ));
+    }
+    Ok(())
 }
 
 /// Validate one package audit result entry without reading files or running checkers.
@@ -642,11 +667,7 @@ pub fn validate_package_import_context_export_cache_entry(
             entry.cache_key.clone(),
         ));
     }
-    validate_import_context_export_data_list(
-        &entry.dependency_exports,
-        "dependency_exports",
-        &entry.key_input.certificate_format,
-    )?;
+    validate_import_context_export_data_list(&entry.dependency_exports, "dependency_exports")?;
     if entry.dependency_exports != entry.key_input.dependency_exports {
         return Err(PackageArtifactError::summary_mismatch(
             "dependency_exports",
@@ -671,8 +692,19 @@ fn validate_import_context_export_cache_key_input(
     }
     validate_package_identity(&input.package_id, &input.package_version)?;
     validate_plain_string(&input.package_lock_schema, "key_input.package_lock_schema")?;
-    validate_plain_string(&input.core_spec, "key_input.core_spec")?;
-    validate_plain_string(&input.certificate_format, "key_input.certificate_format")?;
+    validate_plain_string(
+        &input.package_core_profile,
+        "key_input.package_core_profile",
+    )?;
+    validate_plain_string(
+        &input.package_certificate_profile,
+        "key_input.package_certificate_profile",
+    )?;
+    validate_plain_string(
+        &input.owner_certificate_format,
+        "key_input.owner_certificate_format",
+    )?;
+    validate_plain_string(&input.owner_core_spec, "key_input.owner_core_spec")?;
     validate_hash_string(
         &format_package_hash(&input.checker_policy_hash),
         "key_input.checker_policy_hash",
@@ -681,21 +713,15 @@ fn validate_import_context_export_cache_key_input(
     validate_import_context_export_data_list(
         &input.dependency_exports,
         "key_input.dependency_exports",
-        &input.certificate_format,
     )
 }
 
 fn validate_import_context_export_data_list(
     exports: &[PackageImportContextExportData],
     path: &str,
-    expected_certificate_format: &str,
 ) -> PackageArtifactResult<()> {
     for (index, export) in exports.iter().enumerate() {
-        validate_import_context_export_data(
-            export,
-            &format!("{path}[{index}]"),
-            expected_certificate_format,
-        )?;
+        validate_import_context_export_data(export, &format!("{path}[{index}]"))?;
     }
     Ok(())
 }
@@ -703,7 +729,6 @@ fn validate_import_context_export_data_list(
 fn validate_import_context_export_data(
     export: &PackageImportContextExportData,
     path: &str,
-    expected_certificate_format: &str,
 ) -> PackageArtifactResult<()> {
     validate_module_name(&export.module, field_path(path, "module"))?;
     match export.origin {
@@ -739,18 +764,11 @@ fn validate_import_context_export_data(
             validate_package_identity(package, version)?;
         }
     }
-    if export.certificate_format != expected_certificate_format {
-        return Err(PackageArtifactError::invalid_enum_value(
-            field_path(path, "certificate_format"),
-            "certificate_format",
-            expected_certificate_format,
-            &export.certificate_format,
-        ));
-    }
     validate_plain_string(
         &export.certificate_format,
         field_path(path, "certificate_format"),
-    )
+    )?;
+    validate_plain_string(&export.core_spec, field_path(path, "core_spec"))
 }
 
 fn validate_result_entry_with_schemas(
@@ -882,8 +900,19 @@ fn validate_cache_key_input_with_schema(
     validate_plain_string(input.package_id.as_str(), "key_input.package_id")?;
     validate_plain_string(input.package_version.as_str(), "key_input.package_version")?;
     validate_plain_string(&input.package_lock_schema, "key_input.package_lock_schema")?;
-    validate_plain_string(&input.core_spec, "key_input.core_spec")?;
-    validate_plain_string(&input.certificate_format, "key_input.certificate_format")?;
+    validate_plain_string(
+        &input.package_core_profile,
+        "key_input.package_core_profile",
+    )?;
+    validate_plain_string(
+        &input.package_certificate_profile,
+        "key_input.package_certificate_profile",
+    )?;
+    validate_plain_string(
+        &input.module_certificate_format,
+        "key_input.module_certificate_format",
+    )?;
+    validate_plain_string(&input.module_core_spec, "key_input.module_core_spec")?;
     validate_checker_identity(&input.checker)?;
     validate_module_name(&input.module, "key_input.module")?;
     validate_plain_string(input.origin.as_str(), "key_input.origin")?;
@@ -1038,8 +1067,19 @@ fn cache_key_input_json(input: &PackageAuditCacheKeyInput) -> String {
             "package_lock_schema",
             json_string(&input.package_lock_schema),
         ),
-        ("core_spec", json_string(&input.core_spec)),
-        ("certificate_format", json_string(&input.certificate_format)),
+        (
+            "package_core_profile",
+            json_string(&input.package_core_profile),
+        ),
+        (
+            "package_certificate_profile",
+            json_string(&input.package_certificate_profile),
+        ),
+        (
+            "module_certificate_format",
+            json_string(&input.module_certificate_format),
+        ),
+        ("module_core_spec", json_string(&input.module_core_spec)),
         ("package_lock_hash", hash_json(input.package_lock_hash)),
         ("package_policy_hash", hash_json(input.package_policy_hash)),
         ("checker", checker_identity_json(&input.checker)),
@@ -1166,8 +1206,19 @@ fn import_context_export_cache_key_input_json(
             "package_lock_schema",
             json_string(&input.package_lock_schema),
         ),
-        ("core_spec", json_string(&input.core_spec)),
-        ("certificate_format", json_string(&input.certificate_format)),
+        (
+            "package_core_profile",
+            json_string(&input.package_core_profile),
+        ),
+        (
+            "package_certificate_profile",
+            json_string(&input.package_certificate_profile),
+        ),
+        (
+            "owner_certificate_format",
+            json_string(&input.owner_certificate_format),
+        ),
+        ("owner_core_spec", json_string(&input.owner_core_spec)),
         ("checker_policy_hash", hash_json(input.checker_policy_hash)),
         ("owner_module", json_string(&input.owner_module.as_dotted())),
         (
@@ -1205,6 +1256,7 @@ fn import_context_export_data_json(export: &PackageImportContextExportData) -> S
             "certificate_format",
             json_string(&export.certificate_format),
         ),
+        ("core_spec", json_string(&export.core_spec)),
     ]);
     json_object_in_order(fields)
 }
@@ -1266,8 +1318,10 @@ fn parse_import_context_export_cache_key_input(
         package_id: PackageId::new(required_string(members, path, "package_id")?),
         package_version: PackageVersion::new(required_string(members, path, "package_version")?),
         package_lock_schema: required_string(members, path, "package_lock_schema")?,
-        core_spec: required_string(members, path, "core_spec")?,
-        certificate_format: required_string(members, path, "certificate_format")?,
+        package_core_profile: required_string(members, path, "package_core_profile")?,
+        package_certificate_profile: required_string(members, path, "package_certificate_profile")?,
+        owner_certificate_format: required_string(members, path, "owner_certificate_format")?,
+        owner_core_spec: required_string(members, path, "owner_core_spec")?,
         checker_policy_hash: required_hash(members, path, "checker_policy_hash")?,
         owner_module: required_name(members, path, "owner_module")?,
         dependency_exports: parse_import_context_export_data_list(
@@ -1307,6 +1361,7 @@ fn parse_import_context_export_data(
         certificate_hash: required_hash(members, path, "certificate_hash")?,
         axiom_report_hash: required_hash(members, path, "axiom_report_hash")?,
         certificate_format: required_string(members, path, "certificate_format")?,
+        core_spec: required_string(members, path, "core_spec")?,
     })
 }
 
@@ -1346,8 +1401,10 @@ fn parse_cache_key_input(
         package_id: PackageId::new(required_string(members, path, "package_id")?),
         package_version: PackageVersion::new(required_string(members, path, "package_version")?),
         package_lock_schema: required_string(members, path, "package_lock_schema")?,
-        core_spec: required_string(members, path, "core_spec")?,
-        certificate_format: required_string(members, path, "certificate_format")?,
+        package_core_profile: required_string(members, path, "package_core_profile")?,
+        package_certificate_profile: required_string(members, path, "package_certificate_profile")?,
+        module_certificate_format: required_string(members, path, "module_certificate_format")?,
+        module_core_spec: required_string(members, path, "module_core_spec")?,
         package_lock_hash: required_hash(members, path, "package_lock_hash")?,
         package_policy_hash: required_hash(members, path, "package_policy_hash")?,
         checker: parse_checker_identity(crate::artifacts::required_value(
@@ -1494,8 +1551,10 @@ const IMPORT_CONTEXT_EXPORT_CACHE_KEY_INPUT_FIELDS: &[&str] = &[
     "package_id",
     "package_version",
     "package_lock_schema",
-    "core_spec",
-    "certificate_format",
+    "package_core_profile",
+    "package_certificate_profile",
+    "owner_certificate_format",
+    "owner_core_spec",
     "checker_policy_hash",
     "owner_module",
     "dependency_exports",
@@ -1509,14 +1568,17 @@ const IMPORT_CONTEXT_EXPORT_DATA_FIELDS: &[&str] = &[
     "certificate_hash",
     "axiom_report_hash",
     "certificate_format",
+    "core_spec",
 ];
 const CACHE_KEY_INPUT_FIELDS: &[&str] = &[
     "schema",
     "package_id",
     "package_version",
     "package_lock_schema",
-    "core_spec",
-    "certificate_format",
+    "package_core_profile",
+    "package_certificate_profile",
+    "module_certificate_format",
+    "module_core_spec",
     "package_lock_hash",
     "package_policy_hash",
     "checker",
@@ -1880,6 +1942,26 @@ mod tests {
     }
 
     #[test]
+    fn package_import_context_export_cache_key_changes_for_exact_pairs() {
+        let input = fixture_import_context_export_cache_key_input();
+        let mut changed_owner = input.clone();
+        changed_owner.owner_certificate_format = "NPA-CERT-0.3.0".to_owned();
+        changed_owner.owner_core_spec = "NPA-Core-0.3.0".to_owned();
+        let mut changed_dependency = input.clone();
+        changed_dependency.dependency_exports[0].certificate_format = "NPA-CERT-0.3.0".to_owned();
+        changed_dependency.dependency_exports[0].core_spec = "NPA-Core-0.3.0".to_owned();
+
+        assert_ne!(
+            package_import_context_export_cache_key(&input),
+            package_import_context_export_cache_key(&changed_owner)
+        );
+        assert_ne!(
+            package_import_context_export_cache_key(&input),
+            package_import_context_export_cache_key(&changed_dependency)
+        );
+    }
+
+    #[test]
     fn package_import_context_export_cache_rejects_local_package_identity() {
         let mut entry = fixture_import_context_export_cache_entry();
         entry.dependency_exports[0].package = Some(PackageId::new("unexpected-package"));
@@ -1947,6 +2029,45 @@ mod tests {
         }
     }
 
+    #[test]
+    fn package_audit_cache_key_changes_for_exact_module_pair() {
+        let input = fixture_key_input();
+        let mut changed_format = input.clone();
+        changed_format.module_certificate_format = "NPA-CERT-0.3.0".to_owned();
+        let mut changed_core = input.clone();
+        changed_core.module_core_spec = "NPA-Core-0.3.0".to_owned();
+
+        assert_ne!(
+            package_audit_cache_key(&input),
+            package_audit_cache_key(&changed_format)
+        );
+        assert_ne!(
+            package_audit_cache_key(&input),
+            package_audit_cache_key(&changed_core)
+        );
+    }
+
+    #[test]
+    fn package_audit_v0_1_persistent_entry_is_a_schema_miss() {
+        let json = package_audit_result_entry_json(&fixture_result_entry(
+            PackageAuditCachedStatus::Accepted,
+        ));
+        let old = json
+            .replacen(
+                PACKAGE_AUDIT_RESULT_SCHEMA,
+                "npa.package.audit_result.v0.1",
+                1,
+            )
+            .replace("package_core_profile", "core_spec")
+            .replace("package_certificate_profile", "certificate_format");
+
+        let error = parse_package_audit_result_entry_json(&old).unwrap_err();
+        assert_eq!(
+            error.reason_code,
+            PackageArtifactErrorReason::UnsupportedSchema
+        );
+    }
+
     fn fixture_reference_summary_cache_entry() -> PackageReferenceSummaryCacheEntry {
         let mut key_input = fixture_key_input();
         key_input.schema = PACKAGE_REFERENCE_SUMMARY_CACHE_SCHEMA.to_owned();
@@ -1994,8 +2115,10 @@ mod tests {
             package_id: PackageId::new("fixture-package"),
             package_version: PackageVersion::new("0.1.0"),
             package_lock_schema: PACKAGE_LOCK_SCHEMA.to_owned(),
-            core_spec: "npa.core.v0.1".to_owned(),
-            certificate_format: "npa.certificate.canonical.v0.1".to_owned(),
+            package_core_profile: "npa.core.v0.1".to_owned(),
+            package_certificate_profile: "npa.certificate.canonical.v0.1".to_owned(),
+            owner_certificate_format: "NPA-CERT-0.2.0".to_owned(),
+            owner_core_spec: "NPA-Core-0.2.0".to_owned(),
             checker_policy_hash: hash(42),
             owner_module: module("Fixture.Target"),
             dependency_exports: vec![
@@ -2007,7 +2130,8 @@ mod tests {
                     export_hash: hash(43),
                     certificate_hash: hash(44),
                     axiom_report_hash: hash(45),
-                    certificate_format: "npa.certificate.canonical.v0.1".to_owned(),
+                    certificate_format: "NPA-CERT-0.2.0".to_owned(),
+                    core_spec: "NPA-Core-0.2.0".to_owned(),
                 },
                 PackageImportContextExportData {
                     module: module("Fixture.ExternalImport"),
@@ -2017,7 +2141,8 @@ mod tests {
                     export_hash: hash(46),
                     certificate_hash: hash(47),
                     axiom_report_hash: hash(48),
-                    certificate_format: "npa.certificate.canonical.v0.1".to_owned(),
+                    certificate_format: "NPA-CERT-0.3.0".to_owned(),
+                    core_spec: "NPA-Core-0.3.0".to_owned(),
                 },
             ],
         }
@@ -2029,8 +2154,10 @@ mod tests {
             package_id: PackageId::new("fixture-package"),
             package_version: PackageVersion::new("0.1.0"),
             package_lock_schema: PACKAGE_LOCK_SCHEMA.to_owned(),
-            core_spec: "npa.core.v0.1".to_owned(),
-            certificate_format: "npa.certificate.canonical.v0.1".to_owned(),
+            package_core_profile: "npa.core.v0.1".to_owned(),
+            package_certificate_profile: "npa.certificate.canonical.v0.1".to_owned(),
+            module_certificate_format: "NPA-CERT-0.2.0".to_owned(),
+            module_core_spec: "NPA-Core-0.2.0".to_owned(),
             package_lock_hash: hash(1),
             package_policy_hash: hash(2),
             checker: PackageAuditCheckerIdentity {

@@ -21,6 +21,18 @@ fn output_schema() -> &'static str {
         "inspect_ext_v0_5_policy" => "npa.checker_ext.toolchain_v0_5.policy_preflight.v1",
         "inspect_ext_v0_6_policy" => "npa.checker_ext.toolchain_v0_6.policy_preflight.v1",
         "inspect_ext_v0_7_policy" => "npa.checker_ext.toolchain_v0_7.policy_preflight.v1",
+        "inspect_ext_v0_8_policy" => "npa.checker_ext.toolchain_v0_8.policy_preflight.v1",
+        name => panic!("unsupported versioned preflight example: {name}"),
+    }
+}
+
+fn expected_external_checker_version() -> &'static str {
+    match env!("CARGO_CRATE_NAME") {
+        "inspect_ext_v0_7_policy" | "inspect_ext_v0_8_policy" => "0.3.0",
+        "inspect_ext_v0_3_policy"
+        | "inspect_ext_v0_4_policy"
+        | "inspect_ext_v0_5_policy"
+        | "inspect_ext_v0_6_policy" => "0.2.0",
         name => panic!("unsupported versioned preflight example: {name}"),
     }
 }
@@ -176,8 +188,11 @@ fn inspect(inputs: &Inputs) -> Result<String, String> {
         .iter()
         .find(|entry| entry.profile == "external")
         .ok_or("identity manifest is missing external checker")?;
-    if external_identity.checker_version.as_deref() != Some("0.2.0") {
-        return Err("external checker version is not 0.2.0".to_owned());
+    let expected_external_version = expected_external_checker_version();
+    if external_identity.checker_version.as_deref() != Some(expected_external_version) {
+        return Err(format!(
+            "external checker version is not {expected_external_version}"
+        ));
     }
     if identity
         .checkers
@@ -272,7 +287,9 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{checked_join, output_schema, parse_inputs, Inputs};
+    use super::{
+        checked_join, expected_external_checker_version, output_schema, parse_inputs, Inputs,
+    };
     use std::path::{Path, PathBuf};
 
     fn parse(args: &[&str]) -> Result<Inputs, String> {
@@ -306,9 +323,23 @@ mod tests {
             "inspect_ext_v0_5_policy" => "npa.checker_ext.toolchain_v0_5.policy_preflight.v1",
             "inspect_ext_v0_6_policy" => "npa.checker_ext.toolchain_v0_6.policy_preflight.v1",
             "inspect_ext_v0_7_policy" => "npa.checker_ext.toolchain_v0_7.policy_preflight.v1",
+            "inspect_ext_v0_8_policy" => "npa.checker_ext.toolchain_v0_8.policy_preflight.v1",
             name => panic!("unexpected example target: {name}"),
         };
         assert_eq!(output_schema(), expected);
+    }
+
+    #[test]
+    fn external_checker_version_matches_versioned_example_entry_point() {
+        let expected = if matches!(
+            env!("CARGO_CRATE_NAME"),
+            "inspect_ext_v0_7_policy" | "inspect_ext_v0_8_policy"
+        ) {
+            "0.3.0"
+        } else {
+            "0.2.0"
+        };
+        assert_eq!(expected_external_checker_version(), expected);
     }
 
     #[test]

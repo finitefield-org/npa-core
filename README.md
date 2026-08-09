@@ -28,8 +28,15 @@ implementation repository for a proof-certificate-centered toolchain.
 
 ## Current Status
 
-The published SRA-02-compatible toolchain reference for external theorem
-package repositories remains:
+The current source tree emits `NPA-CERT-0.3.0` / `NPA-Core-0.3.0` from every
+ordinary producer and ships `npa-checker-ref 0.4.0` and
+`npa-checker-ext 0.3.0`. All three check paths also accept the exact historical
+v0.2.0, v0.1.2, and v0.1 pairs without changing their bytes or immediate-opacity
+semantics.
+
+This source capability is newer than the last published external tag. The
+published SRA-02-compatible toolchain pin for external theorem package
+repositories remains:
 
 ```text
 NPA_GIT_TAG = v0.2.0
@@ -39,12 +46,13 @@ RUST_TOOLCHAIN_VERSION = 1.95.0
 The earlier `v0.1.0` tag is historical and should not be used as the current
 external package toolchain pin.
 
-The current adjacent-source compatibility target is `npa-cli 0.7.0` with
-`package_api::v1`. This is a Rust crate/API boundary; it does not change the
-published v0.2.0 certificate format or core specification. Current package
-command results use `npa.package.command_result.v0.3`. See the v0.7.0 toolchain
-reference before consuming the programmatic package API, theorem-premise
-report, or artifact ledger audit.
+The current adjacent-source compatibility target is `npa-cli 0.8.0` with
+`package_api::v1`; current package command results use
+`npa.package.command_result.v0.4`. These host/API/result axes are independent
+of both the current v0.3 certificate pair and the still-published v0.2.0 tag.
+See the v0.8.0 toolchain reference before consuming the programmatic package
+API, fuel diagnostics, performance measurements, theorem-premise report, or
+artifact ledger audit. The v0.7.0 reference remains historical.
 
 The public package repositories are:
 
@@ -73,12 +81,12 @@ target/debug/npa --version
 Expected output when building the current source checkout:
 
 ```text
-npa 0.7.0
+npa 0.8.0
 ```
 
 ## Package Verification Quick Start
 
-The commands in this section describe the current v0.7 source CLI. External
+The commands in this section describe the current v0.8 source CLI. External
 theorem libraries still pinned to the published v0.2.0 tag should use the
 historical v0.2.0 reference. The `npa package ...` command family uses an
 explicit package root:
@@ -158,7 +166,7 @@ are maintenance results, not proof evidence.
 
 Checked mode is the core default and is required for release or audit parity.
 For source-free authoring when `generated/package-lock.json` is intentionally
-absent, the current v0.7 source CLI also supports explicit in-memory
+absent, the current v0.8 source CLI also supports explicit in-memory
 reconstruction without package-root writes:
 
 ```sh
@@ -172,9 +180,11 @@ hash. Reconstructed provenance is authoring evidence, not parity with a frozen
 release lock.
 
 The compatible clean-room external path keeps independent version axes:
-`npa-cli 0.7.x` / `package_api::v1` hosts `npa-checker-ext 0.2.0` over
-`NPA-CERT-0.2.0` and `NPA-Core-0.2.0`. It requires a checked lock and disables
-all local acceleration explicitly. From an aggregate root containing
+`npa-cli 0.8.x` / `package_api::v1` hosts `npa-checker-ext 0.3.0`. The checker
+advertises the current v0.3 capability pair while reporting each certificate's
+actual v0.3, v0.2.0, v0.1.2, or v0.1 input pair separately. It requires a
+checked lock and disables all local acceleration explicitly. From an aggregate
+root containing
 `npa-core/` and the target `proofs/` package:
 
 ```sh
@@ -190,6 +200,22 @@ The `ci/...` locators are relative to `proofs`; Cargo's `--locked --offline`
 flags apply only to the development invocation. External checked evidence,
 generated-artifact v0.2 release evidence, and `verified_high_trust` remain
 three distinct outcomes.
+
+Fast and reference verification use the same explicit cache-disabled package
+contract:
+
+```sh
+npa package verify-certs --root . --package-lock checked --checker fast \
+  --audit-cache off --verifier-memo off --json
+npa package verify-certs --root . --package-lock checked --checker reference \
+  --audit-cache off --verifier-memo off --json
+```
+
+Fast per-module results and reference summaries report the decoded
+`certificate_format` and `core_spec`. External raw-result v2 additionally
+separates the checker capability fields `certificate_format` / `core_spec`
+from `input_certificate_format` / `input_core_spec`; checked results also bind
+`module`, `certificate_hash`, `export_hash`, and `axiom_report_hash`.
 
 For advisory refactor planning from package metadata, use:
 
@@ -266,15 +292,18 @@ Start with the user documentation:
 
 Package-author and toolchain references:
 
+- [Toolchain Reference v0.8.0](docs/npa-toolchain-reference-v0.8.0.md):
+  current adjacent-source Rust API, kernel fuel diagnostics, performance
+  measurements, checker gates, and package operations.
 - [Toolchain Reference v0.7.0](docs/npa-toolchain-reference-v0.7.0.md):
-  current adjacent-source Rust API, theorem-premise reporting, generated checks,
-  package-lock modes, and ledger audit.
+  historical `npa-cli 0.7.x` compatibility reference.
 - [Toolchain Reference v0.6.0](docs/npa-toolchain-reference-v0.6.0.md):
   historical `npa-cli 0.6.x` compatibility reference.
 - [Toolchain Reference v0.5.0](docs/npa-toolchain-reference-v0.5.0.md):
   historical `npa-cli 0.5.x` compatibility reference.
-- [OCaml External Checker](docs/npa-checker-ext-ocaml.md): clean-room checker
-  contract and current `npa-cli 0.7.x` adapter boundary.
+- [OCaml External Checker](docs/npa-checker-ext-ocaml.md): v0.3 clean-room
+  checker contract, four-version input compatibility, and current
+  `npa-cli 0.8.x` adapter boundary.
 - [Toolchain Reference v0.2.0](docs/npa-toolchain-reference-v0.2.0.md):
   published historical external-toolchain contract.
 
@@ -287,6 +316,31 @@ external package fixture path is the split `npa-std` package.
 Phase 6 release/build artifact profiles include `std.nat.mvp`, `std.list.mvp`,
 and `std.all.mvp`; source layout fixtures remain authoring and debug context,
 not trusted proof evidence.
+
+## Opaque Definition Boundary
+
+Human Surface and Machine Surface both accept `opaque def`; Machine terms still
+use the fully explicit Machine grammar:
+
+```text
+opaque def Eval.cachedInvariant (x : Input) : Result := Eval.run x
+```
+
+The body is checked and remains locally transparent to later declarations in
+the defining module. Its exported body is sealed, so importers can use only the
+declared type and stable specification theorems. Put implementation-heavy
+opaque definitions in semantic leaf modules and expose semantic laws, not a
+whole-body equality theorem. No defining-module speedup is promised; the
+benefit begins downstream after the sealed module is imported.
+
+A rebuild under v0.3 changes certificate identity even for a plain module; it
+is never a header-only migration from v0.2. Package manifest/lock profiles stay
+on their independent v0.1 contract axes. `npa.package.build_check_cache.v0.2`,
+`npa.package.audit_cache.v0.2`, and
+`npa.package.verified_export_summary.v0.2` metadata record the exact decoded
+certificate/core pair for each affected module. Targeted package refresh may
+reuse an interface-stable consumer only after full-chain rebind and source-free
+revalidation.
 
 ## Local Development Gates
 
@@ -314,11 +368,14 @@ For contribution policy and the full local-gate checklist, see
 On Linux, the complete real-checker compatibility/release-evidence gate is:
 
 ```sh
-checkers/npa-checker-ext/scripts/toolchain-v0.7.sh
+checkers/npa-checker-ext/scripts/toolchain-v0.8.sh
 ```
 
-Use `--functional-only` for a dirty developer checkout; its success message
-explicitly states that release evidence was not evaluated.
+On hosts with kernel-sealed immutable checker staging, use `--functional-only`
+for a dirty developer checkout; its success message explicitly states that
+release evidence was not evaluated. Unsupported hosts run the portable build
+and host tests, then fail closed before policy preflight or external execution;
+complete both functional closure and the full release gate on clean Linux.
 
 ## License
 

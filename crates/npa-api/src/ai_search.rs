@@ -7694,6 +7694,8 @@ mod tests {
             type_hash: Some(hash(150)),
             proof_hash: Some(hash(151)),
             body_hash: None,
+            definition_reducibility: None,
+            definition_body_visibility: None,
             metadata: CertificateTheoremGraphNodeMetadata::default(),
         }
     }
@@ -7705,7 +7707,7 @@ mod tests {
             source_module: name("Std.Nat.Basic"),
             source_export_hash: hash(10),
             source_certificate_hash: hash(160),
-            extractor_version: CertificateTheoremGraphExtractorVersion::CertificateGraphV1,
+            extractor_version: CertificateTheoremGraphExtractorVersion::CertificateGraphV2,
             imports: Vec::new(),
             nodes: vec![add_zero.clone(), add_assoc.clone()],
             edges: vec![CertificateTheoremGraphEdge {

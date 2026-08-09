@@ -4993,7 +4993,20 @@ pub fn proof_candidate_import_closure_hash(context: &MachineImportCertificateCon
     let mut direct_imports = context
         .direct_import_keys()
         .iter()
-        .map(|key| name_canonical_bytes(&key.module))
+        .map(|key| {
+            let entry = context
+                .verified_modules()
+                .iter()
+                .find(|entry| entry.key == *key)
+                .expect("projected direct import key has a verified context entry");
+            let mut out = Vec::new();
+            encode_name(&mut out, &key.module);
+            encode_hash(&mut out, &key.export_hash);
+            encode_hash(&mut out, &key.certificate_hash);
+            encode_string(&mut out, &entry.certificate_format);
+            encode_string(&mut out, &entry.core_spec);
+            out
+        })
         .collect::<Vec<_>>();
     direct_imports.sort();
 
@@ -5003,6 +5016,10 @@ pub fn proof_candidate_import_closure_hash(context: &MachineImportCertificateCon
         .map(|entry| {
             let mut out = Vec::new();
             encode_name(&mut out, &entry.key.module);
+            encode_hash(&mut out, &entry.key.export_hash);
+            encode_hash(&mut out, &entry.key.certificate_hash);
+            encode_string(&mut out, &entry.certificate_format);
+            encode_string(&mut out, &entry.core_spec);
 
             let mut import_modules = entry
                 .certificate_import_table
@@ -5074,7 +5091,7 @@ pub fn proof_candidate_import_closure_hash(context: &MachineImportCertificateCon
     entries.sort();
 
     let mut out = Vec::new();
-    encode_string(&mut out, "npa.proof-candidate.import-closure.v1");
+    encode_string(&mut out, "npa.proof-candidate.import-closure.v2");
     encode_uvar(&mut out, direct_imports.len() as u64);
     for import in direct_imports {
         encode_uvar(&mut out, import.len() as u64);
@@ -5118,13 +5135,17 @@ pub fn proof_candidate_feature_profile_hash(
 }
 
 pub fn proof_candidate_environment_hash(
+    owner_certificate_format: &str,
+    owner_core_spec: &str,
     import_closure_hash: Hash,
     axiom_policy_hash: Hash,
     feature_profile_hash: Hash,
     statement_hash: Hash,
 ) -> Hash {
     let mut out = Vec::new();
-    encode_string(&mut out, "npa.proof-candidate.environment.v1");
+    encode_string(&mut out, "npa.proof-candidate.environment.v2");
+    encode_string(&mut out, owner_certificate_format);
+    encode_string(&mut out, owner_core_spec);
     encode_hash(&mut out, &import_closure_hash);
     encode_hash(&mut out, &axiom_policy_hash);
     encode_hash(&mut out, &feature_profile_hash);
@@ -6691,6 +6712,8 @@ mod tests {
     #[test]
     fn candidate_environment_hash_changes_for_environment_inputs() {
         let base = proof_candidate_environment_hash(
+            "NPA-CERT-0.2.0",
+            "NPA-Core-0.2.0",
             test_hash(1),
             test_hash(2),
             test_hash(3),
@@ -6700,6 +6723,20 @@ mod tests {
         assert_ne!(
             base,
             proof_candidate_environment_hash(
+                "NPA-CERT-0.3.0",
+                "NPA-Core-0.3.0",
+                test_hash(1),
+                test_hash(2),
+                test_hash(3),
+                test_hash(4),
+            )
+        );
+
+        assert_ne!(
+            base,
+            proof_candidate_environment_hash(
+                "NPA-CERT-0.2.0",
+                "NPA-Core-0.2.0",
                 test_hash(5),
                 test_hash(2),
                 test_hash(3),
@@ -6709,6 +6746,8 @@ mod tests {
         assert_ne!(
             base,
             proof_candidate_environment_hash(
+                "NPA-CERT-0.2.0",
+                "NPA-Core-0.2.0",
                 test_hash(1),
                 test_hash(5),
                 test_hash(3),
@@ -6718,6 +6757,8 @@ mod tests {
         assert_ne!(
             base,
             proof_candidate_environment_hash(
+                "NPA-CERT-0.2.0",
+                "NPA-Core-0.2.0",
                 test_hash(1),
                 test_hash(2),
                 test_hash(5),
@@ -6727,6 +6768,8 @@ mod tests {
         assert_ne!(
             base,
             proof_candidate_environment_hash(
+                "NPA-CERT-0.2.0",
+                "NPA-Core-0.2.0",
                 test_hash(1),
                 test_hash(2),
                 test_hash(3),

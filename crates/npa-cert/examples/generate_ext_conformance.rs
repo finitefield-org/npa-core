@@ -3,13 +3,14 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use npa_cert::{
-    build_module_cert, encode_module_cert, generate_inductive_artifacts_v1,
-    generate_mutual_inductive_artifacts_v1, term_hash, verify_module_cert, AxiomPolicy, CoreModule,
-    DeclPayload, ModuleCert, Name, TermNode, VerifierSession,
+    build_module_cert, build_module_cert_v0_2_compat, encode_module_cert,
+    generate_inductive_artifacts_v1, generate_mutual_inductive_artifacts_v1, term_hash,
+    verify_module_cert, AxiomPolicy, CertError, CoreModule, DeclPayload, DependencyEntryKind,
+    LocalImplementationDependencyErrorReason, ModuleCert, Name, TermNode, VerifierSession,
 };
 use npa_kernel::{
     eq, eq_refl, nat, nat_succ, nat_zero, prop, type0, Binder, ConstructorDecl, Decl, Expr,
-    InductiveDecl, Level, MutualInductiveBlock, UniverseConstraint,
+    InductiveDecl, Level, MutualInductiveBlock, Reducibility, UniverseConstraint,
 };
 use sha2::{Digest, Sha256};
 
@@ -642,6 +643,110 @@ fn forbidden_axiom_module() -> CoreModule {
     }
 }
 
+fn opaque_direct_module() -> CoreModule {
+    CoreModule {
+        name: Name::from_dotted("Conformance.OpaqueDirect"),
+        declarations: vec![
+            Decl::Def {
+                name: "hidden_nat".to_owned(),
+                universe_params: vec![],
+                ty: nat(),
+                value: nat_zero(),
+                reducibility: Reducibility::Opaque,
+            },
+            Decl::Theorem {
+                name: "hidden_nat_eq_zero".to_owned(),
+                universe_params: vec![],
+                ty: eq(
+                    type0(),
+                    nat(),
+                    Expr::konst("hidden_nat", vec![]),
+                    nat_zero(),
+                ),
+                proof: eq_refl(type0(), nat(), nat_zero()),
+            },
+        ],
+    }
+}
+
+fn opaque_alias_chain_module() -> CoreModule {
+    CoreModule {
+        name: Name::from_dotted("Conformance.OpaqueAliasChain"),
+        declarations: vec![
+            Decl::Def {
+                name: "hidden".to_owned(),
+                universe_params: vec!["u".to_owned()],
+                ty: identity_type(),
+                value: identity_proof(),
+                reducibility: Reducibility::Opaque,
+            },
+            Decl::Def {
+                name: "alias".to_owned(),
+                universe_params: vec!["u".to_owned()],
+                ty: identity_type(),
+                value: Expr::konst("hidden", vec![Level::param("u")]),
+                reducibility: Reducibility::Reducible,
+            },
+            Decl::Theorem {
+                name: "uses_alias".to_owned(),
+                universe_params: vec!["u".to_owned()],
+                ty: identity_type(),
+                proof: Expr::konst("alias", vec![Level::param("u")]),
+            },
+        ],
+    }
+}
+
+fn opaque_alias_module() -> CoreModule {
+    CoreModule {
+        name: Name::from_dotted("Conformance.OpaqueAlias"),
+        declarations: vec![
+            Decl::Def {
+                name: "hidden".to_owned(),
+                universe_params: vec!["u".to_owned()],
+                ty: identity_type(),
+                value: identity_proof(),
+                reducibility: Reducibility::Opaque,
+            },
+            Decl::Def {
+                name: "alias".to_owned(),
+                universe_params: vec!["u".to_owned()],
+                ty: identity_type(),
+                value: Expr::konst("hidden", vec![Level::param("u")]),
+                reducibility: Reducibility::Reducible,
+            },
+        ],
+    }
+}
+
+fn invalid_target_base_module() -> CoreModule {
+    CoreModule {
+        name: Name::from_dotted("Conformance.InvalidOpaqueTarget"),
+        declarations: vec![
+            Decl::Def {
+                name: "a_reducible".to_owned(),
+                universe_params: vec!["u".to_owned()],
+                ty: identity_type(),
+                value: identity_proof(),
+                reducibility: Reducibility::Reducible,
+            },
+            Decl::Def {
+                name: "hidden".to_owned(),
+                universe_params: vec!["u".to_owned()],
+                ty: identity_type(),
+                value: identity_proof(),
+                reducibility: Reducibility::Opaque,
+            },
+            Decl::Theorem {
+                name: "z_uses_hidden".to_owned(),
+                universe_params: vec!["u".to_owned()],
+                ty: identity_type(),
+                proof: Expr::konst("hidden", vec![Level::param("u")]),
+            },
+        ],
+    }
+}
+
 fn hash_with_domain(domain: &[u8], payload: &[u8]) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(domain);
@@ -653,6 +758,216 @@ fn recompute_module_certificate_hash(certificate: &mut ModuleCert) {
     let encoded = encode_module_cert(certificate).unwrap();
     let payload = &encoded[..encoded.len() - 32];
     certificate.hashes.certificate_hash = hash_with_domain(b"NPA-MODULE-CERT-0.2.0", payload);
+}
+
+fn build_v0_3(module: CoreModule) -> ModuleCert {
+    build_module_cert(module, &[]).unwrap()
+}
+
+fn encode_uvar(mut value: usize) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    loop {
+        let byte = (value & 0x7f) as u8;
+        value >>= 7;
+        if value == 0 {
+            bytes.push(byte);
+            return bytes;
+        }
+        bytes.push(byte | 0x80);
+    }
+}
+
+fn local_implementation_bytes(certificate: &ModuleCert, declaration_index: usize) -> Vec<u8> {
+    let dependency = certificate.declarations[declaration_index]
+        .dependencies
+        .iter()
+        .find(|dependency| dependency.kind() == DependencyEntryKind::LocalImplementation)
+        .unwrap();
+    let npa_cert::GlobalRef::Local { decl_index } = dependency.global_ref() else {
+        unreachable!()
+    };
+    let mut bytes = vec![0x01, 0x01];
+    bytes.extend(encode_uvar(*decl_index));
+    bytes.extend(dependency.decl_interface_hash());
+    bytes.extend(dependency.decl_certificate_hash().unwrap());
+    bytes
+}
+
+fn unique_offset(haystack: &[u8], needle: &[u8]) -> usize {
+    let offsets = haystack
+        .windows(needle.len())
+        .enumerate()
+        .filter_map(|(offset, window)| (window == needle).then_some(offset))
+        .collect::<Vec<_>>();
+    assert_eq!(offsets.len(), 1, "fixture mutation material must be unique");
+    offsets[0]
+}
+
+fn rehash_v0_3_alias_dependency(
+    mut bytes: Vec<u8>,
+    certificate: &ModuleCert,
+    declaration_index: usize,
+    old_dependency: &[u8],
+    new_dependency: &[u8],
+) -> Vec<u8> {
+    assert_eq!(old_dependency.len(), new_dependency.len());
+    let dependency_offset = unique_offset(&bytes, old_dependency);
+    bytes[dependency_offset..dependency_offset + new_dependency.len()]
+        .copy_from_slice(new_dependency);
+
+    let declaration = &certificate.declarations[declaration_index];
+    let mut declaration_payload = Vec::new();
+    declaration_payload.extend(declaration.hashes.decl_interface_hash);
+    match declaration.decl {
+        DeclPayload::Def { value, .. } | DeclPayload::DefConstrained { value, .. } => {
+            declaration_payload.extend(term_hash(certificate, value).unwrap());
+            declaration_payload.extend(encode_uvar(1));
+            declaration_payload.extend(new_dependency);
+            declaration_payload.push(0x00);
+        }
+        DeclPayload::Theorem { proof, .. } | DeclPayload::TheoremConstrained { proof, .. } => {
+            declaration_payload.extend(term_hash(certificate, proof).unwrap());
+            declaration_payload.extend(encode_uvar(1));
+            declaration_payload.extend(new_dependency);
+        }
+        _ => unreachable!(),
+    }
+    let new_declaration_hash = hash_with_domain(b"NPA-DECL-CERT-0.3.0", &declaration_payload);
+    let old_declaration_hash = declaration.hashes.decl_certificate_hash;
+    let declaration_hash_offset = unique_offset(&bytes, &old_declaration_hash);
+    bytes[declaration_hash_offset..declaration_hash_offset + 32]
+        .copy_from_slice(&new_declaration_hash);
+
+    let certificate_hash_offset = bytes.len() - 32;
+    let new_certificate_hash =
+        hash_with_domain(b"NPA-MODULE-CERT-0.3.0", &bytes[..certificate_hash_offset]);
+    bytes[certificate_hash_offset..].copy_from_slice(&new_certificate_hash);
+    bytes
+}
+
+fn write_v0_3_fixtures(output: &Path) {
+    let direct = build_v0_3(opaque_direct_module());
+    let direct_bytes = encode_module_cert(&direct).unwrap();
+    assert!(verify_module_cert(
+        &direct_bytes,
+        &mut VerifierSession::new(),
+        &AxiomPolicy::normal()
+    )
+    .is_ok());
+    fs::write(output.join("opaque-direct-v0.3.npcert"), direct_bytes).unwrap();
+
+    let alias_chain = build_v0_3(opaque_alias_chain_module());
+    let alias_chain_bytes = encode_module_cert(&alias_chain).unwrap();
+    assert!(verify_module_cert(
+        &alias_chain_bytes,
+        &mut VerifierSession::new(),
+        &AxiomPolicy::normal()
+    )
+    .is_ok());
+    fs::write(
+        output.join("opaque-alias-chain-v0.3.npcert"),
+        alias_chain_bytes,
+    )
+    .unwrap();
+    let alias = build_v0_3(opaque_alias_module());
+    let alias_bytes = encode_module_cert(&alias).unwrap();
+    let declaration_index = 1;
+    let old_dependency = local_implementation_bytes(&alias, declaration_index);
+
+    let invalid_base = build_v0_3(invalid_target_base_module());
+    let invalid_bytes = encode_module_cert(&invalid_base).unwrap();
+    let invalid_declaration_index = 2;
+    let invalid_old_dependency =
+        local_implementation_bytes(&invalid_base, invalid_declaration_index);
+    let mut invalid_target = invalid_old_dependency.clone();
+    invalid_target[2] = 0;
+    let invalid_target_bytes = rehash_v0_3_alias_dependency(
+        invalid_bytes,
+        &invalid_base,
+        invalid_declaration_index,
+        &invalid_old_dependency,
+        &invalid_target,
+    );
+    assert!(matches!(
+        verify_module_cert(
+            &invalid_target_bytes,
+            &mut VerifierSession::new(),
+            &AxiomPolicy::normal()
+        ),
+        Err(CertError::InvalidLocalImplementationDependency {
+            reason: LocalImplementationDependencyErrorReason::TargetNotOpaque,
+            ..
+        })
+    ));
+    fs::write(
+        output.join("invalid-target-v0.3.npcert"),
+        invalid_target_bytes,
+    )
+    .unwrap();
+
+    let mut stale_hash = old_dependency.clone();
+    let last = stale_hash.len() - 1;
+    stale_hash[last] ^= 1;
+    let stale_hash_bytes = rehash_v0_3_alias_dependency(
+        alias_bytes,
+        &alias,
+        declaration_index,
+        &old_dependency,
+        &stale_hash,
+    );
+    assert!(matches!(
+        verify_module_cert(
+            &stale_hash_bytes,
+            &mut VerifierSession::new(),
+            &AxiomPolicy::normal()
+        ),
+        Err(CertError::InvalidLocalImplementationDependency {
+            reason: LocalImplementationDependencyErrorReason::CertificateHashMismatch,
+            ..
+        })
+    ));
+    fs::write(
+        output.join("stale-implementation-hash-v0.3.npcert"),
+        stale_hash_bytes,
+    )
+    .unwrap();
+
+    let forbidden = build_v0_3(forbidden_axiom_module());
+    let forbidden_bytes = encode_module_cert(&forbidden).unwrap();
+    assert!(matches!(
+        verify_module_cert(
+            &forbidden_bytes,
+            &mut VerifierSession::new(),
+            &AxiomPolicy::high_trust()
+        ),
+        Err(CertError::ForbiddenAxiom { .. })
+    ));
+    fs::write(output.join("forbidden-axiom-v0.3.npcert"), forbidden_bytes).unwrap();
+}
+
+fn write_compact_legacy_fixture(output: &Path) {
+    let mut certificate = build_module_cert_v0_2_compat(
+        CoreModule {
+            name: Name::from_dotted("Conformance.LegacyEmpty"),
+            declarations: vec![],
+        },
+        &[],
+    )
+    .unwrap();
+    certificate.header.format = "NPA-CERT-0.1".to_owned();
+    certificate.header.core_spec = "NPA-Core-0.1".to_owned();
+    certificate.hashes.export_hash = hash_with_domain(b"NPA-MODULE-EXPORT-0.1", &[0x00]);
+    let encoded = encode_module_cert(&certificate).unwrap();
+    certificate.hashes.certificate_hash =
+        hash_with_domain(b"NPA-MODULE-CERT-0.1", &encoded[..encoded.len() - 32]);
+    let legacy_bytes = encode_module_cert(&certificate).unwrap();
+    assert!(verify_module_cert(
+        &legacy_bytes,
+        &mut VerifierSession::new(),
+        &AxiomPolicy::normal()
+    )
+    .is_ok());
+    fs::write(output.join("legacy-empty-v0.1.npcert"), legacy_bytes).unwrap();
 }
 
 fn semantically_invalid_provider(mut certificate: ModuleCert) -> ModuleCert {
@@ -695,21 +1010,32 @@ fn semantically_invalid_provider(mut certificate: ModuleCert) -> ModuleCert {
 }
 
 fn write_unchecked_import_fixtures(output: &Path) {
-    let good_certificate = build_module_cert(unchecked_provider_module(), &[]).unwrap();
+    let good_certificate = build_module_cert_v0_2_compat(unchecked_provider_module(), &[]).unwrap();
     let good_bytes = encode_module_cert(&good_certificate).unwrap();
     let mut verifier = VerifierSession::new();
     let verified_provider =
         verify_module_cert(&good_bytes, &mut verifier, &AxiomPolicy::normal()).unwrap();
     let bad_certificate = semantically_invalid_provider(good_certificate);
 
-    let mut dependency_hash_mismatch = build_module_cert(
+    let dependency_hash_mismatch = build_module_cert_v0_2_compat(
         unchecked_consumer_module(),
         std::slice::from_ref(&verified_provider),
     )
     .unwrap();
-    dependency_hash_mismatch.declarations[0].dependencies[0].decl_interface_hash[0] ^= 1;
+    let dependency_hash =
+        dependency_hash_mismatch.declarations[0].dependencies[0].decl_interface_hash();
+    let mut dependency_hash_mismatch_bytes = encode_module_cert(&dependency_hash_mismatch).unwrap();
+    let mut duplicated_hashes = Vec::with_capacity(dependency_hash.len() * 2);
+    duplicated_hashes.extend(dependency_hash);
+    duplicated_hashes.extend(dependency_hash);
+    let dependency_hash_offset = dependency_hash_mismatch_bytes
+        .windows(duplicated_hashes.len())
+        .position(|window| window == duplicated_hashes)
+        .expect("imported dependency must encode its interface hash twice")
+        + dependency_hash.len();
+    dependency_hash_mismatch_bytes[dependency_hash_offset] ^= 1;
     let mut unpinned_consumer =
-        build_module_cert(unchecked_consumer_module(), &[verified_provider]).unwrap();
+        build_module_cert_v0_2_compat(unchecked_consumer_module(), &[verified_provider]).unwrap();
     unpinned_consumer.imports[0].certificate_hash = None;
     recompute_module_certificate_hash(&mut unpinned_consumer);
     let mut pinned_consumer = unpinned_consumer.clone();
@@ -718,7 +1044,7 @@ fn write_unchecked_import_fixtures(output: &Path) {
 
     fs::write(
         output.join("dependency-hash-mismatch-v0.2.npcert"),
-        encode_module_cert(&dependency_hash_mismatch).unwrap(),
+        dependency_hash_mismatch_bytes,
     )
     .unwrap();
     fs::write(
@@ -739,13 +1065,13 @@ fn write_unchecked_import_fixtures(output: &Path) {
 }
 
 fn write_fixture(output: &Path, file_name: &str, module: CoreModule) {
-    let certificate = build_module_cert(module, &[]).unwrap();
+    let certificate = build_module_cert_v0_2_compat(module, &[]).unwrap();
     let bytes = encode_module_cert(&certificate).unwrap();
     fs::write(output.join(file_name), bytes).unwrap();
 }
 
 fn write_noncanonical_identity_fixture(output: &Path) {
-    let mut certificate = build_module_cert(
+    let mut certificate = build_module_cert_v0_2_compat(
         CoreModule {
             name: Name::from_dotted("Conformance.PartialIdentity"),
             declarations: Vec::new(),
@@ -768,12 +1094,13 @@ fn write_noncanonical_identity_fixture(output: &Path) {
 }
 
 fn write_indexed_imported_iota_fixtures(output: &Path) {
-    let indexed_certificate = build_module_cert(indexed_module(), &[]).unwrap();
+    let indexed_certificate = build_module_cert_v0_2_compat(indexed_module(), &[]).unwrap();
     let indexed_bytes = encode_module_cert(&indexed_certificate).unwrap();
     let mut verifier = VerifierSession::new();
     let indexed_verified =
         verify_module_cert(&indexed_bytes, &mut verifier, &AxiomPolicy::normal()).unwrap();
-    let consumer = build_module_cert(imported_vec_iota_module(), &[indexed_verified]).unwrap();
+    let consumer =
+        build_module_cert_v0_2_compat(imported_vec_iota_module(), &[indexed_verified]).unwrap();
 
     fs::write(output.join("indexed-v0.2.npcert"), indexed_bytes).unwrap();
     fs::write(
@@ -784,12 +1111,13 @@ fn write_indexed_imported_iota_fixtures(output: &Path) {
 }
 
 fn write_mutual_imported_iota_fixtures(output: &Path) {
-    let mutual_certificate = build_module_cert(mutual_module(), &[]).unwrap();
+    let mutual_certificate = build_module_cert_v0_2_compat(mutual_module(), &[]).unwrap();
     let mutual_bytes = encode_module_cert(&mutual_certificate).unwrap();
     let mut verifier = VerifierSession::new();
     let mutual_verified =
         verify_module_cert(&mutual_bytes, &mut verifier, &AxiomPolicy::normal()).unwrap();
-    let consumer = build_module_cert(imported_mutual_iota_module(), &[mutual_verified]).unwrap();
+    let consumer =
+        build_module_cert_v0_2_compat(imported_mutual_iota_module(), &[mutual_verified]).unwrap();
 
     fs::write(output.join("mutual-v0.2.npcert"), mutual_bytes).unwrap();
     fs::write(
@@ -816,4 +1144,6 @@ fn main() {
     );
     write_noncanonical_identity_fixture(&output);
     write_unchecked_import_fixtures(&output);
+    write_v0_3_fixtures(&output);
+    write_compact_legacy_fixture(&output);
 }

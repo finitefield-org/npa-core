@@ -2,6 +2,251 @@ use crate::Span;
 
 pub type HumanResult<T> = std::result::Result<T, HumanDiagnostic>;
 
+/// Frontend-owned projection of one fuel-owning kernel operation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HumanKernelFuelOperationCounters {
+    pub budget: u64,
+    pub spent: u64,
+    pub remaining: u64,
+    pub exhausted: bool,
+    pub overflowed: bool,
+}
+
+/// Frontend-owned declaration aggregate for one kernel fuel domain.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HumanKernelFuelDomainTotals {
+    pub calls: u64,
+    pub logical_spent: u64,
+    pub successful_operation_fuel: u64,
+    pub exhausted_operation_fuel: u64,
+    pub overflowed: bool,
+}
+
+/// Domain-separated declaration fuel totals.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HumanKernelFuelTotals {
+    pub whnf: HumanKernelFuelDomainTotals,
+    pub conversion: HumanKernelFuelDomainTotals,
+}
+
+/// Strict bounded work vocabulary copied from one kernel snapshot.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HumanKernelWorkSnapshot {
+    pub check_calls: u64,
+    pub infer_calls: u64,
+    pub whnf_calls: u64,
+    pub defeq_calls: u64,
+    pub quick_equality_hits: u64,
+    pub beta_steps: u64,
+    pub delta_steps: u64,
+    pub iota_steps: u64,
+    pub zeta_steps: u64,
+    pub physical_reductions: u64,
+    pub overflowed: bool,
+}
+
+/// Failed-operation fuel and work projection.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HumanKernelOperationWork {
+    pub fuel: HumanKernelFuelOperationCounters,
+    pub work: HumanKernelWorkSnapshot,
+}
+
+/// Declaration-scope fuel and work projection.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HumanKernelDeclarationWork {
+    pub fuel: HumanKernelFuelTotals,
+    pub work: HumanKernelWorkSnapshot,
+    pub overflowed: bool,
+}
+
+/// Bounded structural comparison path with stable kernel spellings.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HumanKernelComparisonPath {
+    pub steps: Vec<String>,
+    pub truncated: bool,
+}
+
+/// One bounded retained delta-constant count.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HumanKernelDeltaHotsetEntry {
+    pub constant: String,
+    pub count: u64,
+}
+
+/// Bounded retained delta-constant projection.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HumanKernelDeltaHotsetSummary {
+    pub retained_names: u64,
+    pub capacity: u64,
+    pub entries: Vec<HumanKernelDeltaHotsetEntry>,
+    pub emitted: u64,
+    pub entry_limit: u64,
+    pub unretained_name_observations: u64,
+    pub overlong_name_observations: u64,
+    pub output_truncated: bool,
+    pub overflowed: bool,
+}
+
+/// Bounded, untrusted operational context for one kernel fuel exhaustion.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HumanKernelFuelDiagnostic {
+    pub subsystem: String,
+    pub resource: String,
+    pub failed_operation: HumanKernelOperationWork,
+    pub declaration: HumanKernelDeclarationWork,
+    pub comparison_path: HumanKernelComparisonPath,
+    pub retained_delta_constants: Option<HumanKernelDeltaHotsetSummary>,
+    pub overflowed: bool,
+}
+
+impl HumanKernelFuelDiagnostic {
+    pub fn from_kernel(diagnostic: &npa_kernel::KernelFuelDiagnostic) -> Self {
+        Self {
+            subsystem: diagnostic.subsystem.as_str().to_owned(),
+            resource: diagnostic.resource.as_str().to_owned(),
+            failed_operation: HumanKernelOperationWork::from_kernel(&diagnostic.failed_operation),
+            declaration: HumanKernelDeclarationWork::from_kernel(&diagnostic.declaration),
+            comparison_path: HumanKernelComparisonPath {
+                steps: diagnostic
+                    .comparison_path
+                    .steps
+                    .iter()
+                    .map(|step| step.as_str().to_owned())
+                    .collect(),
+                truncated: diagnostic.comparison_path.truncated,
+            },
+            retained_delta_constants: diagnostic
+                .retained_delta_constants
+                .as_ref()
+                .map(HumanKernelDeltaHotsetSummary::from_kernel),
+            overflowed: diagnostic.overflowed,
+        }
+    }
+}
+
+/// Successful detailed declaration summary used by package observation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HumanKernelDeclarationSummary {
+    pub subsystem: String,
+    pub outcome: String,
+    pub fuel: HumanKernelFuelTotals,
+    pub work: HumanKernelWorkSnapshot,
+    pub retained_delta_constants: HumanKernelDeltaHotsetSummary,
+    pub overflowed: bool,
+}
+
+impl HumanKernelDeclarationSummary {
+    pub fn from_admission(admission: &npa_kernel::KernelDiagnosedAdmission) -> Option<Self> {
+        let declaration = admission.declaration_work()?;
+        let retained_delta_constants =
+            HumanKernelDeltaHotsetSummary::from_kernel(admission.retained_delta_constants()?);
+        Some(Self {
+            subsystem: npa_kernel::KernelDiagnosticSubsystem::FastKernel
+                .as_str()
+                .to_owned(),
+            outcome: "accepted".to_owned(),
+            fuel: HumanKernelFuelTotals::from_kernel(&declaration.fuel),
+            work: HumanKernelWorkSnapshot::from_kernel(&declaration.work),
+            overflowed: declaration.overflowed || retained_delta_constants.overflowed,
+            retained_delta_constants,
+        })
+    }
+}
+
+impl HumanKernelFuelOperationCounters {
+    fn from_kernel(counters: &npa_kernel::KernelFuelOperationCounters) -> Self {
+        Self {
+            budget: counters.budget,
+            spent: counters.spent,
+            remaining: counters.remaining,
+            exhausted: counters.exhausted,
+            overflowed: counters.overflowed,
+        }
+    }
+}
+
+impl HumanKernelFuelDomainTotals {
+    fn from_kernel(counters: &npa_kernel::KernelFuelDomainTotals) -> Self {
+        Self {
+            calls: counters.calls,
+            logical_spent: counters.logical_spent,
+            successful_operation_fuel: counters.successful_operation_fuel,
+            exhausted_operation_fuel: counters.exhausted_operation_fuel,
+            overflowed: counters.overflowed,
+        }
+    }
+}
+
+impl HumanKernelFuelTotals {
+    fn from_kernel(counters: &npa_kernel::KernelFuelTotals) -> Self {
+        Self {
+            whnf: HumanKernelFuelDomainTotals::from_kernel(&counters.whnf),
+            conversion: HumanKernelFuelDomainTotals::from_kernel(&counters.conversion),
+        }
+    }
+}
+
+impl HumanKernelWorkSnapshot {
+    fn from_kernel(work: &npa_kernel::KernelWorkSnapshot) -> Self {
+        Self {
+            check_calls: work.check_calls,
+            infer_calls: work.infer_calls,
+            whnf_calls: work.whnf_calls,
+            defeq_calls: work.defeq_calls,
+            quick_equality_hits: work.quick_equality_hits,
+            beta_steps: work.beta_steps,
+            delta_steps: work.delta_steps,
+            iota_steps: work.iota_steps,
+            zeta_steps: work.zeta_steps,
+            physical_reductions: work.physical_reductions,
+            overflowed: work.overflowed,
+        }
+    }
+}
+
+impl HumanKernelOperationWork {
+    fn from_kernel(work: &npa_kernel::KernelOperationWork) -> Self {
+        Self {
+            fuel: HumanKernelFuelOperationCounters::from_kernel(&work.fuel),
+            work: HumanKernelWorkSnapshot::from_kernel(&work.work),
+        }
+    }
+}
+
+impl HumanKernelDeclarationWork {
+    fn from_kernel(work: &npa_kernel::KernelDeclarationWork) -> Self {
+        Self {
+            fuel: HumanKernelFuelTotals::from_kernel(&work.fuel),
+            work: HumanKernelWorkSnapshot::from_kernel(&work.work),
+            overflowed: work.overflowed,
+        }
+    }
+}
+
+impl HumanKernelDeltaHotsetSummary {
+    fn from_kernel(summary: &npa_kernel::KernelDeltaHotsetSummary) -> Self {
+        Self {
+            retained_names: summary.retained_names,
+            capacity: summary.capacity,
+            entries: summary
+                .entries
+                .iter()
+                .map(|entry| HumanKernelDeltaHotsetEntry {
+                    constant: entry.constant.clone(),
+                    count: entry.count,
+                })
+                .collect(),
+            emitted: summary.emitted,
+            entry_limit: summary.entry_limit,
+            unretained_name_observations: summary.unretained_name_observations,
+            overlong_name_observations: summary.overlong_name_observations,
+            output_truncated: summary.output_truncated,
+            overflowed: summary.overflowed,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HumanDiagnosticSeverity {
     Error,
@@ -12,6 +257,10 @@ pub enum HumanDiagnosticSeverity {
 pub enum HumanDiagnosticKind {
     NotImplemented,
     ParseError,
+    OpaqueModifierNotFollowedByDef,
+    DuplicateOpaqueModifier,
+    UnsupportedOpaqueEquationDefinition,
+    UnsupportedOpaqueDefinition,
     ImportAfterItem,
     UnsupportedSyntax,
     ImportResolutionError,
@@ -90,10 +339,13 @@ pub struct HumanDiagnosticPayload {
     pub phase: Option<HumanDiagnosticPhase>,
     pub detail: Option<String>,
     pub candidates: Vec<String>,
+    /// Stable declaration names related to a conversion or elaboration failure.
+    pub related_declarations: Vec<String>,
     pub hole_goals: Vec<HumanHoleGoal>,
     pub unsolved_meta: Option<HumanUnsolvedMeta>,
     pub conversion: Option<HumanDiagnosticConversionContext>,
     pub universe_mismatch: Option<HumanUniverseMismatchContext>,
+    pub kernel_fuel: Option<HumanKernelFuelDiagnostic>,
 }
 
 impl HumanDiagnosticPayload {
@@ -118,6 +370,12 @@ impl HumanDiagnosticPayload {
     #[must_use]
     pub fn with_universe_mismatch(mut self, mismatch: HumanUniverseMismatchContext) -> Self {
         self.universe_mismatch = Some(mismatch);
+        self
+    }
+
+    #[must_use]
+    pub fn with_kernel_fuel(mut self, kernel_fuel: HumanKernelFuelDiagnostic) -> Self {
+        self.kernel_fuel = Some(kernel_fuel);
         self
     }
 }
@@ -308,6 +566,41 @@ impl HumanDiagnostic {
         Self::error(HumanDiagnosticKind::ParseError, primary_span, message)
     }
 
+    pub fn opaque_modifier_not_followed_by_def(
+        primary_span: Span,
+        following: impl Into<String>,
+    ) -> Self {
+        Self::error(
+            HumanDiagnosticKind::OpaqueModifierNotFollowedByDef,
+            primary_span,
+            format!("`opaque` may only modify `def`; found {}", following.into()),
+        )
+    }
+
+    pub fn duplicate_opaque_modifier(primary_span: Span) -> Self {
+        Self::error(
+            HumanDiagnosticKind::DuplicateOpaqueModifier,
+            primary_span,
+            "duplicate `opaque` modifier before `def`",
+        )
+    }
+
+    pub fn unsupported_opaque_equation_definition(primary_span: Span) -> Self {
+        Self::error(
+            HumanDiagnosticKind::UnsupportedOpaqueEquationDefinition,
+            primary_span,
+            "opaque equation definitions require equation-compiler integration; use a term-bodied `opaque def ... := ...`, or keep the recursive definition reducible in a narrow implementation module",
+        )
+    }
+
+    pub fn unsupported_opaque_definition(primary_span: Span) -> Self {
+        Self::error(
+            HumanDiagnosticKind::UnsupportedOpaqueDefinition,
+            primary_span,
+            "opaque definitions are parsed but not yet supported by Human Surface compilation",
+        )
+    }
+
     pub fn unsupported_syntax(primary_span: Span, syntax: impl Into<String>) -> Self {
         Self::error(
             HumanDiagnosticKind::UnsupportedSyntax,
@@ -402,6 +695,9 @@ fn merge_human_diagnostic_payload(
     if next.universe_mismatch.is_none() {
         next.universe_mismatch = existing.universe_mismatch;
     }
+    if next.kernel_fuel.is_none() {
+        next.kernel_fuel = existing.kernel_fuel;
+    }
     next
 }
 
@@ -457,6 +753,14 @@ fn human_diagnostic_kind_label(kind: &HumanDiagnosticKind) -> &'static str {
     match kind {
         HumanDiagnosticKind::NotImplemented => "not implemented",
         HumanDiagnosticKind::ParseError => "parse error",
+        HumanDiagnosticKind::OpaqueModifierNotFollowedByDef => {
+            "opaque modifier not followed by def"
+        }
+        HumanDiagnosticKind::DuplicateOpaqueModifier => "duplicate opaque modifier",
+        HumanDiagnosticKind::UnsupportedOpaqueEquationDefinition => {
+            "unsupported opaque equation definition"
+        }
+        HumanDiagnosticKind::UnsupportedOpaqueDefinition => "unsupported opaque definition",
         HumanDiagnosticKind::ImportAfterItem => "import after item",
         HumanDiagnosticKind::UnsupportedSyntax => "unsupported syntax",
         HumanDiagnosticKind::ImportResolutionError => "import resolution error",

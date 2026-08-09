@@ -5,17 +5,17 @@ use crate::resolver::{
     VerifiedImportLookupError,
 };
 use crate::{
-    HumanAxiomDecl, HumanBinder, HumanBinderInfo, HumanBinderKind, HumanClassDecl,
-    HumanClassFieldDecl, HumanCompileOptions, HumanDecl, HumanDeclValue, HumanDiagnostic,
-    HumanDiagnosticKind, HumanDiagnosticPayload, HumanDiagnosticPhase, HumanEquationDecl,
-    HumanEquationRow, HumanExpr, HumanFrontendState, HumanGeneratedDeclarationKind,
-    HumanGeneratedDeclarationMetadata, HumanImportedSourceInterface, HumanInductiveDecl,
-    HumanInstanceDecl, HumanItem, HumanModule, HumanName, HumanNotationAssociativity,
-    HumanNotationHead, HumanNotationKind, HumanOpenScope, HumanOpenScopeFrame, HumanPattern,
-    HumanResult, HumanSourceBinderMetadata, HumanSourceDeclarationKind,
-    HumanSourceDeclarationMetadata, HumanSourceInterface, HumanSourceNotationMetadata,
-    HumanTerminationAnnotation, HumanTypeclassClassMetadata, HumanTypeclassFieldMetadata,
-    HumanTypeclassInstanceMetadata, Span, VerifiedImport,
+    DefinitionReducibility, HumanAxiomDecl, HumanBinder, HumanBinderInfo, HumanBinderKind,
+    HumanClassDecl, HumanClassFieldDecl, HumanCompileOptions, HumanDecl, HumanDeclValue,
+    HumanDiagnostic, HumanDiagnosticKind, HumanDiagnosticPayload, HumanDiagnosticPhase,
+    HumanEquationDecl, HumanEquationRow, HumanExpr, HumanFrontendState,
+    HumanGeneratedDeclarationKind, HumanGeneratedDeclarationMetadata, HumanImportedSourceInterface,
+    HumanInductiveDecl, HumanInstanceDecl, HumanItem, HumanModule, HumanName,
+    HumanNotationAssociativity, HumanNotationHead, HumanNotationKind, HumanOpenScope,
+    HumanOpenScopeFrame, HumanPattern, HumanResult, HumanSourceBinderMetadata,
+    HumanSourceDeclarationKind, HumanSourceDeclarationMetadata, HumanSourceInterface,
+    HumanSourceNotationMetadata, HumanTerminationAnnotation, HumanTypeclassClassMetadata,
+    HumanTypeclassFieldMetadata, HumanTypeclassInstanceMetadata, Span, VerifiedImport,
 };
 
 const MAX_HUMAN_NAME_CANDIDATES: usize = 32;
@@ -1757,11 +1757,16 @@ impl<'a> HumanResolver<'a> {
                     self.notation_scopes.pop();
                 }
             }
-            HumanItem::Def(decl) => {
+            HumanItem::Def(definition) => {
+                let decl = &definition.declaration;
                 let name = self.qualify_name(&decl.name);
                 self.ensure_current_name_is_available(&name, decl.span)?;
                 self.resolve_decl_terms(decl)?;
-                let metadata = self.decl_metadata(HumanSourceDeclarationKind::Def, decl);
+                let metadata = self.decl_metadata(
+                    HumanSourceDeclarationKind::Def,
+                    Some(definition.reducibility),
+                    decl,
+                );
                 self.add_current_global(name, HumanSourceDeclarationKind::Def, decl.span)?;
                 self.state
                     .source_interfaces
@@ -1807,7 +1812,7 @@ impl<'a> HumanResolver<'a> {
                 let name = self.qualify_name(&decl.name);
                 self.ensure_current_name_is_available(&name, decl.span)?;
                 self.resolve_decl_terms(decl)?;
-                let metadata = self.decl_metadata(HumanSourceDeclarationKind::Theorem, decl);
+                let metadata = self.decl_metadata(HumanSourceDeclarationKind::Theorem, None, decl);
                 self.add_current_global(name, HumanSourceDeclarationKind::Theorem, decl.span)?;
                 self.state
                     .source_interfaces
@@ -1975,10 +1980,12 @@ impl<'a> HumanResolver<'a> {
     fn decl_metadata(
         &self,
         kind: HumanSourceDeclarationKind,
+        definition_reducibility: Option<DefinitionReducibility>,
         decl: &HumanDecl,
     ) -> HumanSourceDeclarationMetadata {
         HumanSourceDeclarationMetadata {
             kind,
+            definition_reducibility,
             name: self.qualify_name(&decl.name),
             universe_params: decl.universe_params.clone(),
             binders: binder_metadata(&decl.binders),
@@ -1990,6 +1997,7 @@ impl<'a> HumanResolver<'a> {
     fn equation_metadata(&self, decl: &HumanEquationDecl) -> HumanSourceDeclarationMetadata {
         HumanSourceDeclarationMetadata {
             kind: HumanSourceDeclarationKind::Def,
+            definition_reducibility: Some(DefinitionReducibility::Reducible),
             name: self.qualify_name(&decl.name),
             universe_params: decl.universe_params.clone(),
             binders: binder_metadata(&decl.binders),
@@ -2001,6 +2009,7 @@ impl<'a> HumanResolver<'a> {
     fn axiom_metadata(&self, decl: &HumanAxiomDecl) -> HumanSourceDeclarationMetadata {
         HumanSourceDeclarationMetadata {
             kind: HumanSourceDeclarationKind::Axiom,
+            definition_reducibility: None,
             name: self.qualify_name(&decl.name),
             universe_params: decl.universe_params.clone(),
             binders: binder_metadata(&decl.binders),
@@ -2012,6 +2021,7 @@ impl<'a> HumanResolver<'a> {
     fn inductive_metadata(&self, decl: &HumanInductiveDecl) -> HumanSourceDeclarationMetadata {
         HumanSourceDeclarationMetadata {
             kind: HumanSourceDeclarationKind::Inductive,
+            definition_reducibility: None,
             name: self.qualify_name(&decl.name),
             universe_params: decl.universe_params.clone(),
             binders: binder_metadata(&decl.binders),
@@ -2023,6 +2033,7 @@ impl<'a> HumanResolver<'a> {
     fn class_metadata(&self, decl: &HumanClassDecl) -> HumanSourceDeclarationMetadata {
         HumanSourceDeclarationMetadata {
             kind: HumanSourceDeclarationKind::Class,
+            definition_reducibility: None,
             name: self.qualify_name(&decl.name),
             universe_params: decl.universe_params.clone(),
             binders: binder_metadata(&decl.binders),
@@ -2049,6 +2060,7 @@ impl<'a> HumanResolver<'a> {
 
         HumanSourceDeclarationMetadata {
             kind: HumanSourceDeclarationKind::ClassField,
+            definition_reducibility: None,
             name: relative_child_name(&class_name, &field.name),
             universe_params: decl.universe_params.clone(),
             binders,
@@ -2060,6 +2072,7 @@ impl<'a> HumanResolver<'a> {
     fn instance_metadata(&self, decl: &HumanInstanceDecl) -> HumanSourceDeclarationMetadata {
         HumanSourceDeclarationMetadata {
             kind: HumanSourceDeclarationKind::Instance,
+            definition_reducibility: None,
             name: self.qualify_name(&decl.name),
             universe_params: decl.universe_params.clone(),
             binders: binder_metadata(&decl.binders),
@@ -2526,7 +2539,13 @@ fn planned_current_names(module: &HumanModule) -> BTreeSet<npa_cert::Name> {
             HumanItem::NamespaceEnd { .. } => {
                 namespace_stack.pop();
             }
-            HumanItem::Def(decl) | HumanItem::Theorem(decl) => {
+            HumanItem::Def(definition) => {
+                names.insert(name_from_parts(
+                    &namespace_stack,
+                    &definition.declaration.name,
+                ));
+            }
+            HumanItem::Theorem(decl) => {
                 names.insert(name_from_parts(&namespace_stack, &decl.name));
             }
             HumanItem::EquationDef(decl) => {
@@ -2618,6 +2637,7 @@ fn fallback_imported_source_interface(import: &VerifiedImport) -> HumanImportedS
         .iter()
         .map(|export| HumanSourceDeclarationMetadata {
             kind: HumanSourceDeclarationKind::Imported,
+            definition_reducibility: export.reducibility.map(DefinitionReducibility::from_cert),
             name: HumanName::new(export.name.0.clone(), crate::Span::empty(crate::FileId(0))),
             universe_params: export
                 .universe_params
@@ -2676,6 +2696,8 @@ fn reconcile_source_interface_with_verified_import(
                 ));
             }
             decl.decl_interface_hash = Some(export.decl_interface_hash);
+            decl.definition_reducibility =
+                export.reducibility.map(DefinitionReducibility::from_cert);
         }
     }
 
@@ -2869,6 +2891,7 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(index, name)| crate::VerifiedExport {
+                reducibility: None,
                 name: npa_cert::Name::from_dotted(name),
                 universe_params: Vec::new(),
                 ty: npa_kernel::Expr::sort(npa_kernel::Level::zero()),
@@ -2919,9 +2942,21 @@ mod tests {
         )
     }
 
+    #[test]
+    fn human_resolver_preserves_opaque_definition_metadata() {
+        let resolved = resolve_source("opaque def hidden : Prop := Prop", &[]).unwrap();
+        let metadata = &resolved.state.source_interfaces.current.declarations[0];
+        assert_eq!(
+            metadata.definition_reducibility,
+            Some(DefinitionReducibility::Opaque)
+        );
+        assert_eq!(metadata.kind, HumanSourceDeclarationKind::Def);
+    }
+
     fn equation_options() -> crate::HumanCompileOptions {
         crate::HumanCompileOptions {
             enable_equation_compiler: true,
+            kernel_fuel_report: crate::HumanKernelFuelReportMode::Off,
             ..crate::HumanCompileOptions::default()
         }
     }
@@ -3661,6 +3696,7 @@ def use (n : Type) : Type := n + Type",
     fn too_many_notation_candidates_is_rejected() {
         let options = crate::HumanCompileOptions {
             max_notation_candidates: 1,
+            kernel_fuel_report: crate::HumanKernelFuelReportMode::Off,
             ..crate::HumanCompileOptions::default()
         };
         let err = resolve_source_with_options(

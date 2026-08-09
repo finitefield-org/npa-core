@@ -151,9 +151,17 @@ let missing_required options =
 type raw_context = {
   module_name : string option;
   certificate_hash : string option;
+  input_certificate_format : string option;
+  input_core_spec : string option;
 }
 
-let empty_context = { module_name = None; certificate_hash = None }
+let empty_context =
+  {
+    module_name = None;
+    certificate_hash = None;
+    input_certificate_format = None;
+    input_core_spec = None;
+  }
 
 let context_of_decoded decoded =
   {
@@ -164,6 +172,8 @@ let context_of_decoded decoded =
       Some
         (Ext_result.wire_hash
            decoded.Ext_cert.hashes.Ext_cert.certificate_hash);
+    input_certificate_format = Some decoded.Ext_cert.header.Ext_cert.format;
+    input_core_spec = Some decoded.Ext_cert.header.Ext_cert.core_spec;
   }
 
 let context_of_hash_bound_trailer bytes =
@@ -171,11 +181,18 @@ let context_of_hash_bound_trailer bytes =
   match Ext_cert.read_header reader with
   | Error _ -> empty_context
   | Ok (header, after_header) ->
+      let header_context =
+        {
+          empty_context with
+          input_certificate_format = Some header.Ext_cert.format;
+          input_core_spec = Some header.Ext_cert.core_spec;
+        }
+      in
       let byte_length = String.length bytes in
       if
         byte_length - Ext_bytes.offset after_header
         < Ext_cert.module_hash_trailer_len
-      then empty_context
+      then header_context
       else
         let certificate_hash_length = 32 in
         let certificate_hash_offset =
@@ -190,7 +207,7 @@ let context_of_hash_bound_trailer bytes =
                header.Ext_cert.version)
             (String.sub bytes 0 certificate_hash_offset)
         in
-        if certificate_hash <> expected_hash then empty_context
+        if certificate_hash <> expected_hash then header_context
         else
           {
             module_name =
@@ -198,6 +215,8 @@ let context_of_hash_bound_trailer bytes =
                 (Ext_name.to_string header.Ext_cert.module_name);
             certificate_hash =
               Some (Ext_result.wire_hash certificate_hash);
+            input_certificate_format = Some header.Ext_cert.format;
+            input_core_spec = Some header.Ext_cert.core_spec;
           }
 
 let context_of_bytes bytes =
@@ -211,11 +230,16 @@ let context_of_bytes bytes =
     match Ext_cert.read_module_sections (Ext_bytes.of_string bytes) with
     | Ok (decoded, next) when Ext_bytes.remaining next = 0 ->
         context_of_decoded decoded
-    | Ok _ -> empty_context
-    | Error _ -> context_of_hash_bound_trailer bytes
+    | Ok _ | Error _ -> context_of_hash_bound_trailer bytes
 
 let render_error context error =
-  Ext_result.render_failed ?module_name:context.module_name
+  let input_pair =
+    match (context.input_certificate_format, context.input_core_spec) with
+    | Some format, Some core_spec -> Some (format, core_spec)
+    | None, None -> None
+    | Some _, None | None, Some _ -> None
+  in
+  Ext_result.render_failed ?input_pair ?module_name:context.module_name
     ?certificate_hash:context.certificate_hash error
 
 let phase_error context = function
@@ -367,6 +391,8 @@ let internal_error context =
 
 let checked_result checked =
   Ext_result.render_checked
+    ~input_certificate_format:(Ext_checker.input_certificate_format checked)
+    ~input_core_spec:(Ext_checker.input_core_spec checked)
     ~module_name:(Ext_name.to_string (Ext_checker.module_name checked))
     ~certificate_hash:(Ext_result.wire_hash (Ext_checker.certificate_hash checked))
     ~export_hash:(Ext_result.wire_hash (Ext_checker.export_hash checked))

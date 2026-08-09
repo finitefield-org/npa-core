@@ -23,7 +23,7 @@ mod policy_toml;
 mod source_free_fs;
 
 const CHECKER_ID: &str = "npa-checker-ref";
-const RAW_SCHEMA: &str = "npa.independent-checker.checker_raw_result.v1";
+const RAW_SCHEMA: &str = "npa.independent-checker.checker_raw_result.v2";
 const MAX_IMPORT_CANDIDATES: usize = 4_096;
 const MAX_IMPORT_DEPTH: usize = 1_024;
 const MAX_IMPORT_DIRECTORY_DEPTH: usize = 128;
@@ -401,6 +401,9 @@ fn load_policy(path: &Path) -> Result<ReferenceCheckerPolicy, ()> {
         allowed_axioms,
         deny_sorry: true,
         deny_custom_axioms: true,
+        // Match the fast and OCaml independent checkers: the exact initial
+        // environment Eq recursor is a standard exception, not a custom axiom.
+        allow_standard_axiom_exceptions: true,
         supported_core_features: Vec::new(),
     })
 }
@@ -721,6 +724,17 @@ fn reason_code(error: &ReferenceCheckError) -> Option<&'static str> {
         Some(ReferenceCheckReason::AxiomReportMismatch) => Some("axiom_report_mismatch"),
         Some(ReferenceCheckReason::SorryDenied) => Some("sorry_denied"),
         Some(ReferenceCheckReason::ForbiddenAxiom) => Some("forbidden_axiom"),
+        Some(ReferenceCheckReason::WrongReferenceKind) => Some("wrong_reference_kind"),
+        Some(ReferenceCheckReason::TargetNotEarlier) => Some("target_not_earlier"),
+        Some(ReferenceCheckReason::TargetNotOpaque) => Some("target_not_opaque"),
+        Some(ReferenceCheckReason::InterfaceHashMismatch) => Some("interface_hash_mismatch"),
+        Some(ReferenceCheckReason::CertificateHashMismatch) => Some("certificate_hash_mismatch"),
+        Some(ReferenceCheckReason::MissingImplementationDependency) => {
+            Some("missing_implementation_dependency")
+        }
+        Some(ReferenceCheckReason::SurplusImplementationDependency) => {
+            Some("surplus_implementation_dependency")
+        }
         Some(ReferenceCheckReason::ReferenceCheckerBodyUnimplemented) => {
             Some("reference_checker_body_unimplemented")
         }
@@ -729,9 +743,11 @@ fn reason_code(error: &ReferenceCheckError) -> Option<&'static str> {
 
 fn checked_json(module: &ReferenceCheckedModule) -> String {
     format!(
-        "{{\"schema\":\"{RAW_SCHEMA}\",\"checker_id\":\"{CHECKER_ID}\",\"checker_version\":\"{}\",\"checker_build_hash\":\"{}\",\"status\":\"checked\",\"module\":\"{}\",\"certificate_hash\":\"{}\",\"export_hash\":\"{}\",\"axiom_report_hash\":\"{}\"}}",
+        "{{\"schema\":\"{RAW_SCHEMA}\",\"checker_id\":\"{CHECKER_ID}\",\"checker_version\":\"{}\",\"checker_build_hash\":\"{}\",\"certificate_format\":\"{REFERENCE_CERTIFICATE_FORMAT}\",\"core_spec\":\"{REFERENCE_CORE_SPEC}\",\"input_certificate_format\":\"{}\",\"input_core_spec\":\"{}\",\"status\":\"checked\",\"module\":\"{}\",\"certificate_hash\":\"{}\",\"export_hash\":\"{}\",\"axiom_report_hash\":\"{}\"}}",
         env!("CARGO_PKG_VERSION"),
         hash_wire(&checker_build_hash()),
+        module.certificate_format(),
+        module.core_spec(),
         module.module().dotted(),
         hash_wire(module.certificate_hash()),
         hash_wire(module.export_hash()),
@@ -795,6 +811,15 @@ fn failed_json_fields(
     }
     error_fields.push(format!("\"section\":{}", json_string(section)));
     error_fields.push(format!("\"offset\":{offset}"));
+    let input_pair = certificate
+        .map(|certificate| {
+            format!(
+                ",\"input_certificate_format\":{},\"input_core_spec\":{}",
+                json_string(&certificate.header.format),
+                json_string(&certificate.header.core_spec),
+            )
+        })
+        .unwrap_or_default();
     let context = certificate
         .map(|certificate| {
             format!(
@@ -805,9 +830,10 @@ fn failed_json_fields(
         })
         .unwrap_or_default();
     format!(
-        "{{\"schema\":\"{RAW_SCHEMA}\",\"checker_id\":\"{CHECKER_ID}\",\"checker_version\":\"{}\",\"checker_build_hash\":\"{}\",\"status\":\"failed\"{},\"error\":{{{}}}}}",
+        "{{\"schema\":\"{RAW_SCHEMA}\",\"checker_id\":\"{CHECKER_ID}\",\"checker_version\":\"{}\",\"checker_build_hash\":\"{}\",\"certificate_format\":\"{REFERENCE_CERTIFICATE_FORMAT}\",\"core_spec\":\"{REFERENCE_CORE_SPEC}\"{},\"status\":\"failed\"{},\"error\":{{{}}}}}",
         env!("CARGO_PKG_VERSION"),
         hash_wire(&checker_build_hash()),
+        input_pair,
         context,
         error_fields.join(","),
     )

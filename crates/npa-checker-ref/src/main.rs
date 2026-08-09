@@ -12,11 +12,12 @@ use npa_checker_ref::{
     ReferenceCheckImportTarget, ReferenceCheckReason, ReferenceCheckReference,
     ReferenceCheckResolvedImportIdentity, ReferenceCheckResult, ReferenceCheckerPolicy,
     ReferenceHash, ReferenceHashObject, ReferenceImportStore, ReferenceTrustMode,
-    REFERENCE_CHECKER_ID, REFERENCE_CHECKER_VERSION,
+    REFERENCE_CERTIFICATE_FORMAT, REFERENCE_CHECKER_ID, REFERENCE_CHECKER_VERSION,
+    REFERENCE_CORE_SPEC,
 };
 use sha2::{Digest, Sha256};
 
-const CHECKER_RAW_RESULT_SCHEMA: &str = "npa.independent-checker.checker_raw_result.v1";
+const CHECKER_RAW_RESULT_SCHEMA: &str = "npa.independent-checker.checker_raw_result.v2";
 
 fn main() -> ExitCode {
     let (json, code) = run_with_args(env::args().skip(1));
@@ -114,11 +115,14 @@ fn run_checker(options: CliOptions) -> Result<(String, u8), CliError> {
     let cert_bytes = fs::read(&options.cert_path).map_err(|_| CliError::new("cert"))?;
     let policy = load_policy(&options)?;
     let imports = load_import_store(&options)?;
+    let input_pair = raw_input_pair(&cert_bytes);
     let decoded = decode_certificate(&cert_bytes).ok();
 
     Ok(match check_certificate(&cert_bytes, &imports, &policy) {
         ReferenceCheckResult::Checked(module) => {
             let json = raw_checked_json(
+                module.certificate_format(),
+                module.core_spec(),
                 module.module().dotted(),
                 module.certificate_hash(),
                 module.export_hash(),
@@ -127,7 +131,7 @@ fn run_checker(options: CliOptions) -> Result<(String, u8), CliError> {
             (json, 0)
         }
         ReferenceCheckResult::Rejected(error) => {
-            let json = raw_rejected_json(&error, decoded.as_ref());
+            let json = raw_rejected_json(&error, decoded.as_ref(), input_pair.as_ref());
             (json, 1)
         }
     })
@@ -164,6 +168,9 @@ fn parse_policy_text(text: &str) -> Result<ReferenceCheckerPolicy, CliError> {
     }
     if let Some(value) = find_bool_field(text, "deny_custom_axioms")? {
         policy.deny_custom_axioms = value;
+    }
+    if let Some(value) = find_bool_field(text, "allow_standard_axiom_exceptions")? {
+        policy.allow_standard_axiom_exceptions = value;
     }
 
     let allowed_axioms = find_string_array_field(text, "allowed_axioms")?;
@@ -417,17 +424,23 @@ fn parse_json_string(source: &str, start: usize) -> Result<(String, usize), CliE
 }
 
 fn raw_checked_json(
+    input_certificate_format: &str,
+    input_core_spec: &str,
     module: String,
     certificate_hash: &ReferenceHash,
     export_hash: &ReferenceHash,
     axiom_report_hash: &ReferenceHash,
 ) -> String {
     format!(
-        "{{\"schema\":\"{}\",\"checker_id\":\"{}\",\"checker_version\":\"{}\",\"checker_build_hash\":\"{}\",\"status\":\"checked\",\"module\":{},\"certificate_hash\":\"{}\",\"export_hash\":\"{}\",\"axiom_report_hash\":\"{}\"}}",
+        "{{\"schema\":\"{}\",\"checker_id\":\"{}\",\"checker_version\":\"{}\",\"checker_build_hash\":\"{}\",\"certificate_format\":\"{}\",\"core_spec\":\"{}\",\"input_certificate_format\":{},\"input_core_spec\":{},\"status\":\"checked\",\"module\":{},\"certificate_hash\":\"{}\",\"export_hash\":\"{}\",\"axiom_report_hash\":\"{}\"}}",
         CHECKER_RAW_RESULT_SCHEMA,
         REFERENCE_CHECKER_ID,
         REFERENCE_CHECKER_VERSION,
         format_hash(&reference_checker_build_hash()),
+        REFERENCE_CERTIFICATE_FORMAT,
+        REFERENCE_CORE_SPEC,
+        json_string(input_certificate_format),
+        json_string(input_core_spec),
         json_string(&module),
         format_hash(certificate_hash),
         format_hash(export_hash),
@@ -438,6 +451,7 @@ fn raw_checked_json(
 fn raw_rejected_json(
     error: &ReferenceCheckError,
     decoded: Option<&npa_checker_ref::ReferenceDecodedCertificate>,
+    input_pair: Option<&(String, String)>,
 ) -> String {
     let mut fields = vec![
         format!("\"schema\":\"{}\"", CHECKER_RAW_RESULT_SCHEMA),
@@ -447,8 +461,20 @@ fn raw_rejected_json(
             "\"checker_build_hash\":\"{}\"",
             format_hash(&reference_checker_build_hash())
         ),
-        "\"status\":\"failed\"".to_owned(),
+        format!(
+            "\"certificate_format\":\"{}\"",
+            REFERENCE_CERTIFICATE_FORMAT
+        ),
+        format!("\"core_spec\":\"{}\"", REFERENCE_CORE_SPEC),
     ];
+    if let Some((certificate_format, core_spec)) = input_pair {
+        fields.push(format!(
+            "\"input_certificate_format\":{}",
+            json_string(certificate_format)
+        ));
+        fields.push(format!("\"input_core_spec\":{}", json_string(core_spec)));
+    }
+    fields.push("\"status\":\"failed\"".to_owned());
     if let Some(decoded) = decoded {
         fields.push(format!(
             "\"module\":{}",
@@ -461,6 +487,62 @@ fn raw_rejected_json(
     }
     fields.push(format!("\"error\":{}", raw_error_json(error)));
     format!("{{{}}}", fields.join(","))
+}
+
+fn raw_input_pair(bytes: &[u8]) -> Option<(String, String)> {
+    fn string_at(bytes: &[u8], offset: &mut usize) -> Option<String> {
+        let start = *offset;
+        let mut value = 0_u64;
+        let mut shift = 0_u32;
+        loop {
+            let byte = *bytes.get(*offset)?;
+            *offset += 1;
+            value |= u64::from(byte & 0x7f).checked_shl(shift)?;
+            if byte & 0x80 == 0 {
+                break;
+            }
+            shift = shift.checked_add(7)?;
+            if shift >= 64 {
+                return None;
+            }
+        }
+        let length_bytes = &bytes[start..*offset];
+        let mut canonical = Vec::new();
+        let mut remaining = value;
+        loop {
+            let mut byte = (remaining & 0x7f) as u8;
+            remaining >>= 7;
+            if remaining != 0 {
+                byte |= 0x80;
+            }
+            canonical.push(byte);
+            if remaining == 0 {
+                break;
+            }
+        }
+        if canonical != length_bytes {
+            return None;
+        }
+        let len = usize::try_from(value).ok()?;
+        let end = offset.checked_add(len)?;
+        let value = std::str::from_utf8(bytes.get(*offset..end)?)
+            .ok()?
+            .to_owned();
+        *offset = end;
+        Some(value)
+    }
+
+    let mut offset = 0;
+    let format = string_at(bytes, &mut offset)?;
+    let core_spec = string_at(bytes, &mut offset)?;
+    matches!(
+        (format.as_str(), core_spec.as_str()),
+        ("NPA-CERT-0.3.0", "NPA-Core-0.3.0")
+            | ("NPA-CERT-0.2.0", "NPA-Core-0.2.0")
+            | ("NPA-CERT-0.1.2", "NPA-Core-0.1.2")
+            | ("NPA-CERT-0.1", "NPA-Core-0.1")
+    )
+    .then_some((format, core_spec))
 }
 
 fn raw_error_json(error: &ReferenceCheckError) -> String {
@@ -481,6 +563,17 @@ fn raw_error_json(error: &ReferenceCheckError) -> String {
         }
         Some(ReferenceCheckReason::UnknownReference) => Some("unknown_reference"),
         Some(ReferenceCheckReason::ResourceLimit) => Some("resource_limit"),
+        Some(ReferenceCheckReason::WrongReferenceKind) => Some("wrong_reference_kind"),
+        Some(ReferenceCheckReason::TargetNotEarlier) => Some("target_not_earlier"),
+        Some(ReferenceCheckReason::TargetNotOpaque) => Some("target_not_opaque"),
+        Some(ReferenceCheckReason::InterfaceHashMismatch) => Some("interface_hash_mismatch"),
+        Some(ReferenceCheckReason::CertificateHashMismatch) => Some("certificate_hash_mismatch"),
+        Some(ReferenceCheckReason::MissingImplementationDependency) => {
+            Some("missing_implementation_dependency")
+        }
+        Some(ReferenceCheckReason::SurplusImplementationDependency) => {
+            Some("surplus_implementation_dependency")
+        }
         _ => None,
     };
     if let Some(reason_code) = reason_code {
@@ -609,11 +702,13 @@ fn reference_projection(reference: &ReferenceCheckReference) -> (Option<String>,
 
 fn raw_internal_error_json(section: &'static str, offset: usize) -> String {
     format!(
-        "{{\"schema\":\"{}\",\"checker_id\":\"{}\",\"checker_version\":\"{}\",\"checker_build_hash\":\"{}\",\"status\":\"failed\",\"error\":{{\"kind\":\"checker_internal_error\",\"reason_code\":\"checker_reported_internal_error\",\"section\":{},\"offset\":{}}}}}",
+        "{{\"schema\":\"{}\",\"checker_id\":\"{}\",\"checker_version\":\"{}\",\"checker_build_hash\":\"{}\",\"certificate_format\":\"{}\",\"core_spec\":\"{}\",\"status\":\"failed\",\"error\":{{\"kind\":\"checker_internal_error\",\"reason_code\":\"checker_reported_internal_error\",\"section\":{},\"offset\":{}}}}}",
         CHECKER_RAW_RESULT_SCHEMA,
         REFERENCE_CHECKER_ID,
         REFERENCE_CHECKER_VERSION,
         format_hash(&reference_checker_build_hash()),
+        REFERENCE_CERTIFICATE_FORMAT,
+        REFERENCE_CORE_SPEC,
         json_string(section),
         offset
     )
@@ -862,7 +957,12 @@ mod tests {
         ]);
 
         assert_eq!(code, 0);
+        assert!(json.contains("\"schema\":\"npa.independent-checker.checker_raw_result.v2\""));
         assert!(json.contains("\"checker_id\":\"npa-checker-ref\""));
+        assert!(json.contains("\"certificate_format\":\"NPA-CERT-0.3.0\""));
+        assert!(json.contains("\"core_spec\":\"NPA-Core-0.3.0\""));
+        assert!(json.contains("\"input_certificate_format\":\"NPA-CERT-0.3.0\""));
+        assert!(json.contains("\"input_core_spec\":\"NPA-Core-0.3.0\""));
         assert!(json.contains("\"status\":\"checked\""));
         assert!(json.contains("\"module\":\"Cli.Empty\""));
         let _ = fs::remove_dir_all(dir);

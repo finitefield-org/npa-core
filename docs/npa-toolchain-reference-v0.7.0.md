@@ -1,10 +1,15 @@
 # NPA Toolchain Reference v0.7.0
 
+Historical snapshot: this document preserves the v0.7 host/result contract and
+uses “current” only relative to that release. For the active adjacent-source
+contract, use the [v0.8 reference](npa-toolchain-reference-v0.8.0.md).
+
 This reference describes the adjacent-source `npa-cli 0.7.x` package
 interface. It adds a source-free theorem-premise report and advances the shared
 generated-artifact check from five to six deterministic subresults. Package
-command results remain `npa.package.command_result.v0.3`; certificate and core
-formats do not change.
+command results remain `npa.package.command_result.v0.3`. The current source
+producer and independent checkers use Core v0.3; the last published external
+tag remains v0.2.0 until a separate release changes that pin.
 
 ## Version axes
 
@@ -15,8 +20,9 @@ formats do not change.
 | Package command result | `npa.package.command_result.v0.3` |
 | Theorem-premise report | `npa.package.theorem_premise_report.v0.1` |
 | Reference checker | `0.3.0` |
-| External checker | `0.2.0` |
-| Certificate and core specification | `NPA-CERT-0.2.0` / `NPA-Core-0.2.0` |
+| External checker | `0.3.0` |
+| Current emitted certificate/core pair | `NPA-CERT-0.3.0` / `NPA-Core-0.3.0` |
+| Read-only compatibility input pairs | exact v0.2.0, v0.1.2, and v0.1 pairs |
 | Generated-artifact release manifest | `npa.generated_artifact_release_manifest.v0.2` |
 
 The release validator accepts these host/result pairs:
@@ -29,6 +35,36 @@ The release validator accepts these host/result pairs:
 
 Cross-pairs remain invalid. The v0.6 reference is historical and is not
 rewritten by this release.
+
+### Core v0.3 identity and migration
+
+Every current Human and Machine producer emits the v0.3 pair, including for
+plain-only modules. Both surfaces spell an opaque definition as `opaque def`;
+the Machine term body remains fully explicit. Its body is checked and locally
+transparent to later declarations in the defining module, then removed from
+the exported interface. Importers cannot restore or unfold it.
+
+V0.2 is an exact compatibility input, not a current output option. Migration
+requires a rebuild, canonical re-encoding, new certificate identities, package
+artifact refresh, and source-free revalidation; a header-only edit rejects.
+Targeted refresh may reuse an interface-stable dependent only after rebinding
+the affected certificate chain and verifying it against current imports.
+
+The package manifest and package lock continue to use the independent
+`npa.core.v0.1`, `npa.certificate.canonical.v0.1`, `npa.package.v0.1`, and
+`npa.package.lock.v0.1` contract axes. The
+`npa.package.build_check_cache.v0.2` key stores emitted
+`output_certificate_format` / `output_core_spec`;
+`npa.package.audit_cache.v0.2` keys and
+`npa.package.verified_export_summary.v0.2` module rows store each decoded
+module's `certificate_format` / `core_spec`. None derives the module pair from
+the package profiles.
+
+Author substantial opaque implementations in semantic leaf modules and expose
+stable specification theorems. Do not expose a whole-body equality theorem,
+which repeats the implementation despite the sealed constant. The defining
+module still checks and may unfold the body, so the expected performance gain
+begins only in importing modules.
 
 ## Theorem-premise report
 
@@ -226,8 +262,9 @@ The following v0.6 capabilities remain available with the same semantics:
 
 See the historical [v0.6 reference](npa-toolchain-reference-v0.6.0.md) for
 those contracts. The reference checker advances independently to `0.3.0` for
-typed unknown-reference diagnostics. This does not relabel
-`npa-checker-ext 0.2.0`, `NPA-CERT-0.2.0`, or `NPA-Core-0.2.0`.
+typed unknown-reference diagnostics. The current external checker is also
+`0.3.0`; its v0.3 capability does not relabel an exact v0.2.0, v0.1.2, or v0.1
+compatibility input.
 
 Artifact refresh renders each declared `meta.json` `imports` field from the
 module's validated manifest-declared direct imports. This is distinct from the
@@ -280,6 +317,21 @@ package-lock, and certificate schemas are unchanged.
 
 ## External checker closure
 
+Run package verification without local acceleration when collecting comparable
+fast/reference/external identities:
+
+```sh
+npa package verify-certs --root . --package-lock checked --checker fast \
+  --audit-cache off --verifier-memo off --json
+npa package verify-certs --root . --package-lock checked --checker reference \
+  --audit-cache off --verifier-memo off --json
+npa package verify-certs --root . --package-lock checked --checker external \
+  --audit-cache off --verifier-memo off --jobs 1 \
+  --runner-policy ci/runner.release.json \
+  --runner-policy-hash "$NPA_RUNNER_POLICY_HASH" \
+  --checker-registry ci/checker-binaries.json --json
+```
+
 The current Linux closure gate is:
 
 ```sh
@@ -288,5 +340,9 @@ npa-core/checkers/npa-checker-ext/scripts/toolchain-v0.7.sh --functional-only
 ```
 
 It binds the `npa-cli 0.7.x` host to the unchanged `package_api::v1` external
-checker adapter and proof-format axes. The functional-only form is a developer
-gate and does not produce release evidence.
+checker adapter. Raw result v2 advertises the checker capability in
+`certificate_format` / `core_spec` and records the decoded certificate in
+`input_certificate_format` / `input_core_spec`; checked results additionally
+bind `module`, `certificate_hash`, `export_hash`, and `axiom_report_hash`. The
+functional-only form is a developer gate and does not produce release
+evidence.

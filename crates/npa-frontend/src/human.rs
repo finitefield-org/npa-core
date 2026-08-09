@@ -1,4 +1,9 @@
-use crate::{FileId, Span};
+use crate::{
+    human_diagnostic::HumanKernelDeclarationSummary, DefinitionReducibility, FileId, Span,
+};
+
+/// Maximum declaration observations retained for one Human module.
+pub const HUMAN_DECLARATION_OBSERVATION_LIMIT: usize = 2_048;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HumanModule {
@@ -23,7 +28,7 @@ pub enum HumanItem {
     Open { namespace: HumanName, span: Span },
     NamespaceStart { name: HumanName, span: Span },
     NamespaceEnd { name: Option<HumanName>, span: Span },
-    Def(HumanDecl),
+    Def(HumanDefinitionDecl),
     EquationDef(HumanEquationDecl),
     Theorem(HumanDecl),
     Axiom(HumanAxiomDecl),
@@ -40,7 +45,8 @@ impl HumanItem {
             | Self::Open { span, .. }
             | Self::NamespaceStart { span, .. }
             | Self::NamespaceEnd { span, .. } => *span,
-            Self::Def(decl) | Self::Theorem(decl) => decl.span,
+            Self::Def(definition) => definition.declaration.span,
+            Self::Theorem(decl) => decl.span,
             Self::EquationDef(decl) => decl.span,
             Self::Axiom(decl) => decl.span,
             Self::Inductive(decl) => decl.span,
@@ -49,6 +55,13 @@ impl HumanItem {
             Self::Notation(decl) => decl.span,
         }
     }
+}
+
+/// Human Surface term-bodied definition and its source-selected reducibility.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HumanDefinitionDecl {
+    pub declaration: HumanDecl,
+    pub reducibility: DefinitionReducibility,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -545,6 +558,57 @@ impl HumanExpr {
             | Self::NotationApp { span, .. } => *span,
         }
     }
+
+    pub(crate) fn with_span(self, span: Span) -> Self {
+        match self {
+            Self::Ident {
+                name,
+                universe_args,
+                implicit_mode,
+                ..
+            } => Self::Ident {
+                name,
+                universe_args,
+                implicit_mode,
+                span,
+            },
+            Self::Sort { level, .. } => Self::Sort { level, span },
+            Self::App { func, arg, .. } => Self::App { func, arg, span },
+            Self::Lam { binders, body, .. } => Self::Lam {
+                binders,
+                body,
+                span,
+            },
+            Self::Pi { binders, body, .. } => Self::Pi {
+                binders,
+                body,
+                span,
+            },
+            Self::Let {
+                name,
+                ty,
+                value,
+                body,
+                ..
+            } => Self::Let {
+                name,
+                ty,
+                value,
+                body,
+                span,
+            },
+            Self::Annot { expr, ty, .. } => Self::Annot { expr, ty, span },
+            Self::Arrow {
+                domain, codomain, ..
+            } => Self::Arrow {
+                domain,
+                codomain,
+                span,
+            },
+            Self::Hole { name, .. } => Self::Hole { name, span },
+            Self::NotationApp { head, args, .. } => Self::NotationApp { head, args, span },
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -635,6 +699,8 @@ pub struct HumanImportedSourceInterface {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HumanSourceDeclarationMetadata {
     pub kind: HumanSourceDeclarationKind,
+    /// Definition reducibility, including values authenticated for imported definitions.
+    pub definition_reducibility: Option<DefinitionReducibility>,
     pub name: HumanName,
     pub universe_params: Vec<HumanUniverseParam>,
     pub binders: Vec<HumanSourceBinderMetadata>,
@@ -751,6 +817,7 @@ pub struct HumanCompileOptions {
     pub max_notation_candidates: usize,
     pub typeclass_search_policy: HumanTypeclassSearchPolicy,
     pub enable_equation_compiler: bool,
+    pub kernel_fuel_report: HumanKernelFuelReportMode,
 }
 
 impl Default for HumanCompileOptions {
@@ -759,13 +826,73 @@ impl Default for HumanCompileOptions {
             max_notation_candidates: 32,
             typeclass_search_policy: HumanTypeclassSearchPolicy::default(),
             enable_equation_compiler: false,
+            kernel_fuel_report: HumanKernelFuelReportMode::Off,
         }
     }
+}
+
+/// Human-authoring selection for bounded fast-kernel fuel diagnostics.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum HumanKernelFuelReportMode {
+    #[default]
+    Off,
+    Failure,
+    Detailed,
+}
+
+impl HumanKernelFuelReportMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Failure => "failure",
+            Self::Detailed => "detailed",
+        }
+    }
+}
+
+impl From<HumanKernelFuelReportMode> for npa_kernel::KernelFuelReportMode {
+    fn from(value: HumanKernelFuelReportMode) -> Self {
+        match value {
+            HumanKernelFuelReportMode::Off => Self::Off,
+            HumanKernelFuelReportMode::Failure => Self::Failure,
+            HumanKernelFuelReportMode::Detailed => Self::Detailed,
+        }
+    }
+}
+
+/// One final Core declaration's bounded authoring observation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HumanDeclarationObservation {
+    pub declaration_index: u64,
+    pub declaration: String,
+    pub term_nodes: u64,
+    pub elaboration_elapsed_ns: u64,
+    pub kernel: Option<HumanKernelDeclarationSummary>,
+}
+
+/// Bounded declaration observations for one successful Human compilation.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HumanCompilationObservations {
+    pub declarations: Vec<HumanDeclarationObservation>,
+    pub attempted: u64,
+    pub omitted: u64,
+    pub overflowed: bool,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn human_compile_options_default_kernel_fuel_reporting_is_off() {
+        assert_eq!(
+            HumanCompileOptions::default().kernel_fuel_report,
+            HumanKernelFuelReportMode::Off
+        );
+        assert_eq!(HumanKernelFuelReportMode::Off.as_str(), "off");
+        assert_eq!(HumanKernelFuelReportMode::Failure.as_str(), "failure");
+        assert_eq!(HumanKernelFuelReportMode::Detailed.as_str(), "detailed");
+    }
 
     fn span(start: u32, end: u32) -> Span {
         Span::new(FileId(0), start, end)
@@ -826,12 +953,16 @@ mod tests {
             value: HumanDeclValue::Term(ident("x", 31, 32)),
             span: span(0, 32),
         };
-        let item = HumanItem::Def(decl);
+        let item = HumanItem::Def(HumanDefinitionDecl {
+            declaration: decl,
+            reducibility: DefinitionReducibility::Reducible,
+        });
 
         assert_eq!(item.span(), span(0, 32));
-        let HumanItem::Def(decl) = item else {
+        let HumanItem::Def(definition) = item else {
             panic!("expected def item");
         };
+        let decl = definition.declaration;
         assert_eq!(decl.name.as_dotted(), "id");
         assert_eq!(decl.binders.len(), 2);
         assert!(decl

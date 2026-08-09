@@ -477,18 +477,22 @@ let parse_policy_toml source =
 type error = {
   section : Ext_bytes.certificate_section;
   offset : Ext_bytes.offset;
+  kind : string;
+  reason_code : string;
 }
 
-let error section offset = Error { section; offset }
+let error ?(kind = "axiom_report_mismatch")
+    ?(reason_code = "axiom_report_mismatch") section offset =
+  Error { section; offset; kind; reason_code }
 
 let bind result f =
   match result with
   | Error err -> Error err
   | Ok value -> f value
 
-let error_kind _ = "axiom_report_mismatch"
+let error_kind error = error.kind
 
-let error_reason_code _ = "axiom_report_mismatch"
+let error_reason_code error = error.reason_code
 
 let rec list_nth_opt index values =
   match (index, values) with
@@ -502,10 +506,12 @@ let builtin_is_axiom name = Ext_name.to_string name = "Eq.rec"
 let global_ref_equal left right = left = right
 
 let dependency_equal left right =
-  global_ref_equal left.Ext_cert.dependency_global_ref
-    right.Ext_cert.dependency_global_ref
-  && left.Ext_cert.dependency_decl_interface_hash
-     = right.Ext_cert.dependency_decl_interface_hash
+  global_ref_equal (Ext_cert.dependency_global_ref left)
+    (Ext_cert.dependency_global_ref right)
+  && Ext_cert.dependency_decl_interface_hash left
+     = Ext_cert.dependency_decl_interface_hash right
+  && Ext_cert.dependency_decl_certificate_hash left
+     = Ext_cert.dependency_decl_certificate_hash right
 
 let axiom_equal left right =
   global_ref_equal left.Ext_cert.axiom_global_ref right.Ext_cert.axiom_global_ref
@@ -572,9 +578,18 @@ let axiom_order_key section offset name_table axiom =
 let dependency_order_key section offset name_table dependency =
   bind
     (global_ref_order_key section offset name_table
-       dependency.Ext_cert.dependency_global_ref)
+       (Ext_cert.dependency_global_ref dependency))
     (fun global_key ->
-      Ok (global_key ^ dependency.Ext_cert.dependency_decl_interface_hash))
+      let tag, certificate_hash =
+        match dependency with
+        | Ext_cert.Interface_dependency _ -> ("\000", "")
+        | Ext_cert.Local_implementation_dependency
+            { dependency_decl_certificate_hash; _ } ->
+            ("\001", dependency_decl_certificate_hash)
+      in
+      Ok
+        (tag ^ global_key ^ Ext_cert.dependency_decl_interface_hash dependency
+       ^ certificate_hash))
 
 let sort_unique_by_key section offset name_table key_fn equal values =
   let rec key_values remaining keyed =
@@ -757,13 +772,266 @@ let expected_dependencies_for_decl section offset name_table imports decl_index
              declarations global_ref)
           (fun decl_interface_hash ->
             loop rest
-              ({
-                 Ext_cert.dependency_global_ref = global_ref;
-                 dependency_decl_interface_hash = decl_interface_hash;
-               }
+              (Ext_cert.Interface_dependency
+                 { dependency_global_ref = global_ref; dependency_decl_interface_hash = decl_interface_hash }
               :: dependencies))
   in
   loop refs []
+
+let local_implementation_error offset reason_code =
+  error ~kind:"dependency_hash_mismatch" ~reason_code Ext_bytes.Declarations
+    offset
+
+let local_transparency_resource_error offset =
+  error ~kind:"certificate_decode_error" ~reason_code:"resource_limit"
+    Ext_bytes.Declarations offset
+
+let is_opaque_definition (declaration : Ext_cert.declaration) =
+  match declaration.Ext_cert.payload with
+  | Ext_cert.DefDecl
+      { decl_reducibility = Ext_cert.Opaque_reducibility; _ } ->
+      true
+  | _ -> false
+
+let referenced_terms_v0_3 payload =
+  match payload with
+  | Ext_cert.DefDecl { decl_ty; decl_value; _ } -> [ decl_ty; decl_value ]
+  | Ext_cert.TheoremDecl { decl_ty; _ } -> [ decl_ty ]
+  | _ -> declaration_terms payload
+
+module Global_ref_map = Map.Make (struct
+  type t = Ext_term.global_ref
+
+  let compare = Stdlib.compare
+end)
+
+module Int_map = Map.Make (Int)
+module Int_set = Set.Make (Int)
+
+let add_ref_with_min_depth global_ref depth refs =
+  Global_ref_map.update global_ref
+    (function None -> Some depth | Some previous -> Some (min previous depth))
+    refs
+
+let scan_term_roots_with_budget offset roots base_depth root_expanded
+    certificate_expanded =
+  let charge depth =
+    if depth > Ext_bytes.max_node_depth then
+      local_transparency_resource_error offset
+    else if !root_expanded >= Ext_bytes.max_root_expanded_nodes then
+      local_transparency_resource_error offset
+    else if !certificate_expanded >= Ext_bytes.max_certificate_expanded_nodes then
+      local_transparency_resource_error offset
+    else (
+      incr root_expanded;
+      incr certificate_expanded;
+      Ok ())
+  in
+  let rec loop pending refs =
+    match pending with
+    | [] -> Ok refs
+    | (term, depth) :: rest ->
+        bind (charge depth) (fun () ->
+            match term with
+            | Ext_term.Sort _ | Ext_term.BVar _ -> loop rest refs
+            | Ext_term.Const (global_ref, _) ->
+                loop rest (add_ref_with_min_depth global_ref depth refs)
+            | Ext_term.App (fn, arg)
+            | Ext_term.Lam (fn, arg)
+            | Ext_term.Pi (fn, arg) ->
+                loop
+                  ((fn, depth + 1) :: (arg, depth + 1) :: rest)
+                  refs
+            | Ext_term.Let (ty, value, body) ->
+                loop
+                  ((ty, depth + 1) :: (value, depth + 1)
+                 :: (body, depth + 1) :: rest)
+                  refs)
+  in
+  loop (List.map (fun term -> (term, base_depth)) roots)
+    Global_ref_map.empty
+
+let queue_local_reference current_decl_index global_ref depth pending =
+  let target =
+    match global_ref with
+    | Ext_term.Local { decl_index }
+    | Ext_term.LocalGenerated { decl_index; _ } ->
+        Some decl_index
+    | Ext_term.Imported _ | Ext_term.Builtin _ -> None
+  in
+  match target with
+  | Some target when target < current_decl_index ->
+      Int_map.update target
+        (function None -> Some depth | Some previous -> Some (min previous depth))
+        pending
+  | Some _ | None -> pending
+
+let validate_local_implementation_entries offset current_decl_index declarations
+    dependencies =
+  let rec loop remaining actual =
+    match remaining with
+    | [] -> Ok actual
+    | Ext_cert.Interface_dependency _ :: rest -> loop rest actual
+    | (Ext_cert.Local_implementation_dependency _ as dependency) :: rest -> (
+        match Ext_cert.dependency_global_ref dependency with
+        | (Ext_term.Imported _ | Ext_term.LocalGenerated _ | Ext_term.Builtin _) ->
+            local_implementation_error offset "wrong_reference_kind"
+        | Ext_term.Local { decl_index = target_index } ->
+            if target_index >= current_decl_index then
+              local_implementation_error offset "target_not_earlier"
+            else
+              match list_nth_opt target_index declarations with
+              | None ->
+                  local_implementation_error offset "target_not_earlier"
+              | Some target ->
+                  if not (is_opaque_definition target) then
+                    local_implementation_error offset "target_not_opaque"
+                  else if
+                    Ext_cert.dependency_decl_interface_hash dependency
+                    <> target.Ext_cert.hashes.Ext_cert.decl_interface_hash
+                  then
+                    local_implementation_error offset "interface_hash_mismatch"
+                  else if
+                    Ext_cert.dependency_decl_certificate_hash dependency
+                    <> Some target.Ext_cert.hashes.Ext_cert.decl_certificate_hash
+                  then
+                    local_implementation_error offset "certificate_hash_mismatch"
+                  else loop rest (Int_set.add target_index actual))
+  in
+  loop dependencies Int_set.empty
+
+let expected_dependencies_for_decl_v0_3 section offset name_table imports
+    decl_index declarations declaration certificate_expanded =
+  let root_expanded = ref 0 in
+  bind
+    (validate_local_implementation_entries offset decl_index declarations
+       declaration.Ext_cert.dependencies)
+    (fun actual_opaque_indices ->
+      bind
+        (scan_term_roots_with_budget offset
+           (declaration_terms declaration.Ext_cert.payload)
+           1 root_expanded certificate_expanded)
+        (fun direct_refs ->
+          let direct_refs =
+            Global_ref_map.filter
+              (fun global_ref _ ->
+                match global_ref with
+                | Ext_term.Local { decl_index = referenced_decl_index }
+                | Ext_term.LocalGenerated
+                    { decl_index = referenced_decl_index; _ }
+                  when allow_self_reference declaration.Ext_cert.payload
+                       && referenced_decl_index = decl_index ->
+                    false
+                | _ -> true)
+              direct_refs
+          in
+          let initial_pending =
+            Global_ref_map.fold
+              (fun global_ref depth pending ->
+                queue_local_reference decl_index global_ref depth pending)
+              direct_refs Int_map.empty
+          in
+          let rec close pending visited opaque_indices =
+            match Int_map.min_binding_opt pending with
+            | None -> Ok opaque_indices
+            | Some (target_index, reference_depth) ->
+                let rest = Int_map.remove target_index pending in
+                if Int_set.mem target_index visited then
+                  close rest visited opaque_indices
+                else
+                  match list_nth_opt target_index declarations with
+                  | None ->
+                      close rest (Int_set.add target_index visited)
+                        opaque_indices
+                  | Some target ->
+                      bind
+                        (scan_term_roots_with_budget offset
+                           (referenced_terms_v0_3 target.Ext_cert.payload)
+                           (reference_depth + 1) root_expanded
+                           certificate_expanded)
+                        (fun refs ->
+                          let pending =
+                            Global_ref_map.fold
+                              (fun global_ref depth queued ->
+                                queue_local_reference decl_index global_ref depth
+                                  queued)
+                              refs rest
+                          in
+                          close pending (Int_set.add target_index visited)
+                            (if is_opaque_definition target then
+                               Int_set.add target_index opaque_indices
+                             else opaque_indices))
+          in
+          bind
+            (close initial_pending Int_set.empty Int_set.empty)
+            (fun opaque_indices ->
+              if
+                not
+                  (Int_set.is_empty
+                     (Int_set.diff opaque_indices actual_opaque_indices))
+              then
+                  local_implementation_error offset
+                    "missing_implementation_dependency"
+              else if
+                not
+                  (Int_set.is_empty
+                     (Int_set.diff actual_opaque_indices opaque_indices))
+              then
+                      local_implementation_error offset
+                        "surplus_implementation_dependency"
+              else
+                      let rec interfaces remaining dependencies =
+                        match remaining with
+                        | [] -> Ok dependencies
+                        | (global_ref, _) :: rest ->
+                            let hidden_local =
+                              match global_ref with
+                              | Ext_term.Local { decl_index = target } ->
+                                  Int_set.mem target opaque_indices
+                              | _ -> false
+                            in
+                            if hidden_local then interfaces rest dependencies
+                            else
+                              bind
+                                (interface_hash_for_global_ref section offset
+                                   name_table imports decl_index declarations
+                                   global_ref)
+                                (fun decl_interface_hash ->
+                                  interfaces rest
+                                    (Ext_cert.Interface_dependency
+                                       {
+                                         dependency_global_ref = global_ref;
+                                         dependency_decl_interface_hash =
+                                           decl_interface_hash;
+                                       }
+                                    :: dependencies))
+                      in
+                      bind
+                        (interfaces (Global_ref_map.bindings direct_refs) [])
+                        (fun interfaces ->
+                          let implementations =
+                            List.filter_map
+                              (fun target_index ->
+                                match list_nth_opt target_index declarations with
+                                | None -> None
+                                | Some target ->
+                                    Some
+                                      (Ext_cert.Local_implementation_dependency
+                                         {
+                                           dependency_global_ref =
+                                             Ext_term.Local
+                                               { decl_index = target_index };
+                                           dependency_decl_interface_hash =
+                                             target.Ext_cert.hashes
+                                               .Ext_cert.decl_interface_hash;
+                                           dependency_decl_certificate_hash =
+                                             target.Ext_cert.hashes
+                                               .Ext_cert.decl_certificate_hash;
+                                         }))
+                              (Int_set.elements opaque_indices)
+                          in
+                          sort_unique_dependencies section offset name_table
+                            (interfaces @ implementations)))))
 
 let local_axiom_ref_for_decl decl_index axioms =
   let rec loop remaining =
@@ -846,13 +1114,13 @@ let expected_axioms_for_decl section offset name_table imports decl_index declar
     match remaining with
     | [] -> Ok ()
     | dependency :: rest -> (
-        match dependency.Ext_cert.dependency_global_ref with
+        match Ext_cert.dependency_global_ref dependency with
         | Ext_term.Builtin { name; decl_interface_hash } ->
             if builtin_is_axiom name then (
               let axiom =
                 {
                   Ext_cert.axiom_global_ref =
-                    dependency.Ext_cert.dependency_global_ref;
+                    Ext_cert.dependency_global_ref dependency;
                   axiom_name = name;
                   axiom_decl_interface_hash = decl_interface_hash;
                 }
@@ -878,13 +1146,13 @@ let expected_axioms_for_decl section offset name_table imports decl_index declar
         | Ext_term.Imported { name; decl_interface_hash; _ } ->
             bind
               (imported_export_for_global_ref section offset imports
-                 dependency.Ext_cert.dependency_global_ref)
+                 (Ext_cert.dependency_global_ref dependency))
               (fun export ->
                 if export.Ext_import_store.public_export_kind = Ext_cert.Export_axiom then
                   add_direct
                     {
                       Ext_cert.axiom_global_ref =
-                        dependency.Ext_cert.dependency_global_ref;
+                        Ext_cert.dependency_global_ref dependency;
                       axiom_name = name;
                       axiom_decl_interface_hash = decl_interface_hash;
                     };
@@ -925,6 +1193,7 @@ let expected_axioms_for_decl section offset name_table imports decl_index declar
 let recompute_axiom_report imports (decoded : Ext_cert.decoded_module) =
   let section = Ext_bytes.Axiom_report in
   let name_table = decoded.Ext_cert.name_table in
+  let local_transparency_certificate_expanded = ref 0 in
   if
     List.length decoded.Ext_cert.axiom_report.Ext_cert.per_declaration
     <> List.length decoded.Ext_cert.declaration_table
@@ -957,9 +1226,19 @@ let recompute_axiom_report imports (decoded : Ext_cert.decoded_module) =
                 decoded.Ext_cert.axiom_report.Ext_cert.module_axioms_offset
           | Some actual_report -> (
               let offset = declaration.Ext_cert.offset in
-              match
-                expected_dependencies_for_decl Ext_bytes.Declarations offset name_table
-                  imports decl_index decoded.Ext_cert.declaration_table declaration
+              let expected_dependencies =
+                match decoded.Ext_cert.header.Ext_cert.version with
+                | Ext_cert.Current ->
+                    expected_dependencies_for_decl_v0_3
+                      Ext_bytes.Declarations offset name_table imports decl_index
+                      decoded.Ext_cert.declaration_table declaration
+                      local_transparency_certificate_expanded
+                | Ext_cert.Compatibility | Ext_cert.Previous | Ext_cert.Legacy ->
+                    expected_dependencies_for_decl Ext_bytes.Declarations offset
+                      name_table imports decl_index
+                      decoded.Ext_cert.declaration_table declaration
+              in
+              match expected_dependencies
               with
               | Error err -> Error err
               | Ok dependencies ->

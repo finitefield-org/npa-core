@@ -70,6 +70,7 @@ impl From<&HumanApiCompileOptions> for HumanCompileOptions {
             max_notation_candidates: value.max_notation_candidates,
             typeclass_search_policy: value.typeclass_search_policy,
             enable_equation_compiler: false,
+            kernel_fuel_report: npa_frontend::HumanKernelFuelReportMode::Off,
         }
     }
 }
@@ -415,6 +416,7 @@ pub struct HumanLspDiagnosticData {
     pub phase: Option<String>,
     pub detail: Option<String>,
     pub candidates: Vec<String>,
+    pub related_declarations: Vec<String>,
     pub hole_goals: Vec<HumanLspHoleGoal>,
     pub unsolved_meta: Option<HumanLspUnsolvedMeta>,
 }
@@ -1459,6 +1461,12 @@ pub struct HumanDocumentIncrementalCache {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HumanDocumentIncrementalDeclCacheEntry {
     pub source_index: u64,
+    pub definition_reducibility: Option<npa_frontend::DefinitionReducibility>,
+    pub owner_certificate_format: String,
+    pub owner_core_spec: String,
+    pub dependency_selective_fingerprint: Hash,
+    /// Whether the fingerprint came from a rebound, checked-current chain.
+    pub dependency_selective_fingerprint_is_canonical: bool,
     pub source_decl_hash: Hash,
     pub resolved_decl_hash: Hash,
     pub core_decl_hash: Hash,
@@ -2533,6 +2541,8 @@ impl KernelCheckProfileId {
 pub struct MachineProofSession {
     pub session_id: SessionId,
     pub protocol_version: MachineApiVersion,
+    pub owner_certificate_format: String,
+    pub owner_core_spec: String,
     pub session_root_hash: Hash,
     pub root: CheckedMachineProofRoot,
     pub imports: Vec<VerifiedImportKey>,
@@ -4137,6 +4147,17 @@ fn encode_uvar(out: &mut Vec<u8>, mut value: u64) {
 mod tests {
     use super::*;
     use crate::{parse_request_body, MachineApiRequestErrorReason, MachineApiUpstreamDiagnostic};
+
+    #[test]
+    fn human_compile_options_keep_package_kernel_fuel_reporting_off() {
+        let api = HumanApiCompileOptions::default();
+        let frontend = HumanCompileOptions::from(&api);
+
+        assert_eq!(
+            frontend.kernel_fuel_report,
+            npa_frontend::HumanKernelFuelReportMode::Off
+        );
+    }
 
     #[test]
     fn hash_and_snapshot_wire_grammar_is_canonical_lowercase_sha256() {

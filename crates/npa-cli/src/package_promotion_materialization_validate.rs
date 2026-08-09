@@ -26,17 +26,16 @@ use npa_package::{
 
 use crate::{
     args::{
-        PackageAxiomReportOptions, PackageBuildCertsOptions, PackageBuildCheckCacheMode,
-        PackageBuildSelection, PackageChecker, PackageCommonOptions, PackageExportSummaryOptions,
-        PackageIndexOptions, PackagePublishPlanOptions, PackageTimingMode,
-        PackageValidatePromotionMaterializationOptions,
+        PackageAxiomReportOptions, PackageChecker, PackageCommonOptions,
+        PackageExportSummaryOptions, PackageIndexOptions, PackagePublishPlanOptions,
+        PackageTimingMode, PackageValidatePromotionMaterializationOptions,
     },
     diagnostic::{CommandArtifact, CommandDiagnostic, CommandResult, DiagnosticKind},
     fs::render_package_root,
     governance_writer::{
         confined_governance_path, write_governance_artifact, GovernanceOutputPolicy,
     },
-    package_api::v1::verify_certs_full,
+    package_api::v1::{build_certs_check, verify_certs_full},
     package_artifacts::{
         load_package_audit_snapshot, LoadedPackageAuditSnapshot, PackageGeneratedArtifactReadMode,
     },
@@ -590,13 +589,7 @@ fn positive_package_gates_pass(root: &Path, publication: bool) -> bool {
     let mut results = vec![
         run_package_check(common.clone()),
         run_package_check_hashes(common.clone()),
-        run_package_build_certs(PackageBuildCertsOptions {
-            common: common.clone(),
-            check: true,
-            build_check_cache: PackageBuildCheckCacheMode::Off,
-            update_manifest_hashes: false,
-            selection: PackageBuildSelection::Full,
-        }),
+        run_package_build_certs(build_certs_check(common.clone())),
         run_package_axiom_report(PackageAxiomReportOptions {
             common: common.clone(),
             check: true,

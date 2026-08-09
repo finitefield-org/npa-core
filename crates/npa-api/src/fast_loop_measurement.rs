@@ -843,10 +843,14 @@ mod tests {
             .any(|item| item.need == "performance_gates"));
 
         let json = fast_loop_measurement_report_json(&report);
+        assert_eq!(
+            report.measurements.schema,
+            crate::PERFORMANCE_MEASUREMENTS_SCHEMA_V0_3
+        );
         assert!(json.contains("\"schema\":\"npa.fast-loop-measurement.v2\""));
         assert!(json.contains("\"trusted\":false"));
         assert!(json.contains("\"proof_evidence\":false"));
-        assert!(json.contains("\"schema\":\"npa.performance.measurements.v0.2\""));
+        assert!(json.contains("\"schema\":\"npa.performance.measurements.v0.3\""));
         assert!(json.contains("\"label\":\"focused_replay_artifact_bytes\""));
         assert!(json.contains("\"label\":\"prepared_snapshot_elapsed_ns\""));
         assert!(json.contains("\"unit\":\"ns\""));

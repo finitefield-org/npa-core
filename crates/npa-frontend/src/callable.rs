@@ -256,6 +256,7 @@ fn is_machine_surface_reserved(value: &str) -> bool {
         || matches!(
             value,
             "import"
+                | "opaque"
                 | "def"
                 | "theorem"
                 | "fun"
@@ -420,5 +421,15 @@ mod tests {
                 MachineCallableBinderVisibility::Explicit,
             ])
         );
+    }
+
+    #[test]
+    fn opaque_is_reserved_as_machine_callable_head_but_allowed_after_dot() {
+        assert!(!is_machine_surface_renderable_name(&Name::from_dotted(
+            "opaque"
+        )));
+        assert!(is_machine_surface_renderable_name(&Name::from_dotted(
+            "Namespace.opaque"
+        )));
     }
 }

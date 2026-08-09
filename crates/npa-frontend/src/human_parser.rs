@@ -1,14 +1,15 @@
 use std::collections::BTreeMap;
 
 use crate::{
-    FileId, HumanAxiomDecl, HumanBinder, HumanBinderInfo, HumanClassDecl, HumanClassFieldDecl,
-    HumanConstructorDecl, HumanDecl, HumanDeclValue, HumanDiagnostic, HumanDiagnosticKind,
-    HumanDiagnosticPhase, HumanEquationDecl, HumanEquationRow, HumanExpr, HumanImplicitMode,
-    HumanImportedSourceInterface, HumanInductiveDecl, HumanInstanceDecl, HumanInstanceFieldDecl,
-    HumanItem, HumanLevel, HumanModule, HumanName, HumanNotationAssociativity, HumanNotationDecl,
-    HumanNotationHead, HumanNotationKind, HumanPattern, HumanProofBlock, HumanResult,
-    HumanRewriteDirection, HumanRewriteRuleSyntax, HumanSourceNotationMetadata, HumanTacticScript,
-    HumanTacticSyntax, HumanTerminationAnnotation, HumanUniverseParam, Span,
+    DefinitionReducibility, FileId, HumanAxiomDecl, HumanBinder, HumanBinderInfo, HumanClassDecl,
+    HumanClassFieldDecl, HumanConstructorDecl, HumanDecl, HumanDeclValue, HumanDefinitionDecl,
+    HumanDiagnostic, HumanDiagnosticKind, HumanDiagnosticPhase, HumanEquationDecl,
+    HumanEquationRow, HumanExpr, HumanImplicitMode, HumanImportedSourceInterface,
+    HumanInductiveDecl, HumanInstanceDecl, HumanInstanceFieldDecl, HumanItem, HumanLevel,
+    HumanModule, HumanName, HumanNotationAssociativity, HumanNotationDecl, HumanNotationHead,
+    HumanNotationKind, HumanPattern, HumanProofBlock, HumanResult, HumanRewriteDirection,
+    HumanRewriteRuleSyntax, HumanSourceNotationMetadata, HumanTacticScript, HumanTacticSyntax,
+    HumanTerminationAnnotation, HumanUniverseParam, Span,
 };
 
 pub fn parse_human_module(file_id: FileId, source: &str) -> HumanResult<HumanModule> {
@@ -139,6 +140,7 @@ enum TokenKind {
     Open,
     Namespace,
     End,
+    Opaque,
     Def,
     Theorem,
     Axiom,
@@ -429,6 +431,7 @@ fn lex_ident(
         "open" => TokenKind::Open,
         "namespace" => TokenKind::Namespace,
         "end" => TokenKind::End,
+        "opaque" => TokenKind::Opaque,
         "def" => TokenKind::Def,
         "theorem" => TokenKind::Theorem,
         "axiom" => TokenKind::Axiom,
@@ -554,6 +557,7 @@ fn reserved_name_component_spelling(kind: &TokenKind) -> Option<&'static str> {
         TokenKind::Open => "open",
         TokenKind::Namespace => "namespace",
         TokenKind::End => "end",
+        TokenKind::Opaque => "opaque",
         TokenKind::Def => "def",
         TokenKind::Theorem => "theorem",
         TokenKind::Axiom => "axiom",
@@ -588,6 +592,17 @@ fn reserved_name_component_spelling(kind: &TokenKind) -> Option<&'static str> {
         TokenKind::IMax => "imax",
         _ => return None,
     })
+}
+
+fn human_token_description(kind: &TokenKind) -> &'static str {
+    match kind {
+        TokenKind::Theorem => "`theorem`",
+        TokenKind::Axiom => "`axiom`",
+        TokenKind::Inductive => "`inductive`",
+        TokenKind::Opaque => "another `opaque`",
+        TokenKind::Eof => "end of file",
+        _ => "a non-`def` token",
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -824,7 +839,12 @@ impl<'a> Parser<'a> {
                 }
                 TokenKind::Def => {
                     saw_non_import = true;
-                    self.parse_def_item()?
+                    let start = self.expect_def()?;
+                    self.parse_definition_item(start, DefinitionReducibility::Reducible)?
+                }
+                TokenKind::Opaque => {
+                    saw_non_import = true;
+                    self.parse_opaque_definition_item()?
                 }
                 TokenKind::Theorem => {
                     saw_non_import = true;
@@ -907,8 +927,28 @@ impl<'a> Parser<'a> {
         Ok(HumanItem::NamespaceEnd { name, span })
     }
 
-    fn parse_def_item(&mut self) -> HumanResult<HumanItem> {
-        let start = self.expect_def()?;
+    fn parse_opaque_definition_item(&mut self) -> HumanResult<HumanItem> {
+        let opaque = self.expect_opaque()?;
+        if matches!(self.peek_kind(), TokenKind::Opaque) {
+            return Err(HumanDiagnostic::duplicate_opaque_modifier(
+                opaque.join(self.peek_span()),
+            ));
+        }
+        if !matches!(self.peek_kind(), TokenKind::Def) {
+            return Err(HumanDiagnostic::opaque_modifier_not_followed_by_def(
+                opaque.join(self.peek_span()),
+                human_token_description(self.peek_kind()),
+            ));
+        }
+        self.expect_def()?;
+        self.parse_definition_item(opaque, DefinitionReducibility::Opaque)
+    }
+
+    fn parse_definition_item(
+        &mut self,
+        start: Span,
+        reducibility: DefinitionReducibility,
+    ) -> HumanResult<HumanItem> {
         let name = self.parse_name()?;
         let universe_params = self.parse_optional_universe_params()?;
         let binders = self.parse_decl_binders()?;
@@ -920,16 +960,24 @@ impl<'a> Parser<'a> {
                 self.expect_colon_eq()?;
                 let value = self.parse_decl_value(false)?;
                 let span = start.join(value.span());
-                Ok(HumanItem::Def(HumanDecl {
-                    name,
-                    universe_params,
-                    binders,
-                    ty: result_type,
-                    value,
-                    span,
+                Ok(HumanItem::Def(HumanDefinitionDecl {
+                    declaration: HumanDecl {
+                        name,
+                        universe_params,
+                        binders,
+                        ty: result_type,
+                        value,
+                        span,
+                    },
+                    reducibility,
                 }))
             }
             TokenKind::Where => {
+                if reducibility == DefinitionReducibility::Opaque {
+                    return Err(HumanDiagnostic::unsupported_opaque_equation_definition(
+                        start.join(self.peek_span()),
+                    ));
+                }
                 self.expect_where()?;
                 let rows = self.parse_equation_rows()?;
                 let termination = self.parse_optional_termination_annotation()?;
@@ -2031,10 +2079,11 @@ impl<'a> Parser<'a> {
             TokenKind::Type => self.parse_type(),
             TokenKind::Sort => self.parse_sort(),
             TokenKind::LParen => {
-                self.expect_lparen()?;
+                let start = self.expect_lparen()?;
                 let term = self.parse_term()?;
-                self.expect_rparen()?;
-                Ok(term)
+                let end = self.expect_rparen()?;
+                let span = start.join(end);
+                Ok(term.with_span(span))
             }
             TokenKind::Hole => {
                 let span = self.advance().span;
@@ -2488,6 +2537,10 @@ impl<'a> Parser<'a> {
         self.expect_simple(|kind| matches!(kind, TokenKind::Def), "expected def")
     }
 
+    fn expect_opaque(&mut self) -> HumanResult<Span> {
+        self.expect_simple(|kind| matches!(kind, TokenKind::Opaque), "expected opaque")
+    }
+
     fn expect_theorem(&mut self) -> HumanResult<Span> {
         self.expect_simple(
             |kind| matches!(kind, TokenKind::Theorem),
@@ -2718,15 +2771,103 @@ end Demo",
     #[test]
     fn parses_explicit_and_implicit_def_declarations() {
         let module = parse_module("def id.{u} {A : Sort u} (x : A) : A := x");
-        let HumanItem::Def(decl) = &module.items[0] else {
+        let HumanItem::Def(definition) = &module.items[0] else {
             panic!("expected def");
         };
+        let decl = &definition.declaration;
+        assert_eq!(definition.reducibility, DefinitionReducibility::Reducible);
 
         assert_eq!(decl.name.as_dotted(), "id");
         assert_eq!(decl.universe_params[0].name, "u");
         assert_eq!(decl.binders.len(), 2);
         assert_eq!(decl.binders[0].binder_info, HumanBinderInfo::Implicit);
         assert_eq!(decl.binders[1].binder_info, HumanBinderInfo::Explicit);
+    }
+
+    #[test]
+    fn parses_opaque_definition_with_comments_layout_and_complete_span() {
+        let source = "opaque -- modifier comment\n def id.{u}\n {A : Sort u} (x : A) : A := x";
+        let module = parse_module(source);
+        let HumanItem::Def(definition) = &module.items[0] else {
+            panic!("expected opaque def");
+        };
+        assert_eq!(definition.reducibility, DefinitionReducibility::Opaque);
+        assert_eq!(definition.declaration.name.as_dotted(), "id");
+        assert_eq!(definition.declaration.universe_params[0].name, "u");
+        assert_eq!(definition.declaration.binders.len(), 2);
+        assert!(matches!(
+            &definition.declaration.ty,
+            HumanExpr::Ident { name, .. } if name.as_dotted() == "A"
+        ));
+        assert!(matches!(
+            &definition.declaration.value,
+            HumanDeclValue::Term(HumanExpr::Ident { name, .. }) if name.as_dotted() == "x"
+        ));
+        assert_eq!(
+            definition.declaration.span,
+            Span::new(FileId(0), 0, source.len() as u32)
+        );
+
+        let compact = parse_module("opaque def id.{u} {A : Sort u} (x : A) : A := x");
+        let HumanItem::Def(compact) = &compact.items[0] else {
+            panic!("expected compact opaque def");
+        };
+        assert_eq!(definition.reducibility, compact.reducibility);
+        assert_eq!(
+            definition.declaration.name.parts,
+            compact.declaration.name.parts
+        );
+        assert_eq!(
+            definition.declaration.universe_params.len(),
+            compact.declaration.universe_params.len()
+        );
+        assert_eq!(
+            definition.declaration.binders.len(),
+            compact.declaration.binders.len()
+        );
+    }
+
+    #[test]
+    fn reports_focused_opaque_modifier_and_equation_diagnostics() {
+        for (source, following) in [
+            ("opaque theorem t : Prop := Prop", "`theorem`"),
+            ("opaque axiom A : Prop", "`axiom`"),
+            ("opaque inductive I : Type", "`inductive`"),
+        ] {
+            let diagnostic = parse_diagnostic(source);
+            assert_eq!(
+                diagnostic.kind,
+                HumanDiagnosticKind::OpaqueModifierNotFollowedByDef
+            );
+            assert!(diagnostic.message.contains(following));
+        }
+        assert_eq!(
+            parse_err("opaque opaque def t : Prop := Prop"),
+            HumanDiagnosticKind::DuplicateOpaqueModifier
+        );
+        assert_eq!(
+            parse_err("opaque"),
+            HumanDiagnosticKind::OpaqueModifierNotFollowedByDef
+        );
+        assert_eq!(
+            parse_err("def opaque : Prop := Prop"),
+            HumanDiagnosticKind::ParseError
+        );
+
+        let equation = parse_diagnostic("opaque def f (x : Nat) : Nat where\n| x => x");
+        assert_eq!(
+            equation.kind,
+            HumanDiagnosticKind::UnsupportedOpaqueEquationDefinition
+        );
+        assert!(equation.message.contains("term-bodied"));
+        assert!(equation.message.contains("narrow implementation module"));
+    }
+
+    #[test]
+    fn human_lexer_reserves_opaque_without_capturing_prefix_identifiers() {
+        let tokens = lex_human(FileId(0), "opaque opaqueValue").unwrap();
+        assert_eq!(tokens[0].kind, TokenKind::Opaque);
+        assert_eq!(tokens[1].kind, TokenKind::Ident("opaqueValue".to_owned()));
     }
 
     #[test]
@@ -3189,9 +3330,10 @@ infixl:65 \" + \" => Nat.add
 infix:50 \" = \" => Eq
 def t (n : Nat) : Prop := n + Nat.zero = n",
         );
-        let HumanItem::Def(decl) = &module.items[2] else {
+        let HumanItem::Def(definition) = &module.items[2] else {
             panic!("expected def");
         };
+        let decl = &definition.declaration;
         let HumanDeclValue::Term(term) = &decl.value else {
             panic!("expected term value");
         };
@@ -3271,8 +3413,7 @@ open B",
 
     #[test]
     fn name_span_api_excludes_comments_and_strings() {
-        let source =
-            "-- Hidden.Comment.Name\nVisible.Name \"Hidden.String.Name\" Other.Name Single\n";
+        let source = "-- opaque Hidden.Comment.Name\nVisible.Name \"opaque Hidden.String.Name\" Other.Name Single\n";
         let spans = parse_human_name_spans(FileId(9), source).unwrap();
         assert_eq!(
             spans

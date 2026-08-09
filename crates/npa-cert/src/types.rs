@@ -270,6 +270,10 @@ impl VerifierSession {
 /// Verified module payload that can be imported by later certificate verification.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VerifiedModule {
+    /// Exact certificate format accepted from the verified input header.
+    pub(crate) certificate_format: String,
+    /// Exact core specification accepted from the verified input header.
+    pub(crate) core_spec: String,
     /// Module name from the verified certificate.
     pub(crate) module: Name,
     /// Canonical import list from the verified certificate.
@@ -295,6 +299,16 @@ pub struct VerifiedModule {
 }
 
 impl VerifiedModule {
+    /// Return the exact certificate format accepted from the input header.
+    pub fn certificate_format(&self) -> &str {
+        &self.certificate_format
+    }
+
+    /// Return the exact core specification accepted from the input header.
+    pub fn core_spec(&self) -> &str {
+        &self.core_spec
+    }
+
     /// Return the verified module name.
     pub fn module(&self) -> &Name {
         &self.module
@@ -744,13 +758,201 @@ pub enum Opacity {
     Opaque,
 }
 
-/// Direct dependency on another declaration interface.
+/// Kind of declaration dependency carried by a certificate entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DependencyEntryKind {
+    /// Dependency on a declaration's public interface only.
+    Interface,
+    /// Dependency on an earlier local opaque definition's checked implementation.
+    LocalImplementation,
+}
+
+/// Stable reason for rejecting a local implementation dependency.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LocalImplementationDependencyErrorReason {
+    /// The entry does not reference a plain local declaration.
+    WrongReferenceKind,
+    /// The local target is missing, current, or later than the dependent declaration.
+    TargetNotEarlier,
+    /// The target is not an opaque definition.
+    TargetNotOpaque,
+    /// The entry's interface hash does not match the target declaration.
+    InterfaceHashMismatch,
+    /// The entry's certificate hash does not match the target declaration.
+    CertificateHashMismatch,
+    /// A semantic local-transparency target has no implementation entry.
+    MissingImplementationDependency,
+    /// An implementation entry names a target outside the semantic closure.
+    SurplusImplementationDependency,
+}
+
+impl LocalImplementationDependencyErrorReason {
+    /// Return the stable snake-case reason used by diagnostics and fixtures.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::WrongReferenceKind => "wrong_reference_kind",
+            Self::TargetNotEarlier => "target_not_earlier",
+            Self::TargetNotOpaque => "target_not_opaque",
+            Self::InterfaceHashMismatch => "interface_hash_mismatch",
+            Self::CertificateHashMismatch => "certificate_hash_mismatch",
+            Self::MissingImplementationDependency => "missing_implementation_dependency",
+            Self::SurplusImplementationDependency => "surplus_implementation_dependency",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum DependencyEntryPayload {
+    Interface {
+        global_ref: GlobalRef,
+        decl_interface_hash: Hash,
+    },
+    LocalImplementation {
+        global_ref: GlobalRef,
+        decl_interface_hash: Hash,
+        decl_certificate_hash: Hash,
+    },
+}
+
+/// Read-only dependency on a declaration interface or earlier local implementation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DependencyEntry {
-    /// Referenced declaration.
-    pub global_ref: GlobalRef,
-    /// Expected interface hash for the referenced declaration.
-    pub decl_interface_hash: Hash,
+    payload: DependencyEntryPayload,
+}
+
+impl DependencyEntry {
+    /// Return the dependency variant.
+    pub fn kind(&self) -> DependencyEntryKind {
+        match self.payload {
+            DependencyEntryPayload::Interface { .. } => DependencyEntryKind::Interface,
+            DependencyEntryPayload::LocalImplementation { .. } => {
+                DependencyEntryKind::LocalImplementation
+            }
+        }
+    }
+
+    /// Return the referenced declaration.
+    pub fn global_ref(&self) -> &GlobalRef {
+        match &self.payload {
+            DependencyEntryPayload::Interface { global_ref, .. }
+            | DependencyEntryPayload::LocalImplementation { global_ref, .. } => global_ref,
+        }
+    }
+
+    /// Return the expected interface hash for the referenced declaration.
+    pub fn decl_interface_hash(&self) -> Hash {
+        match self.payload {
+            DependencyEntryPayload::Interface {
+                decl_interface_hash,
+                ..
+            }
+            | DependencyEntryPayload::LocalImplementation {
+                decl_interface_hash,
+                ..
+            } => decl_interface_hash,
+        }
+    }
+
+    /// Return the expected declaration-certificate hash for an implementation dependency.
+    pub fn decl_certificate_hash(&self) -> Option<Hash> {
+        match self.payload {
+            DependencyEntryPayload::Interface { .. } => None,
+            DependencyEntryPayload::LocalImplementation {
+                decl_certificate_hash,
+                ..
+            } => Some(decl_certificate_hash),
+        }
+    }
+
+    pub(crate) fn from_decoded_interface(global_ref: GlobalRef, decl_interface_hash: Hash) -> Self {
+        Self {
+            payload: DependencyEntryPayload::Interface {
+                global_ref,
+                decl_interface_hash,
+            },
+        }
+    }
+
+    pub(crate) fn from_decoded_local_implementation(
+        global_ref: GlobalRef,
+        decl_interface_hash: Hash,
+        decl_certificate_hash: Hash,
+    ) -> Self {
+        Self {
+            payload: DependencyEntryPayload::LocalImplementation {
+                global_ref,
+                decl_interface_hash,
+                decl_certificate_hash,
+            },
+        }
+    }
+
+    pub(crate) fn checked_interface(
+        global_ref: GlobalRef,
+        decl_interface_hash: Hash,
+    ) -> Result<Self> {
+        let embedded_hash = match &global_ref {
+            GlobalRef::Builtin {
+                decl_interface_hash,
+                ..
+            }
+            | GlobalRef::Imported {
+                decl_interface_hash,
+                ..
+            } => Some(*decl_interface_hash),
+            GlobalRef::Local { .. } | GlobalRef::LocalGenerated { .. } => None,
+        };
+        if let Some(embedded_hash) = embedded_hash {
+            if embedded_hash != decl_interface_hash {
+                return Err(CertError::HashMismatch {
+                    object: HashObject::DeclInterface,
+                    expected: embedded_hash,
+                    actual: decl_interface_hash,
+                });
+            }
+        }
+        Ok(Self {
+            payload: DependencyEntryPayload::Interface {
+                global_ref,
+                decl_interface_hash,
+            },
+        })
+    }
+
+    pub(crate) fn checked_local_implementation(
+        global_ref: GlobalRef,
+        current_decl_index: usize,
+        declarations: &[DeclCert],
+    ) -> Result<Self> {
+        let GlobalRef::Local { decl_index } = global_ref else {
+            return Err(CertError::DecodeError);
+        };
+        if decl_index >= current_decl_index {
+            return Err(CertError::DependencyCycle {
+                name: Name::from_dotted(format!("local.{decl_index}")),
+            });
+        }
+        let target = declarations.get(decl_index).ok_or(CertError::DecodeError)?;
+        if !matches!(
+            target.decl,
+            DeclPayload::Def {
+                reducibility: CertReducibility::Opaque,
+                ..
+            } | DeclPayload::DefConstrained {
+                reducibility: CertReducibility::Opaque,
+                ..
+            }
+        ) {
+            return Err(CertError::DecodeError);
+        }
+        Ok(Self {
+            payload: DependencyEntryPayload::LocalImplementation {
+                global_ref: GlobalRef::Local { decl_index },
+                decl_interface_hash: target.hashes.decl_interface_hash,
+                decl_certificate_hash: target.hashes.decl_certificate_hash,
+            },
+        })
+    }
 }
 
 impl Ord for DependencyEntry {
@@ -789,8 +991,15 @@ impl PartialOrd for AxiomRef {
 }
 
 fn dependency_entry_order_key(entry: &DependencyEntry) -> Vec<u8> {
-    let mut out = global_ref_order_key(&entry.global_ref);
-    out.extend(entry.decl_interface_hash);
+    let mut out = vec![match entry.kind() {
+        DependencyEntryKind::Interface => 0x00,
+        DependencyEntryKind::LocalImplementation => 0x01,
+    }];
+    out.extend(global_ref_order_key(entry.global_ref()));
+    out.extend(entry.decl_interface_hash());
+    if let Some(decl_certificate_hash) = entry.decl_certificate_hash() {
+        out.extend(decl_certificate_hash);
+    }
     out
 }
 
@@ -976,6 +1185,8 @@ pub enum ProducerTokenHashField {
     PostEnvFingerprint,
     /// Token `prior_chain_fingerprint` field.
     PriorChainFingerprint,
+    /// Token dependency-selective fingerprint.
+    DependencyFingerprint,
     /// Token `limit_profile_hash` field.
     LimitProfileHash,
     /// Token private declaration interface hash.
@@ -1073,6 +1284,8 @@ pub enum CertError {
         /// Exported declaration requiring the newer public-interface layout.
         name: ModuleName,
     },
+    /// A pre-v0.3 certificate format cannot encode a local implementation dependency.
+    LocalImplementationDependencyRequiresFormatUpgrade,
     /// Recomputed hash did not match the committed value.
     HashMismatch {
         /// Hash role that mismatched.
@@ -1132,6 +1345,15 @@ pub enum CertError {
     DependencyCycle {
         /// Name participating in the cycle.
         name: ModuleName,
+    },
+    /// A v0.3 local implementation dependency failed semantic validation.
+    InvalidLocalImplementationDependency {
+        /// Dependent declaration index.
+        decl_index: usize,
+        /// Reference carried by, omitted from, or unexpectedly added to the dependency vector.
+        global_ref: GlobalRef,
+        /// Stable validation reason.
+        reason: LocalImplementationDependencyErrorReason,
     },
     /// Certificate axiom report does not match recomputation.
     AxiomReportMismatch {

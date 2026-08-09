@@ -11,6 +11,7 @@ pub enum TokenKind {
     Ident(String),
     Number(u64),
     Import,
+    Opaque,
     Def,
     Theorem,
     Fun,
@@ -236,6 +237,7 @@ fn lex_ident(
     let text = &source[start as usize..end];
     let kind = match text {
         "import" => TokenKind::Import,
+        "opaque" => TokenKind::Opaque,
         "def" => TokenKind::Def,
         "theorem" => TokenKind::Theorem,
         "fun" => TokenKind::Fun,
@@ -350,7 +352,8 @@ mod tests {
 
     #[test]
     fn lexes_comments_and_string_literals_as_tokens() {
-        let tokens = lex(FileId(0), "-- doc\n\"x\"").expect("comments and strings should lex");
+        let tokens = lex(FileId(0), "-- opaque audit hit\n\"opaque\"")
+            .expect("comments and strings should lex");
         let kinds = tokens
             .iter()
             .map(|token| token.kind.clone())
@@ -360,8 +363,16 @@ mod tests {
             kinds,
             vec![TokenKind::Comment, TokenKind::StringLiteral, TokenKind::Eof]
         );
+        assert_eq!(tokens[0].span, Span::new(FileId(0), 0, 19));
+        assert_eq!(tokens[1].span, Span::new(FileId(0), 20, 28));
+    }
+
+    #[test]
+    fn lexes_opaque_as_reserved_keyword_without_capturing_prefix_identifiers() {
+        let tokens = lex(FileId(0), "opaque opaqueValue").expect("keywords should lex");
+        assert_eq!(tokens[0].kind, TokenKind::Opaque);
         assert_eq!(tokens[0].span, Span::new(FileId(0), 0, 6));
-        assert_eq!(tokens[1].span, Span::new(FileId(0), 7, 10));
+        assert_eq!(tokens[1].kind, TokenKind::Ident("opaqueValue".to_owned()));
     }
 
     #[test]

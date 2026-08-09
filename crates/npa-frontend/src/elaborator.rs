@@ -9,16 +9,18 @@ use crate::{
     },
     parse_machine_module, parse_machine_term,
     resolver::resolve_machine_module_with_options,
-    MachineBinder, MachineCallableBinderVisibility, MachineCheckedCurrentDecl,
-    MachineCheckedCurrentGeneratedDecl, MachineCompileOptions, MachineDecl, MachineDiagnostic,
-    MachineDiagnosticKind, MachineDiagnosticPayload, MachineGlobalScope, MachineGlobalScopeEntry,
-    MachineItem, MachineLevel, MachineLocalDecl, MachineRepairCandidate, MachineRepairSuggestion,
-    MachineRepairSuggestionKind, MachineResolvedConstant, MachineSurfaceMode, MachineTerm,
-    MachineTermAst, MachineTermCheckResult, MachineTermElabContext, ResolvedMachineModule, Result,
+    DefinitionReducibility, MachineBinder, MachineCallableBinderVisibility,
+    MachineCheckedCurrentDecl, MachineCheckedCurrentGeneratedDecl, MachineCompileOptions,
+    MachineDecl, MachineDiagnostic, MachineDiagnosticKind, MachineDiagnosticPayload,
+    MachineGlobalScope, MachineGlobalScopeEntry, MachineItem, MachineLevel, MachineLocalDecl,
+    MachineRepairCandidate, MachineRepairSuggestion, MachineRepairSuggestionKind,
+    MachineResolvedConstant, MachineSurfaceMode, MachineTerm, MachineTermAst,
+    MachineTermCheckResult, MachineTermElabContext, ResolvedMachineModule, Result,
     VerifiedDependency, VerifiedExport, VerifiedImport,
 };
 use npa_kernel::{
-    eq_inductive, eq_rec_type, nat_inductive, Ctx, Decl, Env, Expr, Level, Reducibility,
+    eq_inductive, eq_rec_type, nat_inductive, Ctx, Decl, Env, Expr, KernelExecutionOptions,
+    KernelWorkCounterSink, Level, Reducibility,
 };
 use sha2::{Digest, Sha256};
 
@@ -62,10 +64,24 @@ pub(crate) fn elaborate_machine_module_with_available_imports(
     for item in module.module.items {
         match item {
             MachineItem::Import { .. } => {}
-            MachineItem::Def(decl) => {
-                let span = decl.span;
-                let decl = elaborator.elaborate_decl(decl, DeclKind::Def)?;
+            MachineItem::Def(definition) => {
+                let span = definition.declaration.span;
+                let decl = elaborator.elaborate_decl(
+                    definition.declaration,
+                    DeclKind::Def(definition.reducibility),
+                )?;
                 elaborator.add_decl_to_kernel_env(&decl, span)?;
+                if definition.reducibility == DefinitionReducibility::Opaque
+                    && !elaborator
+                        .kernel_env
+                        .expose_checked_opaque_definition(decl.name())
+                {
+                    return Err(MachineDiagnostic::error(
+                        MachineDiagnosticKind::CertificateRejected,
+                        span,
+                        format!("checked opaque definition {} was not retained in the local kernel environment", decl.name()),
+                    ));
+                }
                 elaborator.add_decl_signature(&decl);
                 declarations.push(decl);
             }
@@ -388,7 +404,7 @@ pub struct MachineTermElabContextInModuleRequest<'a> {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DeclKind {
-    Def,
+    Def(DefinitionReducibility),
     Theorem,
 }
 
@@ -494,6 +510,7 @@ impl LocalScope {
 struct Elaborator {
     globals: BTreeMap<String, GlobalSignature>,
     kernel_env: Env,
+    opaque_globals: BTreeSet<String>,
     repair_mode: bool,
 }
 
@@ -503,9 +520,16 @@ impl Elaborator {
         kernel_env: Env,
         repair_mode: bool,
     ) -> Self {
+        let verified_imports = verified_imports.into_iter().collect::<Vec<_>>();
         let mut elaborator = Self {
             globals: BTreeMap::new(),
             kernel_env,
+            opaque_globals: verified_imports
+                .iter()
+                .flat_map(|import| import.exports.iter())
+                .filter(|export| export.reducibility == Some(npa_cert::CertReducibility::Opaque))
+                .map(|export| export.name.as_dotted())
+                .collect(),
             repair_mode,
         };
 
@@ -532,6 +556,7 @@ impl Elaborator {
         let mut elaborator = Self {
             globals: BTreeMap::new(),
             kernel_env,
+            opaque_globals: context.kernel_env.opaque_definition_names().clone(),
             repair_mode,
         };
 
@@ -627,12 +652,15 @@ impl Elaborator {
         );
 
         match kind {
-            DeclKind::Def => Ok(Decl::Def {
+            DeclKind::Def(reducibility) => Ok(Decl::Def {
                 name,
                 universe_params,
                 ty,
                 value,
-                reducibility: Reducibility::Reducible,
+                reducibility: match reducibility {
+                    DefinitionReducibility::Reducible => Reducibility::Reducible,
+                    DefinitionReducibility::Opaque => Reducibility::Opaque,
+                },
             }),
             DeclKind::Theorem => Ok(Decl::Theorem {
                 name,
@@ -812,7 +840,20 @@ impl Elaborator {
         let ctx = locals.to_kernel_ctx();
         self.kernel_env
             .check(&ctx, delta, expr, expected)
-            .map_err(|err| kernel_expr_diagnostic(span, err))
+            .map_err(|err| {
+                let mut diagnostic = kernel_expr_diagnostic(span, err);
+                if diagnostic.kind == MachineDiagnosticKind::TypeMismatch {
+                    if let Some(name) =
+                        first_opaque_constant_name(expected, &self.kernel_env, &self.opaque_globals)
+                    {
+                        let payload = diagnostic
+                            .payload
+                            .get_or_insert_with(|| Box::new(MachineDiagnosticPayload::default()));
+                        payload.head_symbol = Some(name);
+                    }
+                }
+                diagnostic
+            })
     }
 
     fn infer_expr(
@@ -830,11 +871,25 @@ impl Elaborator {
 
     fn add_decl_to_kernel_env(&mut self, decl: &Decl, span: crate::Span) -> Result<()> {
         add_kernel_decl_to_env(&mut self.kernel_env, decl.clone()).map_err(|err| {
-            MachineDiagnostic::error(
-                MachineDiagnosticKind::KernelRejected,
-                span,
-                format!("kernel rejected elaborated declaration: {err:?}"),
-            )
+            let mut diagnostic = match err {
+                npa_kernel::Error::TypeMismatch { .. } => kernel_expr_diagnostic(span, err),
+                _ => MachineDiagnostic::error(
+                    MachineDiagnosticKind::KernelRejected,
+                    span,
+                    format!("kernel rejected elaborated declaration: {err:?}"),
+                ),
+            };
+            if diagnostic.kind == MachineDiagnosticKind::TypeMismatch {
+                if let Some(name) =
+                    first_opaque_constant_name(decl.ty(), &self.kernel_env, &self.opaque_globals)
+                {
+                    diagnostic
+                        .payload
+                        .get_or_insert_with(|| Box::new(MachineDiagnosticPayload::default()))
+                        .head_symbol = Some(name);
+                }
+            }
+            diagnostic
         })
     }
 
@@ -1167,6 +1222,47 @@ impl Elaborator {
             .infer(&validation_locals.to_kernel_ctx(), delta, &expr)
             .ok()?;
         Some(replacement)
+    }
+}
+
+fn first_opaque_constant_name(
+    expr: &Expr,
+    env: &Env,
+    opaque_globals: &BTreeSet<String>,
+) -> Option<String> {
+    match expr {
+        Expr::Const { name, .. } => {
+            opaque_globals
+                .contains(name)
+                .then(|| name.clone())
+                .or_else(|| {
+                    env.decl(name).and_then(|decl| {
+                        matches!(
+                            decl,
+                            Decl::Def {
+                                reducibility: Reducibility::Opaque,
+                                ..
+                            } | Decl::DefConstrained {
+                                reducibility: Reducibility::Opaque,
+                                ..
+                            }
+                        )
+                        .then(|| name.clone())
+                    })
+                })
+        }
+        Expr::App(fun, arg) => first_opaque_constant_name(fun, env, opaque_globals)
+            .or_else(|| first_opaque_constant_name(arg, env, opaque_globals)),
+        Expr::Lam { ty, body, .. } | Expr::Pi { ty, body, .. } => {
+            first_opaque_constant_name(ty, env, opaque_globals)
+                .or_else(|| first_opaque_constant_name(body, env, opaque_globals))
+        }
+        Expr::Let {
+            ty, value, body, ..
+        } => first_opaque_constant_name(ty, env, opaque_globals)
+            .or_else(|| first_opaque_constant_name(value, env, opaque_globals))
+            .or_else(|| first_opaque_constant_name(body, env, opaque_globals)),
+        Expr::Sort(_) | Expr::BVar(_) => None,
     }
 }
 
@@ -2024,6 +2120,7 @@ fn hash_contextual_core_expr(
                 name,
                 source_index,
                 decl_interface_hash,
+                ..
             } => CoreHashGlobalRef::CurrentModule {
                 name: name.clone(),
                 source_index: *source_index,
@@ -3299,11 +3396,28 @@ pub(crate) fn kernel_env_from_verified_imports<'a>(
     allow_builtin_kernel_decls: bool,
     span: crate::Span,
 ) -> Result<Env> {
-    kernel_env_from_imports(
+    kernel_env_from_verified_imports_observed(
         active_imports,
         available_imports,
         allow_builtin_kernel_decls,
         span,
+        None,
+    )
+}
+
+pub(crate) fn kernel_env_from_verified_imports_observed<'a>(
+    active_imports: impl IntoIterator<Item = &'a VerifiedImport>,
+    available_imports: &'a [VerifiedImport],
+    allow_builtin_kernel_decls: bool,
+    span: crate::Span,
+    work_counter_sink: Option<&KernelWorkCounterSink>,
+) -> Result<Env> {
+    kernel_env_from_imports_observed(
+        active_imports,
+        available_imports,
+        allow_builtin_kernel_decls,
+        span,
+        work_counter_sink,
     )
     .map(|build| build.env)
 }
@@ -3313,6 +3427,22 @@ fn kernel_env_from_imports<'a>(
     available_imports: &'a [VerifiedImport],
     allow_builtin_kernel_decls: bool,
     span: crate::Span,
+) -> Result<KernelEnvBuild> {
+    kernel_env_from_imports_observed(
+        active_imports,
+        available_imports,
+        allow_builtin_kernel_decls,
+        span,
+        None,
+    )
+}
+
+fn kernel_env_from_imports_observed<'a>(
+    active_imports: impl IntoIterator<Item = &'a VerifiedImport>,
+    available_imports: &'a [VerifiedImport],
+    allow_builtin_kernel_decls: bool,
+    span: crate::Span,
+    work_counter_sink: Option<&KernelWorkCounterSink>,
 ) -> Result<KernelEnvBuild> {
     let active_imports: Vec<_> = active_imports.into_iter().collect();
     let available_decls = collect_import_decl_infos(available_imports);
@@ -3335,7 +3465,12 @@ fn kernel_env_from_imports<'a>(
         .map(|pending_decl| pending_decl.decl.name().to_owned())
         .collect();
     let mut queued_dependencies = BTreeSet::new();
-    let mut env = Env::new();
+    let mut env = work_counter_sink.map_or_else(Env::new, |sink| {
+        Env::with_execution_options_and_work_counter_sink(
+            KernelExecutionOptions::default(),
+            sink.clone(),
+        )
+    });
     let mut loaded_available_interfaces = BTreeSet::new();
     let mut loaded_available_decl_keys = BTreeSet::new();
     let mut loaded_dependency_refs: BTreeMap<String, BTreeSet<VerifiedDependency>> =
@@ -3974,15 +4109,22 @@ fn machine_term_context_from_parts(
     );
     let loaded_available_decls =
         machine_loaded_available_decl_refs(&build.loaded_available_decl_keys);
+    let mut kernel_env =
+        crate::MachineKernelEnvView::with_decl_interface_hashes(build.env, decl_interface_hashes);
+    for export in direct_imports
+        .iter()
+        .chain(available_imports.iter())
+        .flat_map(|import| import.exports.iter())
+        .filter(|export| export.reducibility == Some(npa_cert::CertReducibility::Opaque))
+    {
+        kernel_env.add_opaque_definition_name(&export.name);
+    }
 
     Ok(MachineTermElabContext {
         global_scope: MachineGlobalScope { entries },
         local_context,
         universe_params,
-        kernel_env: crate::MachineKernelEnvView::with_decl_interface_hashes(
-            build.env,
-            decl_interface_hashes,
-        ),
+        kernel_env,
         callable_interface_table: crate::MachineSurfaceCallableInterfaceTable::empty(),
         current_module,
         direct_imports: direct_imports
@@ -4394,10 +4536,27 @@ fn append_checked_current_decls_to_context(
                 format!("kernel rejected checked current declaration {name}: {err:?}"),
             )
         })?;
+        if checked.reducibility != DefinitionReducibility::from_core_decl(&checked.decl) {
+            return Err(MachineDiagnostic::error(
+                MachineDiagnosticKind::ImportResolutionError,
+                span,
+                format!("checked current declaration {name} has stale reducibility metadata"),
+            ));
+        }
+        if checked.reducibility == DefinitionReducibility::Opaque
+            && !env.expose_checked_opaque_definition(checked.decl.name())
+        {
+            return Err(MachineDiagnostic::error(
+                MachineDiagnosticKind::KernelRejected,
+                span,
+                format!("checked opaque current declaration {name} could not be exposed locally"),
+            ));
+        }
         entries.push(MachineGlobalScopeEntry::CurrentModule {
             name: checked.name.clone(),
             source_index: checked.source_index,
             decl_interface_hash: checked.decl_interface_hash,
+            reducibility: checked.reducibility,
         });
         decl_interface_hashes.push((checked.name.clone(), checked.decl_interface_hash));
     }
@@ -4988,6 +5147,7 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(index, (name, universe_params))| crate::VerifiedExport {
+                reducibility: None,
                 name: npa_cert::Name::from_dotted(name),
                 universe_params: universe_params
                     .iter()
@@ -5049,6 +5209,7 @@ mod tests {
                 hash(22),
             )]),
             exports: vec![crate::VerifiedExport {
+                reducibility: None,
                 name: npa_cert::Name::from_dotted("Poly.K"),
                 universe_params: vec!["u".to_owned()],
                 ty: k_ty.clone(),
@@ -5109,6 +5270,7 @@ mod tests {
                 decl_interface_hash,
             )]),
             exports: vec![crate::VerifiedExport {
+                reducibility: None,
                 name: npa_cert::Name::from_dotted(decl_name),
                 universe_params: Vec::new(),
                 ty: ty.clone(),
@@ -5145,6 +5307,7 @@ mod tests {
                 hash(52),
             )]),
             exports: vec![crate::VerifiedExport {
+                reducibility: None,
                 name: npa_cert::Name::from_dotted("Direct.nat_ty"),
                 universe_params: Vec::new(),
                 ty: ty.clone(),
@@ -5480,12 +5643,14 @@ mod tests {
             ]),
             exports: vec![
                 crate::VerifiedExport {
+                    reducibility: None,
                     name: npa_cert::Name::from_dotted("UseRec.P"),
                     universe_params: Vec::new(),
                     ty: p_ty.clone(),
                     decl_interface_hash: hash(32),
                 },
                 crate::VerifiedExport {
+                    reducibility: None,
                     name: npa_cert::Name::from_dotted("UseRec.w"),
                     universe_params: Vec::new(),
                     ty: Expr::konst("UseRec.P", vec![]),
@@ -5852,6 +6017,8 @@ def Test.copy : UseRec.P := UseRec.w",
             &MachineCompileOptions::default(),
         )
         .expect("machine source should compile to a certificate");
+        assert_eq!(cert.header.format, "NPA-CERT-0.3.0");
+        assert_eq!(cert.header.core_spec, "NPA-Core-0.3.0");
         let bytes = npa_cert::encode_module_cert(&cert).expect("certificate should encode");
         let decoded = npa_cert::decode_module_cert(&bytes).expect("certificate should decode");
         assert_eq!(decoded, cert);
@@ -5862,6 +6029,106 @@ def Test.copy : UseRec.P := UseRec.w",
                 .expect("encoded certificate should verify without source");
 
         assert_eq!(verified.module(), &npa_cert::Name::from_dotted("Test"));
+    }
+
+    #[test]
+    fn machine_opaque_definition_uses_local_body_and_emits_v0_3() {
+        let source = "opaque def Test.hidden (P : Prop) : Prop := P\ntheorem Test.same (P : Prop) (p : P) : Test.hidden P := p";
+        let core = compile_machine_source_to_core(
+            FileId(0),
+            npa_cert::Name::from_dotted("Test"),
+            source,
+            &[],
+            &MachineCompileOptions::default(),
+        )
+        .expect("later Machine declarations should see the checked local opaque body");
+        assert!(matches!(
+            &core.declarations[0],
+            Decl::Def {
+                reducibility: Reducibility::Opaque,
+                ..
+            }
+        ));
+
+        let cert = compile_machine_source_to_certificate(
+            FileId(0),
+            npa_cert::Name::from_dotted("Test"),
+            source,
+            &[],
+            &MachineCompileOptions::default(),
+        )
+        .expect("opaque Machine source should certify through the current v0.3 builder");
+        assert_eq!(cert.header.format, "NPA-CERT-0.3.0");
+        assert_eq!(cert.header.core_spec, "NPA-Core-0.3.0");
+        assert!(matches!(
+            cert.declarations[0].decl,
+            npa_cert::DeclPayload::Def {
+                reducibility: npa_cert::CertReducibility::Opaque,
+                ..
+            }
+        ));
+        let bytes = npa_cert::encode_module_cert(&cert).unwrap();
+        let mut session = npa_cert::VerifierSession::new();
+        npa_cert::verify_module_cert(&bytes, &mut session, &npa_cert::AxiomPolicy::normal())
+            .expect("Machine-produced v0.3 certificate should verify source-free");
+    }
+
+    #[test]
+    fn machine_repair_mode_preserves_opaque_modifier_semantics() {
+        let core = compile_machine_source_to_core(
+            FileId(0),
+            npa_cert::Name::from_dotted("Test"),
+            "opaque def Test.hidden : Type := Prop",
+            &[],
+            &MachineCompileOptions {
+                mode: MachineSurfaceMode::Repair,
+                ..MachineCompileOptions::default()
+            },
+        )
+        .expect("repair mode should retain a valid opaque definition");
+        assert!(matches!(
+            &core.declarations[0],
+            Decl::Def {
+                reducibility: Reducibility::Opaque,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn imported_machine_opaque_body_stays_hidden_and_names_conversion_context() {
+        let opaque_cert = compile_machine_source_to_certificate(
+            FileId(0),
+            npa_cert::Name::from_dotted("Test"),
+            "opaque def Test.hidden (P : Prop) : Prop := P",
+            &[],
+            &MachineCompileOptions::default(),
+        )
+        .unwrap();
+        let opaque_bytes = npa_cert::encode_module_cert(&opaque_cert).unwrap();
+        let mut verifier = npa_cert::VerifierSession::new();
+        let opaque_import = npa_cert::verify_module_cert(
+            &opaque_bytes,
+            &mut verifier,
+            &npa_cert::AxiomPolicy::normal(),
+        )
+        .unwrap();
+
+        let error = compile_machine_source_to_certificate(
+            FileId(0),
+            npa_cert::Name::from_dotted("Client"),
+            "import Test\ntheorem Client.bad (P : Prop) (p : P) : Test.hidden P := p",
+            std::slice::from_ref(&opaque_import),
+            &MachineCompileOptions::default(),
+        )
+        .expect_err("an imported opaque body must not participate in conversion");
+        assert_eq!(error.kind, MachineDiagnosticKind::TypeMismatch);
+        assert_eq!(
+            error
+                .payload
+                .and_then(|payload| payload.head_symbol.clone()),
+            Some("Test.hidden".to_owned())
+        );
     }
 
     #[test]
@@ -6172,6 +6439,7 @@ theorem Test.self_eq (n : Nat) : Eq.{1} Nat n n := @Eq.refl.{1} Nat n",
                 hash(62),
             )]),
             exports: vec![crate::VerifiedExport {
+                reducibility: None,
                 name: npa_cert::Name::from_dotted("Param.Box"),
                 universe_params: vec!["u".to_owned()],
                 ty: Expr::sort(u),
@@ -6524,6 +6792,7 @@ theorem Test.self_eq (n : Nat) : Eq.{1} Nat n n := @Eq.refl.{1} Nat n",
                 universe_params: Vec::new(),
                 ty: Expr::sort(type0()),
             },
+            reducibility: DefinitionReducibility::Reducible,
         };
         let context = crate::MachineTermElabContext::from_verified_modules_and_current_decls(
             &[],
@@ -6573,6 +6842,7 @@ theorem Test.self_eq (n : Nat) : Eq.{1} Nat n n := @Eq.refl.{1} Nat n",
             source_index: 0,
             decl_interface_hash: hash(10),
             decl: unary_rec_core_module().declarations[0].clone(),
+            reducibility: DefinitionReducibility::Reducible,
         };
         let generated = crate::MachineCheckedCurrentGeneratedDecl {
             name: npa_cert::Name::from_dotted("Unary.zero"),
@@ -6629,6 +6899,7 @@ theorem Test.self_eq (n : Nat) : Eq.{1} Nat n n := @Eq.refl.{1} Nat n",
             source_index: 0,
             decl_interface_hash: hash(10),
             decl: unary_rec_core_module().declarations[0].clone(),
+            reducibility: DefinitionReducibility::Reducible,
         };
         let generated = crate::MachineCheckedCurrentGeneratedDecl {
             name: npa_cert::Name::from_dotted("Unary.zero"),
@@ -7073,7 +7344,7 @@ theorem Test.bad (n : Nat) : Eq.{1} Nat n n := Eq.refl n",
     }
 
     #[test]
-    fn rejects_ill_typed_theorem_during_kernel_handoff() {
+    fn classifies_ill_typed_theorem_as_type_mismatch_during_kernel_handoff() {
         let err = compile_machine_source_to_core(
             FileId(0),
             npa_cert::Name::from_dotted("Test"),
@@ -7084,7 +7355,7 @@ theorem Test.bad (A : Type) (x : A) : A := fun (y : A) => y",
         )
         .expect_err("kernel handoff should reject an ill-typed theorem proof");
 
-        assert_eq!(err.kind, MachineDiagnosticKind::KernelRejected);
+        assert_eq!(err.kind, MachineDiagnosticKind::TypeMismatch);
     }
 
     #[test]

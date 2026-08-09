@@ -981,7 +981,10 @@ fn map_human_diagnostic_kind(kind: &npa_frontend::HumanDiagnosticKind) -> Machin
     use MachineApiErrorKind as Api;
 
     match kind {
-        Human::ParseError => Api::MachineTermParseError,
+        Human::ParseError
+        | Human::OpaqueModifierNotFollowedByDef
+        | Human::DuplicateOpaqueModifier
+        | Human::UnsupportedOpaqueEquationDefinition => Api::MachineTermParseError,
         Human::UnknownIdentifier
         | Human::AmbiguousName
         | Human::AmbiguousConstructor
@@ -1022,7 +1025,8 @@ fn map_human_diagnostic_kind(kind: &npa_frontend::HumanDiagnosticKind) -> Machin
         | Human::NamedHoleContextMismatch
         | Human::OccursCheckFailed
         | Human::ExpectedSort
-        | Human::MachineElaborationError => Api::MachineTermElaborationError,
+        | Human::MachineElaborationError
+        | Human::UnsupportedOpaqueDefinition => Api::MachineTermElaborationError,
     }
 }
 

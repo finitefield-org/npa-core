@@ -20,7 +20,8 @@ use std::os::fd::FromRawFd;
 use std::os::unix::process::CommandExt;
 
 use npa_api::{
-    format_hash_string, independent_checker_file_hash, independent_checker_machine_check_run,
+    format_hash_string, independent_checker_file_hash,
+    independent_checker_machine_check_run_with_certificate_bytes,
     independent_checker_npa_checker_ext_launch_plan,
     independent_checker_resolve_checker_executable, materialize_package_phase8_requests,
     package_verification_memo_key_inputs, parse_hash_string,
@@ -697,7 +698,19 @@ fn run_package_verify_external(
         {
             return CommandResult::failed(COMMAND, loaded.root_display.clone(), vec![*diagnostic]);
         }
-        let run = run_external_machine_check(loaded, lock, &policy, &resolved, module);
+        let Some(certificate_bytes) = artifact_bytes.get(&module.request.certificate.path) else {
+            return CommandResult::failed(
+                COMMAND,
+                loaded.root_display.clone(),
+                vec![
+                    CommandDiagnostic::error(DiagnosticKind::ArtifactIo, "certificate_missing")
+                        .with_path(module.request.certificate.path.clone())
+                        .with_module(module.module.as_dotted()),
+                ],
+            );
+        };
+        let run =
+            run_external_machine_check(loaded, lock, &policy, &resolved, module, certificate_bytes);
         let result_path = external_machine_result_path(lock, &module.module);
         if let Err(diagnostic) = write_external_machine_result(loaded, &result_path, &run) {
             return CommandResult::failed(COMMAND, loaded.root_display.clone(), vec![*diagnostic]);
@@ -953,6 +966,7 @@ fn run_external_machine_check(
     policy: &IndependentCheckerRunnerPolicy,
     checker: &VerifiedExternalChecker,
     module: &PackagePhase8RequestMaterialization,
+    certificate_bytes: &[u8],
 ) -> IndependentCheckerMachineCheckResult {
     let import_dir = external_import_dir_path(lock, &module.module);
     let launch = independent_checker_npa_checker_ext_launch_plan(
@@ -970,61 +984,65 @@ fn run_external_machine_check(
         &launch.environment,
         module,
     );
-    independent_checker_machine_check_run(&module.request, policy, observation).unwrap_or_else(
-        |error| {
-            let mut machine_error =
-                IndependentCheckerMachineCheckError::new("checker_internal_error")
-                    .with_reason_code(error.reason_code.to_string());
-            if let (Some(field), Some(expected), Some(actual)) = (
-                error.field.clone(),
-                error.expected_value.clone(),
-                error.actual_value.clone(),
-            ) {
-                machine_error = machine_error.with_value_payload(
-                    field.into_string(),
-                    expected.into_string(),
-                    actual.into_string(),
-                );
-            } else if let (Some(field), Some(expected), Some(actual)) =
-                (error.field, error.expected_hash, error.actual_hash)
-            {
-                machine_error =
-                    machine_error.with_hash_payload(field.into_string(), *expected, *actual);
-            }
-            IndependentCheckerMachineCheckResult {
-                request_id: module.request.request_id.clone(),
-                request_hash: module.request.request_hash(),
-                result_id: external_machine_result_id(&module.module),
-                policy: IndependentCheckerMachineCheckRequestPolicy {
-                    id: policy.id.clone(),
-                    version: policy.version,
-                    hash: policy.policy_hash(),
-                },
-                runner: external_runner_identity(),
-                checker: IndependentCheckerMachineCheckChecker {
-                    profile: EXTERNAL_CHECKER_PROFILE.to_owned(),
-                    binary_id: Some(checker.resolved.binary_id.clone()),
-                    binary_hash: Some(checker.resolved.binary_hash),
-                    id: None,
-                    build_hash: None,
-                    version: None,
-                },
-                attempt: 1,
-                status: IndependentCheckerMachineCheckStatus::Failed,
-                module: module.module.as_dotted(),
-                process: IndependentCheckerMachineCheckProcess::not_launched(),
-                resource_usage: IndependentCheckerMachineCheckResourceUsage::zero(),
-                error: Some(machine_error),
-                certificate_hash: None,
-                export_hash: None,
-                axiom_report_hash: None,
-                diagnostics: Vec::new(),
-                axioms_used: None,
-                declarations_checked: None,
-                raw_checker_output_hex: None,
-            }
-        },
+    independent_checker_machine_check_run_with_certificate_bytes(
+        &module.request,
+        policy,
+        observation,
+        certificate_bytes,
     )
+    .map(|adoption| adoption.result)
+    .unwrap_or_else(|error| {
+        let mut machine_error = IndependentCheckerMachineCheckError::new("checker_internal_error")
+            .with_reason_code(error.reason_code.to_string());
+        if let (Some(field), Some(expected), Some(actual)) = (
+            error.field.clone(),
+            error.expected_value.clone(),
+            error.actual_value.clone(),
+        ) {
+            machine_error = machine_error.with_value_payload(
+                field.into_string(),
+                expected.into_string(),
+                actual.into_string(),
+            );
+        } else if let (Some(field), Some(expected), Some(actual)) =
+            (error.field, error.expected_hash, error.actual_hash)
+        {
+            machine_error =
+                machine_error.with_hash_payload(field.into_string(), *expected, *actual);
+        }
+        IndependentCheckerMachineCheckResult {
+            request_id: module.request.request_id.clone(),
+            request_hash: module.request.request_hash(),
+            result_id: external_machine_result_id(&module.module),
+            policy: IndependentCheckerMachineCheckRequestPolicy {
+                id: policy.id.clone(),
+                version: policy.version,
+                hash: policy.policy_hash(),
+            },
+            runner: external_runner_identity(),
+            checker: IndependentCheckerMachineCheckChecker {
+                profile: EXTERNAL_CHECKER_PROFILE.to_owned(),
+                binary_id: Some(checker.resolved.binary_id.clone()),
+                binary_hash: Some(checker.resolved.binary_hash),
+                id: None,
+                build_hash: None,
+                version: None,
+            },
+            attempt: 1,
+            status: IndependentCheckerMachineCheckStatus::Failed,
+            module: module.module.as_dotted(),
+            process: IndependentCheckerMachineCheckProcess::not_launched(),
+            resource_usage: IndependentCheckerMachineCheckResourceUsage::zero(),
+            error: Some(machine_error),
+            certificate_hash: None,
+            export_hash: None,
+            axiom_report_hash: None,
+            diagnostics: Vec::new(),
+            axioms_used: None,
+            declarations_checked: None,
+            raw_checker_output_hex: None,
+        }
+    })
 }
 
 fn external_run_observation(
@@ -2491,8 +2509,10 @@ fn package_audit_cache_key_inputs_for_lock(
                 package_id: lock.package.clone(),
                 package_version: lock.version.clone(),
                 package_lock_schema: lock.schema.clone(),
-                core_spec: manifest.core_spec.clone(),
-                certificate_format: manifest.certificate_format.clone(),
+                package_core_profile: manifest.core_spec.clone(),
+                package_certificate_profile: manifest.certificate_format.clone(),
+                module_certificate_format: certificate.header.format.clone(),
+                module_core_spec: certificate.header.core_spec.clone(),
                 package_lock_hash,
                 package_policy_hash,
                 checker: checker_identity.clone(),
@@ -3069,10 +3089,12 @@ fn passed_report_diagnostics(
 
 fn module_result_actual_value(module: &PackageModuleVerificationResult) -> String {
     format!(
-        "status={};evidence={};proof_evidence={}",
+        "status={};evidence={};proof_evidence={};certificate_format={};core_spec={}",
         module.status.as_str(),
         module.evidence.as_str(),
-        module.evidence.is_proof_evidence()
+        module.evidence.is_proof_evidence(),
+        module.certificate_format.as_deref().unwrap_or("unknown"),
+        module.core_spec.as_deref().unwrap_or("unknown")
     )
 }
 

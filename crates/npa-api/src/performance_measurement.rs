@@ -12,7 +12,8 @@ use npa_kernel::KernelWorkCounters;
 /// Stable schema for the common cross-subsystem measurement block.
 pub const PERFORMANCE_MEASUREMENTS_SCHEMA_V0_1: &str = "npa.performance.measurements.v0.1";
 pub const PERFORMANCE_MEASUREMENTS_SCHEMA_V0_2: &str = "npa.performance.measurements.v0.2";
-pub const PERFORMANCE_MEASUREMENTS_SCHEMA: &str = PERFORMANCE_MEASUREMENTS_SCHEMA_V0_2;
+pub const PERFORMANCE_MEASUREMENTS_SCHEMA_V0_3: &str = "npa.performance.measurements.v0.3";
+pub const PERFORMANCE_MEASUREMENTS_SCHEMA: &str = PERFORMANCE_MEASUREMENTS_SCHEMA_V0_3;
 /// Maximum retained module detail records.
 pub const PERFORMANCE_MODULE_DETAIL_LIMIT: usize = 1_024;
 /// Maximum retained declaration detail records.
@@ -324,6 +325,186 @@ pub struct PerformanceDeclarationMeasurement {
     pub declaration: String,
     pub term_nodes: u64,
     pub elaboration_elapsed_ns: u64,
+    pub kernel: Option<PerformanceAcceptedKernelMeasurement>,
+}
+
+/// Closed subsystem vocabulary for declaration-level kernel measurements.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PerformanceKernelSubsystem {
+    FastKernel,
+}
+
+impl PerformanceKernelSubsystem {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::FastKernel => "fast_kernel",
+        }
+    }
+}
+
+/// Closed successful declaration outcome vocabulary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PerformanceAcceptedKernelOutcome {
+    Accepted,
+}
+
+impl PerformanceAcceptedKernelOutcome {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Accepted => "accepted",
+        }
+    }
+}
+
+/// Declaration aggregate for one kernel fuel domain.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PerformanceKernelFuelDomainTotals {
+    pub calls: u64,
+    pub logical_spent: u64,
+    pub successful_operation_fuel: u64,
+    pub exhausted_operation_fuel: u64,
+    pub overflowed: bool,
+}
+
+/// Domain-separated declaration fuel totals.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PerformanceKernelFuelTotals {
+    pub whnf: PerformanceKernelFuelDomainTotals,
+    pub conversion: PerformanceKernelFuelDomainTotals,
+}
+
+/// Strict bounded work vocabulary shared by accepted and failed operations.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PerformanceKernelWork {
+    pub check_calls: u64,
+    pub infer_calls: u64,
+    pub whnf_calls: u64,
+    pub defeq_calls: u64,
+    pub quick_equality_hits: u64,
+    pub beta_steps: u64,
+    pub delta_steps: u64,
+    pub iota_steps: u64,
+    pub zeta_steps: u64,
+    pub physical_reductions: u64,
+    pub overflowed: bool,
+}
+
+/// One bounded retained delta-constant count.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PerformanceKernelDeltaHotsetEntry {
+    pub constant: String,
+    pub count: u64,
+}
+
+/// Bounded retained delta-constant projection. This is required even when its
+/// entry list is empty; the kernel's 256-name working map is never exposed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PerformanceKernelDeltaHotsetSummary {
+    pub retained_names: u64,
+    pub capacity: u64,
+    pub entries: Vec<PerformanceKernelDeltaHotsetEntry>,
+    pub emitted: u64,
+    pub entry_limit: u64,
+    pub unretained_name_observations: u64,
+    pub overlong_name_observations: u64,
+    pub output_truncated: bool,
+    pub overflowed: bool,
+}
+
+/// Strict successful fast-kernel declaration measurement.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PerformanceAcceptedKernelMeasurement {
+    pub subsystem: PerformanceKernelSubsystem,
+    pub outcome: PerformanceAcceptedKernelOutcome,
+    pub fuel: PerformanceKernelFuelTotals,
+    pub work: PerformanceKernelWork,
+    pub retained_delta_constants: PerformanceKernelDeltaHotsetSummary,
+    pub overflowed: bool,
+}
+
+impl PerformanceAcceptedKernelMeasurement {
+    /// Adapt the bounded frontend summary without exposing kernel working
+    /// state. Reject forged open-string discriminants instead of relabeling
+    /// them as a strict accepted measurement.
+    pub fn from_frontend(summary: &npa_frontend::HumanKernelDeclarationSummary) -> Option<Self> {
+        if summary.subsystem != PerformanceKernelSubsystem::FastKernel.as_str()
+            || summary.outcome != PerformanceAcceptedKernelOutcome::Accepted.as_str()
+        {
+            return None;
+        }
+        Some(Self {
+            subsystem: PerformanceKernelSubsystem::FastKernel,
+            outcome: PerformanceAcceptedKernelOutcome::Accepted,
+            fuel: PerformanceKernelFuelTotals::from_frontend(&summary.fuel),
+            work: PerformanceKernelWork::from_frontend(&summary.work),
+            retained_delta_constants: PerformanceKernelDeltaHotsetSummary::from_frontend(
+                &summary.retained_delta_constants,
+            ),
+            overflowed: summary.overflowed,
+        })
+    }
+}
+
+impl PerformanceKernelFuelDomainTotals {
+    fn from_frontend(summary: &npa_frontend::HumanKernelFuelDomainTotals) -> Self {
+        Self {
+            calls: summary.calls,
+            logical_spent: summary.logical_spent,
+            successful_operation_fuel: summary.successful_operation_fuel,
+            exhausted_operation_fuel: summary.exhausted_operation_fuel,
+            overflowed: summary.overflowed,
+        }
+    }
+}
+
+impl PerformanceKernelFuelTotals {
+    fn from_frontend(summary: &npa_frontend::HumanKernelFuelTotals) -> Self {
+        Self {
+            whnf: PerformanceKernelFuelDomainTotals::from_frontend(&summary.whnf),
+            conversion: PerformanceKernelFuelDomainTotals::from_frontend(&summary.conversion),
+        }
+    }
+}
+
+impl PerformanceKernelWork {
+    fn from_frontend(summary: &npa_frontend::HumanKernelWorkSnapshot) -> Self {
+        Self {
+            check_calls: summary.check_calls,
+            infer_calls: summary.infer_calls,
+            whnf_calls: summary.whnf_calls,
+            defeq_calls: summary.defeq_calls,
+            quick_equality_hits: summary.quick_equality_hits,
+            beta_steps: summary.beta_steps,
+            delta_steps: summary.delta_steps,
+            iota_steps: summary.iota_steps,
+            zeta_steps: summary.zeta_steps,
+            physical_reductions: summary.physical_reductions,
+            overflowed: summary.overflowed,
+        }
+    }
+}
+
+impl PerformanceKernelDeltaHotsetSummary {
+    fn from_frontend(summary: &npa_frontend::HumanKernelDeltaHotsetSummary) -> Self {
+        Self {
+            retained_names: summary.retained_names,
+            capacity: summary.capacity,
+            entries: summary
+                .entries
+                .iter()
+                .map(|entry| PerformanceKernelDeltaHotsetEntry {
+                    constant: entry.constant.clone(),
+                    count: entry.count,
+                })
+                .collect(),
+            emitted: summary.emitted,
+            entry_limit: summary.entry_limit,
+            unretained_name_observations: summary.unretained_name_observations,
+            overlong_name_observations: summary.overlong_name_observations,
+            output_truncated: summary.output_truncated,
+            overflowed: summary.overflowed,
+        }
+    }
 }
 
 /// Stable outcome for a measured candidate.
@@ -760,6 +941,52 @@ impl PerformanceMeasurementRecorder {
         truncate_last(declarations, PERFORMANCE_DECLARATION_DETAIL_LIMIT);
     }
 
+    /// Record one bounded module-local declaration batch. `attempted` is
+    /// accounted exactly once; supplied records are inserted without adding a
+    /// second attempt per row, then command-wide canonical retention is
+    /// reapplied.
+    pub fn record_declaration_batch(
+        &mut self,
+        attempted: u64,
+        overflowed: bool,
+        declarations: Vec<PerformanceDeclarationMeasurement>,
+    ) {
+        let Some(state) = self.state.as_mut() else {
+            return;
+        };
+        let declaration_count = match u64::try_from(declarations.len()) {
+            Ok(count) => count,
+            Err(_) => {
+                state.overflowed = true;
+                u64::MAX
+            }
+        };
+        if attempted < declaration_count {
+            state.overflowed = true;
+        }
+        state.overflowed |= overflowed;
+        let Some(retained) = state.declarations.as_mut() else {
+            return;
+        };
+        saturating_add(
+            &mut state.declaration_attempted,
+            attempted.max(declaration_count),
+            &mut state.overflowed,
+        );
+
+        for measurement in declarations {
+            retained.insert(
+                (
+                    measurement.module.clone(),
+                    measurement.declaration_index,
+                    measurement.declaration.clone(),
+                ),
+                measurement,
+            );
+        }
+        truncate_last(retained, PERFORMANCE_DECLARATION_DETAIL_LIMIT);
+    }
+
     pub(crate) fn observe_declaration_attempts(&mut self, count: u64) {
         let Some(state) = self.state.as_mut() else {
             return;
@@ -1157,12 +1384,13 @@ pub fn performance_measurement_report_json(report: &PerformanceMeasurementReport
         .iter()
         .map(|declaration| {
             format!(
-                "{{\"module\":\"{}\",\"declaration_index\":{},\"declaration\":\"{}\",\"term_nodes\":{},\"elaboration_elapsed_ns\":{}}}",
+                "{{\"module\":\"{}\",\"declaration_index\":{},\"declaration\":\"{}\",\"term_nodes\":{},\"elaboration_elapsed_ns\":{},\"kernel\":{}}}",
                 json_escape(&declaration.module),
                 declaration.declaration_index,
                 json_escape(&declaration.declaration),
                 declaration.term_nodes,
-                declaration.elaboration_elapsed_ns
+                declaration.elaboration_elapsed_ns,
+                accepted_kernel_json(declaration.kernel.as_ref()),
             )
         })
         .collect::<Vec<_>>()
@@ -1265,6 +1493,86 @@ pub fn performance_measurement_report_json(report: &PerformanceMeasurementReport
         report.clock.source,
         report.clock.resolution_ns,
         report.clock.coarse_stage_reads,
+    )
+}
+
+fn accepted_kernel_json(measurement: Option<&PerformanceAcceptedKernelMeasurement>) -> String {
+    measurement.map_or_else(
+        || "null".to_owned(),
+        |measurement| {
+            format!(
+                "{{\"subsystem\":\"{}\",\"outcome\":\"{}\",\"fuel\":{},\"work\":{},\"retained_delta_constants\":{},\"overflowed\":{}}}",
+                measurement.subsystem.as_str(),
+                measurement.outcome.as_str(),
+                kernel_fuel_totals_json(&measurement.fuel),
+                kernel_work_json(&measurement.work),
+                kernel_delta_hotset_json(&measurement.retained_delta_constants),
+                measurement.overflowed,
+            )
+        },
+    )
+}
+
+fn kernel_fuel_totals_json(fuel: &PerformanceKernelFuelTotals) -> String {
+    format!(
+        "{{\"whnf\":{},\"conversion\":{}}}",
+        kernel_fuel_domain_json(&fuel.whnf),
+        kernel_fuel_domain_json(&fuel.conversion),
+    )
+}
+
+fn kernel_fuel_domain_json(fuel: &PerformanceKernelFuelDomainTotals) -> String {
+    format!(
+        "{{\"calls\":{},\"logical_spent\":{},\"successful_operation_fuel\":{},\"exhausted_operation_fuel\":{},\"overflowed\":{}}}",
+        fuel.calls,
+        fuel.logical_spent,
+        fuel.successful_operation_fuel,
+        fuel.exhausted_operation_fuel,
+        fuel.overflowed,
+    )
+}
+
+fn kernel_work_json(work: &PerformanceKernelWork) -> String {
+    format!(
+        "{{\"check_calls\":{},\"infer_calls\":{},\"whnf_calls\":{},\"defeq_calls\":{},\"quick_equality_hits\":{},\"beta_steps\":{},\"delta_steps\":{},\"iota_steps\":{},\"zeta_steps\":{},\"physical_reductions\":{},\"overflowed\":{}}}",
+        work.check_calls,
+        work.infer_calls,
+        work.whnf_calls,
+        work.defeq_calls,
+        work.quick_equality_hits,
+        work.beta_steps,
+        work.delta_steps,
+        work.iota_steps,
+        work.zeta_steps,
+        work.physical_reductions,
+        work.overflowed,
+    )
+}
+
+fn kernel_delta_hotset_json(summary: &PerformanceKernelDeltaHotsetSummary) -> String {
+    let entries = summary
+        .entries
+        .iter()
+        .map(|entry| {
+            format!(
+                "{{\"constant\":\"{}\",\"count\":{}}}",
+                json_escape(&entry.constant),
+                entry.count,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "{{\"retained_names\":{},\"capacity\":{},\"entries\":[{}],\"emitted\":{},\"entry_limit\":{},\"unretained_name_observations\":{},\"overlong_name_observations\":{},\"output_truncated\":{},\"overflowed\":{}}}",
+        summary.retained_names,
+        summary.capacity,
+        entries,
+        summary.emitted,
+        summary.entry_limit,
+        summary.unretained_name_observations,
+        summary.overlong_name_observations,
+        summary.output_truncated,
+        summary.overflowed,
     )
 }
 
@@ -1379,6 +1687,7 @@ mod tests {
         assert!(recorder.start_timer().is_none());
         recorder.add_counter(PerformanceMeasurementLabel::CandidateSubmitted, 1);
         recorder.record_module(module("B"));
+        recorder.record_declaration_batch(1, true, vec![declaration("B", 0, None)]);
         assert!(recorder.state.is_none());
         assert!(recorder.report().is_none());
     }
@@ -1394,12 +1703,19 @@ mod tests {
             execution_elapsed_ns: 1,
             outcome: PerformanceCandidateOutcome::Accepted,
         });
+        recorder.record_declaration_batch(1, false, vec![declaration("A", 0, None)]);
         let report = recorder.report().unwrap();
         assert!(report.modules.is_empty());
+        assert!(report.declarations.is_empty());
         assert!(report.candidates.is_empty());
         assert_eq!(report.module_details, PerformanceDetailCounts::default());
+        assert_eq!(
+            report.declaration_details,
+            PerformanceDetailCounts::default()
+        );
         assert_eq!(report.candidate_details, PerformanceDetailCounts::default());
         assert!(!report.detail_truncated);
+        assert!(!report.overflowed);
     }
 
     #[test]
@@ -1424,6 +1740,170 @@ mod tests {
         );
         assert_eq!(report.candidate_details.omitted, 4);
         assert!(report.detail_truncated);
+    }
+
+    #[test]
+    fn declaration_batch_carries_module_omissions_without_double_counting() {
+        let mut recorder =
+            PerformanceMeasurementRecorder::new(PerformanceMeasurementMode::Detailed);
+        recorder.record_declaration_batch(
+            3,
+            false,
+            vec![declaration("M", 0, None), declaration("M", 1, None)],
+        );
+
+        let report = recorder.report().unwrap();
+        assert_eq!(report.declarations.len(), 2);
+        assert_eq!(
+            report.declaration_details,
+            PerformanceDetailCounts {
+                attempted: 3,
+                retained: 2,
+                omitted: 1,
+            }
+        );
+        assert!(report.detail_truncated);
+        assert!(!report.overflowed);
+    }
+
+    #[test]
+    fn declaration_batch_duplicate_keys_remain_unique_without_losing_attempts() {
+        let mut first = declaration("M", 0, None);
+        first.term_nodes = 1;
+        let mut replacement = declaration("M", 0, None);
+        replacement.term_nodes = 2;
+        let mut recorder =
+            PerformanceMeasurementRecorder::new(PerformanceMeasurementMode::Detailed);
+        recorder.record_declaration_batch(2, false, vec![first, replacement]);
+
+        let report = recorder.report().unwrap();
+        assert_eq!(report.declarations.len(), 1);
+        assert_eq!(report.declarations[0].term_nodes, 2);
+        assert_eq!(report.declaration_details.attempted, 2);
+        assert_eq!(report.declaration_details.retained, 1);
+        assert_eq!(report.declaration_details.omitted, 1);
+        assert!(!report.overflowed);
+    }
+
+    #[test]
+    fn declaration_batches_reapply_the_global_canonical_cap() {
+        let mut recorder =
+            PerformanceMeasurementRecorder::new(PerformanceMeasurementMode::Detailed);
+        let later = (0..1_025)
+            .map(|index| declaration("Z", index, None))
+            .collect();
+        let earlier = (0..1_025)
+            .map(|index| declaration("A", index, None))
+            .collect();
+        recorder.record_declaration_batch(1_025, false, later);
+        recorder.record_declaration_batch(1_025, false, earlier);
+
+        let report = recorder.report().unwrap();
+        assert_eq!(
+            report.declarations.len(),
+            PERFORMANCE_DECLARATION_DETAIL_LIMIT
+        );
+        assert_eq!(report.declaration_details.attempted, 2_050);
+        assert_eq!(report.declaration_details.omitted, 2);
+        assert_eq!(report.declarations.first().unwrap().module, "A");
+        assert_eq!(report.declarations.first().unwrap().declaration_index, 0);
+        assert_eq!(report.declarations.last().unwrap().module, "Z");
+        assert_eq!(report.declarations.last().unwrap().declaration_index, 1_022);
+        assert!(report.detail_truncated);
+    }
+
+    #[test]
+    fn declaration_batch_invalid_attempts_and_saturation_propagate_overflow() {
+        let mut recorder =
+            PerformanceMeasurementRecorder::new(PerformanceMeasurementMode::Detailed);
+        recorder.record_declaration_batch(0, false, vec![declaration("M", 0, None)]);
+        let report = recorder.report().unwrap();
+        assert_eq!(report.declaration_details.attempted, 1);
+        assert!(report.overflowed);
+
+        let mut recorder =
+            PerformanceMeasurementRecorder::new(PerformanceMeasurementMode::Detailed);
+        recorder.record_declaration_batch(u64::MAX, false, Vec::new());
+        recorder.record_declaration_batch(1, false, Vec::new());
+        let report = recorder.report().unwrap();
+        assert_eq!(report.declaration_details.attempted, u64::MAX);
+        assert!(report.overflowed);
+
+        let mut recorder = PerformanceMeasurementRecorder::new(PerformanceMeasurementMode::Summary);
+        recorder.record_declaration_batch(0, true, Vec::new());
+        let report = recorder.report().unwrap();
+        assert_eq!(
+            report.declaration_details,
+            PerformanceDetailCounts::default()
+        );
+        assert!(report.overflowed);
+    }
+
+    #[test]
+    fn declaration_kernel_json_is_nullable_strict_and_stably_ordered() {
+        let mut recorder =
+            PerformanceMeasurementRecorder::new(PerformanceMeasurementMode::Detailed);
+        recorder.record_declaration_batch(
+            2,
+            false,
+            vec![
+                declaration("M", 1, Some(accepted_kernel_with_empty_hotset())),
+                declaration("M", 0, None),
+            ],
+        );
+        let report = recorder.report().unwrap();
+        assert_eq!(report.schema, PERFORMANCE_MEASUREMENTS_SCHEMA_V0_3);
+
+        let json = performance_measurement_report_json(&report);
+        let expected_declarations = concat!(
+            "\"declarations\":[",
+            "{\"module\":\"M\",\"declaration_index\":0,\"declaration\":\"M.d0\",\"term_nodes\":1,\"elaboration_elapsed_ns\":2,\"kernel\":null},",
+            "{\"module\":\"M\",\"declaration_index\":1,\"declaration\":\"M.d1\",\"term_nodes\":1,\"elaboration_elapsed_ns\":2,\"kernel\":",
+            "{\"subsystem\":\"fast_kernel\",\"outcome\":\"accepted\",\"fuel\":",
+            "{\"whnf\":{\"calls\":1,\"logical_spent\":10,\"successful_operation_fuel\":10,\"exhausted_operation_fuel\":0,\"overflowed\":false},",
+            "\"conversion\":{\"calls\":2,\"logical_spent\":20,\"successful_operation_fuel\":20,\"exhausted_operation_fuel\":0,\"overflowed\":false}},",
+            "\"work\":{\"check_calls\":1,\"infer_calls\":2,\"whnf_calls\":3,\"defeq_calls\":4,\"quick_equality_hits\":5,\"beta_steps\":6,\"delta_steps\":0,\"iota_steps\":7,\"zeta_steps\":8,\"physical_reductions\":21,\"overflowed\":false},",
+            "\"retained_delta_constants\":{\"retained_names\":0,\"capacity\":256,\"entries\":[],\"emitted\":0,\"entry_limit\":16,\"unretained_name_observations\":0,\"overlong_name_observations\":0,\"output_truncated\":false,\"overflowed\":false},",
+            "\"overflowed\":false}}]"
+        );
+        assert!(json.starts_with("{\"schema\":\"npa.performance.measurements.v0.3\""));
+        assert!(json.contains(expected_declarations), "{json}");
+    }
+
+    #[test]
+    fn accepted_kernel_adapter_requires_strict_discriminants_and_keeps_empty_hotset() {
+        let options = npa_frontend::HumanCompileOptions {
+            kernel_fuel_report: npa_frontend::HumanKernelFuelReportMode::Detailed,
+            ..npa_frontend::HumanCompileOptions::default()
+        };
+        let observed = npa_frontend::compile_human_source_to_observed_built_certificate_only_with_available_import_refs(
+            npa_frontend::FileId(0),
+            npa_cert::Name::from_dotted("Measured"),
+            "axiom A : Type",
+            &[],
+            &[],
+            &[],
+            &options,
+            None,
+            true,
+        )
+        .unwrap();
+        let frontend = observed.observations.declarations[0]
+            .kernel
+            .as_ref()
+            .unwrap();
+        let accepted = PerformanceAcceptedKernelMeasurement::from_frontend(frontend).unwrap();
+
+        assert_eq!(accepted.subsystem, PerformanceKernelSubsystem::FastKernel);
+        assert_eq!(accepted.outcome, PerformanceAcceptedKernelOutcome::Accepted);
+        assert!(accepted.retained_delta_constants.entries.is_empty());
+        assert_eq!(accepted.retained_delta_constants.retained_names, 0);
+        assert_eq!(accepted.retained_delta_constants.emitted, 0);
+        assert_eq!(accepted.overflowed, frontend.overflowed);
+
+        let mut invalid = frontend.clone();
+        invalid.outcome = "rejected".to_owned();
+        assert!(PerformanceAcceptedKernelMeasurement::from_frontend(&invalid).is_none());
     }
 
     #[test]
@@ -1485,7 +1965,7 @@ mod tests {
         assert!(report.overflowed);
         assert_eq!(report.counters[0].value, u64::MAX);
         let json = performance_measurement_report_json(&report);
-        assert!(json.starts_with("{\"schema\":\"npa.performance.measurements.v0.2\""));
+        assert!(json.starts_with("{\"schema\":\"npa.performance.measurements.v0.3\""));
         assert!(json.contains("\"trusted\":false,\"proof_evidence\":false"));
         assert!(json.contains("\"overflowed\":true"));
     }
@@ -1695,6 +2175,69 @@ mod tests {
         assert!(report.counters.iter().any(|counter| {
             counter.label == PerformanceMeasurementLabel::KernelMemoProbeLookups
         }));
+    }
+
+    fn declaration(
+        module: &str,
+        declaration_index: u64,
+        kernel: Option<PerformanceAcceptedKernelMeasurement>,
+    ) -> PerformanceDeclarationMeasurement {
+        PerformanceDeclarationMeasurement {
+            module: module.to_owned(),
+            declaration_index,
+            declaration: format!("{module}.d{declaration_index}"),
+            term_nodes: 1,
+            elaboration_elapsed_ns: 2,
+            kernel,
+        }
+    }
+
+    fn accepted_kernel_with_empty_hotset() -> PerformanceAcceptedKernelMeasurement {
+        PerformanceAcceptedKernelMeasurement {
+            subsystem: PerformanceKernelSubsystem::FastKernel,
+            outcome: PerformanceAcceptedKernelOutcome::Accepted,
+            fuel: PerformanceKernelFuelTotals {
+                whnf: PerformanceKernelFuelDomainTotals {
+                    calls: 1,
+                    logical_spent: 10,
+                    successful_operation_fuel: 10,
+                    exhausted_operation_fuel: 0,
+                    overflowed: false,
+                },
+                conversion: PerformanceKernelFuelDomainTotals {
+                    calls: 2,
+                    logical_spent: 20,
+                    successful_operation_fuel: 20,
+                    exhausted_operation_fuel: 0,
+                    overflowed: false,
+                },
+            },
+            work: PerformanceKernelWork {
+                check_calls: 1,
+                infer_calls: 2,
+                whnf_calls: 3,
+                defeq_calls: 4,
+                quick_equality_hits: 5,
+                beta_steps: 6,
+                delta_steps: 0,
+                iota_steps: 7,
+                zeta_steps: 8,
+                physical_reductions: 21,
+                overflowed: false,
+            },
+            retained_delta_constants: PerformanceKernelDeltaHotsetSummary {
+                retained_names: 0,
+                capacity: 256,
+                entries: Vec::new(),
+                emitted: 0,
+                entry_limit: 16,
+                unretained_name_observations: 0,
+                overlong_name_observations: 0,
+                output_truncated: false,
+                overflowed: false,
+            },
+            overflowed: false,
+        }
     }
 
     fn module(name: &str) -> PerformanceModuleMeasurement {

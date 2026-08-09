@@ -1089,9 +1089,8 @@ fn append_surface_inductive(
 
 fn human_item_name(item: &HumanItem) -> Option<String> {
     match item {
-        HumanItem::Def(declaration) | HumanItem::Theorem(declaration) => {
-            Some(declaration.name.as_dotted())
-        }
+        HumanItem::Def(definition) => Some(definition.declaration.name.as_dotted()),
+        HumanItem::Theorem(declaration) => Some(declaration.name.as_dotted()),
         HumanItem::Inductive(declaration) => Some(declaration.name.as_dotted()),
         _ => None,
     }

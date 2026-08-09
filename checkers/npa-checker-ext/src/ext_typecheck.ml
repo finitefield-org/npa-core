@@ -1145,10 +1145,13 @@ let declaration_universe_constraints payload =
 
 let check_dependency section offset env (dependency : Ext_cert.dependency_entry) =
   bind
-    (resolve_signature section offset env dependency.Ext_cert.dependency_global_ref)
+    (resolve_signature section offset env
+       (Ext_cert.dependency_global_ref dependency))
     (fun signature ->
       match signature.Ext_env.signature_decl_interface_hash with
-      | Some hash when hash = dependency.Ext_cert.dependency_decl_interface_hash -> Ok ()
+      | Some hash
+        when hash = Ext_cert.dependency_decl_interface_hash dependency ->
+          Ok ()
       | _ -> error section offset Type_mismatch)
 
 let rec check_dependencies section offset env dependencies =
@@ -1158,8 +1161,10 @@ let rec check_dependencies section offset env dependencies =
       bind (check_dependency section offset env dependency) (fun () ->
           check_dependencies section offset env rest)
 
-let add_checked_declaration env declaration =
-  match Ext_env.add_checked_declaration env declaration with
+let add_checked_declaration ?(local_opaque_transparency = false) env declaration =
+  match
+    Ext_env.add_checked_declaration ~local_opaque_transparency env declaration
+  with
   | Ok env -> Ok env
   | Error env_error -> error_of_env_error env_error
 
@@ -3602,7 +3607,8 @@ let check_inductive_declaration universe_context env
                                               | Ok () -> Ok checked_env)))))))))))
   | _ -> error section offset Unsupported_declaration
 
-let check_declaration env (declaration : Ext_cert.declaration) =
+let check_declaration ~local_opaque_transparency env
+    (declaration : Ext_cert.declaration) =
   let section = Ext_bytes.Declarations in
   let offset = declaration.Ext_cert.offset in
   bind
@@ -3621,7 +3627,9 @@ let check_declaration env (declaration : Ext_cert.declaration) =
                   bind
                     (expect_sort ~section ~offset ~delta ~universe_context env
                        empty_context decl_ty)
-                    (fun _ -> add_checked_declaration env declaration)
+                    (fun _ ->
+                      add_checked_declaration ~local_opaque_transparency env
+                        declaration)
               | Ext_cert.DefDecl { decl_ty; decl_value; _ } ->
                   bind
                     (expect_sort ~section ~offset ~delta ~universe_context env
@@ -3630,7 +3638,9 @@ let check_declaration env (declaration : Ext_cert.declaration) =
                       bind
                         (check ~section ~offset ~delta ~universe_context env
                            empty_context decl_value decl_ty)
-                        (fun () -> add_checked_declaration env declaration))
+                        (fun () ->
+                          add_checked_declaration ~local_opaque_transparency env
+                            declaration))
               | Ext_cert.TheoremDecl { decl_ty; decl_proof; _ } ->
                   bind
                     (expect_sort ~section ~offset ~delta ~universe_context env
@@ -3639,22 +3649,31 @@ let check_declaration env (declaration : Ext_cert.declaration) =
                       bind
                         (check ~section ~offset ~delta ~universe_context env
                            empty_context decl_proof decl_ty)
-                        (fun () -> add_checked_declaration env declaration))
+                        (fun () ->
+                          add_checked_declaration ~local_opaque_transparency env
+                            declaration))
               | Ext_cert.InductiveDecl _ ->
                   check_inductive_declaration universe_context env declaration
               | Ext_cert.MutualInductiveBlockDecl _ ->
                   check_mutual_inductive_declaration universe_context env
                     declaration)
 
-let check_declarations ?(env = Ext_env.empty) declarations =
+let check_declarations ?(env = Ext_env.empty)
+    ?(local_opaque_transparency = false) declarations =
   let rec loop current_env remaining =
     match remaining with
     | [] -> Ok current_env
     | declaration :: rest ->
-        bind (check_declaration current_env declaration) (fun next_env ->
+        bind
+          (check_declaration ~local_opaque_transparency current_env declaration)
+          (fun next_env ->
             loop next_env rest)
   in
   loop env declarations
 
 let check_certificate env (certificate : Ext_cert.decoded_module) =
-  check_declarations ~env certificate.Ext_cert.declaration_table
+  let local_opaque_transparency =
+    certificate.Ext_cert.header.Ext_cert.version = Ext_cert.Current
+  in
+  check_declarations ~env ~local_opaque_transparency
+    certificate.Ext_cert.declaration_table

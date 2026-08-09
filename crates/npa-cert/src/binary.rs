@@ -3,20 +3,48 @@ use crate::*;
 const MODULE_HASH_TRAILER_LEN: usize = 32 * 3;
 const CORE_FEATURE_REPORT_TAG: &str = "core_features";
 
+pub(crate) fn decode_module_cert_header(bytes: &[u8]) -> Result<CertHeader> {
+    let mut decoder = Decoder::new(bytes);
+    let header = decoder.header()?;
+    certificate_format_version(&header)?;
+    Ok(header)
+}
+
 pub(crate) fn encode_module_cert_full_for_header(cert: &ModuleCert) -> Result<Vec<u8>> {
     let version = certificate_format_version(&cert.header)?;
+    ensure_dependency_layout_supported(cert, version)?;
     Ok(encode_module_cert_with_format(cert, version, true))
 }
 
-pub(crate) fn encode_module_cert_without_certificate_hash(cert: &ModuleCert) -> Vec<u8> {
-    encode_module_cert_with_format(cert, CertificateFormatVersion::Current, false)
+pub(crate) fn encode_module_cert_without_certificate_hash_v0_2_compat(
+    cert: &ModuleCert,
+) -> Vec<u8> {
+    encode_module_cert_with_format(cert, CertificateFormatVersion::V0_2_0, false)
 }
 
 pub(crate) fn encode_module_cert_without_certificate_hash_for_header(
     cert: &ModuleCert,
 ) -> Result<Vec<u8>> {
     let version = certificate_format_version(&cert.header)?;
+    ensure_dependency_layout_supported(cert, version)?;
     Ok(encode_module_cert_with_format(cert, version, false))
+}
+
+fn ensure_dependency_layout_supported(
+    cert: &ModuleCert,
+    version: CertificateFormatVersion,
+) -> Result<()> {
+    if !version.encodes_tagged_dependencies()
+        && cert.declarations.iter().any(|declaration| {
+            declaration
+                .dependencies
+                .iter()
+                .any(|dependency| dependency.kind() == DependencyEntryKind::LocalImplementation)
+        })
+    {
+        return Err(CertError::LocalImplementationDependencyRequiresFormatUpgrade);
+    }
+    Ok(())
 }
 
 fn encode_module_cert_with_format(
@@ -30,7 +58,7 @@ fn encode_module_cert_with_format(
     encode_name_table_to(&mut out, &cert.name_table);
     encode_level_table_to(&mut out, &cert.level_table);
     encode_term_table_to(&mut out, &cert.term_table);
-    encode_declarations_to(&mut out, &cert.declarations);
+    encode_declarations_to(&mut out, &cert.declarations, version);
     out.extend(encode_export_block_with_format(&cert.export_block, version));
     out.extend(encode_axiom_report(&cert.axiom_report));
     encode_hash_to(&mut out, &cert.hashes.export_hash);
@@ -132,11 +160,15 @@ fn encode_term_table_to(out: &mut Vec<u8>, terms: &[TermNode]) {
     }
 }
 
-fn encode_declarations_to(out: &mut Vec<u8>, declarations: &[DeclCert]) {
+fn encode_declarations_to(
+    out: &mut Vec<u8>,
+    declarations: &[DeclCert],
+    version: CertificateFormatVersion,
+) {
     encode_uvar_to(out, declarations.len() as u64);
     for decl in declarations {
         encode_decl_payload_to(out, &decl.decl);
-        encode_dependency_entries_to(out, &decl.dependencies);
+        encode_dependency_entries_with_format_to(out, &decl.dependencies, version);
         encode_axiom_refs_to(out, &decl.axiom_dependencies);
         encode_hash_to(out, &decl.hashes.decl_interface_hash);
         encode_hash_to(out, &decl.hashes.decl_certificate_hash);
@@ -370,15 +402,15 @@ fn encode_universe_constraint_specs_to(out: &mut Vec<u8>, constraints: &[Univers
 }
 
 pub(crate) fn encode_export_block(block: &ExportBlock) -> Vec<u8> {
-    encode_export_block_with_format(block, CertificateFormatVersion::Current)
+    encode_export_block_with_format(block, CertificateFormatVersion::V0_2_0)
 }
 
 pub(crate) fn encode_export_block_legacy(block: &ExportBlock) -> Vec<u8> {
-    encode_export_block_with_format(block, CertificateFormatVersion::Legacy)
+    encode_export_block_with_format(block, CertificateFormatVersion::V0_1)
 }
 
 pub(crate) fn encode_export_block_previous(block: &ExportBlock) -> Vec<u8> {
-    encode_export_block_with_format(block, CertificateFormatVersion::Previous)
+    encode_export_block_with_format(block, CertificateFormatVersion::V0_1_2)
 }
 
 fn encode_export_block_with_format(
@@ -435,8 +467,31 @@ pub(crate) fn encode_axiom_report(report: &AxiomReport) -> Vec<u8> {
 pub(crate) fn encode_dependency_entries_to(out: &mut Vec<u8>, deps: &[DependencyEntry]) {
     encode_uvar_to(out, deps.len() as u64);
     for dep in deps {
-        encode_global_ref_to(out, &dep.global_ref);
-        encode_hash_to(out, &dep.decl_interface_hash);
+        encode_global_ref_to(out, dep.global_ref());
+        encode_hash_to(out, &dep.decl_interface_hash());
+    }
+}
+
+pub(crate) fn encode_dependency_entries_with_format_to(
+    out: &mut Vec<u8>,
+    deps: &[DependencyEntry],
+    version: CertificateFormatVersion,
+) {
+    if !version.encodes_tagged_dependencies() {
+        encode_dependency_entries_to(out, deps);
+        return;
+    }
+    encode_uvar_to(out, deps.len() as u64);
+    for dep in deps {
+        out.push(match dep.kind() {
+            DependencyEntryKind::Interface => 0x00,
+            DependencyEntryKind::LocalImplementation => 0x01,
+        });
+        encode_global_ref_to(out, dep.global_ref());
+        encode_hash_to(out, &dep.decl_interface_hash());
+        if let Some(decl_certificate_hash) = dep.decl_certificate_hash() {
+            encode_hash_to(out, &decl_certificate_hash);
+        }
     }
 }
 
@@ -635,7 +690,7 @@ impl<'a> Decoder<'a> {
         let name_table = self.name_table()?;
         let level_table = self.level_table()?;
         let term_table = self.term_table()?;
-        let declarations = self.declarations()?;
+        let declarations = self.declarations(version)?;
         let export_block = self.export_block(version)?;
         let mut axiom_report = self.axiom_report()?;
         if self.has_core_feature_report() {
@@ -744,12 +799,12 @@ impl<'a> Decoder<'a> {
         })
     }
 
-    fn declarations(&mut self) -> Result<Vec<DeclCert>> {
+    fn declarations(&mut self, version: CertificateFormatVersion) -> Result<Vec<DeclCert>> {
         let len = self.bounded_len_for(StructuralLimitKind::Declarations, MAX_DECLARATIONS)?;
         self.collect_n(len, |decoder| {
             Ok(DeclCert {
                 decl: decoder.decl_payload()?,
-                dependencies: decoder.dependency_entries()?,
+                dependencies: decoder.dependency_entries(version)?,
                 axiom_dependencies: decoder.axiom_refs()?,
                 hashes: DeclHashes {
                     decl_interface_hash: decoder.hash()?,
@@ -1051,14 +1106,39 @@ impl<'a> Decoder<'a> {
         Ok(features)
     }
 
-    fn dependency_entries(&mut self) -> Result<Vec<DependencyEntry>> {
+    fn dependency_entries(
+        &mut self,
+        version: CertificateFormatVersion,
+    ) -> Result<Vec<DependencyEntry>> {
         let len = self.bounded_len()?;
-        self.collect_n(len, |decoder| {
-            Ok(DependencyEntry {
-                global_ref: decoder.global_ref()?,
-                decl_interface_hash: decoder.hash()?,
-            })
-        })
+        let entries = self.collect_n(len, |decoder| {
+            if !version.encodes_tagged_dependencies() {
+                return Ok(DependencyEntry::from_decoded_interface(
+                    decoder.global_ref()?,
+                    decoder.hash()?,
+                ));
+            }
+            match decoder.byte()? {
+                0x00 => Ok(DependencyEntry::from_decoded_interface(
+                    decoder.global_ref()?,
+                    decoder.hash()?,
+                )),
+                0x01 => Ok(DependencyEntry::from_decoded_local_implementation(
+                    decoder.global_ref()?,
+                    decoder.hash()?,
+                    decoder.hash()?,
+                )),
+                tag => Err(CertError::UnsupportedEncoding { tag }),
+            }
+        })?;
+        if version.encodes_tagged_dependencies()
+            && entries.windows(2).any(|pair| pair[0] >= pair[1])
+        {
+            return Err(CertError::NonCanonicalEncoding {
+                object: "Dependencies",
+            });
+        }
+        Ok(entries)
     }
 
     fn axiom_refs(&mut self) -> Result<Vec<AxiomRef>> {

@@ -1230,7 +1230,7 @@ fn declaration_closure(
         for global in declaration
             .dependencies
             .iter()
-            .map(|dependency| &dependency.global_ref)
+            .map(|dependency| dependency.global_ref())
             .chain(
                 declaration
                     .axiom_dependencies

@@ -30,10 +30,10 @@ pub const REFERENCE_CHECKER_ID: &str = "npa-checker-ref";
 pub const REFERENCE_CHECKER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Canonical certificate format tag accepted by the reference checker.
-pub const REFERENCE_CERTIFICATE_FORMAT: &str = "NPA-CERT-0.2.0";
+pub const REFERENCE_CERTIFICATE_FORMAT: &str = "NPA-CERT-0.3.0";
 
 /// Canonical core spec tag accepted by the reference checker.
-pub const REFERENCE_CORE_SPEC: &str = "NPA-Core-0.2.0";
+pub const REFERENCE_CORE_SPEC: &str = "NPA-Core-0.3.0";
 
 /// Return the deterministic logical build identity used by the standalone checker.
 ///
@@ -51,12 +51,15 @@ pub fn reference_checker_build_hash() -> ReferenceHash {
     hash
 }
 
+pub(crate) const REFERENCE_COMPAT_CERTIFICATE_FORMAT: &str = "NPA-CERT-0.2.0";
+pub(crate) const REFERENCE_COMPAT_CORE_SPEC: &str = "NPA-Core-0.2.0";
 pub(crate) const REFERENCE_PREVIOUS_CERTIFICATE_FORMAT: &str = "NPA-CERT-0.1.2";
 pub(crate) const REFERENCE_PREVIOUS_CORE_SPEC: &str = "NPA-Core-0.1.2";
 pub(crate) const REFERENCE_LEGACY_CERTIFICATE_FORMAT: &str = "NPA-CERT-0.1";
 pub(crate) const REFERENCE_LEGACY_CORE_SPEC: &str = "NPA-Core-0.1";
 pub(crate) const REFERENCE_MODULE_EXPORT_DOMAIN: &[u8] = b"NPA-MODULE-EXPORT-0.2.0";
-pub(crate) const REFERENCE_MODULE_CERT_DOMAIN: &[u8] = b"NPA-MODULE-CERT-0.2.0";
+pub(crate) const REFERENCE_MODULE_CERT_DOMAIN: &[u8] = b"NPA-MODULE-CERT-0.3.0";
+pub(crate) const REFERENCE_COMPAT_MODULE_CERT_DOMAIN: &[u8] = b"NPA-MODULE-CERT-0.2.0";
 pub(crate) const REFERENCE_PREVIOUS_MODULE_EXPORT_DOMAIN: &[u8] = b"NPA-MODULE-EXPORT-0.1.2";
 pub(crate) const REFERENCE_PREVIOUS_MODULE_CERT_DOMAIN: &[u8] = b"NPA-MODULE-CERT-0.1.2";
 pub(crate) const REFERENCE_LEGACY_MODULE_EXPORT_DOMAIN: &[u8] = b"NPA-MODULE-EXPORT-0.1";
@@ -65,6 +68,7 @@ pub(crate) const REFERENCE_LEGACY_MODULE_CERT_DOMAIN: &[u8] = b"NPA-MODULE-CERT-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ReferenceCertificateFormatVersion {
     Current,
+    Compatibility,
     Previous,
     Legacy,
 }
@@ -72,6 +76,10 @@ pub(crate) enum ReferenceCertificateFormatVersion {
 impl ReferenceCertificateFormatVersion {
     pub(crate) fn encodes_export_universe_constraints(self) -> bool {
         self != Self::Legacy
+    }
+
+    pub(crate) fn encodes_tagged_dependencies(self) -> bool {
+        self == Self::Current
     }
 }
 
@@ -696,6 +704,8 @@ pub struct ReferenceCheckerPolicy {
     pub deny_sorry: bool,
     /// Reject every custom axiom not explicitly allowed by the policy.
     pub deny_custom_axioms: bool,
+    /// Allow checker-defined standard axiom exceptions without an explicit allowlist entry.
+    pub allow_standard_axiom_exceptions: bool,
     /// Core feature profiles supported by this checker run.
     pub supported_core_features: Vec<ReferenceCoreFeature>,
 }
@@ -707,6 +717,7 @@ impl Default for ReferenceCheckerPolicy {
             allowed_axioms: Vec::new(),
             deny_sorry: true,
             deny_custom_axioms: false,
+            allow_standard_axiom_exceptions: true,
             supported_core_features: Vec::new(),
         }
     }
@@ -764,6 +775,8 @@ impl ReferenceCheckResult {
 /// Accepted module summary produced by the reference checker.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReferenceCheckedModule {
+    certificate_format: String,
+    core_spec: String,
     module: ReferenceModuleName,
     export_hash: ReferenceHash,
     axiom_report_hash: ReferenceHash,
@@ -777,6 +790,8 @@ pub struct ReferenceCheckedModule {
 
 impl ReferenceCheckedModule {
     pub(crate) fn new(
+        certificate_format: String,
+        core_spec: String,
         identity: ReferenceModuleIdentity,
         declaration_count: usize,
         public_environment: Arc<ReferencePublicEnvironment>,
@@ -790,6 +805,8 @@ impl ReferenceCheckedModule {
             certificate_hash,
         } = identity;
         Self {
+            certificate_format,
+            core_spec,
             module,
             export_hash,
             axiom_report_hash,
@@ -805,6 +822,8 @@ impl ReferenceCheckedModule {
     #[cfg(test)]
     pub(crate) fn from_import_entry(entry: ReferenceImportEntry) -> Self {
         Self::new(
+            REFERENCE_COMPAT_CERTIFICATE_FORMAT.to_owned(),
+            REFERENCE_COMPAT_CORE_SPEC.to_owned(),
             ReferenceModuleIdentity::new(
                 entry.module,
                 entry.export_hash,
@@ -816,6 +835,16 @@ impl ReferenceCheckedModule {
             entry.structural_cost,
             entry.structural_closure.unwrap_or_default(),
         )
+    }
+
+    /// Returns the exact certificate-format tag of the accepted input.
+    pub fn certificate_format(&self) -> &str {
+        &self.certificate_format
+    }
+
+    /// Returns the exact core-spec tag of the accepted input.
+    pub fn core_spec(&self) -> &str {
+        &self.core_spec
     }
 
     fn into_import_entry(self) -> ReferenceImportEntry {
@@ -1328,11 +1357,40 @@ pub enum ReferenceCheckReason {
     SorryDenied,
     /// A custom axiom was not in the exact allowlist or standard exception set.
     ForbiddenAxiom,
+    /// A local-implementation edge did not use a plain local declaration reference.
+    WrongReferenceKind,
+    /// A local-implementation edge did not target an earlier declaration.
+    TargetNotEarlier,
+    /// A local-implementation edge did not target an opaque definition.
+    TargetNotOpaque,
+    /// A local-implementation edge carried the wrong declaration-interface hash.
+    InterfaceHashMismatch,
+    /// A local-implementation edge carried the wrong declaration-certificate hash.
+    CertificateHashMismatch,
+    /// The independently recomputed transparency closure required a missing edge.
+    MissingImplementationDependency,
+    /// A local-implementation edge was outside the independently recomputed closure.
+    SurplusImplementationDependency,
     /// The P8H-03 decoder/hash verifier intentionally has no semantic checker body.
     ReferenceCheckerBodyUnimplemented,
 }
 
 impl ReferenceCheckError {
+    pub(crate) fn local_implementation_dependency(
+        section: ReferenceCertificateSection,
+        offset: usize,
+        reason: ReferenceCheckReason,
+    ) -> Self {
+        Self {
+            kind: ReferenceCheckErrorKind::AxiomReportMismatch,
+            section,
+            offset,
+            reason: Some(reason),
+            reference: None,
+            structural_limit: None,
+        }
+    }
+
     pub(crate) fn axiom_report(section: ReferenceCertificateSection, offset: usize) -> Self {
         Self {
             kind: ReferenceCheckErrorKind::AxiomReportMismatch,
@@ -1503,7 +1561,7 @@ mod tests {
     use crate::decode::{ReferenceUniverseConstraint, ReferenceUniverseContext};
     use npa_cert::{
         build_module_cert, build_module_cert_from_import_refs_with_preferred_imports,
-        encode_module_cert, generate_inductive_artifacts_v1,
+        decode_module_cert, encode_module_cert, generate_inductive_artifacts_v1,
         generate_mutual_inductive_artifacts_v1, verify_module_cert,
         verify_module_cert_with_import_refs,
         verify_module_cert_with_import_refs_and_kernel_options, AxiomPolicy, CertError, CoreModule,
@@ -1556,7 +1614,11 @@ mod tests {
     }
 
     fn header_bytes_for(module: &[&str]) -> Vec<u8> {
-        header_bytes_for_tags(REFERENCE_CERTIFICATE_FORMAT, REFERENCE_CORE_SPEC, module)
+        header_bytes_for_tags(
+            REFERENCE_COMPAT_CERTIFICATE_FORMAT,
+            REFERENCE_COMPAT_CORE_SPEC,
+            module,
+        )
     }
 
     fn ref_name(name: &str) -> ReferenceModuleName {
@@ -1843,7 +1905,7 @@ mod tests {
     }
 
     fn constrained_axiom_certificate() -> Vec<u8> {
-        let cert = build_module_cert(
+        let cert = npa_cert::build_module_cert_v0_2_compat(
             CoreModule {
                 name: Name::from_dotted("Test.UniverseConstraints"),
                 declarations: vec![Decl::AxiomConstrained {
@@ -2554,7 +2616,7 @@ mod tests {
         append_common_empty_suffix_with_domains(
             bytes,
             REFERENCE_MODULE_EXPORT_DOMAIN,
-            REFERENCE_MODULE_CERT_DOMAIN,
+            REFERENCE_COMPAT_MODULE_CERT_DOMAIN,
         );
     }
 
@@ -2991,7 +3053,7 @@ mod tests {
         let axiom_report_hash = hash_with_domain(b"NPA-AXIOM-REPORT-0.1", &axiom_report);
         bytes.extend(export_hash);
         bytes.extend(axiom_report_hash);
-        let certificate_hash = hash_with_domain(REFERENCE_MODULE_CERT_DOMAIN, &bytes);
+        let certificate_hash = hash_with_domain(REFERENCE_COMPAT_MODULE_CERT_DOMAIN, &bytes);
         bytes.extend(certificate_hash);
 
         DeclarationCertificateFixture { bytes }
@@ -3369,7 +3431,7 @@ mod tests {
         let axiom_report_hash = hash_with_domain(b"NPA-AXIOM-REPORT-0.1", &axiom_report);
         bytes.extend(export_hash);
         bytes.extend(axiom_report_hash);
-        let certificate_hash = hash_with_domain(REFERENCE_MODULE_CERT_DOMAIN, &bytes);
+        let certificate_hash = hash_with_domain(REFERENCE_COMPAT_MODULE_CERT_DOMAIN, &bytes);
         bytes.extend(certificate_hash);
 
         DeclarationCertificateFixture { bytes }
@@ -3558,7 +3620,7 @@ mod tests {
         let axiom_report_hash = hash_with_domain(b"NPA-AXIOM-REPORT-0.1", &axiom_report);
         bytes.extend(export_hash);
         bytes.extend(axiom_report_hash);
-        let certificate_hash = hash_with_domain(REFERENCE_MODULE_CERT_DOMAIN, &bytes);
+        let certificate_hash = hash_with_domain(REFERENCE_COMPAT_MODULE_CERT_DOMAIN, &bytes);
         bytes.extend(certificate_hash);
 
         DeclarationCertificateFixture { bytes }
@@ -3728,7 +3790,7 @@ mod tests {
         let axiom_report_hash_offset = bytes.len();
         bytes.extend(axiom_report_hash);
         let certificate_hash_offset = bytes.len();
-        let certificate_hash = hash_with_domain(REFERENCE_MODULE_CERT_DOMAIN, &bytes);
+        let certificate_hash = hash_with_domain(REFERENCE_COMPAT_MODULE_CERT_DOMAIN, &bytes);
         bytes.extend(certificate_hash);
 
         AxiomCertificateFixture {
@@ -3989,14 +4051,102 @@ mod tests {
         assert!(result.is_checked());
     }
 
+    fn v0_3_opaque_local_equality_certificate() -> Vec<u8> {
+        let cert = build_module_cert_from_import_refs_with_preferred_imports(
+            CoreModule {
+                name: Name::from_dotted("Test.ReferenceOpaqueV03"),
+                declarations: vec![
+                    Decl::Def {
+                        name: "hidden_nat".to_owned(),
+                        universe_params: vec![],
+                        ty: nat(),
+                        value: nat_zero(),
+                        reducibility: Reducibility::Opaque,
+                    },
+                    Decl::Theorem {
+                        name: "hidden_nat_eq_zero".to_owned(),
+                        universe_params: vec![],
+                        ty: eq(
+                            type0(),
+                            nat(),
+                            Expr::konst("hidden_nat", vec![]),
+                            nat_zero(),
+                        ),
+                        proof: eq_refl(type0(), nat(), nat_zero()),
+                    },
+                ],
+            },
+            &[],
+            &BTreeMap::new(),
+        )
+        .expect("v0.3 opaque fixture builds");
+        encode_module_cert(&cert).expect("v0.3 opaque fixture encodes")
+    }
+
+    #[test]
+    fn v0_3_opaque_source_free_bytes_match_fast_verifier_and_reference_checker() {
+        let bytes = v0_3_opaque_local_equality_certificate();
+        let fast = verify_module_cert_with_import_refs(&bytes, &[], &AxiomPolicy::normal())
+            .expect("fast verifier accepts exact v0.3 bytes");
+        let decoded = decode_module_cert(&bytes).expect("the exact v0.3 bytes decode");
+
+        let checked = match check_certificate(
+            &bytes,
+            &ReferenceImportStore::default(),
+            &ReferenceCheckerPolicy::default(),
+        ) {
+            ReferenceCheckResult::Checked(module) => module,
+            ReferenceCheckResult::Rejected(error) => {
+                panic!("reference checker rejected v0.3 fixture: {error:?}")
+            }
+        };
+        assert_eq!(checked.certificate_format(), REFERENCE_CERTIFICATE_FORMAT);
+        assert_eq!(checked.core_spec(), REFERENCE_CORE_SPEC);
+        assert_eq!(checked.declaration_count(), 2);
+        assert_eq!(checked.module().dotted(), fast.module().as_dotted());
+        assert_eq!(*checked.export_hash(), fast.export_hash());
+        assert_eq!(*checked.certificate_hash(), fast.certificate_hash());
+        assert_eq!(
+            *checked.axiom_report_hash(),
+            decoded.hashes.axiom_report_hash
+        );
+    }
+
+    #[test]
+    fn v0_3_opaque_certificate_hash_mutation_is_rejected() {
+        let mut bytes = v0_3_opaque_local_equality_certificate();
+        let last = bytes.last_mut().expect("certificate has a hash trailer");
+        *last ^= 1;
+        let error = verify_certificate_hashes(&bytes).expect_err("mutated v0.3 hash must fail");
+        assert_eq!(error.kind, ReferenceCheckErrorKind::HashMismatch);
+        assert_eq!(
+            error.reason,
+            Some(ReferenceCheckReason::HashMismatch {
+                object: ReferenceHashObject::ModuleCertificate,
+            })
+        );
+    }
+
+    #[test]
+    fn v0_3_opaque_missing_implementation_dependency_uses_fixed_reason() {
+        let bytes = v0_3_opaque_local_equality_certificate();
+        let error = decode::reject_missing_v0_3_implementation_after_hash_check_impl(&bytes);
+        assert_eq!(error.kind, ReferenceCheckErrorKind::AxiomReportMismatch);
+        assert_eq!(
+            error.reason,
+            Some(ReferenceCheckReason::MissingImplementationDependency)
+        );
+        assert_eq!(error.section, ReferenceCertificateSection::Declarations);
+    }
+
     #[test]
     fn decode_valid_golden_certificate_without_source_sections() {
         let cert = empty_module_certificate();
 
         let decoded = decode_certificate(&cert).expect("minimal canonical certificate decodes");
 
-        assert_eq!(decoded.header().format, REFERENCE_CERTIFICATE_FORMAT);
-        assert_eq!(decoded.header().core_spec, REFERENCE_CORE_SPEC);
+        assert_eq!(decoded.header().format, REFERENCE_COMPAT_CERTIFICATE_FORMAT);
+        assert_eq!(decoded.header().core_spec, REFERENCE_COMPAT_CORE_SPEC);
         assert_eq!(decoded.header().module.dotted(), "Std.Nat");
         assert_eq!(decoded.imports_len(), 0);
         assert_eq!(decoded.name_table_len(), 1);
@@ -4037,13 +4187,13 @@ mod tests {
     }
 
     #[test]
-    fn verify_hashes_accepts_current_constrained_public_exports() {
+    fn verify_hashes_accepts_compatibility_constrained_public_exports() {
         let cert = constrained_axiom_certificate();
 
         let decoded = verify_certificate_hashes(&cert).expect("constrained export verifies");
 
-        assert_eq!(decoded.header().format, REFERENCE_CERTIFICATE_FORMAT);
-        assert_eq!(decoded.header().core_spec, REFERENCE_CORE_SPEC);
+        assert_eq!(decoded.header().format, REFERENCE_COMPAT_CERTIFICATE_FORMAT);
+        assert_eq!(decoded.header().core_spec, REFERENCE_COMPAT_CORE_SPEC);
         assert_eq!(decoded.header().module.dotted(), "Test.UniverseConstraints");
         assert_eq!(decoded.export_block_len(), 1);
         assert_ne!(decoded.hashes().export_hash, [0; 32]);
@@ -4051,7 +4201,7 @@ mod tests {
 
     #[test]
     fn verify_hashes_rejects_legacy_constrained_public_exports() {
-        let cert = build_module_cert(
+        let cert = npa_cert::build_module_cert_v0_2_compat(
             CoreModule {
                 name: Name::from_dotted("Test.UniverseConstraints"),
                 declarations: vec![Decl::AxiomConstrained {

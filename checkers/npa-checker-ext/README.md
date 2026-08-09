@@ -4,12 +4,18 @@
 package verification. It is intentionally outside the Cargo workspace and has
 no Rust crate dependency.
 
-Its compatibility axes are independent: the host is `npa-cli 0.7.x` through
-`package_api::v1`, while the checker, `NPA-CERT-0.2.0`, and `NPA-Core-0.2.0`
-remain `0.2.0`. Raw checker and machine results remain v1, package command
-results use `npa.package.command_result.v0.3`, and new generated-artifact
-evidence uses manifest v0.2. A CLI bump does not relabel the checker or proof
-formats.
+Its compatibility axes are independent. The clean-room checker is `0.3.0`,
+advertises `NPA-CERT-0.3.0` / `NPA-Core-0.3.0`, and emits raw checker result
+v2. It also checks exact `0.2.0`, `0.1.2`, and `0.1` compatibility inputs; raw
+v2 reports those actual older input pairs separately from the checker's v0.3
+capability pair.
+
+In raw-result v2, capability fields are always
+`certificate_format = NPA-CERT-0.3.0` and
+`core_spec = NPA-Core-0.3.0`. Once the header pair is decoded,
+`input_certificate_format` and `input_core_spec` record that exact input pair;
+they are not copied from package manifest/lock profiles. A checked result also
+binds `module`, `certificate_hash`, `export_hash`, and `axiom_report_hash`.
 
 This checker is not part of the default public package-author path. Base
 external package verification remains reference-checker-only, with an optional
@@ -119,12 +125,15 @@ or unpinned checker binaries for high-trust evidence.
 
 ## Current Scope
 
-The executable implements the source-free Core v0.2.0 check path and its
-documented v0.1.2 and v0.1 compatibility paths:
+The executable implements the source-free Core v0.3.0 check path and its
+documented v0.2.0, v0.1.2, and v0.1 compatibility paths:
 
 ```text
 versioned source-free certificate decoding and canonical re-encoding
 versioned declaration, export, report, and certificate hash recomputation
+tagged interface and local-implementation dependency verification for v0.3
+independent local opaque-transparency closure recomputation
+checked local opaque bodies exposed only after checking and only within v0.3
 universe constraints and constraint-committing public interfaces
 normal decoded/hash-checked imports
 recursive policy-checked high-trust import DAGs
@@ -214,30 +223,35 @@ scripts/test.sh recursor
 scripts/test.sh checker-pipeline
 ```
 
-Run the cross-implementation, real-package, and source-free boundary gate with:
+The live three-way differential runner, Rust raw-result v2 parser, checker
+registry binding, and committed Rust-derived fixtures are implemented. Run the
+integration gate with:
 
 ```sh
 scripts/differential.sh
 ```
 
-This regenerates the committed conformance fixtures, compares the fast kernel,
-reference checker, and OCaml verdicts and identities, parses every checker raw
-result through the Rust runner schema, exercises a real external package import
-DAG, and runs the filesystem/network trace when `strace` is available.
+That gate regenerates the committed conformance fixtures, compares the fast
+kernel, reference checker, and OCaml verdicts and identities, parses every raw
+result through the Rust runner schema, exercises a real external package
+import DAG, and runs the filesystem/network trace when `strace` is available.
 
-On Linux, run the complete `npa-cli 0.7.x` host compatibility and ephemeral
+### Current v0.8 host compatibility
+
+On Linux, run the complete `npa-cli 0.8.0` host compatibility and ephemeral
 release-evidence closure from the `npa-core` root with:
 
 ```sh
-checkers/npa-checker-ext/scripts/toolchain-v0.7.sh
+checkers/npa-checker-ext/scripts/toolchain-v0.8.sh
 ```
 
-The developer-only functional form permits a dirty checkout, runs the same
-facade and two direct checks without requiring `strace`, and deliberately does
-not evaluate release evidence:
+On a host that supports kernel-sealed checker staging, the developer-only
+functional form permits a dirty checkout, runs the same facade and two direct
+checks without requiring `strace`, and deliberately does not evaluate release
+evidence:
 
 ```sh
-checkers/npa-checker-ext/scripts/toolchain-v0.7.sh --functional-only
+checkers/npa-checker-ext/scripts/toolchain-v0.8.sh --functional-only
 ```
 
 The combined gate uses the actual OCaml executable through the v1 facade and
@@ -245,6 +259,29 @@ two direct locked/offline runs. It checks a frozen checked lock, full identity
 chain, exact command/raw repeatability, narrow machine telemetry differences,
 source/network access, transient mutations, and—in full mode—the archive,
 checksum, and dynamic v0.2 manifest.
+
+The full v0.8 gate is a clean-checkout Linux release requirement. On platforms
+without kernel-sealed checker staging, invoke the functional-only form to run
+the portable checker-build and host-test checks; it then fails closed with the
+structured `checker_binary_immutable_snapshot_unsupported` result before the
+v0.8 policy preflight or any external execution. Record the remaining
+functional closure and the full gate as pending for the clean Linux release
+run. A host that supports immutable staging but lacks `strace` can complete the
+functional-only form locally.
+
+### Historical v0.7 host compatibility
+
+The v0.7 gate and its emitted v0.7/v0.3 evidence are frozen historical
+compatibility material. Run them only from the matching `npa-cli 0.7.0`
+checkout:
+
+```sh
+checkers/npa-checker-ext/scripts/toolchain-v0.7.sh
+checkers/npa-checker-ext/scripts/toolchain-v0.7.sh --functional-only
+```
+
+The historical gate intentionally rejects the current v0.8 checkout; do not
+relabel its archives, schemas, tags, or evidence as v0.8.
 
 The obsolete v0.3/v0.4 host compatibility scripts and their dedicated tests
 have been removed. Historical design records describe those releases but do

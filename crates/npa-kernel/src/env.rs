@@ -9,8 +9,12 @@ use crate::{
         Reducibility,
     },
     diagnostic::{
-        DiagnosedKernelError, KernelComparisonOutcome, KernelConversionContext,
-        KernelDiagnosticContext, KernelDiagnosticPhase, KernelExprHead,
+        DiagnosedKernelError, KernelComparisonOutcome, KernelComparisonPath,
+        KernelComparisonPathStep, KernelConversionContext, KernelConversionRecorder,
+        KernelDeclarationWork, KernelDeltaHotset, KernelDeltaHotsetSummary,
+        KernelDiagnosedAdmission, KernelDiagnosticContext, KernelDiagnosticOptions,
+        KernelDiagnosticPhase, KernelExprHead, KernelFuelDiagnostic, KernelFuelReportMode,
+        KernelFuelResource, KernelOperationWork,
     },
     error::{Error, ResourceLimitKind, Result},
     expr::{collect_apps, quick_syntactic_eq, Expr},
@@ -25,7 +29,9 @@ use crate::{
     name::is_canonical_dotted_name,
     positivity::approved_nested_functor,
     subst::{instantiate, subst_levels_expr},
-    work::{KernelWorkCounterSink, KernelWorkCounters},
+    work::{
+        KernelFuelOperationCounters, KernelWorkCounterSink, KernelWorkCounters, KernelWorkSnapshot,
+    },
 };
 
 #[cfg(test)]
@@ -66,7 +72,6 @@ enum KernelWorkCounter {
     DefeqCall,
     QuickEqualityHit,
     BetaStep,
-    DeltaStep,
     IotaStep,
     ZetaStep,
     PhysicalReduction,
@@ -75,11 +80,32 @@ enum KernelWorkCounter {
 }
 
 trait KernelWorkMeter {
+    #[inline(always)]
     fn increment(&mut self, _counter: KernelWorkCounter) {}
 
-    fn record_fuel(&mut self, _spent: usize, _exhausted: bool) {}
+    #[inline(always)]
+    fn record_fuel(&mut self, _resource: KernelFuelResource, _spent: usize, _exhausted: bool) {}
 
+    #[inline(always)]
+    fn record_delta_reduction(&mut self, _constant: &str) {}
+
+    #[inline(always)]
     fn merge_counters(&mut self, _counters: KernelWorkCounters) {}
+
+    #[inline(always)]
+    fn fuel_report_mode(&self) -> KernelFuelReportMode {
+        KernelFuelReportMode::Off
+    }
+
+    #[inline(always)]
+    fn snapshot(&self) -> KernelWorkSnapshot {
+        KernelWorkSnapshot::zero()
+    }
+
+    #[inline(always)]
+    fn retained_delta_constants(&self) -> Option<KernelDeltaHotsetSummary> {
+        None
+    }
 }
 
 struct DisabledKernelWorkMeter;
@@ -95,7 +121,6 @@ impl KernelWorkMeter for KernelWorkCounters {
             KernelWorkCounter::DefeqCall => &mut self.defeq_calls,
             KernelWorkCounter::QuickEqualityHit => &mut self.quick_equality_hits,
             KernelWorkCounter::BetaStep => &mut self.beta_steps,
-            KernelWorkCounter::DeltaStep => &mut self.delta_steps,
             KernelWorkCounter::IotaStep => &mut self.iota_steps,
             KernelWorkCounter::ZetaStep => &mut self.zeta_steps,
             KernelWorkCounter::PhysicalReduction => &mut self.physical_reductions,
@@ -109,19 +134,83 @@ impl KernelWorkMeter for KernelWorkCounters {
         }
     }
 
-    fn record_fuel(&mut self, spent: usize, exhausted: bool) {
-        let spent = u64::try_from(spent).unwrap_or(u64::MAX);
-        KernelWorkCounters::add(&mut self.logical_fuel, spent, &mut self.overflowed);
-        if exhausted {
-            KernelWorkCounters::add(&mut self.exhausted_fuel, spent, &mut self.overflowed);
-        } else {
-            KernelWorkCounters::add(&mut self.successful_fuel, spent, &mut self.overflowed);
-        }
+    fn record_fuel(&mut self, resource: KernelFuelResource, spent: usize, exhausted: bool) {
+        KernelWorkCounters::record_fuel(self, resource, spent, exhausted);
+    }
+
+    fn record_delta_reduction(&mut self, _constant: &str) {
+        KernelWorkCounters::add(&mut self.delta_steps, 1, &mut self.overflowed);
+        KernelWorkCounters::add(&mut self.physical_reductions, 1, &mut self.overflowed);
     }
 
     fn merge_counters(&mut self, counters: KernelWorkCounters) {
         self.merge(counters);
     }
+
+    fn snapshot(&self) -> KernelWorkSnapshot {
+        KernelWorkCounters::snapshot(self)
+    }
+}
+
+struct KernelDiagnosticWorkMeter {
+    mode: KernelFuelReportMode,
+    counters: KernelWorkCounters,
+    delta_hotset: Option<KernelDeltaHotset>,
+}
+
+impl KernelDiagnosticWorkMeter {
+    fn new(mode: KernelFuelReportMode) -> Self {
+        Self {
+            mode,
+            counters: KernelWorkCounters::default(),
+            delta_hotset: KernelDeltaHotset::for_mode(mode),
+        }
+    }
+}
+
+impl KernelWorkMeter for KernelDiagnosticWorkMeter {
+    fn increment(&mut self, counter: KernelWorkCounter) {
+        self.counters.increment(counter);
+    }
+
+    fn record_fuel(&mut self, resource: KernelFuelResource, spent: usize, exhausted: bool) {
+        self.counters.record_fuel(resource, spent, exhausted);
+    }
+
+    fn record_delta_reduction(&mut self, constant: &str) {
+        self.counters.record_delta_reduction(constant);
+        if let Some(delta_hotset) = &mut self.delta_hotset {
+            delta_hotset.record(constant);
+        }
+    }
+
+    fn merge_counters(&mut self, counters: KernelWorkCounters) {
+        self.counters.merge(counters);
+    }
+
+    fn fuel_report_mode(&self) -> KernelFuelReportMode {
+        self.mode
+    }
+
+    fn snapshot(&self) -> KernelWorkSnapshot {
+        self.counters.snapshot()
+    }
+
+    fn retained_delta_constants(&self) -> Option<KernelDeltaHotsetSummary> {
+        self.delta_hotset.as_ref().map(KernelDeltaHotset::summary)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct KernelDiagnosticFuelLimits {
+    whnf: usize,
+    conversion: usize,
+}
+
+struct DiagnosedConversionRun {
+    result: Result<bool>,
+    observation: Option<(KernelConversionContext, KernelComparisonPath)>,
+    fuel_diagnostic: Option<KernelFuelDiagnostic>,
 }
 
 struct KernelOperationState {
@@ -157,30 +246,6 @@ impl KernelOperationState {
     }
 }
 
-#[derive(Default)]
-struct KernelConversionRecorder {
-    comparison: Option<KernelConversionContext>,
-}
-
-impl KernelConversionRecorder {
-    fn record(&mut self, outcome: KernelComparisonOutcome, lhs: &Expr, rhs: &Expr, depth: u32) {
-        let replace = self.comparison.as_ref().is_none_or(|current| {
-            depth > current.depth()
-                || (depth == current.depth()
-                    && outcome == KernelComparisonOutcome::FuelExhausted
-                    && current.outcome() == KernelComparisonOutcome::NotDefEq)
-        });
-        if replace {
-            self.comparison = Some(KernelConversionContext::new(
-                outcome,
-                KernelExprHead::from_expr(lhs),
-                KernelExprHead::from_expr(rhs),
-                depth,
-            ));
-        }
-    }
-}
-
 impl Env {
     const WHNF_FUEL: usize = 100_000;
     // Keep the default conversion ceiling aligned with the independent
@@ -188,6 +253,13 @@ impl Env {
     // this default path, so a lower fast-kernel ceiling can reject declarations
     // that the source-free acceptance boundary is deliberately sized to check.
     const DEFEQ_FUEL: usize = 5_000_000;
+
+    const fn diagnosed_fuel_limits() -> KernelDiagnosticFuelLimits {
+        KernelDiagnosticFuelLimits {
+            whnf: Self::WHNF_FUEL,
+            conversion: Self::DEFEQ_FUEL,
+        }
+    }
 
     pub fn new() -> Self {
         Self::default()
@@ -203,8 +275,9 @@ impl Env {
         }
     }
 
-    /// Construct an empty environment that aggregates deterministic work
-    /// counters from ordinary nondiagnosed declaration-validation operations.
+    /// Construct an empty environment that aggregates deterministic kernel
+    /// work counters. Observed diagnosed admissions merge one declaration-local
+    /// copy into this sink after admission completes.
     pub fn with_execution_options_and_work_counter_sink(
         execution_options: KernelExecutionOptions,
         work_counter_sink: KernelWorkCounterSink,
@@ -254,6 +327,26 @@ impl Env {
 
     pub fn decl(&self, name: &str) -> Option<&Decl> {
         self.decls.get(name)
+    }
+
+    /// Expose the body of an already checked opaque definition in this
+    /// environment view.
+    ///
+    /// This does not check or insert a declaration. Callers must first add the
+    /// opaque definition through the ordinary declaration-checking path. The
+    /// operation changes only the environment's private copy, leaving the
+    /// source declaration and the behavior of [`Env::add_def`] unchanged.
+    #[must_use]
+    pub fn expose_checked_opaque_definition(&mut self, name: &str) -> bool {
+        match self.decls.get_mut(name) {
+            Some(Decl::Def { reducibility, .. } | Decl::DefConstrained { reducibility, .. })
+                if *reducibility == Reducibility::Opaque =>
+            {
+                *reducibility = Reducibility::Reducible;
+                true
+            }
+            _ => false,
+        }
     }
 
     pub fn add_axiom(
@@ -794,12 +887,15 @@ impl Env {
     ) -> std::result::Result<(), DiagnosedKernelError> {
         let universe_context =
             UniverseContext::from_params(delta.to_vec()).map_err(DiagnosedKernelError::new)?;
+        let limits = Self::diagnosed_fuel_limits();
         self.check_in_universe_context_diagnosed(
             ctx,
             &universe_context,
             term,
             expected,
             KernelDiagnosticPhase::TermCheck,
+            limits,
+            &mut DisabledKernelWorkMeter,
         )
     }
 
@@ -809,14 +905,21 @@ impl Env {
         universe_context: &UniverseContext,
         term: &Expr,
         phase: KernelDiagnosticPhase,
+        limits: KernelDiagnosticFuelLimits,
+        meter: &mut impl KernelWorkMeter,
     ) -> std::result::Result<Expr, DiagnosedKernelError> {
+        meter.increment(KernelWorkCounter::InferCall);
         match term {
             Expr::Sort(level) => {
                 ensure_level_wf(&universe_context.params, level)
                     .map_err(DiagnosedKernelError::new)?;
                 Ok(Expr::sort(Level::succ(level.clone())))
             }
-            Expr::BVar(index) => ctx.lookup_type(*index).map_err(DiagnosedKernelError::new),
+            Expr::BVar(index) => {
+                meter.increment(KernelWorkCounter::ContextLookup);
+                meter.increment(KernelWorkCounter::ContextShift);
+                ctx.lookup_type(*index).map_err(DiagnosedKernelError::new)
+            }
             Expr::Const { name, levels } => self
                 .infer_const_type_in_universe_context(universe_context, name, levels)
                 .map_err(DiagnosedKernelError::new),
@@ -826,6 +929,8 @@ impl Env {
                     universe_context,
                     ty,
                     phase,
+                    limits,
+                    meter,
                 )?;
                 let mut body_ctx = ctx.clone();
                 body_ctx.push_assumption(binder.clone(), (**ty).clone());
@@ -834,11 +939,20 @@ impl Env {
                     universe_context,
                     body,
                     phase,
+                    limits,
+                    meter,
                 )?;
                 Ok(Expr::sort(Level::imax(domain_sort, body_sort)))
             }
             Expr::Lam { binder, ty, body } => {
-                self.expect_sort_in_universe_context_diagnosed(ctx, universe_context, ty, phase)?;
+                self.expect_sort_in_universe_context_diagnosed(
+                    ctx,
+                    universe_context,
+                    ty,
+                    phase,
+                    limits,
+                    meter,
+                )?;
                 let mut body_ctx = ctx.clone();
                 body_ctx.push_assumption(binder.clone(), (**ty).clone());
                 let body_ty = self.infer_in_universe_context_diagnosed(
@@ -846,16 +960,28 @@ impl Env {
                     universe_context,
                     body,
                     phase,
+                    limits,
+                    meter,
                 )?;
                 Ok(Expr::pi(binder.clone(), (**ty).clone(), body_ty))
             }
             Expr::App(fun, arg) => {
-                let fun_ty =
-                    self.infer_in_universe_context_diagnosed(ctx, universe_context, fun, phase)?;
-                match self
-                    .whnf_diagnosed_off(ctx, &universe_context.params, &fun_ty)
-                    .map_err(DiagnosedKernelError::new)?
-                {
+                let fun_ty = self.infer_in_universe_context_diagnosed(
+                    ctx,
+                    universe_context,
+                    fun,
+                    phase,
+                    limits,
+                    meter,
+                )?;
+                match self.whnf_diagnosed(
+                    ctx,
+                    &universe_context.params,
+                    &fun_ty,
+                    phase,
+                    limits.whnf,
+                    meter,
+                )? {
                     Expr::Pi { ty, body, .. } => {
                         self.check_in_universe_context_diagnosed(
                             ctx,
@@ -863,6 +989,8 @@ impl Env {
                             arg,
                             &ty,
                             phase,
+                            limits,
+                            meter,
                         )?;
                         instantiate(&body, arg).map_err(DiagnosedKernelError::new)
                     }
@@ -875,8 +1003,23 @@ impl Env {
                 value,
                 body,
             } => {
-                self.expect_sort_in_universe_context_diagnosed(ctx, universe_context, ty, phase)?;
-                self.check_in_universe_context_diagnosed(ctx, universe_context, value, ty, phase)?;
+                self.expect_sort_in_universe_context_diagnosed(
+                    ctx,
+                    universe_context,
+                    ty,
+                    phase,
+                    limits,
+                    meter,
+                )?;
+                self.check_in_universe_context_diagnosed(
+                    ctx,
+                    universe_context,
+                    value,
+                    ty,
+                    phase,
+                    limits,
+                    meter,
+                )?;
                 let mut body_ctx = ctx.clone();
                 body_ctx.push_definition(binder.clone(), (**ty).clone(), (**value).clone());
                 let body_ty = self.infer_in_universe_context_diagnosed(
@@ -884,6 +1027,8 @@ impl Env {
                     universe_context,
                     body,
                     phase,
+                    limits,
+                    meter,
                 )?;
                 instantiate(&body_ty, value).map_err(DiagnosedKernelError::new)
             }
@@ -896,18 +1041,31 @@ impl Env {
         universe_context: &UniverseContext,
         term: &Expr,
         phase: KernelDiagnosticPhase,
+        limits: KernelDiagnosticFuelLimits,
+        meter: &mut impl KernelWorkMeter,
     ) -> std::result::Result<Level, DiagnosedKernelError> {
-        let inferred =
-            self.infer_in_universe_context_diagnosed(ctx, universe_context, term, phase)?;
-        match self
-            .whnf_diagnosed_off(ctx, &universe_context.params, &inferred)
-            .map_err(DiagnosedKernelError::new)?
-        {
+        let inferred = self.infer_in_universe_context_diagnosed(
+            ctx,
+            universe_context,
+            term,
+            phase,
+            limits,
+            meter,
+        )?;
+        match self.whnf_diagnosed(
+            ctx,
+            &universe_context.params,
+            &inferred,
+            phase,
+            limits.whnf,
+            meter,
+        )? {
             Expr::Sort(level) => Ok(level),
             actual => Err(DiagnosedKernelError::new(Error::ExpectedSort { actual })),
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn check_in_universe_context_diagnosed(
         &self,
         ctx: &Ctx,
@@ -915,40 +1073,367 @@ impl Env {
         term: &Expr,
         expected: &Expr,
         phase: KernelDiagnosticPhase,
+        limits: KernelDiagnosticFuelLimits,
+        meter: &mut impl KernelWorkMeter,
     ) -> std::result::Result<(), DiagnosedKernelError> {
-        let actual =
-            self.infer_in_universe_context_diagnosed(ctx, universe_context, term, phase)?;
-        let mut recorder = KernelConversionRecorder::default();
-        let mut fuel = Self::DEFEQ_FUEL;
-        match self.is_defeq_with_remaining_fuel_diagnosed(
+        meter.increment(KernelWorkCounter::CheckCall);
+        let actual = self.infer_in_universe_context_diagnosed(
+            ctx,
+            universe_context,
+            term,
+            phase,
+            limits,
+            meter,
+        )?;
+        let DiagnosedConversionRun {
+            result,
+            observation,
+            fuel_diagnostic,
+        } = self.run_diagnosed_conversion(
             ctx,
             &universe_context.params,
             &actual,
             expected,
-            &mut fuel,
-            &mut recorder,
-            0,
-        ) {
+            limits.conversion,
+            meter,
+        );
+        match result {
             Ok(true) => Ok(()),
             Ok(false) => Err(DiagnosedKernelError::new(Error::TypeMismatch {
                 expected: expected.clone(),
                 actual,
             })
-            .with_context(KernelDiagnosticContext::new(phase).with_conversion(
-                recorder.comparison.unwrap_or_else(|| {
-                    KernelConversionContext::new(
-                        KernelComparisonOutcome::NotDefEq,
-                        KernelExprHead::Unknown,
-                        KernelExprHead::Unknown,
-                        0,
-                    )
-                }),
-            ))),
+            .with_context(
+                KernelDiagnosticContext::new(phase).with_conversion(
+                    observation
+                        .map(|(comparison, _)| comparison)
+                        .unwrap_or_else(|| {
+                            KernelConversionContext::new(
+                                KernelComparisonOutcome::NotDefEq,
+                                KernelExprHead::Unknown,
+                                KernelExprHead::Unknown,
+                                0,
+                            )
+                        }),
+                ),
+            )),
             Err(error) => {
                 let mut diagnosed = DiagnosedKernelError::new(error);
-                if let Some(comparison) = recorder.comparison {
+                let mut context = KernelDiagnosticContext::new(phase);
+                let mut has_context = false;
+                if let Some((comparison, _)) = observation {
+                    context = context.with_conversion(comparison);
+                    has_context = true;
+                }
+                if let Some(fuel_diagnostic) = fuel_diagnostic {
+                    context = context.with_kernel_fuel(fuel_diagnostic);
+                    has_context = true;
+                }
+                if has_context {
+                    diagnosed = diagnosed.with_context(context);
+                }
+                Err(diagnosed)
+            }
+        }
+    }
+
+    fn run_diagnosed_conversion(
+        &self,
+        ctx: &Ctx,
+        delta: &[String],
+        lhs: &Expr,
+        rhs: &Expr,
+        fuel_budget: usize,
+        meter: &mut impl KernelWorkMeter,
+    ) -> DiagnosedConversionRun {
+        let operation_start = meter.snapshot();
+        let mut remaining_fuel = fuel_budget;
+        let mut recorder = if meter.fuel_report_mode().collects_failures() {
+            KernelConversionRecorder::with_path()
+        } else {
+            KernelConversionRecorder::default()
+        };
+        let result = self.is_defeq_with_remaining_fuel_diagnosed(
+            ctx,
+            delta,
+            lhs,
+            rhs,
+            &mut remaining_fuel,
+            meter,
+            &mut recorder,
+            0,
+        );
+        let exhausted = operation_exhausted(&result, KernelFuelResource::Conversion);
+        let spent = fuel_budget.saturating_sub(remaining_fuel);
+        meter.record_fuel(KernelFuelResource::Conversion, spent, exhausted);
+        let operation_end = meter.snapshot();
+        let observation = recorder.into_observation();
+        let fuel_diagnostic =
+            (exhausted && meter.fuel_report_mode().collects_failures()).then(|| {
+                let comparison_path = observation
+                    .as_ref()
+                    .map(|(_, path)| path.clone())
+                    .unwrap_or_else(KernelComparisonPath::empty);
+                KernelFuelDiagnostic::new(
+                    KernelFuelResource::Conversion,
+                    KernelOperationWork {
+                        fuel: KernelFuelOperationCounters::from_usize(
+                            fuel_budget,
+                            spent,
+                            remaining_fuel,
+                            true,
+                        ),
+                        work: operation_end.delta_since(operation_start),
+                    },
+                    KernelDeclarationWork::from_snapshot(operation_end),
+                    comparison_path,
+                    meter.retained_delta_constants(),
+                )
+            });
+        DiagnosedConversionRun {
+            result,
+            observation,
+            fuel_diagnostic,
+        }
+    }
+
+    fn run_diagnosed_conversion_with_remaining_fuel(
+        &self,
+        ctx: &Ctx,
+        delta: &[String],
+        lhs: &Expr,
+        rhs: &Expr,
+        remaining_fuel: &mut usize,
+        meter: &mut impl KernelWorkMeter,
+    ) -> DiagnosedConversionRun {
+        let operation_start = meter.snapshot();
+        let fuel_budget = *remaining_fuel;
+        let mut recorder = if meter.fuel_report_mode().collects_failures() {
+            KernelConversionRecorder::with_path()
+        } else {
+            KernelConversionRecorder::default()
+        };
+        let result = self.is_defeq_with_remaining_fuel_diagnosed(
+            ctx,
+            delta,
+            lhs,
+            rhs,
+            remaining_fuel,
+            meter,
+            &mut recorder,
+            0,
+        );
+        let exhausted = operation_exhausted(&result, KernelFuelResource::Conversion);
+        let spent = fuel_budget.saturating_sub(*remaining_fuel);
+        meter.record_fuel(KernelFuelResource::Conversion, spent, exhausted);
+        let operation_end = meter.snapshot();
+        let observation = recorder.into_observation();
+        let fuel_diagnostic =
+            (exhausted && meter.fuel_report_mode().collects_failures()).then(|| {
+                let comparison_path = observation
+                    .as_ref()
+                    .map(|(_, path)| path.clone())
+                    .unwrap_or_else(KernelComparisonPath::empty);
+                KernelFuelDiagnostic::new(
+                    KernelFuelResource::Conversion,
+                    KernelOperationWork {
+                        fuel: KernelFuelOperationCounters::from_usize(
+                            fuel_budget,
+                            spent,
+                            *remaining_fuel,
+                            true,
+                        ),
+                        work: operation_end.delta_since(operation_start),
+                    },
+                    KernelDeclarationWork::from_snapshot(operation_end),
+                    comparison_path,
+                    meter.retained_delta_constants(),
+                )
+            });
+        DiagnosedConversionRun {
+            result,
+            observation,
+            fuel_diagnostic,
+        }
+    }
+
+    fn finish_diagnosed_conversion(
+        run: DiagnosedConversionRun,
+        phase: KernelDiagnosticPhase,
+    ) -> std::result::Result<bool, DiagnosedKernelError> {
+        match run.result {
+            Ok(result) => Ok(result),
+            Err(error) => {
+                let mut diagnosed = DiagnosedKernelError::new(error);
+                let mut context = KernelDiagnosticContext::new(phase);
+                let mut has_context = false;
+                if let Some((comparison, _)) = run.observation {
+                    context = context.with_conversion(comparison);
+                    has_context = true;
+                }
+                if let Some(fuel_diagnostic) = run.fuel_diagnostic {
+                    context = context.with_kernel_fuel(fuel_diagnostic);
+                    has_context = true;
+                }
+                if has_context {
+                    diagnosed = diagnosed.with_context(context);
+                }
+                Err(diagnosed)
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn ensure_defeq_diagnosed_metered(
+        &self,
+        ctx: &Ctx,
+        delta: &[String],
+        lhs: &Expr,
+        rhs: &Expr,
+        mismatch: Error,
+        phase: KernelDiagnosticPhase,
+        fuel_budget: usize,
+        meter: &mut impl KernelWorkMeter,
+    ) -> std::result::Result<(), DiagnosedKernelError> {
+        let DiagnosedConversionRun {
+            result,
+            observation,
+            fuel_diagnostic,
+        } = self.run_diagnosed_conversion(ctx, delta, lhs, rhs, fuel_budget, meter);
+        match result {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(DiagnosedKernelError::new(mismatch).with_context(
+                KernelDiagnosticContext::new(phase).with_conversion(
+                    observation
+                        .map(|(comparison, _)| comparison)
+                        .unwrap_or_else(|| {
+                            KernelConversionContext::new(
+                                KernelComparisonOutcome::NotDefEq,
+                                KernelExprHead::Unknown,
+                                KernelExprHead::Unknown,
+                                0,
+                            )
+                        }),
+                ),
+            )),
+            Err(error) => {
+                let mut diagnosed = DiagnosedKernelError::new(error);
+                let mut context = KernelDiagnosticContext::new(phase);
+                let mut has_context = false;
+                if let Some((comparison, _)) = observation {
+                    context = context.with_conversion(comparison);
+                    has_context = true;
+                }
+                if let Some(fuel_diagnostic) = fuel_diagnostic {
+                    context = context.with_kernel_fuel(fuel_diagnostic);
+                    has_context = true;
+                }
+                if has_context {
+                    diagnosed = diagnosed.with_context(context);
+                }
+                Err(diagnosed)
+            }
+        }
+    }
+
+    fn whnf_diagnosed(
+        &self,
+        ctx: &Ctx,
+        delta: &[String],
+        term: &Expr,
+        phase: KernelDiagnosticPhase,
+        fuel_budget: usize,
+        meter: &mut impl KernelWorkMeter,
+    ) -> std::result::Result<Expr, DiagnosedKernelError> {
+        let operation_start = meter.snapshot();
+        let mut remaining_fuel = fuel_budget;
+        let result = self.whnf_with_remaining_fuel(
+            ctx,
+            delta,
+            term,
+            &mut remaining_fuel,
+            ResourceLimitKind::Whnf,
+            meter,
+        );
+        let exhausted = operation_exhausted(&result, KernelFuelResource::Whnf);
+        let spent = fuel_budget.saturating_sub(remaining_fuel);
+        meter.record_fuel(KernelFuelResource::Whnf, spent, exhausted);
+        let operation_end = meter.snapshot();
+        match result {
+            Ok(value) => Ok(value),
+            Err(error) => {
+                let mut diagnosed = DiagnosedKernelError::new(error);
+                if exhausted && meter.fuel_report_mode().collects_failures() {
+                    let fuel_diagnostic = KernelFuelDiagnostic::new(
+                        KernelFuelResource::Whnf,
+                        KernelOperationWork {
+                            fuel: KernelFuelOperationCounters::from_usize(
+                                fuel_budget,
+                                spent,
+                                remaining_fuel,
+                                true,
+                            ),
+                            work: operation_end.delta_since(operation_start),
+                        },
+                        KernelDeclarationWork::from_snapshot(operation_end),
+                        KernelComparisonPath::empty(),
+                        meter.retained_delta_constants(),
+                    );
                     diagnosed = diagnosed.with_context(
-                        KernelDiagnosticContext::new(phase).with_conversion(comparison),
+                        KernelDiagnosticContext::new(phase).with_kernel_fuel(fuel_diagnostic),
+                    );
+                }
+                Err(diagnosed)
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn whnf_diagnosed_with_remaining_fuel(
+        &self,
+        ctx: &Ctx,
+        delta: &[String],
+        term: &Expr,
+        phase: KernelDiagnosticPhase,
+        remaining_fuel: &mut usize,
+        meter: &mut impl KernelWorkMeter,
+    ) -> std::result::Result<Expr, DiagnosedKernelError> {
+        let operation_start = meter.snapshot();
+        let fuel_budget = *remaining_fuel;
+        let result = self.whnf_with_remaining_fuel(
+            ctx,
+            delta,
+            term,
+            remaining_fuel,
+            ResourceLimitKind::Whnf,
+            meter,
+        );
+        let exhausted = operation_exhausted(&result, KernelFuelResource::Whnf);
+        let spent = fuel_budget.saturating_sub(*remaining_fuel);
+        meter.record_fuel(KernelFuelResource::Whnf, spent, exhausted);
+        let operation_end = meter.snapshot();
+        match result {
+            Ok(value) => Ok(value),
+            Err(error) => {
+                let mut diagnosed = DiagnosedKernelError::new(error);
+                if exhausted && meter.fuel_report_mode().collects_failures() {
+                    let fuel_diagnostic = KernelFuelDiagnostic::new(
+                        KernelFuelResource::Whnf,
+                        KernelOperationWork {
+                            fuel: KernelFuelOperationCounters::from_usize(
+                                fuel_budget,
+                                spent,
+                                *remaining_fuel,
+                                true,
+                            ),
+                            work: operation_end.delta_since(operation_start),
+                        },
+                        KernelDeclarationWork::from_snapshot(operation_end),
+                        KernelComparisonPath::empty(),
+                        meter.retained_delta_constants(),
+                    );
+                    diagnosed = diagnosed.with_context(
+                        KernelDiagnosticContext::new(phase).with_kernel_fuel(fuel_diagnostic),
                     );
                 }
                 Err(diagnosed)
@@ -961,21 +1446,70 @@ impl Env {
         &mut self,
         declaration: Decl,
     ) -> std::result::Result<(), DiagnosedKernelError> {
-        if self.execution_options.needs_reuse_state() {
-            let mut counters = KernelWorkCounters::default();
-            KernelWorkCounters::add(
-                &mut counters.memo_ineligible_diagnosed,
-                1,
-                &mut counters.overflowed,
-            );
-            self.observe_work_counters(counters);
-            let execution_options = self.execution_options;
-            self.execution_options = KernelExecutionOptions::memo_off();
-            let result = self.add_decl_diagnosed_off(declaration);
-            self.execution_options = execution_options;
-            return result;
+        self.add_decl_diagnosed_with_options(declaration, KernelDiagnosticOptions::default())
+            .map(|_| ())
+    }
+
+    /// Add one declaration with explicit bounded diagnostic collection.
+    pub fn add_decl_diagnosed_with_options(
+        &mut self,
+        declaration: Decl,
+        options: KernelDiagnosticOptions,
+    ) -> std::result::Result<KernelDiagnosedAdmission, DiagnosedKernelError> {
+        self.add_decl_diagnosed_with_options_and_limits(
+            declaration,
+            options,
+            Self::diagnosed_fuel_limits(),
+        )
+    }
+
+    // Production admission reaches this helper only with the fixed kernel
+    // limits. Unit tests inject small limits here to exercise exhaustion
+    // without changing the public API or production constants.
+    fn add_decl_diagnosed_with_options_and_limits(
+        &mut self,
+        declaration: Decl,
+        options: KernelDiagnosticOptions,
+        limits: KernelDiagnosticFuelLimits,
+    ) -> std::result::Result<KernelDiagnosedAdmission, DiagnosedKernelError> {
+        if options.fuel_report == KernelFuelReportMode::Off && !self.observes_work_counters() {
+            return self
+                .add_decl_diagnosed_unobserved(declaration)
+                .map(|_| KernelDiagnosedAdmission::default());
         }
-        self.add_decl_diagnosed_off(declaration)
+
+        let mut meter = KernelDiagnosticWorkMeter::new(options.fuel_report);
+        if self.execution_options.needs_reuse_state() {
+            KernelWorkCounters::add(
+                &mut meter.counters.memo_ineligible_diagnosed,
+                1,
+                &mut meter.counters.overflowed,
+            );
+        }
+
+        let result = self.add_decl_diagnosed_metered(declaration, limits, &mut meter);
+        self.observe_work_counters(meter.counters);
+        result?;
+        Ok(KernelDiagnosedAdmission::from_success(
+            options.fuel_report,
+            KernelDeclarationWork::from_snapshot(meter.snapshot()),
+            meter.retained_delta_constants(),
+        ))
+    }
+
+    fn add_decl_diagnosed_unobserved(
+        &mut self,
+        declaration: Decl,
+    ) -> std::result::Result<(), DiagnosedKernelError> {
+        if !self.execution_options.needs_reuse_state() {
+            return self.add_decl_diagnosed_off(declaration);
+        }
+
+        let execution_options = self.execution_options;
+        self.execution_options = KernelExecutionOptions::memo_off();
+        let result = self.add_decl_diagnosed_off(declaration);
+        self.execution_options = execution_options;
+        result
     }
 
     fn add_decl_diagnosed_off(
@@ -1048,6 +1582,507 @@ impl Env {
         }
     }
 
+    fn add_decl_diagnosed_metered(
+        &mut self,
+        declaration: Decl,
+        limits: KernelDiagnosticFuelLimits,
+        meter: &mut impl KernelWorkMeter,
+    ) -> std::result::Result<(), DiagnosedKernelError> {
+        match declaration {
+            Decl::Axiom {
+                name,
+                universe_params,
+                ty,
+            } => self.add_axiom_diagnosed_metered(
+                name,
+                universe_params,
+                Vec::new(),
+                ty,
+                limits,
+                meter,
+            ),
+            Decl::AxiomConstrained {
+                name,
+                universe_params,
+                universe_constraints,
+                ty,
+            } => self.add_axiom_diagnosed_metered(
+                name,
+                universe_params,
+                universe_constraints,
+                ty,
+                limits,
+                meter,
+            ),
+            Decl::Def {
+                name,
+                universe_params,
+                ty,
+                value,
+                reducibility,
+            } => self.add_def_diagnosed_metered(
+                name,
+                universe_params,
+                Vec::new(),
+                ty,
+                value,
+                reducibility,
+                limits,
+                meter,
+            ),
+            Decl::DefConstrained {
+                name,
+                universe_params,
+                universe_constraints,
+                ty,
+                value,
+                reducibility,
+            } => self.add_def_diagnosed_metered(
+                name,
+                universe_params,
+                universe_constraints,
+                ty,
+                value,
+                reducibility,
+                limits,
+                meter,
+            ),
+            Decl::Theorem {
+                name,
+                universe_params,
+                ty,
+                proof,
+            } => self.add_theorem_diagnosed_metered(
+                name,
+                universe_params,
+                Vec::new(),
+                ty,
+                proof,
+                limits,
+                meter,
+            ),
+            Decl::TheoremConstrained {
+                name,
+                universe_params,
+                universe_constraints,
+                ty,
+                proof,
+            } => self.add_theorem_diagnosed_metered(
+                name,
+                universe_params,
+                universe_constraints,
+                ty,
+                proof,
+                limits,
+                meter,
+            ),
+            Decl::Inductive { data, .. } => {
+                self.add_inductive_diagnosed_metered(*data, limits, meter)
+            }
+            Decl::MutualInductiveBlock { data, .. } => {
+                self.add_mutual_inductive_diagnosed_metered(*data, limits, meter)
+            }
+            Decl::Constructor { .. } | Decl::Recursor { .. } => Ok(()),
+        }
+    }
+
+    fn add_axiom_diagnosed_metered(
+        &mut self,
+        name: String,
+        universe_params: Vec<String>,
+        universe_constraints: Vec<UniverseConstraint>,
+        ty: Expr,
+        limits: KernelDiagnosticFuelLimits,
+        meter: &mut impl KernelWorkMeter,
+    ) -> std::result::Result<(), DiagnosedKernelError> {
+        self.ensure_fresh(&name)
+            .map_err(DiagnosedKernelError::new)?;
+        let universe_context =
+            UniverseContext::new(universe_params.clone(), universe_constraints.clone())
+                .map_err(DiagnosedKernelError::new)?;
+        self.expect_sort_in_universe_context_diagnosed(
+            &Ctx::new(),
+            &universe_context,
+            &ty,
+            KernelDiagnosticPhase::DeclarationType,
+            limits,
+            meter,
+        )?;
+        let declaration = if universe_constraints.is_empty() {
+            Decl::Axiom {
+                name,
+                universe_params,
+                ty,
+            }
+        } else {
+            Decl::AxiomConstrained {
+                name,
+                universe_params,
+                universe_constraints,
+                ty,
+            }
+        };
+        self.decls
+            .insert(declaration.name().to_owned(), declaration);
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn add_def_diagnosed_metered(
+        &mut self,
+        name: String,
+        universe_params: Vec<String>,
+        universe_constraints: Vec<UniverseConstraint>,
+        ty: Expr,
+        value: Expr,
+        reducibility: Reducibility,
+        limits: KernelDiagnosticFuelLimits,
+        meter: &mut impl KernelWorkMeter,
+    ) -> std::result::Result<(), DiagnosedKernelError> {
+        self.ensure_fresh(&name)
+            .map_err(DiagnosedKernelError::new)?;
+        let universe_context =
+            UniverseContext::new(universe_params.clone(), universe_constraints.clone())
+                .map_err(DiagnosedKernelError::new)?;
+        self.expect_sort_in_universe_context_diagnosed(
+            &Ctx::new(),
+            &universe_context,
+            &ty,
+            KernelDiagnosticPhase::DeclarationType,
+            limits,
+            meter,
+        )?;
+        self.check_in_universe_context_diagnosed(
+            &Ctx::new(),
+            &universe_context,
+            &value,
+            &ty,
+            KernelDiagnosticPhase::DeclarationValue,
+            limits,
+            meter,
+        )?;
+        let declaration = if universe_constraints.is_empty() {
+            Decl::Def {
+                name,
+                universe_params,
+                ty,
+                value,
+                reducibility,
+            }
+        } else {
+            Decl::DefConstrained {
+                name,
+                universe_params,
+                universe_constraints,
+                ty,
+                value,
+                reducibility,
+            }
+        };
+        self.decls
+            .insert(declaration.name().to_owned(), declaration);
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn add_theorem_diagnosed_metered(
+        &mut self,
+        name: String,
+        universe_params: Vec<String>,
+        universe_constraints: Vec<UniverseConstraint>,
+        ty: Expr,
+        proof: Expr,
+        limits: KernelDiagnosticFuelLimits,
+        meter: &mut impl KernelWorkMeter,
+    ) -> std::result::Result<(), DiagnosedKernelError> {
+        self.ensure_fresh(&name)
+            .map_err(DiagnosedKernelError::new)?;
+        let universe_context =
+            UniverseContext::new(universe_params.clone(), universe_constraints.clone())
+                .map_err(DiagnosedKernelError::new)?;
+        self.expect_sort_in_universe_context_diagnosed(
+            &Ctx::new(),
+            &universe_context,
+            &ty,
+            KernelDiagnosticPhase::DeclarationType,
+            limits,
+            meter,
+        )?;
+        self.check_in_universe_context_diagnosed(
+            &Ctx::new(),
+            &universe_context,
+            &proof,
+            &ty,
+            KernelDiagnosticPhase::DeclarationValue,
+            limits,
+            meter,
+        )?;
+        let declaration = if universe_constraints.is_empty() {
+            Decl::Theorem {
+                name,
+                universe_params,
+                ty,
+                proof,
+            }
+        } else {
+            Decl::TheoremConstrained {
+                name,
+                universe_params,
+                universe_constraints,
+                ty,
+                proof,
+            }
+        };
+        self.decls
+            .insert(declaration.name().to_owned(), declaration);
+        Ok(())
+    }
+
+    fn add_inductive_diagnosed_metered(
+        &mut self,
+        data: InductiveDecl,
+        limits: KernelDiagnosticFuelLimits,
+        meter: &mut impl KernelWorkMeter,
+    ) -> std::result::Result<(), DiagnosedKernelError> {
+        let universe_context = UniverseContext::new(
+            data.universe_params.clone(),
+            data.universe_constraints.clone(),
+        )
+        .map_err(DiagnosedKernelError::new)?;
+        ensure_level_wf(&universe_context.params, &data.sort).map_err(DiagnosedKernelError::new)?;
+        self.ensure_inductive_names_fresh(&data)
+            .map_err(DiagnosedKernelError::new)?;
+
+        let ty = inductive_type(&data);
+        self.expect_sort_in_universe_context_diagnosed(
+            &Ctx::new(),
+            &universe_context,
+            &ty,
+            KernelDiagnosticPhase::DeclarationType,
+            limits,
+            meter,
+        )?;
+
+        let mut candidate = self.clone();
+        candidate.decls.insert(
+            data.name.clone(),
+            Decl::Inductive {
+                name: data.name.clone(),
+                universe_params: data.universe_params.clone(),
+                ty,
+                data: Box::new(data.clone()),
+            },
+        );
+
+        for constructor in &data.constructors {
+            candidate.check_constructor_decl_diagnosed(
+                &data,
+                constructor,
+                &universe_context,
+                limits,
+                meter,
+            )?;
+            candidate.decls.insert(
+                constructor.name.clone(),
+                Decl::Constructor {
+                    name: constructor.name.clone(),
+                    universe_params: data.universe_params.clone(),
+                    ty: constructor.ty.clone(),
+                    inductive: data.name.clone(),
+                },
+            );
+        }
+
+        if let Some(recursor) = &data.recursor {
+            let recursor_context = UniverseContext::new(
+                recursor.universe_params.clone(),
+                data.universe_constraints.clone(),
+            )
+            .map_err(DiagnosedKernelError::new)?;
+            candidate.expect_sort_in_universe_context_diagnosed(
+                &Ctx::new(),
+                &recursor_context,
+                &recursor.ty,
+                KernelDiagnosticPhase::InductiveRecursor,
+                limits,
+                meter,
+            )?;
+            let rules = recursor
+                .rules
+                .clone()
+                .unwrap_or_else(|| generated_recursor_rules(&data));
+            candidate.check_recursor_decl_diagnosed(
+                &data,
+                recursor,
+                &rules,
+                &recursor_context,
+                limits,
+                meter,
+            )?;
+            candidate.decls.insert(
+                recursor.name.clone(),
+                Decl::Recursor {
+                    name: recursor.name.clone(),
+                    universe_params: recursor.universe_params.clone(),
+                    ty: recursor.ty.clone(),
+                    inductive: data.name.clone(),
+                    rules,
+                },
+            );
+        }
+
+        *self = candidate;
+        Ok(())
+    }
+
+    fn add_mutual_inductive_diagnosed_metered(
+        &mut self,
+        block: MutualInductiveBlock,
+        limits: KernelDiagnosticFuelLimits,
+        meter: &mut impl KernelWorkMeter,
+    ) -> std::result::Result<(), DiagnosedKernelError> {
+        if block.inductives.is_empty() {
+            return Err(DiagnosedKernelError::new(Error::InvalidInductive(format!(
+                "{} mutual block must contain at least one inductive",
+                block.name
+            ))));
+        }
+        let universe_context = UniverseContext::new(
+            block.universe_params.clone(),
+            block.universe_constraints.clone(),
+        )
+        .map_err(DiagnosedKernelError::new)?;
+        self.ensure_mutual_inductive_names_fresh(&block)
+            .map_err(DiagnosedKernelError::new)?;
+
+        let param_count = block.inductives[0].params.len();
+        for data in &block.inductives {
+            if data.universe_params != block.universe_params
+                || !data.universe_constraints.is_empty()
+                || data.params.len() != param_count
+                || data.params != block.inductives[0].params
+            {
+                return Err(DiagnosedKernelError::new(Error::InvalidInductive(format!(
+                    "{} mutual block requires shared universe and parameter telescopes",
+                    block.name
+                ))));
+            }
+            ensure_level_wf(&universe_context.params, &data.sort)
+                .map_err(DiagnosedKernelError::new)?;
+        }
+
+        let mut candidate = self.clone();
+        for data in &block.inductives {
+            let ty = inductive_type(data);
+            candidate.expect_sort_in_universe_context_diagnosed(
+                &Ctx::new(),
+                &universe_context,
+                &ty,
+                KernelDiagnosticPhase::DeclarationType,
+                limits,
+                meter,
+            )?;
+            candidate.decls.insert(
+                data.name.clone(),
+                Decl::Inductive {
+                    name: data.name.clone(),
+                    universe_params: data.universe_params.clone(),
+                    ty,
+                    data: Box::new(data.clone()),
+                },
+            );
+        }
+
+        for data in &block.inductives {
+            for constructor in &data.constructors {
+                candidate.check_mutual_constructor_decl_diagnosed(
+                    &block,
+                    data,
+                    constructor,
+                    &universe_context,
+                    limits,
+                    meter,
+                )?;
+                candidate.decls.insert(
+                    constructor.name.clone(),
+                    Decl::Constructor {
+                        name: constructor.name.clone(),
+                        universe_params: data.universe_params.clone(),
+                        ty: constructor.ty.clone(),
+                        inductive: data.name.clone(),
+                    },
+                );
+            }
+        }
+
+        for data in &block.inductives {
+            if let Some(recursor) = &data.recursor {
+                let recursor_context = UniverseContext::new(
+                    recursor.universe_params.clone(),
+                    block.universe_constraints.clone(),
+                )
+                .map_err(DiagnosedKernelError::new)?;
+                candidate.expect_sort_in_universe_context_diagnosed(
+                    &Ctx::new(),
+                    &recursor_context,
+                    &recursor.ty,
+                    KernelDiagnosticPhase::InductiveRecursor,
+                    limits,
+                    meter,
+                )?;
+                let rules = recursor
+                    .rules
+                    .clone()
+                    .unwrap_or_else(|| generated_mutual_recursor_rules(&block, data));
+                candidate.check_mutual_recursor_decl_diagnosed(
+                    &block,
+                    data,
+                    recursor,
+                    &rules,
+                    &recursor_context,
+                    limits,
+                    meter,
+                )?;
+                candidate.decls.insert(
+                    recursor.name.clone(),
+                    Decl::Recursor {
+                        name: recursor.name.clone(),
+                        universe_params: recursor.universe_params.clone(),
+                        ty: recursor.ty.clone(),
+                        inductive: data.name.clone(),
+                        rules,
+                    },
+                );
+            }
+        }
+
+        let recursors = block
+            .inductives
+            .iter()
+            .filter_map(|data| {
+                data.recursor
+                    .as_ref()
+                    .map(|recursor| (data.name.clone(), recursor.name.clone()))
+            })
+            .collect();
+        let group = MutualGroupInfo {
+            inductives: block
+                .inductives
+                .iter()
+                .map(|data| data.name.clone())
+                .collect(),
+            recursors,
+            universe_params: block.universe_params.clone(),
+            universe_constraints: block.universe_constraints.clone(),
+        };
+        for name in &group.inductives {
+            candidate.mutual_groups.insert(name.clone(), group.clone());
+        }
+
+        *self = candidate;
+        Ok(())
+    }
+
     fn add_def_diagnosed(
         &mut self,
         name: String,
@@ -1070,6 +2105,8 @@ impl Env {
             &value,
             &ty,
             KernelDiagnosticPhase::DeclarationValue,
+            Self::diagnosed_fuel_limits(),
+            &mut DisabledKernelWorkMeter,
         )?;
         let declaration = if universe_constraints.is_empty() {
             Decl::Def {
@@ -1115,6 +2152,8 @@ impl Env {
             &proof,
             &ty,
             KernelDiagnosticPhase::DeclarationValue,
+            Self::diagnosed_fuel_limits(),
+            &mut DisabledKernelWorkMeter,
         )?;
         let declaration = if universe_constraints.is_empty() {
             Decl::Theorem {
@@ -1353,7 +2392,8 @@ impl Env {
         term: &Expr,
         meter: &mut impl KernelWorkMeter,
     ) -> Result<Expr> {
-        let mut fuel = Self::WHNF_FUEL;
+        let starting_fuel = Self::WHNF_FUEL;
+        let mut fuel = starting_fuel;
         if self.execution_options.needs_reuse_state() {
             let mut state = KernelOperationState::new(self.execution_options);
             let result = self.whnf_with_remaining_fuel_memo(
@@ -1365,10 +2405,12 @@ impl Env {
                 ResourceLimitKind::Whnf,
                 &mut state,
             );
-            let exhausted = matches!(&result, Err(Error::ResourceLimit { .. }));
-            state
-                .counters
-                .record_fuel(Self::WHNF_FUEL - fuel, exhausted);
+            let exhausted = operation_exhausted(&result, KernelFuelResource::Whnf);
+            state.counters.record_fuel(
+                KernelFuelResource::Whnf,
+                starting_fuel.saturating_sub(fuel),
+                exhausted,
+            );
             meter.merge_counters(state.counters);
             return result;
         }
@@ -1380,8 +2422,12 @@ impl Env {
             ResourceLimitKind::Whnf,
             meter,
         );
-        let exhausted = matches!(&result, Err(Error::ResourceLimit { .. }));
-        meter.record_fuel(Self::WHNF_FUEL - fuel, exhausted);
+        let exhausted = operation_exhausted(&result, KernelFuelResource::Whnf);
+        meter.record_fuel(
+            KernelFuelResource::Whnf,
+            starting_fuel.saturating_sub(fuel),
+            exhausted,
+        );
         result
     }
 
@@ -1415,7 +2461,8 @@ impl Env {
         rhs: &Expr,
         meter: &mut impl KernelWorkMeter,
     ) -> Result<bool> {
-        let mut fuel = Self::DEFEQ_FUEL;
+        let starting_fuel = Self::DEFEQ_FUEL;
+        let mut fuel = starting_fuel;
         if self.execution_options.needs_reuse_state() {
             let mut state = KernelOperationState::new(self.execution_options);
             let result = self.is_defeq_with_remaining_fuel_memo(
@@ -1428,29 +2475,23 @@ impl Env {
                 &mut fuel,
                 &mut state,
             );
-            let exhausted = matches!(&result, Err(Error::ResourceLimit { .. }));
-            state
-                .counters
-                .record_fuel(Self::DEFEQ_FUEL - fuel, exhausted);
+            let exhausted = operation_exhausted(&result, KernelFuelResource::Conversion);
+            state.counters.record_fuel(
+                KernelFuelResource::Conversion,
+                starting_fuel.saturating_sub(fuel),
+                exhausted,
+            );
             meter.merge_counters(state.counters);
             return result;
         }
         let result = self.is_defeq_with_remaining_fuel(ctx, delta, lhs, rhs, &mut fuel, meter);
-        let exhausted = matches!(&result, Err(Error::ResourceLimit { .. }));
-        meter.record_fuel(Self::DEFEQ_FUEL - fuel, exhausted);
+        let exhausted = operation_exhausted(&result, KernelFuelResource::Conversion);
+        meter.record_fuel(
+            KernelFuelResource::Conversion,
+            starting_fuel.saturating_sub(fuel),
+            exhausted,
+        );
         result
-    }
-
-    fn whnf_diagnosed_off(&self, ctx: &Ctx, delta: &[String], term: &Expr) -> Result<Expr> {
-        let mut fuel = Self::WHNF_FUEL;
-        self.whnf_with_remaining_fuel(
-            ctx,
-            delta,
-            term,
-            &mut fuel,
-            ResourceLimitKind::Whnf,
-            &mut DisabledKernelWorkMeter,
-        )
     }
 
     /// Compare expressions with explicit fuel and bounded failure context.
@@ -1484,31 +2525,15 @@ impl Env {
                     &mut meter.overflowed,
                 );
             }
+            let run = self.run_diagnosed_conversion(ctx, delta, lhs, rhs, fuel, meter);
+            return Self::finish_diagnosed_conversion(
+                run,
+                KernelDiagnosticPhase::DefinitionalEquality,
+            );
         }
-        let mut fuel = fuel;
-        let mut recorder = KernelConversionRecorder::default();
-        match self.is_defeq_with_remaining_fuel_diagnosed(
-            ctx,
-            delta,
-            lhs,
-            rhs,
-            &mut fuel,
-            &mut recorder,
-            0,
-        ) {
-            Ok(true) => Ok(true),
-            Ok(false) => Ok(false),
-            Err(error) => {
-                let mut diagnosed = DiagnosedKernelError::new(error);
-                if let Some(comparison) = recorder.comparison {
-                    diagnosed = diagnosed.with_context(
-                        KernelDiagnosticContext::new(KernelDiagnosticPhase::DefinitionalEquality)
-                            .with_conversion(comparison),
-                    );
-                }
-                Err(diagnosed)
-            }
-        }
+        let run =
+            self.run_diagnosed_conversion(ctx, delta, lhs, rhs, fuel, &mut DisabledKernelWorkMeter);
+        Self::finish_diagnosed_conversion(run, KernelDiagnosticPhase::DefinitionalEquality)
     }
 
     pub fn whnf_with_fuel(
@@ -1541,10 +2566,12 @@ impl Env {
                 ResourceLimitKind::Whnf,
                 &mut state,
             );
-            let exhausted = matches!(&result, Err(Error::ResourceLimit { .. }));
-            state
-                .counters
-                .record_fuel(starting_fuel.saturating_sub(*fuel), exhausted);
+            let exhausted = operation_exhausted(&result, KernelFuelResource::Whnf);
+            state.counters.record_fuel(
+                KernelFuelResource::Whnf,
+                starting_fuel.saturating_sub(*fuel),
+                exhausted,
+            );
             self.observe_work_counters(state.counters);
             return result;
         }
@@ -1559,8 +2586,12 @@ impl Env {
                 ResourceLimitKind::Whnf,
                 &mut counters,
             );
-            let exhausted = matches!(&result, Err(Error::ResourceLimit { .. }));
-            counters.record_fuel(starting_fuel.saturating_sub(*fuel), exhausted);
+            let exhausted = operation_exhausted(&result, KernelFuelResource::Whnf);
+            counters.record_fuel(
+                KernelFuelResource::Whnf,
+                starting_fuel.saturating_sub(*fuel),
+                exhausted,
+            );
             self.observe_work_counters(counters);
             return result;
         }
@@ -1607,10 +2638,12 @@ impl Env {
                 fuel,
                 &mut state,
             );
-            let exhausted = matches!(&result, Err(Error::ResourceLimit { .. }));
-            state
-                .counters
-                .record_fuel(starting_fuel.saturating_sub(*fuel), exhausted);
+            let exhausted = operation_exhausted(&result, KernelFuelResource::Conversion);
+            state.counters.record_fuel(
+                KernelFuelResource::Conversion,
+                starting_fuel.saturating_sub(*fuel),
+                exhausted,
+            );
             self.observe_work_counters(state.counters);
             return result;
         }
@@ -1619,8 +2652,12 @@ impl Env {
             let mut counters = KernelWorkCounters::default();
             let result =
                 self.is_defeq_with_remaining_fuel(ctx, delta, lhs, rhs, fuel, &mut counters);
-            let exhausted = matches!(&result, Err(Error::ResourceLimit { .. }));
-            counters.record_fuel(starting_fuel.saturating_sub(*fuel), exhausted);
+            let exhausted = operation_exhausted(&result, KernelFuelResource::Conversion);
+            counters.record_fuel(
+                KernelFuelResource::Conversion,
+                starting_fuel.saturating_sub(*fuel),
+                exhausted,
+            );
             self.observe_work_counters(counters);
             return result;
         }
@@ -2003,7 +3040,8 @@ impl Env {
         origin: MemoExprOrigin<'_>,
         state: &mut KernelOperationState,
     ) -> Result<Expr> {
-        let mut fuel = Self::WHNF_FUEL;
+        let starting_fuel = Self::WHNF_FUEL;
+        let mut fuel = starting_fuel;
         let result = self.whnf_with_remaining_fuel_memo(
             ctx,
             delta,
@@ -2013,10 +3051,12 @@ impl Env {
             ResourceLimitKind::Whnf,
             state,
         );
-        let exhausted = matches!(&result, Err(Error::ResourceLimit { .. }));
-        state
-            .counters
-            .record_fuel(Self::WHNF_FUEL - fuel, exhausted);
+        let exhausted = operation_exhausted(&result, KernelFuelResource::Whnf);
+        state.counters.record_fuel(
+            KernelFuelResource::Whnf,
+            starting_fuel.saturating_sub(fuel),
+            exhausted,
+        );
         result
     }
 
@@ -2031,14 +3071,17 @@ impl Env {
         rhs_origin: MemoExprOrigin<'_>,
         state: &mut KernelOperationState,
     ) -> Result<bool> {
-        let mut fuel = Self::DEFEQ_FUEL;
+        let starting_fuel = Self::DEFEQ_FUEL;
+        let mut fuel = starting_fuel;
         let result = self.is_defeq_with_remaining_fuel_memo(
             ctx, delta, lhs, lhs_origin, rhs, rhs_origin, &mut fuel, state,
         );
-        let exhausted = matches!(&result, Err(Error::ResourceLimit { .. }));
-        state
-            .counters
-            .record_fuel(Self::DEFEQ_FUEL - fuel, exhausted);
+        let exhausted = operation_exhausted(&result, KernelFuelResource::Conversion);
+        state.counters.record_fuel(
+            KernelFuelResource::Conversion,
+            starting_fuel.saturating_sub(fuel),
+            exhausted,
+        );
         result
     }
 
@@ -2448,6 +3491,260 @@ impl Env {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn infer_with_remaining_fuel_diagnosed(
+        &self,
+        ctx: &Ctx,
+        universe_context: &UniverseContext,
+        term: &Expr,
+        phase: KernelDiagnosticPhase,
+        whnf_fuel: &mut usize,
+        conversion_fuel: &mut usize,
+        meter: &mut impl KernelWorkMeter,
+    ) -> std::result::Result<Expr, DiagnosedKernelError> {
+        meter.increment(KernelWorkCounter::InferCall);
+        match term {
+            Expr::Sort(level) => {
+                ensure_level_wf(&universe_context.params, level)
+                    .map_err(DiagnosedKernelError::new)?;
+                Ok(Expr::sort(Level::succ(level.clone())))
+            }
+            Expr::BVar(index) => {
+                meter.increment(KernelWorkCounter::ContextLookup);
+                meter.increment(KernelWorkCounter::ContextShift);
+                ctx.lookup_type(*index).map_err(DiagnosedKernelError::new)
+            }
+            Expr::Const { name, levels } => self
+                .infer_const_type_in_universe_context(universe_context, name, levels)
+                .map_err(DiagnosedKernelError::new),
+            Expr::Pi { binder, ty, body } => {
+                let domain_sort = self.expect_sort_with_remaining_fuel_diagnosed(
+                    ctx,
+                    universe_context,
+                    ty,
+                    phase,
+                    whnf_fuel,
+                    conversion_fuel,
+                    meter,
+                )?;
+                let mut body_ctx = ctx.clone();
+                body_ctx.push_assumption(binder.clone(), (**ty).clone());
+                let body_sort = self.expect_sort_with_remaining_fuel_diagnosed(
+                    &body_ctx,
+                    universe_context,
+                    body,
+                    phase,
+                    whnf_fuel,
+                    conversion_fuel,
+                    meter,
+                )?;
+                Ok(Expr::sort(Level::imax(domain_sort, body_sort)))
+            }
+            Expr::Lam { binder, ty, body } => {
+                self.expect_sort_with_remaining_fuel_diagnosed(
+                    ctx,
+                    universe_context,
+                    ty,
+                    phase,
+                    whnf_fuel,
+                    conversion_fuel,
+                    meter,
+                )?;
+                let mut body_ctx = ctx.clone();
+                body_ctx.push_assumption(binder.clone(), (**ty).clone());
+                let body_ty = self.infer_with_remaining_fuel_diagnosed(
+                    &body_ctx,
+                    universe_context,
+                    body,
+                    phase,
+                    whnf_fuel,
+                    conversion_fuel,
+                    meter,
+                )?;
+                Ok(Expr::pi(binder.clone(), (**ty).clone(), body_ty))
+            }
+            Expr::App(fun, arg) => {
+                let fun_ty = self.infer_with_remaining_fuel_diagnosed(
+                    ctx,
+                    universe_context,
+                    fun,
+                    phase,
+                    whnf_fuel,
+                    conversion_fuel,
+                    meter,
+                )?;
+                match self.whnf_diagnosed_with_remaining_fuel(
+                    ctx,
+                    &universe_context.params,
+                    &fun_ty,
+                    phase,
+                    whnf_fuel,
+                    meter,
+                )? {
+                    Expr::Pi { ty, body, .. } => {
+                        self.check_with_remaining_fuel_diagnosed(
+                            ctx,
+                            universe_context,
+                            arg,
+                            &ty,
+                            phase,
+                            whnf_fuel,
+                            conversion_fuel,
+                            meter,
+                        )?;
+                        instantiate(&body, arg).map_err(DiagnosedKernelError::new)
+                    }
+                    actual => Err(DiagnosedKernelError::new(Error::ExpectedPi { actual })),
+                }
+            }
+            Expr::Let {
+                binder,
+                ty,
+                value,
+                body,
+            } => {
+                self.expect_sort_with_remaining_fuel_diagnosed(
+                    ctx,
+                    universe_context,
+                    ty,
+                    phase,
+                    whnf_fuel,
+                    conversion_fuel,
+                    meter,
+                )?;
+                self.check_with_remaining_fuel_diagnosed(
+                    ctx,
+                    universe_context,
+                    value,
+                    ty,
+                    phase,
+                    whnf_fuel,
+                    conversion_fuel,
+                    meter,
+                )?;
+                let mut body_ctx = ctx.clone();
+                body_ctx.push_definition(binder.clone(), (**ty).clone(), (**value).clone());
+                let body_ty = self.infer_with_remaining_fuel_diagnosed(
+                    &body_ctx,
+                    universe_context,
+                    body,
+                    phase,
+                    whnf_fuel,
+                    conversion_fuel,
+                    meter,
+                )?;
+                instantiate(&body_ty, value).map_err(DiagnosedKernelError::new)
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn check_with_remaining_fuel_diagnosed(
+        &self,
+        ctx: &Ctx,
+        universe_context: &UniverseContext,
+        term: &Expr,
+        expected: &Expr,
+        phase: KernelDiagnosticPhase,
+        whnf_fuel: &mut usize,
+        conversion_fuel: &mut usize,
+        meter: &mut impl KernelWorkMeter,
+    ) -> std::result::Result<(), DiagnosedKernelError> {
+        meter.increment(KernelWorkCounter::CheckCall);
+        let actual = self.infer_with_remaining_fuel_diagnosed(
+            ctx,
+            universe_context,
+            term,
+            phase,
+            whnf_fuel,
+            conversion_fuel,
+            meter,
+        )?;
+        let DiagnosedConversionRun {
+            result,
+            observation,
+            fuel_diagnostic,
+        } = self.run_diagnosed_conversion_with_remaining_fuel(
+            ctx,
+            &universe_context.params,
+            &actual,
+            expected,
+            conversion_fuel,
+            meter,
+        );
+        match result {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(DiagnosedKernelError::new(Error::TypeMismatch {
+                expected: expected.clone(),
+                actual,
+            })
+            .with_context(
+                KernelDiagnosticContext::new(phase).with_conversion(
+                    observation
+                        .map(|(comparison, _)| comparison)
+                        .unwrap_or_else(|| {
+                            KernelConversionContext::new(
+                                KernelComparisonOutcome::NotDefEq,
+                                KernelExprHead::Unknown,
+                                KernelExprHead::Unknown,
+                                0,
+                            )
+                        }),
+                ),
+            )),
+            Err(error) => {
+                let mut diagnosed = DiagnosedKernelError::new(error);
+                let mut context = KernelDiagnosticContext::new(phase);
+                let mut has_context = false;
+                if let Some((comparison, _)) = observation {
+                    context = context.with_conversion(comparison);
+                    has_context = true;
+                }
+                if let Some(fuel_diagnostic) = fuel_diagnostic {
+                    context = context.with_kernel_fuel(fuel_diagnostic);
+                    has_context = true;
+                }
+                if has_context {
+                    diagnosed = diagnosed.with_context(context);
+                }
+                Err(diagnosed)
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn expect_sort_with_remaining_fuel_diagnosed(
+        &self,
+        ctx: &Ctx,
+        universe_context: &UniverseContext,
+        term: &Expr,
+        phase: KernelDiagnosticPhase,
+        whnf_fuel: &mut usize,
+        conversion_fuel: &mut usize,
+        meter: &mut impl KernelWorkMeter,
+    ) -> std::result::Result<Level, DiagnosedKernelError> {
+        let ty = self.infer_with_remaining_fuel_diagnosed(
+            ctx,
+            universe_context,
+            term,
+            phase,
+            whnf_fuel,
+            conversion_fuel,
+            meter,
+        )?;
+        match self.whnf_diagnosed_with_remaining_fuel(
+            ctx,
+            &universe_context.params,
+            &ty,
+            phase,
+            whnf_fuel,
+            meter,
+        )? {
+            Expr::Sort(level) => Ok(level),
+            actual => Err(DiagnosedKernelError::new(Error::ExpectedSort { actual })),
+        }
+    }
+
     fn check_constructor_decl(
         &self,
         data: &InductiveDecl,
@@ -2488,6 +3785,147 @@ impl Env {
         let result = self.whnf(&Ctx::new(), &universe_context.params, &result)?;
         self.check_constructor_result(data, constructor, domains.len(), result)?;
         self.check_constructor_universe_bounds(data, constructor, &domains, universe_context)
+    }
+
+    fn check_constructor_decl_diagnosed(
+        &self,
+        data: &InductiveDecl,
+        constructor: &ConstructorDecl,
+        universe_context: &UniverseContext,
+        limits: KernelDiagnosticFuelLimits,
+        meter: &mut impl KernelWorkMeter,
+    ) -> std::result::Result<(), DiagnosedKernelError> {
+        self.expect_sort_in_universe_context_diagnosed(
+            &Ctx::new(),
+            universe_context,
+            &constructor.ty,
+            KernelDiagnosticPhase::InductiveConstructor,
+            limits,
+            meter,
+        )?;
+        let (domains, result) = peel_pi_domains(&constructor.ty);
+        for (domain_index, domain) in domains.iter().enumerate() {
+            check_constructor_domain_positive(self, data, &constructor.name, domain_index, domain)
+                .map_err(DiagnosedKernelError::new)?;
+        }
+
+        let result = self.whnf_diagnosed(
+            &Ctx::new(),
+            &universe_context.params,
+            &result,
+            KernelDiagnosticPhase::InductiveConstructor,
+            limits.whnf,
+            meter,
+        )?;
+        self.check_constructor_result(data, constructor, domains.len(), result)
+            .map_err(DiagnosedKernelError::new)?;
+        self.check_constructor_universe_bounds_diagnosed(
+            data,
+            constructor,
+            &domains,
+            universe_context,
+            limits,
+            meter,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn check_mutual_constructor_decl_diagnosed(
+        &self,
+        block: &MutualInductiveBlock,
+        data: &InductiveDecl,
+        constructor: &ConstructorDecl,
+        universe_context: &UniverseContext,
+        limits: KernelDiagnosticFuelLimits,
+        meter: &mut impl KernelWorkMeter,
+    ) -> std::result::Result<(), DiagnosedKernelError> {
+        self.expect_sort_in_universe_context_diagnosed(
+            &Ctx::new(),
+            universe_context,
+            &constructor.ty,
+            KernelDiagnosticPhase::InductiveConstructor,
+            limits,
+            meter,
+        )?;
+        let (domains, result) = peel_pi_domains(&constructor.ty);
+        for (domain_index, domain) in domains.iter().enumerate() {
+            check_mutual_constructor_domain_positive(
+                self,
+                block,
+                data,
+                &constructor.name,
+                domain_index,
+                domain,
+            )
+            .map_err(DiagnosedKernelError::new)?;
+        }
+
+        let result = self.whnf_diagnosed(
+            &Ctx::new(),
+            &universe_context.params,
+            &result,
+            KernelDiagnosticPhase::InductiveConstructor,
+            limits.whnf,
+            meter,
+        )?;
+        self.check_constructor_result(data, constructor, domains.len(), result)
+            .map_err(DiagnosedKernelError::new)?;
+        self.check_constructor_universe_bounds_diagnosed(
+            data,
+            constructor,
+            &domains,
+            universe_context,
+            limits,
+            meter,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn check_constructor_universe_bounds_diagnosed(
+        &self,
+        data: &InductiveDecl,
+        constructor: &ConstructorDecl,
+        domains: &[Expr],
+        universe_context: &UniverseContext,
+        limits: KernelDiagnosticFuelLimits,
+        meter: &mut impl KernelWorkMeter,
+    ) -> std::result::Result<(), DiagnosedKernelError> {
+        let inductive_sort = normalize_level(data.sort.clone());
+        if inductive_sort == Level::zero() {
+            return Ok(());
+        }
+
+        let mut ctx = Ctx::new();
+        let mut whnf_fuel = limits.whnf;
+        let mut conversion_fuel = limits.conversion;
+        for (domain_index, domain) in domains.iter().enumerate() {
+            let field_level = self.expect_sort_with_remaining_fuel_diagnosed(
+                &ctx,
+                universe_context,
+                domain,
+                KernelDiagnosticPhase::InductiveConstructor,
+                &mut whnf_fuel,
+                &mut conversion_fuel,
+                meter,
+            )?;
+            if domain_index >= data.params.len()
+                && !universe_context
+                    .entails_level_le(&field_level, &inductive_sort)
+                    .map_err(DiagnosedKernelError::new)?
+            {
+                return Err(DiagnosedKernelError::new(
+                    Error::ConstructorUniverseBoundViolation {
+                        inductive: data.name.clone(),
+                        constructor: constructor.name.clone(),
+                        field_index: domain_index - data.params.len(),
+                        field_level: normalize_level(field_level),
+                        inductive_sort,
+                    },
+                ));
+            }
+            ctx.push_assumption("_", domain.clone());
+        }
+        Ok(())
     }
 
     fn check_constructor_universe_bounds(
@@ -2692,6 +4130,235 @@ impl Env {
                         recursor.name, constructor.name
                     )));
                 }
+                constructor_index += 1;
+            }
+        }
+
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn check_recursor_decl_diagnosed(
+        &self,
+        data: &InductiveDecl,
+        recursor: &RecursorDecl,
+        rules: &RecursorRules,
+        universe_context: &UniverseContext,
+        limits: KernelDiagnosticFuelLimits,
+        meter: &mut impl KernelWorkMeter,
+    ) -> std::result::Result<(), DiagnosedKernelError> {
+        if rules.minor_start != data.params.len() + 1 {
+            return Err(DiagnosedKernelError::new(Error::InvalidInductive(format!(
+                "{} recursor minor_start must be params + motive",
+                data.name
+            ))));
+        }
+        if rules.major_index != rules.minor_start + data.constructors.len() + data.indices.len() {
+            return Err(DiagnosedKernelError::new(Error::InvalidInductive(format!(
+                "{} recursor major_index must follow constructor minor premises and indices",
+                data.name
+            ))));
+        }
+
+        let (domains, result) = peel_pi_domains(&recursor.ty);
+        if domains.len() <= rules.major_index {
+            return Err(DiagnosedKernelError::new(Error::InvalidInductive(format!(
+                "{} recursor has no major premise",
+                recursor.name
+            ))));
+        }
+        if domains.len() != rules.major_index + 1 {
+            return Err(DiagnosedKernelError::new(Error::InvalidInductive(format!(
+                "{} recursor major premise must be the final binder in kernel core",
+                recursor.name
+            ))));
+        }
+
+        self.check_recursor_params_diagnosed(
+            data,
+            recursor,
+            &domains,
+            universe_context,
+            limits,
+            meter,
+        )?;
+
+        let motive_domain = domains.get(data.params.len()).ok_or_else(|| {
+            DiagnosedKernelError::new(Error::InvalidInductive(format!(
+                "{} recursor is missing motive",
+                recursor.name
+            )))
+        })?;
+        self.check_motive_domain(data, recursor, motive_domain)
+            .map_err(DiagnosedKernelError::new)?;
+
+        self.check_recursor_indices_diagnosed(
+            data,
+            recursor,
+            rules,
+            &domains,
+            universe_context,
+            limits,
+            meter,
+        )?;
+
+        let major_domain = &domains[rules.major_index];
+        self.check_recursor_target(
+            data,
+            recursor,
+            major_domain,
+            "major premise",
+            rules.major_index,
+            rules.minor_start + data.constructors.len(),
+        )
+        .map_err(DiagnosedKernelError::new)?;
+        self.check_recursor_result_diagnosed(
+            data,
+            recursor,
+            rules,
+            &domains,
+            &result,
+            universe_context,
+            limits,
+            meter,
+        )?;
+
+        for (constructor_index, constructor) in data.constructors.iter().enumerate() {
+            let minor_index = rules.minor_start + constructor_index;
+            let minor_domain = &domains[minor_index];
+            let expected_minor = expected_minor_type(data, constructor, constructor_index)
+                .map_err(DiagnosedKernelError::new)?;
+            let prefix_ctx = recursor_prefix_ctx(&domains[..minor_index]);
+            self.ensure_defeq_diagnosed_metered(
+                &prefix_ctx,
+                &universe_context.params,
+                minor_domain,
+                &expected_minor,
+                Error::InvalidInductive(format!(
+                    "{} minor premise for {} does not match constructor",
+                    recursor.name, constructor.name
+                )),
+                KernelDiagnosticPhase::InductiveRecursor,
+                limits.conversion,
+                meter,
+            )?;
+        }
+
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn check_mutual_recursor_decl_diagnosed(
+        &self,
+        block: &MutualInductiveBlock,
+        data: &InductiveDecl,
+        recursor: &RecursorDecl,
+        rules: &RecursorRules,
+        universe_context: &UniverseContext,
+        limits: KernelDiagnosticFuelLimits,
+        meter: &mut impl KernelWorkMeter,
+    ) -> std::result::Result<(), DiagnosedKernelError> {
+        let param_count = data.params.len();
+        let motive_count = block.inductives.len();
+        let minor_start = param_count + motive_count;
+        let constructor_count = mutual_constructor_count(block);
+        if rules.minor_start != minor_start {
+            return Err(DiagnosedKernelError::new(Error::InvalidInductive(format!(
+                "{} mutual recursor minor_start must follow params and motives",
+                recursor.name
+            ))));
+        }
+        if rules.major_index != minor_start + constructor_count + data.indices.len() {
+            return Err(DiagnosedKernelError::new(Error::InvalidInductive(format!(
+                "{} mutual recursor major_index must follow all minor premises and target indices",
+                recursor.name
+            ))));
+        }
+
+        let (domains, result) = peel_pi_domains(&recursor.ty);
+        if domains.len() != rules.major_index + 1 {
+            return Err(DiagnosedKernelError::new(Error::InvalidInductive(format!(
+                "{} mutual recursor major premise must be the final binder",
+                recursor.name
+            ))));
+        }
+
+        self.check_recursor_params_diagnosed(
+            data,
+            recursor,
+            &domains,
+            universe_context,
+            limits,
+            meter,
+        )?;
+        for (family_index, family) in block.inductives.iter().enumerate() {
+            let motive_domain = domains.get(param_count + family_index).ok_or_else(|| {
+                DiagnosedKernelError::new(Error::InvalidInductive(format!(
+                    "{} mutual recursor is missing motive for {}",
+                    recursor.name, family.name
+                )))
+            })?;
+            self.check_motive_domain(family, recursor, motive_domain)
+                .map_err(DiagnosedKernelError::new)?;
+        }
+
+        let target_family_index =
+            mutual_family_index(block, &data.name).map_err(DiagnosedKernelError::new)?;
+        let index_start = rules.minor_start + constructor_count;
+        self.check_recursor_indices_at_diagnosed(
+            data,
+            recursor,
+            index_start,
+            &domains,
+            universe_context,
+            limits,
+            meter,
+        )?;
+        self.check_recursor_target(
+            data,
+            recursor,
+            &domains[rules.major_index],
+            "major premise",
+            rules.major_index,
+            index_start,
+        )
+        .map_err(DiagnosedKernelError::new)?;
+        self.check_mutual_recursor_result_diagnosed(
+            MutualRecursorResultCheck {
+                data,
+                recursor,
+                rules,
+                domains: &domains,
+                result: &result,
+                universe_context,
+                family_index: target_family_index,
+                index_start,
+            },
+            limits,
+            meter,
+        )?;
+
+        let mut constructor_index = 0usize;
+        for (family_index, family) in block.inductives.iter().enumerate() {
+            for constructor in &family.constructors {
+                let minor_index = rules.minor_start + constructor_index;
+                let expected_minor =
+                    expected_mutual_minor_type(block, family_index, constructor, constructor_index)
+                        .map_err(DiagnosedKernelError::new)?;
+                let prefix_ctx = recursor_prefix_ctx(&domains[..minor_index]);
+                self.ensure_defeq_diagnosed_metered(
+                    &prefix_ctx,
+                    &universe_context.params,
+                    &domains[minor_index],
+                    &expected_minor,
+                    Error::InvalidInductive(format!(
+                        "{} minor premise for {} does not match mutual constructor",
+                        recursor.name, constructor.name
+                    )),
+                    KernelDiagnosticPhase::InductiveRecursor,
+                    limits.conversion,
+                    meter,
+                )?;
                 constructor_index += 1;
             }
         }
@@ -2996,6 +4663,196 @@ impl Env {
         }
     }
 
+    fn check_recursor_params_diagnosed(
+        &self,
+        data: &InductiveDecl,
+        recursor: &RecursorDecl,
+        domains: &[Expr],
+        universe_context: &UniverseContext,
+        limits: KernelDiagnosticFuelLimits,
+        meter: &mut impl KernelWorkMeter,
+    ) -> std::result::Result<(), DiagnosedKernelError> {
+        if domains.len() < data.params.len() {
+            return Err(DiagnosedKernelError::new(Error::InvalidInductive(format!(
+                "{} recursor is missing parameter binders",
+                recursor.name
+            ))));
+        }
+
+        let mut ctx = Ctx::new();
+        for (param_index, param) in data.params.iter().enumerate() {
+            self.expect_sort_in_universe_context_diagnosed(
+                &ctx,
+                universe_context,
+                &param.ty,
+                KernelDiagnosticPhase::InductiveRecursor,
+                limits,
+                meter,
+            )?;
+            self.ensure_defeq_diagnosed_metered(
+                &ctx,
+                &universe_context.params,
+                &domains[param_index],
+                &param.ty,
+                Error::InvalidInductive(format!(
+                    "{} recursor parameter {} does not match inductive",
+                    recursor.name, param.name
+                )),
+                KernelDiagnosticPhase::InductiveRecursor,
+                limits.conversion,
+                meter,
+            )?;
+            ctx.push_assumption(param.name.clone(), param.ty.clone());
+        }
+
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn check_recursor_indices_diagnosed(
+        &self,
+        data: &InductiveDecl,
+        recursor: &RecursorDecl,
+        rules: &RecursorRules,
+        domains: &[Expr],
+        universe_context: &UniverseContext,
+        limits: KernelDiagnosticFuelLimits,
+        meter: &mut impl KernelWorkMeter,
+    ) -> std::result::Result<(), DiagnosedKernelError> {
+        let index_start = rules.minor_start + data.constructors.len();
+        self.check_recursor_indices_at_diagnosed(
+            data,
+            recursor,
+            index_start,
+            domains,
+            universe_context,
+            limits,
+            meter,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn check_recursor_indices_at_diagnosed(
+        &self,
+        data: &InductiveDecl,
+        recursor: &RecursorDecl,
+        index_start: usize,
+        domains: &[Expr],
+        universe_context: &UniverseContext,
+        limits: KernelDiagnosticFuelLimits,
+        meter: &mut impl KernelWorkMeter,
+    ) -> std::result::Result<(), DiagnosedKernelError> {
+        let mut source_to_target = (0..data.params.len()).collect::<Vec<_>>();
+        for (index, expected) in data.indices.iter().enumerate() {
+            let domain_index = index_start + index;
+            let Some(actual) = domains.get(domain_index) else {
+                return Err(DiagnosedKernelError::new(Error::InvalidInductive(format!(
+                    "{} recursor is missing index binder {}",
+                    recursor.name, expected.name
+                ))));
+            };
+            let source_ctx_len = data.params.len() + index;
+            let target_ctx_len = domain_index;
+            let expected_ty = remap_bvars(
+                &expected.ty,
+                source_ctx_len,
+                target_ctx_len,
+                &source_to_target,
+            )
+            .map_err(DiagnosedKernelError::new)?;
+            let ctx = recursor_prefix_ctx(&domains[..domain_index]);
+            self.ensure_defeq_diagnosed_metered(
+                &ctx,
+                &universe_context.params,
+                actual,
+                &expected_ty,
+                Error::InvalidInductive(format!(
+                    "{} recursor index {} does not match inductive",
+                    recursor.name, expected.name
+                )),
+                KernelDiagnosticPhase::InductiveRecursor,
+                limits.conversion,
+                meter,
+            )?;
+            source_to_target.push(domain_index);
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn check_recursor_result_diagnosed(
+        &self,
+        data: &InductiveDecl,
+        recursor: &RecursorDecl,
+        rules: &RecursorRules,
+        domains: &[Expr],
+        result: &Expr,
+        universe_context: &UniverseContext,
+        limits: KernelDiagnosticFuelLimits,
+        meter: &mut impl KernelWorkMeter,
+    ) -> std::result::Result<(), DiagnosedKernelError> {
+        let index_start = rules.minor_start + data.constructors.len();
+        let index_args = (0..data.indices.len())
+            .map(|index| bvar_for_abs(domains.len(), index_start + index))
+            .collect::<Result<Vec<_>>>()
+            .map_err(DiagnosedKernelError::new)?;
+        let expected = motive_app(
+            domains.len(),
+            data.params.len(),
+            index_args,
+            bvar_for_abs(domains.len(), rules.major_index).map_err(DiagnosedKernelError::new)?,
+        )
+        .map_err(DiagnosedKernelError::new)?;
+        let result_ctx = recursor_prefix_ctx(domains);
+        self.ensure_defeq_diagnosed_metered(
+            &result_ctx,
+            &universe_context.params,
+            result,
+            &expected,
+            Error::InvalidInductive(format!(
+                "{} result must apply motive to the major premise",
+                recursor.name
+            )),
+            KernelDiagnosticPhase::InductiveRecursor,
+            limits.conversion,
+            meter,
+        )
+    }
+
+    fn check_mutual_recursor_result_diagnosed(
+        &self,
+        check: MutualRecursorResultCheck<'_>,
+        limits: KernelDiagnosticFuelLimits,
+        meter: &mut impl KernelWorkMeter,
+    ) -> std::result::Result<(), DiagnosedKernelError> {
+        let index_args = (0..check.data.indices.len())
+            .map(|index| bvar_for_abs(check.domains.len(), check.index_start + index))
+            .collect::<Result<Vec<_>>>()
+            .map_err(DiagnosedKernelError::new)?;
+        let expected = motive_app(
+            check.domains.len(),
+            check.data.params.len() + check.family_index,
+            index_args,
+            bvar_for_abs(check.domains.len(), check.rules.major_index)
+                .map_err(DiagnosedKernelError::new)?,
+        )
+        .map_err(DiagnosedKernelError::new)?;
+        let result_ctx = recursor_prefix_ctx(check.domains);
+        self.ensure_defeq_diagnosed_metered(
+            &result_ctx,
+            &check.universe_context.params,
+            check.result,
+            &expected,
+            Error::InvalidInductive(format!(
+                "{} result must apply the matching mutual motive to the major premise",
+                check.recursor.name
+            )),
+            KernelDiagnosticPhase::InductiveRecursor,
+            limits.conversion,
+            meter,
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn whnf_with_remaining_fuel_memo(
         &self,
@@ -3062,7 +4919,7 @@ impl Env {
                             },
                         ) = self.decls.get(name)
                         {
-                            record_reduction(&mut state.counters, KernelWorkCounter::DeltaStep);
+                            state.counters.record_delta_reduction(name);
                             current = subst_levels_expr(value, universe_params, levels);
                         } else {
                             return Ok(current);
@@ -3159,7 +5016,7 @@ impl Env {
                         },
                     ) = self.decls.get(name)
                     {
-                        record_reduction(meter, KernelWorkCounter::DeltaStep);
+                        meter.record_delta_reduction(name);
                         current = subst_levels_expr(value, universe_params, levels);
                     } else {
                         return Ok(current);
@@ -3691,9 +5548,11 @@ impl Env {
         lhs: &Expr,
         rhs: &Expr,
         fuel: &mut usize,
+        meter: &mut impl KernelWorkMeter,
         recorder: &mut KernelConversionRecorder,
         depth: u32,
     ) -> Result<bool> {
+        meter.increment(KernelWorkCounter::DefeqCall);
         if *fuel == 0 {
             recorder.record(KernelComparisonOutcome::FuelExhausted, lhs, rhs, depth);
             return Err(Error::ResourceLimit {
@@ -3702,51 +5561,49 @@ impl Env {
         }
         *fuel -= 1;
         if quick_syntactic_eq(lhs, rhs) {
+            meter.increment(KernelWorkCounter::QuickEqualityHit);
             return Ok(true);
         }
 
-        let lhs = match self.whnf_with_remaining_fuel(
+        let lhs_token = recorder.push_path(KernelComparisonPathStep::WhnfLeft);
+        let lhs_result = self.whnf_with_remaining_fuel(
             ctx,
             delta,
             lhs,
             fuel,
             ResourceLimitKind::Conversion,
-            &mut DisabledKernelWorkMeter,
+            meter,
+        );
+        if matches!(
+            lhs_result,
+            Err(Error::ResourceLimit {
+                kind: ResourceLimitKind::Conversion
+            })
         ) {
-            Ok(lhs) => lhs,
-            Err(error) => {
-                if matches!(
-                    error,
-                    Error::ResourceLimit {
-                        kind: ResourceLimitKind::Conversion
-                    }
-                ) {
-                    recorder.record(KernelComparisonOutcome::FuelExhausted, lhs, rhs, depth);
-                }
-                return Err(error);
-            }
-        };
-        let rhs = match self.whnf_with_remaining_fuel(
+            recorder.record(KernelComparisonOutcome::FuelExhausted, lhs, rhs, depth);
+        }
+        recorder.pop_path(lhs_token);
+        let lhs = lhs_result?;
+
+        let rhs_token = recorder.push_path(KernelComparisonPathStep::WhnfRight);
+        let rhs_result = self.whnf_with_remaining_fuel(
             ctx,
             delta,
             rhs,
             fuel,
             ResourceLimitKind::Conversion,
-            &mut DisabledKernelWorkMeter,
+            meter,
+        );
+        if matches!(
+            rhs_result,
+            Err(Error::ResourceLimit {
+                kind: ResourceLimitKind::Conversion
+            })
         ) {
-            Ok(rhs) => rhs,
-            Err(error) => {
-                if matches!(
-                    error,
-                    Error::ResourceLimit {
-                        kind: ResourceLimitKind::Conversion
-                    }
-                ) {
-                    recorder.record(KernelComparisonOutcome::FuelExhausted, &lhs, rhs, depth);
-                }
-                return Err(error);
-            }
-        };
+            recorder.record(KernelComparisonOutcome::FuelExhausted, &lhs, rhs, depth);
+        }
+        recorder.pop_path(rhs_token);
+        let rhs = rhs_result?;
 
         let next_depth = depth.saturating_add(1);
         let result = match (&lhs, &rhs) {
@@ -3763,14 +5620,20 @@ impl Env {
                 },
             ) => Ok(lhs_name == rhs_name && levels_eq(lhs_levels, rhs_levels)),
             (Expr::App(lhs_f, lhs_a), Expr::App(rhs_f, rhs_a)) => {
-                if !self.is_defeq_with_remaining_fuel_diagnosed(
-                    ctx, delta, lhs_f, rhs_f, fuel, recorder, next_depth,
-                )? {
+                let function_token = recorder.push_path(KernelComparisonPathStep::AppFunction);
+                let function_result = self.is_defeq_with_remaining_fuel_diagnosed(
+                    ctx, delta, lhs_f, rhs_f, fuel, meter, recorder, next_depth,
+                );
+                recorder.pop_path(function_token);
+                if !function_result? {
                     Ok(false)
                 } else {
-                    self.is_defeq_with_remaining_fuel_diagnosed(
-                        ctx, delta, lhs_a, rhs_a, fuel, recorder, next_depth,
-                    )
+                    let argument_token = recorder.push_path(KernelComparisonPathStep::AppArgument);
+                    let argument_result = self.is_defeq_with_remaining_fuel_diagnosed(
+                        ctx, delta, lhs_a, rhs_a, fuel, meter, recorder, next_depth,
+                    );
+                    recorder.pop_path(argument_token);
+                    argument_result
                 }
             }
             (
@@ -3785,16 +5648,22 @@ impl Env {
                     ..
                 },
             ) => {
-                if !self.is_defeq_with_remaining_fuel_diagnosed(
-                    ctx, delta, lhs_ty, rhs_ty, fuel, recorder, next_depth,
-                )? {
+                let domain_token = recorder.push_path(KernelComparisonPathStep::PiDomain);
+                let domain_result = self.is_defeq_with_remaining_fuel_diagnosed(
+                    ctx, delta, lhs_ty, rhs_ty, fuel, meter, recorder, next_depth,
+                );
+                recorder.pop_path(domain_token);
+                if !domain_result? {
                     Ok(false)
                 } else {
                     let mut body_ctx = ctx.clone();
                     body_ctx.push_assumption(binder.clone(), (**lhs_ty).clone());
-                    self.is_defeq_with_remaining_fuel_diagnosed(
-                        &body_ctx, delta, lhs_body, rhs_body, fuel, recorder, next_depth,
-                    )
+                    let body_token = recorder.push_path(KernelComparisonPathStep::PiBody);
+                    let body_result = self.is_defeq_with_remaining_fuel_diagnosed(
+                        &body_ctx, delta, lhs_body, rhs_body, fuel, meter, recorder, next_depth,
+                    );
+                    recorder.pop_path(body_token);
+                    body_result
                 }
             }
             (
@@ -3809,16 +5678,22 @@ impl Env {
                     ..
                 },
             ) => {
-                if !self.is_defeq_with_remaining_fuel_diagnosed(
-                    ctx, delta, lhs_ty, rhs_ty, fuel, recorder, next_depth,
-                )? {
+                let domain_token = recorder.push_path(KernelComparisonPathStep::LambdaDomain);
+                let domain_result = self.is_defeq_with_remaining_fuel_diagnosed(
+                    ctx, delta, lhs_ty, rhs_ty, fuel, meter, recorder, next_depth,
+                );
+                recorder.pop_path(domain_token);
+                if !domain_result? {
                     Ok(false)
                 } else {
                     let mut body_ctx = ctx.clone();
                     body_ctx.push_assumption(binder.clone(), (**lhs_ty).clone());
-                    self.is_defeq_with_remaining_fuel_diagnosed(
-                        &body_ctx, delta, lhs_body, rhs_body, fuel, recorder, next_depth,
-                    )
+                    let body_token = recorder.push_path(KernelComparisonPathStep::LambdaBody);
+                    let body_result = self.is_defeq_with_remaining_fuel_diagnosed(
+                        &body_ctx, delta, lhs_body, rhs_body, fuel, meter, recorder, next_depth,
+                    );
+                    recorder.pop_path(body_token);
+                    body_result
                 }
             }
             _ => Ok(false),
@@ -3833,6 +5708,17 @@ impl Env {
 fn record_reduction(meter: &mut impl KernelWorkMeter, counter: KernelWorkCounter) {
     meter.increment(counter);
     meter.increment(KernelWorkCounter::PhysicalReduction);
+}
+
+fn operation_exhausted<T>(result: &Result<T>, resource: KernelFuelResource) -> bool {
+    let expected_kind = match resource {
+        KernelFuelResource::Whnf => ResourceLimitKind::Whnf,
+        KernelFuelResource::Conversion => ResourceLimitKind::Conversion,
+    };
+    matches!(
+        result,
+        Err(Error::ResourceLimit { kind }) if *kind == expected_kind
+    )
 }
 
 fn replay_memo_fuel(
@@ -4723,6 +6609,282 @@ mod memo_tests {
     use super::*;
     use crate::{nat, nat_zero};
 
+    #[derive(Default)]
+    struct DetailedTestMeter {
+        counters: KernelWorkCounters,
+        delta_constants: Vec<String>,
+    }
+
+    impl KernelWorkMeter for DetailedTestMeter {
+        fn increment(&mut self, counter: KernelWorkCounter) {
+            self.counters.increment(counter);
+        }
+
+        fn record_delta_reduction(&mut self, constant: &str) {
+            self.delta_constants.push(constant.to_owned());
+            self.counters.record_delta_reduction(constant);
+        }
+    }
+
+    const TEST_LOGICAL_FUEL_EVENT_LIMIT: usize = 64;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct TestLogicalFuelEvent {
+        resource: KernelFuelResource,
+        spent: usize,
+        exhausted: bool,
+    }
+
+    /// Test-only view of the logical fuel event stream. The fixed array keeps
+    /// this oracle bounded without adding event history to production meters.
+    struct TestLogicalFuelRecorder {
+        meter: KernelDiagnosticWorkMeter,
+        events: [Option<TestLogicalFuelEvent>; TEST_LOGICAL_FUEL_EVENT_LIMIT],
+        event_count: usize,
+        omitted_events: u64,
+    }
+
+    impl TestLogicalFuelRecorder {
+        fn new(mode: KernelFuelReportMode) -> Self {
+            Self {
+                meter: KernelDiagnosticWorkMeter::new(mode),
+                events: [None; TEST_LOGICAL_FUEL_EVENT_LIMIT],
+                event_count: 0,
+                omitted_events: 0,
+            }
+        }
+
+        fn events(&self) -> &[Option<TestLogicalFuelEvent>] {
+            &self.events[..self.event_count]
+        }
+
+        fn counters(&self) -> KernelWorkCounters {
+            self.meter.counters
+        }
+    }
+
+    impl KernelWorkMeter for TestLogicalFuelRecorder {
+        fn increment(&mut self, counter: KernelWorkCounter) {
+            self.meter.increment(counter);
+        }
+
+        fn record_fuel(&mut self, resource: KernelFuelResource, spent: usize, exhausted: bool) {
+            self.meter.record_fuel(resource, spent, exhausted);
+            let event = TestLogicalFuelEvent {
+                resource,
+                spent,
+                exhausted,
+            };
+            if self.event_count < TEST_LOGICAL_FUEL_EVENT_LIMIT {
+                self.events[self.event_count] = Some(event);
+                self.event_count += 1;
+            } else {
+                self.omitted_events = self.omitted_events.saturating_add(1);
+            }
+        }
+
+        fn record_delta_reduction(&mut self, constant: &str) {
+            self.meter.record_delta_reduction(constant);
+        }
+
+        fn merge_counters(&mut self, counters: KernelWorkCounters) {
+            self.meter.merge_counters(counters);
+        }
+
+        fn fuel_report_mode(&self) -> KernelFuelReportMode {
+            self.meter.fuel_report_mode()
+        }
+
+        fn snapshot(&self) -> KernelWorkSnapshot {
+            self.meter.snapshot()
+        }
+
+        fn retained_delta_constants(&self) -> Option<KernelDeltaHotsetSummary> {
+            self.meter.retained_delta_constants()
+        }
+    }
+
+    fn multi_conversion_exhaustion_fixture(
+        execution_options: KernelExecutionOptions,
+    ) -> (Env, Decl) {
+        let mut env =
+            Env::with_builtins_and_execution_options(execution_options).expect("builtins");
+        let type0 = Expr::sort(Level::succ(Level::zero()));
+        for (name, value) in [
+            ("Neutral.AliasArg", nat()),
+            ("Neutral.AliasExpected1", nat()),
+            (
+                "Neutral.AliasExpected2",
+                Expr::konst("Neutral.AliasExpected1", vec![]),
+            ),
+        ] {
+            env.add_def(name, vec![], type0.clone(), value, Reducibility::Reducible)
+                .expect("fixture alias");
+        }
+
+        let alias_arg = Expr::konst("Neutral.AliasArg", vec![]);
+        let alias_expected = Expr::konst("Neutral.AliasExpected2", vec![]);
+        let value = Expr::app(
+            Expr::app(
+                Expr::lam(
+                    "x",
+                    alias_arg.clone(),
+                    Expr::lam(
+                        "y",
+                        alias_arg.clone(),
+                        Expr::lam("z", alias_arg.clone(), Expr::bvar(0)),
+                    ),
+                ),
+                nat_zero(),
+            ),
+            nat_zero(),
+        );
+        let declaration = Decl::Def {
+            name: "Neutral.FailingDef".to_owned(),
+            universe_params: vec![],
+            ty: Expr::pi("z", alias_expected.clone(), alias_expected),
+            value,
+            reducibility: Reducibility::Reducible,
+        };
+        (env, declaration)
+    }
+
+    fn admit_with_test_logical_fuel_recorder(
+        mut env: Env,
+        declaration: Decl,
+        mode: KernelFuelReportMode,
+        limits: KernelDiagnosticFuelLimits,
+    ) -> (
+        Env,
+        std::result::Result<(), DiagnosedKernelError>,
+        TestLogicalFuelRecorder,
+    ) {
+        let mut recorder = TestLogicalFuelRecorder::new(mode);
+        if env.execution_options.needs_reuse_state() {
+            KernelWorkCounters::add(
+                &mut recorder.meter.counters.memo_ineligible_diagnosed,
+                1,
+                &mut recorder.meter.counters.overflowed,
+            );
+        }
+        let result = env.add_decl_diagnosed_metered(declaration, limits, &mut recorder);
+        (env, result, recorder)
+    }
+
+    fn admit_with_public_mode_and_sink(
+        mut env: Env,
+        declaration: Decl,
+        mode: KernelFuelReportMode,
+        limits: KernelDiagnosticFuelLimits,
+    ) -> (
+        Env,
+        std::result::Result<KernelDiagnosedAdmission, DiagnosedKernelError>,
+        KernelWorkCounters,
+    ) {
+        let sink = KernelWorkCounterSink::default();
+        env.work_counter_sink = Some(sink.clone());
+        let result = env.add_decl_diagnosed_with_options_and_limits(
+            declaration,
+            KernelDiagnosticOptions { fuel_report: mode },
+            limits,
+        );
+        (env, result, sink.snapshot())
+    }
+
+    // KFH-19 keeps this budget hook inside the kernel unit-test module so
+    // production callers cannot select non-production fuel limits.
+    fn kernel_fuel_rollout_exhaustion_fixture(
+        mode: KernelFuelReportMode,
+    ) -> (Env, DiagnosedKernelError, KernelWorkCounters) {
+        let mut env = Env::with_builtins().unwrap();
+        let type0 = Expr::sort(Level::succ(Level::zero()));
+        for (name, value) in [
+            ("Observed.AliasArg", nat()),
+            ("Observed.AliasExpected1", nat()),
+            (
+                "Observed.AliasExpected2",
+                Expr::konst("Observed.AliasExpected1", vec![]),
+            ),
+        ] {
+            env.add_def(name, vec![], type0.clone(), value, Reducibility::Reducible)
+                .unwrap();
+        }
+
+        let nested_successful_conversions = Expr::app(
+            Expr::lam(
+                "outer",
+                Expr::konst("Observed.AliasArg", vec![]),
+                Expr::app(
+                    Expr::lam(
+                        "inner",
+                        Expr::konst("Observed.AliasArg", vec![]),
+                        nat_zero(),
+                    ),
+                    nat_zero(),
+                ),
+            ),
+            nat_zero(),
+        );
+        let declaration = Decl::Def {
+            name: "Observed.FailingDef".to_owned(),
+            universe_params: vec![],
+            ty: Expr::pi(
+                "input",
+                nat(),
+                Expr::konst("Observed.AliasExpected2", vec![]),
+            ),
+            value: Expr::lam("input", nat(), nested_successful_conversions),
+            reducibility: Reducibility::Reducible,
+        };
+
+        let sink = KernelWorkCounterSink::default();
+        env.work_counter_sink = Some(sink.clone());
+        env.infer(&Ctx::new(), &[], &nat_zero()).unwrap();
+        let error = env
+            .add_decl_diagnosed_with_options_and_limits(
+                declaration,
+                KernelDiagnosticOptions { fuel_report: mode },
+                KernelDiagnosticFuelLimits {
+                    whnf: 32,
+                    conversion: 7,
+                },
+            )
+            .unwrap_err();
+        (env, error, sink.snapshot())
+    }
+
+    fn diagnosed_conversion_run(
+        env: &Env,
+        lhs: &Expr,
+        rhs: &Expr,
+        fuel: usize,
+        mode: KernelFuelReportMode,
+    ) -> DiagnosedConversionRun {
+        let mut meter = KernelDiagnosticWorkMeter::new(mode);
+        env.run_diagnosed_conversion(&Ctx::new(), &[], lhs, rhs, fuel, &mut meter)
+    }
+
+    fn diagnosed_conversion_error(
+        env: &Env,
+        lhs: &Expr,
+        rhs: &Expr,
+        fuel: usize,
+        mode: KernelFuelReportMode,
+    ) -> DiagnosedKernelError {
+        Env::finish_diagnosed_conversion(
+            diagnosed_conversion_run(env, lhs, rhs, fuel, mode),
+            KernelDiagnosticPhase::DefinitionalEquality,
+        )
+        .unwrap_err()
+    }
+
+    fn fuel_diagnostic(error: &DiagnosedKernelError) -> &KernelFuelDiagnostic {
+        error
+            .context()
+            .and_then(KernelDiagnosticContext::kernel_fuel)
+            .expect("fixture must emit a fuel diagnostic")
+    }
+
     fn beta_owner() -> Arc<Expr> {
         Arc::new(Expr::app(
             Expr::lam("x", Expr::sort(Level::zero()), Expr::bvar(0)),
@@ -4761,6 +6923,18 @@ mod memo_tests {
 
         assert!(off_result && memo_result);
         assert_eq!(memo_counters.logical_fuel, off_counters.logical_fuel);
+        assert_eq!(off_counters.fuel.conversion.calls, 1);
+        assert_eq!(memo_counters.fuel.conversion.calls, 1);
+        assert_eq!(off_counters.fuel.whnf.calls, 0);
+        assert_eq!(memo_counters.fuel.whnf.calls, 0);
+        assert_eq!(
+            off_counters.fuel.conversion.logical_spent,
+            off_counters.logical_fuel
+        );
+        assert_eq!(
+            memo_counters.fuel.conversion.logical_spent,
+            memo_counters.logical_fuel
+        );
         assert!(memo_counters.defeq_memo_hits > 0);
         assert!(memo_counters.memo_logical_fuel_replayed > 0);
         assert!(memo_counters.defeq_calls < off_counters.defeq_calls);
@@ -5566,5 +7740,860 @@ mod memo_tests {
             diagnosed.check_diagnosed(&Ctx::new(), &[], &term, &expected),
             env.check_diagnosed(&Ctx::new(), &[], &term, &expected),
         );
+    }
+
+    #[test]
+    fn diagnosed_fuel_exhaustion_charges_budget_once_without_failed_attempt() {
+        let env = Env::new();
+        let lhs = Expr::sort(Level::zero());
+        let rhs = Expr::sort(Level::succ(Level::zero()));
+        let mut counters = KernelWorkCounters::default();
+
+        let error = env
+            .is_defeq_diagnosed_with_fuel_and_work_counters(
+                &Ctx::new(),
+                &[],
+                &lhs,
+                &rhs,
+                2,
+                Some(&mut counters),
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            error.error(),
+            Error::ResourceLimit {
+                kind: ResourceLimitKind::Conversion
+            }
+        ));
+        assert_eq!(counters.fuel.conversion.calls, 1);
+        assert_eq!(counters.fuel.conversion.logical_spent, 2);
+        assert_eq!(counters.fuel.conversion.successful_operation_fuel, 0);
+        assert_eq!(counters.fuel.conversion.exhausted_operation_fuel, 2);
+        assert_eq!(counters.fuel.whnf.calls, 0);
+        assert_eq!(counters.logical_fuel, 2);
+        assert_eq!(counters.exhausted_fuel, 2);
+    }
+
+    #[test]
+    fn public_metered_whnf_charges_one_whnf_operation_without_failed_attempt() {
+        let sink = KernelWorkCounterSink::default();
+        let env = Env::with_execution_options_and_work_counter_sink(
+            KernelExecutionOptions::memo_off(),
+            sink.clone(),
+        );
+        let mut remaining = 2;
+
+        let result = env.whnf_with_fuel_metered(&Ctx::new(), &[], &beta_owner(), &mut remaining);
+
+        assert_eq!(
+            result,
+            Err(Error::ResourceLimit {
+                kind: ResourceLimitKind::Whnf
+            })
+        );
+        assert_eq!(remaining, 0);
+        let counters = sink.snapshot();
+        assert_eq!(counters.fuel.whnf.calls, 1);
+        assert_eq!(counters.fuel.whnf.logical_spent, 2);
+        assert_eq!(counters.fuel.whnf.successful_operation_fuel, 0);
+        assert_eq!(counters.fuel.whnf.exhausted_operation_fuel, 2);
+        assert_eq!(counters.fuel.conversion.calls, 0);
+        assert_eq!(counters.logical_fuel, 2);
+        assert_eq!(counters.exhausted_fuel, 2);
+    }
+
+    #[test]
+    fn diagnosed_nonresource_error_stays_in_successful_fuel_bucket() {
+        let env = Env::new();
+        let lhs = Expr::bvar(0);
+        let rhs = Expr::sort(Level::zero());
+        let mut counters = KernelWorkCounters::default();
+
+        let error = env
+            .is_defeq_diagnosed_with_fuel_and_work_counters(
+                &Ctx::new(),
+                &[],
+                &lhs,
+                &rhs,
+                5,
+                Some(&mut counters),
+            )
+            .unwrap_err();
+
+        assert!(matches!(error.error(), Error::InvalidBVar(0)));
+        assert_eq!(counters.fuel.conversion.calls, 1);
+        assert_eq!(counters.fuel.conversion.logical_spent, 2);
+        assert_eq!(counters.fuel.conversion.successful_operation_fuel, 2);
+        assert_eq!(counters.fuel.conversion.exhausted_operation_fuel, 0);
+        assert_eq!(counters.successful_fuel, 2);
+        assert_eq!(counters.exhausted_fuel, 0);
+    }
+
+    #[test]
+    fn resource_exhaustion_classification_requires_the_operation_domain() {
+        let whnf_error: Result<()> = Err(Error::ResourceLimit {
+            kind: ResourceLimitKind::Whnf,
+        });
+        let conversion_error: Result<()> = Err(Error::ResourceLimit {
+            kind: ResourceLimitKind::Conversion,
+        });
+        let universe_error: Result<()> = Err(Error::ResourceLimit {
+            kind: ResourceLimitKind::UniverseConstraints,
+        });
+
+        assert!(operation_exhausted(&whnf_error, KernelFuelResource::Whnf));
+        assert!(!operation_exhausted(
+            &whnf_error,
+            KernelFuelResource::Conversion
+        ));
+        assert!(operation_exhausted(
+            &conversion_error,
+            KernelFuelResource::Conversion
+        ));
+        assert!(!operation_exhausted(
+            &universe_error,
+            KernelFuelResource::Whnf
+        ));
+    }
+
+    #[test]
+    fn named_delta_event_counts_one_physical_reduction_in_all_paths() {
+        let mut off = Env::with_builtins().unwrap();
+        let mut memo =
+            Env::with_builtins_and_execution_options(KernelExecutionOptions::ephemeral_memo())
+                .unwrap();
+        for env in [&mut off, &mut memo] {
+            env.add_def(
+                "Fuel.delta",
+                vec![],
+                nat(),
+                nat_zero(),
+                Reducibility::Reducible,
+            )
+            .unwrap();
+        }
+        let term = Expr::konst("Fuel.delta", vec![]);
+
+        let mut detailed = DetailedTestMeter::default();
+        let mut detailed_fuel = 10;
+        off.whnf_with_remaining_fuel(
+            &Ctx::new(),
+            &[],
+            &term,
+            &mut detailed_fuel,
+            ResourceLimitKind::Whnf,
+            &mut detailed,
+        )
+        .unwrap();
+        assert_eq!(detailed.delta_constants, ["Fuel.delta"]);
+        assert_eq!(detailed.counters.delta_steps, 1);
+        assert_eq!(detailed.counters.physical_reductions, 1);
+
+        for env in [&off, &memo] {
+            let mut counters = KernelWorkCounters::default();
+            assert_eq!(
+                env.whnf_with_work_counters(&Ctx::new(), &[], &term, Some(&mut counters))
+                    .unwrap(),
+                nat_zero()
+            );
+            assert_eq!(counters.delta_steps, 1);
+            assert_eq!(counters.physical_reductions, 1);
+            assert_eq!(counters.fuel.whnf.calls, 1);
+            assert_eq!(counters.fuel.conversion.calls, 0);
+        }
+    }
+
+    #[test]
+    fn diagnosed_kernel_conversion_records_every_structural_path_label() {
+        let sort0 = Expr::sort(Level::zero());
+        let sort1 = Expr::sort(Level::succ(Level::zero()));
+        let cases = [
+            (
+                sort0.clone(),
+                sort1.clone(),
+                1,
+                vec![KernelComparisonPathStep::WhnfLeft],
+            ),
+            (
+                sort0.clone(),
+                sort1.clone(),
+                2,
+                vec![KernelComparisonPathStep::WhnfRight],
+            ),
+            (
+                Expr::app(Expr::konst("f", vec![]), Expr::konst("a", vec![])),
+                Expr::app(Expr::konst("g", vec![]), Expr::konst("b", vec![])),
+                5,
+                vec![KernelComparisonPathStep::AppFunction],
+            ),
+            (
+                Expr::app(Expr::konst("f", vec![]), Expr::konst("a", vec![])),
+                Expr::app(Expr::konst("f", vec![]), Expr::konst("b", vec![])),
+                6,
+                vec![KernelComparisonPathStep::AppArgument],
+            ),
+            (
+                Expr::pi("x", sort0.clone(), sort0.clone()),
+                Expr::pi("x", sort1.clone(), sort0.clone()),
+                3,
+                vec![KernelComparisonPathStep::PiDomain],
+            ),
+            (
+                Expr::pi("x", sort0.clone(), sort0.clone()),
+                Expr::pi("x", sort0.clone(), sort1.clone()),
+                4,
+                vec![KernelComparisonPathStep::PiBody],
+            ),
+            (
+                Expr::lam("x", sort0.clone(), sort0.clone()),
+                Expr::lam("x", sort1.clone(), sort0.clone()),
+                3,
+                vec![KernelComparisonPathStep::LambdaDomain],
+            ),
+            (
+                Expr::lam("x", sort0.clone(), sort0.clone()),
+                Expr::lam("x", sort0.clone(), sort1.clone()),
+                4,
+                vec![KernelComparisonPathStep::LambdaBody],
+            ),
+        ];
+
+        for (lhs, rhs, budget, expected_path) in cases {
+            let error = diagnosed_conversion_error(
+                &Env::new(),
+                &lhs,
+                &rhs,
+                budget,
+                KernelFuelReportMode::Failure,
+            );
+            assert!(matches!(
+                error.error(),
+                Error::ResourceLimit {
+                    kind: ResourceLimitKind::Conversion
+                }
+            ));
+            let context = error.context().unwrap();
+            assert_eq!(
+                context.conversion().unwrap().outcome(),
+                KernelComparisonOutcome::FuelExhausted
+            );
+            let diagnostic = fuel_diagnostic(&error);
+            assert_eq!(diagnostic.resource, KernelFuelResource::Conversion);
+            assert_eq!(diagnostic.failed_operation.fuel.budget, budget as u64);
+            assert_eq!(diagnostic.failed_operation.fuel.spent, budget as u64);
+            assert_eq!(diagnostic.failed_operation.fuel.remaining, 0);
+            assert!(diagnostic.failed_operation.fuel.exhausted);
+            assert_eq!(diagnostic.comparison_path.steps, expected_path);
+            assert!(!diagnostic.comparison_path.truncated);
+            assert!(diagnostic.retained_delta_constants.is_none());
+            assert_eq!(diagnostic.failed_operation.work.fuel.whnf.calls, 0);
+            assert_eq!(diagnostic.failed_operation.work.fuel.conversion.calls, 1);
+        }
+    }
+
+    #[test]
+    fn diagnosed_kernel_conversion_truncates_deep_path_to_first_and_last_32() {
+        fn nested_pi(depth: usize, leaf: Expr) -> Expr {
+            (0..depth).fold(leaf, |body, _| {
+                Expr::pi("x", Expr::sort(Level::zero()), body)
+            })
+        }
+
+        let depth = 70;
+        let lhs = nested_pi(depth, Expr::sort(Level::zero()));
+        let rhs = nested_pi(depth, Expr::sort(Level::succ(Level::zero())));
+        let budget = 4 * depth + 2;
+        let error = diagnosed_conversion_error(
+            &Env::new(),
+            &lhs,
+            &rhs,
+            budget,
+            KernelFuelReportMode::Failure,
+        );
+        let path = &fuel_diagnostic(&error).comparison_path;
+
+        assert!(path.truncated);
+        assert_eq!(path.steps.len(), 64);
+        assert!(path.steps[..32]
+            .iter()
+            .all(|step| *step == KernelComparisonPathStep::PiBody));
+        assert!(path.steps[32..63]
+            .iter()
+            .all(|step| *step == KernelComparisonPathStep::PiBody));
+        assert_eq!(path.steps[63], KernelComparisonPathStep::WhnfRight);
+    }
+
+    #[test]
+    fn diagnosed_kernel_standalone_whnf_reports_empty_path_and_detailed_delta() {
+        let mut env = Env::with_builtins().unwrap();
+        env.add_def(
+            "Fuel.whnfDelta",
+            vec![],
+            nat(),
+            nat_zero(),
+            Reducibility::Reducible,
+        )
+        .unwrap();
+        let mut meter = KernelDiagnosticWorkMeter::new(KernelFuelReportMode::Detailed);
+
+        let error = env
+            .whnf_diagnosed(
+                &Ctx::new(),
+                &[],
+                &Expr::konst("Fuel.whnfDelta", vec![]),
+                KernelDiagnosticPhase::TermCheck,
+                1,
+                &mut meter,
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            error.error(),
+            Error::ResourceLimit {
+                kind: ResourceLimitKind::Whnf
+            }
+        ));
+        let context = error.context().unwrap();
+        assert!(context.conversion().is_none());
+        let diagnostic = fuel_diagnostic(&error);
+        assert_eq!(diagnostic.resource, KernelFuelResource::Whnf);
+        assert_eq!(
+            diagnostic.failed_operation.fuel,
+            KernelFuelOperationCounters {
+                budget: 1,
+                spent: 1,
+                remaining: 0,
+                exhausted: true,
+                overflowed: false,
+            }
+        );
+        assert_eq!(diagnostic.comparison_path, KernelComparisonPath::empty());
+        assert_eq!(diagnostic.failed_operation.work.whnf_calls, 1);
+        assert_eq!(diagnostic.failed_operation.work.delta_steps, 1);
+        assert_eq!(diagnostic.failed_operation.work.physical_reductions, 1);
+        assert_eq!(diagnostic.failed_operation.work.fuel.whnf.calls, 1);
+        assert_eq!(diagnostic.failed_operation.work.fuel.conversion.calls, 0);
+        let hotset = diagnostic.retained_delta_constants.as_ref().unwrap();
+        assert_eq!(hotset.retained_names, 1);
+        assert_eq!(
+            hotset.entries,
+            vec![crate::KernelDeltaHotsetEntry {
+                constant: "Fuel.whnfDelta".to_owned(),
+                count: 1,
+            }]
+        );
+    }
+
+    #[test]
+    fn diagnosed_kernel_failed_operation_excludes_prior_inference_work() {
+        let env = Env::new();
+        let universe_context = UniverseContext::from_params(vec![]).unwrap();
+        let limits = KernelDiagnosticFuelLimits {
+            whnf: 8,
+            conversion: 0,
+        };
+        let mut meter = KernelDiagnosticWorkMeter::new(KernelFuelReportMode::Failure);
+
+        let error = env
+            .check_in_universe_context_diagnosed(
+                &Ctx::new(),
+                &universe_context,
+                &Expr::sort(Level::zero()),
+                &Expr::sort(Level::zero()),
+                KernelDiagnosticPhase::TermCheck,
+                limits,
+                &mut meter,
+            )
+            .unwrap_err();
+        let diagnostic = fuel_diagnostic(&error);
+
+        assert_eq!(diagnostic.declaration.work.check_calls, 1);
+        assert_eq!(diagnostic.declaration.work.infer_calls, 1);
+        assert_eq!(diagnostic.failed_operation.work.check_calls, 0);
+        assert_eq!(diagnostic.failed_operation.work.infer_calls, 0);
+        assert_eq!(diagnostic.failed_operation.work.defeq_calls, 1);
+        assert_eq!(diagnostic.failed_operation.fuel.budget, 0);
+        assert_eq!(diagnostic.failed_operation.fuel.spent, 0);
+        assert_eq!(diagnostic.failed_operation.fuel.remaining, 0);
+        assert!(diagnostic.failed_operation.fuel.exhausted);
+    }
+
+    #[test]
+    fn diagnosed_declaration_exhaustion_fixture_has_prior_conversions_branches_and_deltas() {
+        let (env, error, aggregate) =
+            kernel_fuel_rollout_exhaustion_fixture(KernelFuelReportMode::Detailed);
+
+        assert!(matches!(
+            error.error(),
+            Error::ResourceLimit {
+                kind: ResourceLimitKind::Conversion
+            }
+        ));
+        assert!(env.decl("Observed.FailingDef").is_none());
+        let diagnostic = fuel_diagnostic(&error);
+        assert_eq!(diagnostic.resource, KernelFuelResource::Conversion);
+        assert_eq!(diagnostic.failed_operation.fuel.budget, 7);
+        assert_eq!(diagnostic.failed_operation.fuel.spent, 7);
+        assert_eq!(diagnostic.failed_operation.fuel.remaining, 0);
+        assert!(diagnostic.failed_operation.work.delta_steps >= 1);
+        assert_eq!(diagnostic.failed_operation.work.fuel.conversion.calls, 1);
+        assert!(diagnostic.declaration.fuel.conversion.calls >= 3);
+        assert!(
+            diagnostic
+                .declaration
+                .fuel
+                .conversion
+                .successful_operation_fuel
+                > diagnostic.failed_operation.fuel.spent
+        );
+        assert_eq!(
+            diagnostic
+                .declaration
+                .fuel
+                .conversion
+                .exhausted_operation_fuel,
+            7
+        );
+        assert!(diagnostic.declaration.work.delta_steps >= 3);
+        assert_eq!(
+            diagnostic.comparison_path.steps,
+            [
+                KernelComparisonPathStep::PiBody,
+                KernelComparisonPathStep::WhnfRight,
+            ]
+        );
+        let failed = diagnostic.failed_operation.work;
+        let declaration = diagnostic.declaration.work;
+        for (failed_value, declaration_value) in [
+            (failed.check_calls, declaration.check_calls),
+            (failed.infer_calls, declaration.infer_calls),
+            (failed.whnf_calls, declaration.whnf_calls),
+            (failed.defeq_calls, declaration.defeq_calls),
+            (failed.quick_equality_hits, declaration.quick_equality_hits),
+            (failed.beta_steps, declaration.beta_steps),
+            (failed.delta_steps, declaration.delta_steps),
+            (failed.iota_steps, declaration.iota_steps),
+            (failed.zeta_steps, declaration.zeta_steps),
+            (failed.physical_reductions, declaration.physical_reductions),
+        ] {
+            assert!(failed_value <= declaration_value);
+        }
+        assert!(
+            failed != declaration,
+            "failed operation must be a strict subset"
+        );
+        let hotset = diagnostic.retained_delta_constants.as_ref().unwrap();
+        assert_eq!(hotset.retained_names, 2);
+        assert!(hotset
+            .entries
+            .iter()
+            .any(|entry| { entry.constant == "Observed.AliasArg" && entry.count >= 2 }));
+        assert!(hotset
+            .entries
+            .iter()
+            .any(|entry| { entry.constant == "Observed.AliasExpected2" && entry.count >= 1 }));
+
+        assert_eq!(
+            aggregate.fuel.conversion.calls,
+            diagnostic.declaration.fuel.conversion.calls
+        );
+        assert!(aggregate.infer_calls > diagnostic.declaration.work.infer_calls);
+    }
+
+    #[test]
+    fn diagnosed_declaration_exhaustion_fixture_is_mode_neutral_and_repeatable() {
+        let mut expected_primary = None;
+        let mut expected_conversion = None;
+        for mode in [
+            KernelFuelReportMode::Off,
+            KernelFuelReportMode::Failure,
+            KernelFuelReportMode::Detailed,
+        ] {
+            let (first_env, first_error, first_counters) =
+                kernel_fuel_rollout_exhaustion_fixture(mode);
+            let (second_env, second_error, second_counters) =
+                kernel_fuel_rollout_exhaustion_fixture(mode);
+
+            assert_eq!(first_error, second_error);
+            assert_eq!(first_env.decls, second_env.decls);
+            assert_eq!(first_env.mutual_groups, second_env.mutual_groups);
+            assert_eq!(first_counters, second_counters);
+            assert!(first_env.decl("Observed.FailingDef").is_none());
+            assert!(matches!(
+                first_error.error(),
+                Error::ResourceLimit {
+                    kind: ResourceLimitKind::Conversion
+                }
+            ));
+
+            if let Some(primary) = &expected_primary {
+                assert_eq!(first_error.error(), primary);
+            } else {
+                expected_primary = Some(first_error.error().clone());
+            }
+            let conversion = first_error
+                .context()
+                .and_then(KernelDiagnosticContext::conversion)
+                .cloned();
+            if let Some(expected) = &expected_conversion {
+                assert_eq!(&conversion, expected);
+            } else {
+                expected_conversion = Some(conversion);
+            }
+
+            let fuel = first_error
+                .context()
+                .and_then(KernelDiagnosticContext::kernel_fuel);
+            match mode {
+                KernelFuelReportMode::Off => assert!(fuel.is_none()),
+                KernelFuelReportMode::Failure => {
+                    assert!(fuel.unwrap().retained_delta_constants.is_none())
+                }
+                KernelFuelReportMode::Detailed => {
+                    assert!(fuel.unwrap().retained_delta_constants.is_some())
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_logical_fuel_recorder_has_a_fixed_event_bound() {
+        let mut recorder = TestLogicalFuelRecorder::new(KernelFuelReportMode::Off);
+        for spent in 0..(TEST_LOGICAL_FUEL_EVENT_LIMIT + 3) {
+            recorder.record_fuel(KernelFuelResource::Conversion, spent, false);
+        }
+
+        assert_eq!(recorder.events().len(), TEST_LOGICAL_FUEL_EVENT_LIMIT);
+        assert_eq!(recorder.omitted_events, 3);
+        assert_eq!(
+            recorder.events()[0],
+            Some(TestLogicalFuelEvent {
+                resource: KernelFuelResource::Conversion,
+                spent: 0,
+                exhausted: false,
+            })
+        );
+        assert_eq!(
+            recorder.events()[TEST_LOGICAL_FUEL_EVENT_LIMIT - 1],
+            Some(TestLogicalFuelEvent {
+                resource: KernelFuelResource::Conversion,
+                spent: TEST_LOGICAL_FUEL_EVENT_LIMIT - 1,
+                exhausted: false,
+            })
+        );
+    }
+
+    #[test]
+    fn disabled_and_option_free_diagnosed_admission_keep_observation_state_off() {
+        assert_eq!(std::mem::size_of::<DisabledKernelWorkMeter>(), 0);
+        assert!(!std::mem::needs_drop::<DisabledKernelWorkMeter>());
+        let off_meter = KernelDiagnosticWorkMeter::new(KernelFuelReportMode::Off);
+        assert!(off_meter.delta_hotset.is_none());
+
+        let mut env = Env::new();
+        assert!(!env.observes_work_counters());
+        env.add_decl_diagnosed(Decl::Axiom {
+            name: "Neutral.UnobservedAxiom".to_owned(),
+            universe_params: vec![],
+            ty: Expr::sort(Level::zero()),
+        })
+        .unwrap();
+        assert!(!env.observes_work_counters());
+        assert!(env.decl("Neutral.UnobservedAxiom").is_some());
+    }
+
+    #[test]
+    fn diagnosed_modes_preserve_success_state_and_logical_fuel_sequence() {
+        let modes = [
+            KernelFuelReportMode::Off,
+            KernelFuelReportMode::Failure,
+            KernelFuelReportMode::Detailed,
+        ];
+        let runs = modes.map(|mode| {
+            let env = Env::with_execution_options(KernelExecutionOptions::ephemeral_memo());
+            admit_with_test_logical_fuel_recorder(
+                env,
+                Decl::Axiom {
+                    name: "Neutral.SuccessAxiom".to_owned(),
+                    universe_params: vec![],
+                    ty: Expr::sort(Level::zero()),
+                },
+                mode,
+                KernelDiagnosticFuelLimits {
+                    whnf: 8,
+                    conversion: 8,
+                },
+            )
+        });
+        let (expected_env, expected_result, expected_recorder) = &runs[0];
+        assert!(expected_result.is_ok());
+        assert!(!expected_recorder.events().is_empty());
+        assert_eq!(expected_recorder.omitted_events, 0);
+
+        for (env, result, recorder) in &runs[1..] {
+            assert_eq!(result, expected_result);
+            // npa-kernel has no certificate/hash sidecar. Its ordinary checked
+            // artifact is the declaration table, which must remain identical.
+            assert_eq!(env.decls, expected_env.decls);
+            assert_eq!(env.mutual_groups, expected_env.mutual_groups);
+            assert_eq!(recorder.events(), expected_recorder.events());
+            assert_eq!(recorder.omitted_events, 0);
+            assert_eq!(recorder.counters(), expected_recorder.counters());
+        }
+
+        let counters = expected_recorder.counters();
+        assert_eq!(counters.memo_ineligible_diagnosed, 1);
+        assert_eq!(counters.memo_eligible_calls, 0);
+        assert_eq!(counters.whnf_memo_lookups, 0);
+        assert_eq!(counters.defeq_memo_lookups, 0);
+
+        let public_runs = modes.map(|mode| {
+            admit_with_public_mode_and_sink(
+                Env::with_execution_options(KernelExecutionOptions::ephemeral_memo()),
+                Decl::Axiom {
+                    name: "Neutral.SuccessAxiom".to_owned(),
+                    universe_params: vec![],
+                    ty: Expr::sort(Level::zero()),
+                },
+                mode,
+                KernelDiagnosticFuelLimits {
+                    whnf: 8,
+                    conversion: 8,
+                },
+            )
+        });
+        let (public_env, public_result, public_counters) = &public_runs[0];
+        assert!(public_result.is_ok());
+        assert_eq!(*public_counters, expected_recorder.counters());
+        for (env, result, counters) in &public_runs[1..] {
+            assert!(result.is_ok());
+            assert_eq!(env.decls, public_env.decls);
+            assert_eq!(env.mutual_groups, public_env.mutual_groups);
+            assert_eq!(counters, public_counters);
+        }
+    }
+
+    #[test]
+    fn diagnosed_modes_preserve_multi_conversion_failure_and_logical_fuel_sequence() {
+        let modes = [
+            KernelFuelReportMode::Off,
+            KernelFuelReportMode::Failure,
+            KernelFuelReportMode::Detailed,
+        ];
+        let runs = modes.map(|mode| {
+            let (env, declaration) =
+                multi_conversion_exhaustion_fixture(KernelExecutionOptions::ephemeral_memo());
+            admit_with_test_logical_fuel_recorder(
+                env,
+                declaration,
+                mode,
+                KernelDiagnosticFuelLimits {
+                    whnf: 32,
+                    conversion: 7,
+                },
+            )
+        });
+        let (expected_env, expected_result, expected_recorder) = &runs[0];
+        let expected_error = expected_result.as_ref().unwrap_err();
+        assert!(matches!(
+            expected_error.error(),
+            Error::ResourceLimit {
+                kind: ResourceLimitKind::Conversion
+            }
+        ));
+        assert_eq!(expected_recorder.omitted_events, 0);
+
+        for (env, result, recorder) in &runs[1..] {
+            let error = result.as_ref().unwrap_err();
+            assert_eq!(error.error(), expected_error.error());
+            assert_eq!(
+                error.context().unwrap().phase(),
+                expected_error.context().unwrap().phase()
+            );
+            assert_eq!(
+                error.context().unwrap().conversion(),
+                expected_error.context().unwrap().conversion()
+            );
+            assert_eq!(env.decls, expected_env.decls);
+            assert_eq!(env.mutual_groups, expected_env.mutual_groups);
+            assert!(env.decl("Neutral.FailingDef").is_none());
+            assert_eq!(recorder.events(), expected_recorder.events());
+            assert_eq!(recorder.omitted_events, 0);
+            assert_eq!(recorder.counters(), expected_recorder.counters());
+        }
+
+        assert!(expected_error.context().unwrap().kernel_fuel().is_none());
+        let failure_diagnostic = fuel_diagnostic(runs[1].1.as_ref().unwrap_err());
+        assert!(failure_diagnostic.retained_delta_constants.is_none());
+        let detailed_diagnostic = fuel_diagnostic(runs[2].1.as_ref().unwrap_err());
+        assert_eq!(detailed_diagnostic.resource, KernelFuelResource::Conversion);
+        assert_eq!(detailed_diagnostic.failed_operation.fuel.budget, 7);
+        assert_eq!(detailed_diagnostic.failed_operation.fuel.spent, 7);
+        assert_eq!(detailed_diagnostic.failed_operation.fuel.remaining, 0);
+        assert!(detailed_diagnostic.failed_operation.fuel.exhausted);
+        assert!(detailed_diagnostic
+            .comparison_path
+            .steps
+            .contains(&KernelComparisonPathStep::PiDomain));
+        assert!(detailed_diagnostic
+            .comparison_path
+            .steps
+            .contains(&KernelComparisonPathStep::WhnfRight));
+
+        let conversion_events = expected_recorder
+            .events()
+            .iter()
+            .flatten()
+            .filter(|event| event.resource == KernelFuelResource::Conversion)
+            .copied()
+            .collect::<Vec<_>>();
+        let failed_index = conversion_events
+            .iter()
+            .position(|event| event.exhausted)
+            .expect("one conversion must exhaust");
+        assert!(failed_index >= 2);
+        assert!(conversion_events[..failed_index]
+            .iter()
+            .all(|event| !event.exhausted));
+        assert_eq!(conversion_events[failed_index].spent, 7);
+
+        let hotset = detailed_diagnostic
+            .retained_delta_constants
+            .as_ref()
+            .unwrap();
+        assert!(hotset
+            .entries
+            .iter()
+            .any(|entry| entry.constant == "Neutral.AliasArg"));
+        assert!(hotset
+            .entries
+            .iter()
+            .any(|entry| entry.constant == "Neutral.AliasExpected2"));
+
+        let failed = detailed_diagnostic.failed_operation.work;
+        let declaration = detailed_diagnostic.declaration.work;
+        let failed_values = [
+            failed.check_calls,
+            failed.infer_calls,
+            failed.whnf_calls,
+            failed.defeq_calls,
+            failed.quick_equality_hits,
+            failed.beta_steps,
+            failed.delta_steps,
+            failed.iota_steps,
+            failed.zeta_steps,
+            failed.physical_reductions,
+        ];
+        let declaration_values = [
+            declaration.check_calls,
+            declaration.infer_calls,
+            declaration.whnf_calls,
+            declaration.defeq_calls,
+            declaration.quick_equality_hits,
+            declaration.beta_steps,
+            declaration.delta_steps,
+            declaration.iota_steps,
+            declaration.zeta_steps,
+            declaration.physical_reductions,
+        ];
+        assert!(failed_values
+            .iter()
+            .zip(declaration_values)
+            .all(|(failed, declaration)| *failed <= declaration));
+        assert!(failed_values
+            .iter()
+            .zip(declaration_values)
+            .any(|(failed, declaration)| *failed < declaration));
+
+        let counters = expected_recorder.counters();
+        assert_eq!(counters.memo_ineligible_diagnosed, 1);
+        assert_eq!(counters.memo_eligible_calls, 0);
+        assert_eq!(counters.whnf_memo_lookups, 0);
+        assert_eq!(counters.defeq_memo_lookups, 0);
+
+        let public_runs = modes.map(|mode| {
+            let (env, declaration) =
+                multi_conversion_exhaustion_fixture(KernelExecutionOptions::ephemeral_memo());
+            admit_with_public_mode_and_sink(
+                env,
+                declaration,
+                mode,
+                KernelDiagnosticFuelLimits {
+                    whnf: 32,
+                    conversion: 7,
+                },
+            )
+        });
+        let (public_env, public_result, public_counters) = &public_runs[0];
+        let public_error = public_result.as_ref().unwrap_err();
+        assert_eq!(public_error.error(), expected_error.error());
+        assert_eq!(*public_counters, expected_recorder.counters());
+        for (env, result, counters) in &public_runs[1..] {
+            let error = result.as_ref().unwrap_err();
+            assert_eq!(error.error(), public_error.error());
+            assert_eq!(
+                error.context().unwrap().conversion(),
+                public_error.context().unwrap().conversion()
+            );
+            assert_eq!(env.decls, public_env.decls);
+            assert_eq!(env.mutual_groups, public_env.mutual_groups);
+            assert_eq!(counters, public_counters);
+        }
+    }
+
+    #[test]
+    fn diagnosed_kernel_modes_preserve_primary_error_and_nonresource_absence() {
+        let env = Env::new();
+        let lhs = Expr::sort(Level::zero());
+        let rhs = Expr::sort(Level::succ(Level::zero()));
+        let off = diagnosed_conversion_error(&env, &lhs, &rhs, 2, KernelFuelReportMode::Off);
+        let failure =
+            diagnosed_conversion_error(&env, &lhs, &rhs, 2, KernelFuelReportMode::Failure);
+        let detailed =
+            diagnosed_conversion_error(&env, &lhs, &rhs, 2, KernelFuelReportMode::Detailed);
+
+        assert_eq!(off.error(), failure.error());
+        assert_eq!(failure.error(), detailed.error());
+        assert_eq!(
+            off.context().and_then(KernelDiagnosticContext::conversion),
+            failure
+                .context()
+                .and_then(KernelDiagnosticContext::conversion)
+        );
+        assert_eq!(
+            failure
+                .context()
+                .and_then(KernelDiagnosticContext::conversion),
+            detailed
+                .context()
+                .and_then(KernelDiagnosticContext::conversion)
+        );
+        assert!(off.context().unwrap().kernel_fuel().is_none());
+        assert!(fuel_diagnostic(&failure).retained_delta_constants.is_none());
+        assert_eq!(
+            fuel_diagnostic(&detailed).retained_delta_constants,
+            Some(KernelDeltaHotsetSummary::empty())
+        );
+
+        let universe_context = UniverseContext::from_params(vec![]).unwrap();
+        let mut meter = KernelDiagnosticWorkMeter::new(KernelFuelReportMode::Failure);
+        let mismatch = env
+            .check_in_universe_context_diagnosed(
+                &Ctx::new(),
+                &universe_context,
+                &Expr::sort(Level::zero()),
+                &Expr::sort(Level::zero()),
+                KernelDiagnosticPhase::TermCheck,
+                KernelDiagnosticFuelLimits {
+                    whnf: 8,
+                    conversion: 8,
+                },
+                &mut meter,
+            )
+            .unwrap_err();
+        assert!(matches!(mismatch.error(), Error::TypeMismatch { .. }));
+        assert!(mismatch.context().unwrap().conversion().is_some());
+        assert!(mismatch.context().unwrap().kernel_fuel().is_none());
     }
 }

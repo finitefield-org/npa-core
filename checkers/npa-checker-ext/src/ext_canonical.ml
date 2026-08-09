@@ -4,13 +4,19 @@ let domain_term = "NPA-TERM-0.1"
 
 let domain_decl_interface = "NPA-DECL-IFACE-0.1"
 
-let domain_decl_certificate = "NPA-DECL-CERT-0.1"
+let domain_decl_certificate_current = "NPA-DECL-CERT-0.3.0"
+
+let domain_decl_certificate_compatibility = "NPA-DECL-CERT-0.1"
+
+let domain_decl_certificate = domain_decl_certificate_compatibility
 
 let domain_generated_recursor_signature = "NPA-GEN-REC-SIG-0.1"
 
 let domain_generated_computation_rule = "NPA-GEN-COMP-RULE-0.1"
 
 let domain_module_export_current = "NPA-MODULE-EXPORT-0.2.0"
+
+let domain_module_export_compatibility = domain_module_export_current
 
 let domain_module_export_previous = "NPA-MODULE-EXPORT-0.1.2"
 
@@ -21,7 +27,9 @@ let domain_module_export = domain_module_export_legacy
 
 let domain_axiom_report = "NPA-AXIOM-REPORT-0.1"
 
-let domain_module_certificate_current = "NPA-MODULE-CERT-0.2.0"
+let domain_module_certificate_current = "NPA-MODULE-CERT-0.3.0"
+
+let domain_module_certificate_compatibility = "NPA-MODULE-CERT-0.2.0"
 
 let domain_module_certificate_previous = "NPA-MODULE-CERT-0.1.2"
 
@@ -31,11 +39,13 @@ let domain_module_certificate = domain_module_certificate_legacy
 
 let module_export_domain = function
   | Ext_cert.Current -> domain_module_export_current
+  | Ext_cert.Compatibility -> domain_module_export_compatibility
   | Ext_cert.Previous -> domain_module_export_previous
   | Ext_cert.Legacy -> domain_module_export_legacy
 
 let module_certificate_domain = function
   | Ext_cert.Current -> domain_module_certificate_current
+  | Ext_cert.Compatibility -> domain_module_certificate_compatibility
   | Ext_cert.Previous -> domain_module_certificate_previous
   | Ext_cert.Legacy -> domain_module_certificate_legacy
 
@@ -414,15 +424,29 @@ let encode_option_reducibility value =
 
 let encode_option_opacity value = encode_option (fun opacity -> Ok (encode_opacity opacity)) value
 
-let encode_dependency_entries section offset name_table dependencies =
+let encode_dependency_entries version section offset name_table dependencies =
   let rec loop remaining encoded =
     match remaining with
     | [] -> Ok (encode_uvar (List.length dependencies) ^ String.concat "" (List.rev encoded))
     | dependency :: rest ->
         bind
-          (encode_global_ref section offset name_table dependency.Ext_cert.dependency_global_ref)
+          (encode_global_ref section offset name_table
+             (Ext_cert.dependency_global_ref dependency))
           (fun global_ref ->
-            loop rest ((global_ref ^ encode_hash dependency.Ext_cert.dependency_decl_interface_hash) :: encoded))
+            let interface_hash =
+              encode_hash (Ext_cert.dependency_decl_interface_hash dependency)
+            in
+            let encoded_dependency =
+              if Ext_cert.version_encodes_tagged_dependencies version then
+                match dependency with
+                | Ext_cert.Interface_dependency _ -> byte 0x00 ^ global_ref ^ interface_hash
+                | Ext_cert.Local_implementation_dependency
+                    { dependency_decl_certificate_hash; _ } ->
+                    byte 0x01 ^ global_ref ^ interface_hash
+                    ^ encode_hash dependency_decl_certificate_hash
+              else global_ref ^ interface_hash
+            in
+            loop rest (encoded_dependency :: encoded))
   in
   loop dependencies []
 
@@ -503,9 +527,23 @@ let interface_dependencies_for_decl payload dependencies =
       (fun refs term -> collect_global_refs_from_term term refs)
       [] (interface_terms payload)
   in
-  List.filter
-    (fun dependency -> List.exists (( = ) dependency.Ext_cert.dependency_global_ref) refs)
-    dependencies
+  dependencies
+  |> List.filter (fun dependency ->
+         List.exists (( = ) (Ext_cert.dependency_global_ref dependency)) refs)
+  |> List.map (fun dependency ->
+         Ext_cert.Interface_dependency
+           {
+             dependency_global_ref =
+               Ext_cert.dependency_global_ref dependency;
+             dependency_decl_interface_hash =
+               Ext_cert.dependency_decl_interface_hash dependency;
+           })
+  |> List.sort_uniq (fun left right ->
+         Stdlib.compare
+           ( Ext_cert.dependency_global_ref left,
+             Ext_cert.dependency_decl_interface_hash left )
+           ( Ext_cert.dependency_global_ref right,
+             Ext_cert.dependency_decl_interface_hash right ))
 
 let encode_binder_type_hashes section offset name_table term_table term_hashes binders =
   let rec loop remaining encoded =
@@ -613,7 +651,10 @@ let declaration_interface_payload name_table level_table term_table payload depe
       let level = hash_for_level section offset level_table table_level_hashes in
       let constraints = encode_universe_constraints section offset level_table table_level_hashes in
       let interface_dependencies = interface_dependencies_for_decl payload dependencies in
-      let deps = encode_dependency_entries section offset name_table interface_dependencies in
+      let deps =
+        encode_dependency_entries Ext_cert.Compatibility section offset name_table
+          interface_dependencies
+      in
       let axioms = encode_axiom_refs section offset name_table axiom_dependencies in
       match payload with
       | Ext_cert.AxiomDecl { decl_name; decl_universe_params; decl_universe_constraints = []; decl_ty }
@@ -738,7 +779,7 @@ let declaration_interface_payload name_table level_table term_table payload depe
                  term_table table_term_hashes mutual_inductives)
           ^ unwrap deps ^ unwrap axioms)
 
-let declaration_certificate_payload name_table level_table term_table payload interface_hash dependencies
+let declaration_certificate_payload version name_table level_table term_table payload interface_hash dependencies
     axiom_dependencies =
   bind (level_hashes level_table) (fun table_level_hashes ->
       bind
@@ -747,7 +788,7 @@ let declaration_certificate_payload name_table level_table term_table payload in
           let section = Ext_bytes.Declarations in
           let offset = 0 in
           let term = hash_for_term section offset name_table term_table table_term_hashes in
-          let deps = encode_dependency_entries section offset name_table dependencies in
+          let deps = encode_dependency_entries version section offset name_table dependencies in
           let axioms = encode_axiom_refs section offset name_table axiom_dependencies in
           match payload with
           | Ext_cert.AxiomDecl _ -> bind axioms (fun axioms -> Ok (interface_hash ^ axioms))
@@ -798,7 +839,7 @@ let declaration_hash_role_offset (declaration : Ext_cert.declaration) role =
   | Decl_interface_hash -> declaration.Ext_cert.hashes.Ext_cert.decl_interface_hash_offset
   | Decl_certificate_hash -> declaration.Ext_cert.hashes.Ext_cert.decl_certificate_hash_offset
 
-let declaration_hashes name_table level_table term_table
+let declaration_hashes version name_table level_table term_table
     (declaration : Ext_cert.declaration) =
   bind
     (declaration_interface_payload name_table level_table term_table declaration.Ext_cert.payload
@@ -806,11 +847,17 @@ let declaration_hashes name_table level_table term_table
     (fun interface_payload ->
       let interface_hash = hash_with_domain domain_decl_interface interface_payload in
       bind
-        (declaration_certificate_payload name_table level_table term_table
+        (declaration_certificate_payload version name_table level_table term_table
            declaration.Ext_cert.payload interface_hash declaration.Ext_cert.dependencies
            declaration.Ext_cert.axiom_dependencies)
         (fun certificate_payload ->
-          Ok (interface_hash, hash_with_domain domain_decl_certificate certificate_payload)))
+          let certificate_domain =
+            match version with
+            | Ext_cert.Current -> domain_decl_certificate_current
+            | Ext_cert.Compatibility | Ext_cert.Previous | Ext_cert.Legacy ->
+                domain_decl_certificate_compatibility
+          in
+          Ok (interface_hash, hash_with_domain certificate_domain certificate_payload)))
 
 let interface_payload_has_dependency_material (declaration : Ext_cert.declaration) =
   interface_dependencies_for_decl declaration.Ext_cert.payload declaration.Ext_cert.dependencies <> []
@@ -854,7 +901,8 @@ let verify_declaration_hashes (decoded : Ext_cert.decoded_module) =
     | [] -> Ok Declaration_hashes_ok
     | declaration :: rest ->
         bind
-          (declaration_hashes decoded.Ext_cert.name_table decoded.Ext_cert.level_table
+          (declaration_hashes decoded.Ext_cert.header.Ext_cert.version
+             decoded.Ext_cert.name_table decoded.Ext_cert.level_table
              decoded.Ext_cert.term_table declaration)
           (fun (interface_hash, certificate_hash) ->
             let stored_interface =
@@ -1309,7 +1357,7 @@ let encode_decl_payload_binary name_table level_table term_table
               (encode_mutual_specs_binary section offset name_table level_table
                  term_table mutual_inductives))
 
-let encode_declaration_table_binary name_table level_table term_table
+let encode_declaration_table_binary version name_table level_table term_table
     (declarations : Ext_cert.declaration list) =
   let rec loop (remaining : Ext_cert.declaration list) encoded =
     match remaining with
@@ -1323,7 +1371,7 @@ let encode_declaration_table_binary name_table level_table term_table
           (encode_decl_payload_binary name_table level_table term_table declaration)
           (fun payload ->
             bind
-              (encode_dependency_entries Ext_bytes.Declarations offset name_table
+              (encode_dependency_entries version Ext_bytes.Declarations offset name_table
                  declaration.Ext_cert.dependencies)
               (fun dependencies ->
                 bind
@@ -1390,7 +1438,8 @@ let encode_module_bytes decoded =
                decoded.Ext_cert.level_table decoded.Ext_cert.term_table)
             (fun terms ->
               bind
-                (encode_declaration_table_binary decoded.Ext_cert.name_table
+                (encode_declaration_table_binary decoded.Ext_cert.header.Ext_cert.version
+                   decoded.Ext_cert.name_table
                    decoded.Ext_cert.level_table decoded.Ext_cert.term_table
                    decoded.Ext_cert.declaration_table)
                 (fun declarations ->
@@ -1433,9 +1482,18 @@ let import_order_key import =
 let encoded_dependency_key name_table offset dependency =
   bind
     (encode_global_ref Ext_bytes.Declarations offset name_table
-       dependency.Ext_cert.dependency_global_ref)
+       (Ext_cert.dependency_global_ref dependency))
     (fun global_ref ->
-      Ok (global_ref ^ dependency.Ext_cert.dependency_decl_interface_hash))
+      let tag, certificate_hash =
+        match dependency with
+        | Ext_cert.Interface_dependency _ -> (byte 0x00, "")
+        | Ext_cert.Local_implementation_dependency
+            { dependency_decl_certificate_hash; _ } ->
+            (byte 0x01, dependency_decl_certificate_hash)
+      in
+      Ok
+        (tag ^ global_ref ^ Ext_cert.dependency_decl_interface_hash dependency
+       ^ certificate_hash))
 
 let encoded_axiom_key section name_table offset axiom =
   bind
@@ -1457,14 +1515,22 @@ let validate_encoded_vector_order section offset key entries =
   in
   collect entries []
 
-let local_dependency_indices dependencies =
+let local_dependency_indices current_index dependencies =
   List.fold_left
     (fun indices dependency ->
-      match dependency.Ext_cert.dependency_global_ref with
+      match dependency with
+      | Ext_cert.Local_implementation_dependency _ -> (
+          match Ext_cert.dependency_global_ref dependency with
+          | Ext_term.Local { decl_index } when decl_index < current_index ->
+              if List.mem decl_index indices then indices
+              else decl_index :: indices
+          | _ -> indices)
+      | Ext_cert.Interface_dependency _ -> (
+          match Ext_cert.dependency_global_ref dependency with
       | Ext_term.Local { decl_index }
       | Ext_term.LocalGenerated { decl_index; _ } ->
           if List.mem decl_index indices then indices else decl_index :: indices
-      | Ext_term.Imported _ | Ext_term.Builtin _ -> indices)
+      | Ext_term.Imported _ | Ext_term.Builtin _ -> indices))
     [] dependencies
 
 let validate_declaration_order (decoded : Ext_cert.decoded_module) =
@@ -1473,7 +1539,9 @@ let validate_declaration_order (decoded : Ext_cert.decoded_module) =
   let dependency_sets =
     Array.mapi
       (fun index declaration ->
-        let dependencies = local_dependency_indices declaration.Ext_cert.dependencies in
+        let dependencies =
+          local_dependency_indices index declaration.Ext_cert.dependencies
+        in
         if List.exists (fun dependency -> dependency >= index) dependencies then None
         else Some dependencies)
       declarations

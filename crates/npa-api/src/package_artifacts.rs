@@ -374,8 +374,8 @@ impl PackageAuditSnapshot {
             schema: PACKAGE_VERIFIED_EXPORT_SUMMARY_SCHEMA.to_owned(),
             package: manifest.package.clone(),
             version: manifest.version.clone(),
-            core_spec: manifest.core_spec.clone(),
-            certificate_format: manifest.certificate_format.clone(),
+            package_core_profile: manifest.core_spec.clone(),
+            package_certificate_profile: manifest.certificate_format.clone(),
             package_lock_hash: self.package_lock.file_hash,
             module_order: PACKAGE_VERIFIED_EXPORT_SUMMARY_MODULE_ORDER_TOPOLOGICAL.to_owned(),
             trusted: false,
@@ -748,7 +748,7 @@ pub fn project_package_theorem_premise_report_from_extraction(
     })
 }
 
-/// Project `npa.package.verified_export_summary.v0.1` from verified package modules.
+/// Project `npa.package.verified_export_summary.v0.2` from verified package modules.
 ///
 /// The projection reads only package manifest identity, package lock identity,
 /// and source-free certificate extraction output. It does not read source,
@@ -764,8 +764,8 @@ pub fn project_package_verified_export_summary_source_free(
         schema: PACKAGE_VERIFIED_EXPORT_SUMMARY_SCHEMA.to_owned(),
         package: input.package,
         version: input.version,
-        core_spec: input.core_spec,
-        certificate_format: input.certificate_format,
+        package_core_profile: input.core_spec,
+        package_certificate_profile: input.certificate_format,
         package_lock_hash: input.package_lock.file_hash,
         module_order: PACKAGE_VERIFIED_EXPORT_SUMMARY_MODULE_ORDER_TOPOLOGICAL.to_owned(),
         trusted: false,
@@ -843,6 +843,8 @@ fn project_package_verified_export_summary_module(
         certificate_file_hash: module.certificate.file_hash,
         export_hash: module.key.export_hash,
         certificate_hash: module.key.certificate_hash,
+        certificate_format: module.verified_module.certificate_format().to_owned(),
+        core_spec: module.verified_module.core_spec().to_owned(),
         axiom_report_hash: module.axiom_report_hash,
         direct_imports: package_audit_direct_imports_for_entry(entry),
         exported_globals: project_export_summary_globals(module)?,
@@ -2188,6 +2190,11 @@ mod tests {
         path::{Path, PathBuf},
     };
 
+    use npa_cert::{
+        build_module_cert, encode_module_cert, verify_module_cert, AxiomPolicy, CoreModule,
+        VerifierSession,
+    };
+    use npa_kernel::{Decl, Expr, Level, Reducibility};
     use npa_package::{
         build_package_lock_from_artifacts, parse_and_validate_manifest_str,
         parse_package_axiom_report_json, parse_package_lock_json, parse_package_theorem_index_json,
@@ -2231,6 +2238,54 @@ mod tests {
             converted.field.as_ref().map(|field| field.as_str()),
             Some("module")
         );
+    }
+
+    #[test]
+    fn opaque_definition_is_never_projected_as_declared_axiom() {
+        let cert = build_module_cert(
+            CoreModule {
+                name: Name::from_dotted("Fixture.OpaqueReport"),
+                declarations: vec![Decl::Def {
+                    name: "Fixture.OpaqueReport.hidden".to_owned(),
+                    universe_params: Vec::new(),
+                    ty: Expr::sort(Level::succ(Level::zero())),
+                    value: Expr::sort(Level::zero()),
+                    reducibility: Reducibility::Opaque,
+                }],
+            },
+            &[],
+        )
+        .unwrap();
+        let bytes = encode_module_cert(&cert).unwrap();
+        let verified_module =
+            verify_module_cert(&bytes, &mut VerifierSession::new(), &AxiomPolicy::normal())
+                .unwrap();
+        let export = verified_module.export_block()[0].clone();
+        let module = PackageArtifactVerifiedModule {
+            key: PackageArtifactVerifiedModuleKey {
+                module: verified_module.module().clone(),
+                export_hash: PackageHash::from(verified_module.export_hash()),
+                certificate_hash: PackageHash::from(verified_module.certificate_hash()),
+            },
+            origin: PackageArtifactOrigin::Local,
+            certificate: PackageArtifactFileReference {
+                path: PackagePath::new("certs/Fixture_OpaqueReport.npcert"),
+                file_hash: package_file_hash(&bytes),
+            },
+            axiom_report_hash: PackageHash::new([0; 32]),
+            verified_module,
+        };
+
+        assert!(module
+            .verified_module
+            .axiom_report()
+            .module_axioms
+            .is_empty());
+        assert!(!module_exports_declared_axiom(
+            &module,
+            &Name::from_dotted("Fixture.OpaqueReport.hidden"),
+            export.decl_interface_hash,
+        ));
     }
 
     fn repo_root() -> PathBuf {
@@ -2295,10 +2350,10 @@ meta = "missing/meta/Proofs/Ai/Basic.json"
 replay = "missing/replay/Proofs/Ai/Basic.json"
 producer_profile = "human-surface-explicit-term"
 expected_source_hash = "sha256:2176be7570deae66754789868aa373ab01434512b4f50b992089886d2c655387"
-expected_certificate_file_hash = "sha256:448a3de71485d4f38e45ac7bf3b637b0e9e38d7ce215dd4847a2a2188099ee21"
+expected_certificate_file_hash = "sha256:8653c78a98c84a52377808d6ebd3451d6ecfd91b02aff43318f915a1e5f9f551"
 expected_export_hash = "sha256:6cbf881b56f61d413c2584eb9b1cdd6fb09e504f6ff6c855fa73ee55d763b839"
 expected_axiom_report_hash = "sha256:fed11e73accfbfb0dfc28b4f510e151fa33d8af82d58fdb23b92567e04e59e40"
-expected_certificate_hash = "sha256:7a50b381af353fe15c0b602fad60f4b9d5f70613dfe6f47832da2d8c11b391dd"
+expected_certificate_hash = "sha256:78c4c653a2bce34fbc870d7c4c1b81ac0be32859f481a59ab5d66257362e8956"
 imports = []
 definitions = []
 theorems = ["id"]
@@ -2336,10 +2391,10 @@ meta = "missing/meta/Proofs/Ai/EqReasoning.json"
 replay = "missing/replay/Proofs/Ai/EqReasoning.json"
 producer_profile = "human-surface-explicit-term"
 expected_source_hash = "sha256:676d15f72088b4f107773ad566920c02a5e29d8773a4c5c24ccb0a1b19de930f"
-expected_certificate_file_hash = "sha256:ffc6f428215aca3b28761989ba03160821e2c4aa76dea44e5d5a3af7d2858b2c"
+expected_certificate_file_hash = "sha256:e5806627a8018d9d026e0e982614711ab9f67ac4fe9d76bf5dcb4f11da21476e"
 expected_export_hash = "sha256:4727d19030aece233f2fc0e44ea6a0bff83bf8347fabb0232ea2b52cfc1d10d7"
 expected_axiom_report_hash = "sha256:5283e4bbd120c3ffa60356b600be06364c3739f9c1992538f75aa4c7df947968"
-expected_certificate_hash = "sha256:b73e42bf01fc55ebd79309367d9b3661697b7b11bf97955742fb036711121aba"
+expected_certificate_hash = "sha256:57534e8c7214827f87513dbef645ae8f6ea495300769b69bb8ed72a8f9b717ea"
 imports = ["Std.Logic.Eq"]
 definitions = []
 theorems = ["eq_symm", "eq_trans", "eq_congr_arg", "eq_congr_fun", "eq_congr2", "eq_subst", "eq_transport_const", "eq_rewrite_left", "eq_rewrite_right", "eq_cast_trans", "eq_calc3"]

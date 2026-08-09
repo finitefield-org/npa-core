@@ -23,6 +23,38 @@ mod resolver;
 mod span;
 mod term_source;
 
+/// Source-level reducibility selected for a definition item.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum DefinitionReducibility {
+    /// The definition body remains available to downstream conversion.
+    Reducible,
+    /// The definition body is checked locally but sealed at the module boundary.
+    Opaque,
+}
+
+impl DefinitionReducibility {
+    pub const fn from_cert(reducibility: npa_cert::CertReducibility) -> Self {
+        match reducibility {
+            npa_cert::CertReducibility::Reducible => Self::Reducible,
+            npa_cert::CertReducibility::Opaque => Self::Opaque,
+        }
+    }
+
+    pub fn from_core_decl(decl: &npa_kernel::Decl) -> Self {
+        match decl {
+            npa_kernel::Decl::Def {
+                reducibility: npa_kernel::Reducibility::Opaque,
+                ..
+            }
+            | npa_kernel::Decl::DefConstrained {
+                reducibility: npa_kernel::Reducibility::Opaque,
+                ..
+            } => Self::Opaque,
+            _ => Self::Reducible,
+        }
+    }
+}
+
 pub use callable::{
     builtin_machine_callable_profile, is_machine_surface_renderable_name,
     machine_callable_profile_from_human_binders,
@@ -95,23 +127,29 @@ pub use equation::{
 };
 pub use human::{
     HumanAxiomDecl, HumanBinder, HumanBinderInfo, HumanBinderKind, HumanClassDecl,
-    HumanClassFieldDecl, HumanCompileOptions, HumanConstructorDecl, HumanDecl, HumanDeclValue,
-    HumanEquationDecl, HumanEquationRow, HumanExpr, HumanFrontendState,
-    HumanGeneratedDeclarationKind, HumanGeneratedDeclarationMetadata, HumanImplicitMode,
-    HumanImportedSourceInterface, HumanInductiveDecl, HumanInstanceDecl, HumanInstanceFieldDecl,
-    HumanItem, HumanLevel, HumanModule, HumanName, HumanNotationAssociativity, HumanNotationDecl,
-    HumanNotationHead, HumanNotationKind, HumanOpenScope, HumanOpenScopeFrame, HumanPattern,
-    HumanProofBlock, HumanRewriteDirection, HumanRewriteRuleSyntax, HumanSourceBinderMetadata,
-    HumanSourceDeclarationKind, HumanSourceDeclarationMetadata, HumanSourceInterface,
-    HumanSourceInterfaceStore, HumanSourceNotationMetadata, HumanTacticKind, HumanTacticScript,
-    HumanTacticSyntax, HumanTerminationAnnotation, HumanTypeclassClassMetadata,
+    HumanClassFieldDecl, HumanCompilationObservations, HumanCompileOptions, HumanConstructorDecl,
+    HumanDecl, HumanDeclValue, HumanDeclarationObservation, HumanDefinitionDecl, HumanEquationDecl,
+    HumanEquationRow, HumanExpr, HumanFrontendState, HumanGeneratedDeclarationKind,
+    HumanGeneratedDeclarationMetadata, HumanImplicitMode, HumanImportedSourceInterface,
+    HumanInductiveDecl, HumanInstanceDecl, HumanInstanceFieldDecl, HumanItem,
+    HumanKernelFuelReportMode, HumanLevel, HumanModule, HumanName, HumanNotationAssociativity,
+    HumanNotationDecl, HumanNotationHead, HumanNotationKind, HumanOpenScope, HumanOpenScopeFrame,
+    HumanPattern, HumanProofBlock, HumanRewriteDirection, HumanRewriteRuleSyntax,
+    HumanSourceBinderMetadata, HumanSourceDeclarationKind, HumanSourceDeclarationMetadata,
+    HumanSourceInterface, HumanSourceInterfaceStore, HumanSourceNotationMetadata, HumanTacticKind,
+    HumanTacticScript, HumanTacticSyntax, HumanTerminationAnnotation, HumanTypeclassClassMetadata,
     HumanTypeclassFieldMetadata, HumanTypeclassInstanceMetadata, HumanTypeclassSearchOutput,
     HumanTypeclassSearchPolicy, HumanTypeclassSearchStatus, HumanUniverseParam,
+    HUMAN_DECLARATION_OBSERVATION_LIMIT,
 };
 pub use human_diagnostic::{
     HumanDiagnostic, HumanDiagnosticConversionContext, HumanDiagnosticKind, HumanDiagnosticPayload,
-    HumanDiagnosticPhase, HumanDiagnosticSeverity, HumanHoleGoal, HumanHoleGoalLocal, HumanResult,
-    HumanUniverseMismatchContext, HumanUnsolvedMeta, HumanUnsolvedMetaKind,
+    HumanDiagnosticPhase, HumanDiagnosticSeverity, HumanHoleGoal, HumanHoleGoalLocal,
+    HumanKernelComparisonPath, HumanKernelDeclarationSummary, HumanKernelDeclarationWork,
+    HumanKernelDeltaHotsetEntry, HumanKernelDeltaHotsetSummary, HumanKernelFuelDiagnostic,
+    HumanKernelFuelDomainTotals, HumanKernelFuelOperationCounters, HumanKernelFuelTotals,
+    HumanKernelOperationWork, HumanKernelWorkSnapshot, HumanResult, HumanUniverseMismatchContext,
+    HumanUnsolvedMeta, HumanUnsolvedMetaKind,
 };
 pub use human_elaborator::{
     certificate_imports_for_human_core_module,
@@ -128,16 +166,25 @@ pub use human_elaborator::{
     compile_human_source_to_certificate_with_source_interfaces, compile_human_source_to_core,
     compile_human_source_to_core_output_with_source_interfaces,
     compile_human_source_to_core_output_with_source_interfaces_and_by_proofs,
-    compile_human_source_to_core_with_source_interfaces, elaborate_human_module,
-    elaborate_human_tactic_term_check, elaborate_human_tactic_term_infer,
+    compile_human_source_to_core_with_source_interfaces,
+    compile_human_source_to_observed_built_certificate_only_with_available_import_refs,
+    compile_human_source_to_observed_built_certificate_only_with_import_refs,
+    compile_human_source_to_observed_built_certificate_output_with_available_import_refs,
+    compile_human_source_to_observed_built_certificate_output_with_import_refs,
+    compile_human_source_to_observed_certificate_output_with_available_import_refs_and_axiom_policy,
+    compile_human_source_to_observed_certificate_output_with_import_refs_and_axiom_policy,
+    compile_human_source_to_observed_certificate_output_with_source_interfaces,
+    compile_human_source_to_observed_certificate_output_with_source_interfaces_and_axiom_policy,
+    elaborate_human_module, elaborate_human_tactic_term_check, elaborate_human_tactic_term_infer,
     prepare_human_proof_start_core_with_source_interfaces,
     prepare_human_proof_start_core_with_source_interfaces_and_by_proofs,
     search_human_typeclass_from_source, HumanBuiltCertificateCompileOutput,
     HumanBuiltCertificateOnlyCompileOutput, HumanByProofCore, HumanByProofTarget,
     HumanByProofTargetsOutput, HumanCertificateCompileOutput, HumanCoreCompileOutput,
-    HumanProofStartCore, HumanProofStartCoreOutput, HumanProofStartCoreWithProofsRequest,
-    HumanTacticTermCheckOutput, HumanTacticTermElabContext, HumanTacticTermElabContextRequest,
-    HumanTacticTermInferOutput,
+    HumanObservedBuiltCertificateCompileOutput, HumanObservedBuiltCertificateOnlyCompileOutput,
+    HumanObservedCertificateCompileOutput, HumanProofStartCore, HumanProofStartCoreOutput,
+    HumanProofStartCoreWithProofsRequest, HumanTacticTermCheckOutput, HumanTacticTermElabContext,
+    HumanTacticTermElabContextRequest, HumanTacticTermInferOutput,
 };
 pub use human_extraction::{
     collect_human_source_declaration_families, extract_human_declaration_source,
@@ -161,10 +208,10 @@ pub use human_resolver::{
 pub use lexer::{lex, Token, TokenKind};
 pub use machine::{
     MachineBinder, MachineCheckedCurrentDecl, MachineCheckedCurrentGeneratedDecl,
-    MachineCompileOptions, MachineDecl, MachineGlobalScope, MachineGlobalScopeEntry, MachineItem,
-    MachineKernelEnvView, MachineLevel, MachineLocalDecl, MachineModule, MachineName,
-    MachineResolvedConstant, MachineSurfaceMode, MachineTerm, MachineTermAst,
-    MachineTermCheckResult, MachineTermElabContext, MachineTermSourceCanonical,
+    MachineCompileOptions, MachineDecl, MachineDefinitionDecl, MachineGlobalScope,
+    MachineGlobalScopeEntry, MachineItem, MachineKernelEnvView, MachineLevel, MachineLocalDecl,
+    MachineModule, MachineName, MachineResolvedConstant, MachineSurfaceMode, MachineTerm,
+    MachineTermAst, MachineTermCheckResult, MachineTermElabContext, MachineTermSourceCanonical,
     MachineUniverseParam,
 };
 pub use parser::{parse_machine_module, parse_machine_term};

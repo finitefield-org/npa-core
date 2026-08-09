@@ -1,5 +1,9 @@
 # NPA Toolchain Reference v0.5.0
 
+Historical snapshot: this document preserves the v0.5 host/result contract and
+uses “current” only relative to that release. For the active adjacent-source
+contract, use the [v0.8 reference](npa-toolchain-reference-v0.8.0.md).
+
 This reference describes the adjacent-source `npa-cli 0.5.x` package interface.
 It adds structured source context to Human frontend failures and advances
 package command results to `npa.package.command_result.v0.2`. It does not

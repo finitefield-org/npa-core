@@ -25,8 +25,10 @@ pub const INDEPENDENT_CHECKER_MACHINE_CHECK_REQUEST_SCHEMA: &str =
     "npa.independent-checker.machine_check_request.v1";
 pub const INDEPENDENT_CHECKER_REQUEST_STORE_MANIFEST_SCHEMA: &str =
     "npa.independent-checker.request_store_manifest.v1";
-pub const INDEPENDENT_CHECKER_CHECKER_RAW_RESULT_SCHEMA: &str =
+pub const INDEPENDENT_CHECKER_CHECKER_RAW_RESULT_V1_SCHEMA: &str =
     "npa.independent-checker.checker_raw_result.v1";
+pub const INDEPENDENT_CHECKER_CHECKER_RAW_RESULT_SCHEMA: &str =
+    "npa.independent-checker.checker_raw_result.v2";
 pub const INDEPENDENT_CHECKER_MACHINE_CHECK_RESULT_SCHEMA: &str =
     "npa.independent-checker.machine_check_result.v1";
 pub const INDEPENDENT_CHECKER_MACHINE_RESULT_STORE_MANIFEST_SCHEMA: &str =
@@ -1688,6 +1690,10 @@ pub struct IndependentCheckerRunnerPolicyReference {
 pub struct IndependentCheckerAllowlistEntry {
     pub profile: String,
     pub checker_id: String,
+    pub checker_version: Option<String>,
+    pub raw_result_schema: Option<String>,
+    pub certificate_format: Option<String>,
+    pub core_spec: Option<String>,
     pub binary_id: String,
     pub binary_hash: Hash,
     pub build_hash: Hash,
@@ -1696,7 +1702,7 @@ pub struct IndependentCheckerAllowlistEntry {
 
 impl IndependentCheckerAllowlistEntry {
     fn canonical_json(&self) -> String {
-        canonical_json_object_from_pairs(vec![
+        let mut pairs = vec![
             (
                 "allowed_args".to_owned(),
                 independent_checker_json_string_array(&self.allowed_args),
@@ -1721,7 +1727,24 @@ impl IndependentCheckerAllowlistEntry {
                 "profile".to_owned(),
                 independent_checker_json_string_literal(&self.profile),
             ),
-        ])
+        ];
+        push_optional_string_pair(
+            &mut pairs,
+            "checker_version",
+            self.checker_version.as_deref(),
+        );
+        push_optional_string_pair(
+            &mut pairs,
+            "raw_result_schema",
+            self.raw_result_schema.as_deref(),
+        );
+        push_optional_string_pair(
+            &mut pairs,
+            "certificate_format",
+            self.certificate_format.as_deref(),
+        );
+        push_optional_string_pair(&mut pairs, "core_spec", self.core_spec.as_deref());
+        canonical_json_object_from_pairs(pairs)
     }
 }
 
@@ -3937,12 +3960,38 @@ impl IndependentCheckerPerformanceBenchmarkSummary {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IndependentCheckerRawResultSchema {
+    V1,
+    V2,
+}
+
+impl IndependentCheckerRawResultSchema {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::V1 => INDEPENDENT_CHECKER_CHECKER_RAW_RESULT_V1_SCHEMA,
+            Self::V2 => INDEPENDENT_CHECKER_CHECKER_RAW_RESULT_SCHEMA,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IndependentCheckerCertificatePair {
+    pub certificate_format: String,
+    pub core_spec: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IndependentCheckerRawResult {
+    pub schema: IndependentCheckerRawResultSchema,
     pub status: IndependentCheckerMachineCheckStatus,
     pub checker_id: Option<String>,
     pub checker_version: Option<String>,
     pub checker_build_hash: Option<Hash>,
+    pub certificate_format: Option<String>,
+    pub core_spec: Option<String>,
+    pub input_certificate_format: Option<String>,
+    pub input_core_spec: Option<String>,
     pub module: Option<String>,
     pub certificate_hash: Option<Hash>,
     pub export_hash: Option<Hash>,
@@ -3955,6 +4004,19 @@ pub struct IndependentCheckerRawResultSchemaError {
     pub field: String,
     pub expected_value: String,
     pub actual_value: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IndependentCheckerMachineCheckAdoption {
+    pub result: IndependentCheckerMachineCheckResult,
+    pub input_pair: Option<IndependentCheckerCertificatePair>,
+}
+
+#[derive(Clone, Debug)]
+enum IndependentCheckerRequestedHeader {
+    Unavailable,
+    Invalid,
+    Exact(IndependentCheckerCertificatePair),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -7825,6 +7887,9 @@ pub struct IndependentCheckerIdentityEntry {
     pub profile: String,
     pub checker_id: String,
     pub checker_version: Option<String>,
+    pub raw_result_schema: Option<String>,
+    pub certificate_format: Option<String>,
+    pub core_spec: Option<String>,
     pub binary_id: String,
     pub binary_hash: Hash,
     pub build_hash: Hash,
@@ -8062,6 +8127,37 @@ pub fn independent_checker_validate_selected_checker_identity_manifest(
             &selected.checker_id,
             &entry.checker_id,
         ));
+    }
+    for (field, expected, actual) in [
+        (
+            "checker_version",
+            selected.checker_version.as_deref(),
+            entry.checker_version.as_deref(),
+        ),
+        (
+            "raw_result_schema",
+            selected.raw_result_schema.as_deref(),
+            entry.raw_result_schema.as_deref(),
+        ),
+        (
+            "certificate_format",
+            selected.certificate_format.as_deref(),
+            entry.certificate_format.as_deref(),
+        ),
+        (
+            "core_spec",
+            selected.core_spec.as_deref(),
+            entry.core_spec.as_deref(),
+        ),
+    ] {
+        if expected.is_some() && expected != actual {
+            return Err(IndependentCheckerPolicyFailure::value_failure(
+                IndependentCheckerPolicyFailureReasonCode::CheckerIdentityMismatch,
+                format!("checker_identity_manifest.checkers[].{field}"),
+                expected.unwrap_or("absent"),
+                actual.unwrap_or("absent"),
+            ));
+        }
     }
     if entry.binary_id != selected.binary_id {
         return Err(IndependentCheckerPolicyFailure::value_failure(
@@ -10047,6 +10143,56 @@ pub fn independent_checker_machine_check_run(
     policy: &IndependentCheckerRunnerPolicy,
     observation: IndependentCheckerRunObservation,
 ) -> Result<IndependentCheckerMachineCheckResult, IndependentCheckerCommandError> {
+    independent_checker_machine_check_run_with_header(
+        request,
+        policy,
+        observation,
+        IndependentCheckerRequestedHeader::Unavailable,
+    )
+}
+
+pub fn independent_checker_machine_check_run_with_certificate_bytes(
+    request: &IndependentCheckerMachineCheckRequest,
+    policy: &IndependentCheckerRunnerPolicy,
+    observation: IndependentCheckerRunObservation,
+    certificate_bytes: &[u8],
+) -> Result<IndependentCheckerMachineCheckAdoption, IndependentCheckerCommandError> {
+    let requested_header = independent_checker_requested_certificate_pair(certificate_bytes)
+        .map(IndependentCheckerRequestedHeader::Exact)
+        .unwrap_or(IndependentCheckerRequestedHeader::Invalid);
+    let raw = std::str::from_utf8(&observation.stdout)
+        .ok()
+        .and_then(|source| parse_independent_checker_raw_result(source).ok());
+    let selected = policy.selected_checker_policy(&request.checker_profile);
+    let validated_pair = raw.as_ref().and_then(|raw| {
+        selected.and_then(|selected| {
+            independent_checker_validate_raw_binding(selected, raw, &requested_header)
+                .ok()
+                .flatten()
+        })
+    });
+    let result = independent_checker_machine_check_run_with_header(
+        request,
+        policy,
+        observation,
+        requested_header,
+    )?;
+    let input_pair = validated_pair.filter(|_| {
+        selected.is_some_and(|selected| {
+            result.checker.id.as_deref() == Some(selected.checker_id.as_str())
+                && result.checker.build_hash == Some(selected.build_hash)
+                && result.checker.version.as_deref() == selected.checker_version.as_deref()
+        })
+    });
+    Ok(IndependentCheckerMachineCheckAdoption { result, input_pair })
+}
+
+fn independent_checker_machine_check_run_with_header(
+    request: &IndependentCheckerMachineCheckRequest,
+    policy: &IndependentCheckerRunnerPolicy,
+    observation: IndependentCheckerRunObservation,
+    requested_header: IndependentCheckerRequestedHeader,
+) -> Result<IndependentCheckerMachineCheckResult, IndependentCheckerCommandError> {
     if !independent_checker_valid_request_id(&observation.result_id) {
         return Err(independent_checker_command_value_error(
             IndependentCheckerCommandName::Run,
@@ -10214,6 +10360,7 @@ pub fn independent_checker_machine_check_run(
         policy,
         selected_checker,
         observation,
+        &requested_header,
     ))
 }
 
@@ -16037,6 +16184,7 @@ fn independent_checker_adopt_checker_observation(
     policy: &IndependentCheckerRunnerPolicy,
     selected_checker: &IndependentCheckerAllowlistEntry,
     observation: IndependentCheckerRunObservation,
+    requested_header: &IndependentCheckerRequestedHeader,
 ) -> IndependentCheckerMachineCheckResult {
     if let Some(reason) = observation.process.termination_reason.as_deref() {
         return match reason {
@@ -16282,6 +16430,22 @@ fn independent_checker_adopt_checker_observation(
         return result;
     }
 
+    if let Err(error) =
+        independent_checker_validate_raw_binding(selected_checker, &raw, requested_header)
+    {
+        let mut result = independent_checker_machine_check_result_base(
+            request,
+            policy,
+            Some(selected_checker),
+            &observation,
+            IndependentCheckerMachineCheckStatus::Failed,
+            Some(error),
+        );
+        result.checker = checker;
+        independent_checker_push_stderr_diagnostic(&mut result, &observation);
+        return result;
+    }
+
     if let Some(raw_module) = raw.module.as_deref() {
         if raw_module != request.module {
             let error = IndependentCheckerMachineCheckError::new("checker_internal_error")
@@ -16386,6 +16550,144 @@ fn independent_checker_adopt_checker_observation(
             result
         }
         _ => unreachable!("exit_code >= 3 handled above"),
+    }
+}
+
+#[allow(clippy::result_large_err)]
+fn independent_checker_validate_raw_binding(
+    selected: &IndependentCheckerAllowlistEntry,
+    raw: &IndependentCheckerRawResult,
+    requested_header: &IndependentCheckerRequestedHeader,
+) -> Result<Option<IndependentCheckerCertificatePair>, IndependentCheckerMachineCheckError> {
+    let explicit_binding = match (
+        selected.checker_version.as_deref(),
+        selected.raw_result_schema.as_deref(),
+        selected.certificate_format.as_deref(),
+        selected.core_spec.as_deref(),
+    ) {
+        (Some(version), Some(schema), Some(format), Some(core)) => {
+            Some((version, schema, format, core))
+        }
+        _ => None,
+    };
+
+    if explicit_binding.is_none()
+        && (raw.schema == IndependentCheckerRawResultSchema::V2
+            || raw.checker_version.as_deref() == Some("0.3.0"))
+    {
+        return Err(IndependentCheckerMachineCheckError::new("policy_failure")
+            .with_reason_code("checker_binding_missing")
+            .with_value_payload(
+                "checker.binding",
+                "explicit_version_schema_capability_pair",
+                "missing",
+            ));
+    }
+
+    if let Some((version, schema, format, core)) = explicit_binding {
+        if raw.schema.as_str() != schema {
+            return Err(IndependentCheckerMachineCheckError::new("policy_failure")
+                .with_reason_code("checker_raw_schema_mismatch")
+                .with_value_payload("checker.raw_result_schema", schema, raw.schema.as_str()));
+        }
+        if raw.checker_version.as_deref() != Some(version) {
+            return Err(IndependentCheckerMachineCheckError::new("policy_failure")
+                .with_reason_code("checker_version_mismatch")
+                .with_value_payload(
+                    "checker.version",
+                    version,
+                    raw.checker_version.as_deref().unwrap_or("missing"),
+                ));
+        }
+        if raw.schema == IndependentCheckerRawResultSchema::V2 {
+            if raw.certificate_format.as_deref() != Some(format) {
+                return Err(IndependentCheckerMachineCheckError::new("policy_failure")
+                    .with_reason_code("checker_capability_mismatch")
+                    .with_value_payload(
+                        "checker.certificate_format",
+                        format,
+                        raw.certificate_format.as_deref().unwrap_or("missing"),
+                    ));
+            }
+            if raw.core_spec.as_deref() != Some(core) {
+                return Err(IndependentCheckerMachineCheckError::new("policy_failure")
+                    .with_reason_code("checker_capability_mismatch")
+                    .with_value_payload(
+                        "checker.core_spec",
+                        core,
+                        raw.core_spec.as_deref().unwrap_or("missing"),
+                    ));
+            }
+        }
+    }
+
+    if raw.schema == IndependentCheckerRawResultSchema::V1 {
+        return Ok(None);
+    }
+
+    match requested_header {
+        IndependentCheckerRequestedHeader::Unavailable => Err(
+            IndependentCheckerMachineCheckError::new("checker_internal_error")
+                .with_reason_code("checker_input_identity_unavailable")
+                .with_value_payload(
+                    "certificate.header",
+                    "independently_decoded_exact_pair",
+                    "unavailable",
+                ),
+        ),
+        IndependentCheckerRequestedHeader::Invalid => {
+            if raw.input_certificate_format.is_some() || raw.input_core_spec.is_some() {
+                Err(
+                    IndependentCheckerMachineCheckError::new("checker_internal_error")
+                        .with_reason_code("checker_input_identity_mismatch")
+                        .with_value_payload(
+                            "checker.input_pair",
+                            "absent_when_requested_header_invalid",
+                            "present",
+                        ),
+                )
+            } else {
+                Ok(None)
+            }
+        }
+        IndependentCheckerRequestedHeader::Exact(expected) => {
+            let actual_format = raw.input_certificate_format.as_deref().ok_or_else(|| {
+                IndependentCheckerMachineCheckError::new("checker_internal_error")
+                    .with_reason_code("checker_input_identity_missing")
+                    .with_value_payload(
+                        "checker.input_pair",
+                        "requested_header_exact_pair",
+                        "missing",
+                    )
+            })?;
+            let actual_core = raw
+                .input_core_spec
+                .as_deref()
+                .expect("v2 parser enforces pairs");
+            if actual_format != expected.certificate_format {
+                return Err(
+                    IndependentCheckerMachineCheckError::new("checker_internal_error")
+                        .with_reason_code("checker_input_identity_mismatch")
+                        .with_value_payload(
+                            "checker.input_certificate_format",
+                            &expected.certificate_format,
+                            actual_format,
+                        ),
+                );
+            }
+            if actual_core != expected.core_spec {
+                return Err(
+                    IndependentCheckerMachineCheckError::new("checker_internal_error")
+                        .with_reason_code("checker_input_identity_mismatch")
+                        .with_value_payload(
+                            "checker.input_core_spec",
+                            &expected.core_spec,
+                            actual_core,
+                        ),
+                );
+            }
+            Ok(Some(expected.clone()))
+        }
     }
 }
 
@@ -16531,12 +16833,23 @@ fn parse_independent_checker_raw_result_value(
     let members = value.object_members().ok_or_else(|| {
         IndependentCheckerRawResultSchemaError::new("checker_raw", "object", "wrong_type")
     })?;
-    raw_required_fixed_string(
+    let schema_raw = raw_required_string(
         members,
         "schema",
         "checker_raw.schema",
-        INDEPENDENT_CHECKER_CHECKER_RAW_RESULT_SCHEMA,
+        "checker_raw_result_schema",
     )?;
+    let schema = match schema_raw.as_str() {
+        INDEPENDENT_CHECKER_CHECKER_RAW_RESULT_V1_SCHEMA => IndependentCheckerRawResultSchema::V1,
+        INDEPENDENT_CHECKER_CHECKER_RAW_RESULT_SCHEMA => IndependentCheckerRawResultSchema::V2,
+        _ => {
+            return Err(IndependentCheckerRawResultSchemaError::new(
+                "checker_raw.schema",
+                "checker_raw_result.v1_or_v2",
+                "invalid_enum",
+            ))
+        }
+    };
     let status_raw = raw_required_string(
         members,
         "status",
@@ -16581,6 +16894,45 @@ fn parse_independent_checker_raw_result_value(
         "checker_raw.checker_build_hash",
     )?;
 
+    let (certificate_format, core_spec, input_certificate_format, input_core_spec) =
+        if schema == IndependentCheckerRawResultSchema::V2 {
+            let certificate_format = raw_required_string(
+                members,
+                "certificate_format",
+                "checker_raw.certificate_format",
+                "certificate_format",
+            )?;
+            let core_spec =
+                raw_required_string(members, "core_spec", "checker_raw.core_spec", "core_spec")?;
+            let input_certificate_format = raw_optional_identity_string(
+                members,
+                "input_certificate_format",
+                "checker_raw.input_certificate_format",
+                "certificate_format",
+            )?;
+            let input_core_spec = raw_optional_identity_string(
+                members,
+                "input_core_spec",
+                "checker_raw.input_core_spec",
+                "core_spec",
+            )?;
+            if input_certificate_format.is_some() != input_core_spec.is_some() {
+                return Err(IndependentCheckerRawResultSchemaError::new(
+                    "checker_raw.input_pair",
+                    "both_present_or_both_absent",
+                    "half_present",
+                ));
+            }
+            (
+                Some(certificate_format),
+                Some(core_spec),
+                input_certificate_format,
+                input_core_spec,
+            )
+        } else {
+            (None, None, None, None)
+        };
+
     let module = raw_optional_module(members, "module", "checker_raw.module")?;
     let certificate_hash =
         raw_optional_hash(members, "certificate_hash", "checker_raw.certificate_hash")?;
@@ -16594,6 +16946,14 @@ fn parse_independent_checker_raw_result_value(
 
     match status {
         IndependentCheckerMachineCheckStatus::Checked => {
+            if schema == IndependentCheckerRawResultSchema::V2 && input_certificate_format.is_none()
+            {
+                return Err(IndependentCheckerRawResultSchemaError::new(
+                    "checker_raw.input_pair",
+                    "present_for_checked_status",
+                    "missing",
+                ));
+            }
             if module.is_none() {
                 return Err(IndependentCheckerRawResultSchemaError::new(
                     "checker_raw.module",
@@ -16659,8 +17019,24 @@ fn parse_independent_checker_raw_result_value(
         }
     }
 
-    raw_reject_unknown_fields(
-        members,
+    let allowed_fields: &[&str] = if schema == IndependentCheckerRawResultSchema::V2 {
+        &[
+            "schema",
+            "checker_id",
+            "checker_version",
+            "checker_build_hash",
+            "certificate_format",
+            "core_spec",
+            "input_certificate_format",
+            "input_core_spec",
+            "status",
+            "module",
+            "certificate_hash",
+            "export_hash",
+            "axiom_report_hash",
+            "error",
+        ]
+    } else {
         &[
             "schema",
             "checker_id",
@@ -16672,15 +17048,20 @@ fn parse_independent_checker_raw_result_value(
             "export_hash",
             "axiom_report_hash",
             "error",
-        ],
-        "checker_raw",
-    )?;
+        ]
+    };
+    raw_reject_unknown_fields(members, allowed_fields, "checker_raw")?;
 
     Ok(IndependentCheckerRawResult {
+        schema,
         status,
         checker_id,
         checker_version,
         checker_build_hash,
+        certificate_format,
+        core_spec,
+        input_certificate_format,
+        input_core_spec,
         module,
         certificate_hash,
         export_hash,
@@ -16722,23 +17103,6 @@ fn raw_required_string(
         .string_value()
         .map(ToOwned::to_owned)
         .ok_or_else(|| IndependentCheckerRawResultSchemaError::new(field, expected, "wrong_type"))
-}
-
-fn raw_required_fixed_string(
-    members: &[JsonMember<'_>],
-    name: &str,
-    field: &str,
-    fixed: &str,
-) -> Result<(), IndependentCheckerRawResultSchemaError> {
-    let value = raw_required_string(members, name, field, fixed)?;
-    if value != fixed {
-        return Err(IndependentCheckerRawResultSchemaError::new(
-            field,
-            fixed,
-            "invalid_enum",
-        ));
-    }
-    Ok(())
 }
 
 fn raw_optional_identity_string(
@@ -20217,6 +20581,10 @@ const STORE_REFERENCE_FIELDS: &[&str] = &["kind", "path", "manifest_hash"];
 const CHECKER_ALLOWLIST_FIELDS: &[&str] = &[
     "profile",
     "checker_id",
+    "checker_version",
+    "raw_result_schema",
+    "certificate_format",
+    "core_spec",
     "binary_id",
     "binary_hash",
     "build_hash",
@@ -20230,6 +20598,9 @@ const CHECKER_IDENTITY_ENTRY_FIELDS: &[&str] = &[
     "profile",
     "checker_id",
     "checker_version",
+    "raw_result_schema",
+    "certificate_format",
+    "core_spec",
     "binary_id",
     "binary_hash",
     "build_hash",
@@ -26689,6 +27060,64 @@ fn parse_checker_allowlist_field(
             &format!("{path}.checker_id"),
             "checker_id",
         )?;
+        let checker_version = optional_string_field(
+            entry_members,
+            "checker_version",
+            &format!("{path}.checker_version"),
+            "non_empty_string",
+        )?;
+        let raw_result_schema = optional_string_field(
+            entry_members,
+            "raw_result_schema",
+            &format!("{path}.raw_result_schema"),
+            "checker_raw_result_schema",
+        )?;
+        let certificate_format = optional_string_field(
+            entry_members,
+            "certificate_format",
+            &format!("{path}.certificate_format"),
+            "certificate_format",
+        )?;
+        let core_spec = optional_string_field(
+            entry_members,
+            "core_spec",
+            &format!("{path}.core_spec"),
+            "core_spec",
+        )?;
+        let binding_field_count = [
+            checker_version.as_ref(),
+            raw_result_schema.as_ref(),
+            certificate_format.as_ref(),
+            core_spec.as_ref(),
+        ]
+        .into_iter()
+        .filter(|value| value.is_some())
+        .count();
+        if binding_field_count != 0 && binding_field_count != 4 {
+            return Err(IndependentCheckerPolicyValidationError::new(
+                format!("{path}.checker_binding"),
+                "all_binding_fields_present_or_all_absent",
+                "partial_binding",
+            ));
+        }
+        if checker_id == NPA_CHECKER_EXT_CHECKER_ID && binding_field_count == 0 {
+            return Err(IndependentCheckerPolicyValidationError::new(
+                format!("{path}.checker_binding"),
+                "explicit_external_checker_binding",
+                "missing",
+            ));
+        }
+        if let Some(schema) = raw_result_schema.as_deref() {
+            if schema != INDEPENDENT_CHECKER_CHECKER_RAW_RESULT_V1_SCHEMA
+                && schema != INDEPENDENT_CHECKER_CHECKER_RAW_RESULT_SCHEMA
+            {
+                return Err(IndependentCheckerPolicyValidationError::new(
+                    format!("{path}.raw_result_schema"),
+                    "checker_raw_result.v1_or_v2",
+                    "invalid_enum",
+                ));
+            }
+        }
         let binary_id = required_string_field(
             entry_members,
             "binary_id",
@@ -26717,6 +27146,10 @@ fn parse_checker_allowlist_field(
         out.push(IndependentCheckerAllowlistEntry {
             profile,
             checker_id,
+            checker_version,
+            raw_result_schema,
+            certificate_format,
+            core_spec,
             binary_id,
             binary_hash,
             build_hash,
@@ -27414,6 +27847,24 @@ fn parse_independent_checker_identity_manifest_value(
             &format!("{path}.checker_version"),
             "string",
         )?;
+        let raw_result_schema = optional_string_field(
+            checker_members,
+            "raw_result_schema",
+            &format!("{path}.raw_result_schema"),
+            "checker_raw_result_schema",
+        )?;
+        let certificate_format = optional_string_field(
+            checker_members,
+            "certificate_format",
+            &format!("{path}.certificate_format"),
+            "certificate_format",
+        )?;
+        let core_spec = optional_string_field(
+            checker_members,
+            "core_spec",
+            &format!("{path}.core_spec"),
+            "core_spec",
+        )?;
         let binary_id = required_string_field(
             checker_members,
             "binary_id",
@@ -27437,6 +27888,9 @@ fn parse_independent_checker_identity_manifest_value(
             profile,
             checker_id,
             checker_version,
+            raw_result_schema,
+            certificate_format,
+            core_spec,
             binary_id,
             binary_hash,
             build_hash,
@@ -29138,6 +29592,25 @@ fn independent_checker_raw_certificate_header_module(
     decoder.name()
 }
 
+fn independent_checker_requested_certificate_pair(
+    certificate_bytes: &[u8],
+) -> Option<IndependentCheckerCertificatePair> {
+    let mut decoder = IndependentCheckerRawCertificateHeaderDecoder::new(certificate_bytes);
+    let certificate_format = decoder.string().ok()?;
+    let core_spec = decoder.string().ok()?;
+    let exact = matches!(
+        (certificate_format.as_str(), core_spec.as_str()),
+        ("NPA-CERT-0.3.0", "NPA-Core-0.3.0")
+            | ("NPA-CERT-0.2.0", "NPA-Core-0.2.0")
+            | ("NPA-CERT-0.1.2", "NPA-Core-0.1.2")
+            | ("NPA-CERT-0.1", "NPA-Core-0.1")
+    );
+    exact.then_some(IndependentCheckerCertificatePair {
+        certificate_format,
+        core_spec,
+    })
+}
+
 fn independent_checker_mutate_challenge_certificate_bytes(
     request: &IndependentCheckerChallengeGenerationRequest,
     base_certificate_bytes: &[u8],
@@ -30684,6 +31157,10 @@ mod tests {
                 {{
                   "profile":"external",
                   "checker_id":"npa-checker-ext",
+                  "checker_version":"0.1.0",
+                  "raw_result_schema":"npa.independent-checker.checker_raw_result.v1",
+                  "certificate_format":"NPA-CERT-0.2.0",
+                  "core_spec":"NPA-Core-0.2.0",
                   "binary_id":"npa-checker-ext-macos-aarch64",
                   "binary_hash":"{}",
                   "build_hash":"{}",
@@ -30783,6 +31260,9 @@ mod tests {
                   "profile":"external",
                   "checker_id":"npa-checker-ext",
                   "checker_version":"0.1.0",
+                  "raw_result_schema":"npa.independent-checker.checker_raw_result.v1",
+                  "certificate_format":"NPA-CERT-0.2.0",
+                  "core_spec":"NPA-Core-0.2.0",
                   "binary_id":"npa-checker-ext-macos-aarch64",
                   "binary_hash":"{}",
                   "build_hash":"{}"
@@ -32235,6 +32715,10 @@ mod tests {
             .push(IndependentCheckerAllowlistEntry {
                 profile: "high-trust-reference".to_owned(),
                 checker_id: "npa-checker-ref-high-trust".to_owned(),
+                checker_version: None,
+                raw_result_schema: None,
+                certificate_format: None,
+                core_spec: None,
                 binary_id: "npa-checker-ref-high-trust-macos-aarch64".to_owned(),
                 binary_hash: test_hash(34),
                 build_hash: test_hash(35),
@@ -33016,6 +33500,261 @@ mod tests {
         )
     }
 
+    fn ods12_current_binding() -> (
+        IndependentCheckerMachineCheckRequest,
+        IndependentCheckerRunnerPolicy,
+        Vec<u8>,
+    ) {
+        let (mut request, mut policy) = m3_request_and_policy();
+        let selected = policy
+            .checker_allowlist
+            .iter_mut()
+            .find(|entry| entry.profile == "reference")
+            .unwrap();
+        selected.checker_version = Some("0.3.0".to_owned());
+        selected.raw_result_schema = Some(INDEPENDENT_CHECKER_CHECKER_RAW_RESULT_SCHEMA.to_owned());
+        selected.certificate_format = Some("NPA-CERT-0.3.0".to_owned());
+        selected.core_spec = Some("NPA-Core-0.3.0".to_owned());
+        request.policy.hash = policy.policy_hash();
+        (
+            request,
+            policy,
+            test_raw_certificate_bytes("Std.Nat", test_hash(70)),
+        )
+    }
+
+    fn ods12_v2_checked(input_format: &str, input_core: &str) -> String {
+        format!(
+            r#"{{
+              "schema":"npa.independent-checker.checker_raw_result.v2",
+              "checker_id":"npa-checker-ref",
+              "checker_version":"0.3.0",
+              "checker_build_hash":"{}",
+              "certificate_format":"NPA-CERT-0.3.0",
+              "core_spec":"NPA-Core-0.3.0",
+              "input_certificate_format":"{input_format}",
+              "input_core_spec":"{input_core}",
+              "status":"checked",
+              "module":"Std.Nat",
+              "certificate_hash":"{}",
+              "export_hash":"{}",
+              "axiom_report_hash":"{}"
+            }}"#,
+            hash_wire(11),
+            hash_wire(70),
+            hash_wire(90),
+            hash_wire(91)
+        )
+    }
+
+    #[test]
+    fn ods12_v2_adoption_keeps_checker_capability_distinct_from_v0_2_input() {
+        let (request, policy, certificate_bytes) = ods12_current_binding();
+        let raw = ods12_v2_checked("NPA-CERT-0.2.0", "NPA-Core-0.2.0");
+        let parsed = parse_independent_checker_raw_result(&raw).unwrap();
+        assert_eq!(parsed.schema, IndependentCheckerRawResultSchema::V2);
+        assert_eq!(parsed.certificate_format.as_deref(), Some("NPA-CERT-0.3.0"));
+        assert_eq!(
+            parsed.input_certificate_format.as_deref(),
+            Some("NPA-CERT-0.2.0")
+        );
+
+        let adoption = independent_checker_machine_check_run_with_certificate_bytes(
+            &request,
+            &policy,
+            IndependentCheckerRunObservation {
+                result_id: "mchkres_ods12".to_owned(),
+                attempt: 1,
+                runner: m3_runner(),
+                process: IndependentCheckerMachineCheckProcess::exited(0),
+                resource_usage: m3_resource_usage(1),
+                stdout: raw.into_bytes(),
+                stderr: Vec::new(),
+            },
+            &certificate_bytes,
+        )
+        .unwrap();
+        assert_eq!(
+            adoption.result.status,
+            IndependentCheckerMachineCheckStatus::Checked
+        );
+        assert_eq!(
+            adoption.input_pair,
+            Some(IndependentCheckerCertificatePair {
+                certificate_format: "NPA-CERT-0.2.0".to_owned(),
+                core_spec: "NPA-Core-0.2.0".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn ods12_current_binding_rejects_v1_stale_capability_and_mismatched_input() {
+        let (request, policy, certificate_bytes) = ods12_current_binding();
+        let run = |raw: String, result_id: &str| {
+            independent_checker_machine_check_run_with_certificate_bytes(
+                &request,
+                &policy,
+                IndependentCheckerRunObservation {
+                    result_id: result_id.to_owned(),
+                    attempt: 1,
+                    runner: m3_runner(),
+                    process: IndependentCheckerMachineCheckProcess::exited(0),
+                    resource_usage: m3_resource_usage(1),
+                    stdout: raw.into_bytes(),
+                    stderr: Vec::new(),
+                },
+                &certificate_bytes,
+            )
+            .unwrap()
+            .result
+        };
+
+        let v1 = run(m3_raw_checked("0.3.0"), "mchkres_ods12_v1");
+        assert_eq!(
+            v1.error.unwrap().reason_code.as_deref(),
+            Some("checker_raw_schema_mismatch")
+        );
+
+        let stale = run(
+            ods12_v2_checked("NPA-CERT-0.2.0", "NPA-Core-0.2.0")
+                .replace("NPA-CERT-0.3.0", "NPA-CERT-0.2.0"),
+            "mchkres_ods12_stale",
+        );
+        assert_eq!(
+            stale.error.unwrap().reason_code.as_deref(),
+            Some("checker_capability_mismatch")
+        );
+
+        let mismatched = run(
+            ods12_v2_checked("NPA-CERT-0.3.0", "NPA-Core-0.3.0"),
+            "mchkres_ods12_input",
+        );
+        assert_eq!(
+            mismatched.error.unwrap().reason_code.as_deref(),
+            Some("checker_input_identity_mismatch")
+        );
+
+        let mixed_version = run(
+            ods12_v2_checked("NPA-CERT-0.2.0", "NPA-Core-0.2.0").replace(
+                "\"checker_version\":\"0.3.0\"",
+                "\"checker_version\":\"0.2.0\"",
+            ),
+            "mchkres_ods12_version",
+        );
+        assert_eq!(
+            mixed_version.error.unwrap().reason_code.as_deref(),
+            Some("checker_version_mismatch")
+        );
+
+        let (mut old_request, mut old_policy, _) = ods12_current_binding();
+        let old = old_policy
+            .checker_allowlist
+            .iter_mut()
+            .find(|entry| entry.profile == "reference")
+            .unwrap();
+        old.checker_version = Some("0.2.0".to_owned());
+        old.raw_result_schema = Some(INDEPENDENT_CHECKER_CHECKER_RAW_RESULT_V1_SCHEMA.to_owned());
+        old.certificate_format = Some("NPA-CERT-0.2.0".to_owned());
+        old.core_spec = Some("NPA-Core-0.2.0".to_owned());
+        old_request.policy.hash = old_policy.policy_hash();
+        let cross_bound = independent_checker_machine_check_run_with_certificate_bytes(
+            &old_request,
+            &old_policy,
+            IndependentCheckerRunObservation {
+                result_id: "mchkres_ods12_cross".to_owned(),
+                attempt: 1,
+                runner: m3_runner(),
+                process: IndependentCheckerMachineCheckProcess::exited(0),
+                resource_usage: m3_resource_usage(1),
+                stdout: ods12_v2_checked("NPA-CERT-0.2.0", "NPA-Core-0.2.0").into_bytes(),
+                stderr: Vec::new(),
+            },
+            &certificate_bytes,
+        )
+        .unwrap()
+        .result;
+        assert_eq!(
+            cross_bound.error.unwrap().reason_code.as_deref(),
+            Some("checker_raw_schema_mismatch")
+        );
+    }
+
+    #[test]
+    fn ods12_v2_parser_rejects_half_present_input_pair() {
+        let raw = ods12_v2_checked("NPA-CERT-0.2.0", "NPA-Core-0.2.0").replace(
+            "              \"input_core_spec\":\"NPA-Core-0.2.0\",\n",
+            "",
+        );
+        let error = parse_independent_checker_raw_result(&raw).unwrap_err();
+        assert_eq!(error.field, "checker_raw.input_pair");
+        assert_eq!(error.actual_value, "half_present");
+    }
+
+    #[test]
+    fn ods12_exact_requested_header_rejects_missing_failed_result_input_pair() {
+        let (request, policy, certificate_bytes) = ods12_current_binding();
+        let raw = format!(
+            r#"{{
+              "schema":"npa.independent-checker.checker_raw_result.v2",
+              "checker_id":"npa-checker-ref",
+              "checker_version":"0.3.0",
+              "checker_build_hash":"{}",
+              "certificate_format":"NPA-CERT-0.3.0",
+              "core_spec":"NPA-Core-0.3.0",
+              "status":"failed",
+              "error":{{"kind":"certificate_decode_error","reason_code":"unexpected_eof"}}
+            }}"#,
+            hash_wire(11),
+        );
+        let result = independent_checker_machine_check_run_with_certificate_bytes(
+            &request,
+            &policy,
+            IndependentCheckerRunObservation {
+                result_id: "mchkres_ods12_missing_pair".to_owned(),
+                attempt: 1,
+                runner: m3_runner(),
+                process: IndependentCheckerMachineCheckProcess::exited(1),
+                resource_usage: m3_resource_usage(1),
+                stdout: raw.into_bytes(),
+                stderr: Vec::new(),
+            },
+            &certificate_bytes,
+        )
+        .unwrap()
+        .result;
+        assert_eq!(
+            result.error.unwrap().reason_code.as_deref(),
+            Some("checker_input_identity_missing")
+        );
+    }
+
+    #[test]
+    fn ods12_runner_policy_rejects_partial_checker_binding() {
+        let source = valid_runner_policy_json().replace(
+            "\"checker_id\":\"npa-checker-ref\"",
+            "\"checker_id\":\"npa-checker-ref\",\"checker_version\":\"0.3.0\"",
+        );
+        let error = parse_independent_checker_runner_policy(&source).unwrap_err();
+        assert_eq!(error.field, "checker_allowlist[0].checker_binding");
+        assert_eq!(error.actual_value, "partial_binding");
+
+        let stale_external = pr_runner_policy_with_optional_external_json()
+            .replace("                  \"checker_version\":\"0.1.0\",\n", "")
+            .replace(
+                "                  \"raw_result_schema\":\"npa.independent-checker.checker_raw_result.v1\",\n",
+                "",
+            )
+            .replace(
+                "                  \"certificate_format\":\"NPA-CERT-0.2.0\",\n",
+                "",
+            )
+            .replace("                  \"core_spec\":\"NPA-Core-0.2.0\",\n", "");
+        let error = parse_independent_checker_runner_policy(&stale_external).unwrap_err();
+        assert_eq!(error.field, "checker_allowlist[0].checker_binding");
+        assert_eq!(error.expected_value, "explicit_external_checker_binding");
+        assert_eq!(error.actual_value, "missing");
+    }
+
     #[test]
     fn m3_adopts_checked_raw_result_and_computes_distinct_hashes() {
         let (request, policy) = m3_request_and_policy();
@@ -33515,6 +34254,10 @@ mod tests {
                 {{
                   "profile":"external",
                   "checker_id":"npa-checker-ext",
+                  "checker_version":"0.8.0",
+                  "raw_result_schema":"npa.independent-checker.checker_raw_result.v1",
+                  "certificate_format":"NPA-CERT-0.2.0",
+                  "core_spec":"NPA-Core-0.2.0",
                   "binary_id":"npa-checker-ext-macos-aarch64",
                   "binary_hash":"{}",
                   "build_hash":"{}",
@@ -33615,12 +34358,12 @@ mod tests {
         IndependentCheckerRequestStoreManifest { requests: entries }
     }
 
-    fn m4_raw_checked(checker_id: &str, build_hash: Hash) -> String {
+    fn m4_raw_checked(checker_id: &str, checker_version: &str, build_hash: Hash) -> String {
         format!(
             r#"{{
               "schema":"npa.independent-checker.checker_raw_result.v1",
               "checker_id":"{}",
-              "checker_version":"0.8.0",
+              "checker_version":"{}",
               "checker_build_hash":"{}",
               "status":"checked",
               "module":"Std.Nat",
@@ -33629,6 +34372,7 @@ mod tests {
               "axiom_report_hash":"{}"
             }}"#,
             checker_id,
+            checker_version,
             format_hash_string(&build_hash),
             hash_wire(70),
             hash_wire(90),
@@ -33653,7 +34397,12 @@ mod tests {
                 runner: m3_runner(),
                 process: IndependentCheckerMachineCheckProcess::exited(0),
                 resource_usage: m3_resource_usage(100),
-                stdout: m4_raw_checked(&checker.checker_id, checker.build_hash).into_bytes(),
+                stdout: m4_raw_checked(
+                    &checker.checker_id,
+                    checker.checker_version.as_deref().unwrap_or("0.8.0"),
+                    checker.build_hash,
+                )
+                .into_bytes(),
                 stderr: Vec::new(),
             },
         )
@@ -37655,6 +38404,9 @@ mod tests {
                   "profile":"external",
                   "checker_id":"npa-checker-ext",
                   "checker_version":"0.8.0",
+                  "raw_result_schema":"npa.independent-checker.checker_raw_result.v1",
+                  "certificate_format":"NPA-CERT-0.2.0",
+                  "core_spec":"NPA-Core-0.2.0",
                   "binary_id":"npa-checker-ext-macos-aarch64",
                   "binary_hash":"{}",
                   "build_hash":"{}"

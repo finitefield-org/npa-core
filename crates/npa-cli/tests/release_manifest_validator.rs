@@ -13,6 +13,7 @@ const VALIDATION_SCHEMA: &str = "npa.generated_artifact_release_manifest.validat
 const COMMAND_RESULT_V0_1: &str = "npa.package.command_result.v0.1";
 const COMMAND_RESULT_V0_2: &str = "npa.package.command_result.v0.2";
 const COMMAND_RESULT_V0_3: &str = "npa.package.command_result.v0.3";
+const COMMAND_RESULT_V0_4: &str = "npa.package.command_result.v0.4";
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -163,6 +164,7 @@ fn positive_fixtures_have_exact_deterministic_classification() {
     );
 
     for name in [
+        "valid-v0.2-current.json",
         "valid-v0.2-in-process.json",
         "valid-v0.2-fast.json",
         "valid-v0.2-external.json",
@@ -528,13 +530,35 @@ fn v0_2_pairs_historical_and_current_cli_command_result_series() {
         let output = run_document(&changed, true);
         assert!(output.status.success(), "{version}: {}", stderr(&output));
     }
+    for version in ["0.8.0", "0.8.12"] {
+        let changed = source
+            .replace(
+                "\"npa_cli_crate_version\": \"0.3.0\"",
+                &format!("\"npa_cli_crate_version\": \"{version}\""),
+            )
+            .replace(COMMAND_RESULT_V0_1, COMMAND_RESULT_V0_4);
+        let output = run_document(&changed, true);
+        assert!(output.status.success(), "{version}: {}", stderr(&output));
+    }
     for (version, schema) in [
         ("0.3.0", COMMAND_RESULT_V0_2),
+        ("0.3.0", COMMAND_RESULT_V0_3),
+        ("0.3.0", COMMAND_RESULT_V0_4),
         ("0.4.12", COMMAND_RESULT_V0_2),
+        ("0.4.12", COMMAND_RESULT_V0_3),
+        ("0.4.12", COMMAND_RESULT_V0_4),
         ("0.5.0", COMMAND_RESULT_V0_1),
         ("0.5.0", COMMAND_RESULT_V0_3),
+        ("0.5.0", COMMAND_RESULT_V0_4),
+        ("0.6.0", COMMAND_RESULT_V0_1),
         ("0.6.0", COMMAND_RESULT_V0_2),
+        ("0.6.0", COMMAND_RESULT_V0_4),
+        ("0.7.0", COMMAND_RESULT_V0_1),
         ("0.7.0", COMMAND_RESULT_V0_2),
+        ("0.7.0", COMMAND_RESULT_V0_4),
+        ("0.8.0", COMMAND_RESULT_V0_1),
+        ("0.8.0", COMMAND_RESULT_V0_2),
+        ("0.8.0", COMMAND_RESULT_V0_3),
     ] {
         let changed = source
             .replace(
@@ -672,6 +696,8 @@ fn v0_2_rejects_unsupported_cli_versions() {
         "0.6.01",
         "0.7.00",
         "0.7.01",
+        "0.8.00",
+        "0.8.01",
         "0.4",
         "0.4.0-dev",
         "latest",

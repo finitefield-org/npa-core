@@ -2,10 +2,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use npa_cli::args::{
-    parse_cli_args, render_help, CliAction, CliCommand, HelpTopic, PackageAuditCacheMode,
-    PackageBuildCheckCacheMode, PackageBuildSelection, PackageChecker, PackageCommand,
-    PackageLockCommand, PackageLockInputMode, PackageRefactorPlanScope, PackageTimingMode,
-    PackageVerifierMemoMode, UsageReason,
+    parse_cli_args, render_help, CliAction, CliCommand, HelpTopic, KernelFuelReportMode,
+    PackageAuditCacheMode, PackageBuildCheckCacheMode, PackageBuildSelection, PackageChecker,
+    PackageCommand, PackageLockCommand, PackageLockInputMode, PackageRefactorPlanScope,
+    PackageTimingMode, PackageVerifierMemoMode, UsageReason,
 };
 use npa_cli::diagnostic::{CommandStatus, DiagnosticKind};
 use npa_cli::package::run_package_command;
@@ -542,6 +542,141 @@ fn package_cli_args_parses_build_certs_check_mode() {
     assert!(options.check);
     assert_eq!(options.build_check_cache, PackageBuildCheckCacheMode::Off);
     assert!(!options.update_manifest_hashes);
+    assert_eq!(options.kernel_fuel_report, KernelFuelReportMode::Failure);
+    assert_eq!(options.timings, PackageTimingMode::Off);
+}
+
+#[test]
+fn package_cli_args_build_certs_observation_modes_parse_all_pairs_orthogonally() {
+    let fuel_modes = [
+        ("off", KernelFuelReportMode::Off),
+        ("failure", KernelFuelReportMode::Failure),
+        ("detailed", KernelFuelReportMode::Detailed),
+    ];
+    let timing_modes = [
+        ("off", PackageTimingMode::Off),
+        ("summary", PackageTimingMode::Summary),
+        ("detailed", PackageTimingMode::Detailed),
+    ];
+
+    let fuel_only = parse(&["package", "build-certs", "--kernel-fuel-report=detailed"]);
+    let CliAction::Run(CliCommand::Package(PackageCommand::BuildCerts(fuel_only))) = fuel_only
+    else {
+        panic!("expected package build-certs command");
+    };
+    assert_eq!(fuel_only.kernel_fuel_report, KernelFuelReportMode::Detailed);
+    assert_eq!(fuel_only.timings, PackageTimingMode::Off);
+
+    let timings_only = parse(&["package", "build-certs", "--timings=detailed"]);
+    let CliAction::Run(CliCommand::Package(PackageCommand::BuildCerts(timings_only))) =
+        timings_only
+    else {
+        panic!("expected package build-certs command");
+    };
+    assert_eq!(
+        timings_only.kernel_fuel_report,
+        KernelFuelReportMode::Failure
+    );
+    assert_eq!(timings_only.timings, PackageTimingMode::Detailed);
+
+    for (fuel_spelling, expected_fuel) in fuel_modes {
+        for (timing_spelling, expected_timing) in timing_modes {
+            let separate = parse(&[
+                "package",
+                "build-certs",
+                "--kernel-fuel-report",
+                fuel_spelling,
+                "--timings",
+                timing_spelling,
+            ]);
+            let CliAction::Run(CliCommand::Package(PackageCommand::BuildCerts(options))) = separate
+            else {
+                panic!("expected package build-certs command");
+            };
+            assert_eq!(options.kernel_fuel_report, expected_fuel);
+            assert_eq!(options.timings, expected_timing);
+
+            let fuel_equals = format!("--kernel-fuel-report={fuel_spelling}");
+            let timings_equals = format!("--timings={timing_spelling}");
+            let equals = parse(&[
+                "package",
+                "build-certs",
+                fuel_equals.as_str(),
+                timings_equals.as_str(),
+            ]);
+            let CliAction::Run(CliCommand::Package(PackageCommand::BuildCerts(options))) = equals
+            else {
+                panic!("expected package build-certs command");
+            };
+            assert_eq!(options.kernel_fuel_report, expected_fuel);
+            assert_eq!(options.timings, expected_timing);
+        }
+    }
+}
+
+#[test]
+fn package_cli_args_build_certs_observation_modes_reject_unknown_duplicate_and_missing_values() {
+    let unknown_fuel = parse_error(&["package", "build-certs", "--kernel-fuel-report=verbose"]);
+    assert_eq!(
+        unknown_fuel.reason,
+        UsageReason::UnsupportedKernelFuelReportMode
+    );
+    assert_eq!(unknown_fuel.flag.as_deref(), Some("--kernel-fuel-report"));
+    assert_eq!(unknown_fuel.value.as_deref(), Some("verbose"));
+
+    let unknown_timings = parse_error(&["package", "build-certs", "--timings=trace"]);
+    assert_eq!(unknown_timings.reason, UsageReason::UnsupportedTimingMode);
+    assert_eq!(unknown_timings.flag.as_deref(), Some("--timings"));
+    assert_eq!(unknown_timings.value.as_deref(), Some("trace"));
+
+    for (args, flag) in [
+        (
+            vec![
+                "package",
+                "build-certs",
+                "--kernel-fuel-report",
+                "off",
+                "--kernel-fuel-report=detailed",
+            ],
+            "--kernel-fuel-report",
+        ),
+        (
+            vec![
+                "package",
+                "build-certs",
+                "--timings",
+                "off",
+                "--timings=detailed",
+            ],
+            "--timings",
+        ),
+    ] {
+        let duplicate = parse_error(&args);
+        assert_eq!(duplicate.reason, UsageReason::DuplicateFlag);
+        assert_eq!(duplicate.flag.as_deref(), Some(flag));
+    }
+
+    for (args, flag) in [
+        (
+            vec!["package", "build-certs", "--kernel-fuel-report"],
+            "--kernel-fuel-report",
+        ),
+        (
+            vec!["package", "build-certs", "--kernel-fuel-report="],
+            "--kernel-fuel-report",
+        ),
+        (vec!["package", "build-certs", "--timings"], "--timings"),
+        (vec!["package", "build-certs", "--timings="], "--timings"),
+    ] {
+        let missing = parse_error(&args);
+        assert_eq!(missing.reason, UsageReason::MissingFlagValue);
+        assert_eq!(missing.flag.as_deref(), Some(flag));
+    }
+
+    let help = render_help(HelpTopic::PackageBuildCerts);
+    assert!(help.contains("--kernel-fuel-report off|failure|detailed"));
+    assert!(help.contains("--timings off|summary|detailed"));
+    assert!(help.contains("the two selections are independent"));
 }
 
 #[test]
@@ -1873,7 +2008,7 @@ fn package_cli_args_binary_reports_json_usage_error_when_requested() {
     assert_eq!(output.status.code(), Some(2));
     assert!(output.stderr.is_empty());
     let stdout = String::from_utf8(output.stdout).unwrap();
-    assert!(stdout.contains("\"schema\":\"npa.package.command_result.v0.3\""));
+    assert!(stdout.contains("\"schema\":\"npa.package.command_result.v0.4\""));
     assert!(stdout.contains("\"kind\":\"Usage\""));
     assert!(stdout.contains("\"reason_code\":\"unknown_flag\""));
     assert!(stdout.contains("\"field\":\"--mystery\""));

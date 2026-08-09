@@ -61,7 +61,7 @@ fn hash_with_domain(domain: &[u8], payload: &[u8]) -> [u8; 32] {
 fn recompute_module_certificate_hash(cert: &mut ModuleCert) {
     let encoded = encode_module_cert(cert).unwrap();
     let payload = &encoded[..encoded.len() - 32];
-    cert.hashes.certificate_hash = hash_with_domain(b"NPA-MODULE-CERT-0.2.0", payload);
+    cert.hashes.certificate_hash = hash_with_domain(b"NPA-MODULE-CERT-0.3.0", payload);
 }
 
 fn semantically_invalid_provider(mut cert: ModuleCert) -> ModuleCert {
@@ -98,7 +98,7 @@ fn semantically_invalid_provider(mut cert: ModuleCert) -> ModuleCert {
     payload.extend(term_hash(&cert, proof).unwrap());
     payload.push(0); // Empty dependency vector.
     cert.declarations[0].hashes.decl_certificate_hash =
-        hash_with_domain(b"NPA-DECL-CERT-0.1", &payload);
+        hash_with_domain(b"NPA-DECL-CERT-0.3.0", &payload);
     recompute_module_certificate_hash(&mut cert);
     cert
 }

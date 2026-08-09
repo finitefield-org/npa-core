@@ -989,7 +989,7 @@ fn l2_transport_module_projection_internal(
             let mut dependencies = Vec::new();
             for dependency in &d.dependencies {
                 let mut identity = Vec::new();
-                c.global(&mut identity, &dependency.global_ref)?;
+                c.global(&mut identity, dependency.global_ref())?;
                 dependencies.push(identity);
             }
             dependencies.sort();

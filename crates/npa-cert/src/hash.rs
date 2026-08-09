@@ -431,30 +431,42 @@ pub(crate) fn inductive_export_type_term_id(
     Ok(body)
 }
 
+pub(crate) struct DeclHashTables<'a> {
+    pub(crate) terms: &'a [TermNode],
+    pub(crate) level_hashes: &'a [Hash],
+    pub(crate) term_hashes: &'a [Hash],
+    pub(crate) names: &'a [Name],
+}
+
 pub(crate) fn compute_decl_hashes(
+    version: CertificateFormatVersion,
     decl: &DeclPayload,
     dependencies: &[DependencyEntry],
     axiom_dependencies: &[AxiomRef],
-    term_table: &[TermNode],
-    level_hashes: &[Hash],
-    term_hashes: &[Hash],
-    names: &[Name],
+    tables: DeclHashTables<'_>,
 ) -> Result<DeclHashes> {
-    let interface_dependencies = interface_dependencies_for_decl(decl, dependencies, term_table)?;
+    let interface_dependencies = interface_dependencies_for_decl(decl, dependencies, tables.terms)?;
     let iface = hash_with_domain(
         b"NPA-DECL-IFACE-0.1",
         &decl_interface_payload(
             decl,
             &interface_dependencies,
             axiom_dependencies,
-            level_hashes,
-            term_hashes,
-            names,
+            tables.level_hashes,
+            tables.term_hashes,
+            tables.names,
         )?,
     );
     let cert = hash_with_domain(
-        b"NPA-DECL-CERT-0.1",
-        &decl_certificate_payload(decl, iface, dependencies, axiom_dependencies, term_hashes)?,
+        version.declaration_certificate_domain(),
+        &decl_certificate_payload(
+            version,
+            decl,
+            iface,
+            dependencies,
+            axiom_dependencies,
+            tables.term_hashes,
+        )?,
     );
     Ok(DeclHashes {
         decl_interface_hash: iface,
@@ -793,11 +805,17 @@ fn interface_dependencies_for_decl(
     for term in interface_term_ids(decl) {
         collect_global_refs_from_term(term_table, term, &mut refs)?;
     }
-    Ok(dependencies
+    dependencies
         .iter()
-        .filter(|dependency| refs.contains(&dependency.global_ref))
-        .cloned()
-        .collect())
+        .filter(|dependency| refs.contains(dependency.global_ref()))
+        .map(|dependency| {
+            DependencyEntry::checked_interface(
+                dependency.global_ref().clone(),
+                dependency.decl_interface_hash(),
+            )
+        })
+        .collect::<Result<std::collections::BTreeSet<_>>>()
+        .map(|dependencies| dependencies.into_iter().collect())
 }
 
 fn interface_term_ids(decl: &DeclPayload) -> Vec<TermId> {
@@ -890,6 +908,7 @@ fn collect_global_refs_from_term(
 }
 
 fn decl_certificate_payload(
+    version: CertificateFormatVersion,
     decl: &DeclPayload,
     interface_hash: Hash,
     dependencies: &[DependencyEntry],
@@ -904,20 +923,20 @@ fn decl_certificate_payload(
         }
         DeclPayload::Def { value, .. } | DeclPayload::DefConstrained { value, .. } => {
             out.extend(term_hashes.get(*value).ok_or(CertError::DecodeError)?);
-            encode_dependency_entries_to(&mut out, dependencies);
+            encode_dependency_entries_with_format_to(&mut out, dependencies, version);
             encode_axiom_refs_to(&mut out, axiom_dependencies);
         }
         DeclPayload::Inductive { .. } | DeclPayload::InductiveConstrained { .. } => {
-            encode_dependency_entries_to(&mut out, dependencies);
+            encode_dependency_entries_with_format_to(&mut out, dependencies, version);
             encode_axiom_refs_to(&mut out, axiom_dependencies);
         }
         DeclPayload::MutualInductiveBlock { .. } => {
-            encode_dependency_entries_to(&mut out, dependencies);
+            encode_dependency_entries_with_format_to(&mut out, dependencies, version);
             encode_axiom_refs_to(&mut out, axiom_dependencies);
         }
         DeclPayload::Theorem { proof, .. } | DeclPayload::TheoremConstrained { proof, .. } => {
             out.extend(term_hashes.get(*proof).ok_or(CertError::DecodeError)?);
-            encode_dependency_entries_to(&mut out, dependencies);
+            encode_dependency_entries_with_format_to(&mut out, dependencies, version);
         }
     }
     Ok(out)

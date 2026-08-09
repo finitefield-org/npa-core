@@ -433,7 +433,8 @@ let rec pi_of_binders (binders : Ext_cert.binder_type list) result =
   | [] -> result
   | binder :: rest -> Ext_term.Pi (binder.Ext_cert.binder_ty, pi_of_binders rest result)
 
-let signature_of_declaration decl_index (declaration : Ext_cert.declaration) =
+let signature_of_declaration ?(local_opaque_transparency = false) decl_index
+    (declaration : Ext_cert.declaration) =
   let section = Ext_bytes.Declarations in
   let offset = declaration.Ext_cert.offset in
   let decl_interface_hash =
@@ -456,7 +457,8 @@ let signature_of_declaration decl_index (declaration : Ext_cert.declaration) =
       let unfolding =
         match decl_reducibility with
         | Ext_cert.Reducible -> Reducible decl_value
-        | Ext_cert.Opaque_reducibility -> Opaque
+        | Ext_cert.Opaque_reducibility ->
+            if local_opaque_transparency then Reducible decl_value else Opaque
       in
       make_signature ~decl_interface_hash section offset decl_name decl_universe_params
         decl_universe_constraints decl_ty unfolding (Local { decl_index })
@@ -577,7 +579,8 @@ let generated_signatures_of_declaration decl_index (declaration : Ext_cert.decla
       loop mutual_inductives []
   | _ -> Ok []
 
-let add_checked_declaration env (declaration : Ext_cert.declaration) =
+let add_checked_declaration ?(local_opaque_transparency = false) env
+    (declaration : Ext_cert.declaration) =
   let decl_index = env.checked_declaration_count in
   let section = Ext_bytes.Declarations in
   let offset = declaration.Ext_cert.offset in
@@ -586,7 +589,10 @@ let add_checked_declaration env (declaration : Ext_cert.declaration) =
        (declaration_universe_params declaration.Ext_cert.payload))
     (fun () ->
       bind (generated_signatures_of_declaration decl_index declaration) (fun generated ->
-          match signature_of_declaration decl_index declaration with
+          match
+            signature_of_declaration ~local_opaque_transparency decl_index
+              declaration
+          with
           | Ok signature ->
               Ok
                 {

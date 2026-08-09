@@ -521,6 +521,9 @@ mod tests {
                 direct_dependency_entries: Vec::new(),
                 axiom_dependencies: Vec::new(),
             },
+            owner_certificate_format: "NPA-CERT-0.2.0".to_owned(),
+            owner_core_spec: "NPA-Core-0.2.0".to_owned(),
+            dependency_selective_fingerprint: [0; 32],
         }
     }
 
@@ -559,6 +562,9 @@ mod tests {
                 direct_dependency_entries: Vec::new(),
                 axiom_dependencies: Vec::new(),
             },
+            owner_certificate_format: "NPA-CERT-0.2.0".to_owned(),
+            owner_core_spec: "NPA-Core-0.2.0".to_owned(),
+            dependency_selective_fingerprint: [0; 32],
         }
     }
 

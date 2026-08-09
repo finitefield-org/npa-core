@@ -9,9 +9,9 @@ use std::{
 };
 
 use npa_cert::{
-    decode_module_cert, verify_decoded_module_cert, verify_decoded_module_cert_with_import_refs,
-    AxiomPolicy, CertError, CoreFeature, DeclCert, DeclPayload, ModuleCert, Name, TermNode,
-    VerifiedModule, VerifierSession,
+    decode_module_cert, decode_module_cert_header, verify_decoded_module_cert,
+    verify_decoded_module_cert_with_import_refs, AxiomPolicy, CertError, CertHeader, CoreFeature,
+    DeclCert, DeclPayload, ModuleCert, Name, TermNode, VerifiedModule, VerifierSession,
 };
 use npa_checker_ref::{
     check_certificate, check_certificate_with_observation, ReferenceCertificateSection,
@@ -414,6 +414,10 @@ pub struct PackageModuleVerificationResult {
     pub axiom_report_hash: PackageHash,
     /// Expected certificate hash from the package lock entry.
     pub certificate_hash: PackageHash,
+    /// Exact certificate format decoded from the checked module header.
+    pub certificate_format: Option<String>,
+    /// Exact core specification decoded from the checked module header.
+    pub core_spec: Option<String>,
     /// Deterministic failure details for failed or skipped modules.
     pub error: Option<PackageVerificationError>,
 }
@@ -1270,6 +1274,7 @@ fn verify_package_fast_source_free_serial<'a>(
                     failed.as_dotted(),
                 )),
                 PackageVerificationMode::FastKernel,
+                artifact_bytes.get(&entry.certificate).copied(),
             ));
             continue;
         }
@@ -1300,6 +1305,7 @@ fn verify_package_fast_source_free_serial<'a>(
                     PackageModuleVerificationStatus::Passed,
                     None,
                     PackageVerificationMode::FastKernel,
+                    artifact_bytes.get(&entry.certificate).copied(),
                 ));
             }
             Err(error) => {
@@ -1309,6 +1315,7 @@ fn verify_package_fast_source_free_serial<'a>(
                     PackageModuleVerificationStatus::Failed,
                     Some(error),
                     PackageVerificationMode::FastKernel,
+                    artifact_bytes.get(&entry.certificate).copied(),
                 ));
             }
         }
@@ -1381,6 +1388,8 @@ fn verify_package_fast_source_free_from_root_serial(
         let (entry_index, entry) = entries_by_module
             .get(module)
             .expect("lock graph order only contains lock entries");
+        let certificate_read =
+            read_certificate_artifact_from_root(package_root, *entry_index, entry);
         if let Some(failed) = &failed_module {
             results.push(module_result(
                 entry,
@@ -1390,11 +1399,12 @@ fn verify_package_fast_source_free_from_root_serial(
                     failed.as_dotted(),
                 )),
                 PackageVerificationMode::FastKernel,
+                certificate_read.as_deref().ok(),
             ));
             continue;
         }
 
-        let bytes = match read_certificate_artifact_from_root(package_root, *entry_index, entry) {
+        let bytes = match certificate_read {
             Ok(bytes) => bytes,
             Err(error) => {
                 failed_module = Some(entry.module.clone());
@@ -1403,6 +1413,7 @@ fn verify_package_fast_source_free_from_root_serial(
                     PackageModuleVerificationStatus::Failed,
                     Some(error),
                     PackageVerificationMode::FastKernel,
+                    None,
                 ));
                 continue;
             }
@@ -1445,6 +1456,7 @@ fn verify_package_fast_source_free_from_root_serial(
                     PackageModuleVerificationStatus::Passed,
                     None,
                     PackageVerificationMode::FastKernel,
+                    Some(&bytes),
                 ));
             }
             Err(error) => {
@@ -1454,6 +1466,7 @@ fn verify_package_fast_source_free_from_root_serial(
                     PackageModuleVerificationStatus::Failed,
                     Some(error),
                     PackageVerificationMode::FastKernel,
+                    Some(&bytes),
                 ));
             }
         }
@@ -1627,6 +1640,7 @@ fn verify_package_fast_source_free_execution_with_strategy<'a>(
                             blocked_import.as_dotted(),
                         )),
                         PackageVerificationMode::FastKernel,
+                        artifact_bytes.get(&entry.certificate).copied(),
                     ),
                 );
                 blocked_modules.insert(entry.module.clone());
@@ -2816,6 +2830,7 @@ fn verify_fast_worker<'a>(
                     PackageModuleVerificationStatus::Passed,
                     None,
                     PackageVerificationMode::FastKernel,
+                    artifact_bytes.get(&entry.certificate).copied(),
                 ),
                 record: Box::new(record),
                 decode_cache_counters,
@@ -2836,6 +2851,7 @@ fn verify_fast_worker<'a>(
                     PackageModuleVerificationStatus::Failed,
                     Some(error),
                     PackageVerificationMode::FastKernel,
+                    artifact_bytes.get(&entry.certificate).copied(),
                 ),
                 decode_cache_counters,
                 measurement_observation,
@@ -2956,6 +2972,7 @@ fn verify_package_fast_source_free_with_cached_hits<'a>(
                     failed.as_dotted(),
                 )),
                 PackageVerificationMode::FastKernel,
+                artifact_bytes.get(&entry.certificate).copied(),
             ));
             continue;
         }
@@ -2966,6 +2983,7 @@ fn verify_package_fast_source_free_with_cached_hits<'a>(
                 entry,
                 PackageVerificationMode::FastKernel,
                 cache_evidence,
+                artifact_bytes.get(&entry.certificate).copied(),
             ));
             continue;
         }
@@ -2984,6 +3002,7 @@ fn verify_package_fast_source_free_with_cached_hits<'a>(
                     PackageModuleVerificationStatus::Passed,
                     None,
                     PackageVerificationMode::FastKernel,
+                    artifact_bytes.get(&entry.certificate).copied(),
                 ));
             }
             Err(error) => {
@@ -2993,6 +3012,7 @@ fn verify_package_fast_source_free_with_cached_hits<'a>(
                     PackageModuleVerificationStatus::Failed,
                     Some(error),
                     PackageVerificationMode::FastKernel,
+                    artifact_bytes.get(&entry.certificate).copied(),
                 ));
             }
         }
@@ -3194,6 +3214,7 @@ pub(crate) fn verify_package_reference_source_free_execution_with_validation<'a>
                     failed.as_dotted(),
                 )),
                 PackageVerificationMode::Reference,
+                artifact_bytes.get(&entry.certificate).copied(),
             ));
             continue;
         }
@@ -3277,6 +3298,7 @@ pub(crate) fn verify_package_reference_source_free_execution_with_validation<'a>
                     PackageModuleVerificationStatus::Passed,
                     None,
                     PackageVerificationMode::Reference,
+                    artifact_bytes.get(&entry.certificate).copied(),
                 );
                 memo_run.insert(
                     &entry.module,
@@ -3308,6 +3330,7 @@ pub(crate) fn verify_package_reference_source_free_execution_with_validation<'a>
                     PackageModuleVerificationStatus::Failed,
                     Some(error),
                     PackageVerificationMode::Reference,
+                    artifact_bytes.get(&entry.certificate).copied(),
                 );
                 memo_run.insert(
                     &entry.module,
@@ -3403,6 +3426,8 @@ fn verify_package_reference_source_free_from_root_execution(
         let (entry_index, entry) = entries_by_module
             .get(module)
             .expect("lock graph order only contains lock entries");
+        let certificate_read =
+            read_certificate_artifact_from_root(package_root, *entry_index, entry);
         if let Some(failed) = &failed_module {
             results.push(module_result(
                 entry,
@@ -3412,11 +3437,12 @@ fn verify_package_reference_source_free_from_root_execution(
                     failed.as_dotted(),
                 )),
                 PackageVerificationMode::Reference,
+                certificate_read.as_deref().ok(),
             ));
             continue;
         }
 
-        let bytes = match read_certificate_artifact_from_root(package_root, *entry_index, entry) {
+        let bytes = match certificate_read {
             Ok(bytes) => bytes,
             Err(error) => {
                 failed_module = Some(entry.module.clone());
@@ -3427,6 +3453,7 @@ fn verify_package_reference_source_free_from_root_execution(
                     PackageModuleVerificationStatus::Failed,
                     Some(error),
                     PackageVerificationMode::Reference,
+                    None,
                 ));
                 continue;
             }
@@ -3475,6 +3502,7 @@ fn verify_package_reference_source_free_from_root_execution(
                     PackageModuleVerificationStatus::Passed,
                     None,
                     PackageVerificationMode::Reference,
+                    Some(&bytes),
                 );
                 record_reference_checked_module_for_dependents(
                     &mut checked_by_module,
@@ -3499,6 +3527,7 @@ fn verify_package_reference_source_free_from_root_execution(
                     PackageModuleVerificationStatus::Failed,
                     Some(error),
                     PackageVerificationMode::Reference,
+                    Some(&bytes),
                 );
                 results.push(result);
             }
@@ -3659,6 +3688,7 @@ fn verify_package_reference_source_free_with_cached_hits<'a>(
                     failed.as_dotted(),
                 )),
                 PackageVerificationMode::Reference,
+                artifact_bytes.get(&entry.certificate).copied(),
             ));
             continue;
         }
@@ -3669,6 +3699,7 @@ fn verify_package_reference_source_free_with_cached_hits<'a>(
                 entry,
                 PackageVerificationMode::Reference,
                 cache_evidence,
+                artifact_bytes.get(&entry.certificate).copied(),
             ));
             continue;
         }
@@ -3705,6 +3736,7 @@ fn verify_package_reference_source_free_with_cached_hits<'a>(
                     PackageModuleVerificationStatus::Passed,
                     None,
                     PackageVerificationMode::Reference,
+                    artifact_bytes.get(&entry.certificate).copied(),
                 ));
             }
             Err(error) => {
@@ -3716,6 +3748,7 @@ fn verify_package_reference_source_free_with_cached_hits<'a>(
                     PackageModuleVerificationStatus::Failed,
                     Some(error),
                     PackageVerificationMode::Reference,
+                    artifact_bytes.get(&entry.certificate).copied(),
                 ));
             }
         }
@@ -4128,6 +4161,7 @@ impl PackageEntryCheckObservation {
                 declaration: declaration.declaration.dotted(),
                 term_nodes: u64::try_from(declaration.term_nodes).unwrap_or(u64::MAX),
                 elaboration_elapsed_ns: 0,
+                kernel: None,
             })
             .collect();
     }
@@ -4162,6 +4196,7 @@ impl PackageEntryCheckObservation {
                     ),
                     term_nodes: certificate_declaration_term_nodes(term_table, declaration),
                     elaboration_elapsed_ns: 0,
+                    kernel: None,
                 },
             )
             .collect();
@@ -5157,8 +5192,8 @@ fn package_verification_decode_cache() -> &'static Mutex<PackageVerificationDeco
 #[derive(Clone, Debug)]
 struct PackageVerificationDecodeCacheConfig {
     checker_mode: PackageVerificationMode,
-    certificate_format: String,
-    core_spec: String,
+    package_certificate_profile: String,
+    package_core_profile: String,
     enabled_core_features: Vec<String>,
     checker_policy_hash: PackageHash,
     process_local_cache: bool,
@@ -5170,8 +5205,8 @@ impl PackageVerificationDecodeCacheConfig {
         let manifest = validated.manifest();
         Self {
             checker_mode: mode,
-            certificate_format: manifest.certificate_format.clone(),
-            core_spec: manifest.core_spec.clone(),
+            package_certificate_profile: manifest.certificate_format.clone(),
+            package_core_profile: manifest.core_spec.clone(),
             enabled_core_features: package_verification_enabled_core_features(validated, mode),
             checker_policy_hash: package_verification_policy_hash(validated, mode),
             process_local_cache: false,
@@ -5201,6 +5236,7 @@ struct PackageReferenceImportContext<'a> {
     lock: &'a PackageLockManifest,
     entries: &'a [(usize, &'a PackageLockEntry)],
     checked_by_module: &'a BTreeMap<Name, ReferenceCheckedModule>,
+    owner_header: &'a CertHeader,
     config: &'a PackageVerificationDecodeCacheConfig,
 }
 
@@ -5226,7 +5262,13 @@ fn decode_fast_certificate_with_cache(
         return Ok(cert);
     }
 
-    let key = package_decode_cache_certificate_key(entry, actual_file_hash, config);
+    let header = decode_module_cert_header(bytes).map_err(|source| {
+        PackageVerificationError::certificate_decode_failed(
+            format!("entries[{entry_index}].certificate"),
+            format!("{source:?}"),
+        )
+    })?;
+    let key = package_decode_cache_certificate_key(entry, actual_file_hash, &header, config);
     if let Some(cert) = package_verification_decode_cache()
         .lock()
         .expect("package verification decode cache mutex should not be poisoned")
@@ -5268,6 +5310,7 @@ fn decode_fast_certificate_with_cache(
 }
 
 #[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 fn reference_import_store_with_cache(
     entry_index: usize,
     entry: &PackageLockEntry,
@@ -5275,6 +5318,7 @@ fn reference_import_store_with_cache(
     lock: &PackageLockManifest,
     entries: &[(usize, &PackageLockEntry)],
     checked_by_module: &BTreeMap<Name, ReferenceCheckedModule>,
+    owner_header: &CertHeader,
     config: &PackageVerificationDecodeCacheConfig,
 ) -> PackageVerificationResult<PackageDecodeCacheLookup<ReferenceImportStore>> {
     let mut counters = PackageVerificationDecodeCacheCounters::default();
@@ -5286,6 +5330,7 @@ fn reference_import_store_with_cache(
             lock,
             entries,
             checked_by_module,
+            owner_header,
             config,
         },
         &mut counters,
@@ -5304,11 +5349,15 @@ fn reference_import_store_with_cache_observed(
         lock,
         entries,
         checked_by_module,
+        owner_header,
         config,
     } = context;
     let key = config
         .process_local_cache
-        .then(|| package_decode_cache_import_context_key(resolved_imports, config));
+        .then(|| {
+            package_decode_cache_import_context_key(resolved_imports, checked_by_module, config)
+        })
+        .transpose()?;
     if let Some(key) = &key {
         if let Some(imports) = package_verification_decode_cache()
             .lock()
@@ -5337,6 +5386,8 @@ fn reference_import_store_with_cache_observed(
             resolved_imports,
             lock,
             entries,
+            checked_by_module,
+            owner_header,
             config,
         )?;
         let disk_cache_dir = package_import_context_export_cache_dir();
@@ -5421,6 +5472,8 @@ fn import_context_export_cache_entry_for_context(
     resolved_imports: &[PackageLockResolvedImport],
     lock: &PackageLockManifest,
     entries: &[(usize, &PackageLockEntry)],
+    checked_by_module: &BTreeMap<Name, ReferenceCheckedModule>,
+    owner_header: &CertHeader,
     config: &PackageVerificationDecodeCacheConfig,
 ) -> PackageVerificationResult<PackageImportContextExportCacheEntry> {
     let dependency_exports = resolved_imports
@@ -5442,6 +5495,12 @@ fn import_context_export_cache_entry_for_context(
                     import.module.as_dotted(),
                 )));
             }
+            let checked = checked_by_module.get(&import.module).ok_or_else(|| {
+                PackageVerificationError::earlier_module_failed(
+                    "import_context_export_cache.dependency_exports",
+                    import.module.as_dotted(),
+                )
+            })?;
             Ok(PackageImportContextExportData {
                 module: dependency.module.clone(),
                 origin: dependency.origin,
@@ -5450,7 +5509,8 @@ fn import_context_export_cache_entry_for_context(
                 export_hash: dependency.export_hash,
                 certificate_hash: dependency.certificate_hash,
                 axiom_report_hash: dependency.axiom_report_hash,
-                certificate_format: config.certificate_format.clone(),
+                certificate_format: checked.certificate_format().to_owned(),
+                core_spec: checked.core_spec().to_owned(),
             })
         })
         .collect::<PackageVerificationResult<Vec<_>>>()?;
@@ -5459,8 +5519,10 @@ fn import_context_export_cache_entry_for_context(
         package_id: lock.package.clone(),
         package_version: lock.version.clone(),
         package_lock_schema: lock.schema.clone(),
-        core_spec: config.core_spec.clone(),
-        certificate_format: config.certificate_format.clone(),
+        package_core_profile: config.package_core_profile.clone(),
+        package_certificate_profile: config.package_certificate_profile.clone(),
+        owner_certificate_format: owner_header.format.clone(),
+        owner_core_spec: owner_header.core_spec.clone(),
         checker_policy_hash: config.checker_policy_hash,
         owner_module: entry.module.clone(),
         dependency_exports,
@@ -5559,12 +5621,14 @@ fn import_context_export_cache_slot_key(
     input: &PackageImportContextExportCacheKeyInput,
 ) -> String {
     let material = format!(
-        "schema=npa.package.import_context_export_cache_slot.v0.1\npackage_id={}\npackage_version={}\npackage_lock_schema={}\ncore_spec={}\ncertificate_format={}\nchecker_policy_hash={}\nowner_module={}\n",
+        "schema=npa.package.import_context_export_cache_slot.v0.2\npackage_id={}\npackage_version={}\npackage_lock_schema={}\npackage_core_profile={}\npackage_certificate_profile={}\nowner_certificate_format={}\nowner_core_spec={}\nchecker_policy_hash={}\nowner_module={}\n",
         input.package_id.as_str(),
         input.package_version.as_str(),
         input.package_lock_schema,
-        input.core_spec,
-        input.certificate_format,
+        input.package_core_profile,
+        input.package_certificate_profile,
+        input.owner_certificate_format,
+        input.owner_core_spec,
         format_package_hash(&input.checker_policy_hash),
         owner.module.as_dotted(),
     );
@@ -5606,13 +5670,14 @@ fn validate_reference_import_context_hit(
 fn package_decode_cache_certificate_key(
     entry: &PackageLockEntry,
     certificate_file_hash: PackageHash,
+    header: &CertHeader,
     config: &PackageVerificationDecodeCacheConfig,
 ) -> String {
     let mut material = format!(
-        "schema=npa.package.decode_cache.certificate.v0.1\nmode={}\ncertificate_format={}\ncore_spec={}\ncertificate_file_hash={}\ncertificate_hash={}\nenabled_core_features={}\n",
+        "schema=npa.package.decode_cache.certificate.v0.2\nmode={}\ncertificate_format={}\ncore_spec={}\ncertificate_file_hash={}\ncertificate_hash={}\nenabled_core_features={}\n",
         config.checker_mode.as_str(),
-        config.certificate_format,
-        config.core_spec,
+        header.format,
+        header.core_spec,
         format_package_hash(&certificate_file_hash),
         format_package_hash(&entry.certificate_hash),
         config.enabled_core_features.len(),
@@ -5627,10 +5692,11 @@ fn package_decode_cache_certificate_key(
 
 fn package_decode_cache_import_context_key(
     resolved_imports: &[PackageLockResolvedImport],
+    checked_by_module: &BTreeMap<Name, ReferenceCheckedModule>,
     config: &PackageVerificationDecodeCacheConfig,
-) -> String {
+) -> PackageVerificationResult<String> {
     let mut material = format!(
-        "schema=npa.package.decode_cache.import_context.v0.1\nmode={}\nchecker_policy_hash={}\ndirect_imports={}\n",
+        "schema=npa.package.decode_cache.import_context.v0.2\nmode={}\nchecker_policy_hash={}\ndirect_imports={}\n",
         config.checker_mode.as_str(),
         format_package_hash(&config.checker_policy_hash),
         resolved_imports.len(),
@@ -5642,9 +5708,19 @@ fn package_decode_cache_import_context_key(
         material.push_str(&format_package_hash(&import.export_hash));
         material.push(';');
         material.push_str(&format_package_hash(&import.certificate_hash));
+        let checked = checked_by_module.get(&import.module).ok_or_else(|| {
+            PackageVerificationError::earlier_module_failed(
+                "decode_cache.import_context.direct_imports",
+                import.module.as_dotted(),
+            )
+        })?;
+        material.push(';');
+        material.push_str(checked.certificate_format());
+        material.push(';');
+        material.push_str(checked.core_spec());
         material.push('\n');
     }
-    format_package_hash(&package_file_hash(material.as_bytes()))
+    Ok(format_package_hash(&package_file_hash(material.as_bytes())))
 }
 
 struct PackageVerificationMemoRun {
@@ -5771,13 +5847,20 @@ fn package_verification_memo_key_inputs_for_entries(
         let Some(bytes) = artifact_bytes.get(&entry.certificate).copied() else {
             continue;
         };
+        let Ok(header) = decode_module_cert_header(bytes) else {
+            // Pair-unaware or malformed inputs cannot participate in a v0.2 memo key. The live
+            // verifier still receives them and produces the authoritative structured failure.
+            continue;
+        };
         let key_input = PackageAuditCacheKeyInput {
             schema: PACKAGE_AUDIT_PROCESS_MEMO_SCHEMA.to_owned(),
             package_id: lock.package.clone(),
             package_version: lock.version.clone(),
             package_lock_schema: lock.schema.clone(),
-            core_spec: manifest.core_spec.clone(),
-            certificate_format: manifest.certificate_format.clone(),
+            package_core_profile: manifest.core_spec.clone(),
+            package_certificate_profile: manifest.certificate_format.clone(),
+            module_certificate_format: header.format,
+            module_core_spec: header.core_spec,
             package_lock_hash,
             package_policy_hash,
             checker: checker.clone(),
@@ -5832,10 +5915,11 @@ fn package_verification_policy_hash(
     enabled_core_features.dedup();
 
     let mut material = format!(
-        "schema=npa.package.reference_verification_axiom_policy.v0.1\nmode={}\ntrust_mode={trust_mode}\ndeny_sorry={}\ndeny_custom_axioms={}\nallowed_axioms={}\nenabled_core_features={}\n",
+        "schema=npa.package.reference_verification_axiom_policy.v0.1\nmode={}\ntrust_mode={trust_mode}\ndeny_sorry={}\ndeny_custom_axioms={}\nallow_standard_axiom_exceptions={}\nallowed_axioms={}\nenabled_core_features={}\n",
         mode.as_str(),
         policy.deny_sorry,
         policy.deny_custom_axioms,
+        policy.allow_standard_axiom_exceptions,
         allowed_axioms.len(),
         enabled_core_features.len(),
     );
@@ -6100,6 +6184,7 @@ fn package_reference_checker_policy(
             .collect(),
         deny_sorry: true,
         deny_custom_axioms: !package_policy.allow_custom_axioms,
+        allow_standard_axiom_exceptions: false,
         supported_core_features: reference_checker_supported_core_features(
             &validated.manifest().checker_profile,
         ),
@@ -6376,6 +6461,13 @@ fn verify_reference_lock_entry_bytes_observed(
         ));
     }
 
+    let owner_header = decode_module_cert_header(bytes).map_err(|source| {
+        PackageVerificationError::certificate_decode_failed(
+            format!("{entry_path}.certificate"),
+            format!("{source:?}"),
+        )
+    })?;
+
     let imports = reference_import_store_with_cache_observed(
         entry_index,
         entry,
@@ -6384,6 +6476,7 @@ fn verify_reference_lock_entry_bytes_observed(
             lock: context.lock,
             entries: context.entries,
             checked_by_module: context.checked_by_module,
+            owner_header: &owner_header,
             config: context.decode_cache_config,
         },
         &mut observation.decode_cache_counters,
@@ -6626,6 +6719,17 @@ fn reference_check_reason_code(reason: ReferenceCheckReason) -> &'static str {
         ReferenceCheckReason::AxiomReportMismatch => "axiom_report_mismatch",
         ReferenceCheckReason::SorryDenied => "sorry_denied",
         ReferenceCheckReason::ForbiddenAxiom => "forbidden_axiom",
+        ReferenceCheckReason::WrongReferenceKind => "wrong_reference_kind",
+        ReferenceCheckReason::TargetNotEarlier => "target_not_earlier",
+        ReferenceCheckReason::TargetNotOpaque => "target_not_opaque",
+        ReferenceCheckReason::InterfaceHashMismatch => "interface_hash_mismatch",
+        ReferenceCheckReason::CertificateHashMismatch => "certificate_hash_mismatch",
+        ReferenceCheckReason::MissingImplementationDependency => {
+            "missing_implementation_dependency"
+        }
+        ReferenceCheckReason::SurplusImplementationDependency => {
+            "surplus_implementation_dependency"
+        }
         ReferenceCheckReason::ReferenceCheckerBodyUnimplemented => {
             "reference_checker_body_unimplemented"
         }
@@ -6637,7 +6741,9 @@ fn module_result(
     status: PackageModuleVerificationStatus,
     error: Option<PackageVerificationError>,
     checker_mode: PackageVerificationMode,
+    certificate_bytes: Option<&[u8]>,
 ) -> PackageModuleVerificationResult {
+    let pair = certificate_bytes.and_then(|bytes| decode_module_cert_header(bytes).ok());
     PackageModuleVerificationResult {
         module: entry.module.clone(),
         checker_mode,
@@ -6646,6 +6752,8 @@ fn module_result(
         export_hash: entry.export_hash,
         axiom_report_hash: entry.axiom_report_hash,
         certificate_hash: entry.certificate_hash,
+        certificate_format: pair.as_ref().map(|header| header.format.clone()),
+        core_spec: pair.map(|header| header.core_spec),
         error,
     }
 }
@@ -6654,7 +6762,9 @@ fn cached_module_result(
     entry: &PackageLockEntry,
     checker_mode: PackageVerificationMode,
     evidence: PackageModuleVerificationEvidence,
+    certificate_bytes: Option<&[u8]>,
 ) -> PackageModuleVerificationResult {
+    let pair = certificate_bytes.and_then(|bytes| decode_module_cert_header(bytes).ok());
     PackageModuleVerificationResult {
         module: entry.module.clone(),
         checker_mode,
@@ -6663,6 +6773,8 @@ fn cached_module_result(
         export_hash: entry.export_hash,
         axiom_report_hash: entry.axiom_report_hash,
         certificate_hash: entry.certificate_hash,
+        certificate_format: pair.as_ref().map(|header| header.format.clone()),
+        core_spec: pair.map(|header| header.core_spec),
         error: None,
     }
 }
@@ -6995,6 +7107,7 @@ mod tests {
                 "invalid certificate",
             )),
             PackageVerificationMode::FastKernel,
+            Some(&corrupt_certificate),
         )];
         let options = PackageVerificationExecutionOptions {
             measurement_mode: PerformanceMeasurementMode::Detailed,
@@ -7055,6 +7168,7 @@ mod tests {
                 entry.certificate.as_str(),
             )),
             PackageVerificationMode::FastKernel,
+            None,
         )];
         let empty_artifacts = BTreeMap::new();
         let empty_measurements =
@@ -7087,6 +7201,49 @@ mod tests {
     }
 
     #[test]
+    fn package_checker_declaration_measurements_use_v0_3_without_kernel_details() {
+        let fast_certificate = build_module_cert(unchecked_import_provider(), &[]).unwrap();
+        let mut fast = PackageEntryCheckObservation::new(PerformanceMeasurementMode::Detailed);
+        fast.observe_fast_certificate(&Name::from_dotted("Fast.Fixture"), &fast_certificate);
+
+        let reference_observation = ReferenceCheckObservation {
+            certificate_decoded: true,
+            declaration_count: 1,
+            declarations: vec![npa_checker_ref::ReferenceCheckDeclarationObservation {
+                declaration_index: 0,
+                declaration: ReferenceModuleName::from_dotted("Reference.Fixture.theorem").unwrap(),
+                term_nodes: 3,
+            }],
+        };
+        let mut reference = PackageEntryCheckObservation::new(PerformanceMeasurementMode::Detailed);
+        reference.observe_reference_certificate(
+            &Name::from_dotted("Reference.Fixture"),
+            &reference_observation,
+        );
+
+        assert!(!fast.declarations.is_empty());
+        assert!(fast
+            .declarations
+            .iter()
+            .chain(&reference.declarations)
+            .all(|declaration| declaration.kernel.is_none()));
+
+        let mut recorder =
+            PerformanceMeasurementRecorder::new(PerformanceMeasurementMode::Detailed);
+        for declaration in fast.declarations.into_iter().chain(reference.declarations) {
+            recorder.record_declaration(declaration);
+        }
+        let report = recorder.report().unwrap();
+        assert_eq!(report.schema, crate::PERFORMANCE_MEASUREMENTS_SCHEMA_V0_3);
+        assert_eq!(
+            crate::performance_measurement_report_json(&report)
+                .matches("\"kernel\":null")
+                .count(),
+            2
+        );
+    }
+
+    #[test]
     fn package_verifier_off_mode_has_no_measurement_state_or_detail_storage() {
         assert!(PackageVerifierMeasurementState::new(PerformanceMeasurementMode::Off).is_none());
         let observation = PackageEntryCheckObservation::new(PerformanceMeasurementMode::Off);
@@ -7104,6 +7261,7 @@ mod tests {
                 declaration: format!("{module}.d{declaration_index}"),
                 term_nodes: 1,
                 elaboration_elapsed_ns: 0,
+                kernel: None,
             }
         }
 
@@ -7180,7 +7338,7 @@ mod tests {
         let encoded = encode_module_cert(cert).unwrap();
         let payload = &encoded[..encoded.len() - 32];
         cert.hashes.certificate_hash =
-            unchecked_import_hash_with_domain(b"NPA-MODULE-CERT-0.2.0", payload);
+            unchecked_import_hash_with_domain(b"NPA-MODULE-CERT-0.3.0", payload);
     }
 
     fn semantically_invalid_unchecked_import_provider(mut cert: ModuleCert) -> ModuleCert {
@@ -7217,7 +7375,7 @@ mod tests {
         payload.extend(term_hash(&cert, proof).unwrap());
         payload.push(0); // Empty dependency vector.
         cert.declarations[0].hashes.decl_certificate_hash =
-            unchecked_import_hash_with_domain(b"NPA-DECL-CERT-0.1", &payload);
+            unchecked_import_hash_with_domain(b"NPA-DECL-CERT-0.3.0", &payload);
         recompute_unchecked_import_module_hash(&mut cert);
         cert
     }
@@ -7261,6 +7419,10 @@ mod tests {
             checker_allowlist: vec![IndependentCheckerAllowlistEntry {
                 profile: "reference".to_owned(),
                 checker_id: "npa-checker-ref".to_owned(),
+                checker_version: None,
+                raw_result_schema: None,
+                certificate_format: None,
+                core_spec: None,
                 binary_id: "npa-checker-ref-test".to_owned(),
                 binary_hash: test_hash(10),
                 build_hash: test_hash(11),
@@ -7582,6 +7744,15 @@ mod tests {
             .modules
             .iter()
             .all(|module| module.status == PackageModuleVerificationStatus::Passed));
+        assert!(report.modules.iter().all(|module| {
+            let module_name = module.module.as_dotted();
+            let expected_pair = match module_name.as_str() {
+                "Std.Logic.Eq" | "Std.Nat.Basic" => ("NPA-CERT-0.2.0", "NPA-Core-0.2.0"),
+                _ => ("NPA-CERT-0.3.0", "NPA-Core-0.3.0"),
+            };
+            module.certificate_format.as_deref() == Some(expected_pair.0)
+                && module.core_spec.as_deref() == Some(expected_pair.1)
+        }));
     }
 
     #[test]
@@ -8357,6 +8528,102 @@ mod tests {
     }
 
     #[test]
+    fn package_verifier_v0_4_identity_misses_v0_3_process_memo_without_relabeling() {
+        let _guard = process_memo_test_lock();
+        clear_package_verification_process_memo();
+        let validated = validated_proof_manifest();
+        let lock = proof_lock();
+        let artifacts = proof_certificate_artifacts(&lock);
+        let selected = Some(BTreeSet::from([Name::from_dotted("Proofs.Ai.Basic")]));
+        let inputs = package_verification_memo_key_inputs(
+            &validated,
+            &lock,
+            package_certificate_artifacts(&artifacts),
+            PackageVerificationMode::FastKernel,
+        )
+        .unwrap();
+        let current_input = inputs
+            .get(&Name::from_dotted("Proofs.Ai.Basic"))
+            .expect("proof fixture contains Proofs.Ai.Basic")
+            .clone();
+        assert_eq!(current_input.schema, PACKAGE_AUDIT_PROCESS_MEMO_SCHEMA);
+        assert_eq!(current_input.checker.checker_version, "0.4.0");
+        let current_key = package_audit_process_memo_key(&current_input);
+
+        let mut old_input = current_input.clone();
+        old_input.checker.checker_version = "0.3.0".to_owned();
+        old_input.checker.checker_build_hash = package_file_hash(
+            format!(
+                "schema=npa.package.verification_process_memo_checker_identity.v0.1\nmode={}\nchecker_id={}\nchecker_version=0.3.0\nchecker_profile={}\n",
+                old_input.checker.mode,
+                old_input.checker.checker_id,
+                old_input.checker.checker_profile,
+            )
+            .as_bytes(),
+        );
+        assert_eq!(old_input.schema, PACKAGE_AUDIT_PROCESS_MEMO_SCHEMA);
+        let old_key = package_audit_process_memo_key(&old_input);
+        assert_ne!(old_key, current_key);
+
+        let first = verify_package_fast_source_free_with_options(
+            &validated,
+            &lock,
+            package_certificate_artifacts(&artifacts),
+            PackageVerificationExecutionOptions {
+                selected_modules: selected.clone(),
+                memoization: PackageVerificationMemoMode::ProcessLocal,
+                ..PackageVerificationExecutionOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            first.memo_counters,
+            PackageVerificationMemoCounters {
+                hits: 0,
+                misses: 1,
+                inserted: 1,
+            }
+        );
+        {
+            let mut memo = package_verification_process_memo()
+                .lock()
+                .expect("package verification process memo mutex should not be poisoned");
+            let entry = memo
+                .entries
+                .remove(&current_key)
+                .expect("current-version run inserted its current key");
+            memo.entries.insert(old_key.clone(), entry);
+        }
+
+        let rebuilt = verify_package_fast_source_free_with_options(
+            &validated,
+            &lock,
+            package_certificate_artifacts(&artifacts),
+            PackageVerificationExecutionOptions {
+                selected_modules: selected,
+                memoization: PackageVerificationMemoMode::ProcessLocal,
+                ..PackageVerificationExecutionOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            rebuilt.memo_counters,
+            PackageVerificationMemoCounters {
+                hits: 0,
+                misses: 1,
+                inserted: 1,
+            }
+        );
+        let memo = package_verification_process_memo()
+            .lock()
+            .expect("package verification process memo mutex should not be poisoned");
+        assert!(memo.entries.contains_key(&old_key));
+        assert!(memo.entries.contains_key(&current_key));
+        drop(memo);
+        assert_eq!(without_memo_counters(rebuilt), without_memo_counters(first));
+    }
+
+    #[test]
     fn package_verifier_memo_keeps_fast_and_reference_namespaces_separate() {
         let _guard = process_memo_test_lock();
         clear_package_verification_process_memo();
@@ -8503,10 +8770,10 @@ mod tests {
             PackageVerificationMode::FastKernel,
         )
         .unwrap();
-        let changed_input = changed_inputs
-            .get(&Name::from_dotted("Proofs.Ai.Basic"))
-            .expect("proof fixture contains Proofs.Ai.Basic");
-        assert_ne!(disk_key, package_audit_disk_memo_key(changed_input));
+        assert!(
+            !changed_inputs.contains_key(&Name::from_dotted("Proofs.Ai.Basic")),
+            "an input without an exact decoded pair cannot produce a v0.2 memo key"
+        );
     }
 
     #[test]
@@ -8641,6 +8908,13 @@ mod tests {
             module_evidence(&report, &Name::from_dotted("Proofs.Ai.Basic")),
             PackageModuleVerificationEvidence::DiskVerifierMemo
         );
+        let cached = report
+            .modules
+            .iter()
+            .find(|module| module.module.as_dotted() == "Proofs.Ai.Basic")
+            .unwrap();
+        assert_eq!(cached.certificate_format.as_deref(), Some("NPA-CERT-0.3.0"));
+        assert_eq!(cached.core_spec.as_deref(), Some("NPA-Core-0.3.0"));
     }
 
     #[test]
@@ -9001,6 +9275,13 @@ mod tests {
         let (target_index, target_entry) = entries_by_module
             .get(&target_module)
             .expect("proof fixture contains AbstractGroup");
+        let owner_header = decode_module_cert_header(
+            artifact_bytes
+                .get(&target_entry.certificate)
+                .copied()
+                .unwrap(),
+        )
+        .unwrap();
         let policy = package_reference_checker_policy(&validated);
         let config = PackageVerificationDecodeCacheConfig::for_mode(
             &validated,
@@ -9043,6 +9324,7 @@ mod tests {
             &lock,
             &entries,
             &checked_by_module,
+            &owner_header,
             &config,
         )
         .unwrap();
@@ -9053,6 +9335,7 @@ mod tests {
             &lock,
             &entries,
             &checked_by_module,
+            &owner_header,
             &config,
         )
         .unwrap();
@@ -9063,6 +9346,7 @@ mod tests {
             &lock,
             &entries,
             &BTreeMap::new(),
+            &owner_header,
             &config,
         ) {
             Ok(_) => panic!("cached import context hit must require verified imports in this run"),
@@ -9077,6 +9361,7 @@ mod tests {
             &lock,
             &entries,
             &checked_by_module,
+            &owner_header,
             &config,
         )
         .unwrap();
@@ -9117,6 +9402,13 @@ mod tests {
         let (target_index, target_entry) = entries_by_module
             .get(&target_module)
             .expect("proof fixture contains AbstractGroup");
+        let owner_header = decode_module_cert_header(
+            artifact_bytes
+                .get(&target_entry.certificate)
+                .copied()
+                .unwrap(),
+        )
+        .unwrap();
         let policy = package_reference_checker_policy(&validated);
         let mut config = PackageVerificationDecodeCacheConfig::for_mode(
             &validated,
@@ -9160,6 +9452,7 @@ mod tests {
             &lock,
             &entries,
             &checked_by_module,
+            &owner_header,
             &config,
         )
         .unwrap();
@@ -9175,6 +9468,7 @@ mod tests {
             &lock,
             &entries,
             &checked_by_module,
+            &owner_header,
             &config,
         )
         .unwrap();
@@ -9187,6 +9481,11 @@ mod tests {
         assert_eq!(second.value, first.value);
 
         let mut failed_counters = PackageVerificationDecodeCacheCounters::default();
+        let owner_header = CertHeader {
+            format: "NPA-CERT-0.2.0".to_owned(),
+            core_spec: "NPA-Core-0.2.0".to_owned(),
+            module: target_entry.module.clone(),
+        };
         let failed = reference_import_store_with_cache_observed(
             *target_index,
             target_entry,
@@ -9195,6 +9494,7 @@ mod tests {
                 lock: &lock,
                 entries: &entries,
                 checked_by_module: &BTreeMap::new(),
+                owner_header: &owner_header,
                 config: &config,
             },
             &mut failed_counters,
@@ -9204,7 +9504,7 @@ mod tests {
             failed.reason_code,
             PackageVerificationErrorReason::EarlierModuleFailed
         );
-        assert_eq!(failed_counters.import_context_disk_hits, 1);
+        assert_eq!(failed_counters.import_context_disk_hits, 0);
     }
 
     #[test]
@@ -9226,6 +9526,13 @@ mod tests {
         let (target_index, target_entry) = entries_by_module
             .get(&target_module)
             .expect("proof fixture contains AbstractGroup");
+        let owner_header = decode_module_cert_header(
+            artifact_bytes
+                .get(&target_entry.certificate)
+                .copied()
+                .unwrap(),
+        )
+        .unwrap();
         let policy = package_reference_checker_policy(&validated);
         let config = PackageVerificationDecodeCacheConfig::for_mode(
             &validated,
@@ -9267,6 +9574,7 @@ mod tests {
             &lock,
             &entries,
             &checked_by_module,
+            &owner_header,
             &config,
         )
         .unwrap();
@@ -9290,6 +9598,7 @@ mod tests {
             &lock,
             &changed_entries,
             &checked_by_module,
+            &owner_header,
             &config,
         )
         .unwrap();
@@ -9535,8 +9844,15 @@ mod tests {
         assert!(report.reference_checker_verdict);
         assert_eq!(report.modules.len(), lock.entries.len());
         assert!(report.modules.iter().all(|module| {
+            let module_name = module.module.as_dotted();
+            let expected_pair = match module_name.as_str() {
+                "Std.Logic.Eq" | "Std.Nat.Basic" => ("NPA-CERT-0.2.0", "NPA-Core-0.2.0"),
+                _ => ("NPA-CERT-0.3.0", "NPA-Core-0.3.0"),
+            };
             module.checker_mode == PackageVerificationMode::Reference
                 && module.status == PackageModuleVerificationStatus::Passed
+                && module.certificate_format.as_deref() == Some(expected_pair.0)
+                && module.core_spec.as_deref() == Some(expected_pair.1)
         }));
         let order = report
             .topological_order

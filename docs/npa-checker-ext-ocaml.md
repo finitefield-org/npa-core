@@ -7,9 +7,11 @@ This document is both the implementation specification and the release-evidence
 contract. `crates/npa-checker-ref` remains the source-free Rust reference
 checker, while `checkers/npa-checker-ext/` contains the independent OCaml
 implementation and its conformance gates. The standalone executable now checks
-current v0.2.0, previous v0.1.2, and legacy v0.1 certificates end to end,
+current v0.3.0 plus exact v0.2.0, v0.1.2, and v0.1 compatibility certificates
+end to end,
 including indexed, mutual, and exact approved nested inductives, recursive
-high-trust imports, axiom policy, and raw-result rendering.
+high-trust imports, v0.3 local opaque-transparency closure, sealed exports,
+axiom policy, and raw-result v2 rendering.
 
 `npa-checker-ext` counts as release / high-trust evidence only when the built
 executable is resolved from a runner-owned checker registry and the runner
@@ -51,23 +53,28 @@ output:
   deterministic checker_raw_result JSON
 ```
 
-### 1.1 Toolchain v0.7 host adapter
+### 1.1 Toolchain v0.8 host adapter
 
-The implemented host compatibility combination is `npa-cli 0.7.x`,
-`package_api::v1`, and `npa-checker-ext 0.2.0`. The checker continues to decode
-current `NPA-CERT-0.2.0` / `NPA-Core-0.2.0`, previous v0.1.2, and legacy v0.1
-certificate pairs. The host crate version does not change checker semantics,
-raw-result v1 or machine-result v1. The current host emits command-result v0.3;
-historical 0.3/0.4 hosts retain v0.1 and 0.5 hosts retain v0.2.
+The implemented host compatibility combination is `npa-cli 0.8.x`,
+`package_api::v1`, and `npa-checker-ext 0.3.0`. The checker advertises
+`NPA-CERT-0.3.0` / `NPA-Core-0.3.0` capability and decodes that current pair
+plus exact v0.2.0, v0.1.2, and v0.1 compatibility pairs. Raw-result v2 records
+the capability pair separately from the actual decoded input pair. The host
+crate version does not change checker semantics or machine-result v1. The
+current host emits command-result v0.4; historical 0.3/0.4 hosts retain v0.1,
+0.5 hosts retain v0.2, and 0.6/0.7 hosts retain v0.3.
 
 The Linux closure gate is
-`checkers/npa-checker-ext/scripts/toolchain-v0.7.sh`. It runs the real checker
+`checkers/npa-checker-ext/scripts/toolchain-v0.8.sh`. It runs the real checker
 through the v1 facade and the exact direct checked external command with one
 job, cache/memo off, canonical runner-policy identity, raw-byte-pinned policy
 inputs, and immutable sealed execution. Its `--functional-only` form is a
 dirty-tree developer gate and explicitly does not create release evidence.
 The full form also creates disposable generated-artifact manifest v0.2 assets,
 validates their bytes, and deletes them on exit.
+
+The frozen `toolchain-v0.7.sh` gate and its v0.7/v0.3 evidence remain
+historical compatibility material and must not be relabeled as v0.8/v0.4.
 
 The obsolete v0.3/v0.4 host scripts and their dedicated compatibility tests
 have been removed. Their design records are historical context only and are
@@ -142,6 +149,7 @@ Forbidden:
 Allowed:
 
 ```text
+- docs/core-spec-v0.3.0.md
 - docs/core-spec-v0.2.0.md
 - public certificate and toolchain reference docs in docs/
 - canonical certificate fixtures
@@ -193,16 +201,24 @@ select or override the checker executable.
 
 ## 5. Raw result JSON
 
-`npa-checker-ext` outputs `npa.independent-checker.checker_raw_result.v1`.
+`npa-checker-ext` outputs `npa.independent-checker.checker_raw_result.v2`.
+`certificate_format` / `core_spec` advertise the checker 0.3.0 capability;
+`input_certificate_format` / `input_core_spec` bind the exact decoded input.
+The input fields are absent only when header validation fails before an exact
+pair is known. A checked result always contains both pairs.
 
 checked result:
 
 ```json
 {
-  "schema": "npa.independent-checker.checker_raw_result.v1",
+  "schema": "npa.independent-checker.checker_raw_result.v2",
   "checker_id": "npa-checker-ext",
-  "checker_version": "0.2.0",
+  "checker_version": "0.3.0",
   "checker_build_hash": "sha256:...",
+  "certificate_format": "NPA-CERT-0.3.0",
+  "core_spec": "NPA-Core-0.3.0",
+  "input_certificate_format": "NPA-CERT-0.3.0",
+  "input_core_spec": "NPA-Core-0.3.0",
   "status": "checked",
   "module": "Std.Nat.Basic",
   "certificate_hash": "sha256:...",
@@ -215,10 +231,14 @@ failed result:
 
 ```json
 {
-  "schema": "npa.independent-checker.checker_raw_result.v1",
+  "schema": "npa.independent-checker.checker_raw_result.v2",
   "checker_id": "npa-checker-ext",
-  "checker_version": "0.2.0",
+  "checker_version": "0.3.0",
   "checker_build_hash": "sha256:...",
+  "certificate_format": "NPA-CERT-0.3.0",
+  "core_spec": "NPA-Core-0.3.0",
+  "input_certificate_format": "NPA-CERT-0.2.0",
+  "input_core_spec": "NPA-Core-0.2.0",
   "status": "failed",
   "module": "Std.Nat.Basic",
   "certificate_hash": "sha256:...",
@@ -286,9 +306,10 @@ The checker accepts only canonical binary `.npcert`.
 Checked targets:
 
 ```text
-- current header pair = NPA-CERT-0.2.0 / NPA-Core-0.2.0
-- previous header pair = NPA-CERT-0.1.2 / NPA-Core-0.1.2
-- legacy header pair = NPA-CERT-0.1 / NPA-Core-0.1
+- current header pair = NPA-CERT-0.3.0 / NPA-Core-0.3.0
+- compatibility header pair = NPA-CERT-0.2.0 / NPA-Core-0.2.0
+- compatibility header pair = NPA-CERT-0.1.2 / NPA-Core-0.1.2
+- compatibility header pair = NPA-CERT-0.1 / NPA-Core-0.1
 - module name grammar
 - import table
 - name table
@@ -314,6 +335,17 @@ The decoder rejects:
 - non-normalized level / term table entry
 - trailing bytes
 ```
+
+V0.3 dependency entries are tagged as interface or local implementation
+dependencies. The checker independently reconstructs reachability through
+later declaration types, reducible aliases, and already checked same-module
+opaque bodies. A local implementation edge must name an earlier opaque
+definition and match both its interface and certificate hashes. Missing,
+surplus, wrong-kind, later-target, and hash-mismatched edges reject with the
+same structured reason used by the fast and Rust reference checkers. The
+private reducible view is installed only after the opaque body checks; export
+and every imported environment retain the declaration as opaque without its
+body. Pre-v0.3 inputs keep immediate opacity.
 
 In the OCaml implementation, the decoded AST is stored as algebraic data types,
 not strings. de Bruijn indexes, level expressions, global references, and
@@ -673,8 +705,8 @@ not reference the filesystem, source parser, or JSON rendering.
 
 The original M1-02 slice decoded the legacy `NPA-CERT-0.1` /
 `NPA-Core-0.1` header and the name grammar source-free. The completed
-version-aware decoder now also accepts the current and previous header pairs
-listed in Section 6. Module names and name table entries are stored as
+version-aware decoder now also accepts all current and compatibility header
+pairs listed in Section 6. Module names and name table entries are stored as
 structured component lists in `Ext_name.t`. Empty names, empty components,
 dotted components, invalid UTF-8, and duplicate name table entries are rejected
 as decode errors with reason codes.

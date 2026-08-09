@@ -1,9 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
-    MachineBinder, MachineCompileOptions, MachineDecl, MachineDiagnostic, MachineDiagnosticKind,
-    MachineDiagnosticPayload, MachineItem, MachineLevel, MachineModule, MachineName,
-    MachineRepairCandidate, MachineRepairSuggestion, MachineRepairSuggestionKind,
+    MachineBinder, MachineCompileOptions, MachineDecl, MachineDefinitionDecl, MachineDiagnostic,
+    MachineDiagnosticKind, MachineDiagnosticPayload, MachineItem, MachineLevel, MachineModule,
+    MachineName, MachineRepairCandidate, MachineRepairSuggestion, MachineRepairSuggestionKind,
     MachineSurfaceMode, MachineTerm, Result, Span,
 };
 
@@ -13,6 +13,7 @@ pub struct VerifiedExport {
     pub universe_params: Vec<String>,
     pub ty: npa_kernel::Expr,
     pub decl_interface_hash: npa_cert::Hash,
+    pub reducibility: Option<npa_cert::CertReducibility>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -40,6 +41,7 @@ impl From<&npa_cert::VerifiedModule> for VerifiedImport {
             .export_block()
             .iter()
             .map(|entry| VerifiedExport {
+                reducibility: entry.reducibility,
                 name: module.name_table()[entry.name].clone(),
                 universe_params: entry
                     .universe_params
@@ -200,7 +202,10 @@ impl<'a> Resolver<'a> {
         }
         for item in &module.items {
             match item {
-                MachineItem::Def(decl) | MachineItem::Theorem(decl) => {
+                MachineItem::Def(definition) => {
+                    self.globals.add_decl_root(&definition.declaration.name);
+                }
+                MachineItem::Theorem(decl) => {
                     self.globals.add_decl_root(&decl.name);
                 }
                 MachineItem::Import { .. } => {}
@@ -211,10 +216,13 @@ impl<'a> Resolver<'a> {
         for item in module.items {
             let resolved_item = match item {
                 MachineItem::Import { .. } => item,
-                MachineItem::Def(decl) => {
-                    let resolved = self.resolve_decl(decl)?;
+                MachineItem::Def(definition) => {
+                    let resolved = self.resolve_decl(definition.declaration)?;
                     self.globals.add_local_decl(&resolved.name)?;
-                    MachineItem::Def(resolved)
+                    MachineItem::Def(MachineDefinitionDecl {
+                        declaration: resolved,
+                        reducibility: definition.reducibility,
+                    })
                 }
                 MachineItem::Theorem(decl) => {
                     let resolved = self.resolve_decl(decl)?;
@@ -820,10 +828,26 @@ fn verified_dependencies_from_entries(
     referenced_names: &BTreeSet<String>,
     dependencies: &[npa_cert::DependencyEntry],
 ) -> npa_cert::Result<BTreeSet<VerifiedDependency>> {
+    verified_dependencies_from_parts(
+        imports,
+        name_table,
+        referenced_names,
+        dependencies
+            .iter()
+            .map(|dependency| (dependency.global_ref(), dependency.decl_interface_hash())),
+    )
+}
+
+fn verified_dependencies_from_parts<'a>(
+    imports: &[npa_cert::ImportEntry],
+    name_table: &[npa_cert::Name],
+    referenced_names: &BTreeSet<String>,
+    dependencies: impl IntoIterator<Item = (&'a npa_cert::GlobalRef, npa_cert::Hash)>,
+) -> npa_cert::Result<BTreeSet<VerifiedDependency>> {
     let mut verified_dependencies = BTreeSet::new();
-    for dependency in dependencies {
+    for (global_ref, decl_interface_hash) in dependencies {
         let Some(verified_dependency) =
-            verified_dependency_from_entry(imports, name_table, dependency)?
+            verified_dependency_from_parts(imports, name_table, global_ref, decl_interface_hash)?
         else {
             continue;
         };
@@ -834,12 +858,13 @@ fn verified_dependencies_from_entries(
     Ok(verified_dependencies)
 }
 
-fn verified_dependency_from_entry(
+fn verified_dependency_from_parts(
     imports: &[npa_cert::ImportEntry],
     name_table: &[npa_cert::Name],
-    dependency: &npa_cert::DependencyEntry,
+    global_ref: &npa_cert::GlobalRef,
+    dependency_interface_hash: npa_cert::Hash,
 ) -> npa_cert::Result<Option<VerifiedDependency>> {
-    match &dependency.global_ref {
+    match global_ref {
         npa_cert::GlobalRef::Builtin { name, .. } => {
             let name = name_table
                 .get(*name)
@@ -849,7 +874,7 @@ fn verified_dependency_from_entry(
                 module: None,
                 export_hash: None,
                 name,
-                decl_interface_hash: dependency.decl_interface_hash,
+                decl_interface_hash: dependency_interface_hash,
             }))
         }
         npa_cert::GlobalRef::Imported {
@@ -866,7 +891,7 @@ fn verified_dependency_from_entry(
                 module: Some(import.module.clone()),
                 export_hash: Some(import.export_hash),
                 name,
-                decl_interface_hash: dependency.decl_interface_hash,
+                decl_interface_hash: dependency_interface_hash,
             }))
         }
         npa_cert::GlobalRef::Local { .. } | npa_cert::GlobalRef::LocalGenerated { .. } => Ok(None),
@@ -962,6 +987,7 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(index, name)| VerifiedExport {
+                reducibility: None,
                 name: npa_cert::Name::from_dotted(name),
                 universe_params: Vec::new(),
                 ty: npa_kernel::Expr::sort(npa_kernel::Level::zero()),
@@ -1005,6 +1031,19 @@ mod tests {
         resolve_machine_module_with_options(module, imports, options)
     }
 
+    #[test]
+    fn machine_resolver_preserves_opaque_reducibility() {
+        let resolved = resolve_source("opaque def Test.hidden : Prop := Prop", &[])
+            .expect("opaque definition should resolve");
+        let MachineItem::Def(definition) = &resolved.module.items[0] else {
+            panic!("expected definition");
+        };
+        assert_eq!(
+            definition.reducibility,
+            crate::DefinitionReducibility::Opaque
+        );
+    }
+
     fn resolve_err(source: &str, imports: &[VerifiedImport]) -> MachineDiagnosticKind {
         resolve_source(source, imports)
             .expect_err("source should fail resolution")
@@ -1033,28 +1072,22 @@ mod tests {
         let name_table = vec![shared_name.clone()];
         let referenced_names = BTreeSet::from([shared_name.as_dotted()]);
         let decl_interface_hash = hash(21);
-        let left_dependency = npa_cert::DependencyEntry {
-            global_ref: npa_cert::GlobalRef::Imported {
-                import_index: 0,
-                name: 0,
-                decl_interface_hash,
-            },
+        let left_dependency = npa_cert::GlobalRef::Imported {
+            import_index: 0,
+            name: 0,
             decl_interface_hash,
         };
-        let right_dependency = npa_cert::DependencyEntry {
-            global_ref: npa_cert::GlobalRef::Imported {
-                import_index: 1,
-                name: 0,
-                decl_interface_hash,
-            },
+        let right_dependency = npa_cert::GlobalRef::Imported {
+            import_index: 1,
+            name: 0,
             decl_interface_hash,
         };
 
-        let left_dependencies = verified_dependencies_from_entries(
+        let left_dependencies = verified_dependencies_from_parts(
             &imports,
             &name_table,
             &referenced_names,
-            std::slice::from_ref(&left_dependency),
+            [(&left_dependency, decl_interface_hash)],
         )
         .expect("left dependency should decode");
         assert_eq!(
@@ -1067,11 +1100,11 @@ mod tests {
             }])
         );
 
-        let right_dependencies = verified_dependencies_from_entries(
+        let right_dependencies = verified_dependencies_from_parts(
             &imports,
             &name_table,
             &referenced_names,
-            std::slice::from_ref(&right_dependency),
+            [(&right_dependency, decl_interface_hash)],
         )
         .expect("right dependency should decode");
         assert_eq!(
@@ -1094,9 +1127,10 @@ mod tests {
         )
         .expect("source should resolve");
 
-        let MachineItem::Def(decl) = &resolved.module.items[1] else {
+        let MachineItem::Def(definition) = &resolved.module.items[1] else {
             panic!("expected resolved def");
         };
+        let decl = &definition.declaration;
         let MachineTerm::App { func, arg, .. } = &decl.value else {
             panic!("expected outer application");
         };
@@ -1182,9 +1216,10 @@ def Test.use (A : Type) (x : A) : A := Test.id A x",
         )
         .expect("source should resolve");
 
-        let MachineItem::Def(decl) = &resolved.module.items[1] else {
+        let MachineItem::Def(definition) = &resolved.module.items[1] else {
             panic!("expected second def");
         };
+        let decl = &definition.declaration;
         let MachineTerm::App { func, .. } = &decl.value else {
             panic!("expected application");
         };

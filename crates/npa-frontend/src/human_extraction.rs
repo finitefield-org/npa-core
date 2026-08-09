@@ -9,10 +9,10 @@ use npa_kernel::{Expr, Level};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    parse_human_module_with_source_interfaces, resolve_human_module_with_source_interfaces, FileId,
-    HumanCompileOptions, HumanDiagnostic, HumanDiagnosticKind, HumanGlobalRef,
-    HumanImportedSourceInterface, HumanItem, HumanName, HumanResolvedName, HumanResult, Span,
-    VerifiedExport, VerifiedImport,
+    parse_human_module_with_source_interfaces, resolve_human_module_with_source_interfaces,
+    DefinitionReducibility, FileId, HumanCompileOptions, HumanDiagnostic, HumanDiagnosticKind,
+    HumanGlobalRef, HumanImportedSourceInterface, HumanItem, HumanName, HumanResolvedName,
+    HumanResult, Span, VerifiedExport, VerifiedImport,
 };
 
 const EXTRACTION_DOMAIN: &[u8] = b"NPA-HUMAN-DECLARATION-EXTRACTION-v1\0";
@@ -64,6 +64,8 @@ pub struct HumanDeclarationFamilyMember {
     pub name: npa_cert::Name,
     /// Human/source role.
     pub kind: HumanDeclarationFamilyMemberKind,
+    /// Definition reducibility; absent for non-definition family members.
+    pub definition_reducibility: Option<DefinitionReducibility>,
     /// Exact source span that names or generates the member.
     pub span: Span,
 }
@@ -75,6 +77,8 @@ pub struct HumanSourceDeclarationFamily {
     pub owner: npa_cert::Name,
     /// Human kind of the owner.
     pub owner_kind: HumanDeclarationFamilyMemberKind,
+    /// Owner definition reducibility; absent for non-definition families.
+    pub definition_reducibility: Option<DefinitionReducibility>,
     /// Exact complete top-level item span.
     pub item_span: Span,
     /// Every explicit and generated declaration emitted by the item.
@@ -209,29 +213,34 @@ pub fn collect_human_source_declaration_families(
             HumanItem::NamespaceEnd { .. } => {
                 namespaces.pop();
             }
-            HumanItem::Def(decl) => families.push(single_family(
-                qualify(&namespaces, &decl.name),
+            HumanItem::Def(definition) => families.push(single_family(
+                qualify(&namespaces, &definition.declaration.name),
                 HumanDeclarationFamilyMemberKind::Definition,
-                decl.span,
+                Some(definition.reducibility),
+                definition.declaration.span,
             )),
             HumanItem::EquationDef(decl) => families.push(single_family(
                 qualify(&namespaces, &decl.name),
                 HumanDeclarationFamilyMemberKind::Definition,
+                Some(DefinitionReducibility::Reducible),
                 decl.span,
             )),
             HumanItem::Theorem(decl) => families.push(single_family(
                 qualify(&namespaces, &decl.name),
                 HumanDeclarationFamilyMemberKind::Theorem,
+                None,
                 decl.span,
             )),
             HumanItem::Axiom(decl) => families.push(single_family(
                 qualify(&namespaces, &decl.name),
                 HumanDeclarationFamilyMemberKind::Axiom,
+                None,
                 decl.span,
             )),
             HumanItem::Instance(decl) => families.push(single_family(
                 qualify(&namespaces, &decl.name),
                 HumanDeclarationFamilyMemberKind::Instance,
+                None,
                 decl.span,
             )),
             HumanItem::Inductive(decl) => {
@@ -256,6 +265,7 @@ pub fn collect_human_source_declaration_families(
                 families.push(HumanSourceDeclarationFamily {
                     owner,
                     owner_kind: HumanDeclarationFamilyMemberKind::Inductive,
+                    definition_reducibility: None,
                     item_span: decl.span,
                     members,
                 });
@@ -289,6 +299,7 @@ pub fn collect_human_source_declaration_families(
                 families.push(HumanSourceDeclarationFamily {
                     owner,
                     owner_kind: HumanDeclarationFamilyMemberKind::Class,
+                    definition_reducibility: None,
                     item_span: decl.span,
                     members,
                 });
@@ -992,6 +1003,7 @@ fn extraction_imports(
             let exports = hashes
                 .iter()
                 .map(|(name, hash)| VerifiedExport {
+                    reducibility: None,
                     name: name.clone(),
                     universe_params: Vec::new(),
                     ty: Expr::sort(Level::zero()),
@@ -1108,13 +1120,20 @@ fn put_u64(digest: &mut Sha256, value: u64) {
 fn single_family(
     owner: npa_cert::Name,
     kind: HumanDeclarationFamilyMemberKind,
+    definition_reducibility: Option<DefinitionReducibility>,
     item_span: Span,
 ) -> HumanSourceDeclarationFamily {
     HumanSourceDeclarationFamily {
         owner: owner.clone(),
         owner_kind: kind,
+        definition_reducibility,
         item_span,
-        members: vec![member(owner, kind, item_span)],
+        members: vec![HumanDeclarationFamilyMember {
+            name: owner,
+            kind,
+            definition_reducibility,
+            span: item_span,
+        }],
     }
 }
 
@@ -1123,7 +1142,12 @@ fn member(
     kind: HumanDeclarationFamilyMemberKind,
     span: Span,
 ) -> HumanDeclarationFamilyMember {
-    HumanDeclarationFamilyMember { name, kind, span }
+    HumanDeclarationFamilyMember {
+        name,
+        kind,
+        definition_reducibility: None,
+        span,
+    }
 }
 
 fn qualify(namespaces: &[Vec<String>], name: &HumanName) -> npa_cert::Name {
@@ -1206,6 +1230,79 @@ mod tests {
     }
 
     #[test]
+    fn extraction_retains_parenthesized_declaration_body() {
+        let file_id = FileId(8);
+        let source = "theorem keep : Prop := (Prop)\n";
+        let families = collect_human_source_declaration_families(file_id, source, &[]).unwrap();
+        let keep = &families.families[0];
+        let selection = HumanDeclarationSelection {
+            source_module: npa_cert::Name::from_dotted("Fixture.Source"),
+            target_module: npa_cert::Name::from_dotted("Mathlib.Target"),
+            declarations: vec![HumanSelectedDeclaration {
+                name: keep.owner.clone(),
+                kind: HumanDeclarationFamilyMemberKind::Theorem,
+                item_span: keep.item_span,
+                decl_interface_hash: [1; 32],
+            }],
+        };
+
+        let extracted = extract_human_declaration_source(
+            file_id,
+            source,
+            &[],
+            &selection,
+            &HumanGlobalMapping { rows: Vec::new() },
+        )
+        .unwrap();
+
+        assert_eq!(extracted.source, source);
+        assert_eq!(keep.item_span.end.0 as usize, source.trim_end().len());
+    }
+
+    #[test]
+    fn human_extraction_retains_opaque_definition_spelling_span_and_metadata() {
+        let file_id = FileId(81);
+        let source = "opaque def hidden (P : Prop) : Prop := P\n";
+        let families = collect_human_source_declaration_families(file_id, source, &[]).unwrap();
+        let hidden = &families.families[0];
+        assert_eq!(
+            hidden.definition_reducibility,
+            Some(DefinitionReducibility::Opaque)
+        );
+        assert_eq!(
+            hidden.members[0].definition_reducibility,
+            Some(DefinitionReducibility::Opaque)
+        );
+        assert_eq!(hidden.item_span.start.0, 0);
+        assert_eq!(hidden.item_span.end.0 as usize, source.trim_end().len());
+        let selection = HumanDeclarationSelection {
+            source_module: npa_cert::Name::from_dotted("Fixture.Source"),
+            target_module: npa_cert::Name::from_dotted("Mathlib.Target"),
+            declarations: vec![HumanSelectedDeclaration {
+                name: hidden.owner.clone(),
+                kind: HumanDeclarationFamilyMemberKind::Definition,
+                item_span: hidden.item_span,
+                decl_interface_hash: [9; 32],
+            }],
+        };
+
+        let extracted = extract_human_declaration_source(
+            file_id,
+            source,
+            &[],
+            &selection,
+            &HumanGlobalMapping { rows: Vec::new() },
+        )
+        .unwrap();
+
+        assert_eq!(extracted.source, source);
+        assert_eq!(
+            extracted.source_families.families[0].definition_reducibility,
+            Some(DefinitionReducibility::Opaque)
+        );
+    }
+
+    #[test]
     fn extraction_rewrites_only_resolved_global_spans_and_drops_unrelated_items() {
         let file_id = FileId(9);
         let source = "import Std.Source\n\n-- Std.foo in a comment is inert\ndef keep (Std_foo : Prop) : Prop := Std.foo\n\ndef drop : Prop := Std.foo\n";
@@ -1216,6 +1313,7 @@ mod tests {
             .declarations
             .push(HumanSourceDeclarationMetadata {
                 kind: HumanSourceDeclarationKind::Def,
+                definition_reducibility: Some(crate::DefinitionReducibility::Reducible),
                 name: HumanName::new(
                     vec!["Std".to_owned(), "foo".to_owned()],
                     Span::empty(file_id),
@@ -1295,6 +1393,7 @@ mod tests {
                 .declarations
                 .push(HumanSourceDeclarationMetadata {
                     kind: HumanSourceDeclarationKind::Def,
+                    definition_reducibility: Some(crate::DefinitionReducibility::Reducible),
                     name: HumanName::new(npa_cert::Name::from_dotted(name).0, Span::empty(file_id)),
                     universe_params: Vec::new(),
                     binders: Vec::new(),
@@ -1471,6 +1570,7 @@ mod tests {
                 .declarations
                 .push(HumanSourceDeclarationMetadata {
                     kind: HumanSourceDeclarationKind::Def,
+                    definition_reducibility: Some(crate::DefinitionReducibility::Reducible),
                     name: HumanName::new(npa_cert::Name::from_dotted(name).0, Span::empty(file_id)),
                     universe_params: Vec::new(),
                     binders: Vec::new(),
@@ -1630,6 +1730,7 @@ mod tests {
             .declarations
             .push(HumanSourceDeclarationMetadata {
                 kind: HumanSourceDeclarationKind::Def,
+                definition_reducibility: Some(crate::DefinitionReducibility::Reducible),
                 name: HumanName::new(npa_cert::Name::from_dotted("Std.add").0, imported_span),
                 universe_params: Vec::new(),
                 binders: Vec::new(),

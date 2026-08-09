@@ -40,9 +40,9 @@ a package dependency.
 
 ## `mutual-inductive-constructor-universe-bound-v0.2.npcert`
 
-This smaller, current-format certificate freezes the same invalid constructor
-inside a mutual block so the independent reference checker exercises its
-mutual-constructor path.
+This smaller, v0.2 compatibility-format certificate freezes the same invalid
+constructor inside a mutual block so the independent reference checker
+exercises its mutual-constructor path.
 
 ```text
 format:           NPA-CERT-0.2.0

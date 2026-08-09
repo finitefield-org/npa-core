@@ -1,9 +1,18 @@
 use super::*;
 use npa_kernel::{
     eq, eq_inductive, eq_rec_type, eq_refl, eq_refl_type, nat, nat_inductive, nat_succ, nat_zero,
-    prop, type0, Binder, ConstructorDecl, Decl, Expr, InductiveDecl, Level, MutualInductiveBlock,
-    RecursorDecl, Reducibility, UniverseConstraint,
+    prop, type0, Binder, ConstructorDecl, Ctx, Decl, Env, Expr, InductiveDecl, Level,
+    MutualInductiveBlock, RecursorDecl, Reducibility, ResourceLimitKind, UniverseConstraint,
 };
+use std::collections::BTreeSet;
+
+fn encode_module_cert_without_certificate_hash(cert: &ModuleCert) -> Vec<u8> {
+    encode_module_cert_without_certificate_hash_for_header(cert).unwrap()
+}
+
+fn interface_dependency(global_ref: GlobalRef, decl_interface_hash: Hash) -> DependencyEntry {
+    DependencyEntry::checked_interface(global_ref, decl_interface_hash).unwrap()
+}
 
 fn id_type(a: &str, x: &str) -> Expr {
     Expr::pi(
@@ -184,6 +193,351 @@ fn previous_bytes_from_current_cert(mut cert: ModuleCert) -> Vec<u8> {
         &encode_module_cert_without_certificate_hash_for_header(&cert).unwrap(),
     );
     encode_module_cert(&cert).unwrap()
+}
+
+fn opaque_alias_module() -> CoreModule {
+    CoreModule {
+        name: Name::from_dotted("Test.OpaqueAlias"),
+        declarations: vec![
+            Decl::Def {
+                name: "opaque_id".to_owned(),
+                universe_params: vec!["u".to_owned()],
+                ty: id_type("A", "x"),
+                value: id_value("A", "x"),
+                reducibility: Reducibility::Opaque,
+            },
+            Decl::Def {
+                name: "opaque_id_alias".to_owned(),
+                universe_params: vec!["u".to_owned()],
+                ty: id_type("A", "x"),
+                value: Expr::konst("opaque_id", vec![Level::param("u")]),
+                reducibility: Reducibility::Reducible,
+            },
+        ],
+    }
+}
+
+fn named_opaque_id(name: &str, value: Expr) -> Decl {
+    Decl::Def {
+        name: name.to_owned(),
+        universe_params: vec!["u".to_owned()],
+        ty: id_type("A", "x"),
+        value,
+        reducibility: Reducibility::Opaque,
+    }
+}
+
+fn named_id_alias(name: &str, target: &str, reducibility: Reducibility) -> Decl {
+    Decl::Def {
+        name: name.to_owned(),
+        universe_params: vec!["u".to_owned()],
+        ty: id_type("A", "x"),
+        value: Expr::konst(target, vec![Level::param("u")]),
+        reducibility,
+    }
+}
+
+fn named_id_theorem(name: &str, proof: &str) -> Decl {
+    Decl::Theorem {
+        name: name.to_owned(),
+        universe_params: vec!["u".to_owned()],
+        ty: id_type("A", "x"),
+        proof: Expr::konst(proof, vec![Level::param("u")]),
+    }
+}
+
+fn opaque_alias_chain_module() -> CoreModule {
+    CoreModule {
+        name: Name::from_dotted("Test.OpaqueAliasChain"),
+        declarations: vec![
+            named_opaque_id("hidden", id_value("A", "x")),
+            named_id_alias("alias", "hidden", Reducibility::Reducible),
+            named_id_theorem("uses_alias", "alias"),
+        ],
+    }
+}
+
+fn opaque_nat_equality_module(value: Expr) -> CoreModule {
+    CoreModule {
+        name: Name::from_dotted("Test.OpaqueNatEquality"),
+        declarations: vec![
+            Decl::Def {
+                name: "hidden_nat".to_owned(),
+                universe_params: vec![],
+                ty: nat(),
+                value,
+                reducibility: Reducibility::Opaque,
+            },
+            Decl::Theorem {
+                name: "hidden_nat_eq_zero".to_owned(),
+                universe_params: vec![],
+                ty: eq(
+                    type0(),
+                    nat(),
+                    Expr::konst("hidden_nat", vec![]),
+                    nat_zero(),
+                ),
+                proof: eq_refl(type0(), nat(), nat_zero()),
+            },
+        ],
+    }
+}
+
+fn imported_opaque_nat_equality_module() -> CoreModule {
+    CoreModule {
+        name: Name::from_dotted("Test.ImportedOpaqueNatEquality"),
+        declarations: vec![Decl::Theorem {
+            name: "imported_hidden_nat_eq_zero".to_owned(),
+            universe_params: vec![],
+            ty: eq(
+                type0(),
+                nat(),
+                Expr::konst("hidden_nat", vec![]),
+                nat_zero(),
+            ),
+            proof: eq_refl(type0(), nat(), nat_zero()),
+        }],
+    }
+}
+
+fn opaque_declared_type_module() -> CoreModule {
+    CoreModule {
+        name: Name::from_dotted("Test.OpaqueDeclaredType"),
+        declarations: vec![
+            Decl::Def {
+                name: "hidden_type".to_owned(),
+                universe_params: vec![],
+                ty: Expr::sort(Level::succ(Level::zero())),
+                value: Expr::sort(Level::zero()),
+                reducibility: Reducibility::Opaque,
+            },
+            Decl::Axiom {
+                name: "hidden_witness".to_owned(),
+                universe_params: vec![],
+                ty: Expr::konst("hidden_type", vec![]),
+            },
+            Decl::Axiom {
+                name: "typed_constant".to_owned(),
+                universe_params: vec![],
+                ty: Expr::pi(
+                    "_",
+                    Expr::konst("hidden_type", vec![]),
+                    Expr::sort(Level::zero()),
+                ),
+            },
+            Decl::Theorem {
+                name: "uses_witness_type".to_owned(),
+                universe_params: vec![],
+                ty: Expr::sort(Level::zero()),
+                proof: Expr::app(
+                    Expr::konst("typed_constant", vec![]),
+                    Expr::konst("hidden_witness", vec![]),
+                ),
+            },
+        ],
+    }
+}
+
+fn nested_opaque_module() -> CoreModule {
+    CoreModule {
+        name: Name::from_dotted("Test.NestedOpaque"),
+        declarations: vec![
+            named_opaque_id("inner_hidden", id_value("A", "x")),
+            named_opaque_id(
+                "outer_hidden",
+                Expr::konst("inner_hidden", vec![Level::param("u")]),
+            ),
+            named_id_alias("uses_outer", "outer_hidden", Reducibility::Reducible),
+        ],
+    }
+}
+
+fn theorem_interface_only_module(hidden_value: Expr) -> CoreModule {
+    CoreModule {
+        name: Name::from_dotted("Test.TheoremInterfaceOnly"),
+        declarations: vec![
+            named_opaque_id("hidden", hidden_value),
+            named_id_theorem("stable_theorem", "hidden"),
+            named_id_alias(
+                "uses_stable_theorem",
+                "stable_theorem",
+                Reducibility::Reducible,
+            ),
+        ],
+    }
+}
+
+fn build_v0_3_cert(module: CoreModule) -> ModuleCert {
+    build_module_cert(module, &[]).unwrap()
+}
+
+fn v0_3_opaque_alias_cert_with_interface_dependency() -> ModuleCert {
+    let mut cert = build_v0_3_cert(opaque_alias_module());
+    replace_first_local_dependency_with_interface(&mut cert);
+    cert
+}
+
+fn first_local_dependency(cert: &ModuleCert) -> (usize, usize) {
+    let consumer_index = cert
+        .declarations
+        .iter()
+        .position(|decl| {
+            decl.dependencies
+                .iter()
+                .any(|dependency| matches!(dependency.global_ref(), GlobalRef::Local { .. }))
+        })
+        .unwrap();
+    let dependency_index = cert.declarations[consumer_index]
+        .dependencies
+        .iter()
+        .position(|dependency| matches!(dependency.global_ref(), GlobalRef::Local { .. }))
+        .unwrap();
+    (consumer_index, dependency_index)
+}
+
+fn replace_first_local_dependency_with_interface(cert: &mut ModuleCert) -> usize {
+    let (consumer_index, dependency_index) = first_local_dependency(cert);
+    let dependency = &cert.declarations[consumer_index].dependencies[dependency_index];
+    let interface = DependencyEntry::checked_interface(
+        dependency.global_ref().clone(),
+        dependency.decl_interface_hash(),
+    )
+    .unwrap();
+    cert.declarations[consumer_index].dependencies[dependency_index] = interface;
+    rehash_v0_3_dependency_change(cert, consumer_index);
+    consumer_index
+}
+
+fn replace_first_local_dependency_with_implementation(cert: &mut ModuleCert) -> usize {
+    let (consumer_index, dependency_index) = first_local_dependency(cert);
+    let global_ref = cert.declarations[consumer_index].dependencies[dependency_index]
+        .global_ref()
+        .clone();
+    let implementation = DependencyEntry::checked_local_implementation(
+        global_ref,
+        consumer_index,
+        &cert.declarations,
+    )
+    .unwrap();
+    cert.declarations[consumer_index].dependencies[dependency_index] = implementation;
+    rehash_v0_3_dependency_change(cert, consumer_index);
+    consumer_index
+}
+
+fn rehash_v0_3_dependency_change(cert: &mut ModuleCert, consumer_index: usize) {
+    let level_hashes = compute_level_hashes(&cert.level_table, &cert.name_table).unwrap();
+    let term_hashes = compute_term_hashes(&cert.term_table, &level_hashes).unwrap();
+    cert.declarations[consumer_index].hashes = compute_decl_hashes(
+        CertificateFormatVersion::V0_3_0,
+        &cert.declarations[consumer_index].decl,
+        &cert.declarations[consumer_index].dependencies,
+        &cert.declarations[consumer_index].axiom_dependencies,
+        DeclHashTables {
+            terms: &cert.term_table,
+            level_hashes: &level_hashes,
+            term_hashes: &term_hashes,
+            names: &cert.name_table,
+        },
+    )
+    .unwrap();
+    cert.export_block =
+        build_export_block(&cert.declarations, &cert.term_table, &term_hashes).unwrap();
+    cert.hashes.export_hash = hash_with_domain(
+        MODULE_EXPORT_DOMAIN,
+        &encode_export_block(&cert.export_block),
+    );
+    cert.hashes.certificate_hash = hash_with_domain(
+        MODULE_CERT_DOMAIN,
+        &encode_module_cert_without_certificate_hash_for_header(cert).unwrap(),
+    );
+}
+
+fn v0_3_opaque_alias_cert_with_local_implementation_dependency() -> ModuleCert {
+    build_v0_3_cert(opaque_alias_module())
+}
+
+fn v0_3_dependency_bytes(entry: &DependencyEntry) -> Vec<u8> {
+    let mut bytes = vec![match entry.kind() {
+        DependencyEntryKind::Interface => 0x00,
+        DependencyEntryKind::LocalImplementation => 0x01,
+    }];
+    encode_global_ref_to(&mut bytes, entry.global_ref());
+    bytes.extend(entry.decl_interface_hash());
+    if let Some(decl_certificate_hash) = entry.decl_certificate_hash() {
+        bytes.extend(decl_certificate_hash);
+    }
+    bytes
+}
+
+fn decl_index_named(cert: &ModuleCert, expected: &str) -> usize {
+    let expected = Name::from_dotted(expected);
+    cert.declarations
+        .iter()
+        .position(|declaration| {
+            let name = match &declaration.decl {
+                DeclPayload::Axiom { name, .. }
+                | DeclPayload::AxiomConstrained { name, .. }
+                | DeclPayload::Def { name, .. }
+                | DeclPayload::DefConstrained { name, .. }
+                | DeclPayload::Theorem { name, .. }
+                | DeclPayload::TheoremConstrained { name, .. }
+                | DeclPayload::Inductive { name, .. }
+                | DeclPayload::InductiveConstrained { name, .. }
+                | DeclPayload::MutualInductiveBlock { name, .. } => *name,
+            };
+            cert.name_table[name] == expected
+        })
+        .unwrap()
+}
+
+fn local_implementation_targets(cert: &ModuleCert, decl_index: usize) -> BTreeSet<usize> {
+    cert.declarations[decl_index]
+        .dependencies
+        .iter()
+        .filter_map(|dependency| {
+            (dependency.kind() == DependencyEntryKind::LocalImplementation)
+                .then(|| match dependency.global_ref() {
+                    GlobalRef::Local { decl_index } => Some(*decl_index),
+                    _ => None,
+                })
+                .flatten()
+        })
+        .collect()
+}
+
+fn replace_first_local_dependency_with_raw_implementation(
+    cert: &mut ModuleCert,
+    global_ref: GlobalRef,
+    decl_interface_hash: Hash,
+    decl_certificate_hash: Hash,
+) -> usize {
+    let (consumer_index, dependency_index) = first_local_dependency(cert);
+    cert.declarations[consumer_index].dependencies[dependency_index] =
+        DependencyEntry::from_decoded_local_implementation(
+            global_ref,
+            decl_interface_hash,
+            decl_certificate_hash,
+        );
+    cert.declarations[consumer_index].dependencies.sort();
+    rehash_v0_3_dependency_change(cert, consumer_index);
+    consumer_index
+}
+
+fn assert_local_implementation_error(
+    cert: &ModuleCert,
+    expected_reason: LocalImplementationDependencyErrorReason,
+) {
+    let err = verify_module_cert_with_import_refs(
+        &encode_module_cert(cert).unwrap(),
+        &[],
+        &AxiomPolicy::normal(),
+    )
+    .unwrap_err();
+    assert!(matches!(
+        err,
+        CertError::InvalidLocalImplementationDependency { reason, .. }
+            if reason == expected_reason && reason.as_str() == expected_reason.as_str()
+    ));
 }
 
 fn height_order_regression_constraints() -> Vec<UniverseConstraint> {
@@ -445,7 +799,8 @@ fn constrained_export_entries_encode_universe_constraints_in_current_format() {
 
 #[test]
 fn previous_constrained_public_exports_remain_readable() {
-    let cert = build_module_cert(constrained_axiom_module(vec![max_u_v_le_w()]), &[]).unwrap();
+    let cert =
+        build_module_cert_v0_2_compat(constrained_axiom_module(vec![max_u_v_le_w()]), &[]).unwrap();
     let bytes = previous_bytes_from_current_cert(cert);
     let decoded = decode_module_cert(&bytes).unwrap();
 
@@ -486,7 +841,7 @@ fn imported_public_signature_reconstructs_exported_universe_constraints() {
 
 #[test]
 fn legacy_unconstrained_public_exports_remain_readable() {
-    let cert = build_module_cert(constrained_axiom_module(vec![]), &[]).unwrap();
+    let cert = build_module_cert_v0_2_compat(constrained_axiom_module(vec![]), &[]).unwrap();
     let bytes = legacy_bytes_from_current_cert(cert);
     let decoded = decode_module_cert(&bytes).unwrap();
 
@@ -500,8 +855,1323 @@ fn legacy_unconstrained_public_exports_remain_readable() {
 }
 
 #[test]
+fn binary_four_version_certificates_round_trip_without_rewriting_legacy_dependencies() {
+    let v0_3 = build_module_cert(opaque_alias_module(), &[]).unwrap();
+    let v0_2 = build_module_cert_v0_2_compat(opaque_alias_module(), &[]).unwrap();
+    let cases = [
+        (encode_module_cert(&v0_3).unwrap(), FORMAT, CORE_SPEC),
+        (
+            encode_module_cert(&v0_2).unwrap(),
+            COMPAT_FORMAT,
+            COMPAT_CORE_SPEC,
+        ),
+        (
+            previous_bytes_from_current_cert(v0_2.clone()),
+            PREVIOUS_FORMAT,
+            PREVIOUS_CORE_SPEC,
+        ),
+        (
+            legacy_bytes_from_current_cert(v0_2),
+            LEGACY_FORMAT,
+            LEGACY_CORE_SPEC,
+        ),
+    ];
+
+    for (bytes, expected_format, expected_core_spec) in cases {
+        let decoded = decode_module_cert(&bytes).unwrap();
+        assert_eq!(decoded.header.format, expected_format);
+        assert_eq!(decoded.header.core_spec, expected_core_spec);
+        assert_eq!(encode_module_cert(&decoded).unwrap(), bytes);
+    }
+}
+
+#[test]
+fn certificate_format_builders_emit_v0_3_by_default_and_v0_2_only_explicitly() {
+    let ordinary = build_module_cert(id_module("A", "x"), &[]).unwrap();
+    assert_eq!(ordinary.header.format, FORMAT);
+    assert_eq!(ordinary.header.core_spec, CORE_SPEC);
+
+    let compatibility = build_module_cert_v0_2_compat(id_module("A", "x"), &[]).unwrap();
+    assert_eq!(compatibility.header.format, COMPAT_FORMAT);
+    assert_eq!(compatibility.header.core_spec, COMPAT_CORE_SPEC);
+    verify_module_cert_hashes(&encode_module_cert(&ordinary).unwrap()).unwrap();
+    verify_module_cert_hashes(&encode_module_cert(&compatibility).unwrap()).unwrap();
+}
+
+#[test]
+fn hash_v0_3_plain_migration_changes_certificate_identities_only() {
+    let v0_2 = build_module_cert_v0_2_compat(id_module("A", "x"), &[]).unwrap();
+    let v0_3 = build_module_cert(id_module("A", "x"), &[]).unwrap();
+
+    assert_eq!(v0_2.export_block, v0_3.export_block);
+    assert_eq!(
+        encode_export_block(&v0_2.export_block),
+        encode_export_block(&v0_3.export_block)
+    );
+    assert_eq!(v0_2.hashes.export_hash, v0_3.hashes.export_hash);
+    assert_eq!(
+        v0_2.declarations[0].hashes.decl_interface_hash,
+        v0_3.declarations[0].hashes.decl_interface_hash
+    );
+    assert_ne!(
+        v0_2.declarations[0].hashes.decl_certificate_hash,
+        v0_3.declarations[0].hashes.decl_certificate_hash
+    );
+    assert_ne!(v0_2.hashes.certificate_hash, v0_3.hashes.certificate_hash);
+    let v0_3_payload = encode_module_cert_without_certificate_hash_for_header(&v0_3).unwrap();
+    assert_eq!(
+        v0_3.hashes.certificate_hash,
+        hash_with_domain(MODULE_CERT_DOMAIN, &v0_3_payload)
+    );
+    assert_ne!(
+        v0_3.hashes.certificate_hash,
+        hash_with_domain(COMPAT_MODULE_CERT_DOMAIN, &v0_3_payload)
+    );
+    verify_module_cert_hashes(&encode_module_cert(&v0_3).unwrap()).unwrap();
+
+    let v0_2_bytes = encode_module_cert(&v0_2).unwrap();
+    let v0_3_bytes = encode_module_cert(&v0_3).unwrap();
+    assert_ne!(v0_2_bytes, v0_3_bytes);
+    let mut header_only_upgrade = v0_2.clone();
+    header_only_upgrade.header.format = FORMAT.to_owned();
+    header_only_upgrade.header.core_spec = CORE_SPEC.to_owned();
+    let header_only_upgrade_bytes = encode_module_cert(&header_only_upgrade).unwrap();
+    assert!(verify_module_cert_hashes(&header_only_upgrade_bytes).is_err());
+}
+
+#[test]
+fn hash_v0_3_opaque_body_change_keeps_public_identity() {
+    let direct = build_v0_3_cert(id_def_module_with_value_and_reducibility(
+        id_value("A", "x"),
+        Reducibility::Opaque,
+    ));
+    let beta = build_v0_3_cert(id_def_module_with_value_and_reducibility(
+        id_value_with_beta_redex(),
+        Reducibility::Opaque,
+    ));
+
+    assert_eq!(
+        direct.declarations[0].hashes.decl_interface_hash,
+        beta.declarations[0].hashes.decl_interface_hash
+    );
+    assert_eq!(direct.export_block, beta.export_block);
+    assert_eq!(direct.hashes.export_hash, beta.hashes.export_hash);
+    assert_ne!(
+        direct.declarations[0].hashes.decl_certificate_hash,
+        beta.declarations[0].hashes.decl_certificate_hash
+    );
+    assert_ne!(direct.hashes.certificate_hash, beta.hashes.certificate_hash);
+    verify_module_cert_hashes(&encode_module_cert(&direct).unwrap()).unwrap();
+    verify_module_cert_hashes(&encode_module_cert(&beta).unwrap()).unwrap();
+}
+
+#[test]
+fn hash_v0_3_transitive_axiom_change_still_changes_public_identity() {
+    let p1 = build_v0_3_cert(theorem_using_axiom_module("p1"));
+    let p2 = build_v0_3_cert(theorem_using_axiom_module("p2"));
+
+    assert_ne!(
+        p1.axiom_report.per_declaration[3].transitive_axioms,
+        p2.axiom_report.per_declaration[3].transitive_axioms
+    );
+    assert_ne!(
+        p1.declarations[3].hashes.decl_interface_hash,
+        p2.declarations[3].hashes.decl_interface_hash
+    );
+    assert_ne!(p1.export_block, p2.export_block);
+    assert_ne!(p1.hashes.export_hash, p2.hashes.export_hash);
+    verify_module_cert_hashes(&encode_module_cert(&p1).unwrap()).unwrap();
+    verify_module_cert_hashes(&encode_module_cert(&p2).unwrap()).unwrap();
+}
+
+#[test]
+fn hash_v0_3_local_implementation_projects_to_legacy_public_interface_dependency() {
+    let interface = v0_3_opaque_alias_cert_with_interface_dependency();
+    let implementation = v0_3_opaque_alias_cert_with_local_implementation_dependency();
+    let consumer_index = implementation
+        .declarations
+        .iter()
+        .position(|declaration| {
+            declaration
+                .dependencies
+                .iter()
+                .any(|dependency| dependency.kind() == DependencyEntryKind::LocalImplementation)
+        })
+        .unwrap();
+
+    assert_eq!(
+        interface.declarations[consumer_index]
+            .hashes
+            .decl_interface_hash,
+        implementation.declarations[consumer_index]
+            .hashes
+            .decl_interface_hash
+    );
+    assert_eq!(interface.export_block, implementation.export_block);
+    assert_eq!(
+        interface.hashes.export_hash,
+        implementation.hashes.export_hash
+    );
+    assert_ne!(
+        interface.declarations[consumer_index]
+            .hashes
+            .decl_certificate_hash,
+        implementation.declarations[consumer_index]
+            .hashes
+            .decl_certificate_hash
+    );
+    assert_ne!(
+        interface.hashes.certificate_hash,
+        implementation.hashes.certificate_hash
+    );
+    verify_module_cert_hashes(&encode_module_cert(&implementation).unwrap()).unwrap();
+}
+
+#[test]
+fn hash_v0_3_local_implementation_certificate_hash_is_committed_privately() {
+    let cert = v0_3_opaque_alias_cert_with_interface_dependency();
+    let consumer_index = cert
+        .declarations
+        .iter()
+        .position(|declaration| {
+            declaration
+                .dependencies
+                .iter()
+                .any(|dependency| matches!(dependency.global_ref(), GlobalRef::Local { .. }))
+        })
+        .unwrap();
+    let global_ref = cert.declarations[consumer_index]
+        .dependencies
+        .iter()
+        .find(|dependency| matches!(dependency.global_ref(), GlobalRef::Local { .. }))
+        .unwrap()
+        .global_ref()
+        .clone();
+    let original_dependency = DependencyEntry::checked_local_implementation(
+        global_ref.clone(),
+        consumer_index,
+        &cert.declarations,
+    )
+    .unwrap();
+    let mut changed_targets = cert.declarations.clone();
+    let GlobalRef::Local { decl_index } = global_ref else {
+        unreachable!()
+    };
+    changed_targets[decl_index].hashes.decl_certificate_hash[0] ^= 0x01;
+    let changed_dependency = DependencyEntry::checked_local_implementation(
+        GlobalRef::Local { decl_index },
+        consumer_index,
+        &changed_targets,
+    )
+    .unwrap();
+    let consumer = &cert.declarations[consumer_index];
+    let level_hashes = compute_level_hashes(&cert.level_table, &cert.name_table).unwrap();
+    let term_hashes = compute_term_hashes(&cert.term_table, &level_hashes).unwrap();
+    let original_hashes = compute_decl_hashes(
+        CertificateFormatVersion::V0_3_0,
+        &consumer.decl,
+        &[original_dependency],
+        &consumer.axiom_dependencies,
+        DeclHashTables {
+            terms: &cert.term_table,
+            level_hashes: &level_hashes,
+            term_hashes: &term_hashes,
+            names: &cert.name_table,
+        },
+    )
+    .unwrap();
+    let changed_hashes = compute_decl_hashes(
+        CertificateFormatVersion::V0_3_0,
+        &consumer.decl,
+        &[changed_dependency],
+        &consumer.axiom_dependencies,
+        DeclHashTables {
+            terms: &cert.term_table,
+            level_hashes: &level_hashes,
+            term_hashes: &term_hashes,
+            names: &cert.name_table,
+        },
+    )
+    .unwrap();
+
+    assert_eq!(
+        original_hashes.decl_interface_hash,
+        changed_hashes.decl_interface_hash
+    );
+    assert_ne!(
+        original_hashes.decl_certificate_hash,
+        changed_hashes.decl_certificate_hash
+    );
+}
+
+#[test]
+fn hash_v0_3_closure_only_local_implementation_is_absent_from_public_projection() {
+    let mut module = opaque_alias_module();
+    match &mut module.declarations[1] {
+        Decl::Def { reducibility, .. } => *reducibility = Reducibility::Opaque,
+        _ => panic!("expected definition"),
+    }
+    let mut interface = build_v0_3_cert(module);
+    replace_first_local_dependency_with_interface(&mut interface);
+    let mut implementation = interface.clone();
+    let consumer_index = replace_first_local_dependency_with_implementation(&mut implementation);
+    let consumer = &implementation.declarations[consumer_index];
+    let level_hashes =
+        compute_level_hashes(&implementation.level_table, &implementation.name_table).unwrap();
+    let term_hashes = compute_term_hashes(&implementation.term_table, &level_hashes).unwrap();
+    let without_closure_dependency = compute_decl_hashes(
+        CertificateFormatVersion::V0_3_0,
+        &consumer.decl,
+        &[],
+        &consumer.axiom_dependencies,
+        DeclHashTables {
+            terms: &implementation.term_table,
+            level_hashes: &level_hashes,
+            term_hashes: &term_hashes,
+            names: &implementation.name_table,
+        },
+    )
+    .unwrap();
+
+    assert_eq!(
+        consumer.hashes.decl_interface_hash,
+        without_closure_dependency.decl_interface_hash
+    );
+    assert_eq!(
+        interface.declarations[consumer_index]
+            .hashes
+            .decl_interface_hash,
+        consumer.hashes.decl_interface_hash
+    );
+    assert_eq!(interface.export_block, implementation.export_block);
+    assert_eq!(
+        interface.hashes.export_hash,
+        implementation.hashes.export_hash
+    );
+    assert_ne!(
+        interface.declarations[consumer_index]
+            .hashes
+            .decl_certificate_hash,
+        consumer.hashes.decl_certificate_hash
+    );
+    verify_module_cert_hashes(&encode_module_cert(&implementation).unwrap()).unwrap();
+}
+
+#[test]
+fn current_module_opaque_body_supports_v0_3_equality_and_keeps_stored_decl_opaque() {
+    let cert = build_v0_3_cert(opaque_nat_equality_module(nat_zero()));
+    let hidden = decl_index_named(&cert, "hidden_nat");
+    let theorem = decl_index_named(&cert, "hidden_nat_eq_zero");
+
+    assert!(matches!(
+        cert.declarations[hidden].decl,
+        DeclPayload::Def {
+            reducibility: CertReducibility::Opaque,
+            ..
+        }
+    ));
+    assert_eq!(
+        local_implementation_targets(&cert, theorem),
+        [hidden].into()
+    );
+    let verified = verify_module_cert_with_import_refs(
+        &encode_module_cert(&cert).unwrap(),
+        &[],
+        &AxiomPolicy::normal(),
+    )
+    .unwrap();
+    assert_eq!(verified.certificate_format(), FORMAT);
+    assert_eq!(verified.core_spec(), CORE_SPEC);
+}
+
+#[test]
+fn current_module_opaque_body_is_immediately_opaque_in_v0_2_builder() {
+    assert!(matches!(
+        build_module_cert_v0_2_compat(opaque_nat_equality_module(nat_zero()), &[]),
+        Err(CertError::Kernel(npa_kernel::Error::TypeMismatch { .. }))
+    ));
+}
+
+#[test]
+fn current_module_compatibility_formats_keep_checked_opaque_body_hidden() {
+    for version in [
+        CertificateFormatVersion::V0_2_0,
+        CertificateFormatVersion::V0_1_2,
+        CertificateFormatVersion::V0_1,
+    ] {
+        let mut env = Env::new();
+        add_current_module_decl_to_env(
+            &mut env,
+            Decl::Def {
+                name: "compatibility_hidden".to_owned(),
+                universe_params: vec![],
+                ty: Expr::sort(Level::succ(Level::zero())),
+                value: Expr::sort(Level::zero()),
+                reducibility: Reducibility::Opaque,
+            },
+            version,
+        )
+        .unwrap();
+        assert!(!env
+            .is_defeq(
+                &Ctx::new(),
+                &[],
+                &Expr::konst("compatibility_hidden", vec![]),
+                &Expr::sort(Level::zero()),
+            )
+            .unwrap());
+    }
+}
+
+#[test]
+fn imported_opaque_body_is_not_available_to_conversion_or_export_projection() {
+    let imported_cert = build_v0_3_cert(CoreModule {
+        name: Name::from_dotted("Test.OpaqueNatImport"),
+        declarations: vec![Decl::Def {
+            name: "hidden_nat".to_owned(),
+            universe_params: vec![],
+            ty: nat(),
+            value: nat_zero(),
+            reducibility: Reducibility::Opaque,
+        }],
+    });
+    let mut imported = verify_module_cert_with_import_refs(
+        &encode_module_cert(&imported_cert).unwrap(),
+        &[],
+        &AxiomPolicy::normal(),
+    )
+    .unwrap();
+
+    assert!(matches!(
+        build_module_cert_from_import_refs_with_preferred_imports(
+            imported_opaque_nat_equality_module(),
+            &[&imported],
+            &std::collections::BTreeMap::new(),
+        ),
+        Err(CertError::Kernel(npa_kernel::Error::TypeMismatch { .. }))
+    ));
+
+    match &mut imported.declarations[0].decl {
+        DeclPayload::Def { value, .. } => *value = usize::MAX,
+        _ => panic!("expected opaque definition"),
+    }
+    assert!(matches!(
+        verified_module_to_kernel_decls(&imported).unwrap().as_slice(),
+        [Decl::Axiom { name, .. }] if name == "hidden_nat"
+    ));
+}
+
+#[test]
+fn current_module_failed_opaque_body_check_inserts_no_local_view() {
+    let mut env = Env::new();
+    let bad = Decl::Def {
+        name: "bad_hidden".to_owned(),
+        universe_params: vec![],
+        ty: Expr::sort(Level::succ(Level::zero())),
+        value: Expr::sort(Level::succ(Level::zero())),
+        reducibility: Reducibility::Opaque,
+    };
+    assert!(matches!(
+        add_current_module_decl_to_env(&mut env, bad, CertificateFormatVersion::V0_3_0),
+        Err(CertError::Kernel(npa_kernel::Error::TypeMismatch { .. }))
+    ));
+    assert!(env.decl("bad_hidden").is_none());
+    assert!(!env.expose_checked_opaque_definition("bad_hidden"));
+}
+
+#[test]
+fn current_module_opaque_view_obeys_conversion_fuel_exhaustion() {
+    let mut opaque = Env::new();
+    add_current_module_decl_to_env(
+        &mut opaque,
+        Decl::Def {
+            name: "opaque_zero".to_owned(),
+            universe_params: vec![],
+            ty: Expr::sort(Level::succ(Level::zero())),
+            value: Expr::sort(Level::zero()),
+            reducibility: Reducibility::Opaque,
+        },
+        CertificateFormatVersion::V0_3_0,
+    )
+    .unwrap();
+    let mut reducible = Env::new();
+    add_decl_to_env(
+        &mut reducible,
+        Decl::Def {
+            name: "reducible_zero".to_owned(),
+            universe_params: vec![],
+            ty: Expr::sort(Level::succ(Level::zero())),
+            value: Expr::sort(Level::zero()),
+            reducibility: Reducibility::Reducible,
+        },
+    )
+    .unwrap();
+
+    for (env, name) in [(&opaque, "opaque_zero"), (&reducible, "reducible_zero")] {
+        assert_eq!(
+            env.is_defeq_with_fuel(
+                &Ctx::new(),
+                &[],
+                &Expr::konst(name, vec![]),
+                &Expr::sort(Level::zero()),
+                0,
+            ),
+            Err(npa_kernel::Error::ResourceLimit {
+                kind: ResourceLimitKind::Conversion,
+            })
+        );
+    }
+}
+
+#[test]
+fn opaque_body_check_consumes_same_kernel_work_as_reducible_body() {
+    let module = |name: &str, reducibility| CoreModule {
+        name: Name::from_dotted(name),
+        declarations: vec![Decl::Def {
+            name: "checked_value".to_owned(),
+            universe_params: vec![],
+            ty: Expr::sort(Level::succ(Level::zero())),
+            value: Expr::sort(Level::zero()),
+            reducibility,
+        }],
+    };
+    let opaque = build_v0_3_cert(module("Test.OpaqueBodyWork", Reducibility::Opaque));
+    let reducible = build_v0_3_cert(module("Test.ReducibleBodyWork", Reducibility::Reducible));
+    let mut opaque_counters = npa_kernel::KernelWorkCounters::default();
+    let mut reducible_counters = npa_kernel::KernelWorkCounters::default();
+    verify_module_cert_with_import_refs_and_kernel_options_and_work_counters(
+        &encode_module_cert(&opaque).unwrap(),
+        &[],
+        &AxiomPolicy::normal(),
+        npa_kernel::KernelExecutionOptions::memo_off(),
+        &mut opaque_counters,
+    )
+    .unwrap();
+    verify_module_cert_with_import_refs_and_kernel_options_and_work_counters(
+        &encode_module_cert(&reducible).unwrap(),
+        &[],
+        &AxiomPolicy::normal(),
+        npa_kernel::KernelExecutionOptions::memo_off(),
+        &mut reducible_counters,
+    )
+    .unwrap();
+
+    assert_eq!(opaque_counters.check_calls, reducible_counters.check_calls);
+    assert_eq!(opaque_counters.infer_calls, reducible_counters.infer_calls);
+    assert_eq!(
+        opaque_counters.logical_fuel,
+        reducible_counters.logical_fuel
+    );
+    assert_eq!(
+        opaque_counters.exhausted_fuel,
+        reducible_counters.exhausted_fuel
+    );
+}
+
+#[test]
+fn current_module_opaque_stale_dependency_evidence_is_rejected() {
+    let direct = build_v0_3_cert(opaque_nat_equality_module(nat_zero()));
+    let beta_zero = Expr::app(Expr::lam("x", nat(), Expr::bvar(0)), nat_zero());
+    let mut changed = build_v0_3_cert(opaque_nat_equality_module(beta_zero));
+    let (consumer, dependency_index) = first_local_dependency(&changed);
+    let stale_hash = direct.declarations[decl_index_named(&direct, "hidden_nat")]
+        .hashes
+        .decl_certificate_hash;
+    let dependency = &changed.declarations[consumer].dependencies[dependency_index];
+    let global_ref = dependency.global_ref().clone();
+    let interface_hash = dependency.decl_interface_hash();
+    replace_first_local_dependency_with_raw_implementation(
+        &mut changed,
+        global_ref,
+        interface_hash,
+        stale_hash,
+    );
+    assert_local_implementation_error(
+        &changed,
+        LocalImplementationDependencyErrorReason::CertificateHashMismatch,
+    );
+}
+
+#[test]
+fn verified_module_records_each_validated_compatibility_input_pair() {
+    let cert = build_module_cert(id_module("A", "x"), &[]).unwrap();
+    let compat = build_module_cert_v0_2_compat(id_module("A", "x"), &[]).unwrap();
+    let current = verify_module_cert_with_import_refs(
+        &encode_module_cert(&cert).unwrap(),
+        &[],
+        &AxiomPolicy::normal(),
+    )
+    .unwrap();
+    let previous = verify_module_cert_with_import_refs(
+        &previous_bytes_from_current_cert(compat.clone()),
+        &[],
+        &AxiomPolicy::normal(),
+    )
+    .unwrap();
+    let legacy = verify_module_cert_with_import_refs(
+        &legacy_bytes_from_current_cert(compat),
+        &[],
+        &AxiomPolicy::normal(),
+    )
+    .unwrap();
+
+    assert_eq!(current.certificate_format(), FORMAT);
+    assert_eq!(current.core_spec(), CORE_SPEC);
+    assert_eq!(previous.certificate_format(), PREVIOUS_FORMAT);
+    assert_eq!(previous.core_spec(), PREVIOUS_CORE_SPEC);
+    assert_eq!(legacy.certificate_format(), LEGACY_FORMAT);
+    assert_eq!(legacy.core_spec(), LEGACY_CORE_SPEC);
+}
+
+#[test]
+fn local_transparency_direct_dependency_matches_producer_and_verifier() {
+    let cert = v0_3_opaque_alias_cert_with_local_implementation_dependency();
+    let hidden = decl_index_named(&cert, "opaque_id");
+    let alias = decl_index_named(&cert, "opaque_id_alias");
+
+    assert_eq!(local_implementation_targets(&cert, alias), [hidden].into());
+    for (decl_index, declaration) in cert.declarations.iter().enumerate() {
+        assert_eq!(
+            declaration.dependencies,
+            expected_dependencies_for_decl(&cert, &[], decl_index, &declaration.decl).unwrap()
+        );
+    }
+    verify_module_cert_with_import_refs(
+        &encode_module_cert(&cert).unwrap(),
+        &[],
+        &AxiomPolicy::normal(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn local_transparency_alias_chain_propagates_existing_reducible_body_path() {
+    let cert = build_v0_3_cert(opaque_alias_chain_module());
+    let hidden = decl_index_named(&cert, "hidden");
+    let alias = decl_index_named(&cert, "alias");
+    let uses_alias = decl_index_named(&cert, "uses_alias");
+
+    assert_eq!(local_implementation_targets(&cert, alias), [hidden].into());
+    assert_eq!(
+        local_implementation_targets(&cert, uses_alias),
+        [hidden].into()
+    );
+    assert!(cert.declarations[uses_alias]
+        .dependencies
+        .iter()
+        .any(|dependency| {
+            dependency.kind() == DependencyEntryKind::Interface
+                && matches!(
+                    dependency.global_ref(),
+                    GlobalRef::Local { decl_index } if *decl_index == alias
+                )
+        }));
+    assert_eq!(
+        cert.declarations[uses_alias].dependencies,
+        expected_dependencies_for_decl(
+            &cert,
+            &[],
+            uses_alias,
+            &cert.declarations[uses_alias].decl,
+        )
+        .unwrap()
+    );
+}
+
+#[test]
+fn local_transparency_follows_referenced_declared_type() {
+    let cert = build_v0_3_cert(opaque_declared_type_module());
+    let hidden_type = decl_index_named(&cert, "hidden_type");
+    let hidden_witness = decl_index_named(&cert, "hidden_witness");
+    let uses_witness = decl_index_named(&cert, "uses_witness_type");
+
+    assert_eq!(
+        local_implementation_targets(&cert, hidden_witness),
+        [hidden_type].into()
+    );
+    assert_eq!(
+        local_implementation_targets(&cert, uses_witness),
+        [hidden_type].into()
+    );
+    assert!(cert.declarations[uses_witness]
+        .dependencies
+        .iter()
+        .any(|dependency| {
+            dependency.kind() == DependencyEntryKind::Interface
+                && matches!(
+                    dependency.global_ref(),
+                    GlobalRef::Local { decl_index } if *decl_index == hidden_witness
+                )
+        }));
+}
+
+#[test]
+fn local_transparency_nested_opaque_bodies_propagate_all_reached_targets() {
+    let cert = build_v0_3_cert(nested_opaque_module());
+    let inner = decl_index_named(&cert, "inner_hidden");
+    let outer = decl_index_named(&cert, "outer_hidden");
+    let consumer = decl_index_named(&cert, "uses_outer");
+
+    assert_eq!(local_implementation_targets(&cert, outer), [inner].into());
+    assert_eq!(
+        local_implementation_targets(&cert, consumer),
+        [inner, outer].into()
+    );
+}
+
+#[test]
+fn local_transparency_stops_at_referenced_theorem_proof() {
+    let direct = build_v0_3_cert(theorem_interface_only_module(id_value("A", "x")));
+    let changed = build_v0_3_cert(theorem_interface_only_module(id_value_with_beta_redex()));
+    let hidden = decl_index_named(&direct, "hidden");
+    let theorem = decl_index_named(&direct, "stable_theorem");
+    let consumer = decl_index_named(&direct, "uses_stable_theorem");
+
+    assert_eq!(
+        local_implementation_targets(&direct, theorem),
+        [hidden].into()
+    );
+    assert!(local_implementation_targets(&direct, consumer).is_empty());
+    assert_eq!(
+        dependency_selective_fingerprint_canonical_bytes(
+            &direct.declarations[consumer].dependencies,
+        ),
+        dependency_selective_fingerprint_canonical_bytes(
+            &changed.declarations[consumer].dependencies,
+        )
+    );
+    assert_eq!(
+        direct.declarations[consumer].hashes.decl_certificate_hash,
+        changed.declarations[consumer].hashes.decl_certificate_hash
+    );
+    assert_ne!(
+        direct.declarations[theorem].hashes.decl_certificate_hash,
+        changed.declarations[theorem].hashes.decl_certificate_hash
+    );
+}
+
+#[test]
+fn local_transparency_stops_at_imported_opaque_body() {
+    let imported_cert = build_v0_3_cert(CoreModule {
+        name: Name::from_dotted("Test.ImportedOpaque"),
+        declarations: vec![named_opaque_id("imported_hidden", id_value("A", "x"))],
+    });
+    let imported = verify_module_cert_with_import_refs(
+        &encode_module_cert(&imported_cert).unwrap(),
+        &[],
+        &AxiomPolicy::normal(),
+    )
+    .unwrap();
+    let cert = build_module_cert_from_import_refs_with_preferred_imports(
+        CoreModule {
+            name: Name::from_dotted("Test.UseImportedOpaque"),
+            declarations: vec![named_id_alias(
+                "use_imported_hidden",
+                "imported_hidden",
+                Reducibility::Reducible,
+            )],
+        },
+        &[&imported],
+        &std::collections::BTreeMap::new(),
+    )
+    .unwrap();
+
+    assert!(local_implementation_targets(&cert, 0).is_empty());
+    assert!(cert.declarations[0]
+        .dependencies
+        .iter()
+        .all(|dependency| dependency.kind() == DependencyEntryKind::Interface));
+    verify_module_cert_with_import_refs(
+        &encode_module_cert(&cert).unwrap(),
+        &[&imported],
+        &AxiomPolicy::normal(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn local_transparency_dependency_selective_fingerprint_commits_only_reached_bodies() {
+    let mut changed_module = opaque_alias_chain_module();
+    match &mut changed_module.declarations[0] {
+        Decl::Def { value, .. } => *value = id_value_with_beta_redex(),
+        _ => panic!("expected opaque definition"),
+    }
+    let direct = build_v0_3_cert(opaque_alias_chain_module());
+    let changed = build_v0_3_cert(changed_module);
+    let consumer = decl_index_named(&direct, "uses_alias");
+    let direct_fingerprint = dependency_selective_fingerprint_canonical_bytes(
+        &direct.declarations[consumer].dependencies,
+    );
+    let changed_fingerprint = dependency_selective_fingerprint_canonical_bytes(
+        &changed.declarations[consumer].dependencies,
+    );
+
+    assert_ne!(direct_fingerprint, changed_fingerprint);
+    let mut reversed = direct.declarations[consumer].dependencies.clone();
+    reversed.reverse();
+    assert_eq!(
+        direct_fingerprint,
+        dependency_selective_fingerprint_canonical_bytes(&reversed)
+    );
+}
+
+#[test]
+fn local_transparency_declaration_order_uses_paths_without_bare_source_authority() {
+    let declarations = vec![
+        named_id_theorem("uses_alias", "alias"),
+        named_id_alias("alias", "hidden", Reducibility::Reducible),
+        named_opaque_id("hidden", id_value("A", "x")),
+        named_opaque_id("aaa_unrelated", id_value("A", "x")),
+    ];
+    let cert = build_v0_3_cert(CoreModule {
+        name: Name::from_dotted("Test.OpaqueOrdering"),
+        declarations: declarations.clone(),
+    });
+    let reordered = build_v0_3_cert(CoreModule {
+        name: Name::from_dotted("Test.OpaqueOrdering"),
+        declarations: declarations.into_iter().rev().collect(),
+    });
+    let names = cert
+        .declarations
+        .iter()
+        .map(|declaration| {
+            let name = match declaration.decl {
+                DeclPayload::Def { name, .. } | DeclPayload::Theorem { name, .. } => name,
+                _ => panic!("expected definition or theorem"),
+            };
+            cert.name_table[name].clone()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        names,
+        ["aaa_unrelated", "hidden", "alias", "uses_alias"]
+            .map(Name::from_dotted)
+            .to_vec()
+    );
+    assert_eq!(cert, reordered);
+    let unrelated = decl_index_named(&cert, "aaa_unrelated");
+    let hidden = decl_index_named(&cert, "hidden");
+    let consumer = decl_index_named(&cert, "uses_alias");
+    assert_eq!(
+        local_implementation_targets(&cert, consumer),
+        [hidden].into()
+    );
+    assert!(!local_implementation_targets(&cert, consumer).contains(&unrelated));
+}
+
+#[test]
+fn local_transparency_wrong_reference_kinds_use_fixed_reason() {
+    let base = v0_3_opaque_alias_cert_with_local_implementation_dependency();
+    let (consumer, dependency_index) = first_local_dependency(&base);
+    let dependency = &base.declarations[consumer].dependencies[dependency_index];
+    let interface_hash = dependency.decl_interface_hash();
+    let certificate_hash = dependency.decl_certificate_hash().unwrap();
+    let target = match dependency.global_ref() {
+        GlobalRef::Local { decl_index } => *decl_index,
+        _ => unreachable!(),
+    };
+    for global_ref in [
+        GlobalRef::Builtin {
+            name: 0,
+            decl_interface_hash: interface_hash,
+        },
+        GlobalRef::Imported {
+            import_index: 0,
+            name: 0,
+            decl_interface_hash: interface_hash,
+        },
+        GlobalRef::LocalGenerated {
+            decl_index: target,
+            name: 0,
+        },
+    ] {
+        let mut cert = base.clone();
+        replace_first_local_dependency_with_raw_implementation(
+            &mut cert,
+            global_ref,
+            interface_hash,
+            certificate_hash,
+        );
+        assert_local_implementation_error(
+            &cert,
+            LocalImplementationDependencyErrorReason::WrongReferenceKind,
+        );
+    }
+}
+
+#[test]
+fn local_transparency_non_earlier_targets_use_fixed_reason() {
+    let base = v0_3_opaque_alias_cert_with_local_implementation_dependency();
+    let (consumer, dependency_index) = first_local_dependency(&base);
+    let dependency = &base.declarations[consumer].dependencies[dependency_index];
+    for target in [consumer, base.declarations.len() + 7] {
+        let mut cert = base.clone();
+        replace_first_local_dependency_with_raw_implementation(
+            &mut cert,
+            GlobalRef::Local { decl_index: target },
+            dependency.decl_interface_hash(),
+            dependency.decl_certificate_hash().unwrap(),
+        );
+        assert_local_implementation_error(
+            &cert,
+            LocalImplementationDependencyErrorReason::TargetNotEarlier,
+        );
+    }
+
+    let mut later = build_v0_3_cert(nested_opaque_module());
+    let current = decl_index_named(&later, "outer_hidden");
+    let later_target = decl_index_named(&later, "uses_outer");
+    let dependency_index = later.declarations[current]
+        .dependencies
+        .iter()
+        .position(|dependency| dependency.kind() == DependencyEntryKind::LocalImplementation)
+        .unwrap();
+    let dependency = &later.declarations[current].dependencies[dependency_index];
+    let interface_hash = dependency.decl_interface_hash();
+    let certificate_hash = dependency.decl_certificate_hash().unwrap();
+    later.declarations[current].dependencies[dependency_index] =
+        DependencyEntry::from_decoded_local_implementation(
+            GlobalRef::Local {
+                decl_index: later_target,
+            },
+            interface_hash,
+            certificate_hash,
+        );
+    later.declarations[current].dependencies.sort();
+    rehash_v0_3_dependency_change(&mut later, current);
+    assert_local_implementation_error(
+        &later,
+        LocalImplementationDependencyErrorReason::TargetNotEarlier,
+    );
+}
+
+#[test]
+fn local_transparency_error_reason_vocabulary_is_exact() {
+    let cases = [
+        (
+            LocalImplementationDependencyErrorReason::WrongReferenceKind,
+            "wrong_reference_kind",
+        ),
+        (
+            LocalImplementationDependencyErrorReason::TargetNotEarlier,
+            "target_not_earlier",
+        ),
+        (
+            LocalImplementationDependencyErrorReason::TargetNotOpaque,
+            "target_not_opaque",
+        ),
+        (
+            LocalImplementationDependencyErrorReason::InterfaceHashMismatch,
+            "interface_hash_mismatch",
+        ),
+        (
+            LocalImplementationDependencyErrorReason::CertificateHashMismatch,
+            "certificate_hash_mismatch",
+        ),
+        (
+            LocalImplementationDependencyErrorReason::MissingImplementationDependency,
+            "missing_implementation_dependency",
+        ),
+        (
+            LocalImplementationDependencyErrorReason::SurplusImplementationDependency,
+            "surplus_implementation_dependency",
+        ),
+    ];
+    for (reason, expected) in cases {
+        assert_eq!(reason.as_str(), expected);
+    }
+}
+
+#[test]
+fn local_transparency_non_opaque_target_uses_fixed_reason() {
+    let mut cert = build_v0_3_cert(CoreModule {
+        name: Name::from_dotted("Test.NonOpaqueImplementation"),
+        declarations: vec![
+            Decl::Def {
+                name: "plain".to_owned(),
+                universe_params: vec!["u".to_owned()],
+                ty: id_type("A", "x"),
+                value: id_value("A", "x"),
+                reducibility: Reducibility::Reducible,
+            },
+            named_id_alias("uses_plain", "plain", Reducibility::Reducible),
+        ],
+    });
+    let target = decl_index_named(&cert, "plain");
+    let consumer = decl_index_named(&cert, "uses_plain");
+    let target_hashes = cert.declarations[target].hashes.clone();
+    let dependency_index = cert.declarations[consumer]
+        .dependencies
+        .iter()
+        .position(|dependency| {
+            matches!(
+                dependency.global_ref(),
+                GlobalRef::Local { decl_index } if *decl_index == target
+            )
+        })
+        .unwrap();
+    cert.declarations[consumer].dependencies[dependency_index] =
+        DependencyEntry::from_decoded_local_implementation(
+            GlobalRef::Local { decl_index: target },
+            target_hashes.decl_interface_hash,
+            target_hashes.decl_certificate_hash,
+        );
+    cert.declarations[consumer].dependencies.sort();
+    rehash_v0_3_dependency_change(&mut cert, consumer);
+    assert_local_implementation_error(
+        &cert,
+        LocalImplementationDependencyErrorReason::TargetNotOpaque,
+    );
+}
+
+#[test]
+fn local_transparency_forged_hashes_use_fixed_reasons() {
+    let base = v0_3_opaque_alias_cert_with_local_implementation_dependency();
+    let (consumer, dependency_index) = first_local_dependency(&base);
+    let dependency = &base.declarations[consumer].dependencies[dependency_index];
+    let global_ref = dependency.global_ref().clone();
+    let interface_hash = dependency.decl_interface_hash();
+    let certificate_hash = dependency.decl_certificate_hash().unwrap();
+
+    let mut forged_interface = interface_hash;
+    forged_interface[0] ^= 0x01;
+    let mut cert = base.clone();
+    replace_first_local_dependency_with_raw_implementation(
+        &mut cert,
+        global_ref.clone(),
+        forged_interface,
+        certificate_hash,
+    );
+    assert_local_implementation_error(
+        &cert,
+        LocalImplementationDependencyErrorReason::InterfaceHashMismatch,
+    );
+
+    let mut forged_certificate = certificate_hash;
+    forged_certificate[0] ^= 0x01;
+    let mut cert = base;
+    replace_first_local_dependency_with_raw_implementation(
+        &mut cert,
+        global_ref,
+        interface_hash,
+        forged_certificate,
+    );
+    assert_local_implementation_error(
+        &cert,
+        LocalImplementationDependencyErrorReason::CertificateHashMismatch,
+    );
+}
+
+#[test]
+fn local_transparency_missing_and_surplus_entries_use_fixed_reasons() {
+    let missing = v0_3_opaque_alias_cert_with_interface_dependency();
+    assert_local_implementation_error(
+        &missing,
+        LocalImplementationDependencyErrorReason::MissingImplementationDependency,
+    );
+
+    let mut surplus = build_v0_3_cert(CoreModule {
+        name: Name::from_dotted("Test.SurplusImplementation"),
+        declarations: vec![
+            named_opaque_id("a_unrelated_hidden", id_value("A", "x")),
+            Decl::Def {
+                name: "z_independent".to_owned(),
+                universe_params: vec!["u".to_owned()],
+                ty: id_type("A", "x"),
+                value: id_value("A", "x"),
+                reducibility: Reducibility::Reducible,
+            },
+        ],
+    });
+    let target = decl_index_named(&surplus, "a_unrelated_hidden");
+    let consumer = decl_index_named(&surplus, "z_independent");
+    let implementation = DependencyEntry::checked_local_implementation(
+        GlobalRef::Local { decl_index: target },
+        consumer,
+        &surplus.declarations,
+    )
+    .unwrap();
+    surplus.declarations[consumer]
+        .dependencies
+        .push(implementation);
+    surplus.declarations[consumer].dependencies.sort();
+    rehash_v0_3_dependency_change(&mut surplus, consumer);
+    assert_local_implementation_error(
+        &surplus,
+        LocalImplementationDependencyErrorReason::SurplusImplementationDependency,
+    );
+}
+
+#[test]
+fn local_transparency_source_cycle_remains_rejected() {
+    let err = build_module_cert_from_import_refs_with_preferred_imports(
+        CoreModule {
+            name: Name::from_dotted("Test.OpaqueCycle"),
+            declarations: vec![
+                named_id_alias("cycle_a", "cycle_b", Reducibility::Reducible),
+                named_id_alias("cycle_b", "cycle_a", Reducibility::Reducible),
+            ],
+        },
+        &[],
+        &std::collections::BTreeMap::new(),
+    )
+    .unwrap_err();
+    assert!(matches!(err, CertError::DependencyCycle { .. }));
+}
+
+#[test]
+fn binary_v0_3_local_implementation_dependency_round_trips_with_complete_payload() {
+    let cert = v0_3_opaque_alias_cert_with_local_implementation_dependency();
+    let dependency = cert
+        .declarations
+        .iter()
+        .flat_map(|decl| &decl.dependencies)
+        .find(|dependency| dependency.kind() == DependencyEntryKind::LocalImplementation)
+        .unwrap();
+    assert!(dependency.decl_certificate_hash().is_some());
+
+    let bytes = encode_module_cert(&cert).unwrap();
+    let decoded = decode_module_cert(&bytes).unwrap();
+    assert_eq!(decoded, cert);
+    assert_eq!(encode_module_cert(&decoded).unwrap(), bytes);
+}
+
+#[test]
+fn binary_dependency_checked_constructors_enforce_hash_and_earlier_opaque_target() {
+    let mismatched_interface = DependencyEntry::checked_interface(
+        GlobalRef::Imported {
+            import_index: 0,
+            name: 0,
+            decl_interface_hash: [1; 32],
+        },
+        [2; 32],
+    );
+    assert!(matches!(
+        mismatched_interface,
+        Err(CertError::HashMismatch {
+            object: HashObject::DeclInterface,
+            ..
+        })
+    ));
+
+    let opaque = v0_3_opaque_alias_cert_with_interface_dependency();
+    let (alias_index, target_ref) = opaque
+        .declarations
+        .iter()
+        .enumerate()
+        .find_map(|(decl_index, decl)| {
+            decl.dependencies.iter().find_map(|dependency| {
+                matches!(dependency.global_ref(), GlobalRef::Local { .. })
+                    .then(|| (decl_index, dependency.global_ref().clone()))
+            })
+        })
+        .unwrap();
+    let accepted = DependencyEntry::checked_local_implementation(
+        target_ref.clone(),
+        alias_index,
+        &opaque.declarations,
+    )
+    .unwrap();
+    assert_eq!(accepted.kind(), DependencyEntryKind::LocalImplementation);
+
+    assert!(matches!(
+        DependencyEntry::checked_local_implementation(target_ref, 0, &opaque.declarations,),
+        Err(CertError::DependencyCycle { .. })
+    ));
+    assert!(matches!(
+        DependencyEntry::checked_local_implementation(
+            GlobalRef::Builtin {
+                name: 0,
+                decl_interface_hash: [0; 32],
+            },
+            alias_index,
+            &opaque.declarations,
+        ),
+        Err(CertError::DecodeError)
+    ));
+
+    let reducible = build_module_cert(id_module("A", "x"), &[]).unwrap();
+    assert!(matches!(
+        DependencyEntry::checked_local_implementation(
+            GlobalRef::Local { decl_index: 0 },
+            1,
+            &reducible.declarations,
+        ),
+        Err(CertError::DecodeError)
+    ));
+}
+
+#[test]
+fn binary_v0_3_dependency_rejects_truncation_and_unknown_tag() {
+    let cert = v0_3_opaque_alias_cert_with_local_implementation_dependency();
+    let dependency = cert
+        .declarations
+        .iter()
+        .flat_map(|decl| &decl.dependencies)
+        .find(|dependency| dependency.kind() == DependencyEntryKind::LocalImplementation)
+        .unwrap();
+    let dependency_bytes = v0_3_dependency_bytes(dependency);
+    let bytes = encode_module_cert(&cert).unwrap();
+    let dependency_offset = bytes
+        .windows(dependency_bytes.len())
+        .position(|window| window == dependency_bytes)
+        .unwrap();
+
+    let truncated = &bytes[..dependency_offset + dependency_bytes.len() - 1];
+    assert!(decode_module_cert(truncated).is_err());
+
+    let mut unknown_tag = bytes;
+    unknown_tag[dependency_offset] = 0x7f;
+    assert!(matches!(
+        decode_module_cert(&unknown_tag),
+        Err(CertError::UnsupportedEncoding { tag: 0x7f })
+    ));
+}
+
+#[test]
+fn certificate_format_mixed_pair_rejects_before_v0_3_dependency_tag() {
+    let cert = v0_3_opaque_alias_cert_with_local_implementation_dependency();
+    let dependency = cert
+        .declarations
+        .iter()
+        .flat_map(|decl| &decl.dependencies)
+        .find(|dependency| dependency.kind() == DependencyEntryKind::LocalImplementation)
+        .unwrap();
+    let dependency_bytes = v0_3_dependency_bytes(dependency);
+    let mut bytes = encode_module_cert(&cert).unwrap();
+    let dependency_offset = bytes
+        .windows(dependency_bytes.len())
+        .position(|window| window == dependency_bytes)
+        .unwrap();
+    bytes[dependency_offset] = 0x7f;
+    let core_spec_offset = bytes
+        .windows(CORE_SPEC.len())
+        .position(|window| window == CORE_SPEC.as_bytes())
+        .unwrap();
+    bytes[core_spec_offset..core_spec_offset + COMPAT_CORE_SPEC.len()]
+        .copy_from_slice(COMPAT_CORE_SPEC.as_bytes());
+
+    assert!(matches!(
+        decode_module_cert(&bytes),
+        Err(CertError::UnsupportedFormat { format, core_spec })
+            if format == FORMAT && core_spec == COMPAT_CORE_SPEC
+    ));
+}
+
+#[test]
+fn certificate_format_header_only_downgrade_cannot_erase_local_implementation_commitment() {
+    let mut cert = v0_3_opaque_alias_cert_with_local_implementation_dependency();
+    cert.header.format = COMPAT_FORMAT.to_owned();
+    cert.header.core_spec = COMPAT_CORE_SPEC.to_owned();
+    assert!(matches!(
+        encode_module_cert(&cert),
+        Err(CertError::LocalImplementationDependencyRequiresFormatUpgrade)
+    ));
+}
+
+#[test]
+fn certificate_format_header_only_upgrade_rejects_untagged_v0_2_dependencies() {
+    let cert = build_module_cert_v0_2_compat(opaque_alias_module(), &[]).unwrap();
+    let mut bytes = encode_module_cert(&cert).unwrap();
+    let format_offset = bytes
+        .windows(COMPAT_FORMAT.len())
+        .position(|window| window == COMPAT_FORMAT.as_bytes())
+        .unwrap();
+    bytes[format_offset..format_offset + FORMAT.len()].copy_from_slice(FORMAT.as_bytes());
+    let core_spec_offset = bytes
+        .windows(COMPAT_CORE_SPEC.len())
+        .position(|window| window == COMPAT_CORE_SPEC.as_bytes())
+        .unwrap();
+    bytes[core_spec_offset..core_spec_offset + CORE_SPEC.len()]
+        .copy_from_slice(CORE_SPEC.as_bytes());
+    assert!(decode_module_cert(&bytes).is_err());
+}
+
+#[test]
+fn certificate_format_accepts_only_exact_known_pairs() {
+    for (format, core_spec) in [
+        (FORMAT, COMPAT_CORE_SPEC),
+        (COMPAT_FORMAT, CORE_SPEC),
+        (PREVIOUS_FORMAT, LEGACY_CORE_SPEC),
+        (LEGACY_FORMAT, PREVIOUS_CORE_SPEC),
+        ("NPA-CERT-9.9.9", "NPA-Core-9.9.9"),
+    ] {
+        assert!(matches!(
+            certificate_format_version(&CertHeader {
+                format: format.to_owned(),
+                core_spec: core_spec.to_owned(),
+                module: Name::from_dotted("Test.MixedHeader"),
+            }),
+            Err(CertError::UnsupportedFormat { .. })
+        ));
+    }
+}
+
+#[test]
+fn binary_v0_3_dependency_order_and_duplicates_are_rejected() {
+    let mut cert = v0_3_opaque_alias_cert_with_interface_dependency();
+    let (decl_index, dependency_index) = cert
+        .declarations
+        .iter()
+        .enumerate()
+        .find_map(|(decl_index, decl)| {
+            decl.dependencies
+                .iter()
+                .position(|dependency| matches!(dependency.global_ref(), GlobalRef::Local { .. }))
+                .map(|dependency_index| (decl_index, dependency_index))
+        })
+        .unwrap();
+    let interface = cert.declarations[decl_index].dependencies[dependency_index].clone();
+    let implementation = DependencyEntry::checked_local_implementation(
+        interface.global_ref().clone(),
+        decl_index,
+        &cert.declarations,
+    )
+    .unwrap();
+    assert!(interface < implementation);
+
+    cert.declarations[decl_index].dependencies = vec![implementation, interface.clone()];
+    assert!(matches!(
+        decode_module_cert(&encode_module_cert(&cert).unwrap()),
+        Err(CertError::NonCanonicalEncoding {
+            object: "Dependencies"
+        })
+    ));
+
+    cert.declarations[decl_index].dependencies = vec![interface.clone(), interface];
+    assert!(matches!(
+        decode_module_cert(&encode_module_cert(&cert).unwrap()),
+        Err(CertError::NonCanonicalEncoding {
+            object: "Dependencies"
+        })
+    ));
+}
+
+#[test]
+fn structural_v0_3_local_implementation_counts_added_certificate_hash_bytes() {
+    let interface_cert = v0_3_opaque_alias_cert_with_interface_dependency();
+    let implementation_cert = v0_3_opaque_alias_cert_with_local_implementation_dependency();
+    let interface_bytes = encode_module_cert(&interface_cert).unwrap();
+    let implementation_bytes = encode_module_cert(&implementation_cert).unwrap();
+    assert_eq!(implementation_bytes.len(), interface_bytes.len() + 32);
+
+    let interface_audit = audit_certificate_structural_limits(&interface_bytes).unwrap();
+    let implementation_audit = audit_certificate_structural_limits(&implementation_bytes).unwrap();
+    assert_eq!(interface_audit.certificate_bytes, interface_bytes.len());
+    assert_eq!(
+        implementation_audit.certificate_bytes,
+        implementation_bytes.len()
+    );
+    assert_eq!(
+        implementation_audit.nested_vector_entries,
+        interface_audit.nested_vector_entries
+    );
+}
+
+#[test]
 fn legacy_constrained_public_exports_require_format_upgrade() {
-    let cert = build_module_cert(constrained_axiom_module(vec![max_u_v_le_w()]), &[]).unwrap();
+    let cert =
+        build_module_cert_v0_2_compat(constrained_axiom_module(vec![max_u_v_le_w()]), &[]).unwrap();
     let bytes = legacy_bytes_from_current_cert(cert);
 
     let err = verify_module_cert(&bytes, &mut VerifierSession::new(), &AxiomPolicy::normal())
@@ -1601,10 +3271,10 @@ fn hash_contract_def_fixture() -> HashContractDefFixture {
         value: 1,
         reducibility: CertReducibility::Reducible,
     };
-    let dependencies = vec![DependencyEntry {
-        global_ref: dependency_ref.clone(),
-        decl_interface_hash: test_hash(0x31),
-    }];
+    let dependencies = vec![interface_dependency(
+        dependency_ref.clone(),
+        test_hash(0x31),
+    )];
     let axiom_dependencies = vec![AxiomRef {
         global_ref: axiom_ref.clone(),
         name: 3,
@@ -1960,17 +3630,21 @@ fn replace_level_refs(term: &mut TermNode, old: LevelId, new: LevelId) {
 }
 
 fn rehash_cert_after_decl_change(cert: &mut ModuleCert) {
+    let version = certificate_format_version(&cert.header).unwrap();
     let level_hashes = compute_level_hashes(&cert.level_table, &cert.name_table).unwrap();
     let term_hashes = compute_term_hashes(&cert.term_table, &level_hashes).unwrap();
     for decl in &mut cert.declarations {
         decl.hashes = compute_decl_hashes(
+            version,
             &decl.decl,
             &decl.dependencies,
             &decl.axiom_dependencies,
-            &cert.term_table,
-            &level_hashes,
-            &term_hashes,
-            &cert.name_table,
+            DeclHashTables {
+                terms: &cert.term_table,
+                level_hashes: &level_hashes,
+                term_hashes: &term_hashes,
+                names: &cert.name_table,
+            },
         )
         .unwrap();
     }
@@ -2010,13 +3684,16 @@ fn rehash_cert_after_decl_change(cert: &mut ModuleCert) {
 
     for decl in &mut cert.declarations {
         decl.hashes = compute_decl_hashes(
+            version,
             &decl.decl,
             &decl.dependencies,
             &decl.axiom_dependencies,
-            &cert.term_table,
-            &level_hashes,
-            &term_hashes,
-            &cert.name_table,
+            DeclHashTables {
+                terms: &cert.term_table,
+                level_hashes: &level_hashes,
+                term_hashes: &term_hashes,
+                names: &cert.name_table,
+            },
         )
         .unwrap();
     }
@@ -2031,8 +3708,8 @@ fn rehash_cert_after_decl_change(cert: &mut ModuleCert) {
         &encode_axiom_report(&cert.axiom_report),
     );
     cert.hashes.certificate_hash = hash_with_domain(
-        MODULE_CERT_DOMAIN,
-        &encode_module_cert_without_certificate_hash(cert),
+        version.module_certificate_domain(),
+        &encode_module_cert_without_certificate_hash_for_header(cert).unwrap(),
     );
 }
 
@@ -2137,6 +3814,47 @@ fn golden_certificate_hashes_cover_core_shapes() {
 }
 
 #[test]
+fn golden_v0_3_certificate_hashes_cover_opaque_surface_cases() {
+    let cases = [
+        ("v0_3_plain_id", build_v0_3_cert(id_module("A", "x"))),
+        (
+            "v0_3_opaque_body_direct",
+            build_v0_3_cert(id_def_module_with_value_and_reducibility(
+                id_value("A", "x"),
+                Reducibility::Opaque,
+            )),
+        ),
+        (
+            "v0_3_opaque_body_beta",
+            build_v0_3_cert(id_def_module_with_value_and_reducibility(
+                id_value_with_beta_redex(),
+                Reducibility::Opaque,
+            )),
+        ),
+        (
+            "v0_3_axiom_proof_p1",
+            build_v0_3_cert(theorem_using_axiom_module("p1")),
+        ),
+        (
+            "v0_3_axiom_proof_p2",
+            build_v0_3_cert(theorem_using_axiom_module("p2")),
+        ),
+        (
+            "v0_3_opaque_alias_interface",
+            v0_3_opaque_alias_cert_with_interface_dependency(),
+        ),
+        (
+            "v0_3_opaque_alias_implementation",
+            v0_3_opaque_alias_cert_with_local_implementation_dependency(),
+        ),
+    ];
+
+    for (label, cert) in cases {
+        assert_golden_cert(label, &cert);
+    }
+}
+
+#[test]
 fn binder_names_do_not_affect_term_hashes() {
     let cert_a = build_module_cert(id_module("A", "x"), &[]).unwrap();
     let cert_b = build_module_cert(id_module("B", "y"), &[]).unwrap();
@@ -2171,27 +3889,21 @@ fn dependency_and_axiom_refs_sort_by_canonical_bytes() {
         }
     }
 
-    let dep_255 = DependencyEntry {
-        global_ref: GlobalRef::Local { decl_index: 255 },
-        decl_interface_hash: [0x01; 32],
-    };
-    let dep_16384 = DependencyEntry {
-        global_ref: GlobalRef::Local { decl_index: 16_384 },
-        decl_interface_hash: [0x02; 32],
-    };
+    let dep_255 = interface_dependency(GlobalRef::Local { decl_index: 255 }, [0x01; 32]);
+    let dep_16384 = interface_dependency(GlobalRef::Local { decl_index: 16_384 }, [0x02; 32]);
     let deps = [dep_255, dep_16384]
         .into_iter()
         .collect::<std::collections::BTreeSet<_>>()
         .into_iter()
         .collect::<Vec<_>>();
     assert!(matches!(
-        deps[0].global_ref,
+        deps[0].global_ref(),
         GlobalRef::Local { decl_index: 16_384 }
     ));
     assert_global_refs_are_in_canonical_byte_order(
         &deps
             .iter()
-            .map(|dependency| dependency.global_ref.clone())
+            .map(|dependency| dependency.global_ref().clone())
             .collect::<Vec<_>>(),
     );
 
@@ -2218,37 +3930,34 @@ fn dependency_and_axiom_refs_sort_by_canonical_bytes() {
     );
 
     let mixed_deps = [
-        DependencyEntry {
-            global_ref: GlobalRef::Builtin {
+        interface_dependency(
+            GlobalRef::Builtin {
                 name: 1,
                 decl_interface_hash: [0x05; 32],
             },
-            decl_interface_hash: [0x05; 32],
-        },
-        DependencyEntry {
-            global_ref: GlobalRef::LocalGenerated {
+            [0x05; 32],
+        ),
+        interface_dependency(
+            GlobalRef::LocalGenerated {
                 decl_index: 0,
                 name: 2,
             },
-            decl_interface_hash: [0x06; 32],
-        },
-        DependencyEntry {
-            global_ref: GlobalRef::Local { decl_index: 0 },
-            decl_interface_hash: [0x07; 32],
-        },
-        DependencyEntry {
-            global_ref: GlobalRef::Imported {
+            [0x06; 32],
+        ),
+        interface_dependency(GlobalRef::Local { decl_index: 0 }, [0x07; 32]),
+        interface_dependency(
+            GlobalRef::Imported {
                 import_index: 0,
                 name: 3,
                 decl_interface_hash: [0x08; 32],
             },
-            decl_interface_hash: [0x08; 32],
-        },
+            [0x08; 32],
+        ),
     ]
     .into_iter()
     .collect::<std::collections::BTreeSet<_>>()
     .into_iter()
-    .map(|dependency| dependency.global_ref)
+    .map(|dependency| dependency.global_ref().clone())
     .collect::<Vec<_>>();
     assert!(matches!(
         mixed_deps.as_slice(),
@@ -2507,7 +4216,7 @@ fn forward_source_dependency_is_canonicalized_before_verification() {
     assert!(cert.declarations[1]
         .dependencies
         .iter()
-        .any(|dependency| matches!(dependency.global_ref, GlobalRef::Local { decl_index: 0 })));
+        .any(|dependency| matches!(dependency.global_ref(), GlobalRef::Local { decl_index: 0 })));
 
     let mut session = VerifierSession::new();
     verify_module_cert(
@@ -2989,6 +4698,137 @@ fn import_certificate_rebind_matches_ordinary_rebuild_for_export_stable_provider
 }
 
 #[test]
+fn import_certificate_rebind_v0_3_preserves_payload_and_matches_ordinary_rebuild() {
+    let build_v0_3 = |module, imports: &[&VerifiedModule]| {
+        build_module_cert_from_import_refs_with_preferred_imports(
+            module,
+            imports,
+            &std::collections::BTreeMap::new(),
+        )
+        .unwrap()
+    };
+    let old_provider = build_v0_3(
+        id_def_module_with_value_and_reducibility(id_value("A", "x"), Reducibility::Opaque),
+        &[],
+    );
+    let new_provider = build_v0_3(
+        id_def_module_with_value_and_reducibility(id_value_with_beta_redex(), Reducibility::Opaque),
+        &[],
+    );
+    let policy = AxiomPolicy::normal();
+    let old_verified = verify_module_cert_with_import_refs(
+        &encode_module_cert(&old_provider).unwrap(),
+        &[],
+        &policy,
+    )
+    .unwrap();
+    let new_verified = verify_module_cert_with_import_refs(
+        &encode_module_cert(&new_provider).unwrap(),
+        &[],
+        &policy,
+    )
+    .unwrap();
+    assert_eq!(old_verified.export_hash(), new_verified.export_hash());
+    assert_ne!(
+        old_verified.certificate_hash(),
+        new_verified.certificate_hash()
+    );
+
+    let dependent = build_v0_3(use_id_module(), &[&old_verified]);
+    let dependent_bytes = encode_module_cert(&dependent).unwrap();
+    let expected = ModuleCertRebindExpectedIdentity {
+        module: dependent.header.module.clone(),
+        export_hash: dependent.hashes.export_hash,
+        axiom_report_hash: dependent.hashes.axiom_report_hash,
+        certificate_hash: dependent.hashes.certificate_hash,
+    };
+    let outcome = rebind_module_cert_import_certificate_hashes(
+        &dependent_bytes,
+        &expected,
+        &[ModuleCertRebindImport {
+            verified: &new_verified,
+            origin: ModuleCertRebindImportOrigin::Local,
+        }],
+        &policy,
+    )
+    .unwrap();
+    let ModuleCertImportRebindOutcome::Rebound {
+        certificate,
+        bytes,
+        verified,
+        changed_imports,
+    } = outcome
+    else {
+        panic!("expected v0.3 rebound certificate");
+    };
+
+    assert_eq!(certificate.header.format, FORMAT);
+    assert_eq!(certificate.header.core_spec, CORE_SPEC);
+    assert_eq!(changed_imports, vec![Name::from_dotted("Test.Id")]);
+    assert_eq!(certificate.declarations, dependent.declarations);
+    assert_eq!(certificate.name_table, dependent.name_table);
+    assert_eq!(certificate.level_table, dependent.level_table);
+    assert_eq!(certificate.term_table, dependent.term_table);
+    assert_eq!(certificate.export_block, dependent.export_block);
+    assert_eq!(certificate.axiom_report, dependent.axiom_report);
+    assert_eq!(certificate.hashes.export_hash, dependent.hashes.export_hash);
+    assert_eq!(
+        certificate.hashes.axiom_report_hash,
+        dependent.hashes.axiom_report_hash
+    );
+    assert_ne!(
+        certificate.hashes.certificate_hash,
+        dependent.hashes.certificate_hash
+    );
+    assert_eq!(
+        verified.certificate_hash(),
+        certificate.hashes.certificate_hash
+    );
+
+    let rebuilt = build_v0_3(use_id_module(), &[&new_verified]);
+    assert_eq!(bytes, encode_module_cert(&rebuilt).unwrap());
+}
+
+#[test]
+fn import_certificate_rebind_v0_3_rejects_stale_local_implementation_dependency() {
+    let mut stale = v0_3_opaque_alias_cert_with_local_implementation_dependency();
+    let (consumer, dependency_index) = first_local_dependency(&stale);
+    let dependency = &stale.declarations[consumer].dependencies[dependency_index];
+    let global_ref = dependency.global_ref().clone();
+    let interface_hash = dependency.decl_interface_hash();
+    let mut stale_certificate_hash = dependency.decl_certificate_hash().unwrap();
+    stale_certificate_hash[0] ^= 0x01;
+    replace_first_local_dependency_with_raw_implementation(
+        &mut stale,
+        global_ref,
+        interface_hash,
+        stale_certificate_hash,
+    );
+    let expected = ModuleCertRebindExpectedIdentity {
+        module: stale.header.module.clone(),
+        export_hash: stale.hashes.export_hash,
+        axiom_report_hash: stale.hashes.axiom_report_hash,
+        certificate_hash: stale.hashes.certificate_hash,
+    };
+
+    let error = rebind_module_cert_import_certificate_hashes(
+        &encode_module_cert(&stale).unwrap(),
+        &expected,
+        &[],
+        &AxiomPolicy::normal(),
+    )
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        ModuleCertImportRebindError::Certificate(CertError::InvalidLocalImplementationDependency {
+            reason: LocalImplementationDependencyErrorReason::CertificateHashMismatch,
+            ..
+        })
+    ));
+}
+
+#[test]
 fn import_certificate_rebind_returns_unchanged_after_live_verification() {
     let provider = build_module_cert(id_module("A", "x"), &[]).unwrap();
     let policy = AxiomPolicy::normal();
@@ -3258,13 +5098,16 @@ fn import_certificate_rebind_rejects_duplicate_certificate_module_before_mapped_
 fn decl_interface_hash_def_payload_order_matches_certificate_contract() {
     let fixture = hash_contract_def_fixture();
     let hashes = compute_decl_hashes(
+        CertificateFormatVersion::V0_2_0,
         &fixture.decl,
         &fixture.dependencies,
         &fixture.axiom_dependencies,
-        &fixture.term_table,
-        &[],
-        &fixture.term_hashes,
-        &fixture.names,
+        DeclHashTables {
+            terms: &fixture.term_table,
+            level_hashes: &[],
+            term_hashes: &fixture.term_hashes,
+            names: &fixture.names,
+        },
     )
     .unwrap();
     let DeclPayload::Def {
@@ -3318,13 +5161,16 @@ fn decl_interface_hash_def_payload_order_matches_certificate_contract() {
 fn reducible_def_decl_certificate_hash_includes_value_hash_directly() {
     let fixture = hash_contract_def_fixture();
     let hashes = compute_decl_hashes(
+        CertificateFormatVersion::V0_2_0,
         &fixture.decl,
         &fixture.dependencies,
         &fixture.axiom_dependencies,
-        &fixture.term_table,
-        &[],
-        &fixture.term_hashes,
-        &fixture.names,
+        DeclHashTables {
+            terms: &fixture.term_table,
+            level_hashes: &[],
+            term_hashes: &fixture.term_hashes,
+            names: &fixture.names,
+        },
     )
     .unwrap();
     let DeclPayload::Def { value, .. } = &fixture.decl else {
@@ -3564,7 +5410,7 @@ fn axiom_type_dependencies_are_reported_and_verified() {
     assert!(cert.declarations[1]
         .dependencies
         .iter()
-        .any(|dependency| matches!(dependency.global_ref, GlobalRef::Local { decl_index: 0 })));
+        .any(|dependency| matches!(dependency.global_ref(), GlobalRef::Local { decl_index: 0 })));
     assert!(cert.axiom_report.per_declaration[1]
         .transitive_axioms
         .iter()
@@ -3881,7 +5727,7 @@ fn local_generated_constructor_can_be_referenced_after_inductive() {
     assert!(def
         .dependencies
         .iter()
-        .any(|dependency| matches!(dependency.global_ref, GlobalRef::LocalGenerated { .. })));
+        .any(|dependency| matches!(dependency.global_ref(), GlobalRef::LocalGenerated { .. })));
 
     let bytes = encode_module_cert(&cert).unwrap();
     let mut session = VerifierSession::new();
@@ -3904,9 +5750,9 @@ fn imported_constructor_can_be_referenced_from_downstream_certificate() {
     let def = &use_unary_cert.declarations[0];
     assert!(def.dependencies.iter().any(|dependency| {
         matches!(
-            dependency.global_ref,
+            dependency.global_ref(),
             GlobalRef::Imported { name, .. }
-                if use_unary_cert.name_table[name] == Name::from_dotted("Unary.zero")
+                if use_unary_cert.name_table[*name] == Name::from_dotted("Unary.zero")
         )
     }));
 
@@ -3940,9 +5786,9 @@ fn imported_recursor_can_be_referenced_from_downstream_certificate() {
         .iter()
         .any(|dependency| {
             matches!(
-                dependency.global_ref,
+                dependency.global_ref(),
                 GlobalRef::Imported { name, .. }
-                    if use_rec_cert.name_table[name] == Name::from_dotted("Unary.rec")
+                    if use_rec_cert.name_table[*name] == Name::from_dotted("Unary.rec")
             )
         }));
 

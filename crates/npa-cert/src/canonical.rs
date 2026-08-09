@@ -132,6 +132,33 @@ pub(crate) fn build_module_cert_from_import_refs_with_preferred_imports_impl(
     imports: &[&VerifiedModule],
     preferred_imports: &BTreeMap<Name, ImportEntry>,
 ) -> Result<ModuleCert> {
+    build_module_cert_from_import_refs_with_preferred_imports_for_version(
+        module,
+        imports,
+        preferred_imports,
+        CertificateFormatVersion::V0_3_0,
+    )
+}
+
+pub(crate) fn build_module_cert_v0_2_compat_from_import_refs_with_preferred_imports_impl(
+    module: CoreModule,
+    imports: &[&VerifiedModule],
+    preferred_imports: &BTreeMap<Name, ImportEntry>,
+) -> Result<ModuleCert> {
+    build_module_cert_from_import_refs_with_preferred_imports_for_version(
+        module,
+        imports,
+        preferred_imports,
+        CertificateFormatVersion::V0_2_0,
+    )
+}
+
+fn build_module_cert_from_import_refs_with_preferred_imports_for_version(
+    module: CoreModule,
+    imports: &[&VerifiedModule],
+    preferred_imports: &BTreeMap<Name, ImportEntry>,
+    version: CertificateFormatVersion,
+) -> Result<ModuleCert> {
     let mut module = module;
     module.declarations = canonical_declaration_order(module.declarations)?;
 
@@ -257,7 +284,7 @@ pub(crate) fn build_module_cert_from_import_refs_with_preferred_imports_impl(
     let mut canon_decls = Vec::new();
     let canon_term_memo = std::cell::RefCell::new(CanonTermMemo::default());
     for (decl_index, decl) in module.declarations.iter().cloned().enumerate() {
-        add_decl_to_env(&mut env, decl.clone())?;
+        add_current_module_decl_to_env(&mut env, decl.clone(), version)?;
         let allow_self = matches!(
             decl,
             Decl::Inductive { .. }
@@ -292,11 +319,19 @@ pub(crate) fn build_module_cert_from_import_refs_with_preferred_imports_impl(
     let mut per_declaration = Vec::new();
     let mut previous_axioms: Vec<Vec<AxiomRef>> = Vec::new();
     let mut interface_hashes: Vec<Hash> = Vec::new();
+    let mut local_transparency_budget = LocalTransparencyBudget::default();
     for (decl_index, canon_decl) in canon_decls.iter().enumerate() {
+        let local_transparency = (version == CertificateFormatVersion::V0_3_0).then_some(
+            CanonLocalTransparencyContext {
+                previous_declarations: &declarations,
+                budget: &mut local_transparency_budget,
+            },
+        );
         let finalized = finalize_canon_decl(
             decl_index,
             canon_decl,
             CanonDeclFinalizeContext {
+                version,
                 node_ids: &node_ids,
                 interface_hashes: &interface_hashes,
                 previous_axioms: &previous_axioms,
@@ -306,6 +341,7 @@ pub(crate) fn build_module_cert_from_import_refs_with_preferred_imports_impl(
                 level_hashes: &level_hashes,
                 term_hashes: &term_hashes,
                 include_direct_axioms: true,
+                local_transparency,
             },
         )?;
         interface_hashes.push(finalized.hashes.decl_interface_hash);
@@ -339,10 +375,20 @@ pub(crate) fn build_module_cert_from_import_refs_with_preferred_imports_impl(
     let axiom_report_hash =
         hash_with_domain(b"NPA-AXIOM-REPORT-0.1", &encode_axiom_report(&axiom_report));
 
+    let (format, core_spec) = match version {
+        CertificateFormatVersion::V0_3_0 => (FORMAT, CORE_SPEC),
+        CertificateFormatVersion::V0_2_0 => (COMPAT_FORMAT, COMPAT_CORE_SPEC),
+        CertificateFormatVersion::V0_1_2 | CertificateFormatVersion::V0_1 => {
+            return Err(CertError::UnsupportedFormat {
+                format: FORMAT.to_owned(),
+                core_spec: CORE_SPEC.to_owned(),
+            });
+        }
+    };
     let mut cert = ModuleCert {
         header: CertHeader {
-            format: FORMAT.to_owned(),
-            core_spec: CORE_SPEC.to_owned(),
+            format: format.to_owned(),
+            core_spec: core_spec.to_owned(),
             module: module.name,
         },
         imports: imports_entries,
@@ -360,8 +406,8 @@ pub(crate) fn build_module_cert_from_import_refs_with_preferred_imports_impl(
     };
     audit_emitted_reference_origins(&cert, &reference_bindings)?;
     cert.hashes.certificate_hash = hash_with_domain(
-        MODULE_CERT_DOMAIN,
-        &encode_module_cert_without_certificate_hash(&cert),
+        version.module_certificate_domain(),
+        &encode_module_cert_without_certificate_hash_for_header(&cert)?,
     );
     Ok(cert)
 }
@@ -664,6 +710,27 @@ pub(crate) fn canonical_producer_checked_decl_hashes(
     decl: &Decl,
     lookup_env: &ProducerLookupEnv,
 ) -> Result<(ProducerCheckedDeclInterface, DeclHashes)> {
+    let resolved = canonical_producer_checked_decl_for_version(
+        decl,
+        lookup_env,
+        CertificateFormatVersion::V0_3_0,
+        &[],
+    )?;
+    Ok((resolved.interface, resolved.hashes))
+}
+
+pub(crate) struct CanonicalProducerCheckedDecl {
+    pub(crate) interface: ProducerCheckedDeclInterface,
+    pub(crate) hashes: DeclHashes,
+    pub(crate) dependencies: Vec<DependencyEntry>,
+}
+
+pub(crate) fn canonical_producer_checked_decl_for_version(
+    decl: &Decl,
+    lookup_env: &ProducerLookupEnv,
+    version: CertificateFormatVersion,
+    local_implementation_dependencies: &[DependencyEntry],
+) -> Result<CanonicalProducerCheckedDecl> {
     let current_decl_index = lookup_env.checked_decls.len();
     let mut names = BTreeSet::new();
     for import in &lookup_env.import_exports {
@@ -741,6 +808,7 @@ pub(crate) fn canonical_producer_checked_decl_hashes(
         current_decl_index,
         &canon_decl,
         CanonDeclFinalizeContext {
+            version,
             node_ids: &node_ids,
             interface_hashes: &interface_hashes,
             previous_axioms: &previous_axioms,
@@ -750,13 +818,61 @@ pub(crate) fn canonical_producer_checked_decl_hashes(
             level_hashes: &level_hashes,
             term_hashes: &term_hashes,
             include_direct_axioms: false,
+            local_transparency: None,
         },
     )?;
+    let mut dependencies = finalized.dependencies.clone();
+    if version == CertificateFormatVersion::V0_3_0 {
+        let opaque_targets = local_implementation_dependencies
+            .iter()
+            .map(|dependency| match dependency.global_ref() {
+                GlobalRef::Local { decl_index }
+                    if dependency.kind() == DependencyEntryKind::LocalImplementation =>
+                {
+                    Ok(*decl_index)
+                }
+                _ => Err(CertError::DecodeError),
+            })
+            .collect::<Result<BTreeSet<_>>>()?;
+        dependencies.retain(|dependency| {
+            !matches!(
+                dependency.global_ref(),
+                GlobalRef::Local { decl_index }
+                    if dependency.kind() == DependencyEntryKind::Interface
+                        && opaque_targets.contains(decl_index)
+            )
+        });
+        dependencies.extend(local_implementation_dependencies.iter().cloned());
+        dependencies.sort();
+        dependencies.dedup();
+    } else if !local_implementation_dependencies.is_empty() {
+        return Err(CertError::LocalImplementationDependencyRequiresFormatUpgrade);
+    }
+    let hashes = if dependencies == finalized.dependencies {
+        finalized.hashes
+    } else {
+        compute_decl_hashes(
+            version,
+            &finalized.payload,
+            &dependencies,
+            &finalized.axiom_dependencies,
+            DeclHashTables {
+                terms: &term_table,
+                level_hashes: &level_hashes,
+                term_hashes: &term_hashes,
+                names: &name_table,
+            },
+        )?
+    };
     let interface = ProducerCheckedDeclInterface {
-        decl_interface_hash: finalized.hashes.decl_interface_hash,
+        decl_interface_hash: hashes.decl_interface_hash,
         axiom_dependencies: finalized.axiom_dependencies,
     };
-    Ok((interface, finalized.hashes))
+    Ok(CanonicalProducerCheckedDecl {
+        interface,
+        hashes,
+        dependencies,
+    })
 }
 
 struct Resolver<'a> {
@@ -885,6 +1001,7 @@ struct FinalizedCanonDecl {
 }
 
 struct CanonDeclFinalizeContext<'a> {
+    version: CertificateFormatVersion,
     node_ids: &'a CanonNodeIds<'a>,
     interface_hashes: &'a [Hash],
     previous_axioms: &'a [Vec<AxiomRef>],
@@ -894,6 +1011,12 @@ struct CanonDeclFinalizeContext<'a> {
     level_hashes: &'a [Hash],
     term_hashes: &'a [Hash],
     include_direct_axioms: bool,
+    local_transparency: Option<CanonLocalTransparencyContext<'a>>,
+}
+
+struct CanonLocalTransparencyContext<'a> {
+    previous_declarations: &'a [DeclCert],
+    budget: &'a mut LocalTransparencyBudget,
 }
 
 // Shared by trusted certificate construction and producer token checking. Keep declaration
@@ -901,11 +1024,27 @@ struct CanonDeclFinalizeContext<'a> {
 fn finalize_canon_decl(
     decl_index: usize,
     canon_decl: &CanonDecl,
-    context: CanonDeclFinalizeContext<'_>,
+    mut context: CanonDeclFinalizeContext<'_>,
 ) -> Result<FinalizedCanonDecl> {
     let payload = materialize_decl_payload(&canon_decl.decl, context.node_ids)?;
-    let dependencies =
-        fill_local_dependency_hashes(&canon_decl.dependencies, context.interface_hashes)?;
+    let dependencies = match context.local_transparency.as_mut() {
+        Some(local_transparency) => {
+            let closure = local_transparency_dependencies(
+                context.version,
+                decl_index,
+                &payload,
+                local_transparency.previous_declarations,
+                context.term_table,
+                local_transparency.budget,
+            )?;
+            complete_local_transparency_dependencies(
+                &closure,
+                decl_index,
+                local_transparency.previous_declarations,
+            )?
+        }
+        None => fill_local_dependency_hashes(&canon_decl.dependencies, context.interface_hashes)?,
+    };
     let mut axiom_dependencies = axiom_dependencies_from_final_deps(
         &dependencies,
         context.previous_axioms,
@@ -925,13 +1064,16 @@ fn finalize_canon_decl(
 
     if let DeclPayload::Axiom { name, .. } | DeclPayload::AxiomConstrained { name, .. } = &payload {
         let preliminary = compute_decl_hashes(
+            context.version,
             &payload,
             &dependencies,
             &[],
-            context.term_table,
-            context.level_hashes,
-            context.term_hashes,
-            context.name_table,
+            DeclHashTables {
+                terms: context.term_table,
+                level_hashes: context.level_hashes,
+                term_hashes: context.term_hashes,
+                names: context.name_table,
+            },
         )?;
         let self_ref = AxiomRef {
             global_ref: GlobalRef::Local { decl_index },
@@ -945,13 +1087,16 @@ fn finalize_canon_decl(
     }
 
     let hashes = compute_decl_hashes(
+        context.version,
         &payload,
         &dependencies,
         &axiom_dependencies,
-        context.term_table,
-        context.level_hashes,
-        context.term_hashes,
-        context.name_table,
+        DeclHashTables {
+            terms: context.term_table,
+            level_hashes: context.level_hashes,
+            term_hashes: context.term_hashes,
+            names: context.name_table,
+        },
     )?;
 
     Ok(FinalizedCanonDecl {
@@ -1131,8 +1276,8 @@ fn audit_emitted_reference_origins(
     for declaration in &cert.declarations {
         for dependency in &declaration.dependencies {
             let (name, expected_hash) =
-                audit_global_ref_origin(cert, bindings, &dependency.global_ref)?;
-            if dependency.decl_interface_hash != expected_hash {
+                audit_global_ref_origin(cert, bindings, dependency.global_ref())?;
+            if dependency.decl_interface_hash() != expected_hash {
                 return Err(reference_origin_mismatch(
                     name,
                     "binding interface hash",
@@ -1503,9 +1648,9 @@ fn dependencies_from_terms<'a>(
 fn remove_self_dependency(deps: &mut Vec<DependencyEntry>, current_decl_index: usize) {
     deps.retain(|dependency| {
         !matches!(
-            dependency.global_ref,
+            dependency.global_ref(),
             GlobalRef::Local { decl_index } | GlobalRef::LocalGenerated { decl_index, .. }
-                if decl_index == current_decl_index
+                if *decl_index == current_decl_index
         )
     });
 }
@@ -1525,10 +1670,10 @@ fn collect_dependencies(term: &CanonTerm, deps: &mut BTreeSet<DependencyEntry>) 
                 } => *decl_interface_hash,
                 GlobalRef::Local { .. } | GlobalRef::LocalGenerated { .. } => [0; 32],
             };
-            deps.insert(DependencyEntry {
-                global_ref: global_ref.clone(),
-                decl_interface_hash,
-            });
+            deps.insert(
+                DependencyEntry::checked_interface(global_ref.clone(), decl_interface_hash)
+                    .expect("canonical global-reference hashes must agree"),
+            );
         }
         CanonTerm::App(fun, arg) => {
             collect_dependencies(fun, deps);
@@ -1553,7 +1698,7 @@ pub(crate) fn fill_local_dependency_hashes(
     dependencies
         .iter()
         .map(|dependency| {
-            let decl_interface_hash = match &dependency.global_ref {
+            let decl_interface_hash = match dependency.global_ref() {
                 GlobalRef::Local { decl_index } => {
                     *interface_hashes
                         .get(*decl_index)
@@ -1575,10 +1720,7 @@ pub(crate) fn fill_local_dependency_hashes(
                     ..
                 } => *decl_interface_hash,
             };
-            Ok(DependencyEntry {
-                global_ref: dependency.global_ref.clone(),
-                decl_interface_hash,
-            })
+            DependencyEntry::checked_interface(dependency.global_ref().clone(), decl_interface_hash)
         })
         .collect()
 }
@@ -1591,7 +1733,7 @@ fn axiom_dependencies_from_final_deps(
 ) -> Result<Vec<AxiomRef>> {
     let mut axioms = BTreeSet::new();
     for dependency in dependencies {
-        match &dependency.global_ref {
+        match dependency.global_ref() {
             GlobalRef::Builtin {
                 name,
                 decl_interface_hash,
@@ -1599,7 +1741,7 @@ fn axiom_dependencies_from_final_deps(
                 let name_value = name_table.get(*name).ok_or(CertError::DecodeError)?;
                 if builtin_is_axiom(name_value) {
                     axioms.insert(AxiomRef {
-                        global_ref: dependency.global_ref.clone(),
+                        global_ref: dependency.global_ref().clone(),
                         name: *name,
                         decl_interface_hash: *decl_interface_hash,
                     });
@@ -1650,7 +1792,7 @@ fn direct_axioms_from_final_deps(
 ) -> Result<Vec<AxiomRef>> {
     let mut axioms = BTreeSet::new();
     for dependency in dependencies {
-        match &dependency.global_ref {
+        match dependency.global_ref() {
             GlobalRef::Builtin {
                 name,
                 decl_interface_hash,
@@ -1658,7 +1800,7 @@ fn direct_axioms_from_final_deps(
                 let name_value = name_table.get(*name).ok_or(CertError::DecodeError)?;
                 if builtin_is_axiom(name_value) {
                     axioms.insert(AxiomRef {
-                        global_ref: dependency.global_ref.clone(),
+                        global_ref: dependency.global_ref().clone(),
                         name: *name,
                         decl_interface_hash: *decl_interface_hash,
                     });
@@ -1690,7 +1832,7 @@ fn direct_axioms_from_final_deps(
                     })?;
                 if info.kind == ExportKind::Axiom {
                     axioms.insert(AxiomRef {
-                        global_ref: dependency.global_ref.clone(),
+                        global_ref: dependency.global_ref().clone(),
                         name: *name,
                         decl_interface_hash: *decl_interface_hash,
                     });

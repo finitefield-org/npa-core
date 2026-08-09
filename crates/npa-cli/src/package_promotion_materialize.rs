@@ -47,8 +47,7 @@ use toml_edit::{Array, ArrayOfTables, DocumentMut, Item, Table};
 
 use crate::{
     args::{
-        PackageAxiomReportOptions, PackageBuildCertsOptions, PackageBuildCheckCacheMode,
-        PackageBuildSelection, PackageCommonOptions, PackageExportSummaryOptions,
+        PackageAxiomReportOptions, PackageCommonOptions, PackageExportSummaryOptions,
         PackageIndexOptions, PackageL2NamespaceTransportOptions, PackageLockCommand,
         PackageMaterializePromotionOptions, PackagePromotionPhase, PackagePublishPlanOptions,
         PackageTheoremPremiseReportOptions, PackageTimingMode,
@@ -60,6 +59,7 @@ use crate::{
     },
     fs::render_package_root,
     governance_writer::confined_governance_path,
+    package_api::v1::refresh_artifacts_write,
     package_artifacts::{
         load_package_audit_snapshot, PackageGeneratedArtifactReadMode, PACKAGE_AXIOM_REPORT_PATH,
         PACKAGE_LOCK_PATH, PACKAGE_THEOREM_INDEX_PATH, PACKAGE_THEOREM_PREMISE_REPORT_PATH,
@@ -700,13 +700,7 @@ fn materialize_stage(
         root: stage.to_path_buf(),
         json: false,
     };
-    let build = run_package_build_certs(PackageBuildCertsOptions {
-        common: common.clone(),
-        check: false,
-        build_check_cache: PackageBuildCheckCacheMode::Off,
-        update_manifest_hashes: true,
-        selection: PackageBuildSelection::Full,
-    });
+    let build = run_package_build_certs(refresh_artifacts_write(common.clone()));
     if build.status != CommandStatus::Passed {
         return Err("promotion_materialize_compile_failed");
     }
@@ -3001,14 +2995,7 @@ pub(crate) fn build_declaration_materialization_candidate(
         root: stage.to_path_buf(),
         json: false,
     };
-    if run_package_build_certs(PackageBuildCertsOptions {
-        common: common.clone(),
-        check: false,
-        build_check_cache: PackageBuildCheckCacheMode::Off,
-        update_manifest_hashes: true,
-        selection: PackageBuildSelection::Full,
-    })
-    .status
+    if run_package_build_certs(refresh_artifacts_write(common.clone())).status
         != CommandStatus::Passed
     {
         return Err("promotion_materialize_compile_failed");

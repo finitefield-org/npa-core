@@ -37,6 +37,8 @@ val check_high_trust :
   (high_trust checked, phase_error) result
 
 val module_name : 'trust checked -> Ext_name.t
+val input_certificate_format : 'trust checked -> string
+val input_core_spec : 'trust checked -> string
 val export_hash : 'trust checked -> Ext_hash.digest
 val certificate_hash : 'trust checked -> Ext_hash.digest
 val axiom_report_hash : 'trust checked -> Ext_hash.digest
