@@ -6,6 +6,13 @@ verification-coverage expectations. Host-specific elapsed thresholds are not
 universal baselines and must live under `baselines/elapsed/` when explicitly
 reviewed.
 
+`baselines/opaque-definition.v0.1.tsv` records trusted physical-reduction and
+logical-fuel counters for a paired opaque/reducible semantic leaf, its
+specification-theorem consumer, and a downstream normalization query under
+memo-off and ephemeral-memo execution. The corresponding `npa-api` test runs
+the fixture twice in fresh processes and excludes elapsed time and process
+metadata from comparison.
+
 Run `scripts/check-performance.sh`. The script builds once with the locked,
 offline dependency graph, performs the declared warmup, then checks the
 machine-readable package-verifier and proof-authoring true-batching outputs. It

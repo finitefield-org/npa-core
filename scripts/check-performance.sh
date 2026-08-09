@@ -10,8 +10,10 @@ cargo build --locked --offline -p npa-api --example bench_true_batching
 echo "[2/6] Verify deterministic observability contracts"
 cargo test --locked --offline -p npa-api performance_measurement
 cargo test --locked --offline -p npa-api performance_gate
+cargo test --locked --offline -p npa-api opaque_definition_performance
 cargo test --locked --offline -p npa-api tactic_batch_deterministic_counter_gate_covers_required_candidate_counts
 cargo test --locked --offline -p npa-cert prepared_candidate_chain_counters_cover_required_candidate_counts
+cargo test --locked --offline -p npa-cert opaque_definition_determinism
 cargo test --locked --offline -p npa-kernel optional_work_meter
 
 echo "[3/6] Run compact checked-artifact fixture"

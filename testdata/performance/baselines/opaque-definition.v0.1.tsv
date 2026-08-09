@@ -1,0 +1,13 @@
+mode	phase	reducibility	accepted	physical_reductions	logical_fuel	exhausted_fuel
+memo_off	defining	opaque	true	34	252	0
+memo_off	defining	reducible	true	34	252	0
+memo_off	consumer	opaque	true	0	18	0
+memo_off	consumer	reducible	true	0	180	0
+memo_off	downstream_normalization	opaque	true	0	1	0
+memo_off	downstream_normalization	reducible	true	33	66	0
+ephemeral_memo	defining	opaque	true	34	252	0
+ephemeral_memo	defining	reducible	true	34	252	0
+ephemeral_memo	consumer	opaque	true	0	18	0
+ephemeral_memo	consumer	reducible	true	0	180	0
+ephemeral_memo	downstream_normalization	opaque	true	0	1	0
+ephemeral_memo	downstream_normalization	reducible	true	33	66	0

@@ -5,6 +5,7 @@ use npa_kernel::{
     MutualInductiveBlock, RecursorDecl, Reducibility, ResourceLimitKind, UniverseConstraint,
 };
 use std::collections::BTreeSet;
+use std::process::Command;
 
 fn encode_module_cert_without_certificate_hash(cert: &ModuleCert) -> Vec<u8> {
     encode_module_cert_without_certificate_hash_for_header(cert).unwrap()
@@ -1389,6 +1390,161 @@ fn current_module_opaque_stale_dependency_evidence_is_rejected() {
     assert_local_implementation_error(
         &changed,
         LocalImplementationDependencyErrorReason::CertificateHashMismatch,
+    );
+}
+
+const OPAQUE_DETERMINISM_CHILD_ENV: &str = "NPA_ODS18_OPAQUE_DETERMINISM_CHILD";
+const OPAQUE_DETERMINISM_PREFIX: &str = "ODS18_OPAQUE_DETERMINISM=";
+
+fn opaque_determinism_stale_reason(
+    bytes: &[u8],
+    options: npa_kernel::KernelExecutionOptions,
+) -> &'static str {
+    match verify_module_cert_with_import_refs_and_kernel_options(
+        bytes,
+        &[],
+        &AxiomPolicy::normal(),
+        options,
+    ) {
+        Err(CertError::InvalidLocalImplementationDependency { reason, .. }) => reason.as_str(),
+        Err(error) => panic!("unexpected stale-evidence error: {error:?}"),
+        Ok(_) => panic!("stale local implementation evidence must be rejected"),
+    }
+}
+
+fn opaque_determinism_fuel_result(
+    reducibility: Reducibility,
+    options: npa_kernel::KernelExecutionOptions,
+) -> &'static str {
+    let mut env = Env::with_execution_options(options);
+    env.add_def(
+        "sealed",
+        vec![],
+        Expr::sort(Level::succ(Level::zero())),
+        Expr::sort(Level::zero()),
+        reducibility,
+    )
+    .unwrap();
+    match env.is_defeq_with_fuel(
+        &Ctx::new(),
+        &[],
+        &Expr::konst("sealed", vec![]),
+        &Expr::sort(Level::zero()),
+        0,
+    ) {
+        Err(npa_kernel::Error::ResourceLimit {
+            kind: ResourceLimitKind::Conversion,
+        }) => "conversion_fuel_exhausted",
+        other => panic!("zero-fuel conversion must fail closed, got {other:?}"),
+    }
+}
+
+fn opaque_determinism_snapshot() -> String {
+    let canonical_cert_a = build_v0_3_cert(opaque_alias_chain_module());
+    let canonical_cert_b = build_v0_3_cert(opaque_alias_chain_module());
+    let canonical_hash = hash_hex(canonical_cert_a.hashes.certificate_hash);
+    let canonical_a = encode_module_cert(&canonical_cert_a).unwrap();
+    let canonical_b = encode_module_cert(&canonical_cert_b).unwrap();
+    assert_eq!(
+        canonical_a, canonical_b,
+        "identical opaque source modules must have identical canonical certificates"
+    );
+
+    let direct = build_v0_3_cert(opaque_nat_equality_module(nat_zero()));
+    let beta_zero = Expr::app(Expr::lam("x", nat(), Expr::bvar(0)), nat_zero());
+    let mut changed = build_v0_3_cert(opaque_nat_equality_module(beta_zero));
+    let (consumer, dependency_index) = first_local_dependency(&changed);
+    let stale_hash = direct.declarations[decl_index_named(&direct, "hidden_nat")]
+        .hashes
+        .decl_certificate_hash;
+    let dependency = &changed.declarations[consumer].dependencies[dependency_index];
+    let global_ref = dependency.global_ref().clone();
+    let interface_hash = dependency.decl_interface_hash();
+    replace_first_local_dependency_with_raw_implementation(
+        &mut changed,
+        global_ref,
+        interface_hash,
+        stale_hash,
+    );
+    let stale_bytes = encode_module_cert(&changed).unwrap();
+    let stale_hash = hash_hex(changed.hashes.certificate_hash);
+
+    let off_reason = opaque_determinism_stale_reason(
+        &stale_bytes,
+        npa_kernel::KernelExecutionOptions::memo_off(),
+    );
+    let memo_reason = opaque_determinism_stale_reason(
+        &stale_bytes,
+        npa_kernel::KernelExecutionOptions::ephemeral_memo(),
+    );
+    assert_eq!(off_reason, "certificate_hash_mismatch");
+    assert_eq!(memo_reason, off_reason);
+
+    let opaque_fuel_off = opaque_determinism_fuel_result(
+        Reducibility::Opaque,
+        npa_kernel::KernelExecutionOptions::memo_off(),
+    );
+    let reducible_fuel_off = opaque_determinism_fuel_result(
+        Reducibility::Reducible,
+        npa_kernel::KernelExecutionOptions::memo_off(),
+    );
+    let opaque_fuel_memo = opaque_determinism_fuel_result(
+        Reducibility::Opaque,
+        npa_kernel::KernelExecutionOptions::ephemeral_memo(),
+    );
+    let reducible_fuel_memo = opaque_determinism_fuel_result(
+        Reducibility::Reducible,
+        npa_kernel::KernelExecutionOptions::ephemeral_memo(),
+    );
+    assert_eq!(opaque_fuel_off, reducible_fuel_off);
+    assert_eq!(opaque_fuel_memo, opaque_fuel_off);
+    assert_eq!(reducible_fuel_memo, opaque_fuel_off);
+
+    format!(
+        "canonical_bytes={};canonical_hash={canonical_hash};stale_hash={stale_hash};stale_memo_off={off_reason};stale_ephemeral_memo={memo_reason};opaque_fuel_off={opaque_fuel_off};reducible_fuel_off={reducible_fuel_off};opaque_fuel_memo={opaque_fuel_memo};reducible_fuel_memo={reducible_fuel_memo}",
+        canonical_a.len()
+    )
+}
+
+fn opaque_determinism_child_snapshot() -> String {
+    let output = Command::new(std::env::current_exe().expect("test executable must exist"))
+        .arg("--exact")
+        .arg("tests::opaque_definition_determinism_is_stable_across_fresh_processes")
+        .arg("--nocapture")
+        .env(OPAQUE_DETERMINISM_CHILD_ENV, "1")
+        .output()
+        .expect("fresh determinism fixture process must start");
+    assert!(
+        output.status.success(),
+        "fresh determinism fixture process failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout)
+        .expect("determinism fixture stdout must be UTF-8")
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix(OPAQUE_DETERMINISM_PREFIX)
+                .map(str::to_owned)
+        })
+        .expect("fresh determinism fixture must emit its trusted snapshot")
+}
+
+#[test]
+fn opaque_definition_determinism_is_stable_across_fresh_processes() {
+    if std::env::var_os(OPAQUE_DETERMINISM_CHILD_ENV).is_some() {
+        println!(
+            "{OPAQUE_DETERMINISM_PREFIX}{}",
+            opaque_determinism_snapshot()
+        );
+        return;
+    }
+
+    let first = opaque_determinism_child_snapshot();
+    let second = opaque_determinism_child_snapshot();
+    assert_eq!(
+        first, second,
+        "opaque stale-cache and fuel evidence must be stable across fresh processes"
     );
 }
 
