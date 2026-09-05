@@ -1373,6 +1373,22 @@ Exit criteria:
 
 ### Milestone 6: Rebuild The Package Ecosystem
 
+Status: **Complete (2026-09-06).** The repository-local `npa-cli 0.9.0`
+canonical writer rebuilt the compact/security fixtures, `npa-std`,
+`npa-mathlib`, `npa-corpus`, and every listed `npa-project-*` package in
+dependency order. All 8,067 active declared certificates use exactly
+`NPA-CERT-0.4.0` with `NPA-Core-0.4.0`; the package locks and checked generated
+ledgers were refreshed from those canonical bytes. Full cache-disabled
+source-free reference verification passed for the rebuilt closures, including
+all 2,107 Fermat modules, and the pre-migration axiom-report inventory did not
+grow. The `npa-agents`, `npa-lean-exporter`, `npa`, and `npa-web` consumers were
+validated against the migrated APIs; the exporter is pinned to standalone
+`npa-core` commit `3726cc54278b95b3aa554e454de2b9f89dce9607` and passes its
+workspace tests and Lean 4.31.0 conformance suite. Per explicit project-owner
+direction, a pre-existing IUT manifest declaration-kind ledger inconsistency
+reported by the container compatibility audit was not modified as part of this
+milestone.
+
 Rebuild in topological waves with repository-local `npa-cli 0.9.0`, which
 produces the v0.4 certificate/core pair:
 
