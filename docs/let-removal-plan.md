@@ -1,6 +1,6 @@
 # Term-Level `let` Removal Design
 
-Status: implementation in progress. The design was planned on 2026-09-04
+Status: implementation complete. The design was planned on 2026-09-04
 against container commit `1ad3ae0f0971046935f78a467ca1998f866fe64c`.
 Milestone 0 was completed against the refreshed final let-capable checkpoint
 `5d22858ffed16d75bcf01a61381abdb4040ae275`; its untrusted baseline evidence
@@ -10,8 +10,10 @@ Milestone 1 froze the self-contained
 ledger, shared fixture matrix, and temporary migration/deletion records in
 [let-removal-milestone-1/](let-removal-milestone-1/). Milestones 2 and 3
 removed let from producers and the Rust core and established the strict v0.4
-format. Milestone 4 restored clean-room OCaml parity. Public API/sidecar,
-package-ecosystem, and final release cleanup work remains in Milestones 5–7.
+format. Milestone 4 restored clean-room OCaml parity, Milestone 5 migrated
+the APIs and sidecars, Milestone 6 rebuilt every package closure, and
+Milestone 7 completed the current-only documentation, release, and cleanup
+boundary.
 
 ## Executive Decision
 
@@ -1449,6 +1451,20 @@ Exit criteria:
 - axiom reports do not grow.
 
 ### Milestone 7: Documentation, Release, And Cleanup
+
+Status: **Complete (2026-09-06).** The current documentation now points only
+to the exact v0.9.0 host and v0.4 certificate/core pair. The self-contained
+toolchain reference and release notes record the breaking let-free boundary,
+the verification summary, and the non-executable cleanup evidence. Root
+guidance, checker/exporter documentation, tracked agent guidance, and current
+design chronology no longer advertise retired v0.7/v0.8 hosts. The old
+toolchain references, scripts, facade examples, compatibility-only code and
+tests, raw M0/M1 inventories, and temporary migration ledgers were removed;
+the retained M0/M1 README files are outcome markers only. The v0.9.0 annotated
+tag and hosted release were independently verified at the exact release
+commit, with no assets. Exact remote-ref and hosted-release queries found no
+v0.7.0 or v0.8.0 targets, so no ambiguous deletion was attempted. The IUT
+ledger remains unchanged by this milestone.
 
 1. Make `core-spec-v0.4.0.md` the current core reference.
 2. Add a self-contained, current-only exact toolchain 0.9.0 reference. Prepare

@@ -31,8 +31,6 @@ cargo build --locked --offline -q --manifest-path "$ROOT/Cargo.toml" -p npa-api 
 cargo test --locked --offline -q --manifest-path "$ROOT/Cargo.toml" -p npa-api \
   ods12_
 cargo test --locked --offline -q --manifest-path "$ROOT/Cargo.toml" -p npa-cli \
-  --example verify_ext_v0_8_facade
-cargo test --locked --offline -q --manifest-path "$ROOT/Cargo.toml" -p npa-cli \
   --test package_verify_certs \
   package_verify_external_requires_explicit_policy_and_registry -- --exact
 

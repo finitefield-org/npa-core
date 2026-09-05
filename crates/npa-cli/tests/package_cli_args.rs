@@ -2878,7 +2878,6 @@ fn package_promotion_registry_commands_parse() {
         "--previous-target-root=old-mathlib",
         "--audit=docs/promotion/reconcile.md",
         "--out=docs/promotion/reconcile.json",
-        "--legacy-previous-v0-8-checkpoint",
         "--apply",
         "--json",
     ]);
@@ -2888,7 +2887,7 @@ fn package_promotion_registry_commands_parse() {
     else {
         panic!("expected registry reconciliation");
     };
-    assert!(options.apply && options.common.json && options.legacy_previous_v0_8_checkpoint);
+    assert!(options.apply && options.common.json);
     assert_eq!(
         options.previous_target_root,
         Some(PathBuf::from("old-mathlib"))
@@ -2906,18 +2905,6 @@ fn package_promotion_registry_commands_parse() {
             PackageCommand::ReconcilePromotionOriginRegistry(_)
         ))
     ));
-
-    let recovery_with_legacy_checkpoint = parse_error(&[
-        "package",
-        "reconcile-promotion-origin-registry",
-        "--root=mathlib",
-        "--recover=target/registry-reconciliation/event.json",
-        "--legacy-previous-v0-8-checkpoint",
-    ]);
-    assert_eq!(
-        recovery_with_legacy_checkpoint.reason,
-        UsageReason::InvalidFlagValue
-    );
 
     let conflict = parse_error(&[
         "package",

@@ -244,32 +244,17 @@ the facade argument and policy/registry boundary, plus the filesystem/network
 trace when `strace` is available. Full v0.9 package-runner adoption belongs to
 Milestone 5.
 
-### Transitional v0.8 host lane
+### Current host and release gate
 
-The strict v0.4 checker has moved beyond the temporary `npa-cli 0.8.0` host
-compatibility lane. The checked-in `toolchain-v0.8.sh` remains only as migration
-material until the v0.9 host/evidence work replaces and removes it; it is not a
-current v0.4 compatibility or release claim. Use `scripts/differential.sh` for
-Milestone 4 checker acceptance. Do not reinterpret output from the v0.8 lane
-as evidence for the v0.4 certificate pair.
+The checker is exercised from the current `npa-cli 0.9.0` host. Use
+`scripts/differential.sh` for the v0.4 checker acceptance matrix, then run the
+package release gates from the self-contained v0.9.0 toolchain reference. The
+runner binds checker identity, binary hash, input pair, policy, and raw-result
+schema; an unpinned local build is not release evidence.
 
-### Historical v0.7 host compatibility
-
-The v0.7 gate and its emitted v0.7/v0.3 evidence are frozen historical
-compatibility material. Run them only from the matching `npa-cli 0.7.0`
-checkout:
-
-```sh
-checkers/npa-checker-ext/scripts/toolchain-v0.7.sh
-checkers/npa-checker-ext/scripts/toolchain-v0.7.sh --functional-only
-```
-
-The historical gate intentionally rejects the current v0.8 checkout; do not
-relabel its archives, schemas, tags, or evidence as v0.8.
-
-The obsolete v0.3/v0.4 host compatibility scripts and their dedicated tests
-have been removed. Historical design records describe those releases but do
-not provide a supported or callable compatibility contract.
+No retired host script, compatibility facade, or old-host allowlist is callable
+from this repository. Historical specifications remain version-scoped records
+only and do not define a supported command path.
 
 Remediation is fail-closed: update a stale Cargo lock only through the intended
 Cargo dependency workflow; restore or explicitly freeze a missing/stale NPA

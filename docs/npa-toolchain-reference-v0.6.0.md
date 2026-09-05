@@ -2,7 +2,7 @@
 
 Historical snapshot: this document preserves the v0.6 host/result contract and
 uses “current” only relative to that release. For the active adjacent-source
-contract, use the [v0.8 reference](npa-toolchain-reference-v0.8.0.md).
+contract, use the [v0.9 reference](npa-toolchain-reference-v0.9.0.md).
 
 This reference describes the adjacent-source `npa-cli 0.6.x` package interface.
 It adds targeted certificate authoring, metadata refresh, directly displayable

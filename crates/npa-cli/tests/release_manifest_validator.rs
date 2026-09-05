@@ -660,13 +660,10 @@ fn v0_2_pairs_only_retained_historical_cli_command_result_series() {
 }
 
 #[test]
-fn retired_and_current_hosts_cannot_be_smuggled_into_v0_2_manifests() {
+fn current_host_cannot_be_smuggled_into_v0_2_manifests() {
     let source = fixture("valid-v0.2-in-process.json");
     for (version, formerly_matching_schema) in [
-        ("0.7.0", COMMAND_RESULT_V0_3),
-        ("0.7.12", COMMAND_RESULT_V0_3),
-        ("0.8.0", COMMAND_RESULT_V0_4),
-        ("0.8.12", COMMAND_RESULT_V0_4),
+        ("0.9.12", COMMAND_RESULT_V0_5),
         ("0.9.0", COMMAND_RESULT_V0_5),
     ] {
         let changed = source
@@ -692,7 +689,7 @@ fn v0_3_accepts_only_the_exact_current_host_and_result_schema() {
     let source = fixture("valid-v0.3-current.json");
     assert!(run_current_document(&source).status.success());
 
-    for version in ["0.7.0", "0.8.0", "0.9.1", "1.0.0"] {
+    for version in ["0.9.1", "1.0.0"] {
         let changed = source.replace(
             "\"npa_cli_crate_version\": \"0.9.0\"",
             &format!("\"npa_cli_crate_version\": \"{version}\""),
@@ -849,10 +846,8 @@ fn v0_2_rejects_unsupported_cli_versions() {
         "0.5.01",
         "0.6.00",
         "0.6.01",
-        "0.7.00",
-        "0.7.01",
-        "0.8.00",
-        "0.8.01",
+        "0.9.00",
+        "0.9.01",
         "0.4",
         "0.4.0-dev",
         "latest",

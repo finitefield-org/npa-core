@@ -873,7 +873,7 @@ replacement.
 
 - after implementation, update `README.md`, `docs/README.md`,
   `docs/package-artifact-refresh-command-design.md`, and
-  `docs/npa-toolchain-reference-v0.8.0.md` with the implemented failure-order
+  `docs/npa-toolchain-reference-v0.9.0.md` with the implemented failure-order
   contract, timing fields, and non-proposed status;
 - retain this document as the design and implementation record, changing its
   status only when all acceptance criteria pass.

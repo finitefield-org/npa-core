@@ -2,7 +2,7 @@
 
 Status: implemented in the current `npa-core` package CLI. This document is
 retained as the design and implementation record; package authors should use
-the current workflow documented in `npa-toolchain-reference-v0.8.0.md`, which
+the current workflow documented in `npa-toolchain-reference-v0.9.0.md`, which
 retains the v0.6-introduced refresh contract.
 
 The current implementation adds a context-free Human source preflight and
@@ -817,8 +817,8 @@ The dry run should be used in review and CI; the write mode should be used only
 at explicit package artifact refresh boundaries.
 
 The original implementation left declared module `meta.json` ledgers
-unchanged. The v0.6-introduced behavior retained in historical v0.7 and current
-v0.8 instead regenerates every declared ledger in the rebuild closure from the
+unchanged. The behavior introduced after the early checkpoint and retained in
+current v0.9 instead regenerates every declared ledger in the rebuild closure from the
 same verified artifacts and includes it in the staged transaction. After write
 mode, run
 `npa package audit-artifact-ledger --root proofs --json` and require clean

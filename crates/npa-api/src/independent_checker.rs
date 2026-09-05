@@ -31219,13 +31219,13 @@ mod tests {
               "schema":"npa.independent-checker.checker_identity_manifest.v1",
               "generated_by":{{
                 "runner_id":"npa-check-runner",
-                "runner_version":"0.8.0",
+                "runner_version":"0.9.0",
                 "runner_build_hash":"{}"
               }},
               "checkers":[{{
                 "profile":"reference",
                 "checker_id":"npa-checker-ref",
-                "checker_version":"0.8.0",
+                "checker_version":"0.9.0",
                 "binary_id":"npa-checker-ref-macos-aarch64",
                 "binary_hash":"{}",
                 "build_hash":"{}"
@@ -31265,7 +31265,7 @@ mod tests {
               "schema":"npa.independent-checker.checker_identity_manifest.v1",
               "generated_by":{{
                 "runner_id":"npa-check-runner",
-                "runner_version":"0.8.0",
+                "runner_version":"0.9.0",
                 "runner_build_hash":"{}"
               }},
               "checkers":[
@@ -31283,7 +31283,7 @@ mod tests {
                 {{
                   "profile":"reference",
                   "checker_id":"npa-checker-ref",
-                  "checker_version":"0.8.0",
+                  "checker_version":"0.9.0",
                   "binary_id":"npa-checker-ref-macos-aarch64",
                   "binary_hash":"{}",
                   "build_hash":"{}"
@@ -32077,7 +32077,7 @@ mod tests {
                     memory_peak_mb: 0,
                     elapsed_ms: materialized.request.budget.timeout_ms + 1,
                 },
-                stdout: m3_raw_checked("0.8.0").into_bytes(),
+                stdout: m3_raw_checked("0.9.0").into_bytes(),
                 stderr: Vec::new(),
             },
         )
@@ -32103,7 +32103,7 @@ mod tests {
                     memory_peak_mb: materialized.request.budget.max_memory_mb + 1,
                     elapsed_ms: 10,
                 },
-                stdout: m3_raw_checked("0.8.0").into_bytes(),
+                stdout: m3_raw_checked("0.9.0").into_bytes(),
                 stderr: Vec::new(),
             },
         )
@@ -33493,7 +33493,7 @@ mod tests {
     fn m3_runner() -> IndependentCheckerMachineCheckRunner {
         IndependentCheckerMachineCheckRunner {
             id: "npa-check-runner".to_owned(),
-            version: "0.8.0".to_owned(),
+            version: "0.9.0".to_owned(),
             build_hash: test_hash(20),
         }
     }
@@ -33794,7 +33794,7 @@ mod tests {
                 runner: m3_runner(),
                 process: IndependentCheckerMachineCheckProcess::exited(0),
                 resource_usage: m3_resource_usage(1732),
-                stdout: m3_raw_checked("0.8.0").into_bytes(),
+                stdout: m3_raw_checked("0.9.0").into_bytes(),
                 stderr: Vec::new(),
             },
         )
@@ -33807,7 +33807,7 @@ mod tests {
         assert_eq!(result.axiom_report_hash, Some(test_hash(91)));
         assert_eq!(result.checker.id.as_deref(), Some("npa-checker-ref"));
         assert_eq!(result.checker.build_hash, Some(test_hash(11)));
-        let expected_raw_hex = independent_checker_hex_bytes(m3_raw_checked("0.8.0").as_bytes());
+        let expected_raw_hex = independent_checker_hex_bytes(m3_raw_checked("0.9.0").as_bytes());
         assert_eq!(
             result.raw_checker_output_hex.as_deref(),
             Some(expected_raw_hex.as_str())
@@ -33830,7 +33830,7 @@ mod tests {
                 runner: m3_runner(),
                 process: IndependentCheckerMachineCheckProcess::exited(0),
                 resource_usage: m3_resource_usage(100),
-                stdout: m3_raw_checked("0.8.0").into_bytes(),
+                stdout: m3_raw_checked("0.9.0").into_bytes(),
                 stderr: Vec::new(),
             },
         )
@@ -33844,7 +33844,7 @@ mod tests {
                 runner: m3_runner(),
                 process: IndependentCheckerMachineCheckProcess::exited(0),
                 resource_usage: m3_resource_usage(200),
-                stdout: m3_raw_checked("0.8.1").into_bytes(),
+                stdout: m3_raw_checked("0.9.1").into_bytes(),
                 stderr: b"free form stderr".to_vec(),
             },
         )
@@ -33907,7 +33907,7 @@ mod tests {
               "schema":"npa.independent-checker.checker_raw_result.v1",
               "checker_id":"npa-checker-ref",
               "checker_id":"npa-checker-ref",
-              "checker_version":"0.8.0",
+              "checker_version":"0.9.0",
               "checker_build_hash":"{}",
               "status":"checked",
               "module":"Std.Nat",
@@ -33950,7 +33950,7 @@ mod tests {
             r#"{{
               "schema":"npa.independent-checker.checker_raw_result.v1",
               "checker_id":"npa-checker-ref",
-              "checker_version":"0.8.0",
+              "checker_version":"0.9.0",
               "checker_build_hash":"{}",
               "status":"failed",
               "module":"Std.Nat",
@@ -34029,7 +34029,7 @@ mod tests {
             r#"{{
               "schema":"npa.independent-checker.checker_raw_result.v1",
               "checker_id":"npa-checker-ref",
-              "checker_version":"0.8.0",
+              "checker_version":"0.9.0",
               "checker_build_hash":"{}",
               "status":"failed",
               "error":{{
@@ -34115,7 +34115,7 @@ mod tests {
                     termination_reason: None,
                 },
                 resource_usage: IndependentCheckerMachineCheckResourceUsage::zero(),
-                stdout: m3_raw_checked("0.8.0").into_bytes(),
+                stdout: m3_raw_checked("0.9.0").into_bytes(),
                 stderr: Vec::new(),
             },
         )
@@ -34132,7 +34132,7 @@ mod tests {
     fn m3_policy_identity_gate_prevents_raw_checked_status_adoption() {
         let (request, policy) = m3_request_and_policy();
         let mismatched_raw =
-            m3_raw_checked("0.8.0").replace("npa-checker-ref", "npa-checker-other");
+            m3_raw_checked("0.9.0").replace("npa-checker-ref", "npa-checker-other");
         let result = independent_checker_machine_check_run(
             &request,
             &policy,
@@ -34171,7 +34171,7 @@ mod tests {
                 runner: m3_runner(),
                 process: IndependentCheckerMachineCheckProcess::exited(0),
                 resource_usage: m3_resource_usage(100),
-                stdout: m3_raw_checked("0.8.0").into_bytes(),
+                stdout: m3_raw_checked("0.9.0").into_bytes(),
                 stderr: Vec::new(),
             },
         )
@@ -34185,7 +34185,7 @@ mod tests {
                 runner: m3_runner(),
                 process: IndependentCheckerMachineCheckProcess::exited(0),
                 resource_usage: m3_resource_usage(101),
-                stdout: m3_raw_checked("0.8.0").into_bytes(),
+                stdout: m3_raw_checked("0.9.0").into_bytes(),
                 stderr: Vec::new(),
             },
         )
@@ -34281,7 +34281,7 @@ mod tests {
                 {{
                   "profile":"external",
                   "checker_id":"npa-checker-ext",
-                  "checker_version":"0.8.0",
+                  "checker_version":"0.9.0",
                   "raw_result_schema":"npa.independent-checker.checker_raw_result.v1",
                   "certificate_format":"NPA-CERT-0.2.0",
                   "core_spec":"NPA-Core-0.2.0",
@@ -34426,7 +34426,7 @@ mod tests {
                 resource_usage: m3_resource_usage(100),
                 stdout: m4_raw_checked(
                     &checker.checker_id,
-                    checker.checker_version.as_deref().unwrap_or("0.8.0"),
+                    checker.checker_version.as_deref().unwrap_or("0.9.0"),
                     checker.build_hash,
                 )
                 .into_bytes(),
@@ -34544,7 +34544,7 @@ mod tests {
             r#"{{
               "schema":"npa.independent-checker.checker_raw_result.v1",
               "checker_id":"npa-checker-ref",
-              "checker_version":"0.8.0",
+              "checker_version":"0.9.0",
               "checker_build_hash":"{}",
               "status":"failed",
               "module":"Std.Nat",
@@ -34948,7 +34948,7 @@ mod tests {
             r#"{{
               "schema":"npa.independent-checker.checker_raw_result.v1",
               "checker_id":"{}",
-              "checker_version":"0.8.0",
+              "checker_version":"0.9.0",
               "checker_build_hash":"{}",
               "status":"failed",
               "module":"Std.Nat",
@@ -38423,14 +38423,14 @@ mod tests {
               "schema":"npa.independent-checker.checker_identity_manifest.v1",
               "generated_by":{{
                 "runner_id":"npa-check-runner",
-                "runner_version":"0.8.0",
+                "runner_version":"0.9.0",
                 "runner_build_hash":"{}"
               }},
               "checkers":[
                 {{
                   "profile":"external",
                   "checker_id":"npa-checker-ext",
-                  "checker_version":"0.8.0",
+                  "checker_version":"0.9.0",
                   "raw_result_schema":"npa.independent-checker.checker_raw_result.v1",
                   "certificate_format":"NPA-CERT-0.2.0",
                   "core_spec":"NPA-Core-0.2.0",
@@ -38441,7 +38441,7 @@ mod tests {
                 {{
                   "profile":"fast-kernel",
                   "checker_id":"npa-fast-kernel",
-                  "checker_version":"0.8.0",
+                  "checker_version":"0.9.0",
                   "binary_id":"npa-fast-kernel-macos-aarch64",
                   "binary_hash":"{}",
                   "build_hash":"{}"
@@ -38449,7 +38449,7 @@ mod tests {
                 {{
                   "profile":"reference",
                   "checker_id":"npa-checker-ref",
-                  "checker_version":"0.8.0",
+                  "checker_version":"0.9.0",
                   "binary_id":"npa-checker-ref-macos-aarch64",
                   "binary_hash":"{}",
                   "build_hash":"{}"

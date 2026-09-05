@@ -1,7 +1,7 @@
 # Promotion-Origin Registry Reconciliation Command
 
-Status: introduced in historical `npa-cli 0.7.x`, implemented in current
-`npa-cli 0.8.x`; v1 contract frozen on 2026-08-02.
+Status: introduced in an earlier CLI checkpoint and implemented in current
+`npa-cli 0.9.x`; v1 contract frozen on 2026-08-02.
 
 Date: 2026-07-28
 

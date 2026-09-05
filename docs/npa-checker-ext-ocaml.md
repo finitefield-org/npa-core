@@ -54,29 +54,25 @@ output:
   deterministic checker_raw_result JSON
 ```
 
-### 1.1 Transitional host adapters
+### 1.1 Current host adapter
 
 The standalone checker is `npa-checker-ext 0.4.0` and advertises only
 `NPA-CERT-0.4.0` / `NPA-Core-0.4.0`. Raw-result v2 records this capability pair
-separately from the exact decoded input pair. The v0.8 host script is retained
-only as migration material until the v0.9 host and evidence work lands; it is
-not a v0.4 compatibility or release gate.
+separately from the exact decoded input pair. The checker runs on the current
+`npa-cli 0.9.0` host and is not a compatibility adapter for a retired
+toolchain.
 
 `checkers/npa-checker-ext/scripts/differential.sh` is the Milestone 4 gate. It
 checks the standalone executable directly, validates raw results through the
 Rust runner schema, compiles and tests the transitional facade argument
-contract, and checks the package facade's policy/registry boundary. Full
-v0.9-host adoption belongs to Milestone 5. A facade that cannot provide
+contract, and checks the package facade's policy/registry boundary. A facade
+that cannot provide
 descendant-owned memory/timeout enforcement and authenticated step accounting
 returns `external_checker_supervisor_unavailable` before creating imports or
 results.
 
-The frozen `toolchain-v0.7.sh` gate and its v0.7/v0.3 evidence remain
-historical compatibility material and must not be relabeled as v0.9/v0.4.
-
-The obsolete v0.3/v0.4 host scripts and their dedicated compatibility tests
-have been removed. Their design records are historical context only and are
-not supported operator contracts.
+Retired host scripts, compatibility evidence, and old-version allowlists are
+not supported operator contracts and are not present in the current tree.
 
 Ordinary external checked verification, a byte-validated v0.2 release envelope,
 and `verified_high_trust` are distinct outcomes. None is currently produced by

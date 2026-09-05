@@ -4,7 +4,7 @@ The canonical user documentation index is [docs/README.md](README.md).
 
 The current core implementation emits only `NPA-CERT-0.4.0` /
 `NPA-Core-0.4.0`, and both independent checkers accept only that pair. The
-package ecosystem and public CLI are still migrating toward v0.9.0. The last
+package ecosystem and public CLI use v0.9.0. The last
 published external toolchain tag remains v0.2.0 until a new release is
 published; see the canonical index for the separate source,
 checker-capability, input-pair, and package-profile axes.

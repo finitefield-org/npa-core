@@ -686,9 +686,6 @@ pub struct PackageReconcilePromotionOriginRegistryOptions {
     pub out: Option<PathBuf>,
     /// Optional target-relative lifecycle change request.
     pub request: Option<PathBuf>,
-    /// Use the one-time, externally verified v0.8 checkpoint path for a v0.3
-    /// previous target that the current strict decoder intentionally rejects.
-    pub legacy_previous_v0_8_checkpoint: bool,
     /// Whether the validated transition may be written.
     pub apply: bool,
     /// Target-relative recovery journal path.
@@ -3761,7 +3758,6 @@ fn parse_package_reconcile_promotion_origin_registry_args(
     let mut out = None;
     let mut request = None;
     let mut recover = None;
-    let mut legacy_previous_v0_8_checkpoint = false;
     let mut apply = false;
     let mut dry_run = false;
     let mut index = 0;
@@ -3773,14 +3769,6 @@ fn parse_package_reconcile_promotion_origin_registry_args(
             "--out" => Some(("--out", &mut out)),
             "--request" => Some(("--request", &mut request)),
             "--recover" => Some(("--recover", &mut recover)),
-            "--legacy-previous-v0-8-checkpoint" if !legacy_previous_v0_8_checkpoint => {
-                legacy_previous_v0_8_checkpoint = true;
-                index += 1;
-                continue;
-            }
-            "--legacy-previous-v0-8-checkpoint" => {
-                return Err(flag_error(token, UsageReason::DuplicateFlag).with_command(COMMAND));
-            }
             "--apply" if !apply => {
                 apply = true;
                 index += 1;
@@ -3850,7 +3838,6 @@ fn parse_package_reconcile_promotion_origin_registry_args(
             || audit.is_some()
             || out.is_some()
             || request.is_some()
-            || legacy_previous_v0_8_checkpoint
             || apply
             || dry_run
         {
@@ -3884,7 +3871,6 @@ fn parse_package_reconcile_promotion_origin_registry_args(
                 audit,
                 out,
                 request,
-                legacy_previous_v0_8_checkpoint,
                 apply,
                 recover,
             },
@@ -5315,7 +5301,7 @@ pub fn render_help(topic: HelpTopic) -> &'static str {
             "Usage: npa package validate-promotion-origin-registry [--root PATH] [--source-root PATH]... [--previous-registry PATH] [--json]\n\nValidate the canonical target registry, current target identities, optional source identities, and an optional append-only transition."
         }
         HelpTopic::PackageReconcilePromotionOriginRegistry => {
-            "Usage: npa package reconcile-promotion-origin-registry --root PATH --previous-target-root PATH --audit PATH --out PATH [--request PATH] [--legacy-previous-v0-8-checkpoint] [--dry-run|--apply] [--json]\n       npa package reconcile-promotion-origin-registry --root PATH --recover PATH [--json]\n\nValidate and deterministically migrate or advance the promotion-origin registry to any strictly newer catalog version. Dry-run is the default. The legacy checkpoint flag is a one-time migration path for an externally verified v0.3 previous target and never decodes or accepts that target with the current checker."
+            "Usage: npa package reconcile-promotion-origin-registry --root PATH --previous-target-root PATH --audit PATH --out PATH [--request PATH] [--dry-run|--apply] [--json]\n       npa package reconcile-promotion-origin-registry --root PATH --recover PATH [--json]\n\nValidate and deterministically advance the promotion-origin registry to any strictly newer catalog version. Dry-run is the default; current-checker validation is required for every previous and target package."
         }
         HelpTopic::PackageRegisterEquivalentPromotionOrigin => {
             "Usage: npa package register-equivalent-promotion-origin --root PATH --target-root PATH --promotion-id HASH [--dry-run|--apply] [--json]\n\nValidate and optionally append one artifact-identical source package origin to an existing promotion route. Dry-run is the default."

@@ -10,7 +10,7 @@ use npa_api::PackageArtifactReferenceSummaryMode;
 use npa_package::{
     active_catalog_routes, catalog_change_event_id, catalog_change_set_hash, catalog_target_id,
     catalog_target_revision_hash, migrate_promotion_origin_registry_v1_to_v3,
-    migrate_promotion_origin_registry_v2_to_v3, package_file_hash, parse_and_validate_manifest_str,
+    migrate_promotion_origin_registry_v2_to_v3, package_file_hash,
     parse_catalog_registry_sync_attestation_json,
     validate_catalog_registry_sync_attestation_against_transition, CatalogAddedTarget,
     CatalogAttestationRef, CatalogChangeEvent, CatalogChangeRequestRef, CatalogGovernanceFileRef,
@@ -63,7 +63,6 @@ use crate::{
 const COMMAND: &str = "package reconcile-promotion-origin-registry";
 const REASON: &str = "promotion_registry_reconciliation";
 const MANIFEST_PATH: &str = "npa-package.toml";
-const LEGACY_V0_8_CERTIFICATE_HEADER: &[u8] = b"\x0eNPA-CERT-0.3.0\x0eNPA-Core-0.3.0";
 
 struct PreviousPackageState {
     manifest: PackageManifest,
@@ -227,15 +226,6 @@ pub fn run_package_reconcile_promotion_origin_registry(
         }
         ParsedPromotionOriginRegistry::V3(value) => value,
     };
-    if options.legacy_previous_v0_8_checkpoint
-        && !matches!(transition_base, ParsedPromotionOriginRegistry::V3(_))
-    {
-        return failed(
-            &options.common.root,
-            "promotion_registry_reconciliation_legacy_checkpoint_invalid",
-            MATHLIB_PROMOTION_REGISTRY_PATH,
-        );
-    }
     let mut old_routes = match active_catalog_routes(&proposed) {
         Ok(value) => value,
         Err(_) => {
@@ -246,61 +236,44 @@ pub fn run_package_reconcile_promotion_origin_registry(
             )
         }
     };
-    let mut gates = root_gates(&options.common.root);
-    if !options.legacy_previous_v0_8_checkpoint {
-        let mut previous_gates = immutable_previous_root_gates(previous_root);
-        previous_gates.append(&mut gates);
-        gates = previous_gates;
-    }
+    let mut gates = immutable_previous_root_gates(previous_root);
+    gates.append(&mut root_gates(&options.common.root));
     for gate in gates {
         if gate.status != CommandStatus::Passed {
             return CommandResult::failed(COMMAND, root_display, gate.diagnostics);
         }
     }
-    let previous = if options.legacy_previous_v0_8_checkpoint {
-        match load_legacy_previous_state(previous_root, &proposed, &old_routes) {
-            Ok(value) => value,
-            Err(path) => {
-                return failed(
-                    &options.common.root,
-                    "promotion_registry_reconciliation_legacy_checkpoint_invalid",
-                    path,
-                )
-            }
+    let loaded = match load_snapshot(previous_root) {
+        Ok(value) => value,
+        Err(result) => return result,
+    };
+    if let Err(diagnostic) = validate_checked_generated(&loaded) {
+        return CommandResult::failed(COMMAND, root_display, vec![*diagnostic]);
+    }
+    let previous_projection_value = match projection(previous_root, &loaded) {
+        Ok(value) => value,
+        Err(path) => {
+            return failed(
+                &options.common.root,
+                "promotion_registry_reconciliation_projection_invalid",
+                path,
+            )
         }
-    } else {
-        let loaded = match load_snapshot(previous_root) {
-            Ok(value) => value,
-            Err(result) => return result,
-        };
-        if let Err(diagnostic) = validate_checked_generated(&loaded) {
-            return CommandResult::failed(COMMAND, root_display, vec![*diagnostic]);
+    };
+    let revisions = match package_revisions(previous_root, &loaded) {
+        Ok(value) => value,
+        Err(path) => {
+            return failed(
+                &options.common.root,
+                "promotion_registry_reconciliation_previous_target_mismatch",
+                path,
+            )
         }
-        let projection = match projection(previous_root, &loaded) {
-            Ok(value) => value,
-            Err(path) => {
-                return failed(
-                    &options.common.root,
-                    "promotion_registry_reconciliation_projection_invalid",
-                    path,
-                )
-            }
-        };
-        let revisions = match package_revisions(previous_root, &loaded) {
-            Ok(value) => value,
-            Err(path) => {
-                return failed(
-                    &options.common.root,
-                    "promotion_registry_reconciliation_previous_target_mismatch",
-                    path,
-                )
-            }
-        };
-        PreviousPackageState {
-            manifest: loaded.snapshot.validated.manifest().clone(),
-            projection,
-            revisions,
-        }
+    };
+    let previous = PreviousPackageState {
+        manifest: loaded.snapshot.validated.manifest().clone(),
+        projection: previous_projection_value,
+        revisions,
     };
     let current = match load_snapshot(&options.common.root) {
         Ok(value) => value,
@@ -945,7 +918,6 @@ pub fn run_package_reconcile_promotion_origin_registry(
     if !inputs_still_match(
         previous_root,
         &options.common.root,
-        options.legacy_previous_v0_8_checkpoint,
         &previous_projection,
         &current_projection,
         &previous_revisions,
@@ -1110,145 +1082,6 @@ fn load_snapshot(
         },
         PackageArtifactReferenceSummaryMode::Include,
     )
-}
-
-/// Load the exact pre-v0.4 catalog checkpoint without teaching the current
-/// certificate decoder how to accept the retired pair. The caller must have
-/// verified this immutable root with the pinned v0.8 checker first. Here we
-/// bind every raw package identity to the already append-only registry state,
-/// and we require every local certificate to advertise the retired v0.3 pair.
-fn load_legacy_previous_state(
-    root: &Path,
-    registry: &npa_package::PromotionOriginRegistryV3,
-    expected_revisions: &BTreeMap<
-        String,
-        (
-            npa_package::CatalogRouteRef,
-            PromotionDeclarationTargetRevision,
-        ),
-    >,
-) -> Result<PreviousPackageState, String> {
-    let manifest = read_legacy_manifest(root)?;
-    let projection = projection_for_manifest(root, &manifest)?;
-    if registry.target_package != manifest.package
-        || registry
-            .catalog_change_events
-            .last()
-            .is_none_or(|event| event.target != projection)
-    {
-        return Err(MATHLIB_PROMOTION_REGISTRY_PATH.to_owned());
-    }
-    let revisions = legacy_revisions_from_manifest(root, &manifest, expected_revisions)?;
-    Ok(PreviousPackageState {
-        manifest,
-        projection,
-        revisions,
-    })
-}
-
-fn read_legacy_manifest(root: &Path) -> Result<PackageManifest, String> {
-    let path = PackagePath::new(MANIFEST_PATH);
-    let bytes =
-        read_package_regular_file_no_follow(root, &path).map_err(|_| MANIFEST_PATH.to_owned())?;
-    let source = std::str::from_utf8(&bytes).map_err(|_| MANIFEST_PATH.to_owned())?;
-    parse_and_validate_manifest_str(source)
-        .map(|validated| validated.into_manifest())
-        .map_err(|_| MANIFEST_PATH.to_owned())
-}
-
-fn legacy_revisions_from_manifest(
-    root: &Path,
-    manifest: &PackageManifest,
-    expected: &BTreeMap<
-        String,
-        (
-            npa_package::CatalogRouteRef,
-            PromotionDeclarationTargetRevision,
-        ),
-    >,
-) -> Result<BTreeMap<String, PromotionDeclarationTargetRevision>, String> {
-    if manifest.modules.len() != expected.len() {
-        return Err("$.entries".to_owned());
-    }
-    manifest
-        .modules
-        .iter()
-        .map(|module| {
-            let name = module.module.as_dotted();
-            let (_, stored) = expected.get(&name).ok_or_else(|| name.clone())?;
-            if legacy_revision_is_incomplete(stored) {
-                return Err(name);
-            }
-            let certificate_bytes = read_package_regular_file_no_follow(root, &module.certificate)
-                .map_err(|_| module.certificate.as_str().to_owned())?;
-            if !is_legacy_v0_8_certificate(&certificate_bytes) {
-                return Err(module.certificate.as_str().to_owned());
-            }
-            let revision = PromotionDeclarationTargetRevision {
-                target_version: stored.target_version.clone(),
-                target_source_file_hash: hash_file(root, module.source.as_str())?,
-                target_meta_file_hash: module
-                    .meta
-                    .as_ref()
-                    .map_or(Ok(PackageHash::new([0; 32])), |path| {
-                        hash_file(root, path.as_str())
-                    })?,
-                target_replay_file_hash: module
-                    .replay
-                    .as_ref()
-                    .map_or(Ok(PackageHash::new([0; 32])), |path| {
-                        hash_file(root, path.as_str())
-                    })?,
-                target_certificate_file_hash: package_file_hash(&certificate_bytes),
-                target_certificate_hash: module.expected_certificate_hash,
-                target_export_hash: module.expected_export_hash,
-                target_axiom_report_hash: module.expected_axiom_report_hash,
-                theorems: stored.theorems.clone(),
-            };
-            if revision.target_source_file_hash != module.expected_source_hash
-                || revision.target_certificate_file_hash != module.expected_certificate_file_hash
-                || !same_complete_artifacts(stored, &revision)
-            {
-                return Err(name);
-            }
-            Ok((module.module.as_dotted(), revision))
-        })
-        .collect()
-}
-
-fn legacy_previous_inputs_match(
-    root: &Path,
-    projection: &CatalogTargetProjection,
-    revisions: &BTreeMap<String, PromotionDeclarationTargetRevision>,
-) -> bool {
-    let Ok(manifest) = read_legacy_manifest(root) else {
-        return false;
-    };
-    let expected = revisions
-        .iter()
-        .map(|(module, revision)| {
-            (
-                module.clone(),
-                (
-                    npa_package::CatalogRouteRef {
-                        owner_kind: "checkpoint_input".to_owned(),
-                        owner_id: PackageHash::new([0; 32]),
-                        target_module: npa_cert::Name::from_dotted(module),
-                    },
-                    revision.clone(),
-                ),
-            )
-        })
-        .collect();
-    projection_for_manifest(root, &manifest).ok().as_ref() == Some(projection)
-        && legacy_revisions_from_manifest(root, &manifest, &expected)
-            .ok()
-            .as_ref()
-            == Some(revisions)
-}
-
-fn is_legacy_v0_8_certificate(bytes: &[u8]) -> bool {
-    bytes.starts_with(LEGACY_V0_8_CERTIFICATE_HEADER)
 }
 
 fn projection(
@@ -1527,7 +1360,6 @@ fn remove_recovery_journal_if_unchanged(
 fn inputs_still_match(
     previous_root: &Path,
     current_root: &Path,
-    legacy_previous_v0_8_checkpoint: bool,
     previous_projection: &CatalogTargetProjection,
     current_projection: &CatalogTargetProjection,
     previous_revisions: &BTreeMap<String, PromotionDeclarationTargetRevision>,
@@ -1565,15 +1397,12 @@ fn inputs_still_match(
     let Ok(current) = load_snapshot(current_root) else {
         return false;
     };
-    let previous_matches = if legacy_previous_v0_8_checkpoint {
-        legacy_previous_inputs_match(previous_root, previous_projection, previous_revisions)
-    } else {
-        let Ok(previous) = load_snapshot(previous_root) else {
-            return false;
-        };
-        projection(previous_root, &previous).ok().as_ref() == Some(previous_projection)
-            && package_revisions(previous_root, &previous).ok().as_ref() == Some(previous_revisions)
+    let Ok(previous) = load_snapshot(previous_root) else {
+        return false;
     };
+    let previous_matches = projection(previous_root, &previous).ok().as_ref()
+        == Some(previous_projection)
+        && package_revisions(previous_root, &previous).ok().as_ref() == Some(previous_revisions);
     previous_matches
         && projection(current_root, &current).ok().as_ref() == Some(current_projection)
         && package_revisions(current_root, &current).ok().as_ref() == Some(current_revisions)
@@ -2464,19 +2293,6 @@ mod tests {
             catalog_target_revision_hash(&overlaid).unwrap(),
             catalog_target_revision_hash(&complete).unwrap()
         );
-    }
-
-    #[test]
-    fn legacy_checkpoint_certificate_probe_requires_the_exact_header_pair() {
-        assert!(is_legacy_v0_8_certificate(
-            b"\x0eNPA-CERT-0.3.0\x0eNPA-Core-0.3.0\x03Foo"
-        ));
-        assert!(!is_legacy_v0_8_certificate(
-            b"prefix\x0eNPA-CERT-0.3.0\x0eNPA-Core-0.3.0"
-        ));
-        assert!(!is_legacy_v0_8_certificate(
-            b"\x0eNPA-CERT-0.3.0\x0eNPA-Core-0.4.0"
-        ));
     }
 
     #[test]

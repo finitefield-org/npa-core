@@ -21,19 +21,19 @@ use crate::generated_artifact_writer::{
     write_regular_file_atomic_no_follow_with_mode,
 };
 
-const SCHEMA: &str = "npa.checker_ext.toolchain_v0_8";
-const POLICY_ID: &str = "npa-checker-ext-toolchain-v0-8-compat";
-const EXTERNAL_BINARY_ID: &str = "npa-checker-ext-toolchain-v0-8-real";
-const NPA_CLI_VERSION: &str = "0.8.0";
-const EXTERNAL_CHECKER_VERSION: &str = "0.3.0";
-const COMMAND_RESULT_SCHEMA: &str = "npa.package.command_result.v0.4";
-const POLICY_PREFLIGHT_SCHEMA: &str = "npa.checker_ext.toolchain_v0_8.policy_preflight.v1";
-const TOOLCHAIN_TAG: &str = "toolchain-v0.8.0-compat";
-const ARCHIVE_NAME: &str = "npa-mathlib-downstream-proofs-generated-toolchain-v0.8.0-compat.tar.gz";
+const SCHEMA: &str = "npa.checker_ext.toolchain_v0_9";
+const POLICY_ID: &str = "npa-checker-ext-toolchain-v0-9-real";
+const EXTERNAL_BINARY_ID: &str = "npa-checker-ext-toolchain-v0-9-real";
+const NPA_CLI_VERSION: &str = "0.9.0";
+const EXTERNAL_CHECKER_VERSION: &str = "0.4.0";
+const COMMAND_RESULT_SCHEMA: &str = "npa.package.command_result.v0.5";
+const POLICY_PREFLIGHT_SCHEMA: &str = "npa.checker_ext.toolchain_v0_9.policy_preflight.v1";
+const TOOLCHAIN_TAG: &str = "toolchain-v0.9.0-compat";
+const ARCHIVE_NAME: &str = "npa-mathlib-downstream-proofs-generated-toolchain-v0.9.0-compat.tar.gz";
 const CHECKSUM_NAME: &str =
-    "npa-mathlib-downstream-proofs-generated-toolchain-v0.8.0-compat.sha256";
+    "npa-mathlib-downstream-proofs-generated-toolchain-v0.9.0-compat.sha256";
 const MANIFEST_NAME: &str =
-    "npa-mathlib-downstream-proofs-generated-toolchain-v0.8.0-compat-manifest.json";
+    "npa-mathlib-downstream-proofs-generated-toolchain-v0.9.0-compat-manifest.json";
 const RUNNER_ID: &str = "npa-cli-package-external-runner";
 const RUNNER_VERSION: &str = "0.1.0";
 const IDENTITY_PATH: &str = "ci/checker-identity-manifest.json";
@@ -523,9 +523,9 @@ fn parse_version_record(bytes: &[u8]) -> Result<BTreeMap<String, String>> {
         ),
     )?;
     let literals = [
-        (0, "npa-checker-ext 0.3.0"),
-        (2, "certificate_format NPA-CERT-0.3.0"),
-        (3, "core_spec NPA-Core-0.3.0"),
+        (0, "npa-checker-ext 0.4.0"),
+        (2, "certificate_format NPA-CERT-0.4.0"),
+        (3, "core_spec NPA-Core-0.4.0"),
         (4, "implementation_profile ocaml-clean-room"),
         (5, "project_directory checkers/npa-checker-ext/"),
         (
@@ -567,7 +567,7 @@ fn fixture_hash(label: &str) -> String {
     sha256_bytes(label.as_bytes())
 }
 
-/// Prepare the current v0.8 checker identity, registry, axiom policy, and runner policy.
+/// Prepare the current v0.9 checker identity, registry, axiom policy, and runner policy.
 pub fn prepare_inputs(root: &Path, checker: &Path, version_file: &Path) -> Result<String> {
     let root = canonical(root)?;
     require(
@@ -588,7 +588,7 @@ pub fn prepare_inputs(root: &Path, checker: &Path, version_file: &Path) -> Resul
     write_regular_file_atomic_no_follow(&axiom_path, axiom_bytes)
         .map_err(|error| EvidenceError(error.to_string()))?;
     let axiom_hash = sha256_bytes(axiom_bytes);
-    let label = "npa-checker-ext-toolchain-v0.8.0-fixture";
+    let label = "npa-checker-ext-toolchain-v0.9.0-fixture";
     let runner_build_hash = fixture_hash(&format!("{RUNNER_ID}:{RUNNER_VERSION}"));
     let fast_binary_hash = fixture_hash(&format!("{label}:fast-kernel:binary"));
     let fast_build_hash = fixture_hash(&format!("{label}:fast-kernel:build"));
@@ -613,10 +613,10 @@ pub fn prepare_inputs(root: &Path, checker: &Path, version_file: &Path) -> Resul
                     ("binary_hash", Value::string(&checker_hash)),
                     ("binary_id", Value::string(EXTERNAL_BINARY_ID)),
                     ("build_hash", observed_value("checker_build_hash")),
-                    ("certificate_format", Value::string("NPA-CERT-0.3.0")),
+                    ("certificate_format", Value::string("NPA-CERT-0.4.0")),
                     ("checker_id", observed_value("checker_id")),
                     ("checker_version", observed_value("checker_version")),
-                    ("core_spec", Value::string("NPA-Core-0.3.0")),
+                    ("core_spec", Value::string("NPA-Core-0.4.0")),
                     ("profile", Value::string("external")),
                     (
                         "raw_result_schema",
@@ -626,14 +626,14 @@ pub fn prepare_inputs(root: &Path, checker: &Path, version_file: &Path) -> Resul
                 checker_record(
                     "fast-kernel",
                     "npa-fast-kernel",
-                    "npa-fast-kernel-toolchain-v0-8-fixture",
+                    "npa-fast-kernel-toolchain-v0-9-fixture",
                     &fast_binary_hash,
                     &fast_build_hash,
                 ),
                 checker_record(
                     "reference",
                     "npa-checker-ref",
-                    "npa-checker-ref-toolchain-v0-8-fixture",
+                    "npa-checker-ref-toolchain-v0-9-fixture",
                     &reference_binary_hash,
                     &reference_build_hash,
                 ),
@@ -716,10 +716,10 @@ pub fn prepare_inputs(root: &Path, checker: &Path, version_file: &Path) -> Resul
                     ("binary_hash", Value::string(&checker_hash)),
                     ("binary_id", Value::string(EXTERNAL_BINARY_ID)),
                     ("build_hash", observed_value("checker_build_hash")),
-                    ("certificate_format", Value::string("NPA-CERT-0.3.0")),
+                    ("certificate_format", Value::string("NPA-CERT-0.4.0")),
                     ("checker_id", observed_value("checker_id")),
                     ("checker_version", observed_value("checker_version")),
-                    ("core_spec", Value::string("NPA-Core-0.3.0")),
+                    ("core_spec", Value::string("NPA-Core-0.4.0")),
                     ("profile", Value::string("external")),
                     (
                         "raw_result_schema",
@@ -729,7 +729,7 @@ pub fn prepare_inputs(root: &Path, checker: &Path, version_file: &Path) -> Resul
                 allow(
                     "fast-kernel",
                     "npa-fast-kernel",
-                    "npa-fast-kernel-toolchain-v0-8-fixture",
+                    "npa-fast-kernel-toolchain-v0-9-fixture",
                     &fast_binary_hash,
                     &fast_build_hash,
                     vec![Value::string("--json"), Value::string("--canonical-only")],
@@ -737,7 +737,7 @@ pub fn prepare_inputs(root: &Path, checker: &Path, version_file: &Path) -> Resul
                 allow(
                     "reference",
                     "npa-checker-ref",
-                    "npa-checker-ref-toolchain-v0-8-fixture",
+                    "npa-checker-ref-toolchain-v0-9-fixture",
                     &reference_binary_hash,
                     &reference_build_hash,
                     vec![Value::string("--json"), Value::string("--canonical-only")],
@@ -956,7 +956,7 @@ fn copy_open_tree(
     require_unchanged_catalog(source, &names, relative)
 }
 
-/// Build the deterministic temporary source fixture used by the v0.8 gate.
+/// Build the deterministic temporary source fixture used by the v0.9 gate.
 pub fn prepare_fixture(run_dir: &Path, fixture: &Path, core_root: &Path) -> Result<String> {
     let run_dir = run_dir.to_path_buf();
     let run_directory = open_absolute_directory(&run_dir, true)
@@ -1012,7 +1012,7 @@ pub fn prepare_fixture(run_dir: &Path, fixture: &Path, core_root: &Path) -> Resu
         let path = package.join(locator);
         write_regular_file_atomic_no_follow(
             &path,
-            format!("{{\"forbidden\":\"npa-checker-ext-toolchain-v0.8.0:{label}\"}}\n").as_bytes(),
+            format!("{{\"forbidden\":\"npa-checker-ext-toolchain-v0.9.0:{label}\"}}\n").as_bytes(),
         )
         .map_err(|error| EvidenceError(error.to_string()))?;
     }
@@ -1039,7 +1039,7 @@ pub fn prepare_fixture(run_dir: &Path, fixture: &Path, core_root: &Path) -> Resu
             "commit",
             "--quiet",
             "-m",
-            "npa-checker-ext toolchain v0.8.0 compatibility fixture",
+            "npa-checker-ext toolchain v0.9.0 compatibility fixture",
         ],
         &[
             ("GIT_AUTHOR_DATE", "2000-01-01T00:00:00Z"),
@@ -1462,8 +1462,8 @@ fn validate_machine_result(
             && raw.get("checker_id") == preflight.get("checker_id")
             && raw.get("checker_version") == preflight.get("checker_version")
             && raw.get("checker_build_hash") == preflight.get("checker_build_hash")
-            && raw.get("certificate_format").and_then(Value::as_str) == Some("NPA-CERT-0.3.0")
-            && raw.get("core_spec").and_then(Value::as_str) == Some("NPA-Core-0.3.0")
+            && raw.get("certificate_format").and_then(Value::as_str) == Some("NPA-CERT-0.4.0")
+            && raw.get("core_spec").and_then(Value::as_str) == Some("NPA-Core-0.4.0")
             && raw.get("input_certificate_format") == proof.get("input_certificate_format")
             && raw.get("input_core_spec") == proof.get("input_core_spec"),
         format!("raw checker identity mismatch for {module}"),
@@ -3385,7 +3385,7 @@ pub fn json_field(path: &Path, field: &str) -> Result<String> {
     }
 }
 
-/// Validate the workspace package-version axes used by the v0.8 gate.
+/// Validate the workspace package-version axes used by the v0.9 gate.
 pub fn check_metadata(path: &Path) -> Result<String> {
     let metadata = Value::parse_file(path)?;
     let packages = metadata
@@ -3403,35 +3403,35 @@ pub fn check_metadata(path: &Path) -> Result<String> {
         .collect::<BTreeMap<_, _>>();
     require(
         versions.get("npa-cli") == Some(&NPA_CLI_VERSION),
-        "npa-cli metadata is not 0.8.0",
+        "npa-cli metadata is not 0.9.0",
     )?;
     require(
-        versions.get("npa-frontend") == Some(&"0.4.0"),
-        "npa-frontend metadata left its 0.4.0 axis",
+        versions.get("npa-frontend") == Some(&"0.5.0"),
+        "npa-frontend metadata left its 0.5.0 axis",
     )?;
     require(
-        versions.get("npa-api") == Some(&"0.4.0"),
-        "npa-api metadata left its 0.4.0 axis",
+        versions.get("npa-api") == Some(&"0.5.0"),
+        "npa-api metadata left its 0.5.0 axis",
     )?;
     require(
-        versions.get("npa-package") == Some(&"0.3.0"),
-        "npa-package metadata left its 0.3.0 axis",
+        versions.get("npa-package") == Some(&"0.4.0"),
+        "npa-package metadata left its 0.4.0 axis",
     )?;
     require(
-        versions.get("npa-cert") == Some(&"0.4.0"),
-        "npa-cert metadata left its 0.4.0 axis",
+        versions.get("npa-cert") == Some(&"0.5.0"),
+        "npa-cert metadata left its 0.5.0 axis",
     )?;
     require(
-        versions.get("npa-checker-ref") == Some(&"0.4.0"),
-        "npa-checker-ref metadata left its 0.4.0 axis",
+        versions.get("npa-checker-ref") == Some(&"0.5.0"),
+        "npa-checker-ref metadata left its 0.5.0 axis",
     )?;
     require(
-        versions.get("npa-kernel") == Some(&"0.3.0"),
-        "npa-kernel metadata left its 0.3.0 axis",
+        versions.get("npa-kernel") == Some(&"0.4.0"),
+        "npa-kernel metadata left its 0.4.0 axis",
     )?;
     require(
-        versions.get("npa-tactic") == Some(&"0.2.0"),
-        "npa-tactic metadata left its 0.2.0 axis",
+        versions.get("npa-tactic") == Some(&"0.3.0"),
+        "npa-tactic metadata left its 0.3.0 axis",
     )?;
     Ok(Value::object([
         (
@@ -3521,13 +3521,12 @@ mod tests {
     }
 
     #[test]
-    fn contract_is_v0_8_only() {
+    fn contract_is_v0_9_only() {
         let contract = contract();
-        assert!(contract.contains("toolchain-v0.8.0-compat"));
+        assert!(contract.contains("toolchain-v0.9.0-compat"));
         assert!(contract.contains("npa.package.command_result.v0.4"));
-        assert!(contract.contains("npa-checker-ext 0.3.0"));
+        assert!(contract.contains("npa-checker-ext 0.4.0"));
         assert!(contract.contains("\"fast_kernel_report_attribution\":\"forbidden\""));
-        assert!(!contract.contains("toolchain-v0.7.0-compat"));
     }
 
     #[test]

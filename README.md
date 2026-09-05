@@ -28,11 +28,9 @@ implementation repository for a proof-certificate-centered toolchain.
 
 ## Current Status
 
-The current source tree emits `NPA-CERT-0.3.0` / `NPA-Core-0.3.0` from every
-ordinary producer and ships `npa-checker-ref 0.4.0` and
-`npa-checker-ext 0.3.0`. All three check paths also accept the exact historical
-v0.2.0, v0.1.2, and v0.1 pairs without changing their bytes or immediate-opacity
-semantics.
+The current source tree emits `NPA-CERT-0.4.0` / `NPA-Core-0.4.0` and ships
+`npa-cli 0.9.0`, `npa-checker-ref 0.5.0`, and `npa-checker-ext 0.4.0`. Current
+check paths accept only the exact v0.4 pair.
 
 This source capability is newer than the last published external tag. The
 published SRA-02-compatible toolchain pin for external theorem package
@@ -46,13 +44,13 @@ RUST_TOOLCHAIN_VERSION = 1.95.0
 The earlier `v0.1.0` tag is historical and should not be used as the current
 external package toolchain pin.
 
-The current adjacent-source compatibility target is `npa-cli 0.8.0` with
+The current source/API target is `npa-cli 0.9.0` with
 `package_api::v1`; current package command results use
-`npa.package.command_result.v0.4`. These host/API/result axes are independent
-of both the current v0.3 certificate pair and the still-published v0.2.0 tag.
-See the v0.8.0 toolchain reference before consuming the programmatic package
+`npa.package.command_result.v0.5`. These host/API/result axes are independent
+of the still-published historical v0.2.0 tag.
+See the v0.9.0 toolchain reference before consuming the programmatic package
 API, fuel diagnostics, performance measurements, theorem-premise report, or
-artifact ledger audit. The v0.7.0 reference remains historical.
+artifact ledger audit.
 
 The public package repositories are:
 
@@ -81,12 +79,12 @@ target/debug/npa --version
 Expected output when building the current source checkout:
 
 ```text
-npa 0.8.0
+npa 0.9.0
 ```
 
 ## Package Verification Quick Start
 
-The commands in this section describe the current v0.8 source CLI. External
+The commands in this section describe the current v0.9 source CLI. External
 theorem libraries still pinned to the published v0.2.0 tag should use the
 historical v0.2.0 reference. The `npa package ...` command family uses an
 explicit package root:
@@ -273,7 +271,7 @@ are maintenance results, not proof evidence.
 
 Checked mode is the core default and is required for release or audit parity.
 For source-free authoring when `generated/package-lock.json` is intentionally
-absent, the current v0.8 source CLI also supports explicit in-memory
+absent, the current v0.9 source CLI also supports explicit in-memory
 reconstruction without package-root writes:
 
 ```sh
@@ -287,9 +285,9 @@ hash. Reconstructed provenance is authoring evidence, not parity with a frozen
 release lock.
 
 The compatible clean-room external path keeps independent version axes:
-`npa-cli 0.8.x` / `package_api::v1` hosts `npa-checker-ext 0.3.0`. The checker
-advertises the current v0.3 capability pair while reporting each certificate's
-actual v0.3, v0.2.0, v0.1.2, or v0.1 input pair separately. It requires a
+`npa-cli 0.9.x` / `package_api::v1` hosts `npa-checker-ext 0.4.0`. The checker
+advertises the current v0.4 capability pair while reporting each certificate's
+actual v0.4, v0.3, v0.2.0, v0.1.2, or v0.1 input pair separately. It requires a
 checked lock and disables all local acceleration explicitly. From an aggregate
 root containing
 `npa-core/` and the target `proofs/` package:
@@ -373,7 +371,7 @@ source-free checker.
 
 Large theorem-premise reports use a bounded, hash-addressed chunk layout while
 retaining their complete canonical logical report. Small reports keep their
-existing bytes. See [bounded theorem-premise report storage](docs/npa-toolchain-reference-v0.8.0.md#bounded-theorem-premise-report-storage)
+existing bytes. See [bounded theorem-premise report storage](docs/npa-toolchain-reference-v0.9.0.md#bounded-theorem-premise-report-storage)
 for the index/chunk format, resource bounds, and archive requirements.
 
 ## Repository Layout
@@ -411,18 +409,15 @@ Start with the user documentation:
 
 Package-author and toolchain references:
 
-- [Toolchain Reference v0.8.0](docs/npa-toolchain-reference-v0.8.0.md):
+- [Toolchain Reference v0.9.0](docs/npa-toolchain-reference-v0.9.0.md):
   current adjacent-source Rust API, kernel fuel diagnostics, performance
   measurements, checker gates, and package operations.
-- [Toolchain Reference v0.7.0](docs/npa-toolchain-reference-v0.7.0.md):
-  historical `npa-cli 0.7.x` compatibility reference.
 - [Toolchain Reference v0.6.0](docs/npa-toolchain-reference-v0.6.0.md):
   historical `npa-cli 0.6.x` compatibility reference.
 - [Toolchain Reference v0.5.0](docs/npa-toolchain-reference-v0.5.0.md):
   historical `npa-cli 0.5.x` compatibility reference.
-- [OCaml External Checker](docs/npa-checker-ext-ocaml.md): v0.3 clean-room
-  checker contract, four-version input compatibility, and current
-  `npa-cli 0.8.x` adapter boundary.
+- [OCaml External Checker](docs/npa-checker-ext-ocaml.md): v0.4 clean-room
+  checker contract and current `npa-cli 0.9.x` adapter boundary.
 - [Toolchain Reference v0.2.0](docs/npa-toolchain-reference-v0.2.0.md):
   published historical external-toolchain contract.
 
@@ -487,7 +482,7 @@ For contribution policy and the full local-gate checklist, see
 On Linux, the complete real-checker compatibility/release-evidence gate is:
 
 ```sh
-checkers/npa-checker-ext/scripts/toolchain-v0.8.sh
+checkers/npa-checker-ext/scripts/toolchain-v0.9.sh
 ```
 
 On hosts with kernel-sealed immutable checker staging, use `--functional-only`

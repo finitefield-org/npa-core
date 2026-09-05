@@ -1,8 +1,0 @@
-npa-core/checkers/npa-checker-ext/scripts/toolchain-v0.7.sh
-npa-core/checkers/npa-checker-ext/scripts/toolchain-v0.8.sh
-npa-core/crates/npa-cli/examples/inspect_ext_v0_7_policy.rs
-npa-core/crates/npa-cli/examples/inspect_ext_v0_8_policy.rs
-npa-core/crates/npa-cli/examples/verify_ext_v0_7_facade.rs
-npa-core/crates/npa-cli/examples/verify_ext_v0_8_facade.rs
-npa-core/docs/npa-toolchain-reference-v0.7.0.md
-npa-core/docs/npa-toolchain-reference-v0.8.0.md

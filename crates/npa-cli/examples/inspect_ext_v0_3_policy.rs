@@ -25,19 +25,18 @@ fn output_schema() -> &'static str {
         "inspect_ext_v0_4_policy" => "npa.checker_ext.toolchain_v0_4.policy_preflight.v1",
         "inspect_ext_v0_5_policy" => "npa.checker_ext.toolchain_v0_5.policy_preflight.v1",
         "inspect_ext_v0_6_policy" => "npa.checker_ext.toolchain_v0_6.policy_preflight.v1",
-        "inspect_ext_v0_7_policy" => "npa.checker_ext.toolchain_v0_7.policy_preflight.v1",
-        "inspect_ext_v0_8_policy" => "npa.checker_ext.toolchain_v0_8.policy_preflight.v1",
+        "inspect_ext_current_policy" => "npa.checker_ext.toolchain_v0_9.policy_preflight.v1",
         name => panic!("unsupported versioned preflight example: {name}"),
     }
 }
 
 fn expected_external_checker_version() -> &'static str {
     match env!("CARGO_CRATE_NAME") {
-        "inspect_ext_v0_7_policy" | "inspect_ext_v0_8_policy" => "0.3.0",
         "inspect_ext_v0_3_policy"
         | "inspect_ext_v0_4_policy"
         | "inspect_ext_v0_5_policy"
         | "inspect_ext_v0_6_policy" => "0.2.0",
+        "inspect_ext_current_policy" => "0.4.0",
         name => panic!("unsupported versioned preflight example: {name}"),
     }
 }
@@ -330,8 +329,7 @@ mod tests {
             "inspect_ext_v0_4_policy" => "npa.checker_ext.toolchain_v0_4.policy_preflight.v1",
             "inspect_ext_v0_5_policy" => "npa.checker_ext.toolchain_v0_5.policy_preflight.v1",
             "inspect_ext_v0_6_policy" => "npa.checker_ext.toolchain_v0_6.policy_preflight.v1",
-            "inspect_ext_v0_7_policy" => "npa.checker_ext.toolchain_v0_7.policy_preflight.v1",
-            "inspect_ext_v0_8_policy" => "npa.checker_ext.toolchain_v0_8.policy_preflight.v1",
+            "inspect_ext_current_policy" => "npa.checker_ext.toolchain_v0_9.policy_preflight.v1",
             name => panic!("unexpected example target: {name}"),
         };
         assert_eq!(output_schema(), expected);
@@ -339,13 +337,13 @@ mod tests {
 
     #[test]
     fn external_checker_version_matches_versioned_example_entry_point() {
-        let expected = if matches!(
-            env!("CARGO_CRATE_NAME"),
-            "inspect_ext_v0_7_policy" | "inspect_ext_v0_8_policy"
-        ) {
-            "0.3.0"
-        } else {
-            "0.2.0"
+        let expected = match env!("CARGO_CRATE_NAME") {
+            "inspect_ext_v0_3_policy"
+            | "inspect_ext_v0_4_policy"
+            | "inspect_ext_v0_5_policy"
+            | "inspect_ext_v0_6_policy" => "0.2.0",
+            "inspect_ext_current_policy" => "0.4.0",
+            name => panic!("unexpected example target: {name}"),
         };
         assert_eq!(expected_external_checker_version(), expected);
     }

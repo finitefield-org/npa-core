@@ -1009,9 +1009,9 @@ prove zero former-child reads and zero former-child allocations.
 
 ## 17. Compatibility, Migration, And Acceptance
 
-The supported transition is a one-time rebuild from the pinned npa-cli 0.8.0
-v0.3 checkpoint to npa-cli 0.9.0 and this v0.4 pair. The v0.9 implementation
-does not ship the v0.8 executable lane or any v0.3, v0.2, v0.1.2, or v0.1
+The supported transition is a one-time rebuild from the previous pinned
+checkpoint to npa-cli 0.9.0 and this v0.4 pair. The v0.9 implementation does
+not ship any retired executable lane or any v0.3, v0.2, v0.1.2, or v0.1
 decoder. A package closure is current only when every selected certificate and
 import has the exact v0.4 pair and passes all required source-free checks.
 

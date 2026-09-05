@@ -17,7 +17,7 @@ certificate and import hashes, and axiom reports.
   package verification quick start, and repository layout.
 - [Contributing](../CONTRIBUTING.md): local gates, checked-fixture triggers,
   certificate compatibility policy, and contribution workflow.
-- [Toolchain Reference v0.8.0](npa-toolchain-reference-v0.8.0.md): current Rust
+- [Toolchain Reference v0.9.0](npa-toolchain-reference-v0.9.0.md): current Rust
   CLI/API compatibility reference, kernel fuel diagnostics, common performance
   measurements, checker gates, and package operations.
 - [Package-Verifier Process-Memo Execution-Scope Rollout](package-verifier-process-memo-execution-scope-rollout.md):
@@ -26,8 +26,6 @@ certificate and import hashes, and axiom reports.
 - [Package Changed-Selection Git Query Rollout](package-changed-selection-git-query-rollout.md):
   exec-headroom-aware literal pathspec batching, exact error/process ordering,
   common measurement integration, and the reviewed release-evidence boundary.
-- [Toolchain Reference v0.7.0](npa-toolchain-reference-v0.7.0.md): historical
-  `npa-cli 0.7.x` compatibility reference.
 - [Toolchain Reference v0.6.0](npa-toolchain-reference-v0.6.0.md): historical
   `npa-cli 0.6.x` compatibility reference.
 - [Toolchain Reference v0.5.0](npa-toolchain-reference-v0.5.0.md): historical
@@ -39,11 +37,14 @@ certificate and import hashes, and axiom reports.
 ## Core References
 
 - [Core Implementation Specification v0.4.0](core-spec-v0.4.0.md): frozen,
-  implemented six-form let-free core and current-only certificate pair; later
-  ecosystem migration milestones remain in progress.
+  implemented six-form let-free core and current-only certificate pair.
+- [Toolchain Reference v0.9.0](npa-toolchain-reference-v0.9.0.md): current
+  host, package, checker, and exporter contract.
+- [v0.9.0 Release Notes](release-notes-v0.9.0.md): migration boundary,
+  verification evidence, and retired-host cleanup record.
 - [Term-Level `let` Removal Design](let-removal-plan.md): staged breaking
   migration to a let-free source language, kernel, certificate format, checker
-  set, and package ecosystem; Milestones 0 through 4 are complete.
+  set, and package ecosystem; Milestones 0 through 7 are complete.
 - [Core Implementation Specification v0.3.0](core-spec-v0.3.0.md): historical
   tagged local-implementation dependencies, checked same-module transparency,
   sealed exports, hash-domain migration, and four-version compatibility.
@@ -59,8 +60,7 @@ certificate and import hashes, and axiom reports.
   evidence for the OCaml checker.
 - [OCaml External Checker v0.4 Gate](../checkers/npa-checker-ext/README.md):
   strict v0.4 clean-room capability, shared three-checker conformance matrix,
-  actual-input versus checker-capability identity binding, and the transitional
-  status of the v0.8 host lane.
+  and actual-input versus checker-capability identity binding.
 - [Public Package And Registry Roadmap](public-package-roadmap.md): public
   package boundaries, registry readiness, and non-goals.
 - [Package Refactor Plan Command Design](refactor-plan-command-design.md):
@@ -68,7 +68,7 @@ certificate and import hashes, and axiom reports.
   theorem-family refactor candidates from package metadata.
 - [Package Artifact Refresh Command Design](package-artifact-refresh-command-design.md):
   initial design and implementation record for the package artifact refresh
-  mode. The current v0.8 workflow additionally refreshes declared metadata and
+  mode. The current v0.9 workflow additionally refreshes declared metadata and
   supports dependency-safe targeted selection as documented above.
 - [Package Build Selected-Source Fail-Fast Design](package-build-selected-source-fail-fast-design.md):
   implemented ordering that reports selected Human source delimiter and
@@ -85,7 +85,7 @@ certificate and import hashes, and axiom reports.
 
 The current core checkout builds v0.4 certificates, and both current
 independent checkers advertise and accept only the exact v0.4 certificate/core
-pair. The public CLI and package ecosystem are still migrating toward v0.9.0.
+pair. The public CLI and package ecosystem use v0.9.0.
 The last published external toolchain tag is still v0.2.0; external packages
 pinned to that tag continue to follow its historical toolchain reference. A
 source checkout, checker capability, checked input pair, package profile, and
@@ -148,7 +148,7 @@ escalation. The selectors are mutually exclusive. Base mode requires a checked
 lock and cache/memo off, rejects dirty protected package inputs, and fails on an
 empty range. Its selection summary is review metadata rather than a replacement
 for canonical build, hash, lock, axiom, or policy gates; see the
-[v0.8.0 selector contract](npa-toolchain-reference-v0.8.0.md#verify-certs-selector-modes).
+[v0.9.0 selector contract](npa-toolchain-reference-v0.9.0.md#verify-certs-selector-modes).
 
 Targeted `build-certs --check` may use the explicit advisory command
 `build-certs --build-check-cache local-hit`; an earlier live `read-through` run
@@ -165,7 +165,7 @@ Do not confuse this with `verify-certs --audit-cache local-hit`. The two flags
 select different stores for different commands, and neither produces proof
 evidence. Completion and release retain cache-off canonical build and ordinary
 source-free verification, including reference verification when package policy
-requires it. The [v0.8.0 toolchain reference](npa-toolchain-reference-v0.8.0.md#targeted-build-check-cache)
+requires it. The [v0.9.0 toolchain reference](npa-toolchain-reference-v0.9.0.md#targeted-build-check-cache)
 defines the complete mode matrix, placement, storage, recovery, and package API
 contract.
 
@@ -216,7 +216,7 @@ the reconstructed authoring mode.
 
 The core default is checked NPA package-lock input, which is the release/audit
 parity mode. When normal authoring intentionally omits
-`generated/package-lock.json`, use the current v0.8 source CLI with explicit
+`generated/package-lock.json`, use the current v0.9 source CLI with explicit
 reconstructed mode:
 
 ```sh
@@ -227,7 +227,7 @@ cargo run --locked --offline -p npa-cli -- package verify-certs \
 
 Reconstructed mode reports its canonical lock hash and writes no package-root
 file. It is authoring evidence, not a substitute for the exact checked lock in
-a release or published-bundle audit. See the v0.8.0 toolchain reference for the
+a release or published-bundle audit. See the v0.9.0 toolchain reference for the
 separate Cargo-lock, NPA-package-lock, provenance, and remediation contracts.
 Run `audit-artifact-ledger` before repair when you need a once-read comparison
 of manifest, metadata, certificate, source, and live-checker identities.
