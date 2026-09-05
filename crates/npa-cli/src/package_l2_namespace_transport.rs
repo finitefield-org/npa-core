@@ -23,6 +23,7 @@ use crate::{
     args::PackageL2NamespaceTransportOptions,
     diagnostic::{CommandArtifact, CommandDiagnostic, CommandResult, DiagnosticKind},
     fs::render_package_path,
+    generated_artifact_writer::read_package_regular_file_no_follow,
     governance_writer::{
         confined_governance_path, write_governance_artifact, GovernanceOutputPolicy,
     },
@@ -56,8 +57,7 @@ impl TransportAuditSnapshot {
             if self.files.contains_key(path) {
                 continue;
             }
-            let full = confined_governance_path(root, path, path.as_str(), reason)?;
-            let bytes = match fs::read(full) {
+            let bytes = match read_package_regular_file_no_follow(root, path) {
                 Ok(bytes) => Some(bytes),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
                 Err(_) => return Err(diagnostic(reason, path.as_str())),
@@ -121,19 +121,20 @@ pub fn run_package_validate_l2_namespace_transport(
     };
     if let Some(out) = &options.out {
         let path = PackagePath::new(out.to_string_lossy());
-        let full = match confined_governance_path(
+        if let Err(diagnostic) = confined_governance_path(
             &source.root,
             &path,
             "--out",
             "l2_transport_output_not_package_relative",
         ) {
-            Ok(path) => path,
-            Err(diagnostic) => {
-                return CommandResult::failed(COMMAND, root_display, vec![*diagnostic])
-            }
-        };
+            return CommandResult::failed(COMMAND, root_display, vec![*diagnostic]);
+        }
         if options.check {
-            if fs::read(full).ok().as_deref() != Some(attestation.as_bytes()) {
+            if read_package_regular_file_no_follow(&source.root, &path)
+                .ok()
+                .as_deref()
+                != Some(attestation.as_bytes())
+            {
                 return CommandResult::failed(
                     COMMAND,
                     root_display,
@@ -186,8 +187,9 @@ fn validate_transport(
     if baseline_real == target_real {
         return Err(diagnostic("l2_transport_target_alias", "--target-root"));
     }
-    let acceptance_policy_bytes = fs::read(&options.acceptance_policy)
-        .map_err(|_| diagnostic("l2_transport_policy_mismatch", "--acceptance-policy"))?;
+    let acceptance_policy_bytes =
+        crate::generated_artifact_writer::read_regular_file_no_follow(&options.acceptance_policy)
+            .map_err(|_| diagnostic("l2_transport_policy_mismatch", "--acceptance-policy"))?;
     let acceptance_policy = parse_l2_acceptance_policy_json(
         std::str::from_utf8(&acceptance_policy_bytes)
             .map_err(|_| diagnostic("l2_transport_policy_mismatch", "--acceptance-policy"))?,
@@ -199,8 +201,9 @@ fn validate_transport(
             "--acceptance-policy",
         ));
     }
-    let transport_policy_bytes = fs::read(&options.transport_policy)
-        .map_err(|_| diagnostic("l2_transport_policy_mismatch", "--transport-policy"))?;
+    let transport_policy_bytes =
+        crate::generated_artifact_writer::read_regular_file_no_follow(&options.transport_policy)
+            .map_err(|_| diagnostic("l2_transport_policy_mismatch", "--transport-policy"))?;
     let transport_policy = parse_l2_namespace_transport_policy_json(
         std::str::from_utf8(&transport_policy_bytes)
             .map_err(|_| diagnostic("l2_transport_policy_mismatch", "--transport-policy"))?,
@@ -246,7 +249,7 @@ fn validate_transport(
         if !transport_policy
             .allowed_source_prefixes
             .iter()
-            .any(|prefix| mapping.source.module.as_dotted().starts_with(prefix))
+            .any(|prefix| npa_package::l2_namespace_prefix_matches(&mapping.source.module, prefix))
         {
             return Err(diagnostic(
                 "l2_transport_source_prefix_denied",
@@ -256,7 +259,7 @@ fn validate_transport(
         if !transport_policy
             .allowed_target_prefixes
             .iter()
-            .any(|prefix| mapping.target.module.as_dotted().starts_with(prefix))
+            .any(|prefix| npa_package::l2_namespace_prefix_matches(&mapping.target.module, prefix))
         {
             return Err(diagnostic(
                 "l2_transport_target_prefix_denied",
@@ -455,20 +458,21 @@ fn validate_transport(
             })?;
         let source_cert = &source_loaded.cert;
         let target_cert = &target_loaded.cert;
-        for target_import in &target_cert.imports {
-            let target_name = target_import.module.as_dotted();
+        for target_import in target_cert.imports() {
             if transport_policy
                 .allowed_source_prefixes
                 .iter()
-                .any(|prefix| target_name.starts_with(prefix))
+                .any(|prefix| {
+                    npa_package::l2_namespace_prefix_matches(&target_import.module, prefix)
+                })
             {
                 return Err(diagnostic(
                     "l2_transport_source_namespace_leak",
-                    &target_name,
+                    &target_import.module.as_dotted(),
                 ));
             }
         }
-        for source_import in &source_cert.imports {
+        for source_import in source_cert.imports() {
             if !source_closure
                 .required_imports
                 .get(&mapping.source.module)
@@ -480,21 +484,22 @@ fn validate_transport(
                 .module_mappings
                 .iter()
                 .any(|candidate| candidate.source.module == source_import.module);
-            let source_name = source_import.module.as_dotted();
             if !mapped
                 && transport_policy
                     .allowed_source_prefixes
                     .iter()
-                    .any(|prefix| source_name.starts_with(prefix))
+                    .any(|prefix| {
+                        npa_package::l2_namespace_prefix_matches(&source_import.module, prefix)
+                    })
             {
                 return Err(diagnostic(
                     "l2_transport_source_namespace_leak",
-                    &source_name,
+                    &source_import.module.as_dotted(),
                 ));
             }
             if !mapped
                 && !target_cert
-                    .imports
+                    .imports()
                     .iter()
                     .any(|target_import| target_import == source_import)
             {
@@ -632,13 +637,13 @@ fn validate_transport(
             target_certificate_file_hash: target_loaded.file_hash,
             source_certificate_hash,
             target_certificate_hash: target_module.expected_certificate_hash,
-            source_export_hash: npa_package::PackageHash::from(source_cert.hashes.export_hash),
-            target_export_hash: npa_package::PackageHash::from(target_cert.hashes.export_hash),
+            source_export_hash: npa_package::PackageHash::from(source_cert.hashes().export_hash),
+            target_export_hash: npa_package::PackageHash::from(target_cert.hashes().export_hash),
             source_axiom_report_hash: npa_package::PackageHash::from(
-                source_cert.hashes.axiom_report_hash,
+                source_cert.hashes().axiom_report_hash,
             ),
             target_axiom_report_hash: npa_package::PackageHash::from(
-                target_cert.hashes.axiom_report_hash,
+                target_cert.hashes().axiom_report_hash,
             ),
         });
     }
@@ -1159,12 +1164,12 @@ fn package_certificates(
         let cert = verify_module_cert_hashes(bytes)
             .map_err(|_| diagnostic(reason, certificate.as_str()))?;
         let file_hash = package_file_hash(bytes);
-        if cert.header.module != *module
+        if cert.header().module != *module
             || expected_file_hash.is_some_and(|expected| expected != file_hash)
-            || PackageHash::from(cert.hashes.certificate_hash) != expected_certificate_hash
-            || PackageHash::from(cert.hashes.export_hash) != expected_export_hash
+            || PackageHash::from(cert.hashes().certificate_hash) != expected_certificate_hash
+            || PackageHash::from(cert.hashes().export_hash) != expected_export_hash
             || expected_axiom_report_hash.is_some_and(|expected| {
-                expected != PackageHash::from(cert.hashes.axiom_report_hash)
+                expected != PackageHash::from(cert.hashes().axiom_report_hash)
             })
         {
             return Err(diagnostic(reason, certificate.as_str()));
@@ -1195,7 +1200,7 @@ fn declaration_closure(
             .get(&module)
             .ok_or_else(|| diagnostic("l2_transport_declaration_missing", &module.as_dotted()))?;
         closure.declarations.entry(module.clone()).or_default();
-        for import in &cert.cert.imports {
+        for import in cert.cert.imports() {
             closure
                 .required_imports
                 .entry(module.clone())
@@ -1206,7 +1211,7 @@ fn declaration_closure(
                 .entry(import.module.clone())
                 .or_default();
         }
-        for index in 0..cert.cert.declarations.len() {
+        for index in 0..cert.cert.declarations().len() {
             declarations.push_back((module.clone(), index));
         }
     }
@@ -1224,7 +1229,7 @@ fn declaration_closure(
             .ok_or_else(|| diagnostic("l2_transport_declaration_missing", &module.as_dotted()))?
             .cert;
         let declaration = cert
-            .declarations
+            .declarations()
             .get(index)
             .ok_or_else(|| diagnostic("l2_transport_declaration_missing", &module.as_dotted()))?;
         for global in declaration
@@ -1247,14 +1252,14 @@ fn declaration_closure(
                     import_index, name, ..
                 } => {
                     let imported_module = cert
-                        .imports
+                        .imports()
                         .get(*import_index)
                         .ok_or_else(|| {
                             diagnostic("l2_transport_declaration_missing", &module.as_dotted())
                         })?
                         .module
                         .clone();
-                    let imported_name = cert.name_table.get(*name).ok_or_else(|| {
+                    let imported_name = cert.name_table().get(*name).ok_or_else(|| {
                         diagnostic("l2_transport_declaration_missing", &module.as_dotted())
                     })?;
                     closure
@@ -1284,7 +1289,7 @@ fn declaration_owner_indices(
     cert: &ModuleCert,
 ) -> Result<BTreeMap<Name, usize>, Box<CommandDiagnostic>> {
     let mut owners = BTreeMap::new();
-    for (index, declaration) in cert.declarations.iter().enumerate() {
+    for (index, declaration) in cert.declarations().iter().enumerate() {
         let mut names = vec![decl_name_id(&declaration.decl)];
         match &declaration.decl {
             DeclPayload::Inductive {
@@ -1315,10 +1320,10 @@ fn declaration_owner_indices(
             _ => {}
         }
         for name in names {
-            let name = cert.name_table.get(name).cloned().ok_or_else(|| {
+            let name = cert.name_table().get(name).cloned().ok_or_else(|| {
                 diagnostic(
                     "l2_transport_declaration_missing",
-                    &cert.header.module.as_dotted(),
+                    &cert.header().module.as_dotted(),
                 )
             })?;
             owners.insert(name, index);
@@ -1339,11 +1344,11 @@ fn required_projection_names(
         .into_iter()
         .flatten()
         .map(|index| {
-            let declaration = cert.declarations.get(*index).ok_or_else(|| {
+            let declaration = cert.declarations().get(*index).ok_or_else(|| {
                 diagnostic("l2_transport_declaration_missing", &module.as_dotted())
             })?;
             let source_name = cert
-                .name_table
+                .name_table()
                 .get(decl_name_id(&declaration.decl))
                 .ok_or_else(|| {
                     diagnostic("l2_transport_declaration_missing", &module.as_dotted())
@@ -1407,7 +1412,7 @@ fn first_unmapped_source_namespace(
             !mapped.contains(*module)
                 && prefixes
                     .iter()
-                    .any(|prefix| module.as_dotted().starts_with(prefix))
+                    .any(|prefix| npa_package::l2_namespace_prefix_matches(module, prefix))
         })
         .cloned()
 }
@@ -1573,8 +1578,7 @@ fn read_package(
     path: &PackagePath,
     reason: &str,
 ) -> Result<Vec<u8>, Box<CommandDiagnostic>> {
-    let full = confined_governance_path(root, path, path.as_str(), reason)?;
-    fs::read(full).map_err(|_| diagnostic(reason, path.as_str()))
+    read_package_regular_file_no_follow(root, path).map_err(|_| diagnostic(reason, path.as_str()))
 }
 fn diagnostic(reason: &str, path: &str) -> Box<CommandDiagnostic> {
     Box::new(CommandDiagnostic::error(DiagnosticKind::PackagePolicy, reason).with_path(path))
@@ -1621,13 +1625,14 @@ mod tests {
         let dependency = Name::from_dotted("Std.Nat.Basic");
         let mut unrelated = certificates[&Name::from_dotted("Mathlib.Core.Reduction")]
             .cert
-            .declarations[0]
+            .declarations()[0]
             .clone();
         unrelated.dependencies.clear();
         unrelated.axiom_dependencies.clear();
-        let dependency_cert = &mut certificates.get_mut(&dependency).unwrap().cert;
-        let unrelated_name = dependency_cert.name_table.len();
-        dependency_cert
+        let dependency_entry = certificates.get_mut(&dependency).unwrap();
+        let mut dependency_parts = dependency_entry.cert.clone().into_parts();
+        let unrelated_name = dependency_parts.name_table.len();
+        dependency_parts
             .name_table
             .push(Name::from_dotted("transport_test_unrelated"));
         match &mut unrelated.decl {
@@ -1641,12 +1646,13 @@ mod tests {
             | DeclPayload::InductiveConstrained { name, .. }
             | DeclPayload::MutualInductiveBlock { name, .. } => *name = unrelated_name,
         }
-        dependency_cert.declarations.push(unrelated);
+        dependency_parts.declarations.push(unrelated);
+        dependency_entry.cert = ModuleCert::from_parts(dependency_parts);
         let closure =
             declaration_closure(&certificates, [Name::from_dotted("Mathlib.Core.Reduction")])
                 .unwrap();
         let required = closure.declarations.get(&dependency).unwrap();
-        let available = certificates[&dependency].cert.declarations.len();
+        let available = certificates[&dependency].cert.declarations().len();
         assert!(!required.is_empty());
         assert!(required.len() < available);
     }

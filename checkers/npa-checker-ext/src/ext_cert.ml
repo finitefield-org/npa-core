@@ -1,10 +1,6 @@
 type hash = string
 
-type certificate_version =
-  | Current
-  | Compatibility
-  | Previous
-  | Legacy
+type certificate_version = Current
 
 type declaration_kind =
   | Axiom
@@ -238,48 +234,13 @@ type decoded_module = {
   structural_cost : structural_cost option;
 }
 
-let current_format = "NPA-CERT-0.3.0"
+let current_format = "NPA-CERT-0.4.0"
 
-let current_core_spec = "NPA-Core-0.3.0"
+let current_core_spec = "NPA-Core-0.4.0"
 
-let compatibility_format = "NPA-CERT-0.2.0"
+let format_of_version Current = current_format
 
-let compatibility_core_spec = "NPA-Core-0.2.0"
-
-let previous_format = "NPA-CERT-0.1.2"
-
-let previous_core_spec = "NPA-Core-0.1.2"
-
-let legacy_format = "NPA-CERT-0.1"
-
-let legacy_core_spec = "NPA-Core-0.1"
-
-(* Kept as aliases for the legacy golden builders while the conformance corpus
-   exercises all four explicit versions. Production decoding never uses these
-   aliases to select a version. *)
-let expected_format = legacy_format
-
-let expected_core_spec = legacy_core_spec
-
-let version_encodes_export_universe_constraints = function
-  | Current | Compatibility | Previous -> true
-  | Legacy -> false
-
-let version_encodes_tagged_dependencies = function
-  | Current -> true
-  | Compatibility | Previous | Legacy -> false
-
-let format_of_version = function
-  | Current -> current_format
-  | Compatibility -> compatibility_format
-  | Previous -> previous_format
-  | Legacy -> legacy_format
-
-let core_spec_of_version = function
-  | Current -> current_core_spec
-  | Compatibility -> compatibility_core_spec
-  | Previous -> previous_core_spec
-  | Legacy -> legacy_core_spec
+let core_spec_of_version Current = current_core_spec
 
 let bind result f =
   match result with
@@ -699,7 +660,7 @@ let decl_payload_kind payload =
   | InductiveDecl _ -> Inductive
   | MutualInductiveBlockDecl _ -> Mutual_inductive
 
-let read_dependency_entries version section import_count declaration_count names reader =
+let read_dependency_entries _version section import_count declaration_count names reader =
   read_vector section
     (fun current ->
       let read_interface current =
@@ -712,13 +673,11 @@ let read_dependency_entries version section import_count declaration_count names
                       { dependency_global_ref; dependency_decl_interface_hash },
                     next )))
       in
-      if not (version_encodes_tagged_dependencies version) then read_interface current
-      else
-        let tag_offset = Ext_bytes.offset current in
-        match Ext_bytes.read_byte section current with
-        | Error error -> Error error
-        | Ok (0x00, after_tag) -> read_interface after_tag
-        | Ok (0x01, after_tag) -> (
+      let tag_offset = Ext_bytes.offset current in
+      match Ext_bytes.read_byte section current with
+      | Error error -> Error error
+      | Ok (0x00, after_tag) -> read_interface after_tag
+      | Ok (0x01, after_tag) -> (
             match
               read_global_ref section import_count declaration_count names
                 after_tag
@@ -739,8 +698,8 @@ let read_dependency_entries version section import_count declaration_count names
                                 dependency_decl_certificate_hash;
                               },
                             next ))))
-        | Ok (tag, _) ->
-            Ext_bytes.error section tag_offset (Ext_bytes.Unknown_tag tag))
+      | Ok (tag, _) ->
+          Ext_bytes.error section tag_offset (Ext_bytes.Unknown_tag tag))
     reader
 
 let read_axiom_refs section import_count declaration_count names reader =
@@ -853,30 +812,20 @@ let read_header reader =
   match Ext_bytes.read_string Ext_bytes.Header_format reader with
   | Error err -> Error err
   | Ok (format, after_format) ->
-      let version_and_core =
-        if format = current_format then Some (Current, current_core_spec)
-        else if format = compatibility_format then
-          Some (Compatibility, compatibility_core_spec)
-        else if format = previous_format then Some (Previous, previous_core_spec)
-        else if format = legacy_format then Some (Legacy, legacy_core_spec)
-        else None
-      in
-      (match version_and_core with
-      | None ->
-          Ext_bytes.error Ext_bytes.Header_format (Ext_bytes.offset after_format)
-            Ext_bytes.Format_mismatch
-      | Some (version, expected_core) ->
-        match Ext_bytes.read_string Ext_bytes.Header_core_spec after_format with
-        | Error err -> Error err
-        | Ok (core_spec, after_core_spec) ->
-            if core_spec <> expected_core then
-              Ext_bytes.error Ext_bytes.Header_core_spec (Ext_bytes.offset after_core_spec)
-                Ext_bytes.Core_spec_mismatch
-            else (
-              match read_name Ext_bytes.Header_module after_core_spec with
-              | Error err -> Error err
-              | Ok (module_name, next) ->
-                  Ok ({ format; core_spec; module_name; version }, next)))
+      match Ext_bytes.read_string Ext_bytes.Header_core_spec after_format with
+      | Error err -> Error err
+      | Ok (core_spec, after_core_spec) ->
+          if format <> current_format then
+            Ext_bytes.error Ext_bytes.Header_format (Ext_bytes.offset after_format)
+              Ext_bytes.Format_mismatch
+          else if core_spec <> current_core_spec then
+            Ext_bytes.error Ext_bytes.Header_core_spec (Ext_bytes.offset after_core_spec)
+              Ext_bytes.Core_spec_mismatch
+          else (
+            match read_name Ext_bytes.Header_module after_core_spec with
+            | Error err -> Error err
+            | Ok (module_name, next) ->
+                Ok ({ format; core_spec; module_name; version = Current }, next))
 
 let read_imports reader =
   read_vector_with_limit Ext_bytes.Imports Ext_bytes.Imports_limit
@@ -928,7 +877,7 @@ let read_export_kind reader =
       | 0x05 -> Ok (Export_recursor, next)
       | tag -> Ext_bytes.error Ext_bytes.Export_block offset (Ext_bytes.Unknown_tag tag))
 
-let read_export_block version import_count names levels terms declaration_count reader =
+let read_export_block _version import_count names levels terms declaration_count reader =
   read_vector_with_limit Ext_bytes.Export_block Ext_bytes.Exports_limit
     Ext_bytes.max_exports
     (fun current ->
@@ -938,9 +887,7 @@ let read_export_block version import_count names levels terms declaration_count 
               bind (read_name_vec Ext_bytes.Export_block names after_kind)
                 (fun (export_universe_params, after_params) ->
                   let constraints_result =
-                    if version_encodes_export_universe_constraints version then
-                      read_universe_constraints Ext_bytes.Export_block levels after_params
-                    else Ok ([], after_params)
+                    read_universe_constraints Ext_bytes.Export_block levels after_params
                   in
                   bind constraints_result
                     (fun (export_universe_constraints, after_constraints) ->
@@ -1371,9 +1318,7 @@ let mark_term used import_count declaration_count section offset term =
           | Ext_term.App (fn, arg)
           | Ext_term.Lam (fn, arg)
           | Ext_term.Pi (fn, arg) ->
-              loop (fn :: arg :: rest)
-          | Ext_term.Let (ty, value, body) ->
-              loop (ty :: value :: body :: rest))
+              loop (fn :: arg :: rest))
   in
   loop [ term ]
 

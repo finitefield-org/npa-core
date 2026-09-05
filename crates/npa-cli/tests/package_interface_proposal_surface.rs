@@ -233,7 +233,7 @@ fn fixture_proposal() -> (Vec<u8>, Vec<DeclarationSpec>, Vec<String>) {
         .map(|declaration| (declaration.name.clone(), declaration))
         .collect::<std::collections::BTreeMap<_, _>>();
     let declarations = certificate
-        .declarations
+        .declarations()
         .iter()
         .map(|declaration| match &declaration.decl {
             DeclPayload::Axiom { name, .. }
@@ -245,7 +245,7 @@ fn fixture_proposal() -> (Vec<u8>, Vec<DeclarationSpec>, Vec<String>) {
             | DeclPayload::Inductive { name, .. }
             | DeclPayload::InductiveConstrained { name, .. }
             | DeclPayload::MutualInductiveBlock { name, .. } => {
-                certificate.name_table[*name].as_dotted()
+                certificate.name_table()[*name].as_dotted()
             }
         })
         .map(|name| by_name.remove(&name).unwrap())

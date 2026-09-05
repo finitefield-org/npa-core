@@ -1,14 +1,15 @@
 [package]
 name = "npa-checker-ref"
-version = "0.4.0"
+version = "0.5.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
 [dependencies]
+libc = "0.2"
+rustix = { version = "1.1", features = ["fs"] }
 sha2 = "0.10"
 
 [dev-dependencies]
-libc = "0.2"
 npa-cert = { path = "../npa-cert" }
 npa-kernel = { path = "../npa-kernel" }

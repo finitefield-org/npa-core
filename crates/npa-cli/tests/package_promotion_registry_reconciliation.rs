@@ -385,6 +385,58 @@ fn reconciliation_dry_run_apply_validate_and_repeat_are_consistent_for_revision(
     let repeated = assert_passed(run(binary, &apply));
     assert!(repeated.contains("\"reason_code\":\"already_applied\""));
 
+    let gap_previous = temporary.0.join("gap-previous");
+    let gap_current = temporary.0.join("gap-current");
+    copy_tree(&current, &gap_previous);
+    copy_tree(&current, &gap_current);
+    let gap_previous_manifest = fs::read_to_string(gap_previous.join("npa-package.toml"))
+        .unwrap()
+        .replace("version = \"0.1.1\"", "version = \"0.1.2\"");
+    fs::write(gap_previous.join("npa-package.toml"), gap_previous_manifest).unwrap();
+    generate_projections(binary, &gap_previous);
+    let gap_current_manifest = fs::read_to_string(gap_current.join("npa-package.toml"))
+        .unwrap()
+        .replace("version = \"0.1.1\"", "version = \"0.1.3\"");
+    fs::write(gap_current.join("npa-package.toml"), gap_current_manifest).unwrap();
+    // A version-only advance is a no-op, not an applied catalog event. Give
+    // this nonconsecutive-version/idempotence case a genuine checked revision;
+    // the separate version-only test keeps asserting the no-write behavior.
+    fs::write(
+        gap_current.join("Mathlib/Legacy/source.npa"),
+        "def gap_revision_identity (P : Prop) (h : P) : P := h\n",
+    )
+    .unwrap();
+    prepare_module_package(binary, &gap_current, "0.1.3", &[]);
+    let gap_common = [
+        OsStr::new("package"),
+        OsStr::new("reconcile-promotion-origin-registry"),
+        OsStr::new("--root"),
+        gap_current.as_os_str(),
+        OsStr::new("--previous-target-root"),
+        gap_previous.as_os_str(),
+        OsStr::new("--audit"),
+        OsStr::new("docs/promotion/audit.md"),
+        OsStr::new("--out"),
+        OsStr::new("docs/promotion/gap-sync.json"),
+        OsStr::new("--json"),
+    ];
+    let mut gap_apply = gap_common.to_vec();
+    gap_apply.push(OsStr::new("--apply"));
+    assert_passed(run(binary, &gap_apply));
+    assert!(gap_current.join("docs/promotion/gap-sync.json").is_file());
+    let gap_registry = parse_promotion_origin_registry_v3_json(
+        &fs::read_to_string(gap_current.join("promotion-origins.json")).unwrap(),
+    )
+    .unwrap();
+    let gap_event = gap_registry.catalog_change_events.last().unwrap();
+    assert_eq!(gap_event.revised_routes.len(), 1);
+    assert_eq!(
+        gap_event.revised_routes[0].target_module,
+        Name::from_dotted("Mathlib.Legacy")
+    );
+    let gap_repeated = assert_passed(run(binary, &gap_apply));
+    assert!(gap_repeated.contains("\"reason_code\":\"already_applied\""));
+
     let stale_manifest = fs::read_to_string(current.join("npa-package.toml"))
         .unwrap()
         .replace("version = \"0.1.1\"", "version = \"0.1.2\"");

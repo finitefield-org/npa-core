@@ -1,6 +1,6 @@
 //! Implementation of `npa package prepare-l2-review-input`.
 
-use std::{cell::RefCell, collections::BTreeMap, fs, path::Path};
+use std::{cell::RefCell, collections::BTreeMap, path::Path};
 
 use npa_api::PackageArtifactReferenceSummaryMode;
 use npa_cert::{verify_module_cert_hashes, Name};
@@ -14,7 +14,8 @@ use npa_package::{
 use crate::{
     args::PackageL2ReviewInputOptions,
     diagnostic::{CommandArtifact, CommandDiagnostic, CommandResult, DiagnosticKind},
-    fs::{join_package_path, render_package_path},
+    fs::render_package_path,
+    generated_artifact_writer::read_package_regular_file_no_follow,
     governance_writer::{
         confined_governance_path, write_governance_artifact, GovernanceOutputPolicy,
     },
@@ -51,17 +52,16 @@ pub fn run_package_prepare_l2_review_input(options: PackageL2ReviewInputOptions)
         Err(diagnostic) => return CommandResult::failed(COMMAND, root_display, vec![*diagnostic]),
     };
     let out = PackagePath::new(options.out.to_string_lossy());
-    let output_path = match confined_governance_path(
+    if let Err(diagnostic) = confined_governance_path(
         &loaded.root,
         &out,
         "--out",
         "l2_review_output_not_package_relative",
     ) {
-        Ok(path) => path,
-        Err(diagnostic) => return CommandResult::failed(COMMAND, root_display, vec![*diagnostic]),
-    };
+        return CommandResult::failed(COMMAND, root_display, vec![*diagnostic]);
+    }
     if options.check {
-        match fs::read(&output_path) {
+        match read_package_regular_file_no_follow(&loaded.root, &out) {
             Ok(existing) if existing == bytes => {}
             _ => {
                 return CommandResult::failed(
@@ -118,8 +118,9 @@ impl L2ReviewInputContext {
         loaded: &crate::package::LoadedPackageRoot,
         policy_path: &Path,
     ) -> Result<Self, Box<CommandDiagnostic>> {
-        let policy_bytes = fs::read(policy_path)
-            .map_err(|_| diagnostic("l2_review_policy_read_failed", "--policy"))?;
+        let policy_bytes =
+            crate::generated_artifact_writer::read_regular_file_no_follow(policy_path)
+                .map_err(|_| diagnostic("l2_review_policy_read_failed", "--policy"))?;
         let policy_source = std::str::from_utf8(&policy_bytes)
             .map_err(|_| diagnostic("l2_review_policy_read_failed", "--policy"))?;
         let policy = parse_l2_acceptance_policy_json(policy_source)
@@ -285,11 +286,11 @@ impl L2ReviewInputContext {
         })?;
         if package_file_hash(&source_bytes) != module.expected_source_hash
             || package_file_hash(&certificate_bytes) != module.expected_certificate_file_hash
-            || npa_package::PackageHash::from(certificate.hashes.certificate_hash)
+            || npa_package::PackageHash::from(certificate.hashes().certificate_hash)
                 != module.expected_certificate_hash
-            || npa_package::PackageHash::from(certificate.hashes.export_hash)
+            || npa_package::PackageHash::from(certificate.hashes().export_hash)
                 != module.expected_export_hash
-            || npa_package::PackageHash::from(certificate.hashes.axiom_report_hash)
+            || npa_package::PackageHash::from(certificate.hashes().axiom_report_hash)
                 != module.expected_axiom_report_hash
             || theorem.global_ref.certificate_hash != module.expected_certificate_hash
         {
@@ -389,8 +390,7 @@ fn read_path(
     path: &PackagePath,
     reason: &str,
 ) -> Result<Vec<u8>, Box<CommandDiagnostic>> {
-    let full = join_package_path(root, path, path.as_str())?;
-    fs::read(full).map_err(|_| diagnostic(reason, path.as_str()))
+    read_package_regular_file_no_follow(root, path).map_err(|_| diagnostic(reason, path.as_str()))
 }
 
 fn diagnostic(reason: &str, path: &str) -> Box<CommandDiagnostic> {

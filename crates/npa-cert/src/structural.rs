@@ -153,51 +153,51 @@ fn validate_counts(cert: &ModuleCert) -> Result<(), CertError> {
     ensure_count_limit(
         StructuralLimitKind::Imports,
         MAX_IMPORTS,
-        cert.imports.len(),
+        cert.imports().len(),
     )?;
     ensure_count_limit(
         StructuralLimitKind::NameTableEntries,
         MAX_NAME_TABLE_ENTRIES,
-        cert.name_table.len(),
+        cert.name_table().len(),
     )?;
     ensure_count_limit(
         StructuralLimitKind::LevelTableNodes,
         MAX_LEVEL_TABLE_NODES,
-        cert.level_table.len(),
+        cert.level_table().len(),
     )?;
     ensure_count_limit(
         StructuralLimitKind::TermTableNodes,
         MAX_TERM_TABLE_NODES,
-        cert.term_table.len(),
+        cert.term_table().len(),
     )?;
     ensure_count_limit(
         StructuralLimitKind::Declarations,
         MAX_DECLARATIONS,
-        cert.declarations.len(),
+        cert.declarations().len(),
     )?;
     ensure_count_limit(
         StructuralLimitKind::Exports,
         MAX_EXPORTS,
-        cert.export_block.len(),
+        cert.export_block().len(),
     )?;
-    check_name(&cert.header.module)?;
-    for import in &cert.imports {
+    check_name(&cert.header().module)?;
+    for import in cert.imports() {
         check_import(import)?;
     }
-    for name in &cert.name_table {
+    for name in cert.name_table() {
         check_name(name)?;
     }
-    for term in &cert.term_table {
+    for term in cert.term_table() {
         if let TermNode::Const { levels, .. } = term {
             nested(levels.len())?;
         }
     }
-    for declaration in &cert.declarations {
+    for declaration in cert.declarations() {
         nested(declaration.dependencies.len())?;
         nested(declaration.axiom_dependencies.len())?;
         check_decl_counts(&declaration.decl)?;
     }
-    for export in &cert.export_block {
+    for export in cert.export_block() {
         nested(export.universe_params.len())?;
         nested(export.universe_constraints.len())?;
         nested(export.axiom_dependencies.len())?;
@@ -205,11 +205,11 @@ fn validate_counts(cert: &ModuleCert) -> Result<(), CertError> {
     ensure_count_limit(
         StructuralLimitKind::Declarations,
         MAX_DECLARATIONS,
-        cert.axiom_report.per_declaration.len(),
+        cert.axiom_report().per_declaration.len(),
     )?;
-    nested(cert.axiom_report.module_axioms.len())?;
-    nested(cert.axiom_report.core_features.len())?;
-    for report in &cert.axiom_report.per_declaration {
+    nested(cert.axiom_report().module_axioms.len())?;
+    nested(cert.axiom_report().core_features.len())?;
+    for report in &cert.axiom_report().per_declaration {
         nested(report.direct_axioms.len())?;
         nested(report.transitive_axioms.len())?;
     }
@@ -304,20 +304,20 @@ fn check_decl_counts(decl: &DeclPayload) -> Result<(), CertError> {
 }
 
 fn max_nested_count(cert: &ModuleCert) -> usize {
-    let mut maximum = cert.header.module.0.len();
+    let mut maximum = cert.header().module.0.len();
     let mut observe = |value: usize| maximum = maximum.max(value);
-    for import in &cert.imports {
+    for import in cert.imports() {
         observe(import.module.0.len());
     }
-    for name in &cert.name_table {
+    for name in cert.name_table() {
         observe(name.0.len());
     }
-    for term in &cert.term_table {
+    for term in cert.term_table() {
         if let TermNode::Const { levels, .. } = term {
             observe(levels.len());
         }
     }
-    for declaration in &cert.declarations {
+    for declaration in cert.declarations() {
         observe(declaration.dependencies.len());
         observe(declaration.axiom_dependencies.len());
         match &declaration.decl {
@@ -399,36 +399,36 @@ fn max_nested_count(cert: &ModuleCert) -> usize {
             }
         }
     }
-    for export in &cert.export_block {
+    for export in cert.export_block() {
         observe(export.universe_params.len());
         observe(export.universe_constraints.len());
         observe(export.axiom_dependencies.len());
     }
-    for report in &cert.axiom_report.per_declaration {
+    for report in &cert.axiom_report().per_declaration {
         observe(report.direct_axioms.len());
         observe(report.transitive_axioms.len());
     }
-    observe(cert.axiom_report.module_axioms.len());
-    observe(cert.axiom_report.core_features.len());
+    observe(cert.axiom_report().module_axioms.len());
+    observe(cert.axiom_report().core_features.len());
     maximum
 }
 
 fn validate_semantic_root_references(cert: &ModuleCert) -> Result<(), CertError> {
     let level = |root: LevelId| {
-        if root < cert.level_table.len() {
+        if root < cert.level_table().len() {
             Ok(())
         } else {
             Err(CertError::DecodeError)
         }
     };
     let term = |root: TermId| {
-        if root < cert.term_table.len() {
+        if root < cert.term_table().len() {
             Ok(())
         } else {
             Err(CertError::DecodeError)
         }
     };
-    for declaration in &cert.declarations {
+    for declaration in cert.declarations() {
         for constraint in decl_constraints(&declaration.decl) {
             level(constraint.lhs)?;
             level(constraint.rhs)?;
@@ -489,7 +489,7 @@ fn validate_semantic_root_references(cert: &ModuleCert) -> Result<(), CertError>
             }
         }
     }
-    for export in &cert.export_block {
+    for export in cert.export_block() {
         for constraint in &export.universe_constraints {
             level(constraint.lhs)?;
             level(constraint.rhs)?;
@@ -509,11 +509,11 @@ pub(crate) fn structural_audit(
 ) -> Result<CertificateStructuralAudit, CertError> {
     let cost = structural_preflight(cert)?;
     Ok(CertificateStructuralAudit {
-        module: cert.header.module.clone(),
-        export_hash: cert.hashes.export_hash,
-        certificate_hash: cert.hashes.certificate_hash,
+        module: cert.header().module.clone(),
+        export_hash: cert.hashes().export_hash,
+        certificate_hash: cert.hashes().certificate_hash,
         direct_imports: cert
-            .imports
+            .imports()
             .iter()
             .map(|import| CertificateStructuralImportAudit {
                 module: import.module.clone(),
@@ -522,12 +522,12 @@ pub(crate) fn structural_audit(
             })
             .collect(),
         certificate_bytes,
-        imports: cert.imports.len(),
-        name_table_entries: cert.name_table.len(),
-        level_table_nodes: cert.level_table.len(),
-        term_table_nodes: cert.term_table.len(),
-        declarations: cert.declarations.len(),
-        exports: cert.export_block.len(),
+        imports: cert.imports().len(),
+        name_table_entries: cert.name_table().len(),
+        level_table_nodes: cert.level_table().len(),
+        term_table_nodes: cert.term_table().len(),
+        declarations: cert.declarations().len(),
+        exports: cert.export_block().len(),
         nested_vector_entries: max_nested_count(cert).max(decoded_core_feature_count),
         structural_depth: cost.max_depth,
         root_expanded_nodes: cost.max_root_expansion,
@@ -553,16 +553,16 @@ pub(crate) fn structural_preflight(cert: &ModuleCert) -> Result<StructuralCost, 
     let mut level_depths: Vec<usize> = Vec::new();
     let mut level_expansions: Vec<usize> = Vec::new();
     level_depths
-        .try_reserve_exact(cert.level_table.len())
+        .try_reserve_exact(cert.level_table().len())
         .map_err(|_| CertError::DecodeError)?;
     level_expansions
-        .try_reserve_exact(cert.level_table.len())
+        .try_reserve_exact(cert.level_table().len())
         .map_err(|_| CertError::DecodeError)?;
-    for (index, level) in cert.level_table.iter().enumerate() {
+    for (index, level) in cert.level_table().iter().enumerate() {
         let (depth, expansion) = match level {
             LevelNode::Zero => (1, 1),
             LevelNode::Param(name) => {
-                if *name >= cert.name_table.len() {
+                if *name >= cert.name_table().len() {
                     return Err(CertError::DecodeError);
                 }
                 (1, 1)
@@ -605,13 +605,13 @@ pub(crate) fn structural_preflight(cert: &ModuleCert) -> Result<StructuralCost, 
     let mut term_depths: Vec<usize> = Vec::new();
     let mut term_expansions: Vec<usize> = Vec::new();
     term_depths
-        .try_reserve_exact(cert.term_table.len())
+        .try_reserve_exact(cert.term_table().len())
         .map_err(|_| CertError::DecodeError)?;
     term_expansions
-        .try_reserve_exact(cert.term_table.len())
+        .try_reserve_exact(cert.term_table().len())
         .map_err(|_| CertError::DecodeError)?;
-    for (index, term) in cert.term_table.iter().enumerate() {
-        let mut term_children = [0usize; 3];
+    for (index, term) in cert.term_table().iter().enumerate() {
+        let mut term_children = [0usize; 2];
         let term_child_count;
         let mut level_children: &[LevelId] = &[];
         match term {
@@ -633,10 +633,6 @@ pub(crate) fn structural_preflight(cert: &ModuleCert) -> Result<StructuralCost, 
                 term_children[..2].copy_from_slice(&[*ty, *body]);
                 term_child_count = 2;
             }
-            TermNode::Let { ty, value, body } => {
-                term_children.copy_from_slice(&[*ty, *value, *body]);
-                term_child_count = 3;
-            }
         }
         let term_children = &term_children[..term_child_count];
         if term_children.iter().any(|child| *child >= index) {
@@ -644,7 +640,7 @@ pub(crate) fn structural_preflight(cert: &ModuleCert) -> Result<StructuralCost, 
         }
         if level_children
             .iter()
-            .any(|level| *level >= cert.level_table.len())
+            .any(|level| *level >= cert.level_table().len())
         {
             return Err(CertError::DecodeError);
         }
@@ -686,7 +682,7 @@ pub(crate) fn structural_preflight(cert: &ModuleCert) -> Result<StructuralCost, 
         certificate_expansion: 0,
     };
 
-    for declaration in &cert.declarations {
+    for declaration in cert.declarations() {
         for constraint in decl_constraints(&declaration.decl) {
             add_level_root(&mut roots, constraint.lhs, &level_depths, &level_expansions)?;
             add_level_root(&mut roots, constraint.rhs, &level_depths, &level_expansions)?;
@@ -747,7 +743,7 @@ pub(crate) fn structural_preflight(cert: &ModuleCert) -> Result<StructuralCost, 
             }
         }
     }
-    for export in &cert.export_block {
+    for export in cert.export_block() {
         for constraint in &export.universe_constraints {
             add_level_root(&mut roots, constraint.lhs, &level_depths, &level_expansions)?;
             add_level_root(&mut roots, constraint.rhs, &level_depths, &level_expansions)?;
@@ -767,13 +763,13 @@ pub(crate) fn structural_preflight(cert: &ModuleCert) -> Result<StructuralCost, 
 
 fn validate_global_ref_shape(cert: &ModuleCert, global_ref: &GlobalRef) -> Result<(), CertError> {
     let valid = match global_ref {
-        GlobalRef::Builtin { name, .. } => *name < cert.name_table.len(),
+        GlobalRef::Builtin { name, .. } => *name < cert.name_table().len(),
         GlobalRef::Imported {
             import_index, name, ..
-        } => *import_index < cert.imports.len() && *name < cert.name_table.len(),
-        GlobalRef::Local { decl_index } => *decl_index < cert.declarations.len(),
+        } => *import_index < cert.imports().len() && *name < cert.name_table().len(),
+        GlobalRef::Local { decl_index } => *decl_index < cert.declarations().len(),
         GlobalRef::LocalGenerated { decl_index, name } => {
-            *decl_index < cert.declarations.len() && *name < cert.name_table.len()
+            *decl_index < cert.declarations().len() && *name < cert.name_table().len()
         }
     };
     if valid {
@@ -858,18 +854,18 @@ fn decl_constraints(decl: &DeclPayload) -> &[crate::UniverseConstraintSpec] {
 pub(crate) fn build_closure_summary(
     cert: &ModuleCert,
     cost: StructuralCost,
-    imports: &[&crate::VerifiedModule],
+    imports: &[&dyn crate::local_authoring::CertificateImportView],
 ) -> Result<StructuralClosureSummary, CertError> {
     let mut summaries = Vec::new();
     summaries
         .try_reserve_exact(imports.len())
         .map_err(|_| CertError::DecodeError)?;
-    summaries.extend(imports.iter().map(|import| &import.structural_closure));
+    summaries.extend(imports.iter().map(|import| import.structural_closure()));
     merge_closure_summaries(
         StructuralIdentity {
-            module: cert.header.module.clone(),
-            export_hash: cert.hashes.export_hash,
-            certificate_hash: cert.hashes.certificate_hash,
+            module: cert.header().module.clone(),
+            export_hash: cert.hashes().export_hash,
+            certificate_hash: cert.hashes().certificate_hash,
         },
         cost.certificate_expansion,
         &summaries,
@@ -920,10 +916,10 @@ fn merge_closure_summaries(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{AxiomReport, CertHeader, DeclCert, DeclHashes, ModuleHashes};
+    use crate::{AxiomReport, CertHeader, DeclCert, DeclHashes, ModuleCertParts, ModuleHashes};
 
     fn certificate_with_level_root(level_table: Vec<LevelNode>, root: LevelId) -> ModuleCert {
-        ModuleCert {
+        ModuleCert::from_parts(ModuleCertParts {
             header: CertHeader {
                 format: crate::FORMAT.to_string(),
                 core_spec: crate::CORE_SPEC.to_string(),
@@ -957,7 +953,7 @@ mod tests {
                 axiom_report_hash: [0; 32],
                 certificate_hash: [0; 32],
             },
-        }
+        })
     }
 
     fn doubling_levels(steps: usize) -> Vec<LevelNode> {
@@ -1026,14 +1022,16 @@ mod tests {
         }
         terms.push(TermNode::Const {
             global_ref: GlobalRef::Local {
-                decl_index: cert.declarations.len(),
+                decl_index: cert.declarations().len(),
             },
             levels: vec![],
         });
-        cert.term_table = terms;
-        if let DeclPayload::Axiom { ty, .. } = &mut cert.declarations[0].decl {
-            *ty = 0;
-        }
+        cert.mutate_parts_for_test(|parts| {
+            parts.term_table = terms;
+            if let DeclPayload::Axiom { ty, .. } = &mut parts.declarations[0].decl {
+                *ty = 0;
+            }
+        });
 
         assert_eq!(structural_preflight(&cert), Err(CertError::DecodeError));
     }
@@ -1042,12 +1040,14 @@ mod tests {
     fn repeated_roots_enforce_certificate_total_boundary() {
         let levels = doubling_levels(18);
         let mut cert = certificate_with_level_root(levels.clone(), levels.len() - 1);
-        let declaration = cert.declarations[0].clone();
-        cert.declarations = vec![declaration.clone(); 32];
+        let declaration = cert.declarations()[0].clone();
+        cert.mutate_parts_for_test(|parts| {
+            parts.declarations = vec![declaration.clone(); 32];
+        });
         let cost = structural_preflight(&cert).unwrap();
         assert_eq!(cost.certificate_expansion, MAX_CERTIFICATE_EXPANDED_NODES);
 
-        cert.declarations.push(declaration);
+        cert.mutate_parts_for_test(|parts| parts.declarations.push(declaration));
         assert_eq!(
             structural_preflight(&cert),
             Err(CertError::StructuralLimitExceeded {

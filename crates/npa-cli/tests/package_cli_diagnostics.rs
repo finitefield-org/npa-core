@@ -158,7 +158,7 @@ fn command_diagnostic_source_context_renders_exact_json_and_human_order() {
 
     assert_eq!(
         result.render_json(),
-        "{\"schema\":\"npa.package.command_result.v0.4\",\"command\":\"package build-certs\",\"root\":\"<absolute-root>\",\"status\":\"failed\",\"diagnostics\":[{\"kind\":\"Build\",\"reason_code\":\"build_failed\",\"severity\":\"error\",\"module\":\"Proofs.Ai.ExplicitFinite\",\"path\":\"modules[12].source\",\"field\":\"elaborator\",\"actual_value\":\"unannotated Human lambda binder requires an expected function type\",\"checker\":\"frontend\",\"source\":{\"path\":\"Proofs/Ai/ExplicitFinite/source.npa\",\"start_byte\":4821,\"end_byte\":4822,\"declaration\":\"explicit_finite_product_intro\"}}],\"artifacts\":[]}"
+        "{\"schema\":\"npa.package.command_result.v0.5\",\"command\":\"package build-certs\",\"root\":\"<absolute-root>\",\"status\":\"failed\",\"diagnostics\":[{\"kind\":\"Build\",\"reason_code\":\"build_failed\",\"severity\":\"error\",\"module\":\"Proofs.Ai.ExplicitFinite\",\"path\":\"modules[12].source\",\"field\":\"elaborator\",\"actual_value\":\"unannotated Human lambda binder requires an expected function type\",\"checker\":\"frontend\",\"source\":{\"path\":\"Proofs/Ai/ExplicitFinite/source.npa\",\"start_byte\":4821,\"end_byte\":4822,\"declaration\":\"explicit_finite_product_intro\"}}],\"artifacts\":[]}"
     );
     assert_eq!(
         result.render_human(),

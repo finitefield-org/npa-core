@@ -24,9 +24,9 @@ use crate::{
     MachineApiTacticKind, MachineApiUpstreamDiagnostic,
 };
 
-const API_DIAGNOSTIC_TAG: &str = "npa.machine-api.api-diagnostic.v1";
-pub const MACHINE_DIAGNOSTIC_TREE_SCHEMA: &str = "npa.machine-diagnostic-tree.v1";
-const MACHINE_DIAGNOSTIC_TREE_HASH_TAG: &str = "npa.machine-diagnostic-tree.v1";
+const API_DIAGNOSTIC_TAG: &str = "npa.machine-api.api-diagnostic.v2";
+pub const MACHINE_DIAGNOSTIC_TREE_SCHEMA: &str = "npa.machine-diagnostic-tree.v2";
+const MACHINE_DIAGNOSTIC_TREE_HASH_TAG: &str = "npa.machine-diagnostic-tree.v2";
 const MACHINE_DIAGNOSTIC_TREE_MAX_DEPTH: usize = 4;
 const MACHINE_DIAGNOSTIC_TREE_MAX_CHILDREN: usize = 16;
 const MACHINE_DIAGNOSTIC_TREE_MAX_PATH_STEPS: usize = 64;
@@ -981,6 +981,7 @@ fn map_human_diagnostic_kind(kind: &npa_frontend::HumanDiagnosticKind) -> Machin
     use MachineApiErrorKind as Api;
 
     match kind {
+        Human::RemovedTermLet => Api::RemovedTermLet,
         Human::ParseError
         | Human::OpaqueModifierNotFollowedByDef
         | Human::DuplicateOpaqueModifier
@@ -1684,6 +1685,7 @@ fn parse_error_kind(value: &str) -> Result<MachineApiErrorKind, MachineDiagnosti
         "invalid_candidate" => MachineApiErrorKind::InvalidCandidate,
         "invalid_budget" => MachineApiErrorKind::InvalidBudget,
         "unsupported_tactic" => MachineApiErrorKind::UnsupportedTactic,
+        "removed_term_let" => MachineApiErrorKind::RemovedTermLet,
         "machine_term_parse_error" => MachineApiErrorKind::MachineTermParseError,
         "machine_term_elaboration_error" => MachineApiErrorKind::MachineTermElaborationError,
         "unknown_name" => MachineApiErrorKind::UnknownName,
@@ -2534,6 +2536,7 @@ fn primary_name_forbidden(kind: MachineApiErrorKind) -> bool {
             | MachineApiErrorKind::InvalidBudget
             | MachineApiErrorKind::GoalNotOpen
             | MachineApiErrorKind::ReplayHashMismatch
+            | MachineApiErrorKind::RemovedTermLet
             | MachineApiErrorKind::MachineTermParseError
             | MachineApiErrorKind::TypeMismatch
             | MachineApiErrorKind::ExpectedPiType
@@ -2574,7 +2577,8 @@ fn validate_goal_tactic_population(
             ensure_goal_id(diagnostic)?;
             ensure_tactic_kind(diagnostic)
         }
-        MachineApiErrorKind::MachineTermParseError
+        MachineApiErrorKind::RemovedTermLet
+        | MachineApiErrorKind::MachineTermParseError
         | MachineApiErrorKind::MachineTermElaborationError
         | MachineApiErrorKind::UnknownName
         | MachineApiErrorKind::ImplicitArgumentRequired
@@ -3166,7 +3170,7 @@ mod tests {
         let tree = diagnostic_tree_off_fixture("goal display text");
         let diagnostic_hash = tree.diagnostic_hash().unwrap();
         let expected = format!(
-            "{{\"schema\":\"npa.machine-diagnostic-tree.v1\",\"diagnostic_hash\":{},\"kind\":\"goal_not_open\",\"phase\":\"snapshot_lookup\",\"profile\":\"off\",\"goal_id\":\"g7\",\"candidate_hash\":{},\"deterministic_budget_hash\":{},\"state_fingerprint\":{},\"expression_path\":[],\"expected_summary\":null,\"actual_summary\":null,\"related_constraints\":[],\"parent_diagnostic_hash\":null,\"budget_report\":null,\"children\":[],\"source_message\":\"goal display text\",\"pretty_payload\":null}}",
+            "{{\"schema\":\"npa.machine-diagnostic-tree.v2\",\"diagnostic_hash\":{},\"kind\":\"goal_not_open\",\"phase\":\"snapshot_lookup\",\"profile\":\"off\",\"goal_id\":\"g7\",\"candidate_hash\":{},\"deterministic_budget_hash\":{},\"state_fingerprint\":{},\"expression_path\":[],\"expected_summary\":null,\"actual_summary\":null,\"related_constraints\":[],\"parent_diagnostic_hash\":null,\"budget_report\":null,\"children\":[],\"source_message\":\"goal display text\",\"pretty_payload\":null}}",
             json_hash(&diagnostic_hash),
             json_hash(&hash(1)),
             json_hash(&hash(2)),
@@ -3185,7 +3189,7 @@ mod tests {
         let tree = diagnostic_tree_basic_fixture("type mismatch display text");
         let diagnostic_hash = tree.diagnostic_hash().unwrap();
         let expected = format!(
-            "{{\"schema\":\"npa.machine-diagnostic-tree.v1\",\"diagnostic_hash\":{},\"kind\":\"type_mismatch\",\"phase\":\"machine_term_check\",\"profile\":\"basic\",\"goal_id\":\"g7\",\"candidate_hash\":{},\"deterministic_budget_hash\":{},\"state_fingerprint\":{},\"expression_path\":[\"AppFunction\",\"AppArgument(1)\"],\"expected_summary\":{{\"head_symbol\":\"Nat.succ\",\"structural_hash\":{},\"node_count\":3,\"attributes\":{{\"binder_arity\":\"1\",\"head_kind\":\"constant\"}}}},\"actual_summary\":{{\"head_symbol\":\"Bool.true\",\"structural_hash\":{},\"node_count\":3,\"attributes\":{{\"binder_arity\":\"1\",\"head_kind\":\"constant\"}}}},\"related_constraints\":[{{\"constraint_id\":\"c0\",\"kind\":\"rigid_head_mismatch\",\"phase\":\"machine_term_check\",\"lhs_hash\":{},\"rhs_hash\":{},\"path\":[\"AppArgument(1)\"],\"expected_summary\":{{\"head_symbol\":\"Nat.succ\",\"structural_hash\":{},\"node_count\":3,\"attributes\":{{\"binder_arity\":\"1\",\"head_kind\":\"constant\"}}}},\"actual_summary\":{{\"head_symbol\":\"Bool.true\",\"structural_hash\":{},\"node_count\":3,\"attributes\":{{\"binder_arity\":\"1\",\"head_kind\":\"constant\"}}}},\"child_constraint_ids\":[],\"subset_kind\":\"minimal\",\"attributes\":{{}}}}],\"parent_diagnostic_hash\":null,\"budget_report\":null,\"children\":[],\"source_message\":\"type mismatch display text\",\"pretty_payload\":null}}",
+            "{{\"schema\":\"npa.machine-diagnostic-tree.v2\",\"diagnostic_hash\":{},\"kind\":\"type_mismatch\",\"phase\":\"machine_term_check\",\"profile\":\"basic\",\"goal_id\":\"g7\",\"candidate_hash\":{},\"deterministic_budget_hash\":{},\"state_fingerprint\":{},\"expression_path\":[\"AppFunction\",\"AppArgument(1)\"],\"expected_summary\":{{\"head_symbol\":\"Nat.succ\",\"structural_hash\":{},\"node_count\":3,\"attributes\":{{\"binder_arity\":\"1\",\"head_kind\":\"constant\"}}}},\"actual_summary\":{{\"head_symbol\":\"Bool.true\",\"structural_hash\":{},\"node_count\":3,\"attributes\":{{\"binder_arity\":\"1\",\"head_kind\":\"constant\"}}}},\"related_constraints\":[{{\"constraint_id\":\"c0\",\"kind\":\"rigid_head_mismatch\",\"phase\":\"machine_term_check\",\"lhs_hash\":{},\"rhs_hash\":{},\"path\":[\"AppArgument(1)\"],\"expected_summary\":{{\"head_symbol\":\"Nat.succ\",\"structural_hash\":{},\"node_count\":3,\"attributes\":{{\"binder_arity\":\"1\",\"head_kind\":\"constant\"}}}},\"actual_summary\":{{\"head_symbol\":\"Bool.true\",\"structural_hash\":{},\"node_count\":3,\"attributes\":{{\"binder_arity\":\"1\",\"head_kind\":\"constant\"}}}},\"child_constraint_ids\":[],\"subset_kind\":\"minimal\",\"attributes\":{{}}}}],\"parent_diagnostic_hash\":null,\"budget_report\":null,\"children\":[],\"source_message\":\"type mismatch display text\",\"pretty_payload\":null}}",
             json_hash(&diagnostic_hash),
             json_hash(&hash(1)),
             json_hash(&hash(2)),
@@ -3210,7 +3214,7 @@ mod tests {
         let tree = diagnostic_tree_full_fixture("rewrite display text");
         let diagnostic_hash = tree.diagnostic_hash().unwrap();
         let expected = format!(
-            "{{\"schema\":\"npa.machine-diagnostic-tree.v1\",\"diagnostic_hash\":{},\"kind\":\"rewrite_rule_invalid\",\"phase\":\"tactic_execution\",\"profile\":\"full\",\"goal_id\":\"g9\",\"candidate_hash\":{},\"deterministic_budget_hash\":{},\"state_fingerprint\":{},\"expression_path\":[\"RewriteOccurrence(0)\"],\"expected_summary\":{{\"head_symbol\":\"Eq\",\"structural_hash\":{},\"node_count\":3,\"attributes\":{{\"binder_arity\":\"1\",\"head_kind\":\"constant\"}}}},\"actual_summary\":null,\"related_constraints\":[{{\"constraint_id\":\"c0\",\"kind\":\"rewrite_site_blocked\",\"phase\":\"tactic_execution\",\"lhs_hash\":{},\"rhs_hash\":null,\"path\":[\"RewriteOccurrence(0)\"],\"expected_summary\":{{\"head_symbol\":\"Eq\",\"structural_hash\":{},\"node_count\":3,\"attributes\":{{\"binder_arity\":\"1\",\"head_kind\":\"constant\"}}}},\"actual_summary\":null,\"child_constraint_ids\":[],\"subset_kind\":\"reduced\",\"attributes\":{{}}}}],\"parent_diagnostic_hash\":{},\"budget_report\":{{\"truncated\":true,\"graph_nodes\":{{\"used\":5,\"limit\":4,\"truncated\":true}},\"expression_paths\":{{\"used\":2,\"limit\":2,\"truncated\":false}},\"rewrite_site_scans\":{{\"used\":3,\"limit\":1,\"truncated\":true}},\"pretty_term_bytes\":{{\"used\":17,\"limit\":16,\"truncated\":true}},\"repair_proposals\":{{\"used\":1,\"limit\":1,\"truncated\":false}},\"diagnostic_steps\":{{\"used\":9,\"limit\":8,\"truncated\":true}}}},\"children\":[],\"source_message\":\"rewrite display text\",\"pretty_payload\":{{\"message\":\"full pretty payload\",\"pretty_terms\":[\"target pretty term\"],\"repair_proposals\":[\"reverse rewrite\"]}}}}",
+            "{{\"schema\":\"npa.machine-diagnostic-tree.v2\",\"diagnostic_hash\":{},\"kind\":\"rewrite_rule_invalid\",\"phase\":\"tactic_execution\",\"profile\":\"full\",\"goal_id\":\"g9\",\"candidate_hash\":{},\"deterministic_budget_hash\":{},\"state_fingerprint\":{},\"expression_path\":[\"RewriteOccurrence(0)\"],\"expected_summary\":{{\"head_symbol\":\"Eq\",\"structural_hash\":{},\"node_count\":3,\"attributes\":{{\"binder_arity\":\"1\",\"head_kind\":\"constant\"}}}},\"actual_summary\":null,\"related_constraints\":[{{\"constraint_id\":\"c0\",\"kind\":\"rewrite_site_blocked\",\"phase\":\"tactic_execution\",\"lhs_hash\":{},\"rhs_hash\":null,\"path\":[\"RewriteOccurrence(0)\"],\"expected_summary\":{{\"head_symbol\":\"Eq\",\"structural_hash\":{},\"node_count\":3,\"attributes\":{{\"binder_arity\":\"1\",\"head_kind\":\"constant\"}}}},\"actual_summary\":null,\"child_constraint_ids\":[],\"subset_kind\":\"reduced\",\"attributes\":{{}}}}],\"parent_diagnostic_hash\":{},\"budget_report\":{{\"truncated\":true,\"graph_nodes\":{{\"used\":5,\"limit\":4,\"truncated\":true}},\"expression_paths\":{{\"used\":2,\"limit\":2,\"truncated\":false}},\"rewrite_site_scans\":{{\"used\":3,\"limit\":1,\"truncated\":true}},\"pretty_term_bytes\":{{\"used\":17,\"limit\":16,\"truncated\":true}},\"repair_proposals\":{{\"used\":1,\"limit\":1,\"truncated\":false}},\"diagnostic_steps\":{{\"used\":9,\"limit\":8,\"truncated\":true}}}},\"children\":[],\"source_message\":\"rewrite display text\",\"pretty_payload\":{{\"message\":\"full pretty payload\",\"pretty_terms\":[\"target pretty term\"],\"repair_proposals\":[\"reverse rewrite\"]}}}}",
             json_hash(&diagnostic_hash),
             json_hash(&hash(9)),
             json_hash(&hash(10)),
@@ -3357,7 +3361,7 @@ mod tests {
             MachineDiagnosticTreeParseError::DiagnosticHashMismatch { .. }
         ));
 
-        let duplicate = r#"{"schema":"npa.machine-diagnostic-tree.v1","schema":"npa.machine-diagnostic-tree.v1"}"#;
+        let duplicate = r#"{"schema":"npa.machine-diagnostic-tree.v2","schema":"npa.machine-diagnostic-tree.v2"}"#;
         let err = parse_machine_diagnostic_tree_json(duplicate).unwrap_err();
         let MachineDiagnosticTreeParseError::Shape(error) = err else {
             panic!("expected duplicate-key shape error");
@@ -4111,25 +4115,9 @@ mod tests {
             actual_hash: Some(hash(5)),
             repair_operators: vec![RewriteRepairOperator::ReduceSimpSet],
         };
-        let local_value_site = RewriteDiagnosticSite {
-            id: RewriteDiagnosticId(2),
-            kind: RewriteDiagnosticKind::NoMatch,
-            target_kind: RewriteDiagnosticTargetKind::LocalValue,
-            local_name: Some("x".to_owned()),
-            path: vec!["RewriteOccurrence(2)".to_owned()],
-            direction: RewriteDirection::Forward,
-            matched_side: RewriteSite::EqTargetLeft,
-            replacement_side: RewriteSite::EqTargetRight,
-            occurrence_index: Some(2),
-            required_unfoldings: Vec::new(),
-            congruence_depth: 1,
-            expected_hash: Some(hash(8)),
-            actual_hash: Some(hash(9)),
-            repair_operators: Vec::new(),
-        };
         let rewrite = RewriteDiagnostic {
             subset_kind: UnificationConflictSubsetKind::Reduced,
-            sites: vec![goal_site, local_site, local_value_site],
+            sites: vec![goal_site, local_site],
             forward_valid: true,
             backward_valid: true,
             forward_matches_goal: false,
@@ -4170,7 +4158,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(tree.related_constraints.len(), 3);
+        assert_eq!(tree.related_constraints.len(), 2);
         let local = &tree.related_constraints[0];
         assert_eq!(local.constraint_id, "r0");
         assert_eq!(local.kind, "rewrite_no_progress");
@@ -4214,18 +4202,6 @@ mod tests {
         assert_eq!(
             attr_value(&goal.attributes, "repair_operators"),
             Some("reverse_rewrite,select_rewrite_occurrence,unfold")
-        );
-        let local_value = &tree.related_constraints[2];
-        assert_eq!(local_value.constraint_id, "r2");
-        assert_eq!(local_value.kind, "rewrite_no_match");
-        assert_eq!(
-            attr_value(&local_value.attributes, "target_kind"),
-            Some("local_value")
-        );
-        assert_eq!(attr_value(&local_value.attributes, "local_name"), Some("x"));
-        assert_eq!(
-            attr_value(&local_value.attributes, "congruence_depth"),
-            Some("1")
         );
         assert_eq!(
             tree.pretty_payload

@@ -1,0 +1,62 @@
+path	version_axis	disposition
+docs/README.md	npa-cli consumer pin	Update the current adjacent dependency contract from 0.8 to 0.9.
+docs/core/certificate-term-dag-materialization-design.md	performance measurement schema	Retain reviewed v0.7 measurement-schema history; it is not a CLI/toolchain version.
+docs/core/kernel-whnf-application-spine-machine-design.md	mixed measurement and host chronology	Retain measurement-schema history; rewrite the v0.8 host gate version-neutrally.
+docs/core/kernel-whnf-defeq-ephemeral-memoization-design.md	performance measurement schema	Retain reviewed v0.7 measurement-schema history.
+docs/core/package-certificate-artifact-snapshot-design-tasks.md	performance measurement schema	Retain reviewed v0.7 measurement-schema history.
+docs/core/package-certificate-artifact-snapshot-design.md	performance measurement schema	Retain reviewed v0.7 measurement-schema history.
+docs/core/package-changed-selection-git-query-design.md	performance measurement schema	Retain reviewed v0.7 measurement-schema history.
+docs/core/package-fast-verifier-cost-aware-sharding-design.md	performance measurement schema	Retain reviewed v0.7 measurement-schema history.
+docs/core/package-verifier-process-memo-execution-scope-design.md	performance measurement schema	Retain reviewed v0.7 measurement-schema history.
+docs/core/proof-authoring-verified-context-cache-design.md	npa-cli host chronology	Rewrite the v0.8 host command version-neutrally; current instructions move to v0.9.
+docs/core/targeted-build-certs-authoring-cache-performance-evidence.md	percentage measurement	Retain the unrelated 0.8 percent observation.
+docs/flt/int-019-fourth-power-canonical-leaf-proof-tasks.md	npa-cli host chronology	Rewrite recorded v0.8 writer commands version-neutrally.
+docs/flt/proof-roadmap.md	npa-cli host chronology	Rewrite recorded v0.8 writer attempts version-neutrally while preserving outcomes.
+docs/iut/shared-contract.md	npa-cli current operational contract	Advance the runnable current contract to v0.9.
+npa-agents/Cargo.lock	third-party crate versions	Retain unrelated 0.7/0.8 dependency pins unless normal dependency resolution changes them.
+npa-agents/apps/agentctl/tests/fixtures/open_problem/proof_difficulty/lemma_reuse_graph.json	mathematical score	Retain the unrelated 0.8 centrality score.
+npa-agents/crates/agent-store/Cargo.toml	third-party crate version	Retain the unrelated sqlx 0.8 dependency constraint.
+npa-core/Cargo.lock	mixed npa-cli and third-party crate versions	Regenerate the npa-cli entry at 0.9; do not rewrite unrelated dependency versions by number.
+npa-core/crates/npa-api/examples/bench_package_verifier.rs	current performance measurement schema	Advance the current schema with the zeta-field disposition; not a CLI cleanup by number.
+npa-core/crates/npa-api/examples/support/snap_vmsp_controller.rs	current performance measurement schema	Advance the current schema with the zeta-field disposition.
+npa-core/crates/npa-api/examples/support/term_dag_performance.rs	current performance measurement schema	Advance the current schema with the zeta-field disposition.
+npa-core/crates/npa-api/src/independent_checker.rs	synthetic external checker and runner versions	Retain reviewed 0.8 fixture values; they are not npa-cli identities.
+npa-core/crates/npa-api/src/performance_gate.rs	current performance measurement schema	Advance the current schema with the zeta-field disposition.
+npa-core/crates/npa-api/src/performance_measurement.rs	performance measurement schema	Retain historical v0.7 reader identity; advance current v0.8 for the zeta-field change.
+npa-core/crates/npa-cli/Cargo.toml	npa-cli crate version	Bump exactly from 0.8.0 to 0.9.0.
+npa-core/crates/npa-cli/examples/bench_package_artifact_snapshot.rs	current performance measurement schema	Advance the current schema with the zeta-field disposition.
+npa-core/crates/npa-cli/examples/bench_package_changed_selection.rs	performance measurement schema	Retain historical v0.7 readers; advance current v0.8 with the schema ledger.
+npa-core/crates/npa-cli/src/release_manifest.rs	mixed npa-cli host matrix and performance schema	Remove v0.7/v0.8 host compatibility branches, add v0.9 current validation, and preserve only separately justified historical measurement readers.
+npa-core/crates/npa-cli/tests/package_api_v1.rs	npa-cli crate version	Update the exact current version assertion to 0.9.0.
+npa-core/crates/npa-cli/tests/package_build_certs_check.rs	npa-cli build identity	Remove 0.7/0.8 current-identity fixtures and cover the v0.9 identity plus retired-input rejection.
+npa-core/crates/npa-cli/tests/package_timings.rs	current performance measurement schema	Advance expected current schema with the zeta-field disposition.
+npa-core/crates/npa-cli/tests/release_manifest_validator.rs	npa-cli host matrix	Remove v0.7/v0.8 supported-host cases and add v0.9 current plus retired-host rejection coverage.
+npa-core/crates/npa-package/Cargo.toml	third-party crate version	Retain the unrelated toml 0.8 dependency constraint.
+npa-core/docs/package-changed-selection-git-query-rollout.md	performance measurement schema	Retain reviewed v0.7 measurement-schema history.
+npa-core/scripts/bench-package-verifier-linear-dag-planning.sh	current performance measurement schema	Advance the current schema with the zeta-field disposition.
+npa-core/scripts/check-performance.sh	performance measurement schema	Retain explicit historical readers and advance the current v0.8 schema according to the disposition ledger.
+npa-core/scripts/tests/check-performance-changed-selection.sh	current performance measurement schema	Advance the current fixture schema with the zeta-field disposition.
+npa-core/scripts/tests/check-performance-package-verifier-process-memo.sh	current performance measurement schema	Advance the current fixture schema with the zeta-field disposition.
+npa-core/scripts/tests/fixtures/fake-linear-dag-iut.sh	current performance measurement schema	Advance the current fixture schema with the zeta-field disposition.
+npa-core/testdata/performance/baselines/certificate-term-dag-materialization.measurements.v0.1.json	current performance measurement schema	Regenerate under the advanced current schema.
+npa-core/testdata/performance/baselines/measurements.v0.1.json	current performance measurement schema	Regenerate under the advanced current schema.
+npa-core/testdata/performance/fixtures/common-measurement-historical-readers.v0.1.json	historical performance measurement schema	Retain the explicitly historical untrusted v0.7 reader fixtures.
+npa-core/testdata/release-manifest/invalid-incompatible-cli-version.json	npa-cli host fixture	Delete or replace the v0.7 fixture with deterministic retired-host rejection under the v0.9 matrix.
+npa-core/testdata/release-manifest/valid-v0.2-current.json	npa-cli host fixture	Regenerate the current fixture for npa-cli 0.9.0 and the new command-result contract.
+npa-corpus/Cargo.lock	mixed npa-cli and third-party crate versions	Regenerate the npa-cli entry at 0.9; retain unrelated dependency versions.
+npa-corpus/tools/proof-corpus/Cargo.toml	mixed npa-cli and third-party crate versions	Bump the npa-cli path dependency to 0.9; retain the unrelated toml 0.8 dependency.
+npa-lean-exporter/Cargo.lock	third-party crate versions	Retain unrelated 0.7/0.8 dependency pins unless normal dependency resolution changes them.
+npa-project-navier-stokes/docs/consultations/cauchy-real-finite-galerkin-raw-difference-inner-bound-le-local-bound-opaque-npa-proof-consultation-2026-08-29.md	npa-cli historical environment	Rewrite the old host version version-neutrally while preserving the consultation result.
+npa-project-navier-stokes/docs/consultations/cauchy-real-interval-countable-additivity-npa-proof-consultation-2026-08-16.md	npa-cli historical environment	Rewrite the old host version version-neutrally while preserving the consultation result.
+npa-project-navier-stokes/docs/consultations/scaltrigval-001-npa-proof-consultation-2026-08-07.md	npa-cli historical environment	Rewrite the retired v0.7 host version version-neutrally.
+npa-project-poincare/docs/consultations/pc-099fnd-001-monotone-bar-induction-foundation-decision-npa-proof-consultation-2026-08-18.md	npa-cli historical environment	Rewrite the old host version version-neutrally while preserving the consultation result.
+npa-project-poincare/docs/consultations/thm-009-lagged-center-branchwise-bar-to-inductive-bar-npa-proof-consultation-2026-08-16.md	npa-cli historical environment	Rewrite the old host version version-neutrally while preserving the consultation result.
+npa-project-poincare/docs/consultations/thm-009-monotone-bar-induction-route-b-npa-proof-consultation-2026-08-17.md	npa-cli historical environment	Rewrite the old host version version-neutrally while preserving the consultation result.
+npa-project-poincare/docs/proof-roadmap.md	npa-cli historical environment	Rewrite the old host version version-neutrally while preserving the recorded check outcome.
+npa-project-riemann-hypothesis/docs/rh/rh-014b-positive-power-bridge-blocker.md	npa-cli historical environment	Rewrite the retired v0.7 host version version-neutrally.
+npa-web/Cargo.lock	mixed npa-cli and third-party crate versions	Regenerate the npa-cli entry at 0.9; retain unrelated dependency versions.
+npa-web/Cargo.toml	mixed npa-cli and third-party crate versions	Bump the npa-cli path dependency to 0.9; retain the unrelated axum 0.8 dependency.
+suggestions.md	npa-cli current toolchain claim	Resolve or rewrite the current-v0.8 claim when the v0.9 implementation supersedes it.
+thesis/iut/main.tex	TeX layout dimension	Retain the unrelated 0.8em spacing values.
+tools/npa-container-tools/Cargo.lock	third-party crate versions	Retain unrelated 0.7/0.8 dependency pins unless normal dependency resolution changes them.
+tools/npa-container-tools/src/consumer_manifests.rs	npa-cli consumer compatibility	Advance the expected adjacent npa-cli compatibility version from 0.8 to 0.9.

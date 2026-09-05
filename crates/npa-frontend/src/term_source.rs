@@ -4,7 +4,7 @@ use crate::{
 };
 use sha2::{Digest, Sha256};
 
-const TERM_SOURCE_TAG: &str = "npa.frontend.machine-term-source.v1";
+const TERM_SOURCE_TAG: &str = "npa.frontend.machine-term-source.v2";
 const MAX_CANONICAL_STRING_LEN: usize = 1 << 20;
 const MAX_CANONICAL_LIST_LEN: usize = 100_000;
 const MAX_CANONICAL_NODES: usize = 100_000;
@@ -110,30 +110,6 @@ fn validate_term_for_canonical_encoding_at_depth(
                     remaining_nodes,
                 )?;
             }
-            validate_term_for_canonical_encoding_at_depth(
-                body,
-                child_depth(depth)?,
-                remaining_nodes,
-            )?;
-        }
-        MachineTerm::Let {
-            name,
-            ty,
-            value,
-            body,
-            ..
-        } => {
-            validate_identifier_for_canonical_encoding(name, "let name")?;
-            validate_term_for_canonical_encoding_at_depth(
-                ty,
-                child_depth(depth)?,
-                remaining_nodes,
-            )?;
-            validate_term_for_canonical_encoding_at_depth(
-                value,
-                child_depth(depth)?,
-                remaining_nodes,
-            )?;
             validate_term_for_canonical_encoding_at_depth(
                 body,
                 child_depth(depth)?,
@@ -557,19 +533,6 @@ fn encode_term_to(out: &mut Vec<u8>, term: &MachineTerm) {
             encode_binders_to(out, binders);
             encode_term_to(out, body);
         }
-        MachineTerm::Let {
-            name,
-            ty,
-            value,
-            body,
-            ..
-        } => {
-            out.push(0x06);
-            encode_string_to(out, name);
-            encode_term_to(out, ty);
-            encode_term_to(out, value);
-            encode_term_to(out, body);
-        }
         MachineTerm::Annot { expr, ty, .. } => {
             out.push(0x07);
             encode_term_to(out, expr);
@@ -725,13 +688,7 @@ impl<'a> Decoder<'a> {
                 body: Box::new(self.term_at_depth(self.child_depth(depth)?)?),
                 span,
             }),
-            0x06 => Ok(MachineTerm::Let {
-                name: self.identifier("let name")?,
-                ty: Box::new(self.term_at_depth(self.child_depth(depth)?)?),
-                value: Box::new(self.term_at_depth(self.child_depth(depth)?)?),
-                body: Box::new(self.term_at_depth(self.child_depth(depth)?)?),
-                span,
-            }),
+            0x06 => Err(self.decode_error("removed Machine Surface let term tag")),
             0x07 => Ok(MachineTerm::Annot {
                 expr: Box::new(self.term_at_depth(self.child_depth(depth)?)?),
                 ty: Box::new(self.term_at_depth(self.child_depth(depth)?)?),
@@ -991,14 +948,14 @@ mod tests {
         let expected_bytes = vec![
             0x23, 0x6e, 0x70, 0x61, 0x2e, 0x66, 0x72, 0x6f, 0x6e, 0x74, 0x65, 0x6e, 0x64, 0x2e,
             0x6d, 0x61, 0x63, 0x68, 0x69, 0x6e, 0x65, 0x2d, 0x74, 0x65, 0x72, 0x6d, 0x2d, 0x73,
-            0x6f, 0x75, 0x72, 0x63, 0x65, 0x2e, 0x76, 0x31, 0x03, 0x03, 0x00, 0x02, 0x02, 0x45,
+            0x6f, 0x75, 0x72, 0x63, 0x65, 0x2e, 0x76, 0x32, 0x03, 0x03, 0x00, 0x02, 0x02, 0x45,
             0x71, 0x04, 0x72, 0x65, 0x66, 0x6c, 0x01, 0x01, 0x01, 0x00, 0x01, 0x00, 0x01, 0x03,
             0x4e, 0x61, 0x74, 0x00, 0x00, 0x00, 0x01, 0x01, 0x6e, 0x00, 0x00,
         ];
         let expected_hash = [
-            0x60, 0x8f, 0x3f, 0x0b, 0xa3, 0x6d, 0xbb, 0xaa, 0xd6, 0x8b, 0x50, 0x0a, 0xd8, 0x9e,
-            0x90, 0x43, 0x18, 0x1a, 0xeb, 0x6c, 0x3d, 0xcf, 0xd9, 0x3e, 0xcc, 0xdb, 0x36, 0x8f,
-            0x7d, 0x29, 0x89, 0xcf,
+            0xe8, 0xa2, 0xff, 0xaf, 0xd4, 0x74, 0xc4, 0xef, 0x71, 0x7e, 0x83, 0xf1, 0x45, 0x59,
+            0x01, 0x91, 0x3d, 0x4c, 0xa9, 0x70, 0x8f, 0x70, 0x2d, 0xbf, 0xfd, 0x68, 0x1f, 0x23,
+            0x30, 0xe2, 0x6f, 0xa4,
         ];
 
         assert_eq!(canonical.canonical_bytes, expected_bytes);
@@ -1027,9 +984,9 @@ mod tests {
         assert_eq!(
             canonical.canonical_hash,
             [
-                0x60, 0x8f, 0x3f, 0x0b, 0xa3, 0x6d, 0xbb, 0xaa, 0xd6, 0x8b, 0x50, 0x0a, 0xd8, 0x9e,
-                0x90, 0x43, 0x18, 0x1a, 0xeb, 0x6c, 0x3d, 0xcf, 0xd9, 0x3e, 0xcc, 0xdb, 0x36, 0x8f,
-                0x7d, 0x29, 0x89, 0xcf,
+                0xe8, 0xa2, 0xff, 0xaf, 0xd4, 0x74, 0xc4, 0xef, 0x71, 0x7e, 0x83, 0xf1, 0x45, 0x59,
+                0x01, 0x91, 0x3d, 0x4c, 0xa9, 0x70, 0x8f, 0x70, 0x2d, 0xbf, 0xfd, 0x68, 0x1f, 0x23,
+                0x30, 0xe2, 0x6f, 0xa4,
             ]
         );
     }
@@ -1175,6 +1132,18 @@ mod tests {
 
         decode_machine_term_source_canonical(&bytes)
             .expect_err("resolved locals cannot be produced by the parser");
+    }
+
+    #[test]
+    fn decoder_rejects_removed_let_tag_before_reading_legacy_children() {
+        let bytes = canonical_bytes_with_term(|bytes| {
+            bytes.push(0x06);
+            encode_uvar_to(bytes, MAX_CANONICAL_LIST_LEN as u64 + 1);
+        });
+
+        let diagnostic = decode_machine_term_source_canonical(&bytes)
+            .expect_err("the retired let tag must fail before decoding its former payload");
+        assert_eq!(diagnostic.message, "removed Machine Surface let term tag");
     }
 
     #[test]

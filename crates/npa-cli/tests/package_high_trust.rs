@@ -140,11 +140,11 @@ fn high_trust_runner_policy() -> IndependentCheckerRunnerPolicy {
         .map(|(index, profile)| IndependentCheckerAllowlistEntry {
             profile: profile.clone(),
             checker_id: checker_id(profile),
-            checker_version: (profile == "external").then(|| "0.3.0".to_owned()),
+            checker_version: (profile == "external").then(|| "0.4.0".to_owned()),
             raw_result_schema: (profile == "external")
                 .then(|| "npa.independent-checker.checker_raw_result.v2".to_owned()),
-            certificate_format: (profile == "external").then(|| "NPA-CERT-0.3.0".to_owned()),
-            core_spec: (profile == "external").then(|| "NPA-Core-0.3.0".to_owned()),
+            certificate_format: (profile == "external").then(|| "NPA-CERT-0.4.0".to_owned()),
+            core_spec: (profile == "external").then(|| "NPA-Core-0.4.0".to_owned()),
             binary_id: binary_id(profile),
             binary_hash: hash(10 + index as u8),
             build_hash: hash(20 + index as u8),

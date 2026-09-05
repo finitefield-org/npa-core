@@ -9,7 +9,9 @@
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Component, Path, PathBuf};
+use std::fs::File;
+use std::io::Read as _;
+use std::path::{Component, Path};
 use std::sync::Arc;
 
 use npa_cert::{
@@ -34,25 +36,25 @@ use crate::adapter::{
 use crate::types::machine_api_name_canonical_bytes;
 use crate::MachineApiErrorKind;
 
-const CANDIDATE_HASH_TAG: &str = "npa.advanced-ai.candidate.v1";
+const CANDIDATE_HASH_TAG: &str = "npa.advanced-ai.candidate.v2";
 const OPTIONS_HASH_TAG: &str = "npa.advanced-ai.options.v1";
 const ENV_FINGERPRINT_TAG: &str = "npa.advanced-ai.env.v1";
-const GOAL_FINGERPRINT_TAG: &str = "npa.advanced-ai.goal.v1";
-const VALIDATION_RESULT_HASH_TAG: &str = "npa.advanced-ai.validation_result.v1";
+const GOAL_FINGERPRINT_TAG: &str = "npa.advanced-ai.goal.v2";
+const VALIDATION_RESULT_HASH_TAG: &str = "npa.advanced-ai.validation_result.v2";
 const UNIVERSE_CONSTRAINT_SET_HASH_TAG: &str = "npa.advanced-ai.universe.constraints.v1";
 const THEOREM_GRAPH_SNAPSHOT_HASH_TAG: &str = "npa.advanced-ai.theorem_graph.snapshot.v1";
 const THEOREM_GRAPH_QUERY_FEATURES_HASH_TAG: &str =
     "npa.advanced-ai.theorem_graph.query_features.v1";
-const SMT_PROBLEM_HASH_TAG: &str = "npa.advanced-ai.smt.problem.v1";
+const SMT_PROBLEM_HASH_TAG: &str = "npa.advanced-ai.smt.problem.v2";
 const SMT_ENCODING_HASH_TAG: &str = "npa.advanced-ai.smt.encoding.v1";
 const SMT_LIB_PROBLEM_HASH_TAG: &str = "npa.advanced-ai.smt.smtlib_problem.v1";
-const SMT_PROOF_PAYLOAD_HASH_TAG: &str = "npa.advanced-ai.smt.proof_payload.v1";
+const SMT_PROOF_PAYLOAD_HASH_TAG: &str = "npa.advanced-ai.smt.proof_payload.v2";
 const SMT_OPAQUE_PROOF_PAYLOAD_HASH_TAG: &str = "npa.advanced-ai.smt.opaque_proof_payload.v1";
-const SMT_RECONSTRUCTION_PLAN_HASH_TAG: &str = "npa.advanced-ai.smt.reconstruction_plan.v1";
+const SMT_RECONSTRUCTION_PLAN_HASH_TAG: &str = "npa.advanced-ai.smt.reconstruction_plan.v2";
 const SMT_CERTIFICATE_METADATA_HASH_TAG: &str = "npa.advanced-ai.smt.certificate_metadata.v1";
 const SMT_NAT_TO_INT_SIDE_CONDITION_HASH_TAG: &str =
-    "npa.advanced-ai.smt.nat_to_int_side_condition.v1";
-const SMT_COMMAND_ID_HASH_TAG: &str = "npa.advanced-ai.smt.command_id.v1";
+    "npa.advanced-ai.smt.nat_to_int_side_condition.v2";
+const SMT_COMMAND_ID_HASH_TAG: &str = "npa.advanced-ai.smt.command_id.v2";
 const SMT_SYMBOL_HASH_TAG: &str = "npa.advanced-ai.smt.symbol.v1";
 const SMT_RULE_DESCRIPTOR_HASH_TAG: &str = "npa.advanced-ai.smt.rule_descriptor.v1";
 const SMT_RULE_DESCRIPTOR_FINGERPRINT_TAG: &str =
@@ -67,9 +69,9 @@ const FORMALIZATION_CLAIM_SPAN_HASH_TAG: &str = "npa.advanced-ai.formalization.c
 const FORMALIZATION_REJECTION_REASON_HASH_TAG: &str =
     "npa.advanced-ai.formalization.rejection_reason.v1";
 const FORMALIZATION_CANDIDATE_STATEMENT_HASH_TAG: &str =
-    "npa.advanced-ai.formalization.candidate_statement.v1";
+    "npa.advanced-ai.formalization.candidate_statement.v2";
 const FORMALIZATION_ACCEPTED_STATEMENT_HASH_TAG: &str =
-    "npa.advanced-ai.formalization.accepted_statement.v1";
+    "npa.advanced-ai.formalization.accepted_statement.v2";
 const FORMALIZATION_PROOF_ROOT_HASH_TAG: &str = "npa.advanced-ai.formalization.proof_root.v1";
 const EXTERNAL_INDEX_UPDATE_KEY_HASH_TAG: &str = "npa.advanced-ai.external_index_update.key.v1";
 
@@ -1442,9 +1444,6 @@ pub enum AdvancedMachineExprPathStep {
     LamBody,
     PiDomain,
     PiCodomain,
-    LetType,
-    LetValue,
-    LetBody,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -4192,34 +4191,24 @@ fn read_advanced_ai_formalization_artifact(
             None,
         ));
     }
-    let path = match validate_artifact_path(workspace_root, path) {
-        Ok(path) => path,
-        Err(ArtifactPathError::EnvelopeMalformed) => {
-            return Err(rejected_response(
-                candidate_hash,
-                AdvancedAiValidationError::EnvelopeMalformed,
-                None,
-            ));
-        }
-        Err(ArtifactPathError::ArtifactUnavailable) => {
-            return Err(AdvancedAiEndpointResponse::Error {
-                error: AdvancedAiEndpointError::ArtifactUnavailable,
-            });
-        }
-    };
-    let metadata = std::fs::metadata(&path).map_err(|_| AdvancedAiEndpointResponse::Error {
-        error: AdvancedAiEndpointError::ArtifactUnavailable,
-    })?;
-    if metadata.len() != size_bytes {
-        return Err(rejected_response(
-            candidate_hash,
-            AdvancedAiValidationError::PayloadHashMismatch,
-            None,
-        ));
-    }
-    let bytes = std::fs::read(path).map_err(|_| AdvancedAiEndpointResponse::Error {
-        error: AdvancedAiEndpointError::ArtifactUnavailable,
-    })?;
+    let bytes =
+        read_advanced_ai_artifact_bytes(workspace_root, path, size_bytes).map_err(|error| {
+            match error {
+                ArtifactPathError::EnvelopeMalformed => rejected_response(
+                    candidate_hash,
+                    AdvancedAiValidationError::EnvelopeMalformed,
+                    None,
+                ),
+                ArtifactPathError::ArtifactUnavailable => AdvancedAiEndpointResponse::Error {
+                    error: AdvancedAiEndpointError::ArtifactUnavailable,
+                },
+                ArtifactPathError::SizeMismatch => rejected_response(
+                    candidate_hash,
+                    AdvancedAiValidationError::PayloadHashMismatch,
+                    None,
+                ),
+            }
+        })?;
     if advanced_ai_file_hash(&bytes) != file_hash {
         return Err(rejected_response(
             candidate_hash,
@@ -4876,7 +4865,7 @@ fn run_advanced_ai_inductive_validated(
             error: AdvancedAiEndpointError::InternalValidatorFailure,
         };
     }
-    let Some(decl) = cert.declarations.first() else {
+    let Some(decl) = cert.declarations().first() else {
         return AdvancedAiEndpointResponse::Error {
             error: AdvancedAiEndpointError::InternalValidatorFailure,
         };
@@ -5833,25 +5822,23 @@ fn validate_options_ref(
                     None,
                 ));
             }
-            let path = match validate_artifact_path(workspace_root, path) {
-                Ok(path) => path,
-                Err(ArtifactPathError::EnvelopeMalformed) => {
-                    return Err(rejected_response(
+            let bytes = read_advanced_ai_artifact_bytes(workspace_root, path, *size_bytes)
+                .map_err(|error| match error {
+                    ArtifactPathError::EnvelopeMalformed => rejected_response(
                         candidate_hash,
                         AdvancedAiValidationError::EnvelopeMalformed,
                         None,
-                    ));
-                }
-                Err(ArtifactPathError::ArtifactUnavailable) => {
-                    return Err(AdvancedAiEndpointResponse::Error {
+                    ),
+                    ArtifactPathError::ArtifactUnavailable => AdvancedAiEndpointResponse::Error {
                         error: AdvancedAiEndpointError::ArtifactUnavailable,
-                    });
-                }
-            };
-            let bytes = std::fs::read(path).map_err(|_| AdvancedAiEndpointResponse::Error {
-                error: AdvancedAiEndpointError::ArtifactUnavailable,
-            })?;
-            if bytes.len() as u64 != *size_bytes || advanced_ai_file_hash(&bytes) != *file_hash {
+                    },
+                    ArtifactPathError::SizeMismatch => rejected_response(
+                        candidate_hash,
+                        AdvancedAiValidationError::PayloadHashMismatch,
+                        None,
+                    ),
+                })?;
+            if advanced_ai_file_hash(&bytes) != *file_hash {
                 return Err(rejected_response(
                     candidate_hash,
                     AdvancedAiValidationError::PayloadHashMismatch,
@@ -6103,11 +6090,7 @@ fn advanced_ai_typeclass_candidate_targets_are_unique(
 fn advanced_ai_goal_ctx(goal: &AdvancedAiGoal) -> Ctx {
     let mut ctx = Ctx::new();
     for local in &goal.local_context {
-        if let Some(value) = &local.value {
-            ctx.push_definition(local.name.clone(), local.ty.clone(), value.clone());
-        } else {
-            ctx.push_assumption(local.name.clone(), local.ty.clone());
-        }
+        ctx.push_assumption(local.name.clone(), local.ty.clone());
     }
     ctx
 }
@@ -6730,7 +6713,6 @@ fn advanced_ai_match_typeclass_expr(
             )?),
             _ => Ok(false),
         },
-        Expr::Let { .. } => Ok(false),
     }
 }
 
@@ -6874,41 +6856,6 @@ fn advanced_ai_replace_candidate_bvars(
                 None => return Ok(None),
             },
         ),
-        Expr::Let {
-            binder,
-            ty,
-            value,
-            body,
-        } => Expr::let_in(
-            binder.clone(),
-            match advanced_ai_replace_candidate_bvars(
-                ty,
-                candidate_context_len,
-                local_depth,
-                term_assignments,
-            )? {
-                Some(ty) => ty,
-                None => return Ok(None),
-            },
-            match advanced_ai_replace_candidate_bvars(
-                value,
-                candidate_context_len,
-                local_depth,
-                term_assignments,
-            )? {
-                Some(value) => value,
-                None => return Ok(None),
-            },
-            match advanced_ai_replace_candidate_bvars(
-                body,
-                candidate_context_len,
-                local_depth + 1,
-                term_assignments,
-            )? {
-                Some(body) => body,
-                None => return Ok(None),
-            },
-        ),
     }))
 }
 
@@ -6938,23 +6885,6 @@ fn advanced_ai_candidate_expr_has_only_telescope_bvars(
         Expr::Lam { ty, body, .. } | Expr::Pi { ty, body, .. } => {
             advanced_ai_candidate_expr_has_only_telescope_bvars(
                 ty,
-                candidate_context_len,
-                local_depth,
-            ) && advanced_ai_candidate_expr_has_only_telescope_bvars(
-                body,
-                candidate_context_len,
-                local_depth + 1,
-            )
-        }
-        Expr::Let {
-            ty, value, body, ..
-        } => {
-            advanced_ai_candidate_expr_has_only_telescope_bvars(
-                ty,
-                candidate_context_len,
-                local_depth,
-            ) && advanced_ai_candidate_expr_has_only_telescope_bvars(
-                value,
                 candidate_context_len,
                 local_depth,
             ) && advanced_ai_candidate_expr_has_only_telescope_bvars(
@@ -7141,34 +7071,24 @@ fn advanced_ai_smt_artifact_bytes(
             AdvancedSmtCertificateError::NonCanonicalPayload,
         ));
     }
-    let path = match validate_artifact_path(workspace_root, path) {
-        Ok(path) => path,
-        Err(ArtifactPathError::EnvelopeMalformed) => {
-            return Err(smt_rejected_response(
-                candidate_hash,
-                AdvancedAiValidationError::EnvelopeMalformed,
-                AdvancedSmtCertificateError::NonCanonicalPayload,
-            ));
-        }
-        Err(ArtifactPathError::ArtifactUnavailable) => {
-            return Err(AdvancedAiEndpointResponse::Error {
-                error: AdvancedAiEndpointError::ArtifactUnavailable,
-            });
-        }
-    };
-    let metadata = std::fs::metadata(&path).map_err(|_| AdvancedAiEndpointResponse::Error {
-        error: AdvancedAiEndpointError::ArtifactUnavailable,
-    })?;
-    if metadata.len() != size_bytes {
-        return Err(rejected_response(
-            candidate_hash,
-            AdvancedAiValidationError::PayloadHashMismatch,
-            None,
-        ));
-    }
-    let bytes = std::fs::read(path).map_err(|_| AdvancedAiEndpointResponse::Error {
-        error: AdvancedAiEndpointError::ArtifactUnavailable,
-    })?;
+    let bytes =
+        read_advanced_ai_artifact_bytes(workspace_root, path, size_bytes).map_err(|error| {
+            match error {
+                ArtifactPathError::EnvelopeMalformed => smt_rejected_response(
+                    candidate_hash,
+                    AdvancedAiValidationError::EnvelopeMalformed,
+                    AdvancedSmtCertificateError::NonCanonicalPayload,
+                ),
+                ArtifactPathError::ArtifactUnavailable => AdvancedAiEndpointResponse::Error {
+                    error: AdvancedAiEndpointError::ArtifactUnavailable,
+                },
+                ArtifactPathError::SizeMismatch => rejected_response(
+                    candidate_hash,
+                    AdvancedAiValidationError::PayloadHashMismatch,
+                    None,
+                ),
+            }
+        })?;
     if advanced_ai_file_hash(&bytes) != file_hash {
         return Err(rejected_response(
             candidate_hash,
@@ -8733,7 +8653,11 @@ fn advanced_ai_check_smt_final_proof_certificate(
     }
 
     let (closed_type, closed_proof) =
-        advanced_ai_close_smt_goal_for_certificate(&candidate.goal, final_proof);
+        advanced_ai_close_smt_goal_for_certificate(&candidate.goal, final_proof).map_err(|_| {
+            AdvancedAiEndpointResponse::Error {
+                error: AdvancedAiEndpointError::InternalValidatorFailure,
+            }
+        })?;
     let module = advanced_ai_smt_scratch_module(candidate_hash);
     let theorem_name = advanced_ai_smt_scratch_theorem(candidate_hash).as_dotted();
     let import_modules = verified_imports
@@ -8785,29 +8709,17 @@ fn advanced_ai_check_smt_final_proof_certificate(
     Ok(())
 }
 
-fn advanced_ai_close_smt_goal_for_certificate(goal: &AdvancedAiGoal, proof: &Expr) -> (Expr, Expr) {
+fn advanced_ai_close_smt_goal_for_certificate(
+    goal: &AdvancedAiGoal,
+    proof: &Expr,
+) -> npa_kernel::Result<(Expr, Expr)> {
     let mut ty = goal.target.clone();
     let mut value = proof.clone();
     for local in goal.local_context.iter().rev() {
-        if let Some(local_value) = &local.value {
-            ty = Expr::let_in(
-                local.name.clone(),
-                local.ty.clone(),
-                local_value.clone(),
-                ty,
-            );
-            value = Expr::let_in(
-                local.name.clone(),
-                local.ty.clone(),
-                local_value.clone(),
-                value,
-            );
-        } else {
-            ty = Expr::pi(local.name.clone(), local.ty.clone(), ty);
-            value = Expr::lam(local.name.clone(), local.ty.clone(), value);
-        }
+        ty = Expr::pi(local.name.clone(), local.ty.clone(), ty);
+        value = Expr::lam(local.name.clone(), local.ty.clone(), value);
     }
-    (ty, value)
+    Ok((ty, value))
 }
 
 fn advanced_ai_smt_scratch_module(candidate_hash: Hash) -> ModuleName {
@@ -8968,34 +8880,24 @@ fn advanced_ai_theorem_graph_artifact_bytes(
             malformed_error,
         ));
     }
-    let path = match validate_artifact_path(workspace_root, path) {
-        Ok(path) => path,
-        Err(ArtifactPathError::EnvelopeMalformed) => {
-            return Err(theorem_graph_rejected_response(
-                candidate_hash,
-                AdvancedAiValidationError::EnvelopeMalformed,
-                malformed_error,
-            ));
-        }
-        Err(ArtifactPathError::ArtifactUnavailable) => {
-            return Err(AdvancedAiEndpointResponse::Error {
-                error: AdvancedAiEndpointError::ArtifactUnavailable,
-            });
-        }
-    };
-    let metadata = std::fs::metadata(&path).map_err(|_| AdvancedAiEndpointResponse::Error {
-        error: AdvancedAiEndpointError::ArtifactUnavailable,
-    })?;
-    if metadata.len() != size_bytes {
-        return Err(rejected_response(
-            candidate_hash,
-            AdvancedAiValidationError::PayloadHashMismatch,
-            None,
-        ));
-    }
-    let bytes = std::fs::read(path).map_err(|_| AdvancedAiEndpointResponse::Error {
-        error: AdvancedAiEndpointError::ArtifactUnavailable,
-    })?;
+    let bytes =
+        read_advanced_ai_artifact_bytes(workspace_root, path, size_bytes).map_err(|error| {
+            match error {
+                ArtifactPathError::EnvelopeMalformed => theorem_graph_rejected_response(
+                    candidate_hash,
+                    AdvancedAiValidationError::EnvelopeMalformed,
+                    malformed_error,
+                ),
+                ArtifactPathError::ArtifactUnavailable => AdvancedAiEndpointResponse::Error {
+                    error: AdvancedAiEndpointError::ArtifactUnavailable,
+                },
+                ArtifactPathError::SizeMismatch => rejected_response(
+                    candidate_hash,
+                    AdvancedAiValidationError::PayloadHashMismatch,
+                    None,
+                ),
+            }
+        })?;
     if advanced_ai_file_hash(&bytes) != file_hash {
         return Err(rejected_response(
             candidate_hash,
@@ -9369,13 +9271,6 @@ fn expr_contains_const_name(expr: &Expr, needle: &str) -> bool {
         Expr::Lam { ty, body, .. } | Expr::Pi { ty, body, .. } => {
             expr_contains_const_name(ty, needle) || expr_contains_const_name(body, needle)
         }
-        Expr::Let {
-            ty, value, body, ..
-        } => {
-            expr_contains_const_name(ty, needle)
-                || expr_contains_const_name(value, needle)
-                || expr_contains_const_name(body, needle)
-        }
     }
 }
 
@@ -9413,21 +9308,6 @@ fn expr_imported_refs_are_resolved_with_allowed_locals(
         }
         Expr::Lam { ty, body, .. } | Expr::Pi { ty, body, .. } => {
             expr_imported_refs_are_resolved_with_allowed_locals(ty, imports, allowed_local_names)
-                && expr_imported_refs_are_resolved_with_allowed_locals(
-                    body,
-                    imports,
-                    allowed_local_names,
-                )
-        }
-        Expr::Let {
-            ty, value, body, ..
-        } => {
-            expr_imported_refs_are_resolved_with_allowed_locals(ty, imports, allowed_local_names)
-                && expr_imported_refs_are_resolved_with_allowed_locals(
-                    value,
-                    imports,
-                    allowed_local_names,
-                )
                 && expr_imported_refs_are_resolved_with_allowed_locals(
                     body,
                     imports,
@@ -9643,10 +9523,6 @@ fn advanced_ai_string_list_is_unique(values: &[String]) -> bool {
 
 fn local_decl_levels_are_in_scope(local: &MachineLocalDecl, params: &[String]) -> bool {
     expr_levels_are_in_scope(&local.ty, params)
-        && local
-            .value
-            .as_ref()
-            .is_none_or(|value| expr_levels_are_in_scope(value, params))
 }
 
 fn expr_levels_are_in_scope(expr: &Expr, params: &[String]) -> bool {
@@ -9659,13 +9535,6 @@ fn expr_levels_are_in_scope(expr: &Expr, params: &[String]) -> bool {
         }
         Expr::Lam { ty, body, .. } | Expr::Pi { ty, body, .. } => {
             expr_levels_are_in_scope(ty, params) && expr_levels_are_in_scope(body, params)
-        }
-        Expr::Let {
-            ty, value, body, ..
-        } => {
-            expr_levels_are_in_scope(ty, params)
-                && expr_levels_are_in_scope(value, params)
-                && expr_levels_are_in_scope(body, params)
         }
     }
 }
@@ -9689,13 +9558,10 @@ fn constraint_levels_are_in_scope(
 }
 
 fn goal_imported_refs_are_resolved(goal: &AdvancedAiGoal, imports: &[VerifiedImportRef]) -> bool {
-    goal.local_context.iter().all(|local| {
-        expr_imported_refs_are_resolved(&local.ty, imports)
-            && local
-                .value
-                .as_ref()
-                .is_none_or(|value| expr_imported_refs_are_resolved(value, imports))
-    }) && expr_imported_refs_are_resolved(&goal.target, imports)
+    goal.local_context
+        .iter()
+        .all(|local| expr_imported_refs_are_resolved(&local.ty, imports))
+        && expr_imported_refs_are_resolved(&goal.target, imports)
 }
 
 fn expr_imported_refs_are_resolved(expr: &Expr, imports: &[VerifiedImportRef]) -> bool {
@@ -9708,13 +9574,6 @@ fn expr_imported_refs_are_resolved(expr: &Expr, imports: &[VerifiedImportRef]) -
         }
         Expr::Lam { ty, body, .. } | Expr::Pi { ty, body, .. } => {
             expr_imported_refs_are_resolved(ty, imports)
-                && expr_imported_refs_are_resolved(body, imports)
-        }
-        Expr::Let {
-            ty, value, body, ..
-        } => {
-            expr_imported_refs_are_resolved(ty, imports)
-                && expr_imported_refs_are_resolved(value, imports)
                 && expr_imported_refs_are_resolved(body, imports)
         }
     }
@@ -9740,13 +9599,7 @@ fn validate_goal_kernel(
     let mut ctx = Ctx::new();
     for local in &goal.local_context {
         expect_sort_public(&env, &ctx, &goal.universe_params, &local.ty)?;
-        if let Some(value) = &local.value {
-            env.check(&ctx, &goal.universe_params, value, &local.ty)
-                .map_err(|_| ())?;
-            ctx.push_definition(local.name.clone(), local.ty.clone(), value.clone());
-        } else {
-            ctx.push_assumption(local.name.clone(), local.ty.clone());
-        }
+        ctx.push_assumption(local.name.clone(), local.ty.clone());
     }
     expect_sort_public(&env, &ctx, &goal.universe_params, &goal.target)
 }
@@ -9928,9 +9781,6 @@ fn expr_at_path<'a>(expr: &'a Expr, path: &[AdvancedMachineExprPathStep]) -> Opt
             (Expr::Lam { body, .. }, AdvancedMachineExprPathStep::LamBody) => body,
             (Expr::Pi { ty, .. }, AdvancedMachineExprPathStep::PiDomain) => ty,
             (Expr::Pi { body, .. }, AdvancedMachineExprPathStep::PiCodomain) => body,
-            (Expr::Let { ty, .. }, AdvancedMachineExprPathStep::LetType) => ty,
-            (Expr::Let { value, .. }, AdvancedMachineExprPathStep::LetValue) => value,
-            (Expr::Let { body, .. }, AdvancedMachineExprPathStep::LetBody) => body,
             _ => return None,
         };
     }
@@ -9963,11 +9813,6 @@ fn expr_at_path_mut<'a>(
             (Expr::Lam { body, .. }, AdvancedMachineExprPathStep::LamBody) => Arc::make_mut(body),
             (Expr::Pi { ty, .. }, AdvancedMachineExprPathStep::PiDomain) => Arc::make_mut(ty),
             (Expr::Pi { body, .. }, AdvancedMachineExprPathStep::PiCodomain) => Arc::make_mut(body),
-            (Expr::Let { ty, .. }, AdvancedMachineExprPathStep::LetType) => Arc::make_mut(ty),
-            (Expr::Let { value, .. }, AdvancedMachineExprPathStep::LetValue) => {
-                Arc::make_mut(value)
-            }
-            (Expr::Let { body, .. }, AdvancedMachineExprPathStep::LetBody) => Arc::make_mut(body),
             _ => return None,
         };
     }
@@ -11054,13 +10899,6 @@ fn encode_goal_to(
 fn encode_machine_local_decl_to(out: &mut Vec<u8>, local: &MachineLocalDecl) {
     encode_string_to(out, &local.name);
     encode_expr_to(out, &local.ty);
-    match &local.value {
-        Some(value) => {
-            out.push(1);
-            encode_expr_to(out, value);
-        }
-        None => out.push(0),
-    }
 }
 
 fn encode_formalization_payload_to(
@@ -11480,9 +11318,6 @@ fn encode_path_steps_to(out: &mut Vec<u8>, path: &[AdvancedMachineExprPathStep])
             AdvancedMachineExprPathStep::LamBody => 3,
             AdvancedMachineExprPathStep::PiDomain => 4,
             AdvancedMachineExprPathStep::PiCodomain => 5,
-            AdvancedMachineExprPathStep::LetType => 6,
-            AdvancedMachineExprPathStep::LetValue => 7,
-            AdvancedMachineExprPathStep::LetBody => 8,
         });
     }
 }
@@ -11518,14 +11353,6 @@ fn encode_expr_to(out: &mut Vec<u8>, expr: &Expr) {
         Expr::Pi { ty, body, .. } => {
             out.push(5);
             encode_expr_to(out, ty);
-            encode_expr_to(out, body);
-        }
-        Expr::Let {
-            ty, value, body, ..
-        } => {
-            out.push(6);
-            encode_expr_to(out, ty);
-            encode_expr_to(out, value);
             encode_expr_to(out, body);
         }
     }
@@ -12374,12 +12201,7 @@ impl<'a> Decoder<'a> {
     fn machine_local_decl(&mut self) -> std::result::Result<MachineLocalDecl, DecodeError> {
         let name = self.string()?;
         let ty = self.expr()?;
-        let value = match self.u8()? {
-            0 => None,
-            1 => Some(self.expr()?),
-            _ => return Err(DecodeError::Malformed),
-        };
-        Ok(MachineLocalDecl { name, ty, value })
+        Ok(MachineLocalDecl { name, ty })
     }
 
     fn expr(&mut self) -> std::result::Result<Expr, DecodeError> {
@@ -12408,12 +12230,6 @@ impl<'a> Decoder<'a> {
                 let ty = self.expr()?;
                 let body = self.expr()?;
                 Ok(Expr::pi("_", ty, body))
-            }
-            6 => {
-                let ty = self.expr()?;
-                let value = self.expr()?;
-                let body = self.expr()?;
-                Ok(Expr::let_in("_", ty, value, body))
             }
             _ => Err(DecodeError::Malformed),
         }
@@ -12466,9 +12282,6 @@ impl<'a> Decoder<'a> {
                 3 => AdvancedMachineExprPathStep::LamBody,
                 4 => AdvancedMachineExprPathStep::PiDomain,
                 5 => AdvancedMachineExprPathStep::PiCodomain,
-                6 => AdvancedMachineExprPathStep::LetType,
-                7 => AdvancedMachineExprPathStep::LetValue,
-                8 => AdvancedMachineExprPathStep::LetBody,
                 _ => return Err(DecodeError::Malformed),
             });
         }
@@ -13096,12 +12909,6 @@ impl<'a> Decoder<'a> {
                 let ty = self.expr_counted(budget)?;
                 let body = self.expr_counted(budget)?;
                 Ok(Expr::pi("_", ty, body))
-            }
-            6 => {
-                let ty = self.expr_counted(budget)?;
-                let value = self.expr_counted(budget)?;
-                let body = self.expr_counted(budget)?;
-                Ok(Expr::let_in("_", ty, value, body))
             }
             _ => Err(DecodeError::Malformed),
         }
@@ -13970,12 +13777,14 @@ fn sha256(bytes: &[u8]) -> Hash {
 enum ArtifactPathError {
     EnvelopeMalformed,
     ArtifactUnavailable,
+    SizeMismatch,
 }
 
-fn validate_artifact_path(
+fn read_advanced_ai_artifact_bytes(
     workspace_root: &Path,
     path: &str,
-) -> std::result::Result<PathBuf, ArtifactPathError> {
+    expected_size: u64,
+) -> std::result::Result<Vec<u8>, ArtifactPathError> {
     if path.is_empty() || path.as_bytes().contains(&0) {
         return Err(ArtifactPathError::EnvelopeMalformed);
     }
@@ -14001,30 +13810,133 @@ fn validate_artifact_path(
         }
     }
 
-    let root = workspace_root
-        .canonicalize()
-        .map_err(|_| ArtifactPathError::ArtifactUnavailable)?;
-    let mut current = root.clone();
-    for component in relative.components() {
+    let mut components = relative.components().peekable();
+    let mut directory = open_advanced_ai_workspace_root(workspace_root)?;
+    while let Some(component) = components.next() {
         let Component::Normal(component) = component else {
             return Err(ArtifactPathError::EnvelopeMalformed);
         };
-        current.push(component);
-        match std::fs::symlink_metadata(&current) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
-                let resolved = current
-                    .canonicalize()
-                    .map_err(|_| ArtifactPathError::ArtifactUnavailable)?;
-                if !resolved.starts_with(&root) {
-                    return Err(ArtifactPathError::EnvelopeMalformed);
-                }
-                current = resolved;
-            }
-            Ok(_) => {}
-            Err(_) => break,
+        if components.peek().is_some() {
+            directory = open_advanced_ai_child_directory(&directory, component)?;
+        } else {
+            return read_advanced_ai_child_file(&directory, component, expected_size);
         }
     }
-    Ok(workspace_root.join(relative))
+    Err(ArtifactPathError::EnvelopeMalformed)
+}
+
+#[cfg(unix)]
+fn open_advanced_ai_workspace_root(path: &Path) -> Result<File, ArtifactPathError> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|_| ArtifactPathError::ArtifactUnavailable)
+}
+
+#[cfg(unix)]
+fn classify_advanced_ai_open_error(error: &std::io::Error) -> ArtifactPathError {
+    match error.raw_os_error() {
+        Some(libc::ELOOP) | Some(libc::ENOTDIR) => ArtifactPathError::EnvelopeMalformed,
+        _ => ArtifactPathError::ArtifactUnavailable,
+    }
+}
+
+#[cfg(not(unix))]
+fn open_advanced_ai_workspace_root(_path: &Path) -> Result<File, ArtifactPathError> {
+    Err(ArtifactPathError::ArtifactUnavailable)
+}
+
+#[cfg(unix)]
+fn open_advanced_ai_child_directory(
+    parent: &File,
+    component: &std::ffi::OsStr,
+) -> Result<File, ArtifactPathError> {
+    use std::os::{fd::AsRawFd as _, fd::FromRawFd as _, unix::ffi::OsStrExt as _};
+
+    let component = std::ffi::CString::new(component.as_bytes())
+        .map_err(|_| ArtifactPathError::EnvelopeMalformed)?;
+    // SAFETY: the parent descriptor is live and `component` is a validated,
+    // NUL-terminated direct child name. The returned descriptor is uniquely
+    // transferred to `File` on success.
+    let descriptor = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            component.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW,
+        )
+    };
+    if descriptor < 0 {
+        let error = std::io::Error::last_os_error();
+        return Err(classify_advanced_ai_open_error(&error));
+    }
+    // SAFETY: `descriptor` is a newly returned, uniquely owned descriptor.
+    Ok(unsafe { File::from_raw_fd(descriptor) })
+}
+
+#[cfg(not(unix))]
+fn open_advanced_ai_child_directory(
+    _parent: &File,
+    _component: &std::ffi::OsStr,
+) -> Result<File, ArtifactPathError> {
+    Err(ArtifactPathError::ArtifactUnavailable)
+}
+
+#[cfg(unix)]
+fn read_advanced_ai_child_file(
+    parent: &File,
+    component: &std::ffi::OsStr,
+    expected_size: u64,
+) -> Result<Vec<u8>, ArtifactPathError> {
+    use std::os::{fd::AsRawFd as _, fd::FromRawFd as _, unix::ffi::OsStrExt as _};
+
+    let component = std::ffi::CString::new(component.as_bytes())
+        .map_err(|_| ArtifactPathError::EnvelopeMalformed)?;
+    // O_NONBLOCK prevents a FIFO/device from hanging before fstat rejects it.
+    // SAFETY: parent and component are retained, valid direct-child values.
+    let descriptor = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            component.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+        )
+    };
+    if descriptor < 0 {
+        let error = std::io::Error::last_os_error();
+        return Err(classify_advanced_ai_open_error(&error));
+    }
+    // SAFETY: `descriptor` is newly returned and uniquely owned.
+    let mut file = unsafe { File::from_raw_fd(descriptor) };
+    let metadata = file
+        .metadata()
+        .map_err(|_| ArtifactPathError::ArtifactUnavailable)?;
+    if !metadata.file_type().is_file() {
+        return Err(ArtifactPathError::EnvelopeMalformed);
+    }
+    if metadata.len() != expected_size {
+        return Err(ArtifactPathError::SizeMismatch);
+    }
+    let maximum = usize::try_from(expected_size).map_err(|_| ArtifactPathError::SizeMismatch)?;
+    let mut bytes = Vec::with_capacity(maximum.min(1_048_576));
+    std::io::Read::by_ref(&mut file)
+        .take(expected_size.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|_| ArtifactPathError::ArtifactUnavailable)?;
+    if bytes.len() as u64 != expected_size {
+        return Err(ArtifactPathError::SizeMismatch);
+    }
+    Ok(bytes)
+}
+
+#[cfg(not(unix))]
+fn read_advanced_ai_child_file(
+    _parent: &File,
+    _component: &std::ffi::OsStr,
+    _expected_size: u64,
+) -> Result<Vec<u8>, ArtifactPathError> {
+    Err(ArtifactPathError::ArtifactUnavailable)
 }
 
 #[cfg(test)]
@@ -14032,6 +13944,7 @@ mod tests {
     use super::*;
     use crate::tactic::MachinePerformanceIsolationCounters;
     use std::fs;
+    use std::path::PathBuf;
 
     fn hash(byte: u8) -> Hash {
         [byte; 32]
@@ -15402,6 +15315,50 @@ mod tests {
         let _ = fs::remove_file(outside);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn artifact_reader_rejects_every_symlink_component_and_non_regular_leaf() {
+        use std::os::unix::fs::{symlink, PermissionsExt as _};
+
+        let root = std::env::temp_dir().join(format!(
+            "npa-advanced-ai-no-follow-root-{}",
+            std::process::id()
+        ));
+        let outside = std::env::temp_dir().join(format!(
+            "npa-advanced-ai-no-follow-outside-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&outside);
+        fs::create_dir_all(root.join("real")).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("payload.bin"), b"payload").unwrap();
+        symlink(&outside, root.join("linked-dir")).unwrap();
+        symlink(outside.join("payload.bin"), root.join("linked-file")).unwrap();
+        fs::create_dir(root.join("directory-leaf")).unwrap();
+
+        for path in ["linked-dir/payload.bin", "linked-file", "directory-leaf"] {
+            assert!(matches!(
+                read_advanced_ai_artifact_bytes(&root, path, 7),
+                Err(ArtifactPathError::EnvelopeMalformed)
+            ));
+        }
+
+        let bytes = read_advanced_ai_artifact_bytes(&outside, "payload.bin", 7).unwrap();
+        assert_eq!(bytes, b"payload");
+        assert!(matches!(
+            read_advanced_ai_artifact_bytes(&outside, "payload.bin", 6),
+            Err(ArtifactPathError::SizeMismatch)
+        ));
+        assert_eq!(
+            fs::metadata(&root).unwrap().permissions().mode() & 0o170000,
+            0o040000
+        );
+
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(outside);
+    }
+
     #[test]
     fn duplicate_import_identity_is_import_closure_mismatch() {
         let import = AdvancedImportIdentity {
@@ -15854,6 +15811,41 @@ mod tests {
             }
             other => panic!("expected Human smt prove success, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn smt_certificate_closure_abstracts_local_assumptions() {
+        let goal = AdvancedAiGoal {
+            universe_params: Vec::new(),
+            local_context: vec![
+                MachineLocalDecl::assumption("P", Expr::sort(Level::zero())),
+                MachineLocalDecl::assumption("hp", Expr::bvar(0)),
+            ],
+            target: Expr::bvar(1),
+        };
+        let (closed_type, closed_proof) =
+            advanced_ai_close_smt_goal_for_certificate(&goal, &Expr::bvar(0))
+                .expect("local assumptions should close by lambda abstraction");
+
+        assert_eq!(
+            closed_type,
+            Expr::pi(
+                "P",
+                Expr::sort(Level::zero()),
+                Expr::pi("hp", Expr::bvar(0), Expr::bvar(1)),
+            )
+        );
+        assert_eq!(
+            closed_proof,
+            Expr::lam(
+                "P",
+                Expr::sort(Level::zero()),
+                Expr::lam("hp", Expr::bvar(0), Expr::bvar(0)),
+            )
+        );
+        Env::new()
+            .check(&Ctx::new(), &[], &closed_proof, &closed_type)
+            .expect("the closed proof should kernel-check");
     }
 
     #[test]
@@ -18724,7 +18716,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            theorem_cert.hashes.certificate_hash,
+            theorem_cert.hashes().certificate_hash,
             verified.certificate_hash()
         );
         assert!(verified.axiom_report().module_axioms.is_empty());
@@ -18842,7 +18834,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            theorem_cert.hashes.certificate_hash,
+            theorem_cert.hashes().certificate_hash,
             verified.certificate_hash()
         );
         assert!(verified.axiom_report().module_axioms.is_empty());

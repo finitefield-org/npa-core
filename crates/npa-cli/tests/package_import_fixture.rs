@@ -229,7 +229,7 @@ fn package_import_fixture_accepts_interface_closure_direct_b_available_a() {
     let c_cert = fs::read(fixture.artifact_path("InterfaceClosure/C/certificate.npcert")).unwrap();
     let c_cert = npa_cert::decode_module_cert(&c_cert).unwrap();
     let imports = c_cert
-        .imports
+        .imports()
         .iter()
         .map(|import| import.module.as_dotted())
         .collect::<BTreeSet<_>>();
@@ -1013,12 +1013,12 @@ axioms = []
         target_certificate_file_hash =
             format_package_hash(&package_file_hash(&target.certificate_bytes)),
         target_export_hash =
-            format_package_hash(&PackageHash::from(target.certificate.hashes.export_hash)),
+            format_package_hash(&PackageHash::from(target.certificate.hashes().export_hash)),
         target_axiom_report_hash = format_package_hash(&PackageHash::from(
-            target.certificate.hashes.axiom_report_hash
+            target.certificate.hashes().axiom_report_hash
         )),
         target_certificate_hash = format_package_hash(&PackageHash::from(
-            target.certificate.hashes.certificate_hash
+            target.certificate.hashes().certificate_hash
         )),
         legacy_module = LEGACY_SUPPORT,
     ));
@@ -1098,8 +1098,8 @@ fn build_interface_closure_module(
 fn imported_source_interface(module: &InterfaceClosureModule) -> HumanImportedSourceInterface {
     HumanImportedSourceInterface {
         module: module.module.clone(),
-        export_hash: module.certificate.hashes.export_hash,
-        certificate_hash: Some(module.certificate.hashes.certificate_hash),
+        export_hash: module.certificate.hashes().export_hash,
+        certificate_hash: Some(module.certificate.hashes().certificate_hash),
         source_interface: module.source_interface.clone(),
     }
 }
@@ -1149,12 +1149,12 @@ tags = []
             package_name_array(&module.imports),
             format_package_hash(&package_file_hash(module.source.as_bytes())),
             format_package_hash(&package_file_hash(&module.certificate_bytes)),
-            format_package_hash(&PackageHash::from(module.certificate.hashes.export_hash)),
+            format_package_hash(&PackageHash::from(module.certificate.hashes().export_hash)),
             format_package_hash(&PackageHash::from(
-                module.certificate.hashes.axiom_report_hash
+                module.certificate.hashes().axiom_report_hash
             )),
             format_package_hash(&PackageHash::from(
-                module.certificate.hashes.certificate_hash
+                module.certificate.hashes().certificate_hash
             )),
             string_array(&module.definitions),
         ));

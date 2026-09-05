@@ -77,25 +77,6 @@ fn subst_levels_expr_changed(expr: &Expr, params: &[String], levels: &[Level]) -
                 body: new_body.unwrap_or_else(|| Arc::clone(body)),
             })
         }
-        Expr::Let {
-            binder,
-            ty,
-            value,
-            body,
-        } => {
-            let new_ty = subst_levels_expr_rc(ty, params, levels);
-            let new_value = subst_levels_expr_rc(value, params, levels);
-            let new_body = subst_levels_expr_rc(body, params, levels);
-            if new_ty.is_none() && new_value.is_none() && new_body.is_none() {
-                return None;
-            }
-            Some(Expr::Let {
-                binder: binder.clone(),
-                ty: new_ty.unwrap_or_else(|| Arc::clone(ty)),
-                value: new_value.unwrap_or_else(|| Arc::clone(value)),
-                body: new_body.unwrap_or_else(|| Arc::clone(body)),
-            })
-        }
     }
 }
 
@@ -194,25 +175,6 @@ fn shift_changed(expr: &Expr, amount: i32, cutoff: u32) -> Result<Option<Expr>> 
                 body: new_body.unwrap_or_else(|| Arc::clone(body)),
             }))
         }
-        Expr::Let {
-            binder,
-            ty,
-            value,
-            body,
-        } => {
-            let new_ty = shift_rc(ty, amount, cutoff)?;
-            let new_value = shift_rc(value, amount, cutoff)?;
-            let new_body = shift_rc(body, amount, cutoff + 1)?;
-            if new_ty.is_none() && new_value.is_none() && new_body.is_none() {
-                return Ok(None);
-            }
-            Ok(Some(Expr::Let {
-                binder: binder.clone(),
-                ty: new_ty.unwrap_or_else(|| Arc::clone(ty)),
-                value: new_value.unwrap_or_else(|| Arc::clone(value)),
-                body: new_body.unwrap_or_else(|| Arc::clone(body)),
-            }))
-        }
     }
 }
 
@@ -262,25 +224,6 @@ fn subst_changed(expr: &Expr, target: u32, replacement: &Expr) -> Result<Option<
             Ok(Some(Expr::Pi {
                 binder: binder.clone(),
                 ty: new_ty.unwrap_or_else(|| Arc::clone(ty)),
-                body: new_body.unwrap_or_else(|| Arc::clone(body)),
-            }))
-        }
-        Expr::Let {
-            binder,
-            ty,
-            value,
-            body,
-        } => {
-            let new_ty = subst_rc(ty, target, replacement)?;
-            let new_value = subst_rc(value, target, replacement)?;
-            let new_body = subst_rc(body, target + 1, replacement)?;
-            if new_ty.is_none() && new_value.is_none() && new_body.is_none() {
-                return Ok(None);
-            }
-            Ok(Some(Expr::Let {
-                binder: binder.clone(),
-                ty: new_ty.unwrap_or_else(|| Arc::clone(ty)),
-                value: new_value.unwrap_or_else(|| Arc::clone(value)),
                 body: new_body.unwrap_or_else(|| Arc::clone(body)),
             }))
         }

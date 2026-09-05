@@ -299,10 +299,10 @@ fn decode_closure(
                 source: Box::new(source),
             }
         })?;
-        if cert.header.module != key.module {
+        if cert.header().module != key.module {
             return Err(ImportProjectionError::ModuleNameMismatch {
                 expected: key.module.clone(),
-                actual: cert.header.module.clone(),
+                actual: cert.header().module.clone(),
             });
         }
         let imports = certificate_import_keys(&key, &cert)?;
@@ -335,7 +335,7 @@ fn certificate_import_keys(
     owner: &VerifiedImportKey,
     cert: &ModuleCert,
 ) -> Result<Vec<VerifiedImportKey>, ImportProjectionError> {
-    cert.imports
+    cert.imports()
         .iter()
         .map(|entry| {
             let certificate_hash = entry.certificate_hash.ok_or_else(|| {

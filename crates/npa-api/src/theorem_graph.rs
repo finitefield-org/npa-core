@@ -448,7 +448,7 @@ pub fn extract_certificate_theorem_graph_from_cert(
         edges: BTreeSet::new(),
     };
 
-    for (decl_index, decl) in cert.declarations.iter().enumerate() {
+    for (decl_index, decl) in cert.declarations().iter().enumerate() {
         let source = local_decl_node_id(cert, decl_index)?;
         insert_node(
             &mut state.nodes,
@@ -497,7 +497,7 @@ pub fn extract_certificate_theorem_graph_from_cert(
     }
 
     let imports = cert
-        .imports
+        .imports()
         .iter()
         .map(|import| CertificateTheoremGraphImportBinding {
             module: import.module.clone(),
@@ -506,9 +506,9 @@ pub fn extract_certificate_theorem_graph_from_cert(
         })
         .collect();
     let mut snapshot = CertificateTheoremGraphSnapshot {
-        source_module: cert.header.module.clone(),
-        source_export_hash: cert.hashes.export_hash,
-        source_certificate_hash: cert.hashes.certificate_hash,
+        source_module: cert.header().module.clone(),
+        source_export_hash: cert.hashes().export_hash,
+        source_certificate_hash: cert.hashes().certificate_hash,
         extractor_version: CertificateTheoremGraphExtractorVersion::CertificateGraphV2,
         imports,
         nodes: state.nodes.into_values().collect(),
@@ -1317,7 +1317,7 @@ fn validate_import_bindings<'a>(
             });
         }
     }
-    for required in &cert.imports {
+    for required in cert.imports() {
         let Some(verified) = by_module.get(&required.module) else {
             return Err(CertificateTheoremGraphError::MissingImportBinding {
                 module: required.module.clone(),
@@ -1349,14 +1349,14 @@ fn export_entries_by_name(
     cert: &ModuleCert,
 ) -> Result<BTreeMap<Name, &ExportEntry>, CertificateTheoremGraphError> {
     let mut exports = BTreeMap::new();
-    for entry in &cert.export_block {
+    for entry in cert.export_block() {
         exports.insert(name(cert, entry.name)?, entry);
     }
     Ok(exports)
 }
 
 fn direct_axioms_by_decl(cert: &ModuleCert) -> BTreeMap<usize, Vec<AxiomRef>> {
-    cert.axiom_report
+    cert.axiom_report()
         .per_declaration
         .iter()
         .map(|report| (report.decl_index, report.direct_axioms.clone()))
@@ -1364,7 +1364,7 @@ fn direct_axioms_by_decl(cert: &ModuleCert) -> BTreeMap<usize, Vec<AxiomRef>> {
 }
 
 fn transitive_axioms_by_decl(cert: &ModuleCert) -> BTreeMap<usize, Vec<AxiomRef>> {
-    cert.axiom_report
+    cert.axiom_report()
         .per_declaration
         .iter()
         .map(|report| (report.decl_index, report.transitive_axioms.clone()))
@@ -1611,11 +1611,6 @@ fn collect_const_refs(
             collect_const_refs(cert, *ty, visited, refs)?;
             collect_const_refs(cert, *body, visited, refs)?;
         }
-        TermNode::Let { ty, value, body } => {
-            collect_const_refs(cert, *ty, visited, refs)?;
-            collect_const_refs(cert, *value, visited, refs)?;
-            collect_const_refs(cert, *body, visited, refs)?;
-        }
     }
     Ok(())
 }
@@ -1690,7 +1685,7 @@ fn local_generated_node(
             scope: CertificateTheoremGraphNodeScope::LocalGenerated {
                 source_decl_index: decl_index,
             },
-            module: cert.header.module.clone(),
+            module: cert.header().module.clone(),
             name,
             decl_interface_hash: entry.decl_interface_hash,
         },
@@ -1739,7 +1734,7 @@ fn graph_node_for_global_ref(
             name: name_id,
             decl_interface_hash: ref_interface_hash,
         } => {
-            let import = cert.imports.get(*import_index).ok_or_else(|| {
+            let import = cert.imports().get(*import_index).ok_or_else(|| {
                 CertificateTheoremGraphError::MissingImportBinding {
                     module: Name::from_dotted("<invalid-import-index>"),
                 }
@@ -1782,7 +1777,7 @@ fn graph_node_for_global_ref(
             })
         }
         GlobalRef::Local { decl_index } => {
-            let decl = cert.declarations.get(*decl_index).ok_or(
+            let decl = cert.declarations().get(*decl_index).ok_or(
                 CertificateTheoremGraphError::MissingDeclaration {
                     decl_index: *decl_index,
                 },
@@ -1911,12 +1906,12 @@ fn local_decl_node_id(
     decl_index: usize,
 ) -> Result<CertificateTheoremGraphNodeId, CertificateTheoremGraphError> {
     let decl = cert
-        .declarations
+        .declarations()
         .get(decl_index)
         .ok_or(CertificateTheoremGraphError::MissingDeclaration { decl_index })?;
     Ok(CertificateTheoremGraphNodeId {
         scope: CertificateTheoremGraphNodeScope::Local,
-        module: cert.header.module.clone(),
+        module: cert.header().module.clone(),
         name: decl_payload_name(cert, &decl.decl)?,
         decl_interface_hash: decl.hashes.decl_interface_hash,
     })
@@ -1972,14 +1967,14 @@ fn export_kind_to_node_kind(kind: ExportKind) -> CertificateTheoremGraphNodeKind
 }
 
 fn name(cert: &ModuleCert, name_id: NameId) -> Result<Name, CertificateTheoremGraphError> {
-    cert.name_table
+    cert.name_table()
         .get(name_id)
         .cloned()
         .ok_or(CertificateTheoremGraphError::MissingName { name_id })
 }
 
 fn term(cert: &ModuleCert, term_id: TermId) -> Result<&TermNode, CertificateTheoremGraphError> {
-    cert.term_table
+    cert.term_table()
         .get(term_id)
         .ok_or(CertificateTheoremGraphError::MissingTerm { term_id })
 }
@@ -2923,8 +2918,10 @@ mod tests {
             CertificateTheoremGraphError::ImportExportHashMismatch { .. }
         ));
 
-        let mut cert = decode_module_cert(&client.bytes).unwrap();
-        cert.imports[0].certificate_hash = None;
+        let cert = decode_module_cert(&client.bytes).unwrap();
+        let mut parts = cert.into_parts();
+        parts.imports[0].certificate_hash = None;
+        let cert = ModuleCert::from_parts(parts);
         let err = extract_certificate_theorem_graph_from_cert(
             &cert,
             std::slice::from_ref(&base.verified),
@@ -2937,7 +2934,7 @@ mod tests {
         ));
 
         let cert = decode_module_cert(&client.bytes).unwrap();
-        let dependency_hash = cert.declarations[0].dependencies[0].decl_interface_hash();
+        let dependency_hash = cert.declarations()[0].dependencies[0].decl_interface_hash();
         let mut duplicated_hashes = Vec::with_capacity(dependency_hash.len() * 2);
         duplicated_hashes.extend(dependency_hash);
         duplicated_hashes.extend(dependency_hash);

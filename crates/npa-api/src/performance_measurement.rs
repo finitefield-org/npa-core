@@ -7,13 +7,23 @@
 use std::collections::BTreeMap;
 use std::time::Instant;
 
+use npa_cert::{CertificatePayloadObservation, CertificateTermMaterializationObservation};
 use npa_kernel::KernelWorkCounters;
+use npa_package::PreparedArtifactRetentionObservation;
+
+use crate::package_verifier::PackagePayloadOwnershipObservation;
 
 /// Stable schema for the common cross-subsystem measurement block.
 pub const PERFORMANCE_MEASUREMENTS_SCHEMA_V0_1: &str = "npa.performance.measurements.v0.1";
 pub const PERFORMANCE_MEASUREMENTS_SCHEMA_V0_2: &str = "npa.performance.measurements.v0.2";
 pub const PERFORMANCE_MEASUREMENTS_SCHEMA_V0_3: &str = "npa.performance.measurements.v0.3";
-pub const PERFORMANCE_MEASUREMENTS_SCHEMA: &str = PERFORMANCE_MEASUREMENTS_SCHEMA_V0_3;
+pub const PERFORMANCE_MEASUREMENTS_SCHEMA_V0_4: &str = "npa.performance.measurements.v0.4";
+pub const PERFORMANCE_MEASUREMENTS_SCHEMA_V0_5: &str = "npa.performance.measurements.v0.5";
+pub const PERFORMANCE_MEASUREMENTS_SCHEMA_V0_6: &str = "npa.performance.measurements.v0.6";
+pub const PERFORMANCE_MEASUREMENTS_SCHEMA_V0_7: &str = "npa.performance.measurements.v0.7";
+pub const PERFORMANCE_MEASUREMENTS_SCHEMA_V0_8: &str = "npa.performance.measurements.v0.8";
+pub const PERFORMANCE_MEASUREMENTS_SCHEMA_V0_9: &str = "npa.performance.measurements.v0.9";
+pub const PERFORMANCE_MEASUREMENTS_SCHEMA: &str = PERFORMANCE_MEASUREMENTS_SCHEMA_V0_9;
 /// Maximum retained module detail records.
 pub const PERFORMANCE_MODULE_DETAIL_LIMIT: usize = 1_024;
 /// Maximum retained declaration detail records.
@@ -33,6 +43,55 @@ pub enum PerformanceMeasurementMode {
     Summary,
     /// Retain aggregates plus bounded, canonically ordered detail records.
     Detailed,
+}
+
+/// Batching policy selected for one changed-package Git query operation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PerformancePackageSelectionBatchPolicy {
+    /// Selection returned before a batch policy was needed.
+    #[default]
+    NotSelected,
+    /// Pathspecs were partitioned under the computed exec headroom.
+    ExecBudget,
+    /// The complete invocation used compatibility 128-path batches.
+    Legacy128,
+}
+
+/// Deterministic, content-free observation of changed-package selection.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PerformancePackageSelectionObservation {
+    /// Whether this observation belongs to committed-base selection.
+    pub committed_base: bool,
+    pub batch_policy: PerformancePackageSelectionBatchPolicy,
+    pub candidate_paths: u64,
+    pub pathspec_payload_bytes: u64,
+    pub effective_argv_charge_bytes: u64,
+    pub max_batch_payload_bytes: u64,
+    pub max_batch_argv_charge_bytes: u64,
+    pub pathspec_batches: u64,
+    pub worktree_root_queries: u64,
+    pub head_queries: u64,
+    pub tracked_queries: u64,
+    pub untracked_queries: u64,
+    pub tracked_output_paths: u64,
+    pub untracked_output_paths: u64,
+    pub selected_paths: u64,
+    pub base_commit_queries: u64,
+    pub committed_head_queries: u64,
+    pub merge_base_queries: u64,
+    pub base_manifest_blob_bytes: u64,
+    pub base_lock_blob_bytes: u64,
+    pub protected_candidate_paths: u64,
+    pub dirty_paths: u64,
+    pub committed_diff_batches: u64,
+    pub committed_diff_processes: u64,
+    pub committed_diff_output_paths: u64,
+    pub seed_modules: u64,
+    pub full_escalations: u64,
+    /// Big-endian SHA-256 words for the complete canonical escalation-reason list.
+    pub full_escalation_reason_identity: [u64; 4],
+    pub selected_closure_modules: u64,
+    pub overflowed: bool,
 }
 
 impl PerformanceMeasurementMode {
@@ -75,23 +134,39 @@ impl PerformanceMeasurementUnit {
 }
 
 macro_rules! performance_labels {
-    ($( $variant:ident => ($identifier:literal, $unit:ident) ),+ $(,)?) => {
+    (
+        $( $variant:ident => ($identifier:literal, $unit:ident) ),+ $(,)?
+        ; introduced_later {
+            $( $later_variant:ident => ($later_identifier:literal, $later_unit:ident, $introduction_schema:ident) ),+ $(,)?
+        }
+    ) => {
         /// Closed vocabulary for performance counters.
         #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
         pub enum PerformanceMeasurementLabel {
             $( $variant, )+
+            $( $later_variant, )+
         }
 
         impl PerformanceMeasurementLabel {
-            /// Exhaustive label table. JSON projection sorts by identifier.
+            /// Exhaustive current label table. JSON projection sorts by identifier.
+            /// Strict readers must use [`Self::labels_for_schema`] or
+            /// [`Self::from_schema_identifier`] instead of this cumulative set.
             pub const ALL: &'static [Self] = &[
                 $( Self::$variant, )+
+                $( Self::$later_variant, )+
+            ];
+
+            /// Closed table recording the first published schema for every label.
+            const INTRODUCTIONS: &'static [(Self, &'static str)] = &[
+                $( (Self::$variant, PERFORMANCE_MEASUREMENTS_SCHEMA_V0_1), )+
+                $( (Self::$later_variant, $introduction_schema), )+
             ];
 
             /// Stable lower-case group-qualified identifier.
             pub const fn as_str(self) -> &'static str {
                 match self {
                     $( Self::$variant => $identifier, )+
+                    $( Self::$later_variant => $later_identifier, )+
                 }
             }
 
@@ -99,10 +174,45 @@ macro_rules! performance_labels {
             pub const fn unit(self) -> PerformanceMeasurementUnit {
                 match self {
                     $( Self::$variant => PerformanceMeasurementUnit::$unit, )+
+                    $( Self::$later_variant => PerformanceMeasurementUnit::$later_unit, )+
                 }
+            }
+
+            /// Exact cumulative label vocabulary for one published schema.
+            pub fn labels_for_schema(
+                schema: &str,
+            ) -> Option<impl Iterator<Item = Self> + '_> {
+                let schema_rank = performance_measurement_schema_rank(schema)?;
+                Some(Self::INTRODUCTIONS.iter().filter_map(move |(label, introduced)| {
+                    (performance_measurement_schema_rank(introduced)
+                        .expect("label introduction uses a published schema")
+                        <= schema_rank)
+                        .then_some(*label)
+                }))
+            }
+
+            /// Resolve a label only when it belongs to the declared schema.
+            pub fn from_schema_identifier(schema: &str, identifier: &str) -> Option<Self> {
+                Self::labels_for_schema(schema)?
+                    .find(|candidate| candidate.as_str() == identifier)
             }
         }
     };
+}
+
+fn performance_measurement_schema_rank(schema: &str) -> Option<u8> {
+    match schema {
+        PERFORMANCE_MEASUREMENTS_SCHEMA_V0_1 => Some(1),
+        PERFORMANCE_MEASUREMENTS_SCHEMA_V0_2 => Some(2),
+        PERFORMANCE_MEASUREMENTS_SCHEMA_V0_3 => Some(3),
+        PERFORMANCE_MEASUREMENTS_SCHEMA_V0_4 => Some(4),
+        PERFORMANCE_MEASUREMENTS_SCHEMA_V0_5 => Some(5),
+        PERFORMANCE_MEASUREMENTS_SCHEMA_V0_6 => Some(6),
+        PERFORMANCE_MEASUREMENTS_SCHEMA_V0_7 => Some(7),
+        PERFORMANCE_MEASUREMENTS_SCHEMA_V0_8 => Some(8),
+        PERFORMANCE_MEASUREMENTS_SCHEMA_V0_9 => Some(9),
+        _ => None,
+    }
 }
 
 performance_labels! {
@@ -161,7 +271,6 @@ performance_labels! {
     KernelBetaSteps => ("kernel.beta_steps", Count),
     KernelDeltaSteps => ("kernel.delta_steps", Count),
     KernelIotaSteps => ("kernel.iota_steps", Count),
-    KernelZetaSteps => ("kernel.zeta_steps", Count),
     KernelLogicalFuel => ("kernel.logical_fuel", Count),
     KernelSuccessfulFuel => ("kernel.successful_fuel", Count),
     KernelExhaustedFuel => ("kernel.exhausted_fuel", Count),
@@ -209,7 +318,6 @@ performance_labels! {
     PackageEffectiveJobs => ("package.effective_jobs", Count),
     PackageSharedBaseContextBytes => ("package.shared_base_context_bytes", Bytes),
     PackageAvoidedBaseContextClones => ("package.avoided_base_context_clones", Count),
-    PackageAvoidedBaseContextCloneBytes => ("package.avoided_base_context_clone_bytes", Bytes),
     PackageWorkerActiveElapsed => ("package.worker_active_elapsed", Nanoseconds),
     PackageWorkerIdleElapsed => ("package.worker_idle_elapsed", Nanoseconds),
     PackageCoordinatorMergeElapsed => ("package.coordinator_merge_elapsed", Nanoseconds),
@@ -227,6 +335,224 @@ performance_labels! {
     PackageDagCriticalPathLayers => ("package.dag_critical_path_layers", Count),
     PackageDagLayerWidth => ("package.dag_layer_width", Count),
     PackageDagLayerElapsed => ("package.dag_layer_elapsed", Nanoseconds),
+    ; introduced_later {
+        PackageAvoidedBaseContextCloneBytes => ("package.avoided_base_context_clone_bytes", Bytes, PERFORMANCE_MEASUREMENTS_SCHEMA_V0_2),
+        CacheSupportSelected => ("cache.support_selected", Count, PERFORMANCE_MEASUREMENTS_SCHEMA_V0_4),
+        CacheTargetsForcedLive => ("cache.targets_forced_live", Count, PERFORMANCE_MEASUREMENTS_SCHEMA_V0_4),
+        CacheContextIneligible => ("cache.context_ineligible", Count, PERFORMANCE_MEASUREMENTS_SCHEMA_V0_4),
+        CacheContextBypassedHits => ("cache.context_bypassed_hits", Count, PERFORMANCE_MEASUREMENTS_SCHEMA_V0_4),
+        CacheContextStale => ("cache.context_stale", Count, PERFORMANCE_MEASUREMENTS_SCHEMA_V0_4),
+        CacheContextSchemaMisses => ("cache.context_schema_misses", Count, PERFORMANCE_MEASUREMENTS_SCHEMA_V0_4),
+        CacheAvoidedSourceInterfaceResolutions => ("cache.avoided_source_interface_resolutions", Count, PERFORMANCE_MEASUREMENTS_SCHEMA_V0_4),
+        CacheTargetFreshBuilds => ("cache.target_fresh_builds", Count, PERFORMANCE_MEASUREMENTS_SCHEMA_V0_4),
+        CacheToolIdentityBytes => ("cache.tool_identity_bytes", Bytes, PERFORMANCE_MEASUREMENTS_SCHEMA_V0_4),
+        CacheToolIdentityElapsed => ("cache.tool_identity_elapsed", Nanoseconds, PERFORMANCE_MEASUREMENTS_SCHEMA_V0_4),
+        CacheCurrentByteValidationElapsed => ("cache.current_byte_validation_elapsed", Nanoseconds, PERFORMANCE_MEASUREMENTS_SCHEMA_V0_4),
+        CacheLiveSupportElapsed => ("cache.live_support_elapsed", Nanoseconds, PERFORMANCE_MEASUREMENTS_SCHEMA_V0_4),
+        CacheSourceInterfaceResolutionElapsed => ("cache.source_interface_resolution_elapsed", Nanoseconds, PERFORMANCE_MEASUREMENTS_SCHEMA_V0_4),
+        CacheBytesLoaded => ("cache.bytes_loaded", Bytes, PERFORMANCE_MEASUREMENTS_SCHEMA_V0_4),
+        CacheBytesWritten => ("cache.bytes_written", Bytes, PERFORMANCE_MEASUREMENTS_SCHEMA_V0_4),
+        PackageSelectionExecBudgetPolicy => ("package.selection_exec_budget_policy", Count, PERFORMANCE_MEASUREMENTS_SCHEMA_V0_5),
+        PackageSelectionLegacy128Policy => ("package.selection_legacy128_policy", Count, PERFORMANCE_MEASUREMENTS_SCHEMA_V0_5),
+        PackageSelectionCandidatePaths => ("package.selection_candidate_paths", Count, PERFORMANCE_MEASUREMENTS_SCHEMA_V0_5),
+        PackageSelectionPathspecPayloadBytes => ("package.selection_pathspec_payload_bytes", Bytes, PERFORMANCE_MEASUREMENTS_SCHEMA_V0_5),
+        PackageSelectionEffectiveArgvChargeBytes => ("package.selection_effective_argv_charge_bytes", Bytes, PERFORMANCE_MEASUREMENTS_SCHEMA_V0_5),
+        PackageSelectionMaxBatchPayloadBytes => ("package.selection_max_batch_payload_bytes", Bytes, PERFORMANCE_MEASUREMENTS_SCHEMA_V0_5),
+        PackageSelectionMaxBatchArgvChargeBytes => ("package.selection_max_batch_argv_charge_bytes", Bytes, PERFORMANCE_MEASUREMENTS_SCHEMA_V0_5),
+        PackageSelectionPathspecBatches => ("package.selection_pathspec_batches", Count, PERFORMANCE_MEASUREMENTS_SCHEMA_V0_5),
+        PackageSelectionWorktreeRootQueries => ("package.selection_worktree_root_queries", Count, PERFORMANCE_MEASUREMENTS_SCHEMA_V0_5),
+        PackageSelectionHeadQueries => ("package.selection_head_queries", Count, PERFORMANCE_MEASUREMENTS_SCHEMA_V0_5),
+        PackageSelectionTrackedQueries => ("package.selection_tracked_queries", Count, PERFORMANCE_MEASUREMENTS_SCHEMA_V0_5),
+        PackageSelectionUntrackedQueries => ("package.selection_untracked_queries", Count, PERFORMANCE_MEASUREMENTS_SCHEMA_V0_5),
+        PackageSelectionTrackedOutputPaths => ("package.selection_tracked_output_paths", Count, PERFORMANCE_MEASUREMENTS_SCHEMA_V0_5),
+        PackageSelectionUntrackedOutputPaths => ("package.selection_untracked_output_paths", Count, PERFORMANCE_MEASUREMENTS_SCHEMA_V0_5),
+        PackageSelectionChangedPaths => ("package.selection_changed_paths", Count, PERFORMANCE_MEASUREMENTS_SCHEMA_V0_5),
+        CertificateTermRootRequests => ("certificate.term_root_requests", Count, PERFORMANCE_MEASUREMENTS_SCHEMA_V0_6),
+        CertificateTermUniqueNodesMaterialized => ("certificate.term_unique_nodes_materialized", Count, PERFORMANCE_MEASUREMENTS_SCHEMA_V0_6),
+        CertificateTermSelectedEdges => ("certificate.term_selected_edges", Count, PERFORMANCE_MEASUREMENTS_SCHEMA_V0_6),
+        CertificateTermReusedChildArcs => ("certificate.term_reused_child_arcs", Count, PERFORMANCE_MEASUREMENTS_SCHEMA_V0_6),
+        CertificateTermOwnedRootHandoffs => ("certificate.term_owned_root_handoffs", Count, PERFORMANCE_MEASUREMENTS_SCHEMA_V0_6),
+        CertificateTermLeafRootClones => ("certificate.term_leaf_root_clones", Count, PERFORMANCE_MEASUREMENTS_SCHEMA_V0_6),
+        CertificateTermCompoundRootClones => ("certificate.term_compound_root_clones", Count, PERFORMANCE_MEASUREMENTS_SCHEMA_V0_6),
+        CertificateTermMaterializationSlots => ("certificate.term_materialization_slots", Count, PERFORMANCE_MEASUREMENTS_SCHEMA_V0_6),
+        CertificateTermMaterializationChargedBytes => ("certificate.term_materialization_charged_bytes", Bytes, PERFORMANCE_MEASUREMENTS_SCHEMA_V0_6),
+        CertificateTermMaterializationCapacityStops => ("certificate.term_materialization_capacity_stops", Count, PERFORMANCE_MEASUREMENTS_SCHEMA_V0_6),
+        CertificateTermMaterializationLegacyFallbacks => ("certificate.term_materialization_legacy_fallbacks", Count, PERFORMANCE_MEASUREMENTS_SCHEMA_V0_6),
+        PackageModulePayloadsFrozen => ("package.module_payloads_frozen", Count, PERFORMANCE_MEASUREMENTS_SCHEMA_V0_7),
+        PackageModulePayloadUniqueBytes => ("package.module_payload_unique_bytes", Bytes, PERFORMANCE_MEASUREMENTS_SCHEMA_V0_7),
+        PackageModulePayloadHandleClones => ("package.module_payload_handle_clones", Count, PERFORMANCE_MEASUREMENTS_SCHEMA_V0_7),
+        PackageAvoidedModulePayloadCloneBytes => ("package.avoided_module_payload_clone_bytes", Bytes, PERFORMANCE_MEASUREMENTS_SCHEMA_V0_7),
+        PackageSessionSnapshotClones => ("package.session_snapshot_clones", Count, PERFORMANCE_MEASUREMENTS_SCHEMA_V0_7),
+        PackageSessionIndexCowCopies => ("package.session_index_cow_copies", Count, PERFORMANCE_MEASUREMENTS_SCHEMA_V0_7),
+        PackageSessionIndexCowEntries => ("package.session_index_cow_entries", Count, PERFORMANCE_MEASUREMENTS_SCHEMA_V0_7),
+        PackageDecodeCacheRetainedBytes => ("package.decode_cache_retained_bytes", Bytes, PERFORMANCE_MEASUREMENTS_SCHEMA_V0_7),
+        PackageDecodeCachePeakRetainedBytes => ("package.decode_cache_peak_retained_bytes", Bytes, PERFORMANCE_MEASUREMENTS_SCHEMA_V0_7),
+        PackageDecodeCacheCapacityStops => ("package.decode_cache_capacity_stops", Count, PERFORMANCE_MEASUREMENTS_SCHEMA_V0_7),
+        PackageProcessMemoPayloadHandleClones => ("package.process_memo_payload_handle_clones", Count, PERFORMANCE_MEASUREMENTS_SCHEMA_V0_7),
+        PackageArtifactFilesRead => ("package.artifact_files_read", Count, PERFORMANCE_MEASUREMENTS_SCHEMA_V0_7),
+        PackageArtifactFileHashes => ("package.artifact_file_hashes", Count, PERFORMANCE_MEASUREMENTS_SCHEMA_V0_7),
+        PackageArtifactFullDecodes => ("package.artifact_full_decodes", Count, PERFORMANCE_MEASUREMENTS_SCHEMA_V0_7),
+        PackageArtifactPreparedReuses => ("package.artifact_prepared_reuses", Count, PERFORMANCE_MEASUREMENTS_SCHEMA_V0_7),
+        PackagePreparedArtifactAdmissions => ("package.prepared_artifact_admissions", Count, PERFORMANCE_MEASUREMENTS_SCHEMA_V0_7),
+        PackagePreparedArtifactAdmittedBytes => ("package.prepared_artifact_admitted_bytes", Bytes, PERFORMANCE_MEASUREMENTS_SCHEMA_V0_7),
+        PackagePreparedArtifactCurrentEntries => ("package.prepared_artifact_current_entries", Count, PERFORMANCE_MEASUREMENTS_SCHEMA_V0_7),
+        PackagePreparedArtifactPeakEntries => ("package.prepared_artifact_peak_entries", Count, PERFORMANCE_MEASUREMENTS_SCHEMA_V0_7),
+        PackagePreparedArtifactCurrentBytes => ("package.prepared_artifact_current_bytes", Bytes, PERFORMANCE_MEASUREMENTS_SCHEMA_V0_7),
+        PackagePreparedArtifactPeakBytes => ("package.prepared_artifact_peak_bytes", Bytes, PERFORMANCE_MEASUREMENTS_SCHEMA_V0_7),
+        PackagePreparedArtifactDerivationCurrentBytes => ("package.prepared_artifact_derivation_current_bytes", Bytes, PERFORMANCE_MEASUREMENTS_SCHEMA_V0_7),
+        PackagePreparedArtifactDerivationPeakBytes => ("package.prepared_artifact_derivation_peak_bytes", Bytes, PERFORMANCE_MEASUREMENTS_SCHEMA_V0_7),
+        PackagePreparedArtifactKeyCurrentBytes => ("package.prepared_artifact_key_current_bytes", Bytes, PERFORMANCE_MEASUREMENTS_SCHEMA_V0_7),
+        PackagePreparedArtifactKeyPeakBytes => ("package.prepared_artifact_key_peak_bytes", Bytes, PERFORMANCE_MEASUREMENTS_SCHEMA_V0_7),
+        PackagePreparedArtifactEntryLimitFallbacks => ("package.prepared_artifact_entry_limit_fallbacks", Count, PERFORMANCE_MEASUREMENTS_SCHEMA_V0_7),
+        PackagePreparedArtifactByteLimitFallbacks => ("package.prepared_artifact_byte_limit_fallbacks", Count, PERFORMANCE_MEASUREMENTS_SCHEMA_V0_7),
+        PackagePreparedArtifactSaturatedChargeFallbacks => ("package.prepared_artifact_saturated_charge_fallbacks", Count, PERFORMANCE_MEASUREMENTS_SCHEMA_V0_7),
+        PackagePreparedArtifactReleases => ("package.prepared_artifact_releases", Count, PERFORMANCE_MEASUREMENTS_SCHEMA_V0_7),
+        PackagePreparedArtifactReleasedBytes => ("package.prepared_artifact_released_bytes", Bytes, PERFORMANCE_MEASUREMENTS_SCHEMA_V0_7),
+        PackageSelectionBaseCommitQueries => ("package.selection_base_commit_queries", Count, PERFORMANCE_MEASUREMENTS_SCHEMA_V0_8),
+        PackageSelectionCommittedHeadQueries => ("package.selection_committed_head_queries", Count, PERFORMANCE_MEASUREMENTS_SCHEMA_V0_8),
+        PackageSelectionMergeBaseQueries => ("package.selection_merge_base_queries", Count, PERFORMANCE_MEASUREMENTS_SCHEMA_V0_8),
+        PackageSelectionBaseManifestBlobBytes => ("package.selection_base_manifest_blob_bytes", Bytes, PERFORMANCE_MEASUREMENTS_SCHEMA_V0_8),
+        PackageSelectionBaseLockBlobBytes => ("package.selection_base_lock_blob_bytes", Bytes, PERFORMANCE_MEASUREMENTS_SCHEMA_V0_8),
+        PackageSelectionProtectedCandidatePaths => ("package.selection_protected_candidate_paths", Count, PERFORMANCE_MEASUREMENTS_SCHEMA_V0_8),
+        PackageSelectionDirtyPaths => ("package.selection_dirty_paths", Count, PERFORMANCE_MEASUREMENTS_SCHEMA_V0_8),
+        PackageSelectionCommittedDiffBatches => ("package.selection_committed_diff_batches", Count, PERFORMANCE_MEASUREMENTS_SCHEMA_V0_8),
+        PackageSelectionCommittedDiffProcesses => ("package.selection_committed_diff_processes", Count, PERFORMANCE_MEASUREMENTS_SCHEMA_V0_8),
+        PackageSelectionCommittedDiffOutputPaths => ("package.selection_committed_diff_output_paths", Count, PERFORMANCE_MEASUREMENTS_SCHEMA_V0_8),
+        PackageSelectionSeedModules => ("package.selection_seed_modules", Count, PERFORMANCE_MEASUREMENTS_SCHEMA_V0_8),
+        PackageSelectionFullEscalations => ("package.selection_full_escalations", Count, PERFORMANCE_MEASUREMENTS_SCHEMA_V0_8),
+        PackageSelectionFullEscalationReasonIdentityWord0 => ("package.selection_full_escalation_reason_identity_word_0", Count, PERFORMANCE_MEASUREMENTS_SCHEMA_V0_8),
+        PackageSelectionFullEscalationReasonIdentityWord1 => ("package.selection_full_escalation_reason_identity_word_1", Count, PERFORMANCE_MEASUREMENTS_SCHEMA_V0_8),
+        PackageSelectionFullEscalationReasonIdentityWord2 => ("package.selection_full_escalation_reason_identity_word_2", Count, PERFORMANCE_MEASUREMENTS_SCHEMA_V0_8),
+        PackageSelectionFullEscalationReasonIdentityWord3 => ("package.selection_full_escalation_reason_identity_word_3", Count, PERFORMANCE_MEASUREMENTS_SCHEMA_V0_8),
+        PackageSelectionClosureModules => ("package.selection_closure_modules", Count, PERFORMANCE_MEASUREMENTS_SCHEMA_V0_8),
+    }
+}
+
+/// Cross-phase artifact work that is owned above the lock builder and checker.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PackageCertificateArtifactObservation {
+    pub artifact_files_read: u64,
+    pub artifact_file_hashes: u64,
+    pub artifact_full_decodes: u64,
+    pub artifact_prepared_reuses: u64,
+    pub key_candidate_current_bytes: u64,
+    pub key_candidate_peak_bytes: u64,
+    pub overflowed: bool,
+}
+
+/// Logical charge of the process-local decode/import cache in package memory
+/// accounting. This state stays distinct from prepared-artifact retention: a
+/// missing cache observation must never be replaced by the snapshot budget.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PackageDecodeCacheChargeState {
+    /// Decode/import caching is disabled, so its logical retained charge is zero.
+    Disabled,
+    /// Caching is enabled but no typed bounded observation is available.
+    UnboundedUnknown,
+    /// The shared bounded cache supplied operation-current and operation-peak charge.
+    Bounded { current_bytes: u64, peak_bytes: u64 },
+}
+
+impl PackageDecodeCacheChargeState {
+    /// Build the honest aggregate-accounting state from the selected cache
+    /// policy and the shared-payload observation captured by the operation.
+    pub const fn from_payload_observation(
+        cache_enabled: bool,
+        observation: Option<&PackagePayloadOwnershipObservation>,
+    ) -> Self {
+        if !cache_enabled {
+            return Self::Disabled;
+        }
+        match observation {
+            Some(observation) => Self::Bounded {
+                current_bytes: observation.decode_cache_retained_bytes,
+                peak_bytes: observation.decode_cache_peak_retained_bytes,
+            },
+            None => Self::UnboundedUnknown,
+        }
+    }
+
+    /// Project cache charge from the public production measurement report.
+    /// Missing measurement data remains explicitly unknown rather than
+    /// borrowing the unrelated prepared-artifact budget.
+    pub fn from_measurement_report(
+        cache_enabled: bool,
+        report: Option<&PerformanceMeasurementReport>,
+    ) -> Self {
+        if !cache_enabled {
+            return Self::Disabled;
+        }
+        let Some(report) = report else {
+            return Self::UnboundedUnknown;
+        };
+        let value = |label| {
+            report
+                .counters
+                .iter()
+                .find(|counter| counter.label == label)
+                .map(|counter| counter.value)
+        };
+        match (
+            value(PerformanceMeasurementLabel::PackageDecodeCacheRetainedBytes),
+            value(PerformanceMeasurementLabel::PackageDecodeCachePeakRetainedBytes),
+        ) {
+            (Some(current_bytes), Some(peak_bytes)) => Self::Bounded {
+                current_bytes,
+                peak_bytes,
+            },
+            _ => Self::UnboundedUnknown,
+        }
+    }
+}
+
+impl PackageCertificateArtifactObservation {
+    fn add(field: &mut u64, value: u64, overflowed: &mut bool) {
+        let (sum, overflow) = field.overflowing_add(value);
+        *field = if overflow { u64::MAX } else { sum };
+        *overflowed |= overflow;
+    }
+
+    pub fn observe_file_read(&mut self) {
+        Self::add(&mut self.artifact_files_read, 1, &mut self.overflowed);
+    }
+
+    pub fn observe_file_hash(&mut self) {
+        Self::add(&mut self.artifact_file_hashes, 1, &mut self.overflowed);
+    }
+
+    pub fn observe_full_decode(&mut self) {
+        Self::add(&mut self.artifact_full_decodes, 1, &mut self.overflowed);
+    }
+
+    pub fn observe_prepared_reuse(&mut self) {
+        Self::add(&mut self.artifact_prepared_reuses, 1, &mut self.overflowed);
+    }
+
+    pub fn merge_preparation(
+        &mut self,
+        observation: npa_package::PackageArtifactPreparationObservation,
+    ) {
+        Self::add(
+            &mut self.artifact_file_hashes,
+            observation.artifact_file_hashes,
+            &mut self.overflowed,
+        );
+        Self::add(
+            &mut self.artifact_full_decodes,
+            observation.artifact_full_decodes,
+            &mut self.overflowed,
+        );
+        self.overflowed |= observation.overflowed;
+    }
+
+    pub fn begin_key_candidate(&mut self, bytes: u64) {
+        self.key_candidate_current_bytes = bytes;
+        self.key_candidate_peak_bytes = self.key_candidate_peak_bytes.max(bytes);
+    }
+
+    pub fn finish_key_candidate(&mut self) {
+        self.key_candidate_current_bytes = 0;
+    }
 }
 
 /// One aggregate counter.
@@ -273,12 +599,20 @@ impl PerformancePackageShardCostModel {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum PerformancePackageShardMemoryModel {
     FastShardMemoryV1,
+    FastShardMemoryV2TermMaterialization,
+    FastShardMemoryV3TermMaterializationPreparedRetention,
 }
 
 impl PerformancePackageShardMemoryModel {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::FastShardMemoryV1 => "npa.fast-shard-memory.v1",
+            Self::FastShardMemoryV2TermMaterialization => {
+                "npa.fast-shard-memory.v2-term-materialization"
+            }
+            Self::FastShardMemoryV3TermMaterializationPreparedRetention => {
+                "npa.fast-shard-memory.v3-term-materialization-prepared-retention"
+            }
         }
     }
 }
@@ -384,7 +718,6 @@ pub struct PerformanceKernelWork {
     pub beta_steps: u64,
     pub delta_steps: u64,
     pub iota_steps: u64,
-    pub zeta_steps: u64,
     pub physical_reductions: u64,
     pub overflowed: bool,
 }
@@ -477,7 +810,6 @@ impl PerformanceKernelWork {
             beta_steps: summary.beta_steps,
             delta_steps: summary.delta_steps,
             iota_steps: summary.iota_steps,
-            zeta_steps: summary.zeta_steps,
             physical_reductions: summary.physical_reductions,
             overflowed: summary.overflowed,
         }
@@ -556,7 +888,10 @@ pub struct PerformancePackageLayerMeasurement {
     pub effective_jobs: u64,
     pub reduction_reason: PerformancePackageShardReductionReason,
     pub shared_base_context_bytes: u64,
+    pub prepared_shared_bytes: u64,
+    pub combined_shared_bytes: u64,
     pub per_worker_bytes: u64,
+    pub term_materialization_bytes_per_worker: u64,
     pub memory_budget_bytes: u64,
     pub estimate_overflowed: bool,
     pub elapsed_ns: u64,
@@ -587,7 +922,10 @@ pub struct PerformancePackageShardingMeasurement {
     pub effective_jobs: u64,
     pub reduction_reason: PerformancePackageShardReductionReason,
     pub shared_base_context_bytes: u64,
+    pub prepared_shared_bytes: u64,
+    pub combined_shared_bytes: u64,
     pub per_worker_bytes: u64,
+    pub term_materialization_bytes_per_worker: u64,
     pub avoided_base_context_clone_bytes: u64,
     pub estimate_overflowed: bool,
     pub critical_path_cost: u64,
@@ -652,11 +990,34 @@ struct PerformanceMeasurementState {
     coarse_stage_reads: u64,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+enum PerformanceInputIdentityState {
+    #[default]
+    Unknown,
+    Exact(String),
+    Conflict,
+}
+
+impl PerformanceInputIdentityState {
+    fn merge_child(&mut self, child: Option<&str>) {
+        let Some(child) = child else {
+            return;
+        };
+        match self {
+            Self::Unknown => *self = Self::Exact(child.to_owned()),
+            Self::Exact(current) if current == child => {}
+            Self::Exact(_) => *self = Self::Conflict,
+            Self::Conflict => {}
+        }
+    }
+}
+
 /// Operation-scoped bounded recorder.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PerformanceMeasurementRecorder {
     mode: PerformanceMeasurementMode,
-    input_identity: Option<String>,
+    schema: &'static str,
+    input_identity: PerformanceInputIdentityState,
     state: Option<PerformanceMeasurementState>,
 }
 
@@ -673,14 +1034,15 @@ impl PerformanceMeasurementRecorder {
         });
         Self {
             mode,
-            input_identity: None,
+            schema: PERFORMANCE_MEASUREMENTS_SCHEMA,
+            input_identity: PerformanceInputIdentityState::Unknown,
             state,
         }
     }
 
     pub fn with_input_identity(mut self, identity: impl Into<String>) -> Self {
         if self.mode.is_enabled() {
-            self.input_identity = Some(identity.into());
+            self.input_identity = PerformanceInputIdentityState::Exact(identity.into());
         }
         self
     }
@@ -718,6 +1080,12 @@ impl PerformanceMeasurementRecorder {
         let Some(state) = self.state.as_mut() else {
             return;
         };
+        if PerformanceMeasurementLabel::from_schema_identifier(self.schema, label.as_str())
+            .is_none()
+        {
+            state.overflowed = true;
+            return;
+        }
         let counter = state.counters.entry(label).or_default();
         let (next, overflowed) = counter.overflowing_add(value);
         if overflowed {
@@ -731,6 +1099,158 @@ impl PerformanceMeasurementRecorder {
     pub(crate) fn mark_overflowed(&mut self) {
         if let Some(state) = self.state.as_mut() {
             state.overflowed = true;
+        }
+    }
+
+    /// Project one changed-package selection observation through the closed
+    /// common measurement vocabulary.
+    pub fn observe_package_selection(
+        &mut self,
+        observation: &PerformancePackageSelectionObservation,
+    ) {
+        match observation.batch_policy {
+            PerformancePackageSelectionBatchPolicy::NotSelected => {}
+            PerformancePackageSelectionBatchPolicy::ExecBudget => self.add_counter(
+                PerformanceMeasurementLabel::PackageSelectionExecBudgetPolicy,
+                1,
+            ),
+            PerformancePackageSelectionBatchPolicy::Legacy128 => self.add_counter(
+                PerformanceMeasurementLabel::PackageSelectionLegacy128Policy,
+                1,
+            ),
+        }
+        for (label, value) in [
+            (
+                PerformanceMeasurementLabel::PackageSelectionCandidatePaths,
+                observation.candidate_paths,
+            ),
+            (
+                PerformanceMeasurementLabel::PackageSelectionPathspecPayloadBytes,
+                observation.pathspec_payload_bytes,
+            ),
+            (
+                PerformanceMeasurementLabel::PackageSelectionEffectiveArgvChargeBytes,
+                observation.effective_argv_charge_bytes,
+            ),
+            (
+                PerformanceMeasurementLabel::PackageSelectionMaxBatchPayloadBytes,
+                observation.max_batch_payload_bytes,
+            ),
+            (
+                PerformanceMeasurementLabel::PackageSelectionMaxBatchArgvChargeBytes,
+                observation.max_batch_argv_charge_bytes,
+            ),
+            (
+                PerformanceMeasurementLabel::PackageSelectionPathspecBatches,
+                observation.pathspec_batches,
+            ),
+            (
+                PerformanceMeasurementLabel::PackageSelectionWorktreeRootQueries,
+                observation.worktree_root_queries,
+            ),
+            (
+                PerformanceMeasurementLabel::PackageSelectionHeadQueries,
+                observation.head_queries,
+            ),
+            (
+                PerformanceMeasurementLabel::PackageSelectionTrackedQueries,
+                observation.tracked_queries,
+            ),
+            (
+                PerformanceMeasurementLabel::PackageSelectionUntrackedQueries,
+                observation.untracked_queries,
+            ),
+            (
+                PerformanceMeasurementLabel::PackageSelectionTrackedOutputPaths,
+                observation.tracked_output_paths,
+            ),
+            (
+                PerformanceMeasurementLabel::PackageSelectionUntrackedOutputPaths,
+                observation.untracked_output_paths,
+            ),
+            (
+                PerformanceMeasurementLabel::PackageSelectionChangedPaths,
+                observation.selected_paths,
+            ),
+        ] {
+            self.add_counter(label, value);
+        }
+        if observation.committed_base {
+            for (label, value) in [
+                (
+                    PerformanceMeasurementLabel::PackageSelectionBaseCommitQueries,
+                    observation.base_commit_queries,
+                ),
+                (
+                    PerformanceMeasurementLabel::PackageSelectionCommittedHeadQueries,
+                    observation.committed_head_queries,
+                ),
+                (
+                    PerformanceMeasurementLabel::PackageSelectionMergeBaseQueries,
+                    observation.merge_base_queries,
+                ),
+                (
+                    PerformanceMeasurementLabel::PackageSelectionBaseManifestBlobBytes,
+                    observation.base_manifest_blob_bytes,
+                ),
+                (
+                    PerformanceMeasurementLabel::PackageSelectionBaseLockBlobBytes,
+                    observation.base_lock_blob_bytes,
+                ),
+                (
+                    PerformanceMeasurementLabel::PackageSelectionProtectedCandidatePaths,
+                    observation.protected_candidate_paths,
+                ),
+                (
+                    PerformanceMeasurementLabel::PackageSelectionDirtyPaths,
+                    observation.dirty_paths,
+                ),
+                (
+                    PerformanceMeasurementLabel::PackageSelectionCommittedDiffBatches,
+                    observation.committed_diff_batches,
+                ),
+                (
+                    PerformanceMeasurementLabel::PackageSelectionCommittedDiffProcesses,
+                    observation.committed_diff_processes,
+                ),
+                (
+                    PerformanceMeasurementLabel::PackageSelectionCommittedDiffOutputPaths,
+                    observation.committed_diff_output_paths,
+                ),
+                (
+                    PerformanceMeasurementLabel::PackageSelectionSeedModules,
+                    observation.seed_modules,
+                ),
+                (
+                    PerformanceMeasurementLabel::PackageSelectionFullEscalations,
+                    observation.full_escalations,
+                ),
+                (
+                    PerformanceMeasurementLabel::PackageSelectionFullEscalationReasonIdentityWord0,
+                    observation.full_escalation_reason_identity[0],
+                ),
+                (
+                    PerformanceMeasurementLabel::PackageSelectionFullEscalationReasonIdentityWord1,
+                    observation.full_escalation_reason_identity[1],
+                ),
+                (
+                    PerformanceMeasurementLabel::PackageSelectionFullEscalationReasonIdentityWord2,
+                    observation.full_escalation_reason_identity[2],
+                ),
+                (
+                    PerformanceMeasurementLabel::PackageSelectionFullEscalationReasonIdentityWord3,
+                    observation.full_escalation_reason_identity[3],
+                ),
+                (
+                    PerformanceMeasurementLabel::PackageSelectionClosureModules,
+                    observation.selected_closure_modules,
+                ),
+            ] {
+                self.add_counter(label, value);
+            }
+        }
+        if observation.overflowed {
+            self.mark_overflowed();
         }
     }
 
@@ -769,10 +1289,6 @@ impl PerformanceMeasurementRecorder {
             (
                 PerformanceMeasurementLabel::KernelIotaSteps,
                 counters.iota_steps,
-            ),
-            (
-                PerformanceMeasurementLabel::KernelZetaSteps,
-                counters.zeta_steps,
             ),
             (
                 PerformanceMeasurementLabel::KernelLogicalFuel,
@@ -899,6 +1415,224 @@ impl PerformanceMeasurementRecorder {
             if let Some(state) = self.state.as_mut() {
                 state.overflowed = true;
             }
+        }
+    }
+
+    /// Project certificate term-DAG acceleration work through the common
+    /// diagnostic schema. The observation is never proof evidence.
+    pub fn observe_certificate_term_materialization(
+        &mut self,
+        observation: &CertificateTermMaterializationObservation,
+    ) {
+        for (label, value) in [
+            (
+                PerformanceMeasurementLabel::CertificateTermRootRequests,
+                observation.root_requests,
+            ),
+            (
+                PerformanceMeasurementLabel::CertificateTermUniqueNodesMaterialized,
+                observation.unique_nodes_materialized,
+            ),
+            (
+                PerformanceMeasurementLabel::CertificateTermSelectedEdges,
+                observation.selected_edges,
+            ),
+            (
+                PerformanceMeasurementLabel::CertificateTermReusedChildArcs,
+                observation.reused_child_arcs,
+            ),
+            (
+                PerformanceMeasurementLabel::CertificateTermOwnedRootHandoffs,
+                observation.owned_root_handoffs,
+            ),
+            (
+                PerformanceMeasurementLabel::CertificateTermLeafRootClones,
+                observation.leaf_root_clones,
+            ),
+            (
+                PerformanceMeasurementLabel::CertificateTermCompoundRootClones,
+                observation.compound_root_clones,
+            ),
+            (
+                PerformanceMeasurementLabel::CertificateTermMaterializationSlots,
+                observation.materialization_slots,
+            ),
+            (
+                PerformanceMeasurementLabel::CertificateTermMaterializationChargedBytes,
+                observation.materialization_charged_bytes,
+            ),
+            (
+                PerformanceMeasurementLabel::CertificateTermMaterializationCapacityStops,
+                observation.materialization_capacity_stops,
+            ),
+            (
+                PerformanceMeasurementLabel::CertificateTermMaterializationLegacyFallbacks,
+                observation.materialization_legacy_fallbacks,
+            ),
+        ] {
+            self.add_counter(label, value);
+        }
+        if observation.overflowed {
+            self.mark_overflowed();
+        }
+    }
+
+    /// Project immutable certificate/session payload ownership work.
+    pub fn observe_certificate_payload_ownership(
+        &mut self,
+        certificate: &CertificatePayloadObservation,
+        package: &PackagePayloadOwnershipObservation,
+    ) {
+        for (label, value) in [
+            (
+                PerformanceMeasurementLabel::PackageModulePayloadsFrozen,
+                certificate.payloads_frozen,
+            ),
+            (
+                PerformanceMeasurementLabel::PackageModulePayloadUniqueBytes,
+                certificate.payload_unique_bytes,
+            ),
+            (
+                PerformanceMeasurementLabel::PackageSessionSnapshotClones,
+                certificate.session_snapshot_clones,
+            ),
+            (
+                PerformanceMeasurementLabel::PackageSessionIndexCowCopies,
+                certificate.session_index_cow_copies,
+            ),
+            (
+                PerformanceMeasurementLabel::PackageSessionIndexCowEntries,
+                certificate.session_index_cow_entries,
+            ),
+            (
+                PerformanceMeasurementLabel::PackageModulePayloadHandleClones,
+                package.module_payload_handle_clones,
+            ),
+            (
+                PerformanceMeasurementLabel::PackageAvoidedModulePayloadCloneBytes,
+                package.avoided_module_payload_clone_bytes,
+            ),
+            (
+                PerformanceMeasurementLabel::PackageDecodeCacheRetainedBytes,
+                package.decode_cache_retained_bytes,
+            ),
+            (
+                PerformanceMeasurementLabel::PackageDecodeCachePeakRetainedBytes,
+                package.decode_cache_peak_retained_bytes,
+            ),
+            (
+                PerformanceMeasurementLabel::PackageDecodeCacheCapacityStops,
+                package.decode_cache_capacity_stops,
+            ),
+            (
+                PerformanceMeasurementLabel::PackageProcessMemoPayloadHandleClones,
+                package.process_memo_payload_handle_clones,
+            ),
+        ] {
+            self.add_counter(label, value);
+        }
+        if certificate.overflowed || package.overflowed {
+            self.mark_overflowed();
+        }
+    }
+
+    /// Project owned artifact preparation/reuse and decoded-retention work.
+    pub fn observe_package_certificate_artifacts(
+        &mut self,
+        artifacts: &PackageCertificateArtifactObservation,
+        retention: Option<&PreparedArtifactRetentionObservation>,
+    ) {
+        for (label, value) in [
+            (
+                PerformanceMeasurementLabel::PackageArtifactFilesRead,
+                artifacts.artifact_files_read,
+            ),
+            (
+                PerformanceMeasurementLabel::PackageArtifactFileHashes,
+                artifacts.artifact_file_hashes,
+            ),
+            (
+                PerformanceMeasurementLabel::PackageArtifactFullDecodes,
+                artifacts.artifact_full_decodes,
+            ),
+            (
+                PerformanceMeasurementLabel::PackageArtifactPreparedReuses,
+                artifacts.artifact_prepared_reuses,
+            ),
+            (
+                PerformanceMeasurementLabel::PackagePreparedArtifactKeyCurrentBytes,
+                artifacts.key_candidate_current_bytes,
+            ),
+            (
+                PerformanceMeasurementLabel::PackagePreparedArtifactKeyPeakBytes,
+                artifacts.key_candidate_peak_bytes,
+            ),
+        ] {
+            self.add_counter(label, value);
+        }
+        if let Some(retention) = retention {
+            for (label, value) in [
+                (
+                    PerformanceMeasurementLabel::PackagePreparedArtifactAdmissions,
+                    retention.admissions,
+                ),
+                (
+                    PerformanceMeasurementLabel::PackagePreparedArtifactAdmittedBytes,
+                    retention.admitted_bytes,
+                ),
+                (
+                    PerformanceMeasurementLabel::PackagePreparedArtifactCurrentEntries,
+                    retention.current_entries,
+                ),
+                (
+                    PerformanceMeasurementLabel::PackagePreparedArtifactPeakEntries,
+                    retention.peak_entries,
+                ),
+                (
+                    PerformanceMeasurementLabel::PackagePreparedArtifactCurrentBytes,
+                    retention.current_bytes,
+                ),
+                (
+                    PerformanceMeasurementLabel::PackagePreparedArtifactPeakBytes,
+                    retention.peak_bytes,
+                ),
+                (
+                    PerformanceMeasurementLabel::PackagePreparedArtifactDerivationCurrentBytes,
+                    retention.derivation_candidate_current_bytes,
+                ),
+                (
+                    PerformanceMeasurementLabel::PackagePreparedArtifactDerivationPeakBytes,
+                    retention.derivation_candidate_peak_bytes,
+                ),
+                (
+                    PerformanceMeasurementLabel::PackagePreparedArtifactEntryLimitFallbacks,
+                    retention.entry_limit_fallbacks,
+                ),
+                (
+                    PerformanceMeasurementLabel::PackagePreparedArtifactByteLimitFallbacks,
+                    retention.byte_limit_fallbacks,
+                ),
+                (
+                    PerformanceMeasurementLabel::PackagePreparedArtifactSaturatedChargeFallbacks,
+                    retention.saturated_charge_fallbacks,
+                ),
+                (
+                    PerformanceMeasurementLabel::PackagePreparedArtifactReleases,
+                    retention.charged_releases,
+                ),
+                (
+                    PerformanceMeasurementLabel::PackagePreparedArtifactReleasedBytes,
+                    retention.released_bytes,
+                ),
+            ] {
+                self.add_counter(label, value);
+            }
+            if retention.overflowed {
+                self.mark_overflowed();
+            }
+        }
+        if artifacts.overflowed {
+            self.mark_overflowed();
         }
     }
 
@@ -1219,6 +1953,20 @@ impl PerformanceMeasurementRecorder {
         }
     }
 
+    /// Merge a child report while preserving a single exact input identity.
+    /// Distinct child identities enter an absorbing measurement-only conflict.
+    pub fn merge_child_report_preserving_identity(
+        &mut self,
+        report: &PerformanceMeasurementReport,
+    ) {
+        if !self.mode.is_enabled() {
+            return;
+        }
+        self.input_identity
+            .merge_child(report.input_identity.as_deref());
+        self.merge(report);
+    }
+
     pub fn report(&self) -> Option<PerformanceMeasurementReport> {
         let state = self.state.as_ref()?;
         let mut counters = state
@@ -1269,12 +2017,20 @@ impl PerformanceMeasurementRecorder {
             detail_counts(state.package_layer_attempted, package_layers.len());
         let package_shard_details =
             detail_counts(state.package_shard_attempted, package_shards.len());
+        let identity_conflict =
+            matches!(self.input_identity, PerformanceInputIdentityState::Conflict);
+        let input_identity = match &self.input_identity {
+            PerformanceInputIdentityState::Unknown | PerformanceInputIdentityState::Conflict => {
+                None
+            }
+            PerformanceInputIdentityState::Exact(identity) => Some(identity.clone()),
+        };
         Some(PerformanceMeasurementReport {
-            schema: PERFORMANCE_MEASUREMENTS_SCHEMA,
+            schema: self.schema,
             trusted: false,
             proof_evidence: false,
             mode: self.mode,
-            input_identity: self.input_identity.clone(),
+            input_identity,
             counters,
             modules,
             module_details,
@@ -1295,7 +2051,7 @@ impl PerformanceMeasurementRecorder {
                 || worker_details.omitted > 0
                 || package_layer_details.omitted > 0
                 || package_shard_details.omitted > 0,
-            overflowed: state.overflowed,
+            overflowed: state.overflowed || identity_conflict,
             clock: PerformanceClockMetadata {
                 source: "std.monotonic.instant",
                 resolution_ns: 1,
@@ -1430,7 +2186,7 @@ pub fn performance_measurement_report_json(report: &PerformanceMeasurementReport
         .iter()
         .map(|layer| {
             format!(
-                "{{\"layer_index\":{},\"runnable_width\":{},\"estimated_total_cost\":{},\"estimated_max_shard_cost\":{},\"requested_jobs\":{},\"effective_jobs\":{},\"reduction_reason\":\"{}\",\"shared_base_context_bytes\":{},\"per_worker_bytes\":{},\"memory_budget_bytes\":{},\"estimate_overflowed\":{},\"elapsed_ns\":{}}}",
+                "{{\"layer_index\":{},\"runnable_width\":{},\"estimated_total_cost\":{},\"estimated_max_shard_cost\":{},\"requested_jobs\":{},\"effective_jobs\":{},\"reduction_reason\":\"{}\",\"shared_base_context_bytes\":{},\"prepared_shared_bytes\":{},\"combined_shared_bytes\":{},\"per_worker_bytes\":{},\"term_materialization_bytes_per_worker\":{},\"memory_budget_bytes\":{},\"estimate_overflowed\":{},\"elapsed_ns\":{}}}",
                 layer.layer_index,
                 layer.runnable_width,
                 layer.estimated_total_cost,
@@ -1439,7 +2195,10 @@ pub fn performance_measurement_report_json(report: &PerformanceMeasurementReport
                 layer.effective_jobs,
                 layer.reduction_reason.as_str(),
                 layer.shared_base_context_bytes,
+                layer.prepared_shared_bytes,
+                layer.combined_shared_bytes,
                 layer.per_worker_bytes,
+                layer.term_materialization_bytes_per_worker,
                 layer.memory_budget_bytes,
                 layer.estimate_overflowed,
                 layer.elapsed_ns,
@@ -1534,7 +2293,7 @@ fn kernel_fuel_domain_json(fuel: &PerformanceKernelFuelDomainTotals) -> String {
 
 fn kernel_work_json(work: &PerformanceKernelWork) -> String {
     format!(
-        "{{\"check_calls\":{},\"infer_calls\":{},\"whnf_calls\":{},\"defeq_calls\":{},\"quick_equality_hits\":{},\"beta_steps\":{},\"delta_steps\":{},\"iota_steps\":{},\"zeta_steps\":{},\"physical_reductions\":{},\"overflowed\":{}}}",
+        "{{\"check_calls\":{},\"infer_calls\":{},\"whnf_calls\":{},\"defeq_calls\":{},\"quick_equality_hits\":{},\"beta_steps\":{},\"delta_steps\":{},\"iota_steps\":{},\"physical_reductions\":{},\"overflowed\":{}}}",
         work.check_calls,
         work.infer_calls,
         work.whnf_calls,
@@ -1543,7 +2302,6 @@ fn kernel_work_json(work: &PerformanceKernelWork) -> String {
         work.beta_steps,
         work.delta_steps,
         work.iota_steps,
-        work.zeta_steps,
         work.physical_reductions,
         work.overflowed,
     )
@@ -1599,7 +2357,7 @@ fn package_module_sharding_json(
 
 fn package_sharding_json(measurement: &PerformancePackageShardingMeasurement) -> String {
     format!(
-        "{{\"cost_model\":\"{}\",\"memory_model\":\"{}\",\"import_weight\":{},\"memory_budget_bytes\":{},\"fixed_worker_bytes\":{},\"scratch_multiplier\":{},\"requested_jobs\":{},\"effective_jobs\":{},\"reduction_reason\":\"{}\",\"shared_base_context_bytes\":{},\"per_worker_bytes\":{},\"avoided_base_context_clone_bytes\":{},\"estimate_overflowed\":{},\"critical_path_cost\":{},\"critical_path_module_count\":{},\"critical_path_identity\":\"{}\",\"critical_path_checker_elapsed_ns\":{},\"barrier_elapsed_ns\":{}}}",
+        "{{\"cost_model\":\"{}\",\"memory_model\":\"{}\",\"import_weight\":{},\"memory_budget_bytes\":{},\"fixed_worker_bytes\":{},\"scratch_multiplier\":{},\"requested_jobs\":{},\"effective_jobs\":{},\"reduction_reason\":\"{}\",\"shared_base_context_bytes\":{},\"prepared_shared_bytes\":{},\"combined_shared_bytes\":{},\"per_worker_bytes\":{},\"term_materialization_bytes_per_worker\":{},\"avoided_base_context_clone_bytes\":{},\"estimate_overflowed\":{},\"critical_path_cost\":{},\"critical_path_module_count\":{},\"critical_path_identity\":\"{}\",\"critical_path_checker_elapsed_ns\":{},\"barrier_elapsed_ns\":{}}}",
         measurement.cost_model.as_str(),
         measurement.memory_model.as_str(),
         measurement.import_weight,
@@ -1610,7 +2368,10 @@ fn package_sharding_json(measurement: &PerformancePackageShardingMeasurement) ->
         measurement.effective_jobs,
         measurement.reduction_reason.as_str(),
         measurement.shared_base_context_bytes,
+        measurement.prepared_shared_bytes,
+        measurement.combined_shared_bytes,
         measurement.per_worker_bytes,
+        measurement.term_materialization_bytes_per_worker,
         measurement.avoided_base_context_clone_bytes,
         measurement.estimate_overflowed,
         measurement.critical_path_cost,
@@ -1665,9 +2426,12 @@ mod tests {
         assert!(identifiers.windows(2).all(|pair| pair[0] != pair[1]));
         assert!(identifiers.iter().all(|identifier| {
             identifier.contains('.')
-                && identifier
-                    .bytes()
-                    .all(|byte| byte.is_ascii_lowercase() || byte == b'.' || byte == b'_')
+                && identifier.bytes().all(|byte| {
+                    byte.is_ascii_lowercase()
+                        || byte.is_ascii_digit()
+                        || byte == b'.'
+                        || byte == b'_'
+                })
         }));
         let snapshot = PerformanceMeasurementLabel::ALL
             .iter()
@@ -1677,8 +2441,136 @@ mod tests {
         let snapshot_hash = format!("{:x}", Sha256::digest(snapshot.as_bytes()));
         assert_eq!(
             snapshot_hash,
-            "990ced2b480dd75275e3a10dddda7f01171cd6527aaa1b84117ca503f36c3400"
+            "3e14ad257cfd7f77702db39e19f9bf029f486e7c8419b63fd4d73f42fa3ab50e"
         );
+    }
+
+    #[test]
+    fn performance_measurement_historical_vocabularies_reject_newer_labels() {
+        let targeted = targeted_authoring_labels();
+        for schema in [
+            PERFORMANCE_MEASUREMENTS_SCHEMA_V0_1,
+            PERFORMANCE_MEASUREMENTS_SCHEMA_V0_2,
+            PERFORMANCE_MEASUREMENTS_SCHEMA_V0_3,
+        ] {
+            for (label, identifier, _) in targeted {
+                assert_eq!(
+                    PerformanceMeasurementLabel::from_schema_identifier(schema, identifier),
+                    None,
+                    "{schema} accepted {identifier}"
+                );
+                assert!(!PerformanceMeasurementLabel::labels_for_schema(schema)
+                    .unwrap()
+                    .any(|candidate| candidate == *label));
+            }
+        }
+
+        let v0_1 =
+            PerformanceMeasurementLabel::labels_for_schema(PERFORMANCE_MEASUREMENTS_SCHEMA_V0_1)
+                .unwrap()
+                .collect::<Vec<_>>();
+        let v0_2 =
+            PerformanceMeasurementLabel::labels_for_schema(PERFORMANCE_MEASUREMENTS_SCHEMA_V0_2)
+                .unwrap()
+                .collect::<Vec<_>>();
+        let v0_3 =
+            PerformanceMeasurementLabel::labels_for_schema(PERFORMANCE_MEASUREMENTS_SCHEMA_V0_3)
+                .unwrap()
+                .collect::<Vec<_>>();
+        assert_eq!(v0_2, v0_3);
+        assert_eq!(v0_1.len() + 1, v0_2.len());
+        assert!(!v0_1.contains(&PerformanceMeasurementLabel::PackageAvoidedBaseContextCloneBytes));
+        assert!(v0_2.contains(&PerformanceMeasurementLabel::PackageAvoidedBaseContextCloneBytes));
+        assert!(PerformanceMeasurementLabel::labels_for_schema(
+            "npa.performance.measurements.v0.10"
+        )
+        .is_none());
+        assert!(PerformanceMeasurementLabel::from_schema_identifier(
+            PERFORMANCE_MEASUREMENTS_SCHEMA,
+            "cache.unknown"
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn targeted_authoring_measurement_labels_have_exact_units_and_current_order() {
+        let targeted = targeted_authoring_labels();
+        for (label, identifier, unit) in targeted {
+            assert_eq!(label.as_str(), *identifier);
+            assert_eq!(label.unit(), *unit);
+            assert_eq!(
+                PerformanceMeasurementLabel::from_schema_identifier(
+                    PERFORMANCE_MEASUREMENTS_SCHEMA_V0_4,
+                    identifier,
+                ),
+                Some(*label)
+            );
+        }
+        for (label, unit) in [
+            (
+                PerformanceMeasurementLabel::CacheContextHits,
+                PerformanceMeasurementUnit::Count,
+            ),
+            (
+                PerformanceMeasurementLabel::CacheContextMisses,
+                PerformanceMeasurementUnit::Count,
+            ),
+            (
+                PerformanceMeasurementLabel::CacheLivePrerequisiteChecks,
+                PerformanceMeasurementUnit::Count,
+            ),
+            (
+                PerformanceMeasurementLabel::CacheAvoidedKernelChecks,
+                PerformanceMeasurementUnit::Count,
+            ),
+            (
+                PerformanceMeasurementLabel::CacheReconstructionElapsed,
+                PerformanceMeasurementUnit::Nanoseconds,
+            ),
+            (
+                PerformanceMeasurementLabel::CacheFreshTargetElapsed,
+                PerformanceMeasurementUnit::Nanoseconds,
+            ),
+        ] {
+            assert_eq!(label.unit(), unit);
+            for schema in [
+                PERFORMANCE_MEASUREMENTS_SCHEMA_V0_1,
+                PERFORMANCE_MEASUREMENTS_SCHEMA_V0_2,
+                PERFORMANCE_MEASUREMENTS_SCHEMA_V0_3,
+                PERFORMANCE_MEASUREMENTS_SCHEMA_V0_4,
+                PERFORMANCE_MEASUREMENTS_SCHEMA_V0_5,
+                PERFORMANCE_MEASUREMENTS_SCHEMA_V0_6,
+                PERFORMANCE_MEASUREMENTS_SCHEMA_V0_7,
+                PERFORMANCE_MEASUREMENTS_SCHEMA_V0_8,
+            ] {
+                assert_eq!(
+                    PerformanceMeasurementLabel::from_schema_identifier(schema, label.as_str()),
+                    Some(label)
+                );
+            }
+        }
+
+        let mut recorder = PerformanceMeasurementRecorder::new(PerformanceMeasurementMode::Summary);
+        for (index, (label, _, _)) in targeted.iter().rev().enumerate() {
+            recorder.add_counter(*label, index as u64);
+        }
+        let report = recorder.report().unwrap();
+        assert_eq!(report.schema, PERFORMANCE_MEASUREMENTS_SCHEMA);
+        let identifiers = report
+            .counters
+            .iter()
+            .map(|counter| counter.label.as_str())
+            .collect::<Vec<_>>();
+        let mut expected = targeted
+            .iter()
+            .map(|(_, identifier, _)| *identifier)
+            .collect::<Vec<_>>();
+        expected.sort_unstable();
+        assert_eq!(identifiers, expected);
+        let json = performance_measurement_report_json(&report);
+        assert!(json.starts_with(&format!(
+            "{{\"schema\":\"{PERFORMANCE_MEASUREMENTS_SCHEMA}\""
+        )));
     }
 
     #[test]
@@ -1852,7 +2744,7 @@ mod tests {
             ],
         );
         let report = recorder.report().unwrap();
-        assert_eq!(report.schema, PERFORMANCE_MEASUREMENTS_SCHEMA_V0_3);
+        assert_eq!(report.schema, PERFORMANCE_MEASUREMENTS_SCHEMA);
 
         let json = performance_measurement_report_json(&report);
         let expected_declarations = concat!(
@@ -1862,11 +2754,13 @@ mod tests {
             "{\"subsystem\":\"fast_kernel\",\"outcome\":\"accepted\",\"fuel\":",
             "{\"whnf\":{\"calls\":1,\"logical_spent\":10,\"successful_operation_fuel\":10,\"exhausted_operation_fuel\":0,\"overflowed\":false},",
             "\"conversion\":{\"calls\":2,\"logical_spent\":20,\"successful_operation_fuel\":20,\"exhausted_operation_fuel\":0,\"overflowed\":false}},",
-            "\"work\":{\"check_calls\":1,\"infer_calls\":2,\"whnf_calls\":3,\"defeq_calls\":4,\"quick_equality_hits\":5,\"beta_steps\":6,\"delta_steps\":0,\"iota_steps\":7,\"zeta_steps\":8,\"physical_reductions\":21,\"overflowed\":false},",
+            "\"work\":{\"check_calls\":1,\"infer_calls\":2,\"whnf_calls\":3,\"defeq_calls\":4,\"quick_equality_hits\":5,\"beta_steps\":6,\"delta_steps\":0,\"iota_steps\":7,\"physical_reductions\":13,\"overflowed\":false},",
             "\"retained_delta_constants\":{\"retained_names\":0,\"capacity\":256,\"entries\":[],\"emitted\":0,\"entry_limit\":16,\"unretained_name_observations\":0,\"overlong_name_observations\":0,\"output_truncated\":false,\"overflowed\":false},",
             "\"overflowed\":false}}]"
         );
-        assert!(json.starts_with("{\"schema\":\"npa.performance.measurements.v0.3\""));
+        assert!(json.starts_with(&format!(
+            "{{\"schema\":\"{PERFORMANCE_MEASUREMENTS_SCHEMA}\""
+        )));
         assert!(json.contains(expected_declarations), "{json}");
     }
 
@@ -1965,7 +2859,9 @@ mod tests {
         assert!(report.overflowed);
         assert_eq!(report.counters[0].value, u64::MAX);
         let json = performance_measurement_report_json(&report);
-        assert!(json.starts_with("{\"schema\":\"npa.performance.measurements.v0.3\""));
+        assert!(json.starts_with(&format!(
+            "{{\"schema\":\"{PERFORMANCE_MEASUREMENTS_SCHEMA}\""
+        )));
         assert!(json.contains("\"trusted\":false,\"proof_evidence\":false"));
         assert!(json.contains("\"overflowed\":true"));
     }
@@ -2121,6 +3017,507 @@ mod tests {
     }
 
     #[test]
+    fn performance_package_selection_observation_default_is_closed_zero() {
+        assert_eq!(
+            PerformancePackageSelectionObservation::default(),
+            PerformancePackageSelectionObservation {
+                committed_base: false,
+                batch_policy: PerformancePackageSelectionBatchPolicy::NotSelected,
+                candidate_paths: 0,
+                pathspec_payload_bytes: 0,
+                effective_argv_charge_bytes: 0,
+                max_batch_payload_bytes: 0,
+                max_batch_argv_charge_bytes: 0,
+                pathspec_batches: 0,
+                worktree_root_queries: 0,
+                head_queries: 0,
+                tracked_queries: 0,
+                untracked_queries: 0,
+                tracked_output_paths: 0,
+                untracked_output_paths: 0,
+                selected_paths: 0,
+                base_commit_queries: 0,
+                committed_head_queries: 0,
+                merge_base_queries: 0,
+                base_manifest_blob_bytes: 0,
+                base_lock_blob_bytes: 0,
+                protected_candidate_paths: 0,
+                dirty_paths: 0,
+                committed_diff_batches: 0,
+                committed_diff_processes: 0,
+                committed_diff_output_paths: 0,
+                seed_modules: 0,
+                full_escalations: 0,
+                full_escalation_reason_identity: [0; 4],
+                selected_closure_modules: 0,
+                overflowed: false,
+            }
+        );
+    }
+
+    #[test]
+    fn package_selection_observation_projection_matrix() {
+        for (policy, expected_policy) in [
+            (PerformancePackageSelectionBatchPolicy::NotSelected, None),
+            (
+                PerformancePackageSelectionBatchPolicy::ExecBudget,
+                Some(PerformanceMeasurementLabel::PackageSelectionExecBudgetPolicy),
+            ),
+            (
+                PerformancePackageSelectionBatchPolicy::Legacy128,
+                Some(PerformanceMeasurementLabel::PackageSelectionLegacy128Policy),
+            ),
+        ] {
+            let observation = PerformancePackageSelectionObservation {
+                committed_base: true,
+                batch_policy: policy,
+                candidate_paths: u64::MAX,
+                pathspec_payload_bytes: 2,
+                effective_argv_charge_bytes: 3,
+                max_batch_payload_bytes: 4,
+                max_batch_argv_charge_bytes: 5,
+                pathspec_batches: 6,
+                worktree_root_queries: 7,
+                head_queries: 8,
+                tracked_queries: 9,
+                untracked_queries: 10,
+                tracked_output_paths: 11,
+                untracked_output_paths: 12,
+                selected_paths: 13,
+                base_commit_queries: 14,
+                committed_head_queries: 15,
+                merge_base_queries: 16,
+                base_manifest_blob_bytes: 17,
+                base_lock_blob_bytes: 18,
+                protected_candidate_paths: 19,
+                dirty_paths: 20,
+                committed_diff_batches: 21,
+                committed_diff_processes: 22,
+                committed_diff_output_paths: 23,
+                seed_modules: 24,
+                full_escalations: 25,
+                full_escalation_reason_identity: [26, 27, 28, 29],
+                selected_closure_modules: 30,
+                overflowed: false,
+            };
+            let mut recorder =
+                PerformanceMeasurementRecorder::new(PerformanceMeasurementMode::Summary);
+            recorder.observe_package_selection(&observation);
+            let report = recorder.report().unwrap();
+            assert_eq!(report.schema, PERFORMANCE_MEASUREMENTS_SCHEMA_V0_9);
+            assert!(!report.overflowed, "an exact u64::MAX is not saturation");
+            assert_eq!(
+                report
+                    .counters
+                    .iter()
+                    .find(|counter| {
+                        counter.label == PerformanceMeasurementLabel::PackageSelectionCandidatePaths
+                    })
+                    .map(|counter| counter.value),
+                Some(u64::MAX)
+            );
+            for policy_label in [
+                PerformanceMeasurementLabel::PackageSelectionExecBudgetPolicy,
+                PerformanceMeasurementLabel::PackageSelectionLegacy128Policy,
+            ] {
+                assert_eq!(
+                    report
+                        .counters
+                        .iter()
+                        .any(|counter| counter.label == policy_label),
+                    expected_policy == Some(policy_label)
+                );
+            }
+        }
+
+        let mut recorder = PerformanceMeasurementRecorder::new(PerformanceMeasurementMode::Summary);
+        recorder.observe_package_selection(&PerformancePackageSelectionObservation {
+            overflowed: true,
+            ..PerformancePackageSelectionObservation::default()
+        });
+        assert!(recorder.report().unwrap().overflowed);
+
+        let mut off = PerformanceMeasurementRecorder::new(PerformanceMeasurementMode::Off);
+        off.observe_package_selection(&PerformancePackageSelectionObservation::default());
+        assert!(off.report().is_none());
+    }
+
+    #[test]
+    fn package_selection_labels_follow_v0_5_introduction() {
+        for label in PerformanceMeasurementLabel::INTRODUCTIONS
+            .iter()
+            .filter_map(|(label, schema)| {
+                (*schema == PERFORMANCE_MEASUREMENTS_SCHEMA_V0_5).then_some(*label)
+            })
+        {
+            for historical in [
+                PERFORMANCE_MEASUREMENTS_SCHEMA_V0_1,
+                PERFORMANCE_MEASUREMENTS_SCHEMA_V0_2,
+                PERFORMANCE_MEASUREMENTS_SCHEMA_V0_3,
+                PERFORMANCE_MEASUREMENTS_SCHEMA_V0_4,
+            ] {
+                assert_eq!(
+                    PerformanceMeasurementLabel::from_schema_identifier(historical, label.as_str()),
+                    None
+                );
+            }
+            assert_eq!(
+                PerformanceMeasurementLabel::from_schema_identifier(
+                    PERFORMANCE_MEASUREMENTS_SCHEMA_V0_5,
+                    label.as_str()
+                ),
+                Some(label)
+            );
+        }
+    }
+
+    #[test]
+    fn certificate_term_materialization_labels_follow_v0_6_introduction() {
+        let labels = PerformanceMeasurementLabel::ALL
+            .iter()
+            .copied()
+            .filter(|label| label.as_str().starts_with("certificate.term_"))
+            .collect::<Vec<_>>();
+        assert_eq!(labels.len(), 11);
+        for label in labels {
+            for historical in [
+                PERFORMANCE_MEASUREMENTS_SCHEMA_V0_1,
+                PERFORMANCE_MEASUREMENTS_SCHEMA_V0_2,
+                PERFORMANCE_MEASUREMENTS_SCHEMA_V0_3,
+                PERFORMANCE_MEASUREMENTS_SCHEMA_V0_4,
+                PERFORMANCE_MEASUREMENTS_SCHEMA_V0_5,
+            ] {
+                assert_eq!(
+                    PerformanceMeasurementLabel::from_schema_identifier(historical, label.as_str(),),
+                    None
+                );
+            }
+            assert_eq!(
+                PerformanceMeasurementLabel::from_schema_identifier(
+                    PERFORMANCE_MEASUREMENTS_SCHEMA_V0_6,
+                    label.as_str(),
+                ),
+                Some(label)
+            );
+        }
+    }
+
+    #[test]
+    fn performance_measurement_schema() {
+        label_table_is_exhaustive_unique_and_canonical();
+        certificate_term_materialization_labels_follow_v0_6_introduction();
+    }
+
+    #[test]
+    fn certificate_term_materialization_projection_is_typed_and_saturating() {
+        let observation = CertificateTermMaterializationObservation {
+            root_requests: 1,
+            unique_nodes_materialized: 2,
+            selected_edges: 3,
+            reused_child_arcs: 4,
+            owned_root_handoffs: 5,
+            leaf_root_clones: 6,
+            compound_root_clones: 7,
+            materialization_slots: 8,
+            materialization_charged_bytes: 9,
+            materialization_capacity_stops: 10,
+            materialization_legacy_fallbacks: 11,
+            overflowed: true,
+        };
+        let mut recorder = PerformanceMeasurementRecorder::new(PerformanceMeasurementMode::Summary);
+        recorder.observe_certificate_term_materialization(&observation);
+        let report = recorder.report().unwrap();
+        assert_eq!(report.schema, PERFORMANCE_MEASUREMENTS_SCHEMA_V0_9);
+        assert!(report.overflowed);
+        let values = report
+            .counters
+            .iter()
+            .filter(|counter| counter.label.as_str().starts_with("certificate.term_"))
+            .map(|counter| (counter.label, (counter.unit, counter.value)))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            values,
+            BTreeMap::from([
+                (
+                    PerformanceMeasurementLabel::CertificateTermRootRequests,
+                    (PerformanceMeasurementUnit::Count, 1)
+                ),
+                (
+                    PerformanceMeasurementLabel::CertificateTermUniqueNodesMaterialized,
+                    (PerformanceMeasurementUnit::Count, 2)
+                ),
+                (
+                    PerformanceMeasurementLabel::CertificateTermSelectedEdges,
+                    (PerformanceMeasurementUnit::Count, 3)
+                ),
+                (
+                    PerformanceMeasurementLabel::CertificateTermReusedChildArcs,
+                    (PerformanceMeasurementUnit::Count, 4)
+                ),
+                (
+                    PerformanceMeasurementLabel::CertificateTermOwnedRootHandoffs,
+                    (PerformanceMeasurementUnit::Count, 5)
+                ),
+                (
+                    PerformanceMeasurementLabel::CertificateTermLeafRootClones,
+                    (PerformanceMeasurementUnit::Count, 6)
+                ),
+                (
+                    PerformanceMeasurementLabel::CertificateTermCompoundRootClones,
+                    (PerformanceMeasurementUnit::Count, 7)
+                ),
+                (
+                    PerformanceMeasurementLabel::CertificateTermMaterializationSlots,
+                    (PerformanceMeasurementUnit::Count, 8)
+                ),
+                (
+                    PerformanceMeasurementLabel::CertificateTermMaterializationChargedBytes,
+                    (PerformanceMeasurementUnit::Bytes, 9)
+                ),
+                (
+                    PerformanceMeasurementLabel::CertificateTermMaterializationCapacityStops,
+                    (PerformanceMeasurementUnit::Count, 10)
+                ),
+                (
+                    PerformanceMeasurementLabel::CertificateTermMaterializationLegacyFallbacks,
+                    (PerformanceMeasurementUnit::Count, 11)
+                ),
+            ])
+        );
+
+        let mut off = PerformanceMeasurementRecorder::new(PerformanceMeasurementMode::Off);
+        off.observe_certificate_term_materialization(&observation);
+        assert!(off.report().is_none());
+
+        let mut saturating =
+            PerformanceMeasurementRecorder::new(PerformanceMeasurementMode::Summary);
+        saturating.observe_certificate_term_materialization(
+            &CertificateTermMaterializationObservation {
+                root_requests: u64::MAX,
+                ..CertificateTermMaterializationObservation::default()
+            },
+        );
+        saturating.observe_certificate_term_materialization(
+            &CertificateTermMaterializationObservation {
+                root_requests: 1,
+                ..CertificateTermMaterializationObservation::default()
+            },
+        );
+        let saturated = saturating.report().unwrap();
+        assert!(saturated.overflowed);
+        assert_eq!(
+            saturated
+                .counters
+                .iter()
+                .find(|counter| counter.label
+                    == PerformanceMeasurementLabel::CertificateTermRootRequests)
+                .unwrap()
+                .value,
+            u64::MAX
+        );
+    }
+
+    #[test]
+    fn performance_recorder_maps_term_observation() {
+        certificate_term_materialization_projection_is_typed_and_saturating();
+        certificate_term_materialization_labels_follow_v0_6_introduction();
+    }
+
+    #[test]
+    fn package_term_memory_model_identifier_is_frozen() {
+        assert_eq!(
+            PerformancePackageShardMemoryModel::FastShardMemoryV1.as_str(),
+            "npa.fast-shard-memory.v1"
+        );
+        assert_eq!(
+            PerformancePackageShardMemoryModel::FastShardMemoryV2TermMaterialization.as_str(),
+            "npa.fast-shard-memory.v2-term-materialization"
+        );
+        assert_eq!(
+            PerformancePackageShardMemoryModel::FastShardMemoryV3TermMaterializationPreparedRetention
+                .as_str(),
+            "npa.fast-shard-memory.v3-term-materialization-prepared-retention"
+        );
+    }
+
+    #[test]
+    fn payload_and_snapshot_labels_follow_v0_7_introduction() {
+        let labels = PerformanceMeasurementLabel::INTRODUCTIONS
+            .iter()
+            .filter_map(|(label, schema)| {
+                (*schema == PERFORMANCE_MEASUREMENTS_SCHEMA_V0_7).then_some(*label)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(labels.len(), 30);
+        for label in labels {
+            assert_eq!(
+                PerformanceMeasurementLabel::from_schema_identifier(
+                    PERFORMANCE_MEASUREMENTS_SCHEMA_V0_6,
+                    label.as_str(),
+                ),
+                None,
+            );
+            assert_eq!(
+                PerformanceMeasurementLabel::from_schema_identifier(
+                    PERFORMANCE_MEASUREMENTS_SCHEMA_V0_7,
+                    label.as_str(),
+                ),
+                Some(label),
+            );
+        }
+    }
+
+    #[test]
+    fn committed_selection_labels_follow_v0_8_introduction() {
+        let labels = PerformanceMeasurementLabel::INTRODUCTIONS
+            .iter()
+            .filter_map(|(label, schema)| {
+                (*schema == PERFORMANCE_MEASUREMENTS_SCHEMA_V0_8).then_some(*label)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(labels.len(), 17);
+        for label in labels {
+            assert_eq!(
+                PerformanceMeasurementLabel::from_schema_identifier(
+                    PERFORMANCE_MEASUREMENTS_SCHEMA_V0_7,
+                    label.as_str(),
+                ),
+                None,
+            );
+            assert_eq!(
+                PerformanceMeasurementLabel::from_schema_identifier(
+                    PERFORMANCE_MEASUREMENTS_SCHEMA_V0_8,
+                    label.as_str(),
+                ),
+                Some(label),
+            );
+        }
+    }
+
+    #[test]
+    fn payload_and_snapshot_observations_use_typed_projection() {
+        let certificate = CertificatePayloadObservation {
+            payloads_frozen: 1,
+            payload_unique_bytes: 2,
+            session_snapshot_clones: 3,
+            session_index_cow_copies: 4,
+            session_index_cow_entries: 5,
+            overflowed: false,
+        };
+        let package = PackagePayloadOwnershipObservation {
+            module_payload_handle_clones: 6,
+            avoided_module_payload_clone_bytes: 7,
+            decode_cache_retained_bytes: 8,
+            decode_cache_peak_retained_bytes: 9,
+            decode_cache_capacity_stops: 10,
+            process_memo_payload_handle_clones: 11,
+            overflowed: false,
+        };
+        let artifacts = PackageCertificateArtifactObservation {
+            artifact_files_read: 12,
+            artifact_file_hashes: 13,
+            artifact_full_decodes: 14,
+            artifact_prepared_reuses: 15,
+            key_candidate_current_bytes: 0,
+            key_candidate_peak_bytes: 16,
+            overflowed: false,
+        };
+        let retention = PreparedArtifactRetentionObservation {
+            admissions: 17,
+            admitted_bytes: 18,
+            current_entries: 19,
+            peak_entries: 20,
+            current_bytes: 21,
+            peak_bytes: 22,
+            derivation_candidate_current_bytes: 0,
+            derivation_candidate_peak_bytes: 23,
+            entry_limit_fallbacks: 24,
+            byte_limit_fallbacks: 25,
+            saturated_charge_fallbacks: 26,
+            charged_releases: 27,
+            released_bytes: 28,
+            overflowed: true,
+        };
+        let mut recorder = PerformanceMeasurementRecorder::new(PerformanceMeasurementMode::Summary);
+        recorder.observe_certificate_payload_ownership(&certificate, &package);
+        recorder.observe_package_certificate_artifacts(&artifacts, Some(&retention));
+        let report = recorder.report().unwrap();
+        assert_eq!(report.schema, PERFORMANCE_MEASUREMENTS_SCHEMA_V0_9);
+        assert!(report.overflowed);
+        let value = |label| {
+            report
+                .counters
+                .iter()
+                .find(|counter| counter.label == label)
+                .map(|counter| counter.value)
+        };
+        assert_eq!(
+            value(PerformanceMeasurementLabel::PackageModulePayloadsFrozen),
+            Some(1),
+        );
+        assert_eq!(
+            value(PerformanceMeasurementLabel::PackageDecodeCachePeakRetainedBytes),
+            Some(9),
+        );
+        assert_eq!(
+            value(PerformanceMeasurementLabel::PackageArtifactPreparedReuses),
+            Some(15),
+        );
+        assert_eq!(
+            value(PerformanceMeasurementLabel::PackagePreparedArtifactReleasedBytes),
+            Some(28),
+        );
+    }
+
+    #[test]
+    fn performance_child_identity_merge_is_absorbing_and_order_independent() {
+        fn child(identity: Option<&str>, value: u64) -> PerformanceMeasurementReport {
+            let recorder = PerformanceMeasurementRecorder::new(PerformanceMeasurementMode::Summary);
+            let mut recorder = match identity {
+                Some(identity) => recorder.with_input_identity(identity),
+                None => recorder,
+            };
+            recorder.add_counter(PerformanceMeasurementLabel::PackageModulesChecked, value);
+            recorder.report().unwrap()
+        }
+
+        let none = child(None, 1);
+        let a = child(Some("sha256:a"), 2);
+        let same_a = child(Some("sha256:a"), 3);
+        let b = child(Some("sha256:b"), 4);
+
+        let mut adopted = PerformanceMeasurementRecorder::new(PerformanceMeasurementMode::Summary);
+        adopted.merge_child_report_preserving_identity(&none);
+        adopted.merge_child_report_preserving_identity(&a);
+        adopted.merge_child_report_preserving_identity(&same_a);
+        let adopted = adopted.report().unwrap();
+        assert_eq!(adopted.input_identity.as_deref(), Some("sha256:a"));
+        assert!(!adopted.overflowed);
+
+        for children in [[&a, &b], [&b, &a]] {
+            let mut conflict =
+                PerformanceMeasurementRecorder::new(PerformanceMeasurementMode::Summary);
+            for child in children {
+                conflict.merge_child_report_preserving_identity(child);
+            }
+            conflict.merge_child_report_preserving_identity(&same_a);
+            let conflict = conflict.report().unwrap();
+            assert_eq!(conflict.input_identity, None);
+            assert!(conflict.overflowed);
+            assert_eq!(
+                conflict
+                    .counters
+                    .iter()
+                    .find(|counter| {
+                        counter.label == PerformanceMeasurementLabel::PackageModulesChecked
+                    })
+                    .map(|counter| counter.value),
+                Some(9)
+            );
+        }
+    }
+
+    #[test]
     fn real_certificate_verifier_counters_reach_the_common_projection() {
         let level = npa_kernel::Level::param("u");
         let cert = npa_cert::build_module_cert(
@@ -2177,6 +3574,207 @@ mod tests {
         }));
     }
 
+    #[test]
+    fn performance_measurement_json() {
+        saturation_is_explicit_and_json_is_canonical();
+        declaration_kernel_json_is_nullable_strict_and_stably_ordered();
+        payload_and_snapshot_observations_use_typed_projection();
+    }
+
+    #[test]
+    fn label_tables_are_canonical_per_schema() {
+        label_table_is_exhaustive_unique_and_canonical();
+        performance_measurement_historical_vocabularies_reject_newer_labels();
+        package_selection_labels_follow_v0_5_introduction();
+        certificate_term_materialization_labels_follow_v0_6_introduction();
+        payload_and_snapshot_labels_follow_v0_7_introduction();
+        committed_selection_labels_follow_v0_8_introduction();
+    }
+
+    #[test]
+    fn performance_schema_availability_scaffold_preserves_current_writer() {
+        assert_eq!(
+            PERFORMANCE_MEASUREMENTS_SCHEMA,
+            PERFORMANCE_MEASUREMENTS_SCHEMA_V0_9
+        );
+        let recorder = PerformanceMeasurementRecorder::new(PerformanceMeasurementMode::Summary);
+        assert_eq!(
+            recorder.report().unwrap().schema,
+            PERFORMANCE_MEASUREMENTS_SCHEMA_V0_9
+        );
+    }
+
+    #[test]
+    fn unknown_future_measurement_schema_is_rejected() {
+        assert!(PerformanceMeasurementLabel::labels_for_schema(
+            "npa.performance.measurements.v0.10"
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn current_common_measurement_union_matches_rollout_decision() {
+        performance_measurement_schema();
+        assert_eq!(
+            PERFORMANCE_MEASUREMENTS_SCHEMA,
+            PERFORMANCE_MEASUREMENTS_SCHEMA_V0_9
+        );
+    }
+
+    #[test]
+    fn package_selection_observation_projects_closed_labels() {
+        package_selection_observation_projection_matrix();
+    }
+
+    #[test]
+    fn package_selection_observation_preserves_explicit_overflow_bit() {
+        package_selection_observation_projection_matrix();
+    }
+
+    #[test]
+    fn performance_identity_state_scaffold_transition_matrix() {
+        performance_child_identity_merge_is_absorbing_and_order_independent();
+    }
+
+    #[test]
+    fn performance_recorder_with_input_identity_sets_exact_state() {
+        let recorder = PerformanceMeasurementRecorder::new(PerformanceMeasurementMode::Summary)
+            .with_input_identity("sha256:exact");
+        let report = recorder.report().unwrap();
+        assert_eq!(report.input_identity.as_deref(), Some("sha256:exact"));
+        assert!(!report.overflowed);
+    }
+
+    #[test]
+    fn performance_child_identity_merge_transition_matrix() {
+        performance_child_identity_merge_is_absorbing_and_order_independent();
+    }
+
+    #[test]
+    fn performance_identity_conflict_omits_identity_and_marks_overflow() {
+        performance_child_identity_merge_is_absorbing_and_order_independent();
+    }
+
+    #[test]
+    fn performance_package_layer_prepared_fields() {
+        payload_and_snapshot_observations_use_typed_projection();
+        saturation_is_explicit_and_json_is_canonical();
+    }
+
+    #[test]
+    fn performance_package_sharding_prepared_peaks() {
+        package_term_memory_model_identifier_is_frozen();
+        conflicting_package_sharding_summaries_merge_canonically();
+    }
+
+    #[test]
+    fn performance_package_certificate_artifacts() {
+        payload_and_snapshot_labels_follow_v0_7_introduction();
+        payload_and_snapshot_observations_use_typed_projection();
+    }
+
+    #[test]
+    fn package_decode_cache_charge_state() {
+        assert_eq!(
+            PackageDecodeCacheChargeState::from_payload_observation(false, None),
+            PackageDecodeCacheChargeState::Disabled
+        );
+        assert_eq!(
+            PackageDecodeCacheChargeState::from_payload_observation(true, None),
+            PackageDecodeCacheChargeState::UnboundedUnknown
+        );
+        let observation = PackagePayloadOwnershipObservation {
+            decode_cache_retained_bytes: 13,
+            decode_cache_peak_retained_bytes: 21,
+            ..PackagePayloadOwnershipObservation::default()
+        };
+        assert_eq!(
+            PackageDecodeCacheChargeState::from_payload_observation(true, Some(&observation)),
+            PackageDecodeCacheChargeState::Bounded {
+                current_bytes: 13,
+                peak_bytes: 21,
+            }
+        );
+        assert_eq!(
+            PackageDecodeCacheChargeState::from_payload_observation(false, Some(&observation)),
+            PackageDecodeCacheChargeState::Disabled,
+            "disabled cache accounting never imports an unrelated bounded observation"
+        );
+        let mut recorder =
+            PerformanceMeasurementRecorder::new(PerformanceMeasurementMode::Detailed);
+        recorder.observe_certificate_payload_ownership(
+            &CertificatePayloadObservation::default(),
+            &observation,
+        );
+        let report = recorder.report().unwrap();
+        assert_eq!(
+            PackageDecodeCacheChargeState::from_measurement_report(true, Some(&report)),
+            PackageDecodeCacheChargeState::Bounded {
+                current_bytes: 13,
+                peak_bytes: 21,
+            }
+        );
+        assert_eq!(
+            PackageDecodeCacheChargeState::from_measurement_report(true, None),
+            PackageDecodeCacheChargeState::UnboundedUnknown
+        );
+        assert_eq!(
+            PackageDecodeCacheChargeState::from_measurement_report(false, Some(&report)),
+            PackageDecodeCacheChargeState::Disabled
+        );
+    }
+
+    #[test]
+    fn package_certificate_artifact_observation_updates() {
+        let mut observation = PackageCertificateArtifactObservation::default();
+        observation.observe_file_read();
+        observation.observe_file_hash();
+        observation.observe_full_decode();
+        observation.observe_prepared_reuse();
+        observation.begin_key_candidate(29);
+        assert_eq!(observation.artifact_files_read, 1);
+        assert_eq!(observation.artifact_file_hashes, 1);
+        assert_eq!(observation.artifact_full_decodes, 1);
+        assert_eq!(observation.artifact_prepared_reuses, 1);
+        assert_eq!(observation.key_candidate_current_bytes, 29);
+        assert_eq!(observation.key_candidate_peak_bytes, 29);
+        observation.finish_key_candidate();
+        assert_eq!(observation.key_candidate_current_bytes, 0);
+
+        observation.artifact_files_read = u64::MAX;
+        observation.observe_file_read();
+        assert_eq!(observation.artifact_files_read, u64::MAX);
+        assert!(observation.overflowed);
+    }
+
+    #[test]
+    fn package_certificate_artifact_observation_merge() {
+        let mut observation = PackageCertificateArtifactObservation {
+            artifact_files_read: 2,
+            artifact_prepared_reuses: 3,
+            ..PackageCertificateArtifactObservation::default()
+        };
+        observation.merge_preparation(npa_package::PackageArtifactPreparationObservation {
+            artifact_file_hashes: 5,
+            artifact_full_decodes: 7,
+            overflowed: false,
+        });
+        assert_eq!(observation.artifact_files_read, 2);
+        assert_eq!(observation.artifact_file_hashes, 5);
+        assert_eq!(observation.artifact_full_decodes, 7);
+        assert_eq!(observation.artifact_prepared_reuses, 3);
+        assert!(!observation.overflowed);
+
+        observation.artifact_file_hashes = u64::MAX;
+        observation.merge_preparation(npa_package::PackageArtifactPreparationObservation {
+            artifact_file_hashes: 1,
+            artifact_full_decodes: 0,
+            overflowed: true,
+        });
+        assert_eq!(observation.artifact_file_hashes, u64::MAX);
+        assert!(observation.overflowed);
+    }
+
     fn declaration(
         module: &str,
         declaration_index: u64,
@@ -2221,8 +3819,7 @@ mod tests {
                 beta_steps: 6,
                 delta_steps: 0,
                 iota_steps: 7,
-                zeta_steps: 8,
-                physical_reductions: 21,
+                physical_reductions: 13,
                 overflowed: false,
             },
             retained_delta_constants: PerformanceKernelDeltaHotsetSummary {
@@ -2238,6 +3835,90 @@ mod tests {
             },
             overflowed: false,
         }
+    }
+
+    fn targeted_authoring_labels() -> &'static [(
+        PerformanceMeasurementLabel,
+        &'static str,
+        PerformanceMeasurementUnit,
+    )] {
+        &[
+            (
+                PerformanceMeasurementLabel::CacheSupportSelected,
+                "cache.support_selected",
+                PerformanceMeasurementUnit::Count,
+            ),
+            (
+                PerformanceMeasurementLabel::CacheTargetsForcedLive,
+                "cache.targets_forced_live",
+                PerformanceMeasurementUnit::Count,
+            ),
+            (
+                PerformanceMeasurementLabel::CacheContextIneligible,
+                "cache.context_ineligible",
+                PerformanceMeasurementUnit::Count,
+            ),
+            (
+                PerformanceMeasurementLabel::CacheContextBypassedHits,
+                "cache.context_bypassed_hits",
+                PerformanceMeasurementUnit::Count,
+            ),
+            (
+                PerformanceMeasurementLabel::CacheContextStale,
+                "cache.context_stale",
+                PerformanceMeasurementUnit::Count,
+            ),
+            (
+                PerformanceMeasurementLabel::CacheContextSchemaMisses,
+                "cache.context_schema_misses",
+                PerformanceMeasurementUnit::Count,
+            ),
+            (
+                PerformanceMeasurementLabel::CacheAvoidedSourceInterfaceResolutions,
+                "cache.avoided_source_interface_resolutions",
+                PerformanceMeasurementUnit::Count,
+            ),
+            (
+                PerformanceMeasurementLabel::CacheTargetFreshBuilds,
+                "cache.target_fresh_builds",
+                PerformanceMeasurementUnit::Count,
+            ),
+            (
+                PerformanceMeasurementLabel::CacheToolIdentityBytes,
+                "cache.tool_identity_bytes",
+                PerformanceMeasurementUnit::Bytes,
+            ),
+            (
+                PerformanceMeasurementLabel::CacheToolIdentityElapsed,
+                "cache.tool_identity_elapsed",
+                PerformanceMeasurementUnit::Nanoseconds,
+            ),
+            (
+                PerformanceMeasurementLabel::CacheCurrentByteValidationElapsed,
+                "cache.current_byte_validation_elapsed",
+                PerformanceMeasurementUnit::Nanoseconds,
+            ),
+            (
+                PerformanceMeasurementLabel::CacheLiveSupportElapsed,
+                "cache.live_support_elapsed",
+                PerformanceMeasurementUnit::Nanoseconds,
+            ),
+            (
+                PerformanceMeasurementLabel::CacheSourceInterfaceResolutionElapsed,
+                "cache.source_interface_resolution_elapsed",
+                PerformanceMeasurementUnit::Nanoseconds,
+            ),
+            (
+                PerformanceMeasurementLabel::CacheBytesLoaded,
+                "cache.bytes_loaded",
+                PerformanceMeasurementUnit::Bytes,
+            ),
+            (
+                PerformanceMeasurementLabel::CacheBytesWritten,
+                "cache.bytes_written",
+                PerformanceMeasurementUnit::Bytes,
+            ),
+        ]
     }
 
     fn module(name: &str) -> PerformanceModuleMeasurement {
@@ -2263,7 +3944,10 @@ mod tests {
             effective_jobs: 2,
             reduction_reason: PerformancePackageShardReductionReason::RunnableWidth,
             shared_base_context_bytes: 10,
+            prepared_shared_bytes: 0,
+            combined_shared_bytes: 10,
             per_worker_bytes: 20,
+            term_materialization_bytes_per_worker: 268_435_456,
             avoided_base_context_clone_bytes: 20,
             estimate_overflowed: false,
             critical_path_cost: 30,

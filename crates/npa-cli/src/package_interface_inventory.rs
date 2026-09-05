@@ -8,6 +8,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
+    io::Read as _,
     path::{Component, Path, PathBuf},
 };
 
@@ -20,7 +21,10 @@ use crate::{
         InterfaceInventoryInputFile, InterfaceInventoryOutput, InterfaceInventoryPin,
         InterfaceInventoryRow,
     },
-    fs::render_package_root,
+    fs::{
+        no_follow_directory::{open_absolute_directory, EntryKind},
+        render_package_root,
+    },
 };
 
 const COMMAND: &str = "package inventory-interface";
@@ -580,116 +584,150 @@ fn read_source_files(
     paths: &[RequestedPath],
     diagnostics: &mut Vec<AdapterDiagnostic>,
 ) -> Vec<SourceFile> {
-    let root_metadata = match fs::symlink_metadata(root) {
-        Ok(metadata) => metadata,
+    let root_directory = match open_absolute_directory(root, false) {
+        Ok(directory) => directory,
         Err(_) => {
+            // This metadata lookup is diagnostic-only. Source access remains
+            // anchored to the no-follow directory capability above.
+            let reason = match fs::symlink_metadata(root) {
+                Ok(metadata) if metadata.file_type().is_symlink() => "root_symlink",
+                _ => "root_not_directory",
+            };
             add_diagnostic(
                 diagnostics,
-                AdapterDiagnostic::new("filesystem", "root_not_directory").with_field("root"),
+                AdapterDiagnostic::new("filesystem", reason).with_field("root"),
             );
             return Vec::new();
         }
     };
-    if root_metadata.file_type().is_symlink() {
-        add_diagnostic(
-            diagnostics,
-            AdapterDiagnostic::new("filesystem", "root_symlink").with_field("root"),
-        );
-        return Vec::new();
-    }
-    if !root_metadata.is_dir() {
-        add_diagnostic(
-            diagnostics,
-            AdapterDiagnostic::new("filesystem", "root_not_directory").with_field("root"),
-        );
-        return Vec::new();
-    }
-
     let mut total_bytes = 0usize;
     let mut files = Vec::new();
     for requested in paths {
         let relative = Path::new(&requested.display);
-        let full_path = root.join(relative);
         let components = relative.components().collect::<Vec<_>>();
-        let mut current = root.to_path_buf();
-        let mut rejected = false;
-        for (index, component) in components.iter().enumerate() {
+        let Some((leaf, parents)) = components.split_last() else {
+            continue;
+        };
+        let mut directory = match root_directory.try_clone() {
+            Ok(directory) => directory,
+            Err(_) => continue,
+        };
+        let mut invalid_reason = None;
+        for component in parents {
             let Component::Normal(component) = component else {
-                rejected = true;
+                invalid_reason = Some("path_missing");
                 break;
             };
-            current.push(component);
-            let metadata = match fs::symlink_metadata(&current) {
-                Ok(metadata) => metadata,
-                Err(_) => {
-                    add_diagnostic(
-                        diagnostics,
-                        AdapterDiagnostic::new("filesystem", "path_missing")
-                            .with_path(requested.display.clone()),
-                    );
-                    rejected = true;
+            match directory.entry_kind(component) {
+                Ok(Some(EntryKind::Directory)) => {
+                    match directory.open_or_create_directory(component, false) {
+                        Ok(child) => directory = child,
+                        Err(_) => {
+                            invalid_reason = Some("path_missing");
+                            break;
+                        }
+                    }
+                }
+                Ok(Some(EntryKind::SymbolicLink)) => {
+                    invalid_reason = Some("symlink_entry");
                     break;
                 }
-            };
-            if metadata.file_type().is_symlink() {
+                Ok(Some(EntryKind::Regular | EntryKind::Other)) => {
+                    invalid_reason = Some("non_regular_entry");
+                    break;
+                }
+                Ok(None) | Err(_) => {
+                    invalid_reason = Some("path_missing");
+                    break;
+                }
+            }
+        }
+        let Component::Normal(leaf) = leaf else {
+            continue;
+        };
+        if let Some(reason) = invalid_reason {
+            add_diagnostic(
+                diagnostics,
+                AdapterDiagnostic::new("filesystem", reason).with_path(requested.display.clone()),
+            );
+            continue;
+        }
+        match directory.entry_kind(leaf) {
+            Ok(Some(EntryKind::Regular)) => {}
+            Ok(Some(EntryKind::SymbolicLink)) => {
                 add_diagnostic(
                     diagnostics,
                     AdapterDiagnostic::new("filesystem", "symlink_entry")
                         .with_path(requested.display.clone()),
                 );
-                rejected = true;
-                break;
+                continue;
             }
-            if index + 1 < components.len() && !metadata.is_dir() {
+            Ok(Some(EntryKind::Directory | EntryKind::Other)) => {
                 add_diagnostic(
                     diagnostics,
                     AdapterDiagnostic::new("filesystem", "non_regular_entry")
                         .with_path(requested.display.clone()),
                 );
-                rejected = true;
-                break;
+                continue;
             }
-            if index + 1 == components.len() && !metadata.is_file() {
+            Ok(None) | Err(_) => {
                 add_diagnostic(
                     diagnostics,
-                    AdapterDiagnostic::new("filesystem", "non_regular_entry")
+                    AdapterDiagnostic::new("filesystem", "path_missing")
                         .with_path(requested.display.clone()),
                 );
-                rejected = true;
-                break;
-            }
-            if index + 1 == components.len() {
-                if metadata.len() > MAX_SOURCE_FILE_BYTES as u64 {
-                    add_diagnostic(
-                        diagnostics,
-                        AdapterDiagnostic::new("resource", "source_file_bytes_exceeded")
-                            .with_path(requested.display.clone())
-                            .with_expected(MAX_SOURCE_FILE_BYTES.to_string())
-                            .with_actual(metadata.len().to_string()),
-                    );
-                    rejected = true;
-                    break;
-                }
-                let file_bytes = metadata.len() as usize;
-                if total_bytes.saturating_add(file_bytes) > MAX_SOURCE_SET_BYTES {
-                    add_diagnostic(
-                        diagnostics,
-                        AdapterDiagnostic::new("resource", "source_set_bytes_exceeded")
-                            .with_path(requested.display.clone())
-                            .with_expected(MAX_SOURCE_SET_BYTES.to_string())
-                            .with_actual(total_bytes.saturating_add(file_bytes).to_string()),
-                    );
-                    rejected = true;
-                    break;
-                }
-                total_bytes += file_bytes;
+                continue;
             }
         }
-        if rejected {
+        let file = match directory.open_regular_file(leaf) {
+            Ok(Some(file)) => file,
+            Ok(None) | Err(_) => {
+                let reason = match directory.entry_kind(leaf) {
+                    Ok(Some(EntryKind::SymbolicLink)) => "symlink_entry",
+                    Ok(Some(EntryKind::Directory | EntryKind::Other)) => "non_regular_entry",
+                    Ok(Some(EntryKind::Regular)) => "read_failed",
+                    Ok(None) | Err(_) => "path_missing",
+                };
+                add_diagnostic(
+                    diagnostics,
+                    AdapterDiagnostic::new("filesystem", reason)
+                        .with_path(requested.display.clone()),
+                );
+                continue;
+            }
+        };
+        let metadata = match file.metadata() {
+            Ok(metadata) => metadata,
+            Err(_) => continue,
+        };
+        if metadata.len() > MAX_SOURCE_FILE_BYTES as u64 {
+            add_diagnostic(
+                diagnostics,
+                AdapterDiagnostic::new("resource", "source_file_bytes_exceeded")
+                    .with_path(requested.display.clone())
+                    .with_expected(MAX_SOURCE_FILE_BYTES.to_string())
+                    .with_actual(metadata.len().to_string()),
+            );
             continue;
         }
-        let bytes = match fs::read(&full_path) {
-            Ok(bytes) => bytes,
+        let file_bytes = metadata.len() as usize;
+        if total_bytes.saturating_add(file_bytes) > MAX_SOURCE_SET_BYTES {
+            add_diagnostic(
+                diagnostics,
+                AdapterDiagnostic::new("resource", "source_set_bytes_exceeded")
+                    .with_path(requested.display.clone())
+                    .with_expected(MAX_SOURCE_SET_BYTES.to_string())
+                    .with_actual(total_bytes.saturating_add(file_bytes).to_string()),
+            );
+            continue;
+        }
+        let mut bytes = Vec::new();
+        let bytes = match file
+            .take((MAX_SOURCE_FILE_BYTES as u64) + 1)
+            .read_to_end(&mut bytes)
+        {
+            Ok(_) if bytes.len() <= MAX_SOURCE_FILE_BYTES => bytes,
+            Ok(_) => continue,
             Err(_) => {
                 add_diagnostic(
                     diagnostics,
@@ -699,6 +737,7 @@ fn read_source_files(
                 continue;
             }
         };
+        total_bytes += bytes.len();
         let source = match String::from_utf8(bytes.clone()) {
             Ok(source) => Some(source),
             Err(_) => {
@@ -1532,4 +1571,111 @@ fn bounded(value: &str, max_bytes: usize) -> String {
         end -= 1;
     }
     value[..end].to_owned()
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::{
+        fs,
+        os::unix::fs::symlink,
+        path::{Path, PathBuf},
+        sync::atomic::{AtomicU64, Ordering},
+    };
+
+    use super::{read_source_files, AdapterDiagnostic, RequestedPath, MAX_SOURCE_FILE_BYTES};
+
+    static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
+
+    struct TestRoot {
+        relative: PathBuf,
+        absolute: PathBuf,
+    }
+
+    impl TestRoot {
+        fn new(label: &str) -> Self {
+            let relative = PathBuf::from(format!(
+                ".npa-interface-inventory-{label}-{}-{}",
+                std::process::id(),
+                NEXT_ROOT.fetch_add(1, Ordering::Relaxed)
+            ));
+            let absolute = std::env::current_dir()
+                .expect("current directory")
+                .join(&relative);
+            fs::create_dir(&absolute).expect("create test root");
+            Self { relative, absolute }
+        }
+    }
+
+    impl Drop for TestRoot {
+        fn drop(&mut self) {
+            if self.absolute.is_dir() && !self.absolute.is_symlink() {
+                let _ = fs::remove_dir_all(&self.absolute);
+            }
+        }
+    }
+
+    fn requested(path: &str) -> Vec<RequestedPath> {
+        vec![RequestedPath {
+            display: path.to_owned(),
+        }]
+    }
+
+    fn reasons(diagnostics: &[AdapterDiagnostic]) -> Vec<&'static str> {
+        diagnostics.iter().map(|item| item.reason).collect()
+    }
+
+    fn read(root: &Path, path: &str) -> (usize, Vec<&'static str>) {
+        let mut diagnostics = Vec::new();
+        let files = read_source_files(root, &requested(path), &mut diagnostics);
+        (files.len(), reasons(&diagnostics))
+    }
+
+    #[test]
+    fn interface_inventory_source_reader_is_relative_bounded_and_no_follow() {
+        let valid = TestRoot::new("relative");
+        fs::create_dir(valid.absolute.join("Mathlib")).expect("create Mathlib");
+        fs::write(
+            valid.absolute.join("Mathlib/Valid.lean"),
+            b"theorem Mathlib.Valid : True := by trivial\n",
+        )
+        .expect("write source");
+        assert_eq!(read(&valid.relative, "Mathlib/Valid.lean"), (1, vec![]));
+
+        let final_link = TestRoot::new("final-link");
+        fs::create_dir(final_link.absolute.join("Mathlib")).expect("create Mathlib");
+        let outside = final_link.absolute.join("outside.lean");
+        fs::write(&outside, b"theorem Outside : True := by trivial\n").expect("write outside");
+        symlink(&outside, final_link.absolute.join("Mathlib/Linked.lean"))
+            .expect("create final symlink");
+        assert_eq!(
+            read(&final_link.absolute, "Mathlib/Linked.lean"),
+            (0, vec!["symlink_entry"])
+        );
+
+        let intermediate_link = TestRoot::new("intermediate-link");
+        let outside_dir = intermediate_link.absolute.join("outside");
+        fs::create_dir(&outside_dir).expect("create outside directory");
+        fs::write(
+            outside_dir.join("Linked.lean"),
+            b"theorem Outside : True := by trivial\n",
+        )
+        .expect("write outside source");
+        symlink(&outside_dir, intermediate_link.absolute.join("Mathlib"))
+            .expect("create intermediate symlink");
+        assert_eq!(
+            read(&intermediate_link.absolute, "Mathlib/Linked.lean"),
+            (0, vec!["symlink_entry"])
+        );
+
+        let oversized = TestRoot::new("oversized");
+        fs::create_dir(oversized.absolute.join("Mathlib")).expect("create Mathlib");
+        let file = fs::File::create(oversized.absolute.join("Mathlib/Huge.lean"))
+            .expect("create sparse source");
+        file.set_len((MAX_SOURCE_FILE_BYTES as u64) + 1)
+            .expect("extend sparse source");
+        assert_eq!(
+            read(&oversized.absolute, "Mathlib/Huge.lean"),
+            (0, vec!["source_file_bytes_exceeded"])
+        );
+    }
 }

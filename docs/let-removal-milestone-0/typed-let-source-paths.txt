@@ -1,0 +1,6 @@
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/testdata/package/npa-mathlib-seed/Proofs/Ai/Reduction/source.npa
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/testdata/package/npa-mathlib/Mathlib/Core/Reduction/source.npa
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-corpus/fixtures/npa-mathlib-seed/Proofs/Ai/Reduction/source.npa
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-corpus/fixtures/npa-mathlib/Mathlib/Core/Reduction/source.npa
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-corpus/proofs/Proofs/Ai/Reduction/source.npa
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-mathlib/Mathlib/Core/Reduction/source.npa

@@ -16,6 +16,9 @@ pub mod positivity;
 pub mod subst;
 pub mod work;
 
+/// Semantic ABI of kernel state reconstructed for local authoring.
+pub const LOCAL_AUTHORING_CONTEXT_ABI: &str = "npa.kernel.local_authoring_context_abi.v2";
+
 pub use builtins::{
     eq, eq_inductive, eq_rec_type, eq_refl, eq_refl_type, eq_type, nat, nat_inductive,
     nat_rec_type, nat_succ, nat_zero, prop, type0,
@@ -362,9 +365,6 @@ mod tests {
         let beta = Expr::app(Expr::lam("x", nat(), Expr::bvar(0)), nat_zero());
         env.whnf_with_work_counters(&Ctx::new(), &[], &beta, Some(&mut counters))
             .unwrap();
-        let zeta = Expr::let_in("x", nat(), nat_zero(), Expr::bvar(0));
-        env.whnf_with_work_counters(&Ctx::new(), &[], &zeta, Some(&mut counters))
-            .unwrap();
         env.add_def(
             "Measured.zero",
             vec![],
@@ -389,18 +389,16 @@ mod tests {
         env.whnf_with_work_counters(&Ctx::new(), &[], &recursor, Some(&mut counters))
             .unwrap();
         let mut context = Ctx::new();
-        context.push_definition("x", nat(), nat_zero());
+        context.push_assumption("x", nat());
         env.whnf_with_work_counters(&context, &[], &Expr::bvar(0), Some(&mut counters))
             .unwrap();
-
         assert_eq!(counters.beta_steps, 1);
         assert_eq!(counters.delta_steps, 1);
         assert_eq!(counters.iota_steps, 1);
-        assert_eq!(counters.zeta_steps, 2);
-        assert_eq!(counters.physical_reductions, 5);
+        assert_eq!(counters.physical_reductions, 3);
         assert_eq!(counters.context_lookups, 1);
-        assert_eq!(counters.context_shifts, 1);
-        assert_eq!(counters.fuel.whnf.calls, 5);
+        assert_eq!(counters.context_shifts, 0);
+        assert_eq!(counters.fuel.whnf.calls, 4);
         assert_eq!(
             counters.logical_fuel,
             counters.fuel.whnf.logical_spent + counters.fuel.conversion.logical_spent
@@ -2489,18 +2487,6 @@ mod tests {
         let expected = unary_succ(unary_zero());
 
         assert!(env.is_defeq(&Ctx::new(), &[], &term, &expected).unwrap());
-    }
-
-    #[test]
-    fn checks_let_and_zeta_reduction() {
-        let env = Env::with_builtins().unwrap();
-        let term = Expr::let_in("x", nat(), nat_zero(), Expr::bvar(0));
-
-        env.check(&Ctx::new(), &[], &term, &nat()).unwrap();
-        let reduced = env.whnf(&Ctx::new(), &[], &term).unwrap();
-        assert!(env
-            .is_defeq(&Ctx::new(), &[], &reduced, &nat_zero())
-            .unwrap());
     }
 
     #[test]

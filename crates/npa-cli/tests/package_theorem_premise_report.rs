@@ -163,7 +163,7 @@ fn theorem_premise_report_reader_rejects_non_utf8_and_symlink_targets() {
 }
 
 #[test]
-fn atomic_generated_writer_rejects_symlink_parent_target_and_temp_collision() {
+fn atomic_generated_writer_uses_unique_temp_and_rejects_symlink_parent_or_target() {
     let package = TestPackage::new("atomic-writer");
     fs::create_dir(package.artifact("generated")).unwrap();
     let path = PackagePath::new(PACKAGE_THEOREM_PREMISE_REPORT_PATH);
@@ -180,10 +180,11 @@ fn atomic_generated_writer_rejects_symlink_parent_target_and_temp_collision() {
         std::process::id()
     ));
     fs::write(&temporary, b"collision").unwrap();
-    assert!(write_package_generated_artifact_atomic(package.path(), &path, b"new").is_err());
-    assert!(!target.exists());
+    write_package_generated_artifact_atomic(package.path(), &path, b"new").unwrap();
+    assert_eq!(fs::read(&target).unwrap(), b"new");
     assert_eq!(fs::read(&temporary).unwrap(), b"collision");
     fs::remove_file(temporary).unwrap();
+    fs::remove_file(&target).unwrap();
 
     #[cfg(unix)]
     {
@@ -266,10 +267,10 @@ meta = "missing/meta/Proofs/Ai/Basic.json"
 replay = "missing/replay/Proofs/Ai/Basic.json"
 producer_profile = "human-surface-explicit-term"
 expected_source_hash = "sha256:2176be7570deae66754789868aa373ab01434512b4f50b992089886d2c655387"
-expected_certificate_file_hash = "sha256:8653c78a98c84a52377808d6ebd3451d6ecfd91b02aff43318f915a1e5f9f551"
+expected_certificate_file_hash = "sha256:4f5bf53b2d9ffe7757d24d45d621a21aaf9f09e8814f763c3e0726a7a826f6dd"
 expected_export_hash = "sha256:6cbf881b56f61d413c2584eb9b1cdd6fb09e504f6ff6c855fa73ee55d763b839"
 expected_axiom_report_hash = "sha256:fed11e73accfbfb0dfc28b4f510e151fa33d8af82d58fdb23b92567e04e59e40"
-expected_certificate_hash = "sha256:78c4c653a2bce34fbc870d7c4c1b81ac0be32859f481a59ab5d66257362e8956"
+expected_certificate_hash = "sha256:46d977aa2be8267c6cd1cedbb53ef029b787a1fd28281564be6ca1a4b93104c2"
 imports = []
 definitions = []
 theorems = ["id"]

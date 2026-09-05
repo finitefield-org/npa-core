@@ -667,7 +667,7 @@ pub fn project_package_theorem_index_from_extraction(
     })
 }
 
-/// Project `npa.package.theorem_premise_report.v0.1` from verified local theorems.
+/// Project `npa.package.theorem_premise_report.v0.2` from verified local theorems.
 ///
 /// This projection consumes only source-free certificate extraction output.
 /// It classifies theorem telescopes, checked-proof premise uses, direct global
@@ -1311,7 +1311,6 @@ fn project_theorem_premise_use_site(
         VerifiedTheoremPremiseUseSite::DependentType => {
             Ok(PackageTheoremPremiseUseSite::DependentType)
         }
-        VerifiedTheoremPremiseUseSite::LetValue => Ok(PackageTheoremPremiseUseSite::LetValue),
         _ => Err(theorem_premise_projection_failure(
             "unsupported certificate theorem-premise use-site kind",
         )),
@@ -1593,11 +1592,6 @@ fn collect_term_constants(
         }
         TermNode::Lam { ty, body } | TermNode::Pi { ty, body } => {
             collect_term_constants(extraction, module, *ty, visited, constants)?;
-            collect_term_constants(extraction, module, *body, visited, constants)
-        }
-        TermNode::Let { ty, value, body } => {
-            collect_term_constants(extraction, module, *ty, visited, constants)?;
-            collect_term_constants(extraction, module, *value, visited, constants)?;
             collect_term_constants(extraction, module, *body, visited, constants)
         }
     }
@@ -2350,10 +2344,10 @@ meta = "missing/meta/Proofs/Ai/Basic.json"
 replay = "missing/replay/Proofs/Ai/Basic.json"
 producer_profile = "human-surface-explicit-term"
 expected_source_hash = "sha256:2176be7570deae66754789868aa373ab01434512b4f50b992089886d2c655387"
-expected_certificate_file_hash = "sha256:8653c78a98c84a52377808d6ebd3451d6ecfd91b02aff43318f915a1e5f9f551"
+expected_certificate_file_hash = "sha256:4f5bf53b2d9ffe7757d24d45d621a21aaf9f09e8814f763c3e0726a7a826f6dd"
 expected_export_hash = "sha256:6cbf881b56f61d413c2584eb9b1cdd6fb09e504f6ff6c855fa73ee55d763b839"
 expected_axiom_report_hash = "sha256:fed11e73accfbfb0dfc28b4f510e151fa33d8af82d58fdb23b92567e04e59e40"
-expected_certificate_hash = "sha256:78c4c653a2bce34fbc870d7c4c1b81ac0be32859f481a59ab5d66257362e8956"
+expected_certificate_hash = "sha256:46d977aa2be8267c6cd1cedbb53ef029b787a1fd28281564be6ca1a4b93104c2"
 imports = []
 definitions = []
 theorems = ["id"]
@@ -2381,7 +2375,7 @@ package = "npa-std"
 version = "0.1.0"
 certificate = "vendor/npa-std/Std/Logic/Eq/certificate.npcert"
 export_hash = "sha256:1f203117abf6f3417d663138bbf5b95f2a155b73502be59678b8a57f31bd9eb1"
-certificate_hash = "sha256:0308e48e6f6353e601fe14c737a0e0882e37657fd864cabbdb3a7250a90b82ab"
+certificate_hash = "sha256:79da1dcd2cb154f2cd862974714307df60c3d7c18bf5e7089490e1034425453a"
 
 [[modules]]
 module = "Proofs.Ai.EqReasoning"
@@ -2391,10 +2385,10 @@ meta = "missing/meta/Proofs/Ai/EqReasoning.json"
 replay = "missing/replay/Proofs/Ai/EqReasoning.json"
 producer_profile = "human-surface-explicit-term"
 expected_source_hash = "sha256:676d15f72088b4f107773ad566920c02a5e29d8773a4c5c24ccb0a1b19de930f"
-expected_certificate_file_hash = "sha256:e5806627a8018d9d026e0e982614711ab9f67ac4fe9d76bf5dcb4f11da21476e"
+expected_certificate_file_hash = "sha256:b75da74122aa36693c44cbb69b51b8cc16f75b34499b80a192c89b15491b230f"
 expected_export_hash = "sha256:4727d19030aece233f2fc0e44ea6a0bff83bf8347fabb0232ea2b52cfc1d10d7"
 expected_axiom_report_hash = "sha256:5283e4bbd120c3ffa60356b600be06364c3739f9c1992538f75aa4c7df947968"
-expected_certificate_hash = "sha256:57534e8c7214827f87513dbef645ae8f6ea495300769b69bb8ed72a8f9b717ea"
+expected_certificate_hash = "sha256:e8c1e0ce7d59e31521560bd992f39005d1f94f14ca913312adf0a562e1d5409b"
 imports = ["Std.Logic.Eq"]
 definitions = []
 theorems = ["eq_symm", "eq_trans", "eq_congr_arg", "eq_congr_fun", "eq_congr2", "eq_subst", "eq_transport_const", "eq_rewrite_left", "eq_rewrite_right", "eq_cast_trans", "eq_calc3"]

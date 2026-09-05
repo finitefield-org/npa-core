@@ -1394,6 +1394,23 @@ impl PackageArtifactError {
         )
     }
 
+    /// Build an internally consistent artifact identity-mismatch error.
+    pub fn identity_mismatch(
+        path: impl Into<String>,
+        field: impl Into<String>,
+        expected: impl Into<String>,
+        actual: impl Into<String>,
+    ) -> Self {
+        Self::new(
+            PackageArtifactErrorKind::Domain,
+            path,
+            Some(field.into()),
+            PackageArtifactErrorReason::IdentityMismatch,
+            Some(expected.into()),
+            Some(actual.into()),
+        )
+    }
+
     /// Build a duplicate identity error.
     pub fn duplicate(
         path: impl Into<String>,
@@ -1589,6 +1606,8 @@ pub enum PackageArtifactErrorReason {
     InvalidPath,
     /// An enum-like string field has an unsupported value.
     InvalidEnumValue,
+    /// Two redundant or derived artifact identities disagree.
+    IdentityMismatch,
     /// Module entry is duplicated.
     DuplicateModule,
     /// Axiom reference is duplicated.
@@ -1648,6 +1667,7 @@ impl PackageArtifactErrorReason {
             Self::InvalidDeclarationName => "invalid_declaration_name",
             Self::InvalidPath => "invalid_path",
             Self::InvalidEnumValue => "invalid_enum_value",
+            Self::IdentityMismatch => "identity_mismatch",
             Self::DuplicateModule => "duplicate_module",
             Self::DuplicateAxiom => "duplicate_axiom",
             Self::DuplicateCheckerSummary => "duplicate_checker_summary",

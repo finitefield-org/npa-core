@@ -93,9 +93,9 @@ fn find_candidate(candidates: &[Candidate], import: &ImportEntry) -> Result<usiz
         .iter()
         .enumerate()
         .filter(|(_, candidate)| {
-            candidate.certificate.header.module == import.module
-                && candidate.certificate.hashes.export_hash == import.export_hash
-                && candidate.certificate.hashes.certificate_hash == certificate_hash
+            candidate.certificate.header().module == import.module
+                && candidate.certificate.hashes().export_hash == import.export_hash
+                && candidate.certificate.hashes().certificate_hash == certificate_hash
         })
         .map(|(index, _)| index)
         .collect::<Vec<_>>();
@@ -109,9 +109,9 @@ fn validate_unique_candidates(candidates: &[Candidate]) -> Result<(), ()> {
     let mut seen = BTreeSet::new();
     for candidate in candidates {
         if !seen.insert((
-            candidate.certificate.header.module.clone(),
-            candidate.certificate.hashes.export_hash,
-            candidate.certificate.hashes.certificate_hash,
+            candidate.certificate.header().module.clone(),
+            candidate.certificate.hashes().export_hash,
+            candidate.certificate.hashes().certificate_hash,
         )) {
             return Err(());
         }
@@ -132,14 +132,14 @@ fn verify_candidate(
         return Err(());
     }
     let candidate = &candidates[index];
-    let identity = candidate.certificate.hashes.certificate_hash;
+    let identity = candidate.certificate.hashes().certificate_hash;
     if verified.contains(&identity) {
         return Ok(());
     }
     if !visiting.insert(identity) {
         return Err(());
     }
-    for import in &candidate.certificate.imports {
+    for import in candidate.certificate.imports() {
         let dependency = find_candidate(candidates, import)?;
         verify_candidate(
             dependency,
@@ -163,13 +163,13 @@ fn verify_leaf(
     policy: &AxiomPolicy,
 ) -> Result<(npa_cert::VerifiedModule, Hash), ()> {
     let certificate = verify_module_cert_hashes(bytes).map_err(|_| ())?;
-    let axiom_report_hash = certificate.hashes.axiom_report_hash;
+    let axiom_report_hash = certificate.hashes().axiom_report_hash;
     let candidates = load_candidates(import_directory)?;
     validate_unique_candidates(&candidates)?;
     let mut session = VerifierSession::new();
     let mut visiting = BTreeSet::new();
     let mut verified = BTreeSet::new();
-    for import in &certificate.imports {
+    for import in certificate.imports() {
         let dependency = find_candidate(&candidates, import)?;
         verify_candidate(
             dependency,
@@ -290,7 +290,7 @@ mod tests {
     use super::*;
 
     const MUTUAL: &[u8] = include_bytes!(
-        "../../../checkers/npa-checker-ext/test/fixtures/conformance/mutual-v0.2.npcert"
+        "../../../checkers/npa-checker-ext/test/fixtures/conformance/mutual-v0.4.npcert"
     );
 
     #[test]
@@ -305,7 +305,7 @@ mod tests {
     #[test]
     fn candidate_loading_enforces_aggregate_bytes_and_source_exclusion() {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../checkers/npa-checker-ext/test/fixtures/conformance/mutual-v0.2.npcert");
+            .join("../../checkers/npa-checker-ext/test/fixtures/conformance/mutual-v0.4.npcert");
         let aggregate_bytes = MUTUAL.len() * 2;
         assert_eq!(
             load_candidates_from_paths_with_budget(

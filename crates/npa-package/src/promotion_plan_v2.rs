@@ -302,9 +302,9 @@ pub struct PromotionPlanV2DependencyMapping {
     pub target: PromotionPlanEndpoint,
     /// Same declaration name at both endpoints.
     pub declaration_name: Name,
-    /// Source interface hash.
+    /// Source interface hash before any attested namespace transport.
     pub source_decl_interface_hash: PackageHash,
-    /// Target interface hash.
+    /// Target interface hash after any attested namespace transport.
     pub target_decl_interface_hash: PackageHash,
     /// Target certificate file hash.
     pub target_certificate_file_hash: PackageHash,
@@ -803,6 +803,25 @@ pub(crate) fn validate_promotion_plan_v2_identity(
     Ok(())
 }
 
+fn validate_promotion_plan_v2_direct_dependency(
+    identity: &PromotionPlanV2Identity,
+    path: &str,
+) -> PackageArtifactResult<()> {
+    if identity.module.as_dotted() == "$builtin" {
+        validate_declaration_name(&identity.name, format!("{path}.name"))?;
+        if identity.kind != "definition" {
+            return Err(PackageArtifactError::invalid_enum_value(
+                path,
+                "kind",
+                "definition for a kernel builtin",
+                &identity.kind,
+            ));
+        }
+        return Ok(());
+    }
+    validate_promotion_plan_v2_identity(identity, path)
+}
+
 pub(crate) fn validate_promotion_plan_v2_declaration(
     declaration: &PromotionPlanV2Declaration,
     path: &str,
@@ -864,7 +883,10 @@ pub(crate) fn validate_promotion_plan_v2_declaration(
         validate_promotion_plan_v2_identity(identity, &format!("{path}.generated_exports"))?;
     }
     for identity in &declaration.direct_dependencies {
-        validate_promotion_plan_v2_identity(identity, &format!("{path}.direct_dependencies"))?;
+        validate_promotion_plan_v2_direct_dependency(
+            identity,
+            &format!("{path}.direct_dependencies"),
+        )?;
     }
     Ok(())
 }
@@ -879,11 +901,19 @@ pub(crate) fn validate_promotion_plan_v2_mapping(
         &mapping.declaration_name,
         format!("{path}.declaration_name"),
     )?;
-    if mapping.source_decl_interface_hash != mapping.target_decl_interface_hash {
+    // A module rename can rebind the interface hashes of an inductive family.
+    // This artifact layer admits only the structural shape; promotion commands
+    // must still validate the exact prior registry route and target artifact.
+    let transported_local_identity = mapping.source.origin == PackageArtifactOrigin::Local
+        && mapping.target.origin == PackageArtifactOrigin::Local
+        && mapping.source.module != mapping.target.module;
+    if mapping.source_decl_interface_hash != mapping.target_decl_interface_hash
+        && !transported_local_identity
+    {
         return Err(PackageArtifactError::invalid_enum_value(
             path,
             "decl_interface_hash",
-            "equal source and target interface hash",
+            "equal hashes or a distinct local-to-local namespace transport",
             "mismatch",
         ));
     }
@@ -1887,6 +1917,33 @@ mod tests {
             });
         assert!(dependency_kind.finalize().is_err());
 
+        let mut builtin_dependency = fixture();
+        builtin_dependency.selection.materialized_declarations[0]
+            .direct_dependencies
+            .push(PromotionPlanV2Identity {
+                module: Name::from_dotted("$builtin"),
+                name: Name::from_dotted("Eq.rec"),
+                kind: "definition".to_owned(),
+                decl_interface_hash: hash(30),
+            });
+        builtin_dependency.finalize().unwrap();
+        let builtin_json = builtin_dependency.canonical_json().unwrap();
+        assert_eq!(
+            parse_mathlib_promotion_plan_v2_json(&builtin_json).unwrap(),
+            builtin_dependency
+        );
+
+        let mut invalid_builtin_kind = fixture();
+        invalid_builtin_kind.selection.materialized_declarations[0]
+            .direct_dependencies
+            .push(PromotionPlanV2Identity {
+                module: Name::from_dotted("$builtin"),
+                name: Name::from_dotted("Eq.rec"),
+                kind: "theorem".to_owned(),
+                decl_interface_hash: hash(30),
+            });
+        assert!(invalid_builtin_kind.finalize().is_err());
+
         let mut family_name = fixture();
         family_name.selection.materialized_declarations[0].family_members =
             vec![Name::from_dotted("not..canonical")];
@@ -1957,6 +2014,45 @@ mod tests {
         new_target.dependency_mappings[0].target.module =
             new_target.selection.target_module.clone();
         assert!(new_target.finalize().is_err());
+    }
+
+    #[test]
+    fn plan_v2_only_admits_hash_changes_for_local_namespace_transports() {
+        let mut plan = fixture();
+        plan.dependency_mappings
+            .push(PromotionPlanV2DependencyMapping {
+                source: PromotionPlanEndpoint {
+                    origin: PackageArtifactOrigin::Local,
+                    package: plan.source.package.clone(),
+                    version: plan.source.version.clone(),
+                    module: Name::from_dotted("Proofs.Dependency"),
+                },
+                target: PromotionPlanEndpoint {
+                    origin: PackageArtifactOrigin::Local,
+                    package: plan.target_baseline.package.clone(),
+                    version: plan.target_baseline.version.clone(),
+                    module: Name::from_dotted("Mathlib.Dependency"),
+                },
+                declaration_name: Name::from_dotted("helper"),
+                source_decl_interface_hash: hash(30),
+                target_decl_interface_hash: hash(34),
+                target_certificate_file_hash: hash(31),
+                target_certificate_hash: hash(32),
+                target_export_hash: hash(33),
+            });
+        assert!(plan.finalize().is_ok());
+
+        let mut external_target = plan.clone();
+        external_target.dependency_mappings[0].target.origin = PackageArtifactOrigin::External;
+        assert!(external_target.finalize().is_err());
+
+        let mut unchanged_module = plan;
+        unchanged_module.dependency_mappings[0].target.module = unchanged_module
+            .dependency_mappings[0]
+            .source
+            .module
+            .clone();
+        assert!(unchanged_module.finalize().is_err());
     }
 
     #[test]

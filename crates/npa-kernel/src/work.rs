@@ -159,7 +159,6 @@ pub struct KernelWorkSnapshot {
     pub beta_steps: u64,
     pub delta_steps: u64,
     pub iota_steps: u64,
-    pub zeta_steps: u64,
     pub physical_reductions: u64,
     pub fuel: KernelFuelTotals,
     pub overflowed: bool,
@@ -228,12 +227,6 @@ impl KernelWorkSnapshot {
                 endpoint_overflowed,
                 &mut overflowed,
             ),
-            zeta_steps: counter_delta(
-                self.zeta_steps,
-                start.zeta_steps,
-                endpoint_overflowed,
-                &mut overflowed,
-            ),
             physical_reductions: counter_delta(
                 self.physical_reductions,
                 start.physical_reductions,
@@ -273,7 +266,6 @@ pub struct KernelWorkCounters {
     pub beta_steps: u64,
     pub delta_steps: u64,
     pub iota_steps: u64,
-    pub zeta_steps: u64,
     pub fuel: KernelFuelTotals,
     pub logical_fuel: u64,
     pub successful_fuel: u64,
@@ -384,7 +376,6 @@ impl KernelWorkCounters {
         merge!(beta_steps);
         merge!(delta_steps);
         merge!(iota_steps);
-        merge!(zeta_steps);
         merge!(physical_reductions);
         merge!(context_lookups);
         merge!(context_shifts);
@@ -459,7 +450,6 @@ impl From<&KernelWorkCounters> for KernelWorkSnapshot {
             beta_steps: counters.beta_steps,
             delta_steps: counters.delta_steps,
             iota_steps: counters.iota_steps,
-            zeta_steps: counters.zeta_steps,
             physical_reductions: counters.physical_reductions,
             fuel,
             overflowed: counters.overflowed || fuel.overflowed(),

@@ -8,8 +8,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs::{self, File},
-    io::{self, Read},
+    io::Read,
     path::{Component, Path, PathBuf},
     sync::Arc,
 };
@@ -32,7 +31,10 @@ use crate::diagnostic::{
     InterfaceProposalSurfaceDiagnostic, InterfaceProposalSurfaceOutput,
     InterfaceProposalSurfaceTarget,
 };
-use crate::fs::render_package_root;
+use crate::fs::{
+    no_follow_directory::{open_absolute_directory, Directory, DirectoryChild},
+    render_package_root,
+};
 use crate::package_build::fallback_imported_source_interface;
 use crate::package_interface_proposals::{
     build_surface_core_source, validate_interface_proposal_surface,
@@ -199,9 +201,31 @@ pub fn run_package_check_interface_proposal_surface(
         }
     };
 
+    let package_root = match open_absolute_directory(&options.common.root, false) {
+        Ok(root) => root,
+        Err(_) => {
+            push_diagnostic(
+                &mut state,
+                "input",
+                "proposal_path_escape",
+                None::<String>,
+                Some("root"),
+                Some("existing non-symlink package directory"),
+                Some(render_package_root(&options.common.root)),
+            );
+            return finish(
+                options,
+                proposal_path_display,
+                proposal_sha256,
+                state,
+                "invalid",
+            );
+        }
+    };
+
     let proposal_relative = proposal_root.join(&options.proposal_path);
     let proposal_bytes = match read_confined_file(
-        &options.common.root,
+        &package_root,
         &proposal_relative,
         MAX_PROPOSAL_BYTES,
         ReadReasons {
@@ -328,7 +352,7 @@ pub fn run_package_check_interface_proposal_surface(
     }
 
     let manifest_bytes = match read_confined_file(
-        &options.common.root,
+        &package_root,
         Path::new("npa-package.toml"),
         MAX_MANIFEST_BYTES,
         ReadReasons {
@@ -455,7 +479,7 @@ pub fn run_package_check_interface_proposal_surface(
     let target_certificate_path = state.target.certificate.clone();
 
     let source_bytes = match read_confined_file(
-        &options.common.root,
+        &package_root,
         Path::new(target_module.source.as_str()),
         MAX_SOURCE_BYTES,
         ReadReasons {
@@ -526,7 +550,7 @@ pub fn run_package_check_interface_proposal_surface(
     }
 
     let target_certificate_bytes = match read_confined_file(
-        &options.common.root,
+        &package_root,
         Path::new(target_module.certificate.as_str()),
         MAX_CERTIFICATE_BYTES,
         ReadReasons {
@@ -600,10 +624,10 @@ pub fn run_package_check_interface_proposal_surface(
             );
         }
     };
-    if target_decoded.header.module != target_module.module
-        || PackageHash::from(target_decoded.hashes.certificate_hash)
+    if target_decoded.header().module != target_module.module
+        || PackageHash::from(target_decoded.hashes().certificate_hash)
             != target_module.expected_certificate_hash
-        || PackageHash::from(target_decoded.hashes.export_hash)
+        || PackageHash::from(target_decoded.hashes().export_hash)
             != target_module.expected_export_hash
     {
         push_diagnostic(
@@ -613,7 +637,7 @@ pub fn run_package_check_interface_proposal_surface(
             target_certificate_path.clone(),
             Some("module/export/certificate_hash"),
             Some(target_module.module.as_dotted()),
-            Some(target_decoded.header.module.as_dotted()),
+            Some(target_decoded.header().module.as_dotted()),
         );
         return finish(
             options,
@@ -627,7 +651,7 @@ pub fn run_package_check_interface_proposal_surface(
         &target_module.expected_certificate_hash,
     ));
     state.target.export_sha256 = Some(format_package_hash(&target_module.expected_export_hash));
-    if PackageHash::from(target_decoded.hashes.axiom_report_hash)
+    if PackageHash::from(target_decoded.hashes().axiom_report_hash)
         != target_module.expected_axiom_report_hash
     {
         push_diagnostic(
@@ -640,7 +664,7 @@ pub fn run_package_check_interface_proposal_surface(
                 &target_module.expected_axiom_report_hash,
             )),
             Some(format_package_hash(&PackageHash::from(
-                target_decoded.hashes.axiom_report_hash,
+                target_decoded.hashes().axiom_report_hash,
             ))),
         );
         return finish(
@@ -652,7 +676,7 @@ pub fn run_package_check_interface_proposal_surface(
         );
     }
 
-    if target_decoded.imports.len() > MAX_DIRECT_IMPORTS {
+    if target_decoded.imports().len() > MAX_DIRECT_IMPORTS {
         push_diagnostic(
             &mut state,
             "resource",
@@ -660,7 +684,7 @@ pub fn run_package_check_interface_proposal_surface(
             target_certificate_path.clone(),
             Some("direct_imports"),
             Some(MAX_DIRECT_IMPORTS.to_string()),
-            Some(target_decoded.imports.len().to_string()),
+            Some(target_decoded.imports().len().to_string()),
         );
         return finish(
             options,
@@ -697,12 +721,9 @@ pub fn run_package_check_interface_proposal_surface(
             decoded: target_decoded,
         },
     );
-    if let Err(reason) = load_certificate_closure(
-        &options.common.root,
-        &validated,
-        target_index,
-        &mut artifacts,
-    ) {
+    if let Err(reason) =
+        load_certificate_closure(&package_root, &validated, target_index, &mut artifacts)
+    {
         push_diagnostic(
             &mut state,
             reason.0,
@@ -1198,7 +1219,7 @@ fn validate_proposal_path(path: &Path) -> Result<(), &'static str> {
 }
 
 fn read_confined_file(
-    root: &Path,
+    root: &Directory,
     relative: &Path,
     limit: usize,
     reasons: ReadReasons,
@@ -1208,76 +1229,66 @@ fn read_confined_file(
             reason: reasons.escape,
         });
     }
-    let root_metadata = fs::symlink_metadata(root).map_err(|_| ReadFailure {
+    let components = relative.components().collect::<Vec<_>>();
+    let mut directory = root.try_clone().map_err(|_| ReadFailure {
         reason: reasons.missing,
     })?;
-    if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
-        return Err(ReadFailure {
-            reason: reasons.escape,
-        });
-    }
-    let mut current = root.to_path_buf();
-    let components = relative.components().collect::<Vec<_>>();
     for (index, component) in components.iter().enumerate() {
         let Component::Normal(component) = component else {
             return Err(ReadFailure {
                 reason: reasons.escape,
             });
         };
-        current.push(component);
-        let metadata = match fs::symlink_metadata(&current) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                return Err(ReadFailure {
-                    reason: reasons.missing,
-                });
-            }
-            Err(_) => {
-                return Err(ReadFailure {
-                    reason: reasons.missing,
-                })
-            }
-        };
-        if metadata.file_type().is_symlink() {
-            return Err(ReadFailure {
-                reason: reasons.symlink,
-            });
-        }
+        let child = directory
+            .open_child(component)
+            .map_err(|error| ReadFailure {
+                reason: if error.raw_os_error() == Some(libc::ELOOP) {
+                    reasons.symlink
+                } else {
+                    reasons.missing
+                },
+            })?;
         if index + 1 < components.len() {
-            if !metadata.is_dir() {
+            match child {
+                DirectoryChild::Directory(child) => directory = child,
+                DirectoryChild::Regular(_) => {
+                    return Err(ReadFailure {
+                        reason: reasons.escape,
+                    });
+                }
+            }
+        } else {
+            let DirectoryChild::Regular(mut file) = child else {
                 return Err(ReadFailure {
-                    reason: reasons.escape,
+                    reason: reasons.not_regular,
+                });
+            };
+            let metadata = file.metadata().map_err(|_| ReadFailure {
+                reason: reasons.missing,
+            })?;
+            if metadata.len() > limit as u64 {
+                return Err(ReadFailure {
+                    reason: reasons.bytes_exceeded,
                 });
             }
-        } else if !metadata.is_file() {
-            return Err(ReadFailure {
-                reason: reasons.not_regular,
-            });
+            let mut bytes = Vec::new();
+            std::io::Read::by_ref(&mut file)
+                .take(limit as u64 + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|_| ReadFailure {
+                    reason: reasons.missing,
+                })?;
+            if bytes.len() > limit {
+                return Err(ReadFailure {
+                    reason: reasons.bytes_exceeded,
+                });
+            }
+            return Ok(bytes);
         }
     }
-    let metadata = fs::metadata(&current).map_err(|_| ReadFailure {
-        reason: reasons.missing,
-    })?;
-    if metadata.len() > limit as u64 {
-        return Err(ReadFailure {
-            reason: reasons.bytes_exceeded,
-        });
-    }
-    let file = File::open(&current).map_err(|_| ReadFailure {
-        reason: reasons.missing,
-    })?;
-    let mut bytes = Vec::new();
-    file.take(limit as u64 + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|_| ReadFailure {
-            reason: reasons.missing,
-        })?;
-    if bytes.len() > limit {
-        return Err(ReadFailure {
-            reason: reasons.bytes_exceeded,
-        });
-    }
-    Ok(bytes)
+    Err(ReadFailure {
+        reason: reasons.escape,
+    })
 }
 
 fn package_axiom_policy(validated: &ValidatedPackageManifest) -> AxiomPolicy {
@@ -1295,7 +1306,7 @@ fn package_axiom_policy(validated: &ValidatedPackageManifest) -> AxiomPolicy {
 }
 
 fn load_certificate_closure(
-    root: &Path,
+    root: &Directory,
     validated: &ValidatedPackageManifest,
     target_index: usize,
     artifacts: &mut BTreeMap<Name, CertificateArtifact>,
@@ -1358,11 +1369,12 @@ fn load_certificate_closure(
                         Some(module.certificate.as_str().to_owned()),
                     )
                 })?;
-                if decoded.header.module != module.module
-                    || PackageHash::from(decoded.hashes.export_hash) != module.expected_export_hash
-                    || PackageHash::from(decoded.hashes.certificate_hash)
+                if decoded.header().module != module.module
+                    || PackageHash::from(decoded.hashes().export_hash)
+                        != module.expected_export_hash
+                    || PackageHash::from(decoded.hashes().certificate_hash)
                         != module.expected_certificate_hash
-                    || PackageHash::from(decoded.hashes.axiom_report_hash)
+                    || PackageHash::from(decoded.hashes().axiom_report_hash)
                         != module.expected_axiom_report_hash
                 {
                     return Err((
@@ -1371,7 +1383,7 @@ fn load_certificate_closure(
                         Some(module.certificate.as_str().to_owned()),
                     ));
                 }
-                if decoded.imports.len() > MAX_DIRECT_IMPORTS {
+                if decoded.imports().len() > MAX_DIRECT_IMPORTS {
                     return Err((
                         "resource",
                         "direct_import_count_exceeded",
@@ -1395,7 +1407,7 @@ fn load_certificate_closure(
                 "target_certificate_missing",
                 Some(module.certificate.as_str().to_owned()),
             ))?;
-            for import in &artifact.decoded.imports {
+            for import in artifact.decoded.imports() {
                 pending.push(import.module.clone());
             }
         } else if let Some(&index) = external_by_name.get(&module_name) {
@@ -1426,9 +1438,9 @@ fn load_certificate_closure(
                     Some(import.certificate.as_str().to_owned()),
                 )
             })?;
-            if decoded.header.module != import.module
-                || PackageHash::from(decoded.hashes.export_hash) != import.export_hash
-                || PackageHash::from(decoded.hashes.certificate_hash) != import.certificate_hash
+            if decoded.header().module != import.module
+                || PackageHash::from(decoded.hashes().export_hash) != import.export_hash
+                || PackageHash::from(decoded.hashes().certificate_hash) != import.certificate_hash
             {
                 return Err((
                     "target",
@@ -1436,14 +1448,14 @@ fn load_certificate_closure(
                     Some(import.certificate.as_str().to_owned()),
                 ));
             }
-            if decoded.imports.len() > MAX_DIRECT_IMPORTS {
+            if decoded.imports().len() > MAX_DIRECT_IMPORTS {
                 return Err((
                     "resource",
                     "direct_import_count_exceeded",
                     Some(import.certificate.as_str().to_owned()),
                 ));
             }
-            for child in &decoded.imports {
+            for child in decoded.imports() {
                 pending.push(child.module.clone());
             }
             artifacts.insert(
@@ -1475,7 +1487,7 @@ fn verify_certificate_closure(
             let artifact = &artifacts[&name];
             if !artifact
                 .decoded
-                .imports
+                .imports()
                 .iter()
                 .all(|import| verified.contains_key(&import.module))
             {
@@ -1546,7 +1558,7 @@ fn certificate_import_names_equal(
     manifest_imports: &[Name],
 ) -> bool {
     certificate
-        .imports
+        .imports()
         .iter()
         .map(|import| &import.module)
         .eq(manifest_imports.iter())
@@ -1554,7 +1566,7 @@ fn certificate_import_names_equal(
 
 fn render_certificate_import_names(certificate: &npa_cert::ModuleCert) -> String {
     certificate
-        .imports
+        .imports()
         .iter()
         .map(|import| import.module.as_dotted())
         .collect::<Vec<_>>()
@@ -1929,7 +1941,7 @@ fn compare_surface(
     }
 
     let target_imports = target_certificate
-        .imports
+        .imports()
         .iter()
         .map(|import| import.module.as_dotted())
         .collect::<Vec<_>>();
@@ -2332,6 +2344,9 @@ fn render_family_list(records: &[FamilyRecord]) -> String {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
+
     fn record(name: &str, surface: &str, dependencies: &[&str]) -> DeclarationRecord {
         DeclarationRecord {
             name: name.to_owned(),
@@ -2383,5 +2398,50 @@ mod tests {
         assert_eq!(family[0].name, "Root.mk");
         assert_eq!(family[0].surface, "public");
         assert_eq!(family[0].ty, Some(vec![1, 2, 3]));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn confined_reader_rejects_intermediate_symlinks_and_uses_retained_root() {
+        let base = std::env::temp_dir().join(format!(
+            "npa-interface-surface-reader-{}",
+            std::process::id()
+        ));
+        let original = base.join("original");
+        let replacement = base.join("replacement");
+        let relocated = base.join("relocated");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(original.join("real")).unwrap();
+        std::fs::create_dir_all(replacement.join("real")).unwrap();
+        std::fs::write(original.join("real/value"), b"original").unwrap();
+        std::fs::write(replacement.join("real/value"), b"replacement").unwrap();
+        symlink("real", original.join("linked")).unwrap();
+
+        let retained = open_absolute_directory(&original, false).unwrap();
+        let reasons = ReadReasons {
+            missing: "missing",
+            symlink: "symlink",
+            escape: "escape",
+            not_regular: "not_regular",
+            bytes_exceeded: "too_large",
+        };
+        assert_eq!(
+            read_confined_file(&retained, Path::new("real/value"), 8, reasons).unwrap(),
+            b"original"
+        );
+        assert_eq!(
+            read_confined_file(&retained, Path::new("linked/value"), 8, reasons)
+                .unwrap_err()
+                .reason,
+            "symlink"
+        );
+
+        std::fs::rename(&original, &relocated).unwrap();
+        std::fs::rename(&replacement, &original).unwrap();
+        assert_eq!(
+            read_confined_file(&retained, Path::new("real/value"), 8, reasons).unwrap(),
+            b"original"
+        );
+        std::fs::remove_dir_all(base).unwrap();
     }
 }

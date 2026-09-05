@@ -640,8 +640,6 @@ pub enum KernelExprHead {
     Lambda,
     /// Dependent function type.
     Pi,
-    /// Local let binding.
-    Let,
     /// Unavailable or deliberately omitted head.
     Unknown,
 }
@@ -657,7 +655,6 @@ impl KernelExprHead {
             Expr::App(..) => Self::Application,
             Expr::Lam { .. } => Self::Lambda,
             Expr::Pi { .. } => Self::Pi,
-            Expr::Let { .. } => Self::Let,
         }
     }
 
@@ -670,7 +667,6 @@ impl KernelExprHead {
             Self::Application => "application".to_owned(),
             Self::Lambda => "lambda".to_owned(),
             Self::Pi => "pi".to_owned(),
-            Self::Let => "let".to_owned(),
             Self::Unknown => "unknown".to_owned(),
         }
     }
@@ -1070,7 +1066,6 @@ mod tests {
                 beta_steps: _,
                 delta_steps: _,
                 iota_steps: _,
-                zeta_steps: _,
                 physical_reductions: _,
                 fuel,
                 overflowed: _,

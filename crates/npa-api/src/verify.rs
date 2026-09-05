@@ -206,8 +206,8 @@ fn run_machine_verify_request_parsed(
     )
     .map_err(certificate_verify_error)?;
 
-    if certificate.hashes.export_hash != verified_module.export_hash()
-        || certificate.hashes.certificate_hash != verified_module.certificate_hash()
+    if certificate.hashes().export_hash != verified_module.export_hash()
+        || certificate.hashes().certificate_hash != verified_module.certificate_hash()
     {
         return Err(plain_error(
             MachineApiErrorKind::VerifyFailed,
@@ -219,7 +219,7 @@ fn run_machine_verify_request_parsed(
     let generated_context = generated_certificate_context(session, &certificate)?;
     let root_decl_index = root_decl_index(session, &certificate)?;
     let root_decl = certificate
-        .declarations
+        .declarations()
         .get(root_decl_index)
         .ok_or_else(|| {
             plain_error(
@@ -240,8 +240,8 @@ fn run_machine_verify_request_parsed(
 
     let import_payload = MachineVerifiedModuleCertificatePayload {
         module: session.root.module.clone(),
-        expected_export_hash: certificate.hashes.export_hash,
-        expected_certificate_hash: certificate.hashes.certificate_hash,
+        expected_export_hash: certificate.hashes().export_hash,
+        expected_certificate_hash: certificate.hashes().certificate_hash,
         certificate: certificate_payload(&certificate_bytes),
     };
 
@@ -251,8 +251,8 @@ fn run_machine_verify_request_parsed(
             root_decl_interface_hash: root_decl.hashes.decl_interface_hash,
             root_decl_certificate_hash: root_decl.hashes.decl_certificate_hash,
             root_axioms_used,
-            module_export_hash: certificate.hashes.export_hash,
-            module_certificate_hash: certificate.hashes.certificate_hash,
+            module_export_hash: certificate.hashes().export_hash,
+            module_certificate_hash: certificate.hashes().certificate_hash,
             module_axioms_used,
             certificate: certificate_payload(&certificate_bytes),
             dependency_import_closure: dependency_import_closure_payloads(session),
@@ -430,17 +430,6 @@ fn add_term_dependency_imports(
             add_term_dependency_imports(entry, *ty, entries_by_key, selected_keys, pending_keys)?;
             add_term_dependency_imports(entry, *body, entries_by_key, selected_keys, pending_keys)?;
         }
-        TermNode::Let { ty, value, body } => {
-            add_term_dependency_imports(entry, *ty, entries_by_key, selected_keys, pending_keys)?;
-            add_term_dependency_imports(
-                entry,
-                *value,
-                entries_by_key,
-                selected_keys,
-                pending_keys,
-            )?;
-            add_term_dependency_imports(entry, *body, entries_by_key, selected_keys, pending_keys)?;
-        }
     }
     Ok(())
 }
@@ -594,13 +583,6 @@ fn collect_const_names_from_expr(names: &mut BTreeSet<Name>, expr: &Expr) {
             collect_const_names_from_expr(names, ty);
             collect_const_names_from_expr(names, body);
         }
-        Expr::Let {
-            ty, value, body, ..
-        } => {
-            collect_const_names_from_expr(names, ty);
-            collect_const_names_from_expr(names, value);
-            collect_const_names_from_expr(names, body);
-        }
     }
 }
 
@@ -615,7 +597,7 @@ fn generated_certificate_context<'a>(
     source_by_name.insert(session.root.theorem_name.clone(), session.root.source_index);
 
     let mut cert_decl_to_source_index = BTreeMap::new();
-    for (decl_index, decl) in cert.declarations.iter().enumerate() {
+    for (decl_index, decl) in cert.declarations().iter().enumerate() {
         let name = decl_payload_name(cert, &decl.decl)?;
         let Some(source_index) = source_by_name.get(&name).copied() else {
             return Err(plain_error(
@@ -650,7 +632,7 @@ fn root_decl_index(
     cert: &ModuleCert,
 ) -> Result<usize, Box<MachineVerifyError>> {
     let mut matches = cert
-        .declarations
+        .declarations()
         .iter()
         .enumerate()
         .filter_map(|(index, decl)| match decl_payload_name(cert, &decl.decl) {
@@ -668,7 +650,7 @@ fn root_decl_index(
     }
     let index = matches.pop().expect("len checked above");
     if !matches!(
-        cert.declarations[index].decl,
+        cert.declarations()[index].decl,
         DeclPayload::Theorem {
             opacity: npa_cert::Opacity::Opaque,
             ..
@@ -725,7 +707,7 @@ fn axiom_ref_to_wire(
             decl_interface_hash,
             ..
         } => {
-            let import = context.cert.imports.get(*import_index).ok_or_else(|| {
+            let import = context.cert.imports().get(*import_index).ok_or_else(|| {
                 plain_error(
                     MachineApiErrorKind::VerifyFailed,
                     MachineApiDiagnosticPhase::CertificateVerify,
@@ -740,13 +722,17 @@ fn axiom_ref_to_wire(
             })
         }
         GlobalRef::Local { decl_index } => {
-            let decl = context.cert.declarations.get(*decl_index).ok_or_else(|| {
-                plain_error(
-                    MachineApiErrorKind::VerifyFailed,
-                    MachineApiDiagnosticPhase::CertificateVerify,
-                    "verifier output local axiom ref has out-of-range decl_index",
-                )
-            })?;
+            let decl = context
+                .cert
+                .declarations()
+                .get(*decl_index)
+                .ok_or_else(|| {
+                    plain_error(
+                        MachineApiErrorKind::VerifyFailed,
+                        MachineApiDiagnosticPhase::CertificateVerify,
+                        "verifier output local axiom ref has out-of-range decl_index",
+                    )
+                })?;
             if !matches!(decl.decl, DeclPayload::Axiom { .. }) {
                 return Err(plain_error(
                     MachineApiErrorKind::VerifyFailed,
@@ -766,7 +752,7 @@ fn axiom_ref_to_wire(
                     )
                 })?;
             Ok(MachineAxiomRefWire::CurrentModule {
-                module: context.cert.header.module.clone(),
+                module: context.cert.header().module.clone(),
                 name,
                 source_index,
                 decl_interface_hash: axiom.decl_interface_hash,
@@ -855,7 +841,7 @@ fn decl_payload_name(
 }
 
 fn cert_name(cert: &ModuleCert, name: usize) -> Result<Name, Box<MachineVerifyError>> {
-    cert.name_table.get(name).cloned().ok_or_else(|| {
+    cert.name_table().get(name).cloned().ok_or_else(|| {
         plain_error(
             MachineApiErrorKind::VerifyFailed,
             MachineApiDiagnosticPhase::CertificateGeneration,
@@ -1109,7 +1095,7 @@ mod tests {
     fn minimal_session_json(theorem_type: &str) -> String {
         format!(
             r#"{{
-              "protocol_version":"npa.machine-api.v1",
+              "protocol_version":"npa.machine-api.v2",
               "root":{{
                 "module":"Scratch",
                 "theorem_name":"Scratch.t",
@@ -1296,7 +1282,7 @@ mod tests {
         let cert_bytes = decode_hex_bytes(&ok.endpoint_fields.certificate.bytes);
 
         let decoded = decode_module_cert(&cert_bytes).unwrap();
-        assert_eq!(decoded.header.module, Name::from_dotted("Scratch"));
+        assert_eq!(decoded.header().module, Name::from_dotted("Scratch"));
 
         let env = Env::new();
         env.check(
@@ -1427,11 +1413,11 @@ mod tests {
         let cert_bytes = decode_hex_bytes(&ok.endpoint_fields.certificate.bytes);
         let cert = decode_module_cert(&cert_bytes).unwrap();
         let import_modules = cert
-            .imports
+            .imports()
             .iter()
             .map(|import| import.module.clone())
             .collect::<BTreeSet<_>>();
-        assert_eq!(cert.imports.len(), 2);
+        assert_eq!(cert.imports().len(), 2);
         assert!(import_modules.contains(&Name::from_dotted("A")));
         assert!(import_modules.contains(&Name::from_dotted("P")));
 
@@ -1483,11 +1469,14 @@ mod tests {
         let cert = decode_module_cert(&cert_bytes).unwrap();
 
         assert_eq!(session.imports.len(), 1);
-        assert_eq!(cert.imports.len(), 1);
-        assert_eq!(cert.imports[0].module, session.imports[0].module);
-        assert_eq!(cert.imports[0].export_hash, session.imports[0].export_hash);
+        assert_eq!(cert.imports().len(), 1);
+        assert_eq!(cert.imports()[0].module, session.imports[0].module);
         assert_eq!(
-            cert.imports[0].certificate_hash,
+            cert.imports()[0].export_hash,
+            session.imports[0].export_hash
+        );
+        assert_eq!(
+            cert.imports()[0].certificate_hash,
             Some(session.imports[0].certificate_hash)
         );
         assert_eq!(ok.endpoint_fields.dependency_import_closure.len(), 2);
@@ -1521,13 +1510,13 @@ mod tests {
         let cert_bytes = decode_hex_bytes(&ok.endpoint_fields.certificate.bytes);
         let cert = decode_module_cert(&cert_bytes).unwrap();
         let import_modules = cert
-            .imports
+            .imports()
             .iter()
             .map(|import| import.module.clone())
             .collect::<BTreeSet<_>>();
 
         assert_eq!(session.imports.len(), 1);
-        assert_eq!(cert.imports.len(), 2);
+        assert_eq!(cert.imports().len(), 2);
         assert!(import_modules.contains(&Name::from_dotted("A")));
         assert!(import_modules.contains(&Name::from_dotted("H")));
         assert_eq!(ok.endpoint_fields.dependency_import_closure.len(), 2);
@@ -1566,7 +1555,7 @@ mod tests {
         let session_json = move |allow_axioms: &str| {
             format!(
                 r#"{{
-                  "protocol_version":"npa.machine-api.v1",
+                  "protocol_version":"npa.machine-api.v2",
                   "root":{{
                     "module":"Scratch",
                     "theorem_name":"Scratch.t",
@@ -1647,7 +1636,7 @@ mod tests {
         let session_json = move |allow_axioms: &str| {
             format!(
                 r#"{{
-                  "protocol_version":"npa.machine-api.v1",
+                  "protocol_version":"npa.machine-api.v2",
                   "root":{{
                     "module":"Scratch",
                     "theorem_name":"Scratch.t",
@@ -1725,7 +1714,7 @@ mod tests {
 
         format!(
             r#"{{
-              "protocol_version":"npa.machine-api.v1",
+              "protocol_version":"npa.machine-api.v2",
               "root":{{
                 "module":"Scratch",
                 "theorem_name":"Scratch.t",
@@ -1802,7 +1791,7 @@ mod tests {
 
         format!(
             r#"{{
-              "protocol_version":"npa.machine-api.v1",
+              "protocol_version":"npa.machine-api.v2",
               "root":{{
                 "module":"Scratch",
                 "theorem_name":"Scratch.t",
@@ -1843,7 +1832,9 @@ mod tests {
         assert!(value.len().is_multiple_of(2));
         value
             .as_bytes()
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|chunk| (hex_value(chunk[0]) << 4) | hex_value(chunk[1]))
             .collect()
     }

@@ -35,23 +35,13 @@ case $# in
     ;;
 esac
 
-for tool in awk basename cargo cmp cp find mkdir mktemp ocamlc rg rm rustc sed sha256sum sort xargs /usr/bin/git
+for tool in awk basename cargo cmp cp find mkdir mktemp ocamlc rg rustc sed sha256sum sort xargs /usr/bin/git
 do
   if ! command -v "$tool" >/dev/null 2>&1; then
     echo "toolchain v0.8 compatibility requires $tool" >&2
     exit 1
   fi
 done
-if [ "$MODE" = full ]; then
-  for tool in date gzip strace tar
-  do
-    if ! command -v "$tool" >/dev/null 2>&1; then
-      echo "full toolchain v0.8 compatibility requires $tool" >&2
-      exit 1
-    fi
-  done
-fi
-
 GIT_ROOT=$(/usr/bin/git -C "$ROOT" rev-parse --show-toplevel)
 if [ "$MODE" = full ] && [ -n "$(/usr/bin/git -C "$GIT_ROOT" status --porcelain=v1 --untracked-files=all)" ]; then
   echo "full toolchain v0.8 compatibility requires a clean candidate checkout" >&2
@@ -67,7 +57,16 @@ fi
 RUN_PARENT="$ROOT/target/npa-checker-ext-v0.8"
 mkdir -p "$RUN_PARENT"
 RUN_DIR=$(mktemp -d "$RUN_PARENT/run.XXXXXX")
-trap 'rm -rf "$RUN_DIR"' EXIT HUP INT TERM
+report_preserved_run_dir() {
+  status=$?
+  trap - EXIT
+  printf 'toolchain-v0.8: preserved run directory: %s\n' "$RUN_DIR" >&2
+  exit "$status"
+}
+trap report_preserved_run_dir EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 export CARGO_BUILD_JOBS=1
 export LC_ALL=C.UTF-8
 export LANG=C.UTF-8
@@ -115,7 +114,7 @@ cargo test --locked --offline --manifest-path "$ROOT/Cargo.toml" -p npa-cli \
 NPA_CHECKER_EXT_BINARY_PATH="$CHECKER" \
   cargo test --locked --offline --manifest-path "$ROOT/Cargo.toml" -p npa-cli \
     --test package_verify_certs \
-    package_verify_external_real_ocaml_checker_closes_source_free_import_dag \
+    package_verify_external_real_ocaml_checker_still_requires_enforceable_supervisor \
     -- --ignored --exact
 cargo test --locked --offline --manifest-path "$ROOT/Cargo.toml" -p npa-cli \
   --test checker_ext_toolchain_evidence
@@ -146,6 +145,33 @@ cargo run --locked --offline -q --manifest-path npa-core/Cargo.toml -p npa-cli \
   --checker-registry ci/checker-binaries.json > "$RUN_DIR/preflight.json"
 POLICY_HASH=$(evidence json-field --path "$RUN_DIR/preflight.json" --field runner_policy_sha256)
 
+phase "external command fails closed before generated-state mutation"
+if cargo run --locked --offline -q --manifest-path npa-core/Cargo.toml -p npa-cli -- \
+  package verify-certs \
+  --root proofs \
+  --package-lock checked \
+  --checker external \
+  --audit-cache off \
+  --verifier-memo off \
+  --jobs 1 \
+  --runner-policy ci/runner.release.json \
+  --runner-policy-hash "$POLICY_HASH" \
+  --checker-registry ci/checker-binaries.json \
+  --json > "$RUN_DIR/external-fail-closed.json"
+then
+  echo "external checker unexpectedly launched without a complete resource supervisor" >&2
+  exit 1
+fi
+rg -F '"reason_code":"external_checker_supervisor_unavailable"' \
+  "$RUN_DIR/external-fail-closed.json" >/dev/null
+test ! -e "$PACKAGE/generated/checker-imports"
+test ! -e "$PACKAGE/generated/checker-results"
+snapshot_proofs > "$RUN_DIR/proofs.after"
+cmp "$RUN_DIR/proofs.before" "$RUN_DIR/proofs.after"
+/usr/bin/git -C "$GIT_ROOT" diff --check
+echo "toolchain v0.8 checker compatibility and host fail-closed boundary passed; release evidence not produced"
+exit 0
+
 if [ "$MODE" = full ]; then
   evidence collect-build \
     --core-root "$ROOT" \
@@ -164,12 +190,8 @@ evidence inventory --root "$PACKAGE" \
 
 TRACE_EXPR='%file,%network,%process,write,writev,pwrite64,pwritev,pwritev2,ftruncate'
 clear_outputs() {
-  label=$1
-  rm -rf \
-    "$PACKAGE/generated/checker-imports" \
-    "$PACKAGE/generated/checker-results"
-  printf '%s %s\n' "$label" 'generated/checker-imports generated/checker-results' \
-    >> "$RUN_DIR/permitted-clears.log"
+  echo "legacy online output cleanup is disabled" >&2
+  exit 1
 }
 
 phase "v1 facade run"

@@ -1,4 +1,8 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+    hash::{Hash, Hasher},
+};
 
 use crate::error::{Error, ResourceLimitKind, Result};
 
@@ -7,13 +11,152 @@ pub const MAX_UNIVERSE_ATOM_INEQUALITIES: usize = 1024;
 
 const HUMAN_UNIVERSE_META_PREFIX: &str = "__npa_internal_human_universe_meta#";
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Level {
     Zero,
     Succ(Box<Level>),
     Max(Box<Level>, Box<Level>),
     IMax(Box<Level>, Box<Level>),
     Param(String),
+}
+
+impl PartialEq for Level {
+    fn eq(&self, other: &Self) -> bool {
+        level_eq_stack_safe(self, other)
+    }
+}
+
+impl Eq for Level {}
+
+impl PartialOrd for Level {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Level {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        level_cmp_stack_safe(self, other)
+    }
+}
+
+impl Hash for Level {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        let mut pending = vec![self];
+        while let Some(level) = pending.pop() {
+            match level {
+                Level::Zero => 0u8.hash(state),
+                Level::Succ(inner) => {
+                    1u8.hash(state);
+                    pending.push(inner);
+                }
+                Level::Max(lhs, rhs) => {
+                    2u8.hash(state);
+                    pending.push(rhs);
+                    pending.push(lhs);
+                }
+                Level::IMax(lhs, rhs) => {
+                    3u8.hash(state);
+                    pending.push(rhs);
+                    pending.push(lhs);
+                }
+                Level::Param(name) => {
+                    4u8.hash(state);
+                    name.hash(state);
+                }
+            }
+        }
+    }
+}
+
+impl fmt::Debug for Level {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        enum Frame<'a> {
+            Level(&'a Level),
+            Text(&'static str),
+        }
+
+        let mut pending = vec![Frame::Level(self)];
+        while let Some(frame) = pending.pop() {
+            match frame {
+                Frame::Text(text) => formatter.write_str(text)?,
+                Frame::Level(Level::Zero) => formatter.write_str("Zero")?,
+                Frame::Level(Level::Param(name)) => {
+                    formatter.write_str("Param(")?;
+                    write!(formatter, "{name:?}")?;
+                    formatter.write_str(")")?;
+                }
+                Frame::Level(Level::Succ(inner)) => {
+                    formatter.write_str("Succ(")?;
+                    pending.push(Frame::Text(")"));
+                    pending.push(Frame::Level(inner));
+                }
+                Frame::Level(Level::Max(lhs, rhs)) => {
+                    formatter.write_str("Max(")?;
+                    pending.push(Frame::Text(")"));
+                    pending.push(Frame::Level(rhs));
+                    pending.push(Frame::Text(", "));
+                    pending.push(Frame::Level(lhs));
+                }
+                Frame::Level(Level::IMax(lhs, rhs)) => {
+                    formatter.write_str("IMax(")?;
+                    pending.push(Frame::Text(")"));
+                    pending.push(Frame::Level(rhs));
+                    pending.push(Frame::Text(", "));
+                    pending.push(Frame::Level(lhs));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Clone for Level {
+    fn clone(&self) -> Self {
+        enum Frame<'a> {
+            Visit(&'a Level),
+            Succ,
+            Max,
+            IMax,
+        }
+
+        let mut frames = vec![Frame::Visit(self)];
+        let mut values = Vec::new();
+        while let Some(frame) = frames.pop() {
+            match frame {
+                Frame::Visit(Level::Zero) => values.push(Level::Zero),
+                Frame::Visit(Level::Param(name)) => values.push(Level::Param(name.clone())),
+                Frame::Visit(Level::Succ(inner)) => {
+                    frames.push(Frame::Succ);
+                    frames.push(Frame::Visit(inner));
+                }
+                Frame::Visit(Level::Max(lhs, rhs)) => {
+                    frames.push(Frame::Max);
+                    frames.push(Frame::Visit(rhs));
+                    frames.push(Frame::Visit(lhs));
+                }
+                Frame::Visit(Level::IMax(lhs, rhs)) => {
+                    frames.push(Frame::IMax);
+                    frames.push(Frame::Visit(rhs));
+                    frames.push(Frame::Visit(lhs));
+                }
+                Frame::Succ => {
+                    let inner = values.pop().unwrap_or(Level::Zero);
+                    values.push(Level::Succ(Box::new(inner)));
+                }
+                Frame::Max => {
+                    let rhs = values.pop().unwrap_or(Level::Zero);
+                    let lhs = values.pop().unwrap_or(Level::Zero);
+                    values.push(Level::Max(Box::new(lhs), Box::new(rhs)));
+                }
+                Frame::IMax => {
+                    let rhs = values.pop().unwrap_or(Level::Zero);
+                    let lhs = values.pop().unwrap_or(Level::Zero);
+                    values.push(Level::IMax(Box::new(lhs), Box::new(rhs)));
+                }
+            }
+        }
+        values.pop().unwrap_or(Level::Zero)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -178,7 +321,7 @@ impl UniverseContext {
         ensure_level_wf(&self.params, rhs)?;
         let lhs = normalize_level(lhs.clone());
         let rhs = normalize_level(rhs.clone());
-        if lhs == rhs {
+        if level_eq_stack_safe(&lhs, &rhs) {
             return Ok(true);
         }
         // `imax(a, b)` is zero when `b` is zero. When `b` is positive,
@@ -186,7 +329,9 @@ impl UniverseContext {
         // Recognizing this exact impredicative case avoids replacing `imax`
         // by the strictly stronger (and here unprovable) `max` obligation.
         if let Level::IMax(imax_lhs, imax_rhs) = &lhs {
-            if **imax_rhs == rhs && self.entails_level_le(imax_lhs, &Level::succ(Level::zero()))? {
+            if level_eq_stack_safe(imax_rhs, &rhs)
+                && self.entails_level_le(imax_lhs, &Level::succ(Level::zero()))?
+            {
                 return Ok(true);
             }
         }
@@ -340,24 +485,26 @@ pub fn validate_universe_params(params: &[String]) -> Result<Vec<String>> {
 }
 
 pub fn ensure_level_wf(delta: &[String], level: &Level) -> Result<()> {
-    match level {
-        Level::Zero => Ok(()),
-        Level::Succ(level) => ensure_level_wf(delta, level),
-        Level::Max(lhs, rhs) | Level::IMax(lhs, rhs) => {
-            ensure_level_wf(delta, lhs)?;
-            ensure_level_wf(delta, rhs)
-        }
-        Level::Param(name) => {
-            if is_unresolved_universe_meta_param(name) {
-                return Err(Error::UnresolvedUniverseMeta(name.clone()));
+    let mut pending = vec![level];
+    while let Some(level) = pending.pop() {
+        match level {
+            Level::Zero => {}
+            Level::Succ(inner) => pending.push(inner),
+            Level::Max(lhs, rhs) | Level::IMax(lhs, rhs) => {
+                pending.push(rhs);
+                pending.push(lhs);
             }
-            if delta.iter().any(|param| param == name) {
-                Ok(())
-            } else {
-                Err(Error::UnknownUniverseParam(name.clone()))
+            Level::Param(name) => {
+                if is_unresolved_universe_meta_param(name) {
+                    return Err(Error::UnresolvedUniverseMeta(name.clone()));
+                }
+                if !delta.iter().any(|param| param == name) {
+                    return Err(Error::UnknownUniverseParam(name.clone()));
+                }
             }
         }
     }
+    Ok(())
 }
 
 fn is_unresolved_universe_meta_param(param: &str) -> bool {
@@ -368,61 +515,167 @@ pub fn ensure_universe_constraints_wf(
     delta: &[String],
     constraints: &[UniverseConstraint],
 ) -> Result<()> {
-    let mut canonical = constraints.to_vec();
-    canonical.sort();
-    for constraint in &canonical {
+    for constraint in constraints {
         ensure_canonical_level(delta, &constraint.lhs)?;
         ensure_canonical_level(delta, &constraint.rhs)?;
     }
-    if constraints != canonical.as_slice() {
-        return Err(Error::NonCanonicalUniverseConstraints);
-    }
-    if canonical.windows(2).any(|pair| pair[0] == pair[1]) {
-        return Err(Error::DuplicateUniverseConstraint);
+    for pair in constraints.windows(2) {
+        match universe_constraint_cmp_stack_safe(&pair[0], &pair[1]) {
+            std::cmp::Ordering::Greater => return Err(Error::NonCanonicalUniverseConstraints),
+            std::cmp::Ordering::Equal => return Err(Error::DuplicateUniverseConstraint),
+            std::cmp::Ordering::Less => {}
+        }
     }
     Ok(())
 }
 
 pub fn normalize_level(level: Level) -> Level {
-    match level {
-        Level::Zero | Level::Param(_) => level,
-        Level::Succ(level) => Level::Succ(Box::new(normalize_level(*level))),
-        Level::Max(lhs, rhs) => {
-            let lhs = normalize_level(*lhs);
-            let rhs = normalize_level(*rhs);
-            if lhs == rhs {
-                return lhs;
+    enum Frame {
+        Visit(Level),
+        Succ,
+        Max,
+        IMax,
+    }
+
+    let mut frames = vec![Frame::Visit(level)];
+    let mut values = Vec::new();
+    while let Some(frame) = frames.pop() {
+        match frame {
+            Frame::Visit(Level::Zero) => values.push(Level::Zero),
+            Frame::Visit(Level::Param(name)) => values.push(Level::Param(name)),
+            Frame::Visit(Level::Succ(inner)) => {
+                frames.push(Frame::Succ);
+                frames.push(Frame::Visit(*inner));
             }
-            if lhs == Level::Zero {
-                return rhs;
+            Frame::Visit(Level::Max(lhs, rhs)) => {
+                frames.push(Frame::Max);
+                frames.push(Frame::Visit(*rhs));
+                frames.push(Frame::Visit(*lhs));
             }
-            if rhs == Level::Zero {
-                return lhs;
+            Frame::Visit(Level::IMax(lhs, rhs)) => {
+                frames.push(Frame::IMax);
+                frames.push(Frame::Visit(*rhs));
+                frames.push(Frame::Visit(*lhs));
             }
-            match (level_as_nat(&lhs), level_as_nat(&rhs)) {
-                (Some(lhs_nat), Some(rhs_nat)) => level_from_nat(lhs_nat.max(rhs_nat)),
-                _ if rhs < lhs => Level::Max(Box::new(rhs), Box::new(lhs)),
-                _ => Level::Max(Box::new(lhs), Box::new(rhs)),
+            Frame::Succ => {
+                let inner = values.pop().unwrap_or(Level::Zero);
+                values.push(Level::Succ(Box::new(inner)));
+            }
+            Frame::Max => {
+                let rhs = values.pop().unwrap_or(Level::Zero);
+                let lhs = values.pop().unwrap_or(Level::Zero);
+                values.push(normalize_max_pair(lhs, rhs));
+            }
+            Frame::IMax => {
+                let rhs = values.pop().unwrap_or(Level::Zero);
+                let lhs = values.pop().unwrap_or(Level::Zero);
+                values.push(match rhs {
+                    Level::Zero => {
+                        drop_level_stack_safe(lhs);
+                        Level::Zero
+                    }
+                    Level::Succ(inner) => normalize_max_pair(lhs, Level::Succ(inner)),
+                    rhs => Level::IMax(Box::new(lhs), Box::new(rhs)),
+                });
             }
         }
-        Level::IMax(lhs, rhs) => {
-            let lhs = normalize_level(*lhs);
-            let rhs = normalize_level(*rhs);
-            match rhs {
-                Level::Zero => Level::Zero,
-                Level::Succ(inner) => {
-                    normalize_level(Level::Max(Box::new(lhs), Box::new(Level::Succ(inner))))
-                }
-                rhs => Level::IMax(Box::new(lhs), Box::new(rhs)),
+    }
+    values.pop().unwrap_or(Level::Zero)
+}
+
+fn normalize_max_pair(lhs: Level, rhs: Level) -> Level {
+    if level_eq_stack_safe(&lhs, &rhs) {
+        drop_level_stack_safe(rhs);
+        return lhs;
+    }
+    if matches!(lhs, Level::Zero) {
+        return rhs;
+    }
+    if matches!(rhs, Level::Zero) {
+        return lhs;
+    }
+    match (level_as_nat(&lhs), level_as_nat(&rhs)) {
+        (Some(lhs_nat), Some(rhs_nat)) => {
+            let result = level_from_nat(lhs_nat.max(rhs_nat));
+            drop_level_stack_safe(lhs);
+            drop_level_stack_safe(rhs);
+            result
+        }
+        _ if level_cmp_stack_safe(&rhs, &lhs).is_lt() => Level::Max(Box::new(rhs), Box::new(lhs)),
+        _ => Level::Max(Box::new(lhs), Box::new(rhs)),
+    }
+}
+
+fn drop_level_stack_safe(level: Level) {
+    let mut pending = vec![level];
+    while let Some(level) = pending.pop() {
+        match level {
+            Level::Zero | Level::Param(_) => {}
+            Level::Succ(inner) => pending.push(*inner),
+            Level::Max(lhs, rhs) | Level::IMax(lhs, rhs) => {
+                pending.push(*rhs);
+                pending.push(*lhs);
             }
         }
     }
 }
 
+fn level_eq_stack_safe(lhs: &Level, rhs: &Level) -> bool {
+    level_cmp_stack_safe(lhs, rhs).is_eq()
+}
+
+fn level_cmp_stack_safe(lhs: &Level, rhs: &Level) -> std::cmp::Ordering {
+    fn rank(level: &Level) -> u8 {
+        match level {
+            Level::Zero => 0,
+            Level::Succ(_) => 1,
+            Level::Max(_, _) => 2,
+            Level::IMax(_, _) => 3,
+            Level::Param(_) => 4,
+        }
+    }
+
+    let mut pending = vec![(lhs, rhs)];
+    while let Some((lhs, rhs)) = pending.pop() {
+        let ordering = rank(lhs).cmp(&rank(rhs));
+        if !ordering.is_eq() {
+            return ordering;
+        }
+        match (lhs, rhs) {
+            (Level::Zero, Level::Zero) => {}
+            (Level::Succ(lhs), Level::Succ(rhs)) => pending.push((lhs, rhs)),
+            (Level::Max(lhs_l, lhs_r), Level::Max(rhs_l, rhs_r))
+            | (Level::IMax(lhs_l, lhs_r), Level::IMax(rhs_l, rhs_r)) => {
+                pending.push((lhs_r, rhs_r));
+                pending.push((lhs_l, rhs_l));
+            }
+            (Level::Param(lhs), Level::Param(rhs)) => {
+                let ordering = lhs.cmp(rhs);
+                if !ordering.is_eq() {
+                    return ordering;
+                }
+            }
+            _ => return ordering,
+        }
+    }
+    std::cmp::Ordering::Equal
+}
+
+fn universe_constraint_cmp_stack_safe(
+    lhs: &UniverseConstraint,
+    rhs: &UniverseConstraint,
+) -> std::cmp::Ordering {
+    level_cmp_stack_safe(&lhs.lhs, &rhs.lhs)
+        .then_with(|| lhs.relation.cmp(&rhs.relation))
+        .then_with(|| level_cmp_stack_safe(&lhs.rhs, &rhs.rhs))
+}
+
 fn ensure_canonical_level(delta: &[String], level: &Level) -> Result<()> {
     ensure_level_wf(delta, level)?;
     let normalized = normalize_level(level.clone());
-    if normalized == *level {
+    let is_canonical = level_eq_stack_safe(&normalized, level);
+    drop_level_stack_safe(normalized);
+    if is_canonical {
         Ok(())
     } else {
         Err(Error::NonCanonicalUniverseLevel {
@@ -480,7 +733,7 @@ fn decompose_constraint(constraint: &UniverseConstraint) -> Result<Vec<AtomInequ
     match normalized.relation {
         UniverseConstraintRelation::Le => decompose_le_constraint(normalized.lhs, normalized.rhs),
         UniverseConstraintRelation::Eq => {
-            if normalized.lhs == normalized.rhs {
+            if level_eq_stack_safe(&normalized.lhs, &normalized.rhs) {
                 return Ok(Vec::new());
             }
             let mut inequalities =
@@ -494,7 +747,7 @@ fn decompose_constraint(constraint: &UniverseConstraint) -> Result<Vec<AtomInequ
 fn decompose_le_constraint(lhs: Level, rhs: Level) -> Result<Vec<AtomInequality>> {
     let lhs = normalize_level(lhs);
     let rhs = normalize_level(rhs);
-    if lhs == rhs {
+    if level_eq_stack_safe(&lhs, &rhs) {
         return Ok(Vec::new());
     }
     let lhs_atoms = decompose_lhs_level_expr(&lhs)?;
@@ -514,16 +767,20 @@ fn decompose_le_constraint(lhs: Level, rhs: Level) -> Result<Vec<AtomInequality>
 }
 
 fn decompose_level_expr(level: &Level) -> Result<Vec<Atom>> {
-    match normalize_level(level.clone()) {
-        Level::Max(lhs, rhs) => {
-            let mut atoms = decompose_level_expr(&lhs)?;
-            atoms.extend(decompose_level_expr(&rhs)?);
-            atoms.sort();
-            atoms.dedup();
-            Ok(atoms)
+    let mut pending = vec![normalize_level(level.clone())];
+    let mut atoms = Vec::new();
+    while let Some(level) = pending.pop() {
+        match level {
+            Level::Max(lhs, rhs) => {
+                pending.push(*rhs);
+                pending.push(*lhs);
+            }
+            level => atoms.push(decompose_atom(&level)?),
         }
-        level => Ok(vec![decompose_atom(&level)?]),
     }
+    atoms.sort();
+    atoms.dedup();
+    Ok(atoms)
 }
 
 /// Conservatively decomposes a universe expression used on the left of `<=`.
@@ -535,43 +792,50 @@ fn decompose_level_expr(level: &Level) -> Result<Vec<Atom>> {
 /// use `decompose_level_expr` and fails closed on symbolic `imax`, where the
 /// same replacement would be unsound.
 fn decompose_lhs_level_expr(level: &Level) -> Result<Vec<Atom>> {
-    match normalize_level(level.clone()) {
-        Level::Max(lhs, rhs) | Level::IMax(lhs, rhs) => {
-            let mut atoms = decompose_lhs_level_expr(&lhs)?;
-            atoms.extend(decompose_lhs_level_expr(&rhs)?);
-            atoms.sort();
-            atoms.dedup();
-            Ok(atoms)
+    let mut pending = vec![normalize_level(level.clone())];
+    let mut atoms = Vec::new();
+    while let Some(level) = pending.pop() {
+        match level {
+            Level::Max(lhs, rhs) | Level::IMax(lhs, rhs) => {
+                pending.push(*rhs);
+                pending.push(*lhs);
+            }
+            level => atoms.push(decompose_atom(&level)?),
         }
-        level => Ok(vec![decompose_atom(&level)?]),
     }
+    atoms.sort();
+    atoms.dedup();
+    Ok(atoms)
 }
 
 fn decompose_atom(level: &Level) -> Result<Atom> {
-    match normalize_level(level.clone()) {
-        Level::Zero => Ok(Atom {
-            base: AtomBase::Zero,
-            offset: 0,
-        }),
-        Level::Param(name) => Ok(Atom {
-            base: AtomBase::Param(name),
-            offset: 0,
-        }),
-        Level::Succ(inner) => {
-            let mut atom = decompose_atom(&inner)?;
-            atom.offset =
-                atom.offset
-                    .checked_add(1)
-                    .ok_or_else(|| Error::UnsupportedUniverseConstraint {
-                        constraint: UniverseConstraint::le(level.clone(), level.clone()),
-                    })?;
-            offset_bound(&atom)?;
-            Ok(atom)
-        }
-        _ => Err(Error::UnsupportedUniverseConstraint {
-            constraint: UniverseConstraint::le(level.clone(), level.clone()),
-        }),
+    let mut current = level;
+    let mut offset = 0u64;
+    while let Level::Succ(inner) = current {
+        offset = offset
+            .checked_add(1)
+            .ok_or_else(|| Error::UnsupportedUniverseConstraint {
+                constraint: UniverseConstraint::le(level.clone(), level.clone()),
+            })?;
+        current = inner;
     }
+    let atom = match current {
+        Level::Zero => Atom {
+            base: AtomBase::Zero,
+            offset,
+        },
+        Level::Param(name) => Atom {
+            base: AtomBase::Param(name.clone()),
+            offset,
+        },
+        _ => {
+            return Err(Error::UnsupportedUniverseConstraint {
+                constraint: UniverseConstraint::le(level.clone(), level.clone()),
+            });
+        }
+    };
+    offset_bound(&atom)?;
+    Ok(atom)
 }
 
 fn offset_bound(atom: &Atom) -> Result<i64> {
@@ -581,27 +845,64 @@ fn offset_bound(atom: &Atom) -> Result<i64> {
 }
 
 fn substitute_level(level: &Level, params: &[String], levels: &[Level]) -> Level {
-    match level {
-        Level::Zero => Level::Zero,
-        Level::Succ(inner) => normalize_level(Level::succ(substitute_level(inner, params, levels))),
-        Level::Max(lhs, rhs) => Level::max(
-            substitute_level(lhs, params, levels),
-            substitute_level(rhs, params, levels),
-        ),
-        Level::IMax(lhs, rhs) => Level::imax(
-            substitute_level(lhs, params, levels),
-            substitute_level(rhs, params, levels),
-        ),
-        Level::Param(name) => params
-            .iter()
-            .position(|param| param == name)
-            .map(|index| levels[index].clone())
-            .unwrap_or_else(|| Level::Param(name.clone())),
+    enum Frame<'a> {
+        Visit(&'a Level),
+        Succ,
+        Max,
+        IMax,
     }
+    let mut frames = vec![Frame::Visit(level)];
+    let mut values = Vec::new();
+    while let Some(frame) = frames.pop() {
+        match frame {
+            Frame::Visit(Level::Zero) => values.push(Level::Zero),
+            Frame::Visit(Level::Param(name)) => values.push(
+                params
+                    .iter()
+                    .position(|param| param == name)
+                    .map(|index| levels[index].clone())
+                    .unwrap_or_else(|| Level::Param(name.clone())),
+            ),
+            Frame::Visit(Level::Succ(inner)) => {
+                frames.push(Frame::Succ);
+                frames.push(Frame::Visit(inner));
+            }
+            Frame::Visit(Level::Max(lhs, rhs)) => {
+                frames.push(Frame::Max);
+                frames.push(Frame::Visit(rhs));
+                frames.push(Frame::Visit(lhs));
+            }
+            Frame::Visit(Level::IMax(lhs, rhs)) => {
+                frames.push(Frame::IMax);
+                frames.push(Frame::Visit(rhs));
+                frames.push(Frame::Visit(lhs));
+            }
+            Frame::Succ => {
+                let inner = values.pop().unwrap_or(Level::Zero);
+                values.push(Level::succ(inner));
+            }
+            Frame::Max => {
+                let rhs = values.pop().unwrap_or(Level::Zero);
+                let lhs = values.pop().unwrap_or(Level::Zero);
+                values.push(Level::max(lhs, rhs));
+            }
+            Frame::IMax => {
+                let rhs = values.pop().unwrap_or(Level::Zero);
+                let lhs = values.pop().unwrap_or(Level::Zero);
+                values.push(Level::imax(lhs, rhs));
+            }
+        }
+    }
+    values.pop().unwrap_or(Level::Zero)
 }
 
 pub fn level_eq(lhs: &Level, rhs: &Level) -> bool {
-    normalize_level(lhs.clone()) == normalize_level(rhs.clone())
+    let lhs = normalize_level(lhs.clone());
+    let rhs = normalize_level(rhs.clone());
+    let equal = level_eq_stack_safe(&lhs, &rhs);
+    drop_level_stack_safe(lhs);
+    drop_level_stack_safe(rhs);
+    equal
 }
 
 pub fn levels_eq(lhs: &[Level], rhs: &[Level]) -> bool {
@@ -609,10 +910,17 @@ pub fn levels_eq(lhs: &[Level], rhs: &[Level]) -> bool {
 }
 
 fn level_as_nat(level: &Level) -> Option<u32> {
-    match level {
-        Level::Zero => Some(0),
-        Level::Succ(level) => Some(level_as_nat(level)? + 1),
-        _ => None,
+    let mut current = level;
+    let mut value = 0u32;
+    loop {
+        match current {
+            Level::Zero => return Some(value),
+            Level::Succ(inner) => {
+                value = value.checked_add(1)?;
+                current = inner;
+            }
+            _ => return None,
+        }
     }
 }
 
@@ -911,5 +1219,34 @@ mod tests {
                 level: noncanonical.lhs,
             })
         );
+    }
+
+    #[test]
+    fn deep_level_clone_normalize_validate_and_substitute_are_stack_safe() {
+        let mut level = Level::zero();
+        for _ in 0..8_192 {
+            level = Level::succ(level);
+        }
+
+        let cloned = level.clone();
+        ensure_level_wf(&[], &cloned).unwrap();
+        let normalized = normalize_level(cloned);
+        assert!(level_eq(&level, &normalized));
+        let substituted = substitute_level(&level, &[], &[]);
+        assert!(level_eq(&level, &substituted));
+        assert_eq!(level.cmp(&normalized), std::cmp::Ordering::Equal);
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        level.hash(&mut hasher);
+        assert_ne!(std::hash::Hasher::finish(&hasher), 0);
+        let debug = format!("{level:?}");
+        assert!(debug.starts_with("Succ(Succ("));
+        assert!(debug.contains("Zero"));
+        assert!(debug.ends_with(')'));
+
+        // Keep the deliberately adversarial Box spines alive: the operation
+        // under test is the stack-safe walker, not std's recursive Box drop.
+        std::mem::forget(level);
+        std::mem::forget(normalized);
+        std::mem::forget(substituted);
     }
 }

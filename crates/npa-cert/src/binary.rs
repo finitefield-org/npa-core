@@ -10,32 +10,51 @@ pub(crate) fn decode_module_cert_header(bytes: &[u8]) -> Result<CertHeader> {
     Ok(header)
 }
 
-pub(crate) fn encode_module_cert_full_for_header(cert: &ModuleCert) -> Result<Vec<u8>> {
-    let version = certificate_format_version(&cert.header)?;
-    ensure_dependency_layout_supported(cert, version)?;
-    Ok(encode_module_cert_with_format(cert, version, true))
+pub(crate) struct FullModuleCertEncoding {
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) version: CertificateFormatVersion,
+    pub(crate) certificate_hash_input_end: usize,
 }
 
-pub(crate) fn encode_module_cert_without_certificate_hash_v0_2_compat(
+pub(crate) fn encode_module_cert_full_with_boundary_for_header(
     cert: &ModuleCert,
-) -> Vec<u8> {
-    encode_module_cert_with_format(cert, CertificateFormatVersion::V0_2_0, false)
+) -> Result<FullModuleCertEncoding> {
+    let version = certificate_format_version(cert.header())?;
+    ensure_dependency_layout_supported(cert.declarations(), version)?;
+    let mut bytes = encode_module_cert_with_format(cert, version, false);
+    let certificate_hash_input_end = bytes.len();
+    encode_hash_to(&mut bytes, &cert.hashes().certificate_hash);
+    Ok(FullModuleCertEncoding {
+        bytes,
+        version,
+        certificate_hash_input_end,
+    })
+}
+
+pub(crate) fn encode_module_cert_full_for_header(cert: &ModuleCert) -> Result<Vec<u8>> {
+    Ok(encode_module_cert_full_with_boundary_for_header(cert)?.bytes)
 }
 
 pub(crate) fn encode_module_cert_without_certificate_hash_for_header(
     cert: &ModuleCert,
 ) -> Result<Vec<u8>> {
-    let version = certificate_format_version(&cert.header)?;
-    ensure_dependency_layout_supported(cert, version)?;
-    Ok(encode_module_cert_with_format(cert, version, false))
+    encode_module_cert_parts_without_certificate_hash_for_header(cert.parts())
+}
+
+pub(crate) fn encode_module_cert_parts_without_certificate_hash_for_header(
+    parts: &ModuleCertParts,
+) -> Result<Vec<u8>> {
+    let version = certificate_format_version(&parts.header)?;
+    ensure_dependency_layout_supported(&parts.declarations, version)?;
+    Ok(encode_module_cert_parts_with_format(parts, version, false))
 }
 
 fn ensure_dependency_layout_supported(
-    cert: &ModuleCert,
+    declarations: &[DeclCert],
     version: CertificateFormatVersion,
 ) -> Result<()> {
     if !version.encodes_tagged_dependencies()
-        && cert.declarations.iter().any(|declaration| {
+        && declarations.iter().any(|declaration| {
             declaration
                 .dependencies
                 .iter()
@@ -52,19 +71,30 @@ fn encode_module_cert_with_format(
     version: CertificateFormatVersion,
     include_certificate_hash: bool,
 ) -> Vec<u8> {
+    encode_module_cert_parts_with_format(cert.parts(), version, include_certificate_hash)
+}
+
+fn encode_module_cert_parts_with_format(
+    parts: &ModuleCertParts,
+    version: CertificateFormatVersion,
+    include_certificate_hash: bool,
+) -> Vec<u8> {
     let mut out = Vec::new();
-    encode_header_to(&mut out, &cert.header);
-    encode_imports_to(&mut out, &cert.imports);
-    encode_name_table_to(&mut out, &cert.name_table);
-    encode_level_table_to(&mut out, &cert.level_table);
-    encode_term_table_to(&mut out, &cert.term_table);
-    encode_declarations_to(&mut out, &cert.declarations, version);
-    out.extend(encode_export_block_with_format(&cert.export_block, version));
-    out.extend(encode_axiom_report(&cert.axiom_report));
-    encode_hash_to(&mut out, &cert.hashes.export_hash);
-    encode_hash_to(&mut out, &cert.hashes.axiom_report_hash);
+    encode_header_to(&mut out, &parts.header);
+    encode_imports_to(&mut out, &parts.imports);
+    encode_name_table_to(&mut out, &parts.name_table);
+    encode_level_table_to(&mut out, &parts.level_table);
+    encode_term_table_to(&mut out, &parts.term_table);
+    encode_declarations_to(&mut out, &parts.declarations, version);
+    out.extend(encode_export_block_with_format(
+        &parts.export_block,
+        version,
+    ));
+    out.extend(encode_axiom_report(&parts.axiom_report));
+    encode_hash_to(&mut out, &parts.hashes.export_hash);
+    encode_hash_to(&mut out, &parts.hashes.axiom_report_hash);
     if include_certificate_hash {
-        encode_hash_to(&mut out, &cert.hashes.certificate_hash);
+        encode_hash_to(&mut out, &parts.hashes.certificate_hash);
     }
     out
 }
@@ -148,12 +178,6 @@ fn encode_term_table_to(out: &mut Vec<u8>, terms: &[TermNode]) {
             TermNode::Pi { ty, body } => {
                 out.push(0x05);
                 encode_uvar_to(out, *ty as u64);
-                encode_uvar_to(out, *body as u64);
-            }
-            TermNode::Let { ty, value, body } => {
-                out.push(0x06);
-                encode_uvar_to(out, *ty as u64);
-                encode_uvar_to(out, *value as u64);
                 encode_uvar_to(out, *body as u64);
             }
         }
@@ -401,20 +425,12 @@ fn encode_universe_constraint_specs_to(out: &mut Vec<u8>, constraints: &[Univers
     }
 }
 
-pub(crate) fn encode_export_block(block: &ExportBlock) -> Vec<u8> {
-    encode_export_block_with_format(block, CertificateFormatVersion::V0_2_0)
-}
-
-pub(crate) fn encode_export_block_legacy(block: &ExportBlock) -> Vec<u8> {
-    encode_export_block_with_format(block, CertificateFormatVersion::V0_1)
-}
-
-pub(crate) fn encode_export_block_previous(block: &ExportBlock) -> Vec<u8> {
-    encode_export_block_with_format(block, CertificateFormatVersion::V0_1_2)
+pub(crate) fn encode_export_block(block: &[ExportEntry]) -> Vec<u8> {
+    encode_export_block_with_format(block, CertificateFormatVersion::V0_4_0)
 }
 
 fn encode_export_block_with_format(
-    block: &ExportBlock,
+    block: &[ExportEntry],
     version: CertificateFormatVersion,
 ) -> Vec<u8> {
     let mut out = Vec::new();
@@ -679,11 +695,13 @@ impl<'a> Decoder<'a> {
     }
 
     pub(crate) fn module_cert(&mut self) -> Result<ModuleCert> {
-        self.module_cert_with_import_offsets()
-            .map(|(certificate, _)| certificate)
+        self.module_cert_parts_with_import_offsets()
+            .map(|(parts, _)| ModuleCert::from_parts(parts))
     }
 
-    pub(crate) fn module_cert_with_import_offsets(&mut self) -> Result<(ModuleCert, Vec<usize>)> {
+    pub(crate) fn module_cert_parts_with_import_offsets(
+        &mut self,
+    ) -> Result<(ModuleCertParts, Vec<usize>)> {
         let header = self.header()?;
         let version = certificate_format_version(&header)?;
         let (imports, import_offsets) = self.imports_with_offsets()?;
@@ -702,7 +720,7 @@ impl<'a> Decoder<'a> {
             certificate_hash: self.hash()?,
         };
         Ok((
-            ModuleCert {
+            ModuleCertParts {
                 header,
                 imports,
                 name_table,
@@ -718,9 +736,14 @@ impl<'a> Decoder<'a> {
     }
 
     fn header(&mut self) -> Result<CertHeader> {
+        let format = self.string()?;
+        let core_spec = self.string()?;
+        if format != FORMAT || core_spec != CORE_SPEC {
+            return Err(CertError::UnsupportedFormat { format, core_spec });
+        }
         Ok(CertHeader {
-            format: self.string()?,
-            core_spec: self.string()?,
+            format,
+            core_spec,
             module: self.name()?,
         })
     }
@@ -770,33 +793,43 @@ impl<'a> Decoder<'a> {
     }
 
     fn term_table(&mut self) -> Result<Vec<TermNode>> {
-        let len =
-            self.bounded_len_for(StructuralLimitKind::TermTableNodes, MAX_TERM_TABLE_NODES)?;
-        self.collect_n(len, |decoder| {
-            Ok(match decoder.byte()? {
-                0x00 => TermNode::Sort(decoder.usize()?),
-                0x01 => TermNode::BVar(decoder.u32()?),
+        let len = self.usize()?;
+        ensure_count_limit(
+            StructuralLimitKind::TermTableNodes,
+            MAX_TERM_TABLE_NODES,
+            len,
+        )?;
+        // Do not use `bounded_len_for` here: its minimum-byte feasibility check
+        // would turn a tag-only retired `0x06` node into `DecodeError` before
+        // the decoder observed the tag. Capacity remains bounded by available
+        // bytes, and no node is pushed until its complete retained payload has
+        // decoded successfully.
+        let mut terms = Vec::new();
+        terms
+            .try_reserve_exact(len.min(self.remaining_len()))
+            .map_err(|_| CertError::DecodeError)?;
+        for _ in 0..len {
+            let term = match self.byte()? {
+                0x00 => TermNode::Sort(self.usize()?),
+                0x01 => TermNode::BVar(self.u32()?),
                 0x02 => TermNode::Const {
-                    global_ref: decoder.global_ref()?,
-                    levels: decoder.usize_vec()?,
+                    global_ref: self.global_ref()?,
+                    levels: self.usize_vec()?,
                 },
-                0x03 => TermNode::App(decoder.usize()?, decoder.usize()?),
+                0x03 => TermNode::App(self.usize()?, self.usize()?),
                 0x04 => TermNode::Lam {
-                    ty: decoder.usize()?,
-                    body: decoder.usize()?,
+                    ty: self.usize()?,
+                    body: self.usize()?,
                 },
                 0x05 => TermNode::Pi {
-                    ty: decoder.usize()?,
-                    body: decoder.usize()?,
-                },
-                0x06 => TermNode::Let {
-                    ty: decoder.usize()?,
-                    value: decoder.usize()?,
-                    body: decoder.usize()?,
+                    ty: self.usize()?,
+                    body: self.usize()?,
                 },
                 tag => return Err(CertError::UnsupportedEncoding { tag }),
-            })
-        })
+            };
+            terms.push(term);
+        }
+        Ok(terms)
     }
 
     fn declarations(&mut self, version: CertificateFormatVersion) -> Result<Vec<DeclCert>> {
@@ -1339,5 +1372,60 @@ impl<'a> Decoder<'a> {
             .ok_or(CertError::DecodeError)?;
         self.offset = end;
         Ok(bytes)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn v0_4_term_table_uses_exact_six_form_encoding() {
+        let matrix = include_str!("../../../testdata/certificate-v0.4/fixture-matrix.tsv");
+        let rows = matrix
+            .lines()
+            .skip(1)
+            .map(|line| {
+                let fields = line.split('\t').collect::<Vec<_>>();
+                assert_eq!(fields.len(), 10, "malformed fixture row: {line}");
+                fields
+            })
+            .filter(|fields| fields[1] == "positive_term")
+            .collect::<Vec<_>>();
+        assert_eq!(rows.len(), 6);
+
+        for fields in rows {
+            assert_eq!(fields[3], FORMAT, "{}", fields[0]);
+            assert_eq!(fields[4], CORE_SPEC, "{}", fields[0]);
+            assert_eq!(fields[6], "checked", "{}", fields[0]);
+            let node = match fields[0] {
+                "term_sort" => TermNode::Sort(0),
+                "term_bvar" => TermNode::BVar(0),
+                "term_const" => TermNode::Const {
+                    global_ref: GlobalRef::Local { decl_index: 0 },
+                    levels: Vec::new(),
+                },
+                "term_app" => TermNode::App(0, 1),
+                "term_lam" => TermNode::Lam { ty: 0, body: 1 },
+                "term_pi" => TermNode::Pi { ty: 0, body: 1 },
+                case_id => panic!("unmapped positive-term fixture: {case_id}"),
+            };
+            let expected_node_bytes = fields[5]
+                .strip_prefix("assert_node_hex:")
+                .expect("positive-term mutation must carry exact node hex")
+                .as_bytes();
+            assert_eq!(expected_node_bytes.len() % 2, 0, "{}", fields[0]);
+            let expected_node_bytes = expected_node_bytes
+                .chunks_exact(2)
+                .map(|pair| {
+                    let text = std::str::from_utf8(pair).unwrap();
+                    u8::from_str_radix(text, 16).unwrap()
+                })
+                .collect::<Vec<_>>();
+            let mut encoded = Vec::new();
+            encode_term_table_to(&mut encoded, &[node]);
+            assert_eq!(encoded[0], 1, "singleton table length");
+            assert_eq!(&encoded[1..], expected_node_bytes, "{}", fields[0]);
+        }
     }
 }

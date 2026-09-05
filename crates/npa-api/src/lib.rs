@@ -41,6 +41,7 @@ mod package_artifact_ledger;
 mod package_artifacts;
 mod package_verifier;
 mod parent_proof_integration;
+mod performance_fixture_v02;
 mod performance_gate;
 mod performance_measurement;
 mod projection;
@@ -68,6 +69,27 @@ mod trust;
 mod types;
 mod validation;
 mod verify;
+
+/// Build-script-authenticated metadata for the npa-api crate containing the
+/// VMSP benchmark. The npa-cli controller imports this descriptor from its
+/// independently compiled npa-api dependency rather than accepting the
+/// benchmark process's self-description as authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NpaApiBuildDescriptor {
+    pub target: &'static str,
+    pub features: &'static str,
+    pub rustc_vv_hex: &'static str,
+    pub rustflags_hex: &'static str,
+}
+
+pub const fn npa_api_build_descriptor() -> NpaApiBuildDescriptor {
+    NpaApiBuildDescriptor {
+        target: env!("NPA_BUILD_TARGET"),
+        features: env!("NPA_BUILD_CARGO_FEATURES"),
+        rustc_vv_hex: env!("NPA_BUILD_RUSTC_VV_HEX"),
+        rustflags_hex: env!("NPA_BUILD_RUSTFLAGS_HEX"),
+    }
+}
 
 pub use adapter::{
     machine_tactic_extract_closed_machine_theorem_decl, machine_tactic_machine_tactic_result_error,
@@ -711,32 +733,67 @@ pub use package_artifacts::{
 };
 pub use package_verifier::{
     clear_package_import_context_export_disk_cache, clear_package_verification_decode_cache,
-    clear_package_verification_process_memo, materialize_package_phase8_import_locks,
-    materialize_package_phase8_requests, package_import_context_export_disk_cache_entry_count,
-    package_verification_axiom_policy_hash, package_verification_decode_cache_entry_count,
-    package_verification_memo_key_inputs, package_verification_process_memo_entry_count,
-    verify_package_fast_source_free, verify_package_fast_source_free_from_root,
+    materialize_package_phase8_import_locks, materialize_package_phase8_requests,
+    package_import_context_export_disk_cache_entry_count, package_verification_axiom_policy_hash,
+    package_verification_decode_cache_entry_count,
+    package_verification_decode_cache_retained_bytes, package_verification_memo_key_inputs,
+    package_verification_memo_key_inputs_from_artifact_snapshots,
+    package_verification_memo_key_inputs_from_artifact_snapshots_indexed,
+    package_verification_memo_key_inputs_indexed, verify_package_fast_source_free,
+    verify_package_fast_source_free_from_root,
     verify_package_fast_source_free_from_root_with_options,
+    verify_package_fast_source_free_with_artifact_snapshots_and_cache_aware_disk_memo_hits,
+    verify_package_fast_source_free_with_artifact_snapshots_and_cached_hits_observed,
+    verify_package_fast_source_free_with_artifact_snapshots_and_cached_hits_observed_indexed,
+    verify_package_fast_source_free_with_artifact_snapshots_and_disk_memo_hits,
+    verify_package_fast_source_free_with_artifact_snapshots_and_local_audit_cache_hits,
+    verify_package_fast_source_free_with_artifact_snapshots_and_options,
+    verify_package_fast_source_free_with_artifact_snapshots_and_options_and_observation,
+    verify_package_fast_source_free_with_artifact_snapshots_and_options_and_observation_indexed,
     verify_package_fast_source_free_with_cache_aware_disk_memo_hits,
+    verify_package_fast_source_free_with_cached_hits_indexed,
     verify_package_fast_source_free_with_disk_memo_hits,
+    verify_package_fast_source_free_with_hashed_artifacts,
+    verify_package_fast_source_free_with_hashed_artifacts_and_options,
+    verify_package_fast_source_free_with_hashed_artifacts_and_options_indexed,
     verify_package_fast_source_free_with_local_audit_cache_hits,
     verify_package_fast_source_free_with_modules, verify_package_fast_source_free_with_options,
-    verify_package_reference_source_free, verify_package_reference_source_free_from_root,
+    verify_package_fast_source_free_with_options_indexed, verify_package_reference_source_free,
+    verify_package_reference_source_free_from_root,
     verify_package_reference_source_free_from_root_with_options,
     verify_package_reference_source_free_with_cache_aware_disk_memo_hits,
+    verify_package_reference_source_free_with_cached_hits_indexed,
     verify_package_reference_source_free_with_disk_memo_hits,
+    verify_package_reference_source_free_with_hashed_artifacts,
+    verify_package_reference_source_free_with_hashed_artifacts_and_cache_aware_disk_memo_hits,
+    verify_package_reference_source_free_with_hashed_artifacts_and_cached_hits_indexed,
+    verify_package_reference_source_free_with_hashed_artifacts_and_disk_memo_hits,
+    verify_package_reference_source_free_with_hashed_artifacts_and_local_audit_cache_hits,
+    verify_package_reference_source_free_with_hashed_artifacts_and_options,
+    verify_package_reference_source_free_with_hashed_artifacts_and_options_indexed,
     verify_package_reference_source_free_with_local_audit_cache_hits,
-    verify_package_reference_source_free_with_options, PackageCertificateArtifact,
+    verify_package_reference_source_free_with_options,
+    verify_package_reference_source_free_with_options_indexed, PackageCertificateArtifact,
     PackageFastSourceFreeVerification, PackageModuleVerificationEvidence,
     PackageModuleVerificationResult, PackageModuleVerificationStatus,
-    PackagePhase8ImportLockMaterialization, PackagePhase8RequestMaterialization,
-    PackagePhase8RequestMaterializationReport, PackageVerificationCheckerError,
-    PackageVerificationDecodeCacheCounters, PackageVerificationDecodeCacheMode,
-    PackageVerificationError, PackageVerificationErrorKind, PackageVerificationErrorReason,
-    PackageVerificationExecutionOptions, PackageVerificationMemoCounters,
-    PackageVerificationMemoMode, PackageVerificationMode, PackageVerificationReport,
-    PackageVerificationResult, PackageVerificationStatus, PackageVerificationVerdictSource,
-    PackageVerifiedModuleRecord,
+    PackagePayloadOwnershipObservation, PackagePhase8ImportLockMaterialization,
+    PackagePhase8RequestMaterialization, PackagePhase8RequestMaterializationReport,
+    PackageVerificationCheckerError, PackageVerificationDecodeCacheCounters,
+    PackageVerificationDecodeCacheMode, PackageVerificationError, PackageVerificationErrorKind,
+    PackageVerificationErrorReason, PackageVerificationExecutionOptions,
+    PackageVerificationMemoCounters, PackageVerificationMemoMode, PackageVerificationMode,
+    PackageVerificationProcessMemoAccessError, PackageVerificationProcessMemoHandle,
+    PackageVerificationProcessMemoLimits, PackageVerificationProcessMemoStats,
+    PackageVerificationReport, PackageVerificationResult, PackageVerificationStatus,
+    PackageVerificationVerdictSource, PackageVerifiedModuleRecord,
+};
+
+#[cfg(feature = "planning-benchmark")]
+#[doc(hidden)]
+pub use package_verifier::{
+    benchmark_package_verifier_linear_dag_planning, PackageVerifierLinearDagBenchmarkCounters,
+    PackageVerifierLinearDagBenchmarkObservation, PackageVerifierLinearDagBenchmarkShape,
+    PackageVerifierLinearDagBenchmarkShardProfile,
 };
 pub use parent_proof_integration::{
     integrate_parent_proof, parent_proof_completed_candidate_hash,
@@ -753,13 +810,31 @@ pub use parent_proof_integration::{
     PARENT_PROOF_IMPORT_IDENTITY_HASH_DOMAIN, PARENT_PROOF_INTEGRATION_OUTPUT_HASH_DOMAIN,
     PARENT_PROOF_SUBSTITUTION_HASH_DOMAIN,
 };
+pub use performance_fixture_v02::{
+    validate_checked_performance_fixture_selection_v02, validate_performance_fixture_selection_v02,
+    validate_versioned_performance_fixture_selection, HistoricalPerformanceFixtureCommonV01,
+    PackageArtifactSnapshotFixture, PerformanceFixtureArtifactMode,
+    PerformanceFixtureAuditCachePolicy, PerformanceFixtureCachePhase, PerformanceFixtureCommonV02,
+    PerformanceFixtureDecodeCachePolicy, PerformanceFixtureDiskMemoPolicy,
+    PerformanceFixtureExecutionLane, PerformanceFixtureImplementation,
+    PerformanceFixtureManifestV02, PerformanceFixtureMeasurementMode, PerformanceFixtureMemoPhase,
+    PerformanceFixtureProcessMemoPolicy, PerformanceFixtureProfile, PerformanceFixtureSelectionV02,
+    PerformanceFixtureSessionPhase, PerformanceFixtureV02Error, PerformanceFixtureVerifier,
+    SharedPayloadCacheFixture, SharedPayloadCloneFixture, SharedPayloadMemoFixture,
+    SharedPayloadSessionFixture, SharedPayloadShardFixture, TargetedBuildCertsFixtureV01,
+    VersionedPerformanceFixtureSelection, PERFORMANCE_FIXTURES_SCHEMA_V0_2,
+};
 pub use performance_gate::{
-    validate_performance_fixture_selection, validate_performance_measurement_baseline,
-    PerformanceFixtureSelection, PerformanceGateValidationError, PERFORMANCE_BASELINES_SCHEMA,
-    PERFORMANCE_FIXTURES_SCHEMA,
+    validate_package_changed_selection_baseline,
+    validate_package_verifier_process_memo_scope_baseline, validate_performance_fixture_selection,
+    validate_performance_measurement_baseline, PackageVerifierProcessMemoScopeBaselineObservation,
+    PackageVerifierProcessMemoScopeStoreObservation, PerformanceFixtureSelection,
+    PerformanceGateValidationError, PACKAGE_VERIFIER_PROCESS_MEMO_SCOPE_BASELINES_SCHEMA,
+    PERFORMANCE_BASELINES_SCHEMA, PERFORMANCE_FIXTURES_SCHEMA,
 };
 pub use performance_measurement::{
-    performance_measurement_report_json, PerformanceAcceptedKernelMeasurement,
+    performance_measurement_report_json, PackageCertificateArtifactObservation,
+    PackageDecodeCacheChargeState, PerformanceAcceptedKernelMeasurement,
     PerformanceAcceptedKernelOutcome, PerformanceCandidateMeasurement, PerformanceCandidateOutcome,
     PerformanceClockMetadata, PerformanceDeclarationMeasurement, PerformanceDetailCounts,
     PerformanceKernelDeltaHotsetEntry, PerformanceKernelDeltaHotsetSummary,
@@ -767,13 +842,17 @@ pub use performance_measurement::{
     PerformanceKernelWork, PerformanceMeasurementCounter, PerformanceMeasurementLabel,
     PerformanceMeasurementMode, PerformanceMeasurementRecorder, PerformanceMeasurementReport,
     PerformanceMeasurementUnit, PerformanceModuleMeasurement, PerformancePackageLayerMeasurement,
-    PerformancePackageModuleShardingMeasurement, PerformancePackageShardCostModel,
+    PerformancePackageModuleShardingMeasurement, PerformancePackageSelectionBatchPolicy,
+    PerformancePackageSelectionObservation, PerformancePackageShardCostModel,
     PerformancePackageShardMeasurement, PerformancePackageShardMemoryModel,
     PerformancePackageShardReductionReason, PerformancePackageShardingMeasurement,
     PerformanceWorkerMeasurement, PERFORMANCE_CANDIDATE_DETAIL_LIMIT,
     PERFORMANCE_DECLARATION_DETAIL_LIMIT, PERFORMANCE_MEASUREMENTS_SCHEMA,
     PERFORMANCE_MEASUREMENTS_SCHEMA_V0_1, PERFORMANCE_MEASUREMENTS_SCHEMA_V0_2,
-    PERFORMANCE_MEASUREMENTS_SCHEMA_V0_3, PERFORMANCE_MODULE_DETAIL_LIMIT,
+    PERFORMANCE_MEASUREMENTS_SCHEMA_V0_3, PERFORMANCE_MEASUREMENTS_SCHEMA_V0_4,
+    PERFORMANCE_MEASUREMENTS_SCHEMA_V0_5, PERFORMANCE_MEASUREMENTS_SCHEMA_V0_6,
+    PERFORMANCE_MEASUREMENTS_SCHEMA_V0_7, PERFORMANCE_MEASUREMENTS_SCHEMA_V0_8,
+    PERFORMANCE_MEASUREMENTS_SCHEMA_V0_9, PERFORMANCE_MODULE_DETAIL_LIMIT,
     PERFORMANCE_WORKER_DETAIL_LIMIT,
 };
 pub use projection::{
@@ -806,8 +885,8 @@ pub use proof_semantic::{
     validate_local_context_generalization, validate_proof_local_context_capture,
     validate_proof_sketch_semantics, ProofLocalContextCapture, ProofLocalContextValidationError,
     ProofLocalContextValidationErrorKind, ProofLocalStatementGeneralization,
-    ProofLocalStatementGeneralizationBinder, ProofLocalStatementGeneralizationPolicy,
-    ProofSemanticValidationError, ProofSemanticValidationErrorKind, ProofSemanticValidationProfile,
+    ProofLocalStatementGeneralizationBinder, ProofSemanticValidationError,
+    ProofSemanticValidationErrorKind, ProofSemanticValidationProfile,
     ProofSemanticValidationReport, ProofTypedStatementArtifact,
     PROOF_LOCAL_CONTEXT_BINDER_FINGERPRINT_HASH_DOMAIN,
     PROOF_LOCAL_STATEMENT_GENERALIZATION_HASH_DOMAIN,
@@ -1130,14 +1209,15 @@ pub use solver::{
 };
 pub use std_library::{
     audit_machine_std_mvp_release_artifacts, audit_machine_std_mvp_validated_release,
-    build_legacy_std_package_module_cert, finalize_machine_std_mvp_import_bundle_recipes,
-    finalize_machine_std_mvp_theorem_index, generate_human_std_module_debug_views,
-    generate_human_std_theorem_search_view, generate_machine_std_mvp_final_import_bundle_set,
-    generate_machine_std_mvp_final_theorem_index, generate_machine_std_mvp_import_bundle_set,
-    generate_machine_std_mvp_rewrite_profile_set, generate_machine_std_mvp_simp_profile_set,
-    generate_machine_std_mvp_theorem_index, human_std_theorem_search_view_canonical_bytes,
-    human_std_theorem_search_view_hash, load_machine_std_certificates_from_locators,
-    load_machine_std_mvp_certificates, load_machine_std_mvp_release,
+    build_legacy_std_package_module_cert, build_std_package_module_cert,
+    finalize_machine_std_mvp_import_bundle_recipes, finalize_machine_std_mvp_theorem_index,
+    generate_human_std_module_debug_views, generate_human_std_theorem_search_view,
+    generate_machine_std_mvp_final_import_bundle_set, generate_machine_std_mvp_final_theorem_index,
+    generate_machine_std_mvp_import_bundle_set, generate_machine_std_mvp_rewrite_profile_set,
+    generate_machine_std_mvp_simp_profile_set, generate_machine_std_mvp_theorem_index,
+    human_std_theorem_search_view_canonical_bytes, human_std_theorem_search_view_hash,
+    load_machine_std_certificates_from_locators, load_machine_std_mvp_certificates,
+    load_machine_std_mvp_release,
     load_machine_std_mvp_release_with_optional_prompt_metadata_from_json,
     load_machine_std_mvp_release_with_sidecars_from_json, machine_std_audit_check_canonical_bytes,
     machine_std_audit_report_canonical_bytes, machine_std_audit_report_hash,
@@ -1187,7 +1267,7 @@ pub use std_library::{
     MachineStdSimpProfile, MachineStdSimpProfileError, MachineStdSimpProfileSet,
     MachineStdSourcePackageEntry, MachineStdTacticOptionsRecipe, MachineStdTheoremEntry,
     MachineStdTheoremIndex, MachineStdTheoremIndexError, MachineStdTheoremKind,
-    MachineStdValidatedRelease, LEGACY_STD_PACKAGE_PRODUCER_PROFILE,
+    MachineStdValidatedRelease, LEGACY_STD_PACKAGE_PRODUCER_PROFILE, STD_PACKAGE_PRODUCER_PROFILE,
 };
 pub use tactic::{
     build_focused_replay_failure_artifact, build_focused_replay_failure_artifact_from_tactic_batch,

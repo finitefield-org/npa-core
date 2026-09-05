@@ -7,9 +7,9 @@ use npa_api::{performance_measurement_report_json, PerformanceMeasurementReport}
 use crate::args::CliUsageError;
 
 /// Stable schema string for package command results.
-pub const PACKAGE_COMMAND_RESULT_SCHEMA: &str = "npa.package.command_result.v0.4";
+pub const PACKAGE_COMMAND_RESULT_SCHEMA: &str = "npa.package.command_result.v0.5";
 /// Stable schema string for bounded, untrusted kernel fuel diagnostics.
-pub const KERNEL_FUEL_DIAGNOSTIC_SCHEMA: &str = "npa.kernel-fuel-diagnostic.v0.1";
+pub const KERNEL_FUEL_DIAGNOSTIC_SCHEMA: &str = "npa.kernel-fuel-diagnostic.v0.2";
 
 const KERNEL_FUEL_DIAGNOSTIC_MAX_JSON_BYTES: usize = 64 * 1024;
 /// Stable schema string for optional package timing telemetry.
@@ -25,6 +25,8 @@ pub const INTERFACE_INVENTORY_SCHEMA: &str = "npa.mathlib.interface_inventory.v1
 /// Stable schema string for adopted interface-proposal surface drift.
 pub const INTERFACE_PROPOSAL_SURFACE_DRIFT_SCHEMA: &str =
     "npa.mathlib.interface_proposal_surface_drift.v1";
+/// Stable schema for untrusted certificate-verification selection metadata.
+pub const PACKAGE_VERIFY_SELECTION_SCHEMA: &str = "npa.package.verify-selection.v0.1";
 
 /// Process exit class for a command result.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -104,6 +106,8 @@ pub enum DiagnosticKind {
     InterfaceProposal,
     /// Lean interface-inventory metadata validation.
     InterfaceInventory,
+    /// Human source lexical-structure validation.
+    SourceStructure,
     /// Unexpected internal command failure.
     Internal,
 }
@@ -129,6 +133,7 @@ impl DiagnosticKind {
             Self::PackagePolicy => "PackagePolicy",
             Self::InterfaceProposal => "InterfaceProposal",
             Self::InterfaceInventory => "InterfaceInventory",
+            Self::SourceStructure => "SourceStructure",
             Self::Internal => "Internal",
         }
     }
@@ -151,7 +156,8 @@ impl DiagnosticKind {
             | Self::GeneratedArtifact
             | Self::PackagePolicy
             | Self::InterfaceProposal
-            | Self::InterfaceInventory => CommandExitCode::PackageFailure,
+            | Self::InterfaceInventory
+            | Self::SourceStructure => CommandExitCode::PackageFailure,
         }
     }
 }
@@ -272,7 +278,7 @@ impl CommandDiagnosticConversionContext {
 fn valid_kernel_head(head: &str) -> bool {
     matches!(
         head,
-        "sort" | "bound_variable" | "application" | "lambda" | "pi" | "let" | "unknown"
+        "sort" | "bound_variable" | "application" | "lambda" | "pi" | "unknown"
     ) || head.strip_prefix("constant:").is_some_and(|name| {
         !name.is_empty() && name.len() <= 256 && !name.chars().any(char::is_control)
     })
@@ -336,8 +342,6 @@ pub struct CommandKernelWorkSnapshot {
     pub delta_steps: u64,
     /// Iota reductions.
     pub iota_steps: u64,
-    /// Zeta reductions.
-    pub zeta_steps: u64,
     /// Total physical reductions.
     pub physical_reductions: u64,
     /// Whether any work counter arithmetic overflowed.
@@ -485,7 +489,7 @@ impl CommandKernelFuelDiagnostic {
                 .join(" > ")
         };
         let mut output = format!(
-            "kernel fuel:\n  subsystem: {}\n  resource: {}\n  failed operation: budget={} spent={} remaining={}\n  work: defeq_calls={} whnf_calls={} beta={} delta={} iota={} zeta={}\n  declaration: conversion_spent={} whnf_spent={} physical_reductions={}\n  path: {}\n  path truncated: {}\n  overflowed: {}",
+            "kernel fuel:\n  subsystem: {}\n  resource: {}\n  failed operation: budget={} spent={} remaining={}\n  work: defeq_calls={} whnf_calls={} beta={} delta={} iota={}\n  declaration: conversion_spent={} whnf_spent={} physical_reductions={}\n  path: {}\n  path truncated: {}\n  overflowed: {}",
             self.subsystem,
             self.resource,
             failed.fuel.budget,
@@ -496,7 +500,6 @@ impl CommandKernelFuelDiagnostic {
             failed.work.beta_steps,
             failed.work.delta_steps,
             failed.work.iota_steps,
-            failed.work.zeta_steps,
             declaration.fuel.conversion.logical_spent,
             declaration.fuel.whnf.logical_spent,
             declaration.work.physical_reductions,
@@ -563,7 +566,6 @@ fn command_kernel_work_snapshot(
         beta_steps: value.beta_steps,
         delta_steps: value.delta_steps,
         iota_steps: value.iota_steps,
-        zeta_steps: value.zeta_steps,
         physical_reductions: value.physical_reductions,
         overflowed: value.overflowed,
     }
@@ -657,6 +659,143 @@ impl CommandDiagnosticSourceContext {
     }
 }
 
+/// Machine-readable delimiter context for a source-structure diagnostic.
+#[non_exhaustive]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CommandDiagnosticDelimiterContext {
+    /// Stable delimiter failure classification.
+    kind: String,
+    /// Expected closing delimiter when one is known.
+    expected_closing: Option<String>,
+    /// Encountered closing delimiter, absent for an end-of-input failure.
+    actual_closing: Option<String>,
+    /// Exact source location of the related opening delimiter, when one exists.
+    opening_source: Option<CommandDiagnosticSourceContext>,
+    /// Whether a builder received an unsupported delimiter token.
+    malformed: bool,
+}
+
+impl CommandDiagnosticDelimiterContext {
+    /// Build delimiter context from a supported stable classification.
+    pub fn new(kind: impl Into<String>) -> Option<Self> {
+        let kind = kind.into();
+        if !matches!(
+            kind.as_str(),
+            "unexpected_closing_delimiter" | "mismatched_closing_delimiter" | "unclosed_delimiter"
+        ) {
+            return None;
+        }
+        Some(Self {
+            kind,
+            expected_closing: None,
+            actual_closing: None,
+            opening_source: None,
+            malformed: false,
+        })
+    }
+
+    /// Attach a supported expected closing delimiter.
+    #[must_use]
+    pub fn with_expected_closing(mut self, expected: impl Into<String>) -> Self {
+        let expected = expected.into();
+        if is_human_closing_delimiter(&expected) {
+            self.expected_closing = Some(expected);
+        } else {
+            self.malformed = true;
+        }
+        self
+    }
+
+    /// Attach a supported encountered closing delimiter.
+    #[must_use]
+    pub fn with_actual_closing(mut self, actual: impl Into<String>) -> Self {
+        let actual = actual.into();
+        if is_human_closing_delimiter(&actual) {
+            self.actual_closing = Some(actual);
+        } else {
+            self.malformed = true;
+        }
+        self
+    }
+
+    /// Attach the related opening-delimiter source location.
+    #[must_use]
+    pub fn with_opening_source(mut self, opening: CommandDiagnosticSourceContext) -> Self {
+        self.opening_source = Some(opening);
+        self
+    }
+
+    /// Return the stable delimiter failure classification.
+    pub fn kind(&self) -> &str {
+        &self.kind
+    }
+
+    /// Return the expected closing delimiter.
+    pub fn expected_closing(&self) -> Option<&str> {
+        self.expected_closing.as_deref()
+    }
+
+    /// Return the encountered closing delimiter.
+    pub fn actual_closing(&self) -> Option<&str> {
+        self.actual_closing.as_deref()
+    }
+
+    /// Return the opening-delimiter source location.
+    pub fn opening_source(&self) -> Option<&CommandDiagnosticSourceContext> {
+        self.opening_source.as_ref()
+    }
+
+    fn is_well_formed(&self) -> bool {
+        if self.malformed {
+            return false;
+        }
+        match self.kind.as_str() {
+            "unexpected_closing_delimiter" => {
+                self.expected_closing.is_none()
+                    && self.actual_closing.is_some()
+                    && self.opening_source.is_none()
+            }
+            "mismatched_closing_delimiter" => self
+                .expected_closing
+                .as_deref()
+                .zip(self.actual_closing.as_deref())
+                .zip(self.opening_source.as_ref())
+                .is_some_and(|((expected, actual), opening)| {
+                    expected != actual && opening_matches_closing_delimiter(opening, expected)
+                }),
+            "unclosed_delimiter" => {
+                self.actual_closing.is_none()
+                    && self
+                        .expected_closing
+                        .as_deref()
+                        .zip(self.opening_source.as_ref())
+                        .is_some_and(|(expected, opening)| {
+                            opening_matches_closing_delimiter(opening, expected)
+                        })
+            }
+            _ => false,
+        }
+    }
+}
+
+fn is_human_closing_delimiter(value: &str) -> bool {
+    matches!(value, ")" | "]" | "}")
+}
+
+fn opening_matches_closing_delimiter(
+    opening: &CommandDiagnosticSourceContext,
+    expected_closing: &str,
+) -> bool {
+    let expected_opening = match expected_closing {
+        ")" => "(",
+        "]" => "[",
+        "}" => "{",
+        _ => return false,
+    };
+    opening.end_byte.checked_sub(opening.start_byte) == Some(1)
+        && opening.token() == Some(expected_opening)
+}
+
 /// A single deterministic command diagnostic.
 #[non_exhaustive]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -685,6 +824,8 @@ pub struct CommandDiagnostic {
     pub checker: Option<String>,
     /// Source-local context, when the diagnostic originates in authoring text.
     pub source: Option<CommandDiagnosticSourceContext>,
+    /// Structured delimiter context for source-structure failures.
+    delimiter: Option<CommandDiagnosticDelimiterContext>,
     /// Bounded kernel conversion context, when available.
     pub conversion: Option<CommandDiagnosticConversionContext>,
     /// Bounded, untrusted kernel fuel diagnostic, when available.
@@ -707,6 +848,7 @@ impl CommandDiagnostic {
             actual_value: None,
             checker: None,
             source: None,
+            delimiter: None,
             conversion: None,
             kernel_fuel: None,
         }
@@ -727,6 +869,7 @@ impl CommandDiagnostic {
             actual_value: None,
             checker: None,
             source: None,
+            delimiter: None,
             conversion: None,
             kernel_fuel: None,
         }
@@ -773,6 +916,21 @@ impl CommandDiagnostic {
     pub fn with_source(mut self, source: CommandDiagnosticSourceContext) -> Self {
         self.source = Some(source);
         self
+    }
+
+    /// Attach coherent machine-readable delimiter context.
+    ///
+    /// Unsupported classifications, delimiter tokens, or field combinations
+    /// are omitted from the command diagnostic.
+    #[must_use]
+    pub fn with_delimiter(mut self, delimiter: CommandDiagnosticDelimiterContext) -> Self {
+        self.delimiter = delimiter.is_well_formed().then_some(delimiter);
+        self
+    }
+
+    /// Return validated machine-readable delimiter context when available.
+    pub fn delimiter(&self) -> Option<&CommandDiagnosticDelimiterContext> {
+        self.delimiter.as_ref()
     }
 
     /// Attach bounded kernel conversion context.
@@ -827,6 +985,7 @@ impl CommandDiagnostic {
             actual_value: error.actual_value.clone(),
             checker: None,
             source: None,
+            delimiter: None,
             conversion: None,
             kernel_fuel: None,
         }
@@ -853,6 +1012,7 @@ impl CommandDiagnostic {
             actual_value: error.actual_value.clone(),
             checker: None,
             source: None,
+            delimiter: None,
             conversion: None,
             kernel_fuel: None,
         };
@@ -899,6 +1059,27 @@ impl CommandDiagnostic {
                 let mut quoted = String::new();
                 push_json_string(&mut quoted, token);
                 message.push_str(&format!(" token={quoted}"));
+            }
+        }
+        if let Some(delimiter) = &self.delimiter {
+            message.push_str(&format!(" delimiter={}", delimiter.kind));
+            if let Some(expected) = &delimiter.expected_closing {
+                message.push_str(&format!(" expected_closing={expected}"));
+            }
+            if let Some(actual) = &delimiter.actual_closing {
+                message.push_str(&format!(" actual_closing={actual}"));
+            }
+            if let Some(opening) = &delimiter.opening_source {
+                message.push_str(&format!(
+                    " opening={}:byte[{}..{}]",
+                    opening.path, opening.start_byte, opening.end_byte
+                ));
+                if let Some(line) = opening.line {
+                    message.push_str(&format!(" opening_line={line}"));
+                }
+                if let Some(column) = opening.column {
+                    message.push_str(&format!(" opening_column={column}"));
+                }
             }
         }
         if let Some(conversion) = &self.conversion {
@@ -1231,6 +1412,60 @@ pub struct InterfaceProposalSurfaceOutput {
     pub diagnostics: Vec<InterfaceProposalSurfaceDiagnostic>,
 }
 
+/// Strict counts for one bounded certificate-verification selection detail list.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PackageVerifySelectionDetailCounts {
+    /// Complete number of logical details before retention.
+    pub attempted: u64,
+    /// Number of retained details.
+    pub retained: u64,
+    /// Number of omitted details.
+    pub omitted: u64,
+}
+
+/// Bounded, deterministic, and explicitly untrusted verification-selection metadata.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PackageVerifySelectionSummary {
+    /// Schema identifier; always [`PACKAGE_VERIFY_SELECTION_SCHEMA`].
+    pub schema: String,
+    /// Selection metadata is never trusted proof input.
+    pub trusted: bool,
+    /// Selection metadata is never proof evidence.
+    pub proof_evidence: bool,
+    /// `modules` or `base`.
+    pub mode: String,
+    /// `targeted` or `full_escalated`.
+    pub outcome: String,
+    /// Bounded user-supplied base text for committed selection.
+    pub requested_base: Option<String>,
+    /// Resolved base commit object ID.
+    pub base_commit: Option<String>,
+    /// Resolved unique merge-base object ID.
+    pub merge_base: Option<String>,
+    /// Resolved `HEAD` commit object ID.
+    pub head_commit: Option<String>,
+    /// Number of changed protected candidate paths for committed selection.
+    pub changed_path_count: Option<u64>,
+    /// Strict seed-module detail counts.
+    pub seed_modules: PackageVerifySelectionDetailCounts,
+    /// Retained canonical seed module names.
+    pub seed_details: Vec<String>,
+    /// SHA-256 identity of the complete canonical seed list.
+    pub seed_identity: String,
+    /// Number of modules in the verifier's selected import closure, when available.
+    pub closure_module_count: Option<u64>,
+    /// Strict full-escalation detail counts.
+    pub escalation_reasons: PackageVerifySelectionDetailCounts,
+    /// Retained canonical escalation details.
+    pub escalation_details: Vec<String>,
+    /// SHA-256 identity of the complete canonical escalation detail list.
+    pub escalation_identity: String,
+    /// Whether either bounded detail list omitted entries.
+    pub detail_truncated: bool,
+    /// Whether any count overflowed its representation.
+    pub overflowed: bool,
+}
+
 /// Deterministic command result.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CommandResult {
@@ -1246,6 +1481,8 @@ pub struct CommandResult {
     pub artifacts: Vec<CommandArtifact>,
     /// Optional informational timing telemetry.
     pub timings: Option<Box<CommandTimings>>,
+    /// Optional untrusted certificate-verification selection summary.
+    pub verify_selection: Option<Box<PackageVerifySelectionSummary>>,
     /// Optional command-specific interface-proposal result payload.
     pub interface_proposals: Option<Box<InterfaceProposalCheckOutput>>,
     /// Optional command-specific interface-inventory result payload.
@@ -1264,6 +1501,7 @@ impl CommandResult {
             diagnostics: Vec::new(),
             artifacts: Vec::new(),
             timings: None,
+            verify_selection: None,
             interface_proposals: None,
             interface_inventory: None,
             interface_proposal_surface: None,
@@ -1283,6 +1521,7 @@ impl CommandResult {
             diagnostics,
             artifacts: Vec::new(),
             timings: None,
+            verify_selection: None,
             interface_proposals: None,
             interface_inventory: None,
             interface_proposal_surface: None,
@@ -1317,6 +1556,12 @@ impl CommandResult {
     /// Attach informational timing telemetry to the command result.
     pub fn with_timings(mut self, timings: CommandTimings) -> Self {
         self.timings = Some(Box::new(timings));
+        self
+    }
+
+    /// Attach a typed, untrusted certificate-verification selection summary.
+    pub fn with_verify_selection(mut self, summary: PackageVerifySelectionSummary) -> Self {
+        self.verify_selection = Some(Box::new(summary));
         self
     }
 
@@ -1381,6 +1626,10 @@ impl CommandResult {
             output.push_str(",\"timings\":");
             push_timings_json(&mut output, timings);
         }
+        if let Some(summary) = &self.verify_selection {
+            output.push_str(",\"verify_selection\":");
+            push_package_verify_selection_json(&mut output, summary);
+        }
         output.push('}');
         output
     }
@@ -1389,6 +1638,22 @@ impl CommandResult {
     pub fn render_human(&self) -> String {
         let mut lines = vec![format!("{}: {}", self.command, self.status.as_str())];
         lines.extend(self.diagnostics.iter().map(CommandDiagnostic::render_human));
+        if let Some(summary) = &self.verify_selection {
+            lines.push(format!(
+                "verify selection: mode={} outcome={} seeds={} closure_modules={} changed_paths={} trusted=false proof_evidence=false",
+                summary.mode,
+                summary.outcome,
+                summary.seed_modules.attempted,
+                summary
+                    .closure_module_count
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "null".to_owned()),
+                summary
+                    .changed_path_count
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "null".to_owned()),
+            ));
+        }
         if let Some(timings) = &self.timings {
             let summary = timings
                 .metrics
@@ -2001,6 +2266,114 @@ fn push_json_value(output: &mut String, value: &JsonValue<'_>) {
     }
 }
 
+fn push_package_verify_selection_json(
+    output: &mut String,
+    summary: &PackageVerifySelectionSummary,
+) {
+    output.push('{');
+    push_json_pair(output, "schema", &JsonValue::String(&summary.schema), true);
+    push_json_pair(output, "trusted", &JsonValue::Bool(summary.trusted), false);
+    push_json_pair(
+        output,
+        "proof_evidence",
+        &JsonValue::Bool(summary.proof_evidence),
+        false,
+    );
+    push_json_pair(output, "mode", &JsonValue::String(&summary.mode), false);
+    push_json_pair(
+        output,
+        "outcome",
+        &JsonValue::String(&summary.outcome),
+        false,
+    );
+    push_nullable_json_pair(output, "requested_base", summary.requested_base.as_deref());
+    push_nullable_json_pair(output, "base_commit", summary.base_commit.as_deref());
+    push_nullable_json_pair(output, "merge_base", summary.merge_base.as_deref());
+    push_nullable_json_pair(output, "head_commit", summary.head_commit.as_deref());
+    output.push_str(",\"changed_path_count\":");
+    push_optional_u64_json(output, summary.changed_path_count);
+    output.push_str(",\"seed_modules\":");
+    push_package_verify_detail_counts_json(output, summary.seed_modules);
+    output.push_str(",\"seed_details\":");
+    push_string_list_json(output, &summary.seed_details);
+    push_json_pair(
+        output,
+        "seed_identity",
+        &JsonValue::String(&summary.seed_identity),
+        false,
+    );
+    output.push_str(",\"closure_module_count\":");
+    push_optional_u64_json(output, summary.closure_module_count);
+    output.push_str(",\"escalation_reasons\":");
+    push_package_verify_detail_counts_json(output, summary.escalation_reasons);
+    output.push_str(",\"escalation_details\":");
+    push_string_list_json(output, &summary.escalation_details);
+    push_json_pair(
+        output,
+        "escalation_identity",
+        &JsonValue::String(&summary.escalation_identity),
+        false,
+    );
+    push_json_pair(
+        output,
+        "detail_truncated",
+        &JsonValue::Bool(summary.detail_truncated),
+        false,
+    );
+    push_json_pair(
+        output,
+        "overflowed",
+        &JsonValue::Bool(summary.overflowed),
+        false,
+    );
+    output.push('}');
+}
+
+fn push_package_verify_detail_counts_json(
+    output: &mut String,
+    counts: PackageVerifySelectionDetailCounts,
+) {
+    output.push('{');
+    push_json_pair(
+        output,
+        "attempted",
+        &JsonValue::U128(u128::from(counts.attempted)),
+        true,
+    );
+    push_json_pair(
+        output,
+        "retained",
+        &JsonValue::U128(u128::from(counts.retained)),
+        false,
+    );
+    push_json_pair(
+        output,
+        "omitted",
+        &JsonValue::U128(u128::from(counts.omitted)),
+        false,
+    );
+    output.push('}');
+}
+
+fn push_string_list_json(output: &mut String, values: &[String]) {
+    output.push('[');
+    for (index, value) in values.iter().enumerate() {
+        if index > 0 {
+            output.push(',');
+        }
+        push_json_string(output, value);
+    }
+    output.push(']');
+}
+
+fn push_optional_u64_json(output: &mut String, value: Option<u64>) {
+    if let Some(value) = value {
+        write!(output, "{value}").expect("write to String cannot fail");
+    } else {
+        output.push_str("null");
+    }
+}
+
 fn push_diagnostics_json(output: &mut String, diagnostics: &[CommandDiagnostic]) {
     output.push('[');
     for (index, diagnostic) in diagnostics.iter().enumerate() {
@@ -2042,6 +2415,10 @@ fn push_diagnostics_json(output: &mut String, diagnostics: &[CommandDiagnostic])
             output.push_str(",\"source\":");
             push_command_diagnostic_source_json(output, source);
         }
+        if let Some(delimiter) = &diagnostic.delimiter {
+            output.push_str(",\"delimiter\":");
+            push_command_diagnostic_delimiter_json(output, delimiter);
+        }
         if let Some(conversion) = &diagnostic.conversion {
             output.push_str(",\"conversion\":");
             push_command_diagnostic_conversion_json(output, conversion);
@@ -2053,6 +2430,31 @@ fn push_diagnostics_json(output: &mut String, diagnostics: &[CommandDiagnostic])
         output.push('}');
     }
     output.push(']');
+}
+
+fn push_command_diagnostic_delimiter_json(
+    output: &mut String,
+    delimiter: &CommandDiagnosticDelimiterContext,
+) {
+    output.push('{');
+    push_json_pair(output, "kind", &JsonValue::String(&delimiter.kind), true);
+    push_nullable_json_pair(
+        output,
+        "expected_closing",
+        delimiter.expected_closing.as_deref(),
+    );
+    push_nullable_json_pair(
+        output,
+        "actual_closing",
+        delimiter.actual_closing.as_deref(),
+    );
+    if let Some(opening) = &delimiter.opening_source {
+        output.push_str(",\"opening_source\":");
+        push_command_diagnostic_source_json(output, opening);
+    } else {
+        output.push_str(",\"opening_source\":null");
+    }
+    output.push('}');
 }
 
 fn push_command_diagnostic_conversion_json(
@@ -2096,27 +2498,6 @@ fn command_kernel_fuel_json_with_limit(
     diagnostic: &CommandKernelFuelDiagnostic,
     limit: usize,
 ) -> String {
-    let mut minimum = diagnostic.clone();
-    if let Some(summary) = minimum.retained_delta_constants.as_mut() {
-        if !summary.entries.is_empty() {
-            summary.entries.clear();
-            summary.emitted = 0;
-            summary.output_truncated = true;
-        }
-    }
-    if minimum.comparison_path.steps.len() > 2 {
-        let last = minimum.comparison_path.steps.pop().unwrap();
-        minimum.comparison_path.steps.truncate(1);
-        minimum.comparison_path.steps.push(last);
-        minimum.comparison_path.truncated = true;
-    }
-    let mut minimum_json = String::new();
-    push_command_kernel_fuel_json(&mut minimum_json, &minimum);
-    assert!(
-        minimum_json.len() <= limit,
-        "fixed kernel fuel diagnostic scalars and two path endpoints must fit the JSON limit"
-    );
-
     let mut bounded = diagnostic.clone();
     loop {
         let mut output = String::new();
@@ -2137,7 +2518,25 @@ fn command_kernel_fuel_json_with_limit(
             bounded.comparison_path.truncated = true;
             continue;
         }
-        unreachable!("preflight established that the pruned kernel fuel diagnostic fits");
+        if !bounded.comparison_path.steps.is_empty() {
+            bounded.comparison_path.steps.clear();
+            bounded.comparison_path.truncated = true;
+            continue;
+        }
+        if !bounded.subsystem.is_empty() {
+            bounded.subsystem.clear();
+            continue;
+        }
+        if !bounded.resource.is_empty() {
+            bounded.resource.clear();
+            continue;
+        }
+
+        // Production uses a 64-KiB limit, which always admits the fixed
+        // scalar-only payload. Keep this helper total for smaller test-only
+        // limits as well: returning the irreducible JSON is safer than
+        // panicking in a serializer.
+        return output;
     }
 }
 
@@ -2332,12 +2731,6 @@ fn push_command_kernel_work_json(output: &mut String, work: &CommandKernelWorkSn
         output,
         "iota_steps",
         &JsonValue::U128(u128::from(work.iota_steps)),
-        false,
-    );
-    push_json_pair(
-        output,
-        "zeta_steps",
-        &JsonValue::U128(u128::from(work.zeta_steps)),
         false,
     );
     push_json_pair(
@@ -2555,12 +2948,14 @@ mod tests {
     use super::{
         command_kernel_fuel_json, command_kernel_fuel_json_with_limit,
         push_command_kernel_fuel_json, CommandDiagnostic, CommandDiagnosticConversionContext,
-        CommandDiagnosticSourceContext, CommandKernelComparisonPath, CommandKernelDeclarationWork,
-        CommandKernelDeltaHotsetEntry, CommandKernelDeltaHotsetSummary,
-        CommandKernelFuelDiagnostic, CommandKernelFuelDomainTotals,
-        CommandKernelFuelOperationCounters, CommandKernelFuelTotals, CommandKernelOperationWork,
-        CommandKernelWorkSnapshot, CommandResult, CommandTimingMetric, CommandTimings,
-        DiagnosticKind, KERNEL_FUEL_DIAGNOSTIC_MAX_JSON_BYTES, PACKAGE_TIMINGS_SCHEMA_V0_2,
+        CommandDiagnosticDelimiterContext, CommandDiagnosticSourceContext,
+        CommandKernelComparisonPath, CommandKernelDeclarationWork, CommandKernelDeltaHotsetEntry,
+        CommandKernelDeltaHotsetSummary, CommandKernelFuelDiagnostic,
+        CommandKernelFuelDomainTotals, CommandKernelFuelOperationCounters, CommandKernelFuelTotals,
+        CommandKernelOperationWork, CommandKernelWorkSnapshot, CommandResult, CommandTimingMetric,
+        CommandTimings, DiagnosticKind, PackageVerifySelectionDetailCounts,
+        PackageVerifySelectionSummary, KERNEL_FUEL_DIAGNOSTIC_MAX_JSON_BYTES,
+        PACKAGE_TIMINGS_SCHEMA_V0_2, PACKAGE_VERIFY_SELECTION_SCHEMA,
     };
     use npa_api::{
         PerformanceMeasurementMode, PerformanceMeasurementRecorder, PerformanceModuleMeasurement,
@@ -2586,6 +2981,104 @@ mod tests {
     }
 
     #[test]
+    fn command_diagnostic_delimiter_context_rejects_unbounded_or_incoherent_values() {
+        assert!(CommandDiagnosticDelimiterContext::new("other\nkind").is_none());
+
+        let opening = CommandDiagnosticSourceContext::new("source.npa", 2, 3)
+            .unwrap()
+            .with_token("[");
+        let valid = CommandDiagnosticDelimiterContext::new("mismatched_closing_delimiter")
+            .unwrap()
+            .with_expected_closing("]")
+            .with_actual_closing(")")
+            .with_opening_source(opening.clone());
+        let diagnostic = CommandDiagnostic::error(
+            DiagnosticKind::SourceStructure,
+            "mismatched_closing_delimiter",
+        )
+        .with_delimiter(valid);
+        assert!(diagnostic.delimiter().is_some());
+        let result = CommandResult::failed("package check-source-structure", ".", vec![diagnostic]);
+        assert_eq!(
+            result.render_json(),
+            "{\"schema\":\"npa.package.command_result.v0.5\",\"command\":\"package check-source-structure\",\"root\":\".\",\"status\":\"failed\",\"diagnostics\":[{\"kind\":\"SourceStructure\",\"reason_code\":\"mismatched_closing_delimiter\",\"severity\":\"error\",\"delimiter\":{\"kind\":\"mismatched_closing_delimiter\",\"expected_closing\":\"]\",\"actual_closing\":\")\",\"opening_source\":{\"path\":\"source.npa\",\"start_byte\":2,\"end_byte\":3,\"token\":\"[\"}}}],\"artifacts\":[]}"
+        );
+        assert_eq!(
+            result.render_human(),
+            "package check-source-structure: failed\nerror SourceStructure mismatched_closing_delimiter delimiter=mismatched_closing_delimiter expected_closing=] actual_closing=) opening=source.npa:byte[2..3]"
+        );
+
+        let wrong_opening = CommandDiagnosticDelimiterContext::new("unclosed_delimiter")
+            .unwrap()
+            .with_expected_closing(")")
+            .with_opening_source(opening);
+        let diagnostic = CommandDiagnostic::error(DiagnosticKind::SourceStructure, "unclosed")
+            .with_delimiter(wrong_opening);
+        assert!(diagnostic.delimiter().is_none());
+
+        let exact_paren = CommandDiagnosticSourceContext::new("source.npa", 4, 5)
+            .unwrap()
+            .with_token("(");
+        for malformed in [
+            CommandDiagnosticDelimiterContext::new("unclosed_delimiter")
+                .unwrap()
+                .with_expected_closing(")")
+                .with_actual_closing("invalid\ncloser")
+                .with_opening_source(exact_paren),
+            CommandDiagnosticDelimiterContext::new("unexpected_closing_delimiter")
+                .unwrap()
+                .with_expected_closing("not-a-delimiter")
+                .with_actual_closing(")"),
+        ] {
+            let diagnostic = CommandDiagnostic::error(
+                DiagnosticKind::SourceStructure,
+                "malformed_delimiter_context",
+            )
+            .with_delimiter(malformed);
+            assert!(
+                diagnostic.delimiter().is_none(),
+                "unsupported delimiter tokens must fail closed"
+            );
+        }
+
+        let valid = CommandDiagnosticDelimiterContext::new("unexpected_closing_delimiter")
+            .unwrap()
+            .with_actual_closing(")");
+        let malformed = CommandDiagnosticDelimiterContext::new("unexpected_closing_delimiter")
+            .unwrap()
+            .with_actual_closing("invalid");
+        let diagnostic = CommandDiagnostic::error(
+            DiagnosticKind::SourceStructure,
+            "unexpected_closing_delimiter",
+        )
+        .with_delimiter(valid)
+        .with_delimiter(malformed);
+        assert!(
+            diagnostic.delimiter().is_none(),
+            "an invalid replacement must clear previously attached delimiter context"
+        );
+
+        for incomplete_opening in [
+            CommandDiagnosticSourceContext::new("source.npa", 2, 3).unwrap(),
+            CommandDiagnosticSourceContext::new("source.npa", 2, 4)
+                .unwrap()
+                .with_token("["),
+        ] {
+            let context = CommandDiagnosticDelimiterContext::new("unclosed_delimiter")
+                .unwrap()
+                .with_expected_closing("]")
+                .with_opening_source(incomplete_opening);
+            let diagnostic =
+                CommandDiagnostic::error(DiagnosticKind::SourceStructure, "unclosed_delimiter")
+                    .with_delimiter(context);
+            assert!(
+                diagnostic.delimiter().is_none(),
+                "an opener must expose the exact one-byte delimiter token"
+            );
+        }
+    }
+
+    #[test]
     fn command_diagnostic_source_context_unit_renderers_keep_exact_order() {
         let source = CommandDiagnosticSourceContext::new("Proofs/A/source.npa", 10, 11)
             .unwrap()
@@ -2608,12 +3101,32 @@ mod tests {
         let result = CommandResult::failed("package build-certs", ".", vec![diagnostic]);
         assert_eq!(
             result.render_json(),
-            "{\"schema\":\"npa.package.command_result.v0.4\",\"command\":\"package build-certs\",\"root\":\".\",\"status\":\"failed\",\"diagnostics\":[{\"kind\":\"Build\",\"reason_code\":\"build_failed\",\"severity\":\"error\",\"field\":\"elaborator\",\"actual_value\":\"failure\",\"source\":{\"path\":\"Proofs/A/source.npa\",\"start_byte\":10,\"end_byte\":11,\"declaration\":\"A.term\",\"line\":3,\"column\":5,\"token\":\"x\"},\"conversion\":{\"phase\":\"definitional_equality\",\"outcome\":\"not_defeq\",\"lhs_head\":\"application\",\"rhs_head\":\"constant:A.expected\",\"depth\":7}}],\"artifacts\":[]}"
+            "{\"schema\":\"npa.package.command_result.v0.5\",\"command\":\"package build-certs\",\"root\":\".\",\"status\":\"failed\",\"diagnostics\":[{\"kind\":\"Build\",\"reason_code\":\"build_failed\",\"severity\":\"error\",\"field\":\"elaborator\",\"actual_value\":\"failure\",\"source\":{\"path\":\"Proofs/A/source.npa\",\"start_byte\":10,\"end_byte\":11,\"declaration\":\"A.term\",\"line\":3,\"column\":5,\"token\":\"x\"},\"conversion\":{\"phase\":\"definitional_equality\",\"outcome\":\"not_defeq\",\"lhs_head\":\"application\",\"rhs_head\":\"constant:A.expected\",\"depth\":7}}],\"artifacts\":[]}"
         );
         assert_eq!(
             result.render_human(),
             "package build-certs: failed\nerror Build build_failed field=elaborator source=Proofs/A/source.npa:byte[10..11] line=3 column=5 declaration=A.term token=\"x\" conversion=phase:definitional_equality,outcome:not_defeq,lhs:application,rhs:constant:A.expected,depth:7 actual=failure"
         );
+    }
+
+    #[test]
+    fn command_diagnostic_conversion_context_rejects_retired_let_heads() {
+        assert!(CommandDiagnosticConversionContext::new(
+            "definitional_equality",
+            "not_defeq",
+            "let",
+            "unknown",
+            0,
+        )
+        .is_none());
+        assert!(CommandDiagnosticConversionContext::new(
+            "definitional_equality",
+            "not_defeq",
+            "unknown",
+            "let",
+            0,
+        )
+        .is_none());
     }
 
     #[test]
@@ -2635,13 +3148,13 @@ mod tests {
         assert_eq!(
             result.render_json(),
             format!(
-                "{{\"schema\":\"npa.package.command_result.v0.4\",\"command\":\"package build-certs\",\"root\":\".\",\"status\":\"failed\",\"diagnostics\":[{{\"kind\":\"Build\",\"reason_code\":\"build_failed\",\"severity\":\"error\",\"field\":\"kernel_handoff\",\"conversion\":{{\"phase\":\"definitional_equality\",\"outcome\":\"fuel_exhausted\",\"lhs_head\":\"application\",\"rhs_head\":\"constant:A.expected\",\"depth\":7}},\"kernel_fuel\":{}}}],\"artifacts\":[]}}",
+                "{{\"schema\":\"npa.package.command_result.v0.5\",\"command\":\"package build-certs\",\"root\":\".\",\"status\":\"failed\",\"diagnostics\":[{{\"kind\":\"Build\",\"reason_code\":\"build_failed\",\"severity\":\"error\",\"field\":\"kernel_handoff\",\"conversion\":{{\"phase\":\"definitional_equality\",\"outcome\":\"fuel_exhausted\",\"lhs_head\":\"application\",\"rhs_head\":\"constant:A.expected\",\"depth\":7}},\"kernel_fuel\":{}}}],\"artifacts\":[]}}",
                 expected_conversion_fuel_json("null")
             )
         );
         assert_eq!(
             result.render_human(),
-            "package build-certs: failed\nerror Build build_failed field=kernel_handoff conversion=phase:definitional_equality,outcome:fuel_exhausted,lhs:application,rhs:constant:A.expected,depth:7\nkernel fuel:\n  subsystem: fast_kernel\n  resource: conversion\n  failed operation: budget=5000000 spent=5000000 remaining=0\n  work: defeq_calls=4187 whnf_calls=9120 beta=64 delta=4821031 iota=0 zeta=7\n  declaration: conversion_spent=5000218 whnf_spent=18342 physical_reductions=4821171\n  path: app.argument > pi.body > whnf.left > app.function\n  path truncated: false\n  overflowed: false"
+            "package build-certs: failed\nerror Build build_failed field=kernel_handoff conversion=phase:definitional_equality,outcome:fuel_exhausted,lhs:application,rhs:constant:A.expected,depth:7\nkernel fuel:\n  subsystem: fast_kernel\n  resource: conversion\n  failed operation: budget=5000000 spent=5000000 remaining=0\n  work: defeq_calls=4187 whnf_calls=9120 beta=64 delta=4821031 iota=0\n  declaration: conversion_spent=5000218 whnf_spent=18342 physical_reductions=4821164\n  path: app.argument > pi.body > whnf.left > app.function\n  path truncated: false\n  overflowed: false"
         );
     }
 
@@ -2736,12 +3249,12 @@ mod tests {
         assert_eq!(
             result.render_json(),
             format!(
-                "{{\"schema\":\"npa.package.command_result.v0.4\",\"command\":\"package build-certs\",\"root\":\".\",\"status\":\"failed\",\"diagnostics\":[{{\"kind\":\"Build\",\"reason_code\":\"build_failed\",\"severity\":\"error\",\"field\":\"kernel_handoff\",\"kernel_fuel\":{expected_fuel}}}],\"artifacts\":[]}}"
+                "{{\"schema\":\"npa.package.command_result.v0.5\",\"command\":\"package build-certs\",\"root\":\".\",\"status\":\"failed\",\"diagnostics\":[{{\"kind\":\"Build\",\"reason_code\":\"build_failed\",\"severity\":\"error\",\"field\":\"kernel_handoff\",\"kernel_fuel\":{expected_fuel}}}],\"artifacts\":[]}}"
             )
         );
         assert_eq!(
             result.render_human(),
-            "package build-certs: failed\nerror Build build_failed field=kernel_handoff\nkernel fuel:\n  subsystem: fast_kernel\n  resource: whnf\n  failed operation: budget=5000000 spent=5000000 remaining=0\n  work: defeq_calls=4187 whnf_calls=9120 beta=64 delta=4821031 iota=0 zeta=7\n  declaration: conversion_spent=5000218 whnf_spent=18342 physical_reductions=4821171\n  path: <root>\n  path truncated: false\n  overflowed: false"
+            "package build-certs: failed\nerror Build build_failed field=kernel_handoff\nkernel fuel:\n  subsystem: fast_kernel\n  resource: whnf\n  failed operation: budget=5000000 spent=5000000 remaining=0\n  work: defeq_calls=4187 whnf_calls=9120 beta=64 delta=4821031 iota=0\n  declaration: conversion_spent=5000218 whnf_spent=18342 physical_reductions=4821164\n  path: <root>\n  path truncated: false\n  overflowed: false"
         );
     }
 
@@ -2767,8 +3280,7 @@ mod tests {
                     beta_steps: 6,
                     delta_steps: 7,
                     iota_steps: 8,
-                    zeta_steps: 9,
-                    physical_reductions: 30,
+                    physical_reductions: 21,
                     overflowed: false,
                 },
             },
@@ -2798,8 +3310,7 @@ mod tests {
                     beta_steps: 6,
                     delta_steps: 7,
                     iota_steps: 8,
-                    zeta_steps: 9,
-                    physical_reductions: 30,
+                    physical_reductions: 21,
                     overflowed: false,
                 },
                 overflowed: false,
@@ -2826,7 +3337,7 @@ mod tests {
         assert_eq!(projected.subsystem, frontend.subsystem);
         assert_eq!(projected.resource, frontend.resource);
         assert_eq!(projected.failed_operation.fuel.spent, 9);
-        assert_eq!(projected.failed_operation.work.physical_reductions, 30);
+        assert_eq!(projected.failed_operation.work.physical_reductions, 21);
         assert_eq!(projected.declaration.fuel.whnf.exhausted_operation_fuel, 9);
         assert_eq!(projected.declaration.fuel.conversion.calls, 0);
         assert!(projected.comparison_path.steps.is_empty());
@@ -2871,7 +3382,7 @@ mod tests {
         );
         assert_eq!(
             detailed.render_human(),
-            "kernel fuel:\n  subsystem: fast_kernel\n  resource: conversion\n  failed operation: budget=5000000 spent=5000000 remaining=0\n  work: defeq_calls=4187 whnf_calls=9120 beta=64 delta=4821031 iota=0 zeta=7\n  declaration: conversion_spent=5000218 whnf_spent=18342 physical_reductions=4821171\n  path: app.argument > pi.body > whnf.left > app.function\n  path truncated: false\n  overflowed: false\n  retained delta constants:\n    MyProject.Expr.eval: 3100421\n    MyProject.Residue.normalize: 1720679\n  retained names: 2/256; emitted: 2/16; unretained observations: 0;\n    overlong observations: 0; output truncated: false"
+            "kernel fuel:\n  subsystem: fast_kernel\n  resource: conversion\n  failed operation: budget=5000000 spent=5000000 remaining=0\n  work: defeq_calls=4187 whnf_calls=9120 beta=64 delta=4821031 iota=0\n  declaration: conversion_spent=5000218 whnf_spent=18342 physical_reductions=4821164\n  path: app.argument > pi.body > whnf.left > app.function\n  path truncated: false\n  overflowed: false\n  retained delta constants:\n    MyProject.Expr.eval: 3100421\n    MyProject.Residue.normalize: 1720679\n  retained names: 2/256; emitted: 2/16; unretained observations: 0;\n    overlong observations: 0; output truncated: false"
         );
 
         let empty_hotset = CommandKernelDeltaHotsetSummary {
@@ -2986,7 +3497,24 @@ mod tests {
     }
 
     #[test]
-    fn command_result_v0_4_omits_fuel_for_unrelated_and_incapable_commands() {
+    fn command_kernel_fuel_json_bounds_forged_public_strings_without_panicking() {
+        let oversized = "X".repeat(KERNEL_FUEL_DIAGNOSTIC_MAX_JSON_BYTES * 2);
+        let mut diagnostic = conversion_fuel_fixture(None);
+        diagnostic.subsystem = oversized.clone();
+        diagnostic.resource = oversized.clone();
+        diagnostic.comparison_path.steps = vec![oversized.clone(), oversized];
+
+        let json = command_kernel_fuel_json(&diagnostic);
+
+        assert!(json.len() <= KERNEL_FUEL_DIAGNOSTIC_MAX_JSON_BYTES);
+        assert!(json.contains("\"subsystem\":\"\""));
+        assert!(json.contains("\"resource\":\"\""));
+        assert!(json.contains("\"steps\":[]"));
+        assert!(json.contains("\"truncated\":true"));
+    }
+
+    #[test]
+    fn command_result_v0_5_omits_fuel_for_unrelated_and_incapable_commands() {
         let result = CommandResult::failed(
             "package build-certs",
             ".",
@@ -2997,12 +3525,63 @@ mod tests {
         );
         assert_eq!(
             result.render_json(),
-            "{\"schema\":\"npa.package.command_result.v0.4\",\"command\":\"package build-certs\",\"root\":\".\",\"status\":\"failed\",\"diagnostics\":[{\"kind\":\"Build\",\"reason_code\":\"build_failed\",\"severity\":\"error\"}],\"artifacts\":[]}"
+            "{\"schema\":\"npa.package.command_result.v0.5\",\"command\":\"package build-certs\",\"root\":\".\",\"status\":\"failed\",\"diagnostics\":[{\"kind\":\"Build\",\"reason_code\":\"build_failed\",\"severity\":\"error\"}],\"artifacts\":[]}"
         );
         let incapable = CommandResult::passed("package check-hashes", ".");
         assert_eq!(
             incapable.render_json(),
-            "{\"schema\":\"npa.package.command_result.v0.4\",\"command\":\"package check-hashes\",\"root\":\".\",\"status\":\"passed\",\"diagnostics\":[],\"artifacts\":[]}"
+            "{\"schema\":\"npa.package.command_result.v0.5\",\"command\":\"package check-hashes\",\"root\":\".\",\"status\":\"passed\",\"diagnostics\":[],\"artifacts\":[]}"
+        );
+    }
+
+    #[test]
+    fn command_result_verify_selection_renderers_are_byte_exact() {
+        let summary = PackageVerifySelectionSummary {
+            schema: PACKAGE_VERIFY_SELECTION_SCHEMA.to_owned(),
+            trusted: false,
+            proof_evidence: false,
+            mode: "base".to_owned(),
+            outcome: "full_escalated".to_owned(),
+            requested_base: Some("origin/main".to_owned()),
+            base_commit: Some("a".repeat(40)),
+            merge_base: Some("b".repeat(40)),
+            head_commit: Some("c".repeat(40)),
+            changed_path_count: Some(3),
+            seed_modules: PackageVerifySelectionDetailCounts {
+                attempted: 2,
+                retained: 2,
+                omitted: 0,
+            },
+            seed_details: vec!["Proofs.A".to_owned(), "Proofs.B".to_owned()],
+            seed_identity: format!("sha256:{}", "0".repeat(64)),
+            closure_module_count: Some(4),
+            escalation_reasons: PackageVerifySelectionDetailCounts {
+                attempted: 1,
+                retained: 1,
+                omitted: 0,
+            },
+            escalation_details: vec!["package_identity_changed:package".to_owned()],
+            escalation_identity: format!("sha256:{}", "f".repeat(64)),
+            detail_truncated: false,
+            overflowed: false,
+        };
+        let result =
+            CommandResult::passed("package verify-certs", "proofs").with_verify_selection(summary);
+
+        assert_eq!(
+            result.render_json(),
+            format!(
+                "{{\"schema\":\"npa.package.command_result.v0.5\",\"command\":\"package verify-certs\",\"root\":\"proofs\",\"status\":\"passed\",\"diagnostics\":[],\"artifacts\":[],\"verify_selection\":{{\"schema\":\"npa.package.verify-selection.v0.1\",\"trusted\":false,\"proof_evidence\":false,\"mode\":\"base\",\"outcome\":\"full_escalated\",\"requested_base\":\"origin/main\",\"base_commit\":\"{}\",\"merge_base\":\"{}\",\"head_commit\":\"{}\",\"changed_path_count\":3,\"seed_modules\":{{\"attempted\":2,\"retained\":2,\"omitted\":0}},\"seed_details\":[\"Proofs.A\",\"Proofs.B\"],\"seed_identity\":\"sha256:{}\",\"closure_module_count\":4,\"escalation_reasons\":{{\"attempted\":1,\"retained\":1,\"omitted\":0}},\"escalation_details\":[\"package_identity_changed:package\"],\"escalation_identity\":\"sha256:{}\",\"detail_truncated\":false,\"overflowed\":false}}}}",
+                "a".repeat(40),
+                "b".repeat(40),
+                "c".repeat(40),
+                "0".repeat(64),
+                "f".repeat(64),
+            )
+        );
+        assert_eq!(
+            result.render_human(),
+            "package verify-certs: passed\nverify selection: mode=base outcome=full_escalated seeds=2 closure_modules=4 changed_paths=3 trusted=false proof_evidence=false"
         );
     }
 
@@ -3066,8 +3645,7 @@ mod tests {
                     beta_steps: 64,
                     delta_steps: 4_821_031,
                     iota_steps: 0,
-                    zeta_steps: 7,
-                    physical_reductions: 4_821_102,
+                    physical_reductions: 4_821_095,
                     overflowed: false,
                 },
             },
@@ -3097,8 +3675,7 @@ mod tests {
                     beta_steps: 64,
                     delta_steps: 4_821_100,
                     iota_steps: 0,
-                    zeta_steps: 7,
-                    physical_reductions: 4_821_171,
+                    physical_reductions: 4_821_164,
                     overflowed: false,
                 },
                 overflowed: false,
@@ -3138,7 +3715,6 @@ mod tests {
                     beta_steps: 0,
                     delta_steps: 1,
                     iota_steps: 0,
-                    zeta_steps: 0,
                     physical_reductions: 1,
                     overflowed: false,
                 },
@@ -3169,7 +3745,6 @@ mod tests {
                     beta_steps: 0,
                     delta_steps: 3,
                     iota_steps: 0,
-                    zeta_steps: 0,
                     physical_reductions: 3,
                     overflowed: false,
                 },
@@ -3186,13 +3761,13 @@ mod tests {
 
     fn expected_conversion_fuel_json(retained_delta_constants: &str) -> String {
         concat!(
-            "{\"schema\":\"npa.kernel-fuel-diagnostic.v0.1\",\"trusted\":false,\"proof_evidence\":false,",
+            "{\"schema\":\"npa.kernel-fuel-diagnostic.v0.2\",\"trusted\":false,\"proof_evidence\":false,",
             "\"subsystem\":\"fast_kernel\",\"resource\":\"conversion\",",
             "\"failed_operation\":{\"fuel\":{\"budget\":5000000,\"spent\":5000000,\"remaining\":0,\"exhausted\":true,\"overflowed\":false},",
-            "\"work\":{\"check_calls\":0,\"infer_calls\":0,\"whnf_calls\":9120,\"defeq_calls\":4187,\"quick_equality_hits\":203,\"beta_steps\":64,\"delta_steps\":4821031,\"iota_steps\":0,\"zeta_steps\":7,\"physical_reductions\":4821102,\"overflowed\":false}},",
+            "\"work\":{\"check_calls\":0,\"infer_calls\":0,\"whnf_calls\":9120,\"defeq_calls\":4187,\"quick_equality_hits\":203,\"beta_steps\":64,\"delta_steps\":4821031,\"iota_steps\":0,\"physical_reductions\":4821095,\"overflowed\":false}},",
             "\"declaration\":{\"fuel\":{\"whnf\":{\"calls\":114,\"logical_spent\":18342,\"successful_operation_fuel\":18342,\"exhausted_operation_fuel\":0,\"overflowed\":false},",
             "\"conversion\":{\"calls\":27,\"logical_spent\":5000218,\"successful_operation_fuel\":218,\"exhausted_operation_fuel\":5000000,\"overflowed\":false}},",
-            "\"work\":{\"check_calls\":1,\"infer_calls\":12,\"whnf_calls\":9234,\"defeq_calls\":4214,\"quick_equality_hits\":210,\"beta_steps\":64,\"delta_steps\":4821100,\"iota_steps\":0,\"zeta_steps\":7,\"physical_reductions\":4821171,\"overflowed\":false},\"overflowed\":false},",
+            "\"work\":{\"check_calls\":1,\"infer_calls\":12,\"whnf_calls\":9234,\"defeq_calls\":4214,\"quick_equality_hits\":210,\"beta_steps\":64,\"delta_steps\":4821100,\"iota_steps\":0,\"physical_reductions\":4821164,\"overflowed\":false},\"overflowed\":false},",
             "\"comparison_path\":{\"steps\":[\"app_argument\",\"pi_body\",\"whnf_left\",\"app_function\"],\"truncated\":false},",
             "\"retained_delta_constants\":$HOTSET$,\"overflowed\":false}"
         )

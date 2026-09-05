@@ -89,7 +89,7 @@ fn package_check_hashes_succeeds_on_proof_corpus_fixture_json() {
     assert!(output.stderr.is_empty());
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
-        "{\"schema\":\"npa.package.command_result.v0.4\",\"command\":\"package check-hashes\",\"root\":\"testdata/package/proofs\",\"status\":\"passed\",\"diagnostics\":[],\"artifacts\":[]}\n"
+        "{\"schema\":\"npa.package.command_result.v0.5\",\"command\":\"package check-hashes\",\"root\":\"testdata/package/proofs\",\"status\":\"passed\",\"diagnostics\":[],\"artifacts\":[]}\n"
     );
 }
 
@@ -447,14 +447,18 @@ fn replace_manifest_hash(
 }
 
 fn tamper_certificate_hash(path: PathBuf) {
-    let mut cert = npa_cert::decode_module_cert(&fs::read(&path).unwrap()).unwrap();
-    cert.hashes.certificate_hash[0] ^= 0x01;
+    let cert = npa_cert::decode_module_cert(&fs::read(&path).unwrap()).unwrap();
+    let mut parts = cert.into_parts();
+    parts.hashes.certificate_hash[0] ^= 0x01;
+    let cert = npa_cert::ModuleCert::from_parts(parts);
     fs::write(path, npa_cert::encode_module_cert(&cert).unwrap()).unwrap();
 }
 
 fn tamper_first_import_export_hash(path: &Path) {
-    let mut cert = npa_cert::decode_module_cert(&fs::read(path).unwrap()).unwrap();
-    cert.imports[0].export_hash[0] ^= 0x01;
+    let cert = npa_cert::decode_module_cert(&fs::read(path).unwrap()).unwrap();
+    let mut parts = cert.into_parts();
+    parts.imports[0].export_hash[0] ^= 0x01;
+    let cert = npa_cert::ModuleCert::from_parts(parts);
     fs::write(path, npa_cert::encode_module_cert(&cert).unwrap()).unwrap();
 }
 

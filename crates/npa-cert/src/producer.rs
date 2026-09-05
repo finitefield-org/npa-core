@@ -1,14 +1,17 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use npa_kernel::{Ctx, Decl, Env, Error, Expr, Level, Reducibility};
+use npa_kernel::{
+    Ctx, Decl, Env, Error, Expr, InductiveDecl, Level, Reducibility, UniverseConstraint,
+};
 use sha2::{Digest, Sha256};
 
 use crate::{
     encode_axiom_refs_to, encode_name_to, encode_uvar_to, hash_with_domain, union_axioms, AxiomRef,
-    CertError, CertificateFormatVersion, CoreModule, DeclHashes, DependencyEntry,
-    DependencyEntryKind, ExportEntry, Hash, ModuleCert, ModuleName, ProducerLimitKind,
-    ProducerTokenHashField, VerifiedModule,
+    CertError, CertificateFormatVersion, CertificatePayloadObservation, CoreModule, DeclHashes,
+    DependencyEntry, DependencyEntryKind, ExportEntry, Hash, ModuleCert, ModuleName,
+    ProducerLimitKind, ProducerTokenHashField, StructuralLimitKind, VerifiedModule,
+    MAX_CERTIFICATE_BYTES, MAX_NESTED_VECTOR_ENTRIES, MAX_STRUCTURAL_DEPTH,
 };
 
 /// Sidecar-only producer classification for audit and diagnostics.
@@ -482,7 +485,7 @@ pub fn post_env_fingerprint(
 pub fn validate_prior_current_decls(
     batch: &CandidateBatch<'_>,
 ) -> Result<Vec<ProducerCheckedDeclInterface>, CertError> {
-    let version = producer_token_chain_version(batch.prior_current_decls);
+    let version = CertificateFormatVersion::V0_4_0;
     Ok(validate_checked_decl_chain(
         batch.imports,
         batch.prior_current_decls,
@@ -505,17 +508,26 @@ pub fn build_module_cert_from_checked_candidates(
     imports: &[VerifiedModule],
     checked_decls: &[CheckedDeclCandidate],
 ) -> Result<ModuleCert, CertError> {
-    let version = producer_token_chain_version(checked_decls);
+    build_module_cert_from_checked_candidates_observed(module_name, imports, checked_decls, None)
+}
+
+/// Build from checked producer tokens and optionally observe the frozen certificate payload.
+///
+/// Token validation, selected certificate format, canonical bytes, and errors are identical to
+/// [`build_module_cert_from_checked_candidates`]. The meter changes only after a successful build.
+pub fn build_module_cert_from_checked_candidates_observed(
+    module_name: ModuleName,
+    imports: &[VerifiedModule],
+    checked_decls: &[CheckedDeclCandidate],
+    observation: Option<&mut CertificatePayloadObservation>,
+) -> Result<ModuleCert, CertError> {
+    let version = CertificateFormatVersion::V0_4_0;
     let chain = validate_checked_decl_chain(imports, checked_decls, None, version, None)?;
     let module = CoreModule {
         name: module_name,
         declarations: chain.declarations,
     };
-    if chain.version == CertificateFormatVersion::V0_3_0 {
-        crate::build_module_cert(module, imports)
-    } else {
-        crate::build_module_cert_v0_2_compat(module, imports)
-    }
+    crate::build_module_cert_observed(module, imports, observation)
 }
 
 /// Precheck a single producer candidate against an existing kernel environment under limits.
@@ -573,19 +585,7 @@ fn check_core_decl_candidates_impl(
 ) -> Result<CandidateBatchResult, CertError> {
     ensure_candidate_batch_schema(&batch)?;
     let direct_imports = validate_candidate_batch_imports(&batch)?;
-    let version = if producer_token_chain_version(batch.prior_current_decls)
-        == CertificateFormatVersion::V0_3_0
-        || producer_chain_version(
-            batch
-                .candidates
-                .iter()
-                .map(|candidate| &candidate.declaration),
-        ) == CertificateFormatVersion::V0_3_0
-    {
-        CertificateFormatVersion::V0_3_0
-    } else {
-        CertificateFormatVersion::V0_2_0
-    };
+    let version = CertificateFormatVersion::V0_4_0;
     let validated = validate_checked_decl_chain(
         batch.imports,
         batch.prior_current_decls,
@@ -949,7 +949,6 @@ struct ValidatedTokenChain {
     declarations: Vec<Decl>,
     tokens: Vec<CheckedDeclCandidate>,
     prior_chain_entries: Vec<ProducerPriorChainEntry>,
-    version: CertificateFormatVersion,
 }
 
 fn check_candidate_in_batch(
@@ -957,9 +956,8 @@ fn check_candidate_in_batch(
     candidate: &CoreDeclCandidate,
     mut measurement: Option<&mut ProducerBatchMeasurement>,
 ) -> Result<AcceptedCandidate, CertError> {
+    ensure_candidate_schema_limits(&candidate.declaration, &context.limits)?;
     let declaration = candidate.declaration.clone();
-    ensure_no_unresolved_metavariable(&declaration)?;
-    ensure_candidate_schema_limits(&declaration, &context.limits)?;
 
     let resolved = resolve_core_decl_candidate(
         &context.lookup_env,
@@ -1065,15 +1063,11 @@ fn resolve_core_decl_candidate(
 ) -> Result<ResolvedCoreDeclCandidate, CertError> {
     // This is the producer boundary where name-based kernel declarations become hash-bound
     // certificate references for dependency and private token hashes.
-    let local_implementation_dependencies = if version == CertificateFormatVersion::V0_3_0 {
-        producer_local_implementation_dependencies(
-            declaration,
-            checked_decl_sources,
-            prior_chain_entries,
-        )?
-    } else {
-        Vec::new()
-    };
+    let local_implementation_dependencies = producer_local_implementation_dependencies(
+        declaration,
+        checked_decl_sources,
+        prior_chain_entries,
+    )?;
     let resolved = crate::canonical_producer_checked_decl_for_version(
         declaration,
         lookup_env,
@@ -1085,31 +1079,6 @@ fn resolve_core_decl_candidate(
         hashes: resolved.hashes,
         dependencies: resolved.dependencies,
     })
-}
-
-fn producer_chain_version<'a>(
-    declarations: impl IntoIterator<Item = &'a Decl>,
-) -> CertificateFormatVersion {
-    if declarations.into_iter().next().is_some() {
-        CertificateFormatVersion::V0_3_0
-    } else {
-        CertificateFormatVersion::V0_2_0
-    }
-}
-
-fn producer_token_chain_version(tokens: &[CheckedDeclCandidate]) -> CertificateFormatVersion {
-    if tokens.is_empty()
-        || tokens
-            .iter()
-            .any(|token| token.version == CertificateFormatVersion::V0_3_0)
-        || tokens
-            .iter()
-            .any(|token| is_opaque_definition(&token.declaration))
-    {
-        CertificateFormatVersion::V0_3_0
-    } else {
-        CertificateFormatVersion::V0_2_0
-    }
 }
 
 fn is_opaque_definition(declaration: &Decl) -> bool {
@@ -1305,17 +1274,6 @@ fn validate_checked_decl_chain(
         if reusable_limits.is_some_and(|limits| !token.limits_are_reusable_under(limits)) {
             return Err(CertError::ProducerTokenLimitTooLoose { token_index });
         }
-        if token.version != CertificateFormatVersion::V0_3_0
-            && !token.local_implementation_dependencies.is_empty()
-        {
-            return Err(CertError::ProducerTokenHashMismatch {
-                token_index,
-                field: ProducerTokenHashField::DependencyFingerprint,
-                expected: producer_dependency_selective_fingerprint(&[]),
-                actual: token.dependency_fingerprint,
-            });
-        }
-
         let lookup_env = producer_lookup_env_for_sources(imports, &checked_decls, &declarations)?;
         let resolved = resolve_core_decl_candidate(
             &lookup_env,
@@ -1456,7 +1414,6 @@ fn validate_checked_decl_chain(
         declarations,
         tokens: rebound_tokens,
         prior_chain_entries,
-        version,
     })
 }
 
@@ -1632,100 +1589,6 @@ fn import_export_names(imports: &[VerifiedModule]) -> Result<BTreeSet<ModuleName
     Ok(names)
 }
 
-fn ensure_no_unresolved_metavariable(decl: &Decl) -> Result<(), CertError> {
-    if decl_contains_unresolved_metavariable(decl) {
-        Err(CertError::UnresolvedMetavariable)
-    } else {
-        Ok(())
-    }
-}
-
-fn decl_contains_unresolved_metavariable(decl: &Decl) -> bool {
-    match decl {
-        Decl::MutualInductiveBlock { data, .. } => data.inductives.iter().any(|inductive| {
-            inductive
-                .params
-                .iter()
-                .any(|binder| expr_contains_unresolved_metavariable(&binder.ty))
-                || inductive
-                    .indices
-                    .iter()
-                    .any(|binder| expr_contains_unresolved_metavariable(&binder.ty))
-                || inductive
-                    .constructors
-                    .iter()
-                    .any(|constructor| expr_contains_unresolved_metavariable(&constructor.ty))
-                || inductive
-                    .recursor
-                    .iter()
-                    .any(|recursor| expr_contains_unresolved_metavariable(&recursor.ty))
-        }),
-        _ => {
-            expr_contains_unresolved_metavariable(decl.ty())
-                || match decl {
-                    Decl::Def { value, .. } | Decl::DefConstrained { value, .. } => {
-                        expr_contains_unresolved_metavariable(value)
-                    }
-                    Decl::Theorem { proof, .. } | Decl::TheoremConstrained { proof, .. } => {
-                        expr_contains_unresolved_metavariable(proof)
-                    }
-                    Decl::Inductive { data, .. } => {
-                        data.params
-                            .iter()
-                            .any(|binder| expr_contains_unresolved_metavariable(&binder.ty))
-                            || data
-                                .indices
-                                .iter()
-                                .any(|binder| expr_contains_unresolved_metavariable(&binder.ty))
-                            || data.constructors.iter().any(|constructor| {
-                                expr_contains_unresolved_metavariable(&constructor.ty)
-                            })
-                            || data
-                                .recursor
-                                .iter()
-                                .any(|recursor| expr_contains_unresolved_metavariable(&recursor.ty))
-                    }
-                    Decl::Axiom { .. }
-                    | Decl::AxiomConstrained { .. }
-                    | Decl::Constructor { .. }
-                    | Decl::Recursor { .. }
-                    | Decl::MutualInductiveBlock { .. } => false,
-                }
-        }
-    }
-}
-
-fn expr_contains_unresolved_metavariable(expr: &Expr) -> bool {
-    match expr {
-        Expr::Sort(level) => level_contains_unresolved_metavariable(level),
-        Expr::BVar(_) | Expr::Const { .. } => false,
-        Expr::App(fun, arg) => {
-            expr_contains_unresolved_metavariable(fun) || expr_contains_unresolved_metavariable(arg)
-        }
-        Expr::Lam { ty, body, .. } | Expr::Pi { ty, body, .. } => {
-            expr_contains_unresolved_metavariable(ty) || expr_contains_unresolved_metavariable(body)
-        }
-        Expr::Let {
-            ty, value, body, ..
-        } => {
-            expr_contains_unresolved_metavariable(ty)
-                || expr_contains_unresolved_metavariable(value)
-                || expr_contains_unresolved_metavariable(body)
-        }
-    }
-}
-
-fn level_contains_unresolved_metavariable(level: &Level) -> bool {
-    match level {
-        Level::Zero | Level::Param(_) => false,
-        Level::Succ(level) => level_contains_unresolved_metavariable(level),
-        Level::Max(lhs, rhs) | Level::IMax(lhs, rhs) => {
-            level_contains_unresolved_metavariable(lhs)
-                || level_contains_unresolved_metavariable(rhs)
-        }
-    }
-}
-
 fn collect_const_names_from_decl(names: &mut BTreeSet<ModuleName>, decl: &Decl) {
     if !matches!(decl, Decl::MutualInductiveBlock { .. }) {
         collect_const_names_from_expr(names, decl.ty());
@@ -1775,25 +1638,21 @@ fn collect_const_names_from_decl(names: &mut BTreeSet<ModuleName>, decl: &Decl) 
 }
 
 fn collect_const_names_from_expr(names: &mut BTreeSet<ModuleName>, expr: &Expr) {
-    match expr {
-        Expr::Sort(_) | Expr::BVar(_) => {}
-        Expr::Const { name, .. } => {
-            names.insert(crate::Name::from_dotted(name));
-        }
-        Expr::App(fun, arg) => {
-            collect_const_names_from_expr(names, fun);
-            collect_const_names_from_expr(names, arg);
-        }
-        Expr::Lam { ty, body, .. } | Expr::Pi { ty, body, .. } => {
-            collect_const_names_from_expr(names, ty);
-            collect_const_names_from_expr(names, body);
-        }
-        Expr::Let {
-            ty, value, body, ..
-        } => {
-            collect_const_names_from_expr(names, ty);
-            collect_const_names_from_expr(names, value);
-            collect_const_names_from_expr(names, body);
+    let mut pending = vec![expr];
+    while let Some(expr) = pending.pop() {
+        match expr {
+            Expr::Sort(_) | Expr::BVar(_) => {}
+            Expr::Const { name, .. } => {
+                names.insert(crate::Name::from_dotted(name));
+            }
+            Expr::App(fun, arg) => {
+                pending.push(arg);
+                pending.push(fun);
+            }
+            Expr::Lam { ty, body, .. } | Expr::Pi { ty, body, .. } => {
+                pending.push(body);
+                pending.push(ty);
+            }
         }
     }
 }
@@ -1806,34 +1665,264 @@ fn verified_import_order_key(import: &VerifiedModule) -> (ModuleName, Hash, Opti
     )
 }
 
+struct CandidateSchemaAudit<'a> {
+    limits: &'a ProducerLimits,
+    expr_nodes: usize,
+    level_nodes: usize,
+    nested_entries: usize,
+    name_bytes: usize,
+}
+
+impl<'a> CandidateSchemaAudit<'a> {
+    fn new(limits: &'a ProducerLimits) -> Self {
+        Self {
+            limits,
+            expr_nodes: 0,
+            level_nodes: 0,
+            nested_entries: 0,
+            name_bytes: 0,
+        }
+    }
+
+    fn audit_decl(&mut self, decl: &Decl) -> Result<(), CertError> {
+        self.audit_name(decl.name())?;
+        self.audit_universe_params(decl.universe_params())?;
+        match decl {
+            Decl::Axiom { ty, .. } | Decl::AxiomConstrained { ty, .. } => {
+                self.audit_constraints(decl.universe_constraints())?;
+                self.audit_expr(ty)
+            }
+            Decl::Def { ty, value, .. } | Decl::DefConstrained { ty, value, .. } => {
+                self.audit_constraints(decl.universe_constraints())?;
+                self.audit_expr(ty)?;
+                self.audit_expr(value)
+            }
+            Decl::Theorem { ty, proof, .. } | Decl::TheoremConstrained { ty, proof, .. } => {
+                self.audit_constraints(decl.universe_constraints())?;
+                self.audit_expr(ty)?;
+                self.audit_expr(proof)
+            }
+            Decl::Inductive { ty, data, .. } => {
+                self.audit_expr(ty)?;
+                self.audit_inductive(data)
+            }
+            Decl::Constructor { ty, inductive, .. } | Decl::Recursor { ty, inductive, .. } => {
+                self.audit_name(inductive)?;
+                self.audit_expr(ty)
+            }
+            Decl::MutualInductiveBlock { data, .. } => {
+                self.audit_name(&data.name)?;
+                self.audit_universe_params(&data.universe_params)?;
+                self.charge_nested_entries(data.inductives.len())?;
+                self.audit_constraints(&data.universe_constraints)?;
+                for inductive in &data.inductives {
+                    self.audit_inductive(inductive)?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn audit_inductive(&mut self, data: &InductiveDecl) -> Result<(), CertError> {
+        self.audit_name(&data.name)?;
+        self.audit_universe_params(&data.universe_params)?;
+        self.audit_constraints(&data.universe_constraints)?;
+        self.charge_nested_entries(data.params.len())?;
+        self.charge_nested_entries(data.indices.len())?;
+        self.charge_nested_entries(data.constructors.len())?;
+        self.audit_level(&data.sort, 1)?;
+        for binder in &data.params {
+            self.audit_name(&binder.name)?;
+            self.audit_expr(&binder.ty)?;
+        }
+        for binder in &data.indices {
+            self.audit_name(&binder.name)?;
+            self.audit_expr(&binder.ty)?;
+        }
+        for constructor in &data.constructors {
+            self.audit_name(&constructor.name)?;
+            self.audit_expr(&constructor.ty)?;
+        }
+        if let Some(recursor) = &data.recursor {
+            self.audit_name(&recursor.name)?;
+            self.audit_universe_params(&recursor.universe_params)?;
+            self.audit_expr(&recursor.ty)?;
+        }
+        Ok(())
+    }
+
+    fn audit_constraints(&mut self, constraints: &[UniverseConstraint]) -> Result<(), CertError> {
+        self.charge_nested_entries(constraints.len())?;
+        for constraint in constraints {
+            self.audit_level(&constraint.lhs, 1)?;
+            self.audit_level(&constraint.rhs, 1)?;
+        }
+        Ok(())
+    }
+
+    fn audit_universe_params(&mut self, params: &[String]) -> Result<(), CertError> {
+        self.charge_nested_entries(params.len())?;
+        for param in params {
+            self.audit_name(param)?;
+            if is_unresolved_universe_meta_param(param) {
+                return Err(CertError::UnresolvedMetavariable);
+            }
+        }
+        Ok(())
+    }
+
+    fn audit_expr(&mut self, root: &Expr) -> Result<(), CertError> {
+        let mut pending = vec![(root, 1usize)];
+        while let Some((expr, depth)) = pending.pop() {
+            self.check_depth(depth)?;
+            self.expr_nodes =
+                self.expr_nodes
+                    .checked_add(1)
+                    .ok_or(CertError::ProducerLimitExceeded {
+                        limit: ProducerLimitKind::MaxExprNodes,
+                    })?;
+            if self.expr_nodes > self.limits.max_expr_nodes as usize {
+                return Err(CertError::ProducerLimitExceeded {
+                    limit: ProducerLimitKind::MaxExprNodes,
+                });
+            }
+            let child_depth = depth.saturating_add(1);
+            match expr {
+                Expr::Sort(level) => self.audit_level(level, child_depth)?,
+                Expr::BVar(_) => {}
+                Expr::Const { name, levels } => {
+                    self.audit_name(name)?;
+                    self.charge_nested_entries(levels.len())?;
+                    for level in levels {
+                        self.audit_level(level, child_depth)?;
+                    }
+                }
+                Expr::App(fun, arg) => {
+                    pending.push((arg.as_ref(), child_depth));
+                    pending.push((fun.as_ref(), child_depth));
+                }
+                Expr::Lam {
+                    binder, ty, body, ..
+                }
+                | Expr::Pi {
+                    binder, ty, body, ..
+                } => {
+                    self.audit_name(binder)?;
+                    pending.push((body.as_ref(), child_depth));
+                    pending.push((ty.as_ref(), child_depth));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn audit_level(&mut self, root: &Level, root_depth: usize) -> Result<(), CertError> {
+        let mut pending = vec![(root, root_depth)];
+        while let Some((level, depth)) = pending.pop() {
+            self.check_depth(depth)?;
+            self.level_nodes =
+                self.level_nodes
+                    .checked_add(1)
+                    .ok_or(CertError::ProducerLimitExceeded {
+                        limit: ProducerLimitKind::MaxLevelNodes,
+                    })?;
+            if self.level_nodes > self.limits.max_level_nodes as usize {
+                return Err(CertError::ProducerLimitExceeded {
+                    limit: ProducerLimitKind::MaxLevelNodes,
+                });
+            }
+            let child_depth = depth.saturating_add(1);
+            match level {
+                Level::Zero => {}
+                Level::Param(name) => {
+                    self.audit_name(name)?;
+                    if is_unresolved_universe_meta_param(name) {
+                        return Err(CertError::UnresolvedMetavariable);
+                    }
+                }
+                Level::Succ(inner) => pending.push((inner.as_ref(), child_depth)),
+                Level::Max(lhs, rhs) | Level::IMax(lhs, rhs) => {
+                    pending.push((rhs.as_ref(), child_depth));
+                    pending.push((lhs.as_ref(), child_depth));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn audit_name(&mut self, name: &str) -> Result<(), CertError> {
+        self.name_bytes =
+            self.name_bytes
+                .checked_add(name.len())
+                .ok_or(CertError::StructuralLimitExceeded {
+                    kind: StructuralLimitKind::CertificateBytes,
+                    limit: MAX_CERTIFICATE_BYTES,
+                    observed: MAX_CERTIFICATE_BYTES + 1,
+                })?;
+        if self.name_bytes > MAX_CERTIFICATE_BYTES {
+            return Err(CertError::StructuralLimitExceeded {
+                kind: StructuralLimitKind::CertificateBytes,
+                limit: MAX_CERTIFICATE_BYTES,
+                observed: MAX_CERTIFICATE_BYTES + 1,
+            });
+        }
+        let components = name
+            .as_bytes()
+            .iter()
+            .filter(|byte| **byte == b'.')
+            .count()
+            .saturating_add(1);
+        if components > self.limits.max_name_components as usize {
+            return Err(CertError::ProducerLimitExceeded {
+                limit: ProducerLimitKind::MaxNameComponents,
+            });
+        }
+        Ok(())
+    }
+
+    fn charge_nested_entries(&mut self, count: usize) -> Result<(), CertError> {
+        self.nested_entries =
+            self.nested_entries
+                .checked_add(count)
+                .ok_or(CertError::StructuralLimitExceeded {
+                    kind: StructuralLimitKind::NestedVectorEntries,
+                    limit: MAX_NESTED_VECTOR_ENTRIES,
+                    observed: MAX_NESTED_VECTOR_ENTRIES + 1,
+                })?;
+        if self.nested_entries > MAX_NESTED_VECTOR_ENTRIES {
+            return Err(CertError::StructuralLimitExceeded {
+                kind: StructuralLimitKind::NestedVectorEntries,
+                limit: MAX_NESTED_VECTOR_ENTRIES,
+                observed: MAX_NESTED_VECTOR_ENTRIES + 1,
+            });
+        }
+        Ok(())
+    }
+
+    fn check_depth(&self, depth: usize) -> Result<(), CertError> {
+        if depth > MAX_STRUCTURAL_DEPTH {
+            Err(CertError::StructuralLimitExceeded {
+                kind: StructuralLimitKind::StructuralDepth,
+                limit: MAX_STRUCTURAL_DEPTH,
+                observed: MAX_STRUCTURAL_DEPTH + 1,
+            })
+        } else {
+            Ok(())
+        }
+    }
+}
+
+fn is_unresolved_universe_meta_param(param: &str) -> bool {
+    param.starts_with("__npa_internal_human_universe_meta#") || param.contains('?')
+}
+
 fn ensure_candidate_schema_limits(decl: &Decl, limits: &ProducerLimits) -> Result<(), CertError> {
     if limits.max_declarations == 0 {
         return Err(CertError::ProducerLimitExceeded {
             limit: ProducerLimitKind::MaxDeclarations,
         });
     }
-
-    let expr_nodes = decl_expr_node_count(decl);
-    if expr_nodes > limits.max_expr_nodes as u64 {
-        return Err(CertError::ProducerLimitExceeded {
-            limit: ProducerLimitKind::MaxExprNodes,
-        });
-    }
-
-    let level_nodes = decl_level_node_count(decl);
-    if level_nodes > limits.max_level_nodes as u64 {
-        return Err(CertError::ProducerLimitExceeded {
-            limit: ProducerLimitKind::MaxLevelNodes,
-        });
-    }
-
-    if decl_max_name_components(decl) > limits.max_name_components as u64 {
-        return Err(CertError::ProducerLimitExceeded {
-            limit: ProducerLimitKind::MaxNameComponents,
-        });
-    }
-
-    Ok(())
+    CandidateSchemaAudit::new(limits).audit_decl(decl)
 }
 
 fn precheck_decl_with_fuel(
@@ -1957,6 +2046,7 @@ fn expect_sort_with_fuel(
     }
 }
 
+#[allow(dead_code)]
 fn decl_expr_node_count(decl: &Decl) -> u64 {
     match decl {
         Decl::Axiom { ty, .. } | Decl::AxiomConstrained { ty, .. } => expr_node_count(ty),
@@ -2026,12 +2116,10 @@ fn expr_node_count(expr: &Expr) -> u64 {
         Expr::Lam { ty, body, .. } | Expr::Pi { ty, body, .. } => {
             1 + expr_node_count(ty) + expr_node_count(body)
         }
-        Expr::Let {
-            ty, value, body, ..
-        } => 1 + expr_node_count(ty) + expr_node_count(value) + expr_node_count(body),
     }
 }
 
+#[allow(dead_code)]
 fn decl_level_node_count(decl: &Decl) -> u64 {
     let constraint_count: u64 = decl
         .universe_constraints()
@@ -2115,9 +2203,6 @@ fn expr_level_node_count(expr: &Expr) -> u64 {
         Expr::Lam { ty, body, .. } | Expr::Pi { ty, body, .. } => {
             expr_level_node_count(ty) + expr_level_node_count(body)
         }
-        Expr::Let {
-            ty, value, body, ..
-        } => expr_level_node_count(ty) + expr_level_node_count(value) + expr_level_node_count(body),
     }
 }
 
@@ -2131,6 +2216,7 @@ fn level_node_count(level: &Level) -> u64 {
     }
 }
 
+#[allow(dead_code)]
 fn decl_max_name_components(decl: &Decl) -> u64 {
     match decl {
         Decl::Axiom {
@@ -2369,15 +2455,6 @@ fn expr_max_name_components(expr: &Expr) -> u64 {
         } => name_component_count(binder)
             .max(expr_max_name_components(ty))
             .max(expr_max_name_components(body)),
-        Expr::Let {
-            binder,
-            ty,
-            value,
-            body,
-        } => name_component_count(binder)
-            .max(expr_max_name_components(ty))
-            .max(expr_max_name_components(value))
-            .max(expr_max_name_components(body)),
     }
 }
 
@@ -2411,24 +2488,77 @@ mod tests {
         }
     }
 
+    #[test]
+    fn candidate_schema_rejects_shared_dag_in_bounded_work() {
+        let mut ty = Expr::sort(Level::Zero);
+        for _ in 0..24 {
+            let shared = Arc::new(ty);
+            ty = Expr::App(Arc::clone(&shared), shared);
+        }
+        let declaration = Decl::Axiom {
+            name: "SharedDag".to_owned(),
+            universe_params: Vec::new(),
+            ty,
+        };
+        let limits = ProducerLimits {
+            max_declarations: 1,
+            max_expr_nodes: 64,
+            max_level_nodes: 64,
+            max_name_components: 8,
+            max_reduction_steps: 1,
+            max_conversion_steps: 1,
+        };
+
+        assert_eq!(
+            ensure_candidate_schema_limits(&declaration, &limits),
+            Err(CertError::ProducerLimitExceeded {
+                limit: ProducerLimitKind::MaxExprNodes,
+            })
+        );
+    }
+
+    #[test]
+    fn candidate_schema_rejects_deep_spine_without_recursive_descent() {
+        let mut ty = Expr::bvar(0);
+        for _ in 0..MAX_STRUCTURAL_DEPTH {
+            ty = Expr::lam("x", Expr::sort(Level::Zero), ty);
+        }
+        let declaration = Decl::Axiom {
+            name: "DeepSpine".to_owned(),
+            universe_params: Vec::new(),
+            ty,
+        };
+        let limits = ProducerLimits {
+            max_declarations: 1,
+            max_expr_nodes: u32::MAX,
+            max_level_nodes: u32::MAX,
+            max_name_components: 8,
+            max_reduction_steps: 1,
+            max_conversion_steps: 1,
+        };
+
+        let result = ensure_candidate_schema_limits(&declaration, &limits);
+        // Dropping an adversarially deep user-provided `Arc<Expr>` is itself recursive in Rust's
+        // standard `Arc` destruction path. The admission API has already rejected it; keep the
+        // test focused on the controlled validation result rather than exercising that allocator
+        // implementation detail during test teardown.
+        std::mem::forget(declaration);
+        assert_eq!(
+            result,
+            Err(CertError::StructuralLimitExceeded {
+                kind: StructuralLimitKind::StructuralDepth,
+                limit: MAX_STRUCTURAL_DEPTH,
+                observed: MAX_STRUCTURAL_DEPTH + 1,
+            })
+        );
+    }
+
     fn check_core_decl_candidates_reference(
         batch: CandidateBatch<'_>,
     ) -> Result<CandidateBatchResult, CertError> {
         ensure_candidate_batch_schema(&batch)?;
         let direct_imports = validate_candidate_batch_imports(&batch)?;
-        let version = if producer_token_chain_version(batch.prior_current_decls)
-            == CertificateFormatVersion::V0_3_0
-            || producer_chain_version(
-                batch
-                    .candidates
-                    .iter()
-                    .map(|candidate| &candidate.declaration),
-            ) == CertificateFormatVersion::V0_3_0
-        {
-            CertificateFormatVersion::V0_3_0
-        } else {
-            CertificateFormatVersion::V0_2_0
-        };
+        let version = CertificateFormatVersion::V0_4_0;
         let validated = validate_checked_decl_chain(
             batch.imports,
             batch.prior_current_decls,
@@ -2497,9 +2627,8 @@ mod tests {
         candidate: &CoreDeclCandidate,
         version: CertificateFormatVersion,
     ) -> Result<AcceptedCandidate, CertError> {
+        ensure_candidate_schema_limits(&candidate.declaration, limits)?;
         let declaration = candidate.declaration.clone();
-        ensure_no_unresolved_metavariable(&declaration)?;
-        ensure_candidate_schema_limits(&declaration, limits)?;
         let lookup_env =
             producer_lookup_env_for_sources(imports, checked_decls, checked_decl_sources)?;
         let resolved = resolve_core_decl_candidate(
@@ -2595,7 +2724,7 @@ mod tests {
                 universe_params: vec![],
                 ty: Expr::sort(Level::zero()),
             },
-            version: CertificateFormatVersion::V0_2_0,
+            version: CertificateFormatVersion::V0_4_0,
             preview_hashes: CandidateHashPreview {
                 type_hash: None,
                 body_hash: None,
@@ -2709,7 +2838,7 @@ mod tests {
         let resolved = crate::canonical_producer_checked_decl_for_version(
             &declaration,
             &lookup_env,
-            CertificateFormatVersion::V0_2_0,
+            CertificateFormatVersion::V0_4_0,
             &[],
         )
         .unwrap();
@@ -2726,7 +2855,7 @@ mod tests {
         });
         let token = CheckedDeclCandidate {
             declaration,
-            version: CertificateFormatVersion::V0_2_0,
+            version: CertificateFormatVersion::V0_4_0,
             preview_hashes: CandidateHashPreview {
                 type_hash: Some(hash(0x91)),
                 body_hash: Some(hash(0x92)),
@@ -3034,7 +3163,56 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(cert.declarations.len(), 1);
+        assert_eq!(cert.declarations().len(), 1);
+    }
+
+    #[test]
+    fn observed_checked_candidate_build_preserves_bytes_errors_and_commit_on_success() {
+        let tokens = accepted_candidate_tokens(vec![prior_axiom("Observed.P")]);
+        let module_name = crate::Name::from_dotted("Observed.CheckedCandidates");
+        let ordinary =
+            build_module_cert_from_checked_candidates(module_name.clone(), &[], &tokens).unwrap();
+        let mut observation = CertificatePayloadObservation::default();
+        let observed = build_module_cert_from_checked_candidates_observed(
+            module_name,
+            &[],
+            &tokens,
+            Some(&mut observation),
+        )
+        .unwrap();
+        assert_eq!(
+            crate::encode_module_cert(&ordinary).unwrap(),
+            crate::encode_module_cert(&observed).unwrap()
+        );
+        assert_eq!(observation.payloads_frozen, 1);
+        assert_eq!(
+            observation.payload_unique_bytes,
+            observed.logical_retained_bytes_v1()
+        );
+
+        let mut forged_tokens = tokens;
+        forged_tokens[0].decl_certificate_hash = hash(0x5a);
+        let before = CertificatePayloadObservation {
+            payloads_frozen: 7,
+            payload_unique_bytes: 11,
+            ..CertificatePayloadObservation::default()
+        };
+        let ordinary_error = build_module_cert_from_checked_candidates(
+            crate::Name::from_dotted("Observed.InvalidCheckedCandidates"),
+            &[],
+            &forged_tokens,
+        )
+        .unwrap_err();
+        let mut retained = before;
+        let observed_error = build_module_cert_from_checked_candidates_observed(
+            crate::Name::from_dotted("Observed.InvalidCheckedCandidates"),
+            &[],
+            &forged_tokens,
+            Some(&mut retained),
+        )
+        .unwrap_err();
+        assert_eq!(observed_error, ordinary_error);
+        assert_eq!(retained, before);
     }
 
     #[test]

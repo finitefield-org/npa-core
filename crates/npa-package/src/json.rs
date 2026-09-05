@@ -4,6 +4,25 @@ use std::fmt;
 
 const MAX_JSON_NESTING_DEPTH: usize = 512;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct JsonResourceLimits {
+    pub(crate) nesting_depth: usize,
+    pub(crate) string_bytes: usize,
+    pub(crate) number_bytes: usize,
+    pub(crate) array_elements: usize,
+    pub(crate) object_members: usize,
+    pub(crate) array_member_elements: &'static [(&'static str, usize)],
+}
+
+const DEFAULT_JSON_RESOURCE_LIMITS: JsonResourceLimits = JsonResourceLimits {
+    nesting_depth: MAX_JSON_NESTING_DEPTH,
+    string_bytes: usize::MAX,
+    number_bytes: usize::MAX,
+    array_elements: usize::MAX,
+    object_members: usize::MAX,
+    array_member_elements: &[],
+};
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum JsonValue {
     Null,
@@ -124,10 +143,21 @@ pub(crate) enum JsonParseErrorKind {
     InvalidUnicodeEscape,
     ControlCharacterInString,
     NestingDepthExceeded { max_depth: usize },
+    StringBytesExceeded { max_bytes: usize },
+    NumberBytesExceeded { max_bytes: usize },
+    ArrayElementsExceeded { max_elements: usize },
+    ObjectMembersExceeded { max_members: usize },
 }
 
 pub(crate) fn parse_json(source: &str) -> Result<JsonValue, JsonParseError> {
-    let mut parser = Parser::new(source);
+    parse_json_with_limits(source, DEFAULT_JSON_RESOURCE_LIMITS)
+}
+
+pub(crate) fn parse_json_with_limits(
+    source: &str,
+    limits: JsonResourceLimits,
+) -> Result<JsonValue, JsonParseError> {
+    let mut parser = Parser::new(source, limits);
     let value = parser.parse_value(0)?;
     parser.skip_ws();
     if parser.is_done() {
@@ -141,21 +171,31 @@ struct Parser<'src> {
     source: &'src str,
     bytes: &'src [u8],
     offset: usize,
+    limits: JsonResourceLimits,
 }
 
 impl<'src> Parser<'src> {
-    fn new(source: &'src str) -> Self {
+    fn new(source: &'src str, limits: JsonResourceLimits) -> Self {
         Self {
             source,
             bytes: source.as_bytes(),
             offset: 0,
+            limits,
         }
     }
 
     fn parse_value(&mut self, depth: usize) -> Result<JsonValue, JsonParseError> {
-        if depth > MAX_JSON_NESTING_DEPTH {
+        self.parse_value_with_array_limit(depth, None)
+    }
+
+    fn parse_value_with_array_limit(
+        &mut self,
+        depth: usize,
+        array_elements: Option<usize>,
+    ) -> Result<JsonValue, JsonParseError> {
+        if depth > self.limits.nesting_depth {
             return Err(self.error(JsonParseErrorKind::NestingDepthExceeded {
-                max_depth: MAX_JSON_NESTING_DEPTH,
+                max_depth: self.limits.nesting_depth,
             }));
         }
         self.skip_ws();
@@ -168,7 +208,12 @@ impl<'src> Parser<'src> {
             b't' => self.parse_literal(b"true", JsonValue::Bool(true)),
             b'f' => self.parse_literal(b"false", JsonValue::Bool(false)),
             b'"' => self.parse_string().map(JsonValue::String),
-            b'[' => self.parse_array(depth),
+            b'[' => self.parse_array(
+                depth,
+                array_elements
+                    .unwrap_or(self.limits.array_elements)
+                    .min(self.limits.array_elements),
+            ),
             b'{' => self.parse_object(depth),
             b'-' | b'0'..=b'9' => self.parse_number().map(JsonValue::Number),
             _ => Err(self.error(JsonParseErrorKind::ExpectedValue)),
@@ -212,7 +257,7 @@ impl<'src> Parser<'src> {
                         .next()
                         .ok_or_else(|| self.error(JsonParseErrorKind::UnexpectedEof))?;
                     self.offset += ch.len_utf8();
-                    out.push(ch);
+                    self.push_string_char(&mut out, ch)?;
                 }
             }
         }
@@ -223,21 +268,24 @@ impl<'src> Parser<'src> {
             return Err(self.error(JsonParseErrorKind::UnexpectedEof));
         };
         match byte {
-            b'"' => out.push('"'),
-            b'\\' => out.push('\\'),
-            b'/' => out.push('/'),
-            b'b' => out.push('\u{0008}'),
-            b'f' => out.push('\u{000c}'),
-            b'n' => out.push('\n'),
-            b'r' => out.push('\r'),
-            b't' => out.push('\t'),
-            b'u' => self.parse_unicode_escape(out)?,
+            b'"' => self.push_string_char(out, '"')?,
+            b'\\' => self.push_string_char(out, '\\')?,
+            b'/' => self.push_string_char(out, '/')?,
+            b'b' => self.push_string_char(out, '\u{0008}')?,
+            b'f' => self.push_string_char(out, '\u{000c}')?,
+            b'n' => self.push_string_char(out, '\n')?,
+            b'r' => self.push_string_char(out, '\r')?,
+            b't' => self.push_string_char(out, '\t')?,
+            b'u' => {
+                let ch = self.parse_unicode_escape()?;
+                self.push_string_char(out, ch)?;
+            }
             _ => return Err(self.error(JsonParseErrorKind::InvalidEscape)),
         }
         Ok(())
     }
 
-    fn parse_unicode_escape(&mut self, out: &mut String) -> Result<(), JsonParseError> {
+    fn parse_unicode_escape(&mut self) -> Result<char, JsonParseError> {
         let unit = self.parse_hex_u16()?;
         let scalar = if (0xd800..=0xdbff).contains(&unit) {
             self.consume_expected_byte(b'\\', "unicode low surrogate")?;
@@ -256,6 +304,15 @@ impl<'src> Parser<'src> {
         let Some(ch) = char::from_u32(scalar) else {
             return Err(self.error(JsonParseErrorKind::InvalidUnicodeEscape));
         };
+        Ok(ch)
+    }
+
+    fn push_string_char(&self, out: &mut String, ch: char) -> Result<(), JsonParseError> {
+        if out.len().saturating_add(ch.len_utf8()) > self.limits.string_bytes {
+            return Err(self.error(JsonParseErrorKind::StringBytesExceeded {
+                max_bytes: self.limits.string_bytes,
+            }));
+        }
         out.push(ch);
         Ok(())
     }
@@ -274,7 +331,11 @@ impl<'src> Parser<'src> {
         Ok(value)
     }
 
-    fn parse_array(&mut self, depth: usize) -> Result<JsonValue, JsonParseError> {
+    fn parse_array(
+        &mut self,
+        depth: usize,
+        max_elements: usize,
+    ) -> Result<JsonValue, JsonParseError> {
         self.consume_expected_byte(b'[', "array")?;
         let mut values = Vec::new();
         self.skip_ws();
@@ -284,6 +345,9 @@ impl<'src> Parser<'src> {
         }
 
         loop {
+            if values.len() == max_elements {
+                return Err(self.error(JsonParseErrorKind::ArrayElementsExceeded { max_elements }));
+            }
             values.push(self.parse_value(depth + 1)?);
             self.skip_ws();
             match self.take_byte() {
@@ -314,6 +378,11 @@ impl<'src> Parser<'src> {
 
         loop {
             self.skip_ws();
+            if members.len() == self.limits.object_members {
+                return Err(self.error(JsonParseErrorKind::ObjectMembersExceeded {
+                    max_members: self.limits.object_members,
+                }));
+            }
             if self.peek() != Some(b'"') {
                 return Err(self.error(JsonParseErrorKind::UnexpectedByte {
                     expected: "object key string",
@@ -323,7 +392,12 @@ impl<'src> Parser<'src> {
             let key = self.parse_string()?;
             self.skip_ws();
             self.consume_expected_byte(b':', "object colon")?;
-            let value = self.parse_value(depth + 1)?;
+            let array_elements = self
+                .limits
+                .array_member_elements
+                .iter()
+                .find_map(|(field, maximum)| (key == *field).then_some(*maximum));
+            let value = self.parse_value_with_array_limit(depth + 1, array_elements)?;
             members.push(JsonMember { key, value });
             self.skip_ws();
             match self.take_byte() {
@@ -385,6 +459,12 @@ impl<'src> Parser<'src> {
             }
         }
 
+        let number_bytes = self.offset - start;
+        if number_bytes > self.limits.number_bytes {
+            return Err(self.error(JsonParseErrorKind::NumberBytesExceeded {
+                max_bytes: self.limits.number_bytes,
+            }));
+        }
         Ok(self.source[start..self.offset].to_owned())
     }
 
@@ -464,6 +544,51 @@ mod tests {
             JsonParseErrorKind::NestingDepthExceeded {
                 max_depth: MAX_JSON_NESTING_DEPTH,
             }
+        );
+    }
+
+    #[test]
+    fn json_resource_limits_reject_before_the_next_container_or_string_item() {
+        let limits = JsonResourceLimits {
+            nesting_depth: 2,
+            string_bytes: 4,
+            number_bytes: 4,
+            array_elements: 2,
+            object_members: 2,
+            array_member_elements: &[("x", 1)],
+        };
+
+        assert!(parse_json_with_limits(r#"{"a":"four","b":[]}"#, limits).is_ok());
+        assert_eq!(
+            parse_json_with_limits(r#""12345""#, limits)
+                .unwrap_err()
+                .kind,
+            JsonParseErrorKind::StringBytesExceeded { max_bytes: 4 }
+        );
+        assert_eq!(
+            parse_json_with_limits("12345", limits).unwrap_err().kind,
+            JsonParseErrorKind::NumberBytesExceeded { max_bytes: 4 }
+        );
+        assert_eq!(
+            parse_json_with_limits("[0,1,2]", limits).unwrap_err().kind,
+            JsonParseErrorKind::ArrayElementsExceeded { max_elements: 2 }
+        );
+        assert!(parse_json_with_limits(r#"{"x":[0]}"#, limits).is_ok());
+        assert_eq!(
+            parse_json_with_limits(r#"{"x":[0,1]}"#, limits)
+                .unwrap_err()
+                .kind,
+            JsonParseErrorKind::ArrayElementsExceeded { max_elements: 1 }
+        );
+        assert_eq!(
+            parse_json_with_limits(r#"{"a":0,"b":1,"c":2}"#, limits)
+                .unwrap_err()
+                .kind,
+            JsonParseErrorKind::ObjectMembersExceeded { max_members: 2 }
+        );
+        assert_eq!(
+            parse_json_with_limits("[[[0]]]", limits).unwrap_err().kind,
+            JsonParseErrorKind::NestingDepthExceeded { max_depth: 2 }
         );
     }
 }

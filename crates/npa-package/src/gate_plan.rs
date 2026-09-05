@@ -241,6 +241,7 @@ fn is_package_generated_artifact(path: &str) -> bool {
             || path.ends_with("axiom-report.json")
             || path.ends_with("theorem-index.json")
             || path.ends_with("theorem-premise-report.json")
+            || path.starts_with("proofs/generated/theorem-premise-report-chunks/")
             || path.ends_with("ai-theorem-index.json")
             || path.ends_with("verified-export-summary.json")
             || path.ends_with("publish-plan.json"))

@@ -557,6 +557,71 @@ fn declaration_promotion_materializes_attests_and_publishes_exact_closure() {
         .all(|gate| gate.gate != "theorem-premise-report-check"));
     validate_declaration_registry_entry_admission(entry, &plan, &attestation).unwrap();
 
+    // A source package may continue to evolve after a declaration promotion.
+    // Registry validation must rederive the selected closure from the current,
+    // fully checked package without requiring its whole-package projections to
+    // retain the historical hashes bound by the immutable promotion plan.
+    let evolved_source = root.0.join("evolved-source");
+    copy_tree(&source, &evolved_source);
+    let evolved_manifest_path = evolved_source.join("npa-package.toml");
+    let mut evolved_manifest = fs::read_to_string(&evolved_manifest_path).unwrap();
+    evolved_manifest.push_str("\n# Unrelated package evolution after promotion.\n");
+    fs::write(&evolved_manifest_path, evolved_manifest).unwrap();
+    for arguments in [
+        vec![
+            OsStr::new("package"),
+            OsStr::new("lock"),
+            OsStr::new("write"),
+            OsStr::new("--root"),
+            evolved_source.as_os_str(),
+            OsStr::new("--json"),
+        ],
+        vec![
+            OsStr::new("package"),
+            OsStr::new("axiom-report"),
+            OsStr::new("--root"),
+            evolved_source.as_os_str(),
+            OsStr::new("--json"),
+        ],
+        vec![
+            OsStr::new("package"),
+            OsStr::new("index"),
+            OsStr::new("--root"),
+            evolved_source.as_os_str(),
+            OsStr::new("--json"),
+        ],
+    ] {
+        assert_passed(run(binary, &arguments));
+    }
+    assert_ne!(
+        package_file_hash(&fs::read(&evolved_manifest_path).unwrap()),
+        plan.source.manifest_file_hash
+    );
+    assert_ne!(
+        package_file_hash(&fs::read(evolved_source.join("generated/package-lock.json")).unwrap()),
+        plan.source.lock_file_hash
+    );
+    assert_ne!(
+        package_file_hash(&fs::read(evolved_source.join("generated/axiom-report.json")).unwrap()),
+        plan.source.axiom_report_file_hash
+    );
+    assert_ne!(
+        package_file_hash(&fs::read(evolved_source.join("generated/theorem-index.json")).unwrap()),
+        plan.source.theorem_index_file_hash
+    );
+    assert_passed(run(
+        binary,
+        &[
+            OsStr::new("package"),
+            OsStr::new("validate-promotion-origin-registry"),
+            OsStr::new("--root"),
+            tracked_arg,
+            OsStr::new("--source-root"),
+            evolved_source.as_os_str(),
+            OsStr::new("--json"),
+        ],
+    ));
+
     let mut unplanned_equivalent = (**entry).clone();
     let mut forged_origin = unplanned_equivalent.canonical_source.clone();
     forged_origin.package = PackageId::new("unplanned-equivalent-source");
@@ -972,6 +1037,40 @@ fn declaration_promotion_materializes_attests_and_publishes_exact_closure() {
     .unwrap();
     assert_eq!(later_plan.selection.materialized_declarations.len(), 1);
     assert_eq!(later_plan.dependency_mappings.len(), 1);
+
+    // Plan v2 can represent a local namespace transport, but a self-consistent
+    // plan hash cannot authorize an interface hash that the active route and
+    // locked target artifact do not attest.
+    let mut forged_transport_plan = later_plan.clone();
+    forged_transport_plan.dependency_mappings[0].target_decl_interface_hash =
+        PackageHash::new([98; 32]);
+    forged_transport_plan.finalize().unwrap();
+    fs::write(
+        source.join("promotion/declaration-local-introduction.forged-transport.plan.json"),
+        forged_transport_plan.canonical_json().unwrap(),
+    )
+    .unwrap();
+    assert_failed_with_reason(
+        run(
+            binary,
+            &[
+                OsStr::new("package"),
+                OsStr::new("materialize-promotion"),
+                OsStr::new("--root"),
+                source_arg,
+                OsStr::new("--target-baseline-root"),
+                tracked_arg,
+                OsStr::new("--target-root"),
+                tracked_arg,
+                OsStr::new("--plan"),
+                OsStr::new("promotion/declaration-local-introduction.forged-transport.plan.json"),
+                OsStr::new("--phase"),
+                OsStr::new("temporary"),
+                OsStr::new("--json"),
+            ],
+        ),
+        "promotion_materialize_plan_stale",
+    );
 
     // A self-consistent hand-authored plan cannot bypass active registry
     // ownership by rebinding itself to an otherwise unchanged baseline.

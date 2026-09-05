@@ -4,15 +4,15 @@
 package verification. It is intentionally outside the Cargo workspace and has
 no Rust crate dependency.
 
-Its compatibility axes are independent. The clean-room checker is `0.3.0`,
-advertises `NPA-CERT-0.3.0` / `NPA-Core-0.3.0`, and emits raw checker result
-v2. It also checks exact `0.2.0`, `0.1.2`, and `0.1` compatibility inputs; raw
-v2 reports those actual older input pairs separately from the checker's v0.3
-capability pair.
+The clean-room checker is `0.4.0`, advertises the exact
+`NPA-CERT-0.4.0` / `NPA-Core-0.4.0` capability pair, and emits raw checker
+result v2. It accepts only that pair. Every older, unknown, or mixed pair is
+rejected while decoding the header, before any term or module payload is
+interpreted.
 
 In raw-result v2, capability fields are always
-`certificate_format = NPA-CERT-0.3.0` and
-`core_spec = NPA-Core-0.3.0`. Once the header pair is decoded,
+`certificate_format = NPA-CERT-0.4.0` and
+`core_spec = NPA-Core-0.4.0`. Once the exact header pair is decoded,
 `input_certificate_format` and `input_core_spec` record that exact input pair;
 they are not copied from package manifest/lock profiles. A checked result also
 binds `module`, `certificate_hash`, `export_hash`, and `axiom_report_hash`.
@@ -125,15 +125,16 @@ or unpinned checker binaries for high-trust evidence.
 
 ## Current Scope
 
-The executable implements the source-free Core v0.3.0 check path and its
-documented v0.2.0, v0.1.2, and v0.1 compatibility paths:
+The executable implements only the source-free Core v0.4.0 check path:
 
 ```text
-versioned source-free certificate decoding and canonical re-encoding
-versioned declaration, export, report, and certificate hash recomputation
-tagged interface and local-implementation dependency verification for v0.3
+strict v0.4 source-free certificate decoding and canonical re-encoding
+v0.4 declaration/module and retained export/report hash recomputation
+the exact six-form term grammar with retired tag 0x06 rejection
+tagged interface and local-implementation dependency verification
 independent local opaque-transparency closure recomputation
-checked local opaque bodies exposed only after checking and only within v0.3
+checked local opaque bodies exposed only after checking
+assumption-only local typing contexts with beta, delta, and iota conversion
 universe constraints and constraint-committing public interfaces
 normal decoded/hash-checked imports
 recursive policy-checked high-trust import DAGs
@@ -195,6 +196,7 @@ Targeted suites can be run by passing a suite name:
 scripts/test.sh cli
 scripts/test.sh sha256
 scripts/test.sh feature-policy
+scripts/test.sh fixture-matrix
 scripts/test.sh axiom-report
 scripts/test.sh axiom-policy
 scripts/test.sh axiom-policy-parse
@@ -231,43 +233,25 @@ integration gate with:
 scripts/differential.sh
 ```
 
-That gate regenerates the committed conformance fixtures, compares the fast
-kernel, reference checker, and OCaml verdicts and identities, parses every raw
-result through the Rust runner schema, exercises a real external package
-import DAG, and runs the filesystem/network trace when `strace` is available.
+That gate reads the shared v0.4 fixture matrix, regenerates and byte-compares
+all 16 committed conformance certificates, and compares fast, reference, and
+OCaml verdicts. For every accepted certificate it also compares the module,
+certificate, export, and axiom-report identities and binds the decoded input
+pair separately from the checker's capability pair. It covers every old or
+mixed header row, all retired-`0x06` tail shapes, source-path rejection, a
+resource-bound failure, Rust raw-result parsing, a source-free import DAG, and
+the facade argument and policy/registry boundary, plus the filesystem/network
+trace when `strace` is available. Full v0.9 package-runner adoption belongs to
+Milestone 5.
 
-### Current v0.8 host compatibility
+### Transitional v0.8 host lane
 
-On Linux, run the complete `npa-cli 0.8.0` host compatibility and ephemeral
-release-evidence closure from the `npa-core` root with:
-
-```sh
-checkers/npa-checker-ext/scripts/toolchain-v0.8.sh
-```
-
-On a host that supports kernel-sealed checker staging, the developer-only
-functional form permits a dirty checkout, runs the same facade and two direct
-checks without requiring `strace`, and deliberately does not evaluate release
-evidence:
-
-```sh
-checkers/npa-checker-ext/scripts/toolchain-v0.8.sh --functional-only
-```
-
-The combined gate uses the actual OCaml executable through the v1 facade and
-two direct locked/offline runs. It checks a frozen checked lock, full identity
-chain, exact command/raw repeatability, narrow machine telemetry differences,
-source/network access, transient mutations, and—in full mode—the archive,
-checksum, and dynamic v0.2 manifest.
-
-The full v0.8 gate is a clean-checkout Linux release requirement. On platforms
-without kernel-sealed checker staging, invoke the functional-only form to run
-the portable checker-build and host-test checks; it then fails closed with the
-structured `checker_binary_immutable_snapshot_unsupported` result before the
-v0.8 policy preflight or any external execution. Record the remaining
-functional closure and the full gate as pending for the clean Linux release
-run. A host that supports immutable staging but lacks `strace` can complete the
-functional-only form locally.
+The strict v0.4 checker has moved beyond the temporary `npa-cli 0.8.0` host
+compatibility lane. The checked-in `toolchain-v0.8.sh` remains only as migration
+material until the v0.9 host/evidence work replaces and removes it; it is not a
+current v0.4 compatibility or release claim. Use `scripts/differential.sh` for
+Milestone 4 checker acceptance. Do not reinterpret output from the v0.8 lane
+as evidence for the v0.4 certificate pair.
 
 ### Historical v0.7 host compatibility
 

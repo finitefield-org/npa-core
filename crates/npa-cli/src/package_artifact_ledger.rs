@@ -1,7 +1,6 @@
 //! Implementation of the non-mutating package artifact-ledger audit.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
 use std::io;
 
 use npa_api::{
@@ -24,7 +23,8 @@ use crate::args::PackageArtifactLedgerAuditOptions;
 use crate::diagnostic::{
     CommandDiagnostic, CommandResult, CommandStatus, DiagnosticKind, DiagnosticSeverity,
 };
-use crate::fs::{join_package_path, render_package_path};
+use crate::fs::render_package_path;
+use crate::generated_artifact_writer::read_package_regular_file_no_follow;
 use crate::package::{load_package_root, LoadedPackageRoot, PACKAGE_MANIFEST_PATH};
 
 const COMMAND: &str = "package audit-artifact-ledger";
@@ -613,11 +613,10 @@ fn capture_path(loaded: &LoadedPackageRoot, path: &PackagePath, cache: &mut Snap
     if cache.contains_key(path) {
         return;
     }
-    let full_path = join_package_path(&loaded.root, path, "artifact_ledger.path")
-        .expect("validated manifest paths remain package-relative");
-    let result = fs::read(full_path).map_err(|error| ReadFailure {
-        not_found: error.kind() == io::ErrorKind::NotFound,
-    });
+    let result =
+        read_package_regular_file_no_follow(&loaded.root, path).map_err(|error| ReadFailure {
+            not_found: error.kind() == io::ErrorKind::NotFound,
+        });
     cache.insert(path.clone(), result);
 }
 

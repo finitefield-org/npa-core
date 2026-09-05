@@ -3,16 +3,14 @@ use std::{
     fmt,
 };
 
-use npa_kernel::{
-    subst::instantiate, Ctx, Env, Error as KernelError, Expr, Level, ResourceLimitKind,
-    UniverseContext,
-};
+use npa_kernel::{Ctx, Env, Error as KernelError, Expr, Level, ResourceLimitKind, UniverseContext};
 
 use crate::{
     add_decl_to_env, add_verified_module_referenced_imports_to_env, builtin_decl_interface_hash,
-    builtin_is_axiom, core_expr_hash, expr_from_term, kernel::universe_constraints_from_specs,
+    builtin_is_axiom, core_expr_hash, kernel::universe_constraints_from_specs,
     source_decl_index_for_export_entry, universe_names, verified_module_to_kernel_decls, AxiomRef,
-    DeclPayload, ExportEntry, ExportKind, GlobalRef, Hash, ImportEntry, Name, VerifiedModule,
+    DeclPayload, ExportEntry, ExportKind, GlobalRef, Hash, ImportEntry, KernelExprMaterialization,
+    KernelTermConversion, Name, TermMaterializationBudgetV1, VerifiedModule,
 };
 
 /// Fixed resource limits for version 1 theorem-premise analysis.
@@ -79,10 +77,8 @@ pub enum VerifiedTheoremPremiseUseSite {
     ApplicationArgument,
     /// The premise occurs at another proof-term position.
     TermBody,
-    /// The premise occurs inside a nested lambda, pi, or let type.
+    /// The premise occurs inside a nested lambda or pi type.
     DependentType,
-    /// The premise occurs inside a let-bound value.
-    LetValue,
 }
 
 /// One direct global dependency of a verified theorem declaration.
@@ -189,7 +185,7 @@ pub fn analyze_verified_module_theorem_premises(
     let mut analyses = Vec::new();
 
     for export in module
-        .export_block
+        .export_block()
         .iter()
         .filter(|entry| entry.kind == ExportKind::Theorem)
     {
@@ -220,19 +216,19 @@ fn resolve_exact_import_context<'a>(
     let mut unique = BTreeSet::new();
     for import in imports {
         if !unique.insert((
-            import.module.clone(),
-            import.export_hash,
-            import.certificate_hash,
+            import.module().clone(),
+            import.export_hash(),
+            import.certificate_hash(),
         )) {
             return Err(import_context_mismatch());
         }
     }
-    if imports.len() != module.imports.len() {
+    if imports.len() != module.imports().len() {
         return Err(import_context_mismatch());
     }
 
-    let mut resolved = Vec::with_capacity(module.imports.len());
-    for entry in &module.imports {
+    let mut resolved = Vec::with_capacity(module.imports().len());
+    for entry in module.imports() {
         let matches = imports
             .iter()
             .copied()
@@ -247,9 +243,9 @@ fn resolve_exact_import_context<'a>(
         .iter()
         .map(|module| {
             (
-                module.module.clone(),
-                module.export_hash,
-                module.certificate_hash,
+                module.module().clone(),
+                module.export_hash(),
+                module.certificate_hash(),
             )
         })
         .collect::<BTreeSet<_>>()
@@ -262,11 +258,11 @@ fn resolve_exact_import_context<'a>(
 }
 
 fn import_matches(entry: &ImportEntry, module: &VerifiedModule) -> bool {
-    entry.module == module.module
-        && entry.export_hash == module.export_hash
+    &entry.module == module.module()
+        && entry.export_hash == module.export_hash()
         && entry
             .certificate_hash
-            .is_none_or(|hash| hash == module.certificate_hash)
+            .is_none_or(|hash| hash == module.certificate_hash())
 }
 
 fn analysis_environment(
@@ -293,7 +289,7 @@ fn analyze_theorem(
     limits: VerifiedTheoremPremiseAnalysisLimits,
 ) -> std::result::Result<VerifiedTheoremPremiseAnalysis, VerifiedTheoremPremiseAnalysisError> {
     let decl = module
-        .declarations
+        .declarations()
         .get(declaration_index)
         .ok_or_else(|| invalid_verified_module(Some(declaration_index)))?;
     let (name, universe_params, universe_constraint_specs, ty, proof) = match &decl.decl {
@@ -337,15 +333,20 @@ fn analyze_theorem(
     let mut conversion_fuel = limits.kernel_conversion_fuel_per_theorem;
     let mut traversal_states = limits.expression_traversal_states_per_theorem;
     let mut ctx = Ctx::new();
-    let mut current =
-        expr_from_term(module, ty).map_err(|_| invalid_verified_module(Some(declaration_index)))?;
+    let mut term_budget = TermMaterializationBudgetV1::new();
+    let term_attempt =
+        KernelExprMaterialization::for_selected_roots(module, &[ty, proof], &mut term_budget, None);
+    let terms = KernelTermConversion::from_attempt(module, term_attempt, None);
+    let mut current = terms
+        .root_expr(ty, None)
+        .map_err(|_| invalid_verified_module(Some(declaration_index)))?;
     let mut domains = Vec::new();
     let mut sort_parameter_indices = Vec::new();
+    let mut proposition_sort_parameter_indices = BTreeSet::new();
     let mut data_parameter_indices = Vec::new();
     let mut fact_premises = Vec::new();
 
     loop {
-        current = reduce_leading_lets(current, &mut whnf_fuel, declaration_index)?;
         let exposed = env
             .whnf_with_fuel_metered(&ctx, &delta, &current, &mut whnf_fuel)
             .map_err(|error| map_kernel_error(error, declaration_index))?;
@@ -372,7 +373,21 @@ fn analyze_theorem(
             .whnf_with_fuel_metered(&ctx, &delta, &domain, &mut whnf_fuel)
             .map_err(|error| map_kernel_error(error, declaration_index))?;
         if matches!(domain_whnf, Expr::Sort(_)) {
+            if domain_whnf == Expr::Sort(Level::zero()) {
+                proposition_sort_parameter_indices.insert(binder_index);
+            }
             sort_parameter_indices.push(binder_index);
+        } else if pi_codomain_is_proposition_sort_parameter(
+            &domain_whnf,
+            binder_index,
+            &proposition_sort_parameter_indices,
+        ) {
+            fact_premises.push(VerifiedTheoremFactPremise {
+                binder_index,
+                type_hash,
+                depends_on_prior_binder_indices,
+                use_sites: Vec::new(),
+            });
         } else {
             let inferred = env
                 .infer_with_fuel_metered_in_universe_context(
@@ -410,14 +425,14 @@ fn analyze_theorem(
     )?;
     let conclusion_hash = core_expr_hash(&current);
 
-    let proof = expr_from_term(module, proof)
+    let proof = terms
+        .root_expr(proof, None)
         .map_err(|_| invalid_verified_module(Some(declaration_index)))?;
     let (proof_body, aligned_binders) = align_proof_binders(
         env,
         &delta,
         proof,
         &domains,
-        &mut whnf_fuel,
         &mut conversion_fuel,
         declaration_index,
     )?;
@@ -461,7 +476,7 @@ fn analyze_theorem(
         return Err(invalid_verified_module(Some(declaration_index)));
     }
     let export_name = module
-        .name_table
+        .name_table()
         .get(export.name)
         .cloned()
         .ok_or_else(|| invalid_verified_module(Some(declaration_index)))?;
@@ -482,21 +497,33 @@ fn analyze_theorem(
     })
 }
 
-fn reduce_leading_lets(
-    mut expression: Expr,
-    whnf_fuel: &mut usize,
-    declaration_index: usize,
-) -> std::result::Result<Expr, VerifiedTheoremPremiseAnalysisError> {
-    while let Expr::Let { value, body, .. } = expression {
-        spend(
-            whnf_fuel,
-            VerifiedTheoremPremiseAnalysisErrorReason::WhnfFuelLimit,
-            declaration_index,
-        )?;
-        expression = instantiate(&body, &value)
-            .map_err(|_| invalid_verified_module(Some(declaration_index)))?;
+fn pi_codomain_is_proposition_sort_parameter(
+    expression: &Expr,
+    binder_count: usize,
+    proposition_sort_parameter_indices: &BTreeSet<usize>,
+) -> bool {
+    let mut current = expression;
+    let mut depth = 0_u32;
+    while let Expr::Pi { body, .. } = current {
+        current = body;
+        let Some(next_depth) = depth.checked_add(1) else {
+            return false;
+        };
+        depth = next_depth;
     }
-    Ok(expression)
+    let Expr::BVar(index) = current else {
+        return false;
+    };
+    let Some(relative) = index.checked_sub(depth) else {
+        return false;
+    };
+    let Ok(relative) = usize::try_from(relative) else {
+        return false;
+    };
+    let Some(outer_index) = binder_count.checked_sub(relative + 1) else {
+        return false;
+    };
+    proposition_sort_parameter_indices.contains(&outer_index)
 }
 
 fn collect_outer_binder_indices(
@@ -541,16 +568,6 @@ fn collect_outer_binder_indices(
                 stack.push((body, nested));
                 stack.push((ty, depth));
             }
-            Expr::Let {
-                ty, value, body, ..
-            } => {
-                let nested = depth
-                    .checked_add(1)
-                    .ok_or_else(|| invalid_verified_module(Some(declaration_index)))?;
-                stack.push((body, nested));
-                stack.push((value, depth));
-                stack.push((ty, depth));
-            }
         }
     }
     Ok(found.into_iter().collect())
@@ -561,21 +578,20 @@ fn align_proof_binders(
     delta: &[String],
     mut proof: Expr,
     domains: &[Expr],
-    whnf_fuel: &mut usize,
     conversion_fuel: &mut usize,
     declaration_index: usize,
 ) -> std::result::Result<(Expr, usize), VerifiedTheoremPremiseAnalysisError> {
     let mut ctx = Ctx::new();
     let mut aligned = 0;
     while aligned < domains.len() {
-        proof = reduce_leading_lets(proof, whnf_fuel, declaration_index)?;
         let Expr::Lam { ty, body, .. } = proof else {
             break;
         };
-        if !env
-            .is_defeq_with_fuel_metered(&ctx, delta, &ty, &domains[aligned], conversion_fuel)
-            .map_err(|error| map_kernel_error(error, declaration_index))?
-        {
+        let aligned_defeq = ty.as_ref() == &domains[aligned]
+            || env
+                .is_defeq_with_fuel_metered(&ctx, delta, &ty, &domains[aligned], conversion_fuel)
+                .map_err(|error| map_kernel_error(error, declaration_index))?;
+        if !aligned_defeq {
             return Err(invalid_verified_module(Some(declaration_index)));
         }
         let ty = (*ty).clone();
@@ -583,7 +599,6 @@ fn align_proof_binders(
         ctx.push_assumption("_", ty);
         aligned += 1;
     }
-    proof = reduce_leading_lets(proof, whnf_fuel, declaration_index)?;
     Ok((proof, aligned))
 }
 
@@ -684,16 +699,6 @@ fn collect_fact_premise_uses(
                 stack.push((body, nested, VerifiedTheoremPremiseUseSite::DependentType));
                 stack.push((ty, depth, VerifiedTheoremPremiseUseSite::DependentType));
             }
-            Expr::Let {
-                ty, value, body, ..
-            } => {
-                let nested = depth
-                    .checked_add(1)
-                    .ok_or_else(|| invalid_verified_module(Some(declaration_index)))?;
-                stack.push((body, nested, site));
-                stack.push((value, depth, VerifiedTheoremPremiseUseSite::LetValue));
-                stack.push((ty, depth, VerifiedTheoremPremiseUseSite::DependentType));
-            }
         }
     }
     Ok(uses)
@@ -727,7 +732,7 @@ fn resolve_dependency_kind(
             decl_interface_hash,
         } => {
             let name = module
-                .name_table
+                .name_table()
                 .get(*name)
                 .ok_or_else(|| invalid_verified_module(None))?;
             if *decl_interface_hash != dependency.decl_interface_hash()
@@ -743,7 +748,7 @@ fn resolve_dependency_kind(
         }
         GlobalRef::Local { decl_index } => {
             let decl = module
-                .declarations
+                .declarations()
                 .get(*decl_index)
                 .ok_or_else(|| invalid_verified_module(None))?;
             if decl.hashes.decl_interface_hash != dependency.decl_interface_hash() {
@@ -753,7 +758,7 @@ fn resolve_dependency_kind(
         }
         GlobalRef::LocalGenerated { name, .. } => {
             let entry = module
-                .export_block
+                .export_block()
                 .iter()
                 .find(|entry| {
                     entry.name == *name
@@ -775,16 +780,16 @@ fn resolve_dependency_kind(
                 .copied()
                 .ok_or_else(|| invalid_verified_module(None))?;
             let wanted = module
-                .name_table
+                .name_table()
                 .get(*name)
                 .ok_or_else(|| invalid_verified_module(None))?;
             let entry = imported
-                .export_block
+                .export_block()
                 .iter()
                 .find(|entry| {
                     entry.decl_interface_hash == *decl_interface_hash
                         && imported
-                            .name_table
+                            .name_table()
                             .get(entry.name)
                             .is_some_and(|name| name == wanted)
                 })
@@ -1117,5 +1122,62 @@ mod tests {
             VerifiedTheoremPremiseAnalysisErrorReason::TelescopeLimit
         );
         assert_eq!(error.declaration_index, Some(0));
+    }
+
+    #[test]
+    fn theorem_premise_analysis_does_not_spend_conversion_fuel_on_identical_binders() {
+        let module = verified_module(vec![Decl::Theorem {
+            name: "identity".to_owned(),
+            universe_params: vec![],
+            ty: identity_statement(),
+            proof: identity_proof(),
+        }]);
+        let mut limits = VERIFIED_THEOREM_PREMISE_ANALYSIS_LIMITS_V1;
+        limits.kernel_conversion_fuel_per_theorem = 0;
+
+        let analyses = analyze_verified_module_theorem_premises(&module, &[], limits).unwrap();
+
+        assert_eq!(analyses[0].binder_count, 2);
+    }
+
+    #[test]
+    fn theorem_premise_analysis_recognizes_pi_into_proposition_parameter_without_inference() {
+        let statement = Expr::pi(
+            "P",
+            Expr::sort(prop()),
+            Expr::pi(
+                "mk",
+                Expr::pi("h", Expr::bvar(0), Expr::bvar(1)),
+                Expr::pi("h", Expr::bvar(1), Expr::bvar(2)),
+            ),
+        );
+        let proof = Expr::lam(
+            "P",
+            Expr::sort(prop()),
+            Expr::lam(
+                "mk",
+                Expr::pi("h", Expr::bvar(0), Expr::bvar(1)),
+                Expr::lam("h", Expr::bvar(1), Expr::app(Expr::bvar(1), Expr::bvar(0))),
+            ),
+        );
+        let module = verified_module(vec![Decl::Theorem {
+            name: "apply".to_owned(),
+            universe_params: vec![],
+            ty: statement,
+            proof,
+        }]);
+        let mut limits = VERIFIED_THEOREM_PREMISE_ANALYSIS_LIMITS_V1;
+        limits.kernel_conversion_fuel_per_theorem = 0;
+
+        let analyses = analyze_verified_module_theorem_premises(&module, &[], limits).unwrap();
+
+        assert_eq!(
+            analyses[0]
+                .fact_premises
+                .iter()
+                .map(|premise| premise.binder_index)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
     }
 }

@@ -745,39 +745,6 @@ let allow_self_reference payload =
   | Ext_cert.InductiveDecl _ | Ext_cert.MutualInductiveBlockDecl _ -> true
   | _ -> false
 
-let expected_dependencies_for_decl section offset name_table imports decl_index
-    declarations declaration =
-  let refs =
-    List.fold_left
-      (fun refs term -> append_global_refs term refs)
-      [] (declaration_terms declaration.Ext_cert.payload)
-  in
-  let refs =
-    List.filter
-      (function
-        | Ext_term.Local { decl_index = referenced_decl_index }
-        | Ext_term.LocalGenerated { decl_index = referenced_decl_index; _ }
-          when allow_self_reference declaration.Ext_cert.payload
-               && referenced_decl_index = decl_index ->
-            false
-        | _ -> true)
-      refs
-  in
-  let rec loop remaining dependencies =
-    match remaining with
-    | [] -> sort_unique_dependencies section offset name_table dependencies
-    | global_ref :: rest ->
-        bind
-          (interface_hash_for_global_ref section offset name_table imports decl_index
-             declarations global_ref)
-          (fun decl_interface_hash ->
-            loop rest
-              (Ext_cert.Interface_dependency
-                 { dependency_global_ref = global_ref; dependency_decl_interface_hash = decl_interface_hash }
-              :: dependencies))
-  in
-  loop refs []
-
 let local_implementation_error offset reason_code =
   error ~kind:"dependency_hash_mismatch" ~reason_code Ext_bytes.Declarations
     offset
@@ -793,7 +760,7 @@ let is_opaque_definition (declaration : Ext_cert.declaration) =
       true
   | _ -> false
 
-let referenced_terms_v0_3 payload =
+let referenced_terms_current payload =
   match payload with
   | Ext_cert.DefDecl { decl_ty; decl_value; _ } -> [ decl_ty; decl_value ]
   | Ext_cert.TheoremDecl { decl_ty; _ } -> [ decl_ty ]
@@ -841,11 +808,6 @@ let scan_term_roots_with_budget offset roots base_depth root_expanded
             | Ext_term.Pi (fn, arg) ->
                 loop
                   ((fn, depth + 1) :: (arg, depth + 1) :: rest)
-                  refs
-            | Ext_term.Let (ty, value, body) ->
-                loop
-                  ((ty, depth + 1) :: (value, depth + 1)
-                 :: (body, depth + 1) :: rest)
                   refs)
   in
   loop (List.map (fun term -> (term, base_depth)) roots)
@@ -900,7 +862,7 @@ let validate_local_implementation_entries offset current_decl_index declarations
   in
   loop dependencies Int_set.empty
 
-let expected_dependencies_for_decl_v0_3 section offset name_table imports
+let expected_dependencies_for_decl_current section offset name_table imports
     decl_index declarations declaration certificate_expanded =
   let root_expanded = ref 0 in
   bind
@@ -946,7 +908,7 @@ let expected_dependencies_for_decl_v0_3 section offset name_table imports
                   | Some target ->
                       bind
                         (scan_term_roots_with_budget offset
-                           (referenced_terms_v0_3 target.Ext_cert.payload)
+                           (referenced_terms_current target.Ext_cert.payload)
                            (reference_depth + 1) root_expanded
                            certificate_expanded)
                         (fun refs ->
@@ -1227,16 +1189,10 @@ let recompute_axiom_report imports (decoded : Ext_cert.decoded_module) =
           | Some actual_report -> (
               let offset = declaration.Ext_cert.offset in
               let expected_dependencies =
-                match decoded.Ext_cert.header.Ext_cert.version with
-                | Ext_cert.Current ->
-                    expected_dependencies_for_decl_v0_3
-                      Ext_bytes.Declarations offset name_table imports decl_index
-                      decoded.Ext_cert.declaration_table declaration
-                      local_transparency_certificate_expanded
-                | Ext_cert.Compatibility | Ext_cert.Previous | Ext_cert.Legacy ->
-                    expected_dependencies_for_decl Ext_bytes.Declarations offset
-                      name_table imports decl_index
-                      decoded.Ext_cert.declaration_table declaration
+                expected_dependencies_for_decl_current
+                  Ext_bytes.Declarations offset name_table imports decl_index
+                  decoded.Ext_cert.declaration_table declaration
+                  local_transparency_certificate_expanded
               in
               match expected_dependencies
               with

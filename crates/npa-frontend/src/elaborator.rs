@@ -8,7 +8,9 @@ use crate::{
         MachineVerifiedImportRef,
     },
     parse_machine_module, parse_machine_term,
-    resolver::resolve_machine_module_with_options,
+    resolver::{
+        resolve_machine_module_with_options, FrontendCertificateImportView, FrontendImportView,
+    },
     DefinitionReducibility, MachineBinder, MachineCallableBinderVisibility,
     MachineCheckedCurrentDecl, MachineCheckedCurrentGeneratedDecl, MachineCompileOptions,
     MachineDecl, MachineDiagnostic, MachineDiagnosticKind, MachineDiagnosticPayload,
@@ -426,7 +428,6 @@ struct GlobalSignature {
 struct LocalDecl {
     name: String,
     ty: Expr,
-    value: Option<Expr>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -436,19 +437,7 @@ struct LocalContext {
 
 impl LocalContext {
     fn push_assumption(&mut self, name: String, ty: Expr) {
-        self.locals.push(LocalDecl {
-            name,
-            ty,
-            value: None,
-        });
-    }
-
-    fn push_definition(&mut self, name: String, ty: Expr, value: Expr) {
-        self.locals.push(LocalDecl {
-            name,
-            ty,
-            value: Some(value),
-        });
+        self.locals.push(LocalDecl { name, ty });
     }
 
     fn lookup_bvar(&self, name: &str) -> Option<u32> {
@@ -475,12 +464,7 @@ impl LocalContext {
     fn to_kernel_ctx(&self) -> Ctx {
         let mut ctx = Ctx::new();
         for local in &self.locals {
-            match &local.value {
-                Some(value) => {
-                    ctx.push_definition(local.name.clone(), local.ty.clone(), value.clone())
-                }
-                None => ctx.push_assumption(local.name.clone(), local.ty.clone()),
-            }
+            ctx.push_assumption(local.name.clone(), local.ty.clone());
         }
         ctx
     }
@@ -764,20 +748,6 @@ impl Elaborator {
                 }
                 let body = self.elaborate_term(*body, &mut nested_locals, delta)?;
                 Ok(close_pi(&elaborated_binders, body))
-            }
-            MachineTerm::Let {
-                name,
-                ty,
-                value,
-                body,
-                ..
-            } => {
-                let ty = self.elaborate_term(*ty, locals, delta)?;
-                let value = self.elaborate_term(*value, locals, delta)?;
-                let mut nested_locals = locals.clone();
-                nested_locals.push_definition(name.clone(), ty.clone(), value.clone());
-                let body = self.elaborate_term(*body, &mut nested_locals, delta)?;
-                Ok(Expr::let_in(name, ty, value, body))
             }
             MachineTerm::Annot { expr, ty, span } => {
                 let expr = self.elaborate_term(*expr, locals, delta)?;
@@ -1257,11 +1227,6 @@ fn first_opaque_constant_name(
             first_opaque_constant_name(ty, env, opaque_globals)
                 .or_else(|| first_opaque_constant_name(body, env, opaque_globals))
         }
-        Expr::Let {
-            ty, value, body, ..
-        } => first_opaque_constant_name(ty, env, opaque_globals)
-            .or_else(|| first_opaque_constant_name(value, env, opaque_globals))
-            .or_else(|| first_opaque_constant_name(body, env, opaque_globals)),
         Expr::Sort(_) | Expr::BVar(_) => None,
     }
 }
@@ -1374,7 +1339,7 @@ fn machine_term_repair_source(term: &MachineTerm) -> Option<String> {
             }
             Some(parts.join(" "))
         }
-        MachineTerm::Lam { .. } | MachineTerm::Pi { .. } | MachineTerm::Let { .. } => None,
+        MachineTerm::Lam { .. } | MachineTerm::Pi { .. } => None,
         MachineTerm::Annot { expr, ty, .. } => Some(format!(
             "({} : {})",
             machine_term_repair_source(expr)?,
@@ -1392,7 +1357,7 @@ fn machine_term_atom_repair_source(term: &MachineTerm) -> Option<String> {
         | MachineTerm::Sort { .. }
         | MachineTerm::Annot { .. } => machine_term_repair_source(term),
         MachineTerm::App { .. } => Some(format!("({})", machine_term_repair_source(term)?)),
-        MachineTerm::Lam { .. } | MachineTerm::Pi { .. } | MachineTerm::Let { .. } => None,
+        MachineTerm::Lam { .. } | MachineTerm::Pi { .. } => None,
     }
 }
 
@@ -1455,7 +1420,7 @@ fn expr_repair_source(expr: &Expr, locals: &LocalContext) -> Option<String> {
             }
             Some(parts.join(" "))
         }
-        Expr::Lam { .. } | Expr::Pi { .. } | Expr::Let { .. } => None,
+        Expr::Lam { .. } | Expr::Pi { .. } => None,
     }
 }
 
@@ -1463,7 +1428,7 @@ fn expr_atom_repair_source(expr: &Expr, locals: &LocalContext) -> Option<String>
     match expr {
         Expr::Sort(_) | Expr::BVar(_) | Expr::Const { .. } => expr_repair_source(expr, locals),
         Expr::App(_, _) => Some(format!("({})", expr_repair_source(expr, locals)?)),
-        Expr::Lam { .. } | Expr::Pi { .. } | Expr::Let { .. } => None,
+        Expr::Lam { .. } | Expr::Pi { .. } => None,
     }
 }
 
@@ -1668,30 +1633,6 @@ impl TermResolver {
                     span,
                 })
             }
-            MachineTerm::Let {
-                name,
-                ty,
-                value,
-                body,
-                span,
-            } => {
-                self.ensure_local_does_not_shadow_global(&name, span)?;
-                let ty = self.resolve_term(*ty, locals, universe_params)?;
-                let value = self.resolve_term(*value, locals, universe_params)?;
-                let mut nested_locals = locals.clone();
-                nested_locals.push(name.clone());
-                Ok(MachineTerm::Let {
-                    name,
-                    ty: Box::new(ty),
-                    value: Box::new(value),
-                    body: Box::new(self.resolve_term(
-                        *body,
-                        &mut nested_locals,
-                        universe_params,
-                    )?),
-                    span,
-                })
-            }
             MachineTerm::Annot { expr, ty, span } => Ok(MachineTerm::Annot {
                 expr: Box::new(self.resolve_term(*expr, locals, universe_params)?),
                 ty: Box::new(self.resolve_term(*ty, locals, universe_params)?),
@@ -1844,13 +1785,6 @@ impl TermResolver {
                 for binder in binders {
                     self.collect_constants_from_resolved_term(&binder.ty, constants)?;
                 }
-                self.collect_constants_from_resolved_term(body, constants)?;
-            }
-            MachineTerm::Let {
-                ty, value, body, ..
-            } => {
-                self.collect_constants_from_resolved_term(ty, constants)?;
-                self.collect_constants_from_resolved_term(value, constants)?;
                 self.collect_constants_from_resolved_term(body, constants)?;
             }
             MachineTerm::Annot { expr, ty, .. } => {
@@ -2075,14 +2009,6 @@ fn hash_owner_free_core_expr(expr: &Expr) -> npa_cert::Hash {
             payload.extend(hash_owner_free_core_expr(ty));
             payload.extend(hash_owner_free_core_expr(body));
         }
-        Expr::Let {
-            ty, value, body, ..
-        } => {
-            payload.push(0x06);
-            payload.extend(hash_owner_free_core_expr(ty));
-            payload.extend(hash_owner_free_core_expr(value));
-            payload.extend(hash_owner_free_core_expr(body));
-        }
     }
 
     hash_with_domain(b"NPA-KERNEL-CORE-EXPR-0.1", &payload)
@@ -2190,18 +2116,10 @@ fn hash_contextual_core_expr_with_refs(
             payload.extend(hash_contextual_core_expr_with_refs(ty, refs, span)?);
             payload.extend(hash_contextual_core_expr_with_refs(body, refs, span)?);
         }
-        Expr::Let {
-            ty, value, body, ..
-        } => {
-            payload.push(0x06);
-            payload.extend(hash_contextual_core_expr_with_refs(ty, refs, span)?);
-            payload.extend(hash_contextual_core_expr_with_refs(value, refs, span)?);
-            payload.extend(hash_contextual_core_expr_with_refs(body, refs, span)?);
-        }
     }
 
     Ok(hash_with_domain(
-        b"NPA-FRONTEND-MACHINE-TERM-CONTEXT-0.1",
+        b"NPA-FRONTEND-MACHINE-TERM-CONTEXT-0.2",
         &payload,
     ))
 }
@@ -2304,12 +2222,7 @@ fn hash_with_domain(domain: &[u8], payload: &[u8]) -> npa_cert::Hash {
 fn local_context_from_machine(locals: &[MachineLocalDecl]) -> LocalContext {
     let mut context = LocalContext::default();
     for local in locals {
-        match &local.value {
-            Some(value) => {
-                context.push_definition(local.name.clone(), local.ty.clone(), value.clone())
-            }
-            None => context.push_assumption(local.name.clone(), local.ty.clone()),
-        }
+        context.push_assumption(local.name.clone(), local.ty.clone());
     }
     context
 }
@@ -2492,6 +2405,33 @@ fn certificate_import_selection_for_module_refs(
     verified_modules: &[&npa_cert::VerifiedModule],
     file_id: crate::FileId,
 ) -> Result<CertificateImportSelection> {
+    let imports = verified_modules
+        .iter()
+        .map(|module| *module as &dyn FrontendCertificateImportView)
+        .collect::<Vec<_>>();
+    certificate_import_selection_for_views(module, active_import_indices, &imports, file_id)
+}
+
+pub(crate) fn certificate_import_indices_and_providers_for_authoring_imports(
+    module: &npa_cert::CoreModule,
+    active_import_indices: &[usize],
+    authoring_imports: &[crate::HumanAuthoringImport<'_>],
+    file_id: crate::FileId,
+) -> Result<(Vec<usize>, BTreeMap<npa_cert::Name, npa_cert::ImportEntry>)> {
+    let imports = authoring_imports
+        .iter()
+        .map(|import| import as &dyn FrontendCertificateImportView)
+        .collect::<Vec<_>>();
+    certificate_import_selection_for_views(module, active_import_indices, &imports, file_id)
+        .map(|selection| (selection.indices, selection.preferred_imports))
+}
+
+fn certificate_import_selection_for_views(
+    module: &npa_cert::CoreModule,
+    active_import_indices: &[usize],
+    imports: &[&dyn FrontendCertificateImportView],
+    file_id: crate::FileId,
+) -> Result<CertificateImportSelection> {
     let span = crate::Span::empty(file_id);
     let referenced_exports = referenced_import_names(module);
     let mut selected = BTreeSet::new();
@@ -2501,7 +2441,7 @@ fn certificate_import_selection_for_module_refs(
 
     for index in active_import_indices.iter().copied() {
         selected.insert(index);
-        let import = verified_modules.get(index).copied().ok_or_else(|| {
+        let import = imports.get(index).copied().ok_or_else(|| {
             import_resolution_diagnostic(span, "verified import index is out of bounds")
         })?;
         enqueue_referenced_import_exports(
@@ -2520,17 +2460,13 @@ fn certificate_import_selection_for_module_refs(
             continue;
         }
 
-        let import = verified_modules
-            .get(export.import_index)
-            .copied()
-            .ok_or_else(|| {
-                import_resolution_diagnostic(span, "verified import index is out of bounds")
-            })?;
+        let import = imports.get(export.import_index).copied().ok_or_else(|| {
+            import_resolution_diagnostic(span, "verified import index is out of bounds")
+        })?;
         let entry = find_verified_module_export_entry(import, &export, span)?;
         for dependency in export_interface_dependency_targets(import, entry, span)? {
-            let dependency_index =
-                find_verified_module_export_ref(verified_modules, &dependency, span)?;
-            let dependency_import = verified_modules[dependency_index];
+            let dependency_index = find_verified_module_export_ref(imports, &dependency, span)?;
+            let dependency_import = imports[dependency_index];
             record_preferred_import(
                 &mut preferred_imports,
                 dependency.name.clone(),
@@ -2547,8 +2483,8 @@ fn certificate_import_selection_for_module_refs(
 
         for dependency in export_axiom_dependency_targets(import, entry, span)? {
             let dependency_index =
-                find_verified_module_axiom_export_ref(verified_modules, &dependency, span)?;
-            let dependency_import = verified_modules[dependency_index];
+                find_verified_module_axiom_export_ref(imports, &dependency, span)?;
+            let dependency_import = imports[dependency_index];
             record_preferred_import(
                 &mut preferred_imports,
                 dependency.name.clone(),
@@ -2593,7 +2529,7 @@ struct ImportDependencySource {
 
 fn enqueue_referenced_import_exports(
     index: usize,
-    module: &npa_cert::VerifiedModule,
+    module: &dyn FrontendCertificateImportView,
     referenced_exports: &BTreeSet<npa_cert::Name>,
     pending: &mut Vec<PendingCertificateImportExport>,
     preferred_imports: &mut BTreeMap<npa_cert::Name, npa_cert::ImportEntry>,
@@ -2618,7 +2554,7 @@ fn enqueue_referenced_import_exports(
 fn record_preferred_import(
     preferred_imports: &mut BTreeMap<npa_cert::Name, npa_cert::ImportEntry>,
     name: npa_cert::Name,
-    module: &npa_cert::VerifiedModule,
+    module: &dyn FrontendCertificateImportView,
     reject_conflict: bool,
     span: crate::Span,
 ) -> Result<()> {
@@ -2647,7 +2583,7 @@ fn record_preferred_import(
 }
 
 fn find_verified_module_export_entry<'a>(
-    module: &'a npa_cert::VerifiedModule,
+    module: &'a dyn FrontendCertificateImportView,
     export: &PendingCertificateImportExport,
     span: crate::Span,
 ) -> Result<&'a npa_cert::ExportEntry> {
@@ -2683,7 +2619,7 @@ fn find_verified_module_export_entry<'a>(
 }
 
 fn export_interface_dependency_targets(
-    module: &npa_cert::VerifiedModule,
+    module: &dyn FrontendCertificateImportView,
     entry: &npa_cert::ExportEntry,
     span: crate::Span,
 ) -> Result<BTreeSet<ImportDependencyTarget>> {
@@ -2700,7 +2636,7 @@ fn export_interface_dependency_targets(
 }
 
 fn collect_export_interface_dependency_targets(
-    module: &npa_cert::VerifiedModule,
+    module: &dyn FrontendCertificateImportView,
     entry: &npa_cert::ExportEntry,
     dependencies: &mut BTreeSet<ImportDependencyTarget>,
     scanned_exports: &mut BTreeSet<(npa_cert::NameId, npa_cert::Hash)>,
@@ -2754,7 +2690,7 @@ fn collect_export_interface_dependency_targets(
 }
 
 fn collect_imported_dependency_targets_from_term(
-    module: &npa_cert::VerifiedModule,
+    module: &dyn FrontendCertificateImportView,
     term: npa_cert::TermId,
     dependencies: &mut BTreeSet<ImportDependencyTarget>,
     scanned_exports: &mut BTreeSet<(npa_cert::NameId, npa_cert::Hash)>,
@@ -2866,38 +2802,12 @@ fn collect_imported_dependency_targets_from_term(
                 span,
             )?;
         }
-        npa_cert::TermNode::Let { ty, value, body } => {
-            collect_imported_dependency_targets_from_term(
-                module,
-                *ty,
-                dependencies,
-                scanned_exports,
-                skip_local_decl_index,
-                span,
-            )?;
-            collect_imported_dependency_targets_from_term(
-                module,
-                *value,
-                dependencies,
-                scanned_exports,
-                skip_local_decl_index,
-                span,
-            )?;
-            collect_imported_dependency_targets_from_term(
-                module,
-                *body,
-                dependencies,
-                scanned_exports,
-                skip_local_decl_index,
-                span,
-            )?;
-        }
     }
     Ok(())
 }
 
 fn source_decl_index_for_verified_export(
-    module: &npa_cert::VerifiedModule,
+    module: &dyn FrontendCertificateImportView,
     entry: &npa_cert::ExportEntry,
     span: crate::Span,
 ) -> Result<usize> {
@@ -2926,7 +2836,7 @@ fn source_decl_index_for_verified_export(
 }
 
 fn find_verified_module_local_export_entry(
-    module: &npa_cert::VerifiedModule,
+    module: &dyn FrontendCertificateImportView,
     decl_index: usize,
     span: crate::Span,
 ) -> Result<&npa_cert::ExportEntry> {
@@ -2945,7 +2855,7 @@ fn find_verified_module_local_export_entry(
 }
 
 fn find_verified_module_local_generated_export_entry(
-    module: &npa_cert::VerifiedModule,
+    module: &dyn FrontendCertificateImportView,
     _decl_index: usize,
     name: npa_cert::NameId,
     span: crate::Span,
@@ -3069,7 +2979,7 @@ fn verified_decl_term_ids(decl: &npa_cert::DeclPayload) -> Vec<npa_cert::TermId>
 }
 
 fn export_axiom_dependency_targets(
-    module: &npa_cert::VerifiedModule,
+    module: &dyn FrontendCertificateImportView,
     entry: &npa_cert::ExportEntry,
     span: crate::Span,
 ) -> Result<BTreeSet<ImportDependencyTarget>> {
@@ -3117,7 +3027,7 @@ fn export_axiom_dependency_targets(
 }
 
 fn find_verified_module_export_ref(
-    verified_modules: &[&npa_cert::VerifiedModule],
+    verified_modules: &[&dyn FrontendCertificateImportView],
     dependency: &ImportDependencyTarget,
     span: crate::Span,
 ) -> Result<usize> {
@@ -3125,7 +3035,7 @@ fn find_verified_module_export_ref(
 }
 
 fn find_verified_module_axiom_export_ref(
-    verified_modules: &[&npa_cert::VerifiedModule],
+    verified_modules: &[&dyn FrontendCertificateImportView],
     dependency: &ImportDependencyTarget,
     span: crate::Span,
 ) -> Result<usize> {
@@ -3138,7 +3048,7 @@ fn find_verified_module_axiom_export_ref(
 }
 
 fn find_verified_module_export_by(
-    verified_modules: &[&npa_cert::VerifiedModule],
+    verified_modules: &[&dyn FrontendCertificateImportView],
     dependency: &ImportDependencyTarget,
     kind: Option<npa_cert::ExportKind>,
     span: crate::Span,
@@ -3147,7 +3057,7 @@ fn find_verified_module_export_by(
         .iter()
         .enumerate()
         .filter_map(|(index, module)| {
-            if !dependency_source_matches_module(dependency.import.as_ref(), module) {
+            if !dependency_source_matches_module(dependency.import.as_ref(), *module) {
                 return None;
             }
             module
@@ -3186,7 +3096,7 @@ fn find_verified_module_export_by(
 
 fn dependency_source_matches_module(
     source: Option<&ImportDependencySource>,
-    module: &npa_cert::VerifiedModule,
+    module: &dyn FrontendCertificateImportView,
 ) -> bool {
     let Some(source) = source else {
         return true;
@@ -3309,13 +3219,6 @@ fn collect_const_names_from_expr(names: &mut BTreeSet<npa_cert::Name>, expr: &Ex
             collect_const_names_from_expr(names, ty);
             collect_const_names_from_expr(names, body);
         }
-        Expr::Let {
-            ty, value, body, ..
-        } => {
-            collect_const_names_from_expr(names, ty);
-            collect_const_names_from_expr(names, value);
-            collect_const_names_from_expr(names, body);
-        }
     }
 }
 
@@ -3390,9 +3293,9 @@ struct PendingKernelDecl {
     loaded_decl_keys: BTreeSet<LoadedImportDeclKey>,
 }
 
-pub(crate) fn kernel_env_from_verified_imports<'a>(
-    active_imports: impl IntoIterator<Item = &'a VerifiedImport>,
-    available_imports: &'a [VerifiedImport],
+pub(crate) fn kernel_env_from_verified_imports<'a, T: FrontendImportView + 'a>(
+    active_imports: impl IntoIterator<Item = &'a T>,
+    available_imports: &'a [T],
     allow_builtin_kernel_decls: bool,
     span: crate::Span,
 ) -> Result<Env> {
@@ -3405,9 +3308,9 @@ pub(crate) fn kernel_env_from_verified_imports<'a>(
     )
 }
 
-pub(crate) fn kernel_env_from_verified_imports_observed<'a>(
-    active_imports: impl IntoIterator<Item = &'a VerifiedImport>,
-    available_imports: &'a [VerifiedImport],
+pub(crate) fn kernel_env_from_verified_imports_observed<'a, T: FrontendImportView + 'a>(
+    active_imports: impl IntoIterator<Item = &'a T>,
+    available_imports: &'a [T],
     allow_builtin_kernel_decls: bool,
     span: crate::Span,
     work_counter_sink: Option<&KernelWorkCounterSink>,
@@ -3422,9 +3325,9 @@ pub(crate) fn kernel_env_from_verified_imports_observed<'a>(
     .map(|build| build.env)
 }
 
-fn kernel_env_from_imports<'a>(
-    active_imports: impl IntoIterator<Item = &'a VerifiedImport>,
-    available_imports: &'a [VerifiedImport],
+fn kernel_env_from_imports<'a, T: FrontendImportView + 'a>(
+    active_imports: impl IntoIterator<Item = &'a T>,
+    available_imports: &'a [T],
     allow_builtin_kernel_decls: bool,
     span: crate::Span,
 ) -> Result<KernelEnvBuild> {
@@ -3437,9 +3340,9 @@ fn kernel_env_from_imports<'a>(
     )
 }
 
-fn kernel_env_from_imports_observed<'a>(
-    active_imports: impl IntoIterator<Item = &'a VerifiedImport>,
-    available_imports: &'a [VerifiedImport],
+fn kernel_env_from_imports_observed<'a, T: FrontendImportView + 'a>(
+    active_imports: impl IntoIterator<Item = &'a T>,
+    available_imports: &'a [T],
     allow_builtin_kernel_decls: bool,
     span: crate::Span,
     work_counter_sink: Option<&KernelWorkCounterSink>,
@@ -4425,14 +4328,14 @@ fn add_builtin_decl_for_unknown_constant(
     Ok(true)
 }
 
-fn add_builtin_eq_rec_for_generated_import_exports<'a>(
+fn add_builtin_eq_rec_for_generated_import_exports<'a, T: FrontendImportView + 'a>(
     env: &mut Env,
-    imports: impl IntoIterator<Item = &'a VerifiedImport>,
+    imports: impl IntoIterator<Item = &'a T>,
     span: crate::Span,
 ) -> Result<()> {
     let needs_eq_rec = imports.into_iter().any(|import| {
         import
-            .exports
+            .exports()
             .iter()
             .any(|export| import_export_uses_builtin_eq_rec(import, export))
     });
@@ -4448,10 +4351,13 @@ fn add_builtin_eq_rec_for_generated_import_exports<'a>(
     .map_err(|err| builtin_kernel_diagnostic(span, err))
 }
 
-fn import_export_uses_builtin_eq_rec(import: &VerifiedImport, export: &VerifiedExport) -> bool {
+fn import_export_uses_builtin_eq_rec(
+    import: &impl FrontendImportView,
+    export: &VerifiedExport,
+) -> bool {
     export.name.as_dotted() == "Eq.rec"
         && import
-            .kernel_decls
+            .kernel_declarations()
             .iter()
             .any(|decl| matches!(decl, Decl::Inductive { name, .. } if name == "Eq"))
 }
@@ -4614,14 +4520,14 @@ fn append_checked_current_decls_to_context(
     Ok(())
 }
 
-fn validate_direct_kernel_env_matches_import_exports(
+fn validate_direct_kernel_env_matches_import_exports<T: FrontendImportView>(
     env: &Env,
-    imports: &[VerifiedImport],
+    imports: &[T],
     direct_decls: &BTreeMap<String, Option<Decl>>,
     span: crate::Span,
 ) -> Result<()> {
     for import in imports {
-        for export in &import.exports {
+        for export in import.exports() {
             let name = export.name.as_dotted();
             if direct_decls.get(&name).is_some_and(Option::is_none) {
                 continue;
@@ -4631,7 +4537,7 @@ fn validate_direct_kernel_env_matches_import_exports(
                     span,
                     format!(
                         "verified import {} exports {name}, but the kernel environment has no matching declaration",
-                        import.module.as_dotted()
+                        import.module().as_dotted()
                     ),
                 ));
             };
@@ -4643,7 +4549,7 @@ fn validate_direct_kernel_env_matches_import_exports(
                     span,
                     format!(
                         "verified import {} export {name} does not match its kernel declaration",
-                        import.module.as_dotted()
+                        import.module().as_dotted()
                     ),
                 ));
             }
@@ -4653,14 +4559,14 @@ fn validate_direct_kernel_env_matches_import_exports(
     Ok(())
 }
 
-fn validate_loaded_available_kernel_env_matches_import_exports(
+fn validate_loaded_available_kernel_env_matches_import_exports<T: FrontendImportView>(
     env: &Env,
-    imports: &[VerifiedImport],
+    imports: &[T],
     loaded_interfaces: &BTreeSet<DeclInterfaceKey>,
     span: crate::Span,
 ) -> Result<()> {
     for import in imports {
-        for export in &import.exports {
+        for export in import.exports() {
             let name = export.name.as_dotted();
             let key = DeclInterfaceKey {
                 name: name.clone(),
@@ -4674,7 +4580,7 @@ fn validate_loaded_available_kernel_env_matches_import_exports(
                     span,
                     format!(
                         "verified import {} exports {name}, but the kernel environment has no matching declaration",
-                        import.module.as_dotted()
+                        import.module().as_dotted()
                     ),
                 ));
             };
@@ -4686,7 +4592,7 @@ fn validate_loaded_available_kernel_env_matches_import_exports(
                     span,
                     format!(
                         "verified import {} export {name} does not match its kernel declaration",
-                        import.module.as_dotted()
+                        import.module().as_dotted()
                     ),
                 ));
             }
@@ -4696,8 +4602,8 @@ fn validate_loaded_available_kernel_env_matches_import_exports(
     Ok(())
 }
 
-fn collect_import_decls<'a>(
-    imports: impl IntoIterator<Item = &'a VerifiedImport>,
+fn collect_import_decls<'a, T: FrontendImportView + 'a>(
+    imports: impl IntoIterator<Item = &'a T>,
 ) -> BTreeMap<String, Option<Decl>> {
     collect_import_decl_infos(imports)
         .into_iter()
@@ -4705,8 +4611,8 @@ fn collect_import_decls<'a>(
         .collect()
 }
 
-fn collect_import_decl_infos<'a>(
-    imports: impl IntoIterator<Item = &'a VerifiedImport>,
+fn collect_import_decl_infos<'a, T: FrontendImportView + 'a>(
+    imports: impl IntoIterator<Item = &'a T>,
 ) -> BTreeMap<String, Option<ImportKernelDecl>> {
     let mut decls: BTreeMap<String, Option<ImportKernelDecl>> = BTreeMap::new();
 
@@ -4715,7 +4621,7 @@ fn collect_import_decl_infos<'a>(
         for decl in kernel_decls_for_import(import) {
             let lookup_names = kernel_decl_lookup_names(&decl);
             let interfaces = import
-                .exports
+                .exports()
                 .iter()
                 .filter_map(|export| {
                     let name = export.name.as_dotted();
@@ -4766,21 +4672,21 @@ fn collect_import_decl_infos<'a>(
     decls
 }
 
-fn import_key_for_import(import: &VerifiedImport) -> ImportKey {
+fn import_key_for_import(import: &impl FrontendImportView) -> ImportKey {
     ImportKey {
-        module: import.module.clone(),
-        export_hash: import.export_hash,
+        module: import.module().clone(),
+        export_hash: import.export_hash(),
     }
 }
 
-fn collect_import_decl_interface_infos<'a>(
-    imports: impl IntoIterator<Item = &'a VerifiedImport>,
+fn collect_import_decl_interface_infos<'a, T: FrontendImportView + 'a>(
+    imports: impl IntoIterator<Item = &'a T>,
 ) -> BTreeMap<DeclInterfaceKey, Option<ImportKernelDecl>> {
     let mut decls: BTreeMap<DeclInterfaceKey, Option<ImportKernelDecl>> = BTreeMap::new();
 
     for import in imports {
         let import_decls = collect_import_decl_infos(std::iter::once(import));
-        for export in &import.exports {
+        for export in import.exports() {
             let name = export.name.as_dotted();
             let key = DeclInterfaceKey {
                 name: name.clone(),
@@ -4804,15 +4710,15 @@ fn collect_import_decl_interface_infos<'a>(
     decls
 }
 
-fn collect_import_decl_import_interface_infos<'a>(
-    imports: impl IntoIterator<Item = &'a VerifiedImport>,
+fn collect_import_decl_import_interface_infos<'a, T: FrontendImportView + 'a>(
+    imports: impl IntoIterator<Item = &'a T>,
 ) -> BTreeMap<ImportDeclInterfaceKey, Option<ImportKernelDecl>> {
     let mut decls: BTreeMap<ImportDeclInterfaceKey, Option<ImportKernelDecl>> = BTreeMap::new();
 
     for import in imports {
         let import_key = import_key_for_import(import);
         let import_decls = collect_import_decl_infos(std::iter::once(import));
-        for export in &import.exports {
+        for export in import.exports() {
             let name = export.name.as_dotted();
             let key = ImportDeclInterfaceKey {
                 import_key: import_key.clone(),
@@ -4838,11 +4744,11 @@ fn collect_import_decl_import_interface_infos<'a>(
 }
 
 fn dependencies_for_import_decl(
-    import: &VerifiedImport,
+    import: &impl FrontendImportView,
     decl_name: &str,
 ) -> BTreeMap<String, BTreeSet<VerifiedDependency>> {
     let mut dependencies: BTreeMap<String, BTreeSet<VerifiedDependency>> = BTreeMap::new();
-    if let Some(decl_dependencies) = import.kernel_decl_dependencies.get(decl_name) {
+    if let Some(decl_dependencies) = import.kernel_declaration_dependencies().get(decl_name) {
         for dependency in decl_dependencies {
             dependencies
                 .entry(dependency.name.as_dotted())
@@ -4870,17 +4776,17 @@ fn kernel_decl_lookup_names(decl: &Decl) -> Vec<String> {
     names
 }
 
-fn kernel_decls_for_import(import: &VerifiedImport) -> Vec<Decl> {
-    if import.kernel_decls.is_empty() {
+fn kernel_decls_for_import(import: &impl FrontendImportView) -> Vec<Decl> {
+    if import.kernel_declarations().is_empty() {
         return fallback_kernel_decls_for_import(import);
     }
 
-    import.kernel_decls.clone()
+    import.kernel_declarations().to_vec()
 }
 
-fn fallback_kernel_decls_for_import(import: &VerifiedImport) -> Vec<Decl> {
+fn fallback_kernel_decls_for_import(import: &impl FrontendImportView) -> Vec<Decl> {
     import
-        .exports
+        .exports()
         .iter()
         .map(|export| Decl::Axiom {
             name: export.name.as_dotted(),
@@ -5751,11 +5657,11 @@ def Test.copy : UseRec.P := UseRec.w",
         .expect("certificate construction should receive transitive import dependencies");
 
         assert!(cert
-            .imports
+            .imports()
             .iter()
             .any(|import| import.module == npa_cert::Name::from_dotted("Test.UseRec")));
         assert!(cert
-            .imports
+            .imports()
             .iter()
             .any(|import| import.module == npa_cert::Name::from_dotted("Test.Unary")));
     }
@@ -6017,8 +5923,8 @@ def Test.copy : UseRec.P := UseRec.w",
             &MachineCompileOptions::default(),
         )
         .expect("machine source should compile to a certificate");
-        assert_eq!(cert.header.format, "NPA-CERT-0.3.0");
-        assert_eq!(cert.header.core_spec, "NPA-Core-0.3.0");
+        assert_eq!(cert.header().format, "NPA-CERT-0.4.0");
+        assert_eq!(cert.header().core_spec, "NPA-Core-0.4.0");
         let bytes = npa_cert::encode_module_cert(&cert).expect("certificate should encode");
         let decoded = npa_cert::decode_module_cert(&bytes).expect("certificate should decode");
         assert_eq!(decoded, cert);
@@ -6032,7 +5938,7 @@ def Test.copy : UseRec.P := UseRec.w",
     }
 
     #[test]
-    fn machine_opaque_definition_uses_local_body_and_emits_v0_3() {
+    fn machine_opaque_definition_uses_local_body_and_emits_v0_4() {
         let source = "opaque def Test.hidden (P : Prop) : Prop := P\ntheorem Test.same (P : Prop) (p : P) : Test.hidden P := p";
         let core = compile_machine_source_to_core(
             FileId(0),
@@ -6057,11 +5963,11 @@ def Test.copy : UseRec.P := UseRec.w",
             &[],
             &MachineCompileOptions::default(),
         )
-        .expect("opaque Machine source should certify through the current v0.3 builder");
-        assert_eq!(cert.header.format, "NPA-CERT-0.3.0");
-        assert_eq!(cert.header.core_spec, "NPA-Core-0.3.0");
+        .expect("opaque Machine source should certify through the current v0.4 builder");
+        assert_eq!(cert.header().format, "NPA-CERT-0.4.0");
+        assert_eq!(cert.header().core_spec, "NPA-Core-0.4.0");
         assert!(matches!(
-            cert.declarations[0].decl,
+            cert.declarations()[0].decl,
             npa_cert::DeclPayload::Def {
                 reducibility: npa_cert::CertReducibility::Opaque,
                 ..
@@ -6070,7 +5976,7 @@ def Test.copy : UseRec.P := UseRec.w",
         let bytes = npa_cert::encode_module_cert(&cert).unwrap();
         let mut session = npa_cert::VerifierSession::new();
         npa_cert::verify_module_cert(&bytes, &mut session, &npa_cert::AxiomPolicy::normal())
-            .expect("Machine-produced v0.3 certificate should verify source-free");
+            .expect("Machine-produced v0.4 certificate should verify source-free");
     }
 
     #[test]
@@ -6152,8 +6058,8 @@ def Test.copy : UseRec.P := UseRec.w",
         .expect("second certificate should compile");
 
         assert_eq!(
-            first.hashes.certificate_hash,
-            second.hashes.certificate_hash
+            first.hashes().certificate_hash,
+            second.hashes().certificate_hash
         );
         assert_eq!(
             npa_cert::encode_module_cert(&first).expect("first certificate should encode"),
@@ -6188,11 +6094,11 @@ def Test.id_nat (n : Nat) : Nat := n",
         )
         .expect("imported machine source should compile to a certificate");
 
-        assert_eq!(cert.imports.len(), 1);
-        assert_eq!(cert.imports[0].module, nat.module().clone());
-        assert_eq!(cert.imports[0].export_hash, nat.export_hash());
+        assert_eq!(cert.imports().len(), 1);
+        assert_eq!(cert.imports()[0].module, nat.module().clone());
+        assert_eq!(cert.imports()[0].export_hash, nat.export_hash());
         assert_eq!(
-            cert.imports[0].certificate_hash,
+            cert.imports()[0].certificate_hash,
             Some(nat.certificate_hash())
         );
 
@@ -6295,7 +6201,6 @@ theorem Test.self_eq (n : Nat) : Eq.{1} Nat n n := @Eq.refl.{1} Nat n",
             vec![MachineLocalDecl {
                 name: "n".to_owned(),
                 ty: nat(),
-                value: None,
             }],
             Vec::new(),
         );
@@ -6343,7 +6248,6 @@ theorem Test.self_eq (n : Nat) : Eq.{1} Nat n n := @Eq.refl.{1} Nat n",
             vec![MachineLocalDecl {
                 name: "n".to_owned(),
                 ty: nat(),
-                value: None,
             }],
             Vec::new(),
         );
@@ -6928,7 +6832,6 @@ theorem Test.self_eq (n : Nat) : Eq.{1} Nat n n := @Eq.refl.{1} Nat n",
             vec![MachineLocalDecl {
                 name: "n".to_owned(),
                 ty: nat(),
-                value: None,
             }],
             Vec::new(),
         );
@@ -7008,7 +6911,6 @@ theorem Test.self_eq (n : Nat) : Eq.{1} Nat n n := @Eq.refl.{1} Nat n",
             vec![MachineLocalDecl {
                 name: "n".to_owned(),
                 ty: nat(),
-                value: None,
             }],
             Vec::new(),
         );
@@ -7091,7 +6993,6 @@ theorem Test.self_eq (n : Nat) : Eq.{1} Nat n n := @Eq.refl.{1} Nat n",
             vec![MachineLocalDecl {
                 name: "n".to_owned(),
                 ty: nat(),
-                value: None,
             }],
             Vec::new(),
         );
@@ -7123,7 +7024,6 @@ theorem Test.self_eq (n : Nat) : Eq.{1} Nat n n := @Eq.refl.{1} Nat n",
             vec![MachineLocalDecl {
                 name: "f".to_owned(),
                 ty: Expr::pi("x", nat(), nat()),
-                value: None,
             }],
             Vec::new(),
         );
@@ -7149,7 +7049,6 @@ theorem Test.self_eq (n : Nat) : Eq.{1} Nat n n := @Eq.refl.{1} Nat n",
             vec![MachineLocalDecl {
                 name: "x".to_owned(),
                 ty: nat(),
-                value: None,
             }],
             Vec::new(),
         );
@@ -7174,7 +7073,6 @@ theorem Test.self_eq (n : Nat) : Eq.{1} Nat n n := @Eq.refl.{1} Nat n",
             vec![MachineLocalDecl {
                 name: "A".to_owned(),
                 ty: Expr::sort(Level::max(Level::param("u"), Level::param("v"))),
-                value: None,
             }],
             vec!["u".to_owned(), "v".to_owned()],
         );
@@ -7231,7 +7129,6 @@ theorem Test.self_eq (n : Nat) : Eq.{1} Nat n n := @Eq.refl.{1} Nat n",
             vec![MachineLocalDecl {
                 name: "n".to_owned(),
                 ty: nat(),
-                value: None,
             }],
             Vec::new(),
         );
@@ -7282,7 +7179,6 @@ theorem Test.bad (n : Nat) : Eq.{1} Nat n n := refl",
             vec![MachineLocalDecl {
                 name: "Nat".to_owned(),
                 ty: Expr::sort(type0()),
-                value: None,
             }],
             Vec::new(),
         );
@@ -7359,17 +7255,17 @@ theorem Test.bad (A : Type) (x : A) : A := fun (y : A) => y",
     }
 
     #[test]
-    fn elaborates_lambda_pi_let_and_annotation() {
+    fn elaborates_lambda_pi_and_annotation() {
         compile_machine_source_to_core(
             FileId(0),
             npa_cert::Name::from_dotted("Test"),
             "\
 def Test.term.{u} (A : Sort u) : (forall (x : A), A) :=
-  fun (x : A) => let y : A := x in (y : A)",
+  fun (x : A) => (x : A)",
             &[],
             &MachineCompileOptions::default(),
         )
-        .expect("lambda, Pi, let, and annotation should elaborate");
+        .expect("lambda, Pi, and annotation should elaborate");
     }
 
     #[test]

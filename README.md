@@ -92,6 +92,7 @@ historical v0.2.0 reference. The `npa package ...` command family uses an
 explicit package root:
 
 ```sh
+npa package check-source-structure --root . --json
 npa package check --root . --json
 npa package build-certs --root . --check --json
 npa package verify-certs --root . --package-lock checked --checker reference \
@@ -101,6 +102,47 @@ npa package axiom-report --root . --check --json
 npa package index --root . --check --json
 npa package audit-artifact-ledger --root . --json
 ```
+
+Run `check-source-structure` after each direct Human Surface edit. With no
+selector it checks every manifest module; repeated `--module` checks registered
+modules, and repeated `--path` checks package-relative files without loading a
+manifest. It uses the production lexer, ignores brackets inside comments and
+strings, and reports both sides of a delimiter mismatch in structured JSON.
+This read-only check is authoring feedback, not parsing or proof evidence.
+
+For an advisory targeted authoring loop, `build-certs` has this closed
+build-check cache mode set:
+
+| `--build-check-cache` | Allowed build | Support behavior | Result boundary |
+| --- | --- | --- | --- |
+| `off` | every supported build shape | no cache-only work | ordinary live result |
+| `read-through` | full or targeted `--check` | checks everything live; records diagnostics and may warm eligible entries | ordinary live result; cache metadata is not evidence |
+| `local-hit` | targeted `--check --module ...` or `--check --changed` only | reuses exact eligible support contexts; checks misses live | local-only authoring feedback |
+
+For example:
+
+```sh
+npa package build-certs --root . --check --module Proofs.Example \
+  --build-check-cache read-through --json
+npa package build-certs --root . --check --module Proofs.Example \
+  --build-check-cache local-hit --json
+```
+
+`read-through` always performs every selected build and support check live.
+`build-certs --build-check-cache local-hit` may avoid eligible support checks,
+but every reached explicit target is still built fresh and the whole result is
+`trusted=false`, `build_evidence=false`, and `proof_evidence=false`. Both
+non-off modes may write only their automatically placed external local stores;
+`build-certs --build-check-cache local-hit` publishes only eligible cache-free
+live miss subtrees. They never write canonical package artifacts. Store failure
+produces a bounded diagnostic and falls back to live work.
+
+This option is distinct from `verify-certs --audit-cache local-hit`: the flags
+belong to different commands and stores, and neither cache hit is proof
+evidence. Canonical `.npcert` bytes become acceptable proof evidence only after
+the ordinary cache-disabled source-free checker gates, including the reference
+checker wherever package policy requires it. Keep completion and release
+commands cache-off.
 
 The Mathlib interface-proposal validator is a separate curation-only command:
 
@@ -130,6 +172,58 @@ npa package verify-certs --root . --changed --package-lock checked \
 are changed in Git, plus certificate imports needed by the verifier. It does not
 run `build-certs` or read source/replay/meta artifacts.
 
+For an explicit source-free subset, repeat `--module` with local logical module
+names. The verifier checks those seeds plus their exact transitive import
+closure in canonical order:
+
+```sh
+npa package verify-certs --root . \
+  --module Proofs.Example --module Proofs.Support \
+  --package-lock checked --checker reference \
+  --audit-cache off --verifier-memo off --json
+```
+
+For a clean committed branch, `--base REF` resolves `REF`, `HEAD`, and their
+unique merge base, rejects any staged, unstaged, deleted, or untracked protected
+package input (including inputs hidden by `assume-unchanged`, `skip-worktree`,
+incorrect fsmonitor hook output, weakened stat-cache settings, or a tracked
+gitlink/symlink ancestor). It also rejects a protected leaf whose index entry
+is not a stage-zero ordinary blob, including a symlink entry exposed as a
+regular file by `core.symlinks=false`. Index-to-`HEAD` and worktree-to-index
+diffs are checked separately so staged changes cannot be canceled by the final
+worktree snapshot, and raw `git hash-object --no-filters` identities prevent
+clean filters or end-of-line normalization from hiding different protected
+bytes. Protected queries also force executable-bit checking, so
+`core.fileMode=false` cannot hide a worktree mode change. The selector then
+uses no-follow metadata checks to reject exact protected files hidden inside
+an untracked embedded repository without reading their bodies. It then selects
+only structurally
+attributable committed module changes. Selector Git children discard every
+inherited `GIT_*` variable
+so the caller cannot redirect their repository, index, configuration injection,
+or exact pathspec protocol. Exact candidate queries pair each top-literal path
+with an atomic descendant exclusion and isolate path depths, so Git cannot
+reinterpret a directory-valued candidate as a recursive package-prefix query.
+Every selector child also disables replace-object
+substitution; base-mode children additionally disable lazy object fetching, so
+unavailable history fails locally and object IDs continue to name their
+original bytes. Package-wide, deleted, renamed, or otherwise uncertain
+changes escalate to the ordinary full verifier; an empty committed range fails
+rather than reporting proof success:
+
+```sh
+npa package verify-certs --root . --base origin/main \
+  --package-lock checked --checker reference \
+  --audit-cache off --verifier-memo off --json
+```
+
+`--changed`, `--module`, and `--base` are mutually exclusive. Partial selectors
+reject the external checker and non-off audit-cache or verifier-memo modes;
+`--base` additionally requires the checked package lock. Its bounded
+`npa.package.verify-selection.v0.1` summary is untrusted selection metadata,
+not a complete PR gate: run the package's canonical build, hash, lock, axiom,
+and policy gates at the same committed head/base boundary.
+
 For release-ready packages that check in `generated/publish-plan.json`, also
 run:
 
@@ -153,6 +247,19 @@ certificate files, local module hash pins in `npa-package.toml`, declared
 module `meta.json` ledgers, and `generated/package-lock.json`. It does not
 update external import pins, and it is artifact maintenance rather than proof
 evidence; source-free checker verification remains required.
+
+Canonical refresh performs a context-free lexer and delimiter preflight before
+reading certificates. Full refresh scans every local source first. Targeted
+`--module` and `--changed` refresh scans the explicit selected seeds, then
+processes only their dependency-closed priority prefix before reverse-only
+dependents and unrelated package artifacts. A parenthesis, string, parser,
+application-shape, resolver, elaborator, or kernel-handoff failure in selected
+work therefore stops before the deferred package closure while successful runs
+still verify and lock the complete package. Structured output reports
+`package_build_refresh_schedule`; timing-enabled JSON additionally reports
+`source_preflight_ms`, `priority_build_ms`, and `completion_build_ms` (full
+refresh omits `priority_build_ms`). These diagnostics and timings are untrusted
+authoring metadata, not proof evidence.
 
 After a successful refresh, run the non-mutating ledger audit:
 
@@ -195,6 +302,13 @@ cargo run --locked --offline -q --manifest-path npa-core/Cargo.toml -p npa-cli -
   --runner-policy-hash "$NPA_RUNNER_POLICY_HASH" \
   --checker-registry ci/checker-binaries.json --json
 ```
+
+This is the frozen invocation shape, not a currently enabled evidence path.
+The host now fails it before creating checker-import or checker-result files
+with `external_checker_supervisor_unavailable`. Re-enabling execution requires
+a descendant-owning supervisor that enforces memory and timeout and an
+authenticated checker step counter; reporting unavailable usage as zero is not
+accepted evidence.
 
 The `ci/...` locators are relative to `proofs`; Cargo's `--locked --offline`
 flags apply only to the development invocation. External checked evidence,
@@ -256,6 +370,11 @@ refactor plans, and command output are deterministic review and release
 metadata. They are not proof evidence.
 Downstream users must still verify hash-pinned certificate bytes with a
 source-free checker.
+
+Large theorem-premise reports use a bounded, hash-addressed chunk layout while
+retaining their complete canonical logical report. Small reports keep their
+existing bytes. See [bounded theorem-premise report storage](docs/npa-toolchain-reference-v0.8.0.md#bounded-theorem-premise-report-storage)
+for the index/chunk format, resource bounds, and archive requirements.
 
 ## Repository Layout
 

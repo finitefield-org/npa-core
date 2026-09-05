@@ -23,7 +23,6 @@ type t =
   | App of t * t
   | Lam of t * t
   | Pi of t * t
-  | Let of t * t * t
 
 type located = {
   term : t;
@@ -35,7 +34,7 @@ type located = {
   structural_hash : string;
 }
 
-type rebuild_kind = Rebuild_app | Rebuild_lam | Rebuild_pi | Rebuild_let
+type rebuild_kind = Rebuild_app | Rebuild_lam | Rebuild_pi
 type rebuild_frame = Visit of t | Rebuild of t * rebuild_kind
 
 module Term_identity_map = Hashtbl.Make (struct
@@ -84,11 +83,6 @@ let map_global_refs map_global_ref malformed root =
             | Pi (ty, body) ->
                 loop
                   (Visit ty :: Visit body :: Rebuild (term, Rebuild_pi) :: rest)
-                  results
-            | Let (ty, value, body) ->
-                loop
-                  (Visit ty :: Visit value :: Visit body
-                 :: Rebuild (term, Rebuild_let) :: rest)
                   results))
     | Rebuild (source, kind) :: rest -> (
         match (kind, results) with
@@ -102,10 +96,6 @@ let map_global_refs map_global_ref malformed root =
             loop rest (result :: tail)
         | Rebuild_pi, body :: ty :: tail ->
             let result = Pi (ty, body) in
-            Term_identity_map.replace mapped source result;
-            loop rest (result :: tail)
-        | Rebuild_let, body :: value :: ty :: tail ->
-            let result = Let (ty, value, body) in
             Term_identity_map.replace mapped source result;
             loop rest (result :: tail)
         | _ -> malformed ())
@@ -361,37 +351,6 @@ let read_table names levels reader =
                                     byte 0x05 ^ ty.structural_hash
                                     ^ body.structural_hash ),
                                   next )))
-                  | 0x06 ->
-                      bind
-                        (read_previous_term_id values index entry_offset
-                           after_tag)
-                        (fun (ty, after_ty) ->
-                          bind
-                            (read_previous_term_id values index entry_offset
-                               after_ty)
-                            (fun (value, after_value) ->
-                              bind
-                                (read_previous_term_id values index entry_offset
-                                   after_value)
-                                (fun (body, next) ->
-                                  Ok
-                                    ( ( Let
-                                          (ty.term, value.term, body.term),
-                                        1
-                                        + max ty.depth
-                                            (max value.depth body.depth),
-                                        1
-                                        + max ty.order_height
-                                            (max value.order_height
-                                               body.order_height),
-                                        capped_add 1
-                                          (capped_add ty.expanded
-                                             (capped_add value.expanded
-                                                body.expanded)),
-                                        byte 0x06 ^ ty.structural_hash
-                                        ^ value.structural_hash
-                                        ^ body.structural_hash ),
-                                      next ))))
                   | tag ->
                       Ext_bytes.error Ext_bytes.Term_table entry_offset
                         (Ext_bytes.Unknown_tag tag)

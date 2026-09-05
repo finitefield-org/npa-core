@@ -57,10 +57,6 @@ let rec contains_any_recursive_const families term =
   | Ext_term.Lam (ty, body) | Ext_term.Pi (ty, body) ->
       contains_any_recursive_const families ty
       || contains_any_recursive_const families body
-  | Ext_term.Let (ty, value, body) ->
-      contains_any_recursive_const families ty
-      || contains_any_recursive_const families value
-      || contains_any_recursive_const families body
 
 let collect_apps term =
   let rec loop current args =
@@ -213,10 +209,6 @@ let rec contains_recursive_const family term =
       contains_recursive_const family fn || contains_recursive_const family arg
   | Ext_term.Lam (ty, body) | Ext_term.Pi (ty, body) ->
       contains_recursive_const family ty || contains_recursive_const family body
-  | Ext_term.Let (ty, value, body) ->
-      contains_recursive_const family ty
-      || contains_recursive_const family value
-      || contains_recursive_const family body
 
 let bvar_for_abs ctx_len abs_index =
   if abs_index < 0 || abs_index >= ctx_len then None
@@ -318,7 +310,7 @@ let rec recursive_occurrences_strictly_positive env family domain ctx_len =
     | Ext_term.Pi (ty, body) ->
         (not (contains_recursive_const family ty))
         && recursive_occurrences_strictly_positive env family body (ctx_len + 1)
-    | Ext_term.Lam _ | Ext_term.Let _ ->
+    | Ext_term.Lam _ ->
         not (contains_recursive_const family domain)
 
 let check_domain_positive env family domain_index domain =
@@ -362,7 +354,7 @@ let rec mutual_occurrences_strictly_positive env families domain ctx_len =
     | Ext_term.Pi (ty, body) ->
         (not (contains_any_recursive_const families ty))
         && mutual_occurrences_strictly_positive env families body (ctx_len + 1)
-    | Ext_term.Lam _ | Ext_term.Let _ ->
+    | Ext_term.Lam _ ->
         not (contains_any_recursive_const families domain)
 
 let check_mutual_constructor_domains env owner families domains =

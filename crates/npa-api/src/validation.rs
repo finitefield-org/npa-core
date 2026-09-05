@@ -32,6 +32,7 @@ pub enum MachineApiErrorKind {
     InvalidCandidate,
     InvalidBudget,
     UnsupportedTactic,
+    RemovedTermLet,
     MachineTermParseError,
     MachineTermElaborationError,
     UnknownName,
@@ -75,6 +76,7 @@ impl MachineApiErrorKind {
             Self::InvalidCandidate => "invalid_candidate",
             Self::InvalidBudget => "invalid_budget",
             Self::UnsupportedTactic => "unsupported_tactic",
+            Self::RemovedTermLet => "removed_term_let",
             Self::MachineTermParseError => "machine_term_parse_error",
             Self::MachineTermElaborationError => "machine_term_elaboration_error",
             Self::UnknownName => "unknown_name",
@@ -669,7 +671,10 @@ mod tests {
         let err = parse_request_body_with_limits(
             r#"{"outer":{"inner":0}}"#,
             MachineApiErrorKind::InvalidReplayPlan,
-            JsonParseLimits { max_depth: 1 },
+            JsonParseLimits {
+                max_depth: 1,
+                ..JsonParseLimits::default()
+            },
         )
         .unwrap_err();
 
@@ -694,6 +699,7 @@ mod tests {
             MachineApiErrorKind::InvalidReplayPlan,
             JsonParseLimits {
                 max_depth: usize::MAX,
+                ..JsonParseLimits::default()
             },
         )
         .unwrap_err();

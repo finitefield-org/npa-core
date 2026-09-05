@@ -1,7 +1,5 @@
 //! Implementation of `npa package check-hashes`.
 
-use std::fs;
-
 use npa_package::{
     build_package_lock_from_package_root, format_package_hash, package_file_hash,
     parse_package_lock_json, PackageHash, PackagePath,
@@ -9,7 +7,8 @@ use npa_package::{
 
 use crate::args::PackageCommonOptions;
 use crate::diagnostic::{CommandDiagnostic, CommandResult, DiagnosticKind};
-use crate::fs::{join_package_path, render_package_path};
+use crate::fs::render_package_path;
+use crate::generated_artifact_writer::read_package_regular_file_no_follow;
 use crate::package::{load_package_root, LoadedPackageRoot};
 
 const COMMAND: &str = "package check-hashes";
@@ -65,16 +64,8 @@ pub fn run_package_check_hashes(options: PackageCommonOptions) -> CommandResult 
 }
 
 fn check_source_hashes(loaded: &LoadedPackageRoot) -> Option<CommandDiagnostic> {
-    for (index, module) in loaded.validated.manifest().modules.iter().enumerate() {
-        let path = match join_package_path(
-            &loaded.root,
-            &module.source,
-            format!("modules[{index}].source"),
-        ) {
-            Ok(path) => path,
-            Err(diagnostic) => return Some(*diagnostic),
-        };
-        let bytes = match fs::read(&path) {
+    for module in &loaded.validated.manifest().modules {
+        let bytes = match read_package_regular_file_no_follow(&loaded.root, &module.source) {
             Ok(bytes) => bytes,
             Err(_) => {
                 return Some(
@@ -102,13 +93,12 @@ fn check_package_lock(
     regenerated_lock_json: &str,
 ) -> Option<CommandDiagnostic> {
     let lock_path = PackagePath::new(PACKAGE_LOCK_PATH);
-    let full_lock_path = match join_package_path(&loaded.root, &lock_path, "package_lock.path") {
-        Ok(path) => path,
-        Err(diagnostic) => return Some(*diagnostic),
-    };
-    let lock_source = match fs::read_to_string(&full_lock_path) {
-        Ok(source) => source,
-        Err(_) => {
+    let lock_source = match read_package_regular_file_no_follow(&loaded.root, &lock_path)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+    {
+        Some(source) => source,
+        None => {
             return Some(
                 CommandDiagnostic::error(DiagnosticKind::PackageLock, "package_lock_missing")
                     .with_path(PACKAGE_LOCK_PATH),

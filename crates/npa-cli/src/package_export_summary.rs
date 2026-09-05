@@ -1,6 +1,6 @@
 //! Implementation of `npa package export-summary`.
 
-use std::{fs, io, path::Path};
+use std::{io, path::Path};
 
 use npa_api::{
     project_package_verified_export_summary_from_extraction, PackageArtifactReferenceSummaryMode,
@@ -16,11 +16,15 @@ use npa_package::{
 
 use crate::args::{PackageCommonOptions, PackageExportSummaryOptions};
 use crate::diagnostic::{CommandArtifact, CommandDiagnostic, CommandResult, DiagnosticKind};
-use crate::fs::{join_package_path, render_package_root, validate_package_output_path};
+use crate::fs::{render_package_root, validate_package_output_path};
+use crate::generated_artifact_writer::{
+    read_package_generated_artifact_no_follow, write_package_generated_artifact_under_lock,
+};
 use crate::package_artifacts::{
     load_package_artifact_extraction_with_timings, LoadedPackageArtifactExtraction,
     LoadedPackageAuditSnapshot, PackageGeneratedArtifactReadMode,
 };
+use crate::package_promotion_transaction::TargetLock;
 use crate::timing::{
     PackageTimingCollector, TIMING_ARTIFACT_COMPARE_MS, TIMING_JSON_WRITE_MS, TIMING_PROJECTION_MS,
     TIMING_SELECTION_MS,
@@ -313,12 +317,22 @@ fn run_package_export_summary_write(
             );
         }
     };
+    let mutation_lock = match TargetLock::acquire(&options.root) {
+        Ok(lock) => lock,
+        Err(_) => {
+            return CommandResult::failed(
+                COMMAND,
+                render_package_root(&options.root),
+                vec![write_failed_diagnostic(&target)],
+            );
+        }
+    };
     let (loaded, _summary, summary_json) = match generate_export_summary(&options, timings) {
         Ok(generated) => generated,
         Err(result) => return result,
     };
     let write_result = timings.time_phase(TIMING_JSON_WRITE_MS, || {
-        write_export_summary(&options, &target, summary_json.as_bytes())
+        write_export_summary(&options, &target, summary_json.as_bytes(), &mutation_lock)
     });
     if let Err(diagnostic) = write_result {
         return CommandResult::failed(COMMAND, loaded.root_display, vec![*diagnostic]);
@@ -437,20 +451,26 @@ fn read_export_summary(
     options: &PackageCommonOptions,
     target: &PackagePath,
 ) -> Result<String, Box<CommandDiagnostic>> {
-    let full_path = join_package_path(
-        &options.root,
-        target,
-        "generated.verified_export_summary.path",
-    )?;
-    fs::read_to_string(full_path).map_err(|error| {
-        let reason = if error.kind() == io::ErrorKind::NotFound {
-            "verified_export_summary_missing"
-        } else {
-            "generated_artifact_read_failed"
-        };
+    String::from_utf8(
+        read_package_generated_artifact_no_follow(&options.root, target).map_err(|error| {
+            let reason = if error.kind() == io::ErrorKind::NotFound {
+                "verified_export_summary_missing"
+            } else {
+                "generated_artifact_read_failed"
+            };
+            Box::new(
+                CommandDiagnostic::error(DiagnosticKind::GeneratedArtifact, reason)
+                    .with_path(target.as_str()),
+            )
+        })?,
+    )
+    .map_err(|_| {
         Box::new(
-            CommandDiagnostic::error(DiagnosticKind::GeneratedArtifact, reason)
-                .with_path(target.as_str()),
+            CommandDiagnostic::error(
+                DiagnosticKind::GeneratedArtifact,
+                "generated_artifact_read_failed",
+            )
+            .with_path(target.as_str()),
         )
     })
 }
@@ -459,22 +479,10 @@ fn write_export_summary(
     options: &PackageCommonOptions,
     target: &PackagePath,
     summary_json: &[u8],
+    mutation_lock: &TargetLock,
 ) -> Result<(), Box<CommandDiagnostic>> {
-    let full_path = join_package_path(
-        &options.root,
-        target,
-        "generated.verified_export_summary.path",
-    )?;
-    match fs::read(&full_path) {
-        Ok(existing) if existing == summary_json => return Ok(()),
-        Ok(_) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(_) => return Err(Box::new(write_failed_diagnostic(target))),
-    }
-    if let Some(parent) = full_path.parent() {
-        fs::create_dir_all(parent).map_err(|_| Box::new(write_failed_diagnostic(target)))?;
-    }
-    fs::write(full_path, summary_json).map_err(|_| Box::new(write_failed_diagnostic(target)))
+    write_package_generated_artifact_under_lock(&options.root, target, summary_json, mutation_lock)
+        .map_err(|_| Box::new(write_failed_diagnostic(target)))
 }
 
 fn passed_result(root_display: String, target: &PackagePath) -> CommandResult {

@@ -132,11 +132,11 @@ impl From<CertError> for ModuleCertImportRebindError {
 
 /// Rebind strict certificate hashes for export-stable local imports of one canonical certificate.
 ///
-/// The operation accepts v0.2 compatibility and v0.3 canonical bytes with manifest-qualified module,
-/// export, axiom-report, and old certificate hashes. Every certificate import must have one exact
-/// live-verified mapping. External identities are immutable; local export changes are returned as
-/// a source-rebuild outcome. Rebound bytes are structurally audited and live source-free verified
-/// before they are returned.
+/// The operation accepts canonical bytes with manifest-qualified module, export, axiom-report,
+/// and old certificate hashes. Every certificate import must have one exact live-verified mapping.
+/// External identities are immutable; local export changes are returned as a source-rebuild
+/// outcome. Rebound bytes are structurally audited and live source-free verified before they are
+/// returned.
 pub fn rebind_module_cert_import_certificate_hashes(
     previous_bytes: &[u8],
     expected: &ModuleCertRebindExpectedIdentity,
@@ -144,20 +144,11 @@ pub fn rebind_module_cert_import_certificate_hashes(
     policy: &AxiomPolicy,
 ) -> std::result::Result<ModuleCertImportRebindOutcome, ModuleCertImportRebindError> {
     let previous = verify_module_cert_hashes(previous_bytes)?;
-    let version = certificate_format_version(&previous.header)?;
-    if !matches!(
-        version,
-        CertificateFormatVersion::V0_2_0 | CertificateFormatVersion::V0_3_0
-    ) {
-        return Ok(ModuleCertImportRebindOutcome::IneligibleFormat {
-            format: previous.header.format,
-            core_spec: previous.header.core_spec,
-        });
-    }
+    let version = certificate_format_version(previous.header())?;
     qualify_expected_identity(&previous, expected)?;
 
     let mut certificate_import_modules = BTreeSet::new();
-    for import in &previous.imports {
+    for import in previous.imports() {
         if !certificate_import_modules.insert(import.module.clone()) {
             return Err(ModuleCertImportRebindError::DuplicateCertificateImport {
                 module: import.module.clone(),
@@ -179,7 +170,7 @@ pub fn rebind_module_cert_import_certificate_hashes(
     }
 
     let mut local_export_change = None;
-    for import in &previous.imports {
+    for import in previous.imports() {
         let encoded_certificate_hash = import
             .certificate_hash
             .expect("strict import pin was checked before rebinding");
@@ -219,9 +210,9 @@ pub fn rebind_module_cert_import_certificate_hashes(
         });
     }
 
-    let mut rebound = previous.clone();
+    let mut rebound_parts = previous.clone().into_parts();
     let mut changed_imports = Vec::new();
-    for import in &mut rebound.imports {
+    for import in &mut rebound_parts.imports {
         let encoded_certificate_hash = import
             .certificate_hash
             .expect("strict import pin was checked before rebinding");
@@ -250,10 +241,11 @@ pub fn rebind_module_cert_import_certificate_hashes(
         });
     }
 
-    rebound.hashes.certificate_hash = hash_with_domain(
+    rebound_parts.hashes.certificate_hash = hash_with_domain(
         version.module_certificate_domain(),
-        &encode_module_cert_without_certificate_hash_for_header(&rebound)?,
+        &encode_module_cert_parts_without_certificate_hash_for_header(&rebound_parts)?,
     );
+    let rebound = ModuleCert::from_parts(rebound_parts);
     if !matches_rebind_structural_mask(&previous, &rebound, &changed_imports) {
         return Err(ModuleCertImportRebindError::StructuralAuditMismatch);
     }
@@ -278,45 +270,45 @@ fn matches_rebind_structural_mask(
     rebound: &ModuleCert,
     changed_imports: &[Name],
 ) -> bool {
-    if previous.imports.len() != rebound.imports.len() {
+    if previous.imports().len() != rebound.imports().len() {
         return false;
     }
     let changed_imports = changed_imports.iter().collect::<BTreeSet<_>>();
-    let mut masked = rebound.clone();
-    masked.hashes.certificate_hash = previous.hashes.certificate_hash;
-    for (old_import, new_import) in previous.imports.iter().zip(&mut masked.imports) {
+    let mut masked_parts = rebound.clone().into_parts();
+    masked_parts.hashes.certificate_hash = previous.hashes().certificate_hash;
+    for (old_import, new_import) in previous.imports().iter().zip(&mut masked_parts.imports) {
         if changed_imports.contains(&new_import.module) {
             new_import.certificate_hash = old_import.certificate_hash;
         }
     }
-    masked == *previous
+    ModuleCert::from_parts(masked_parts) == *previous
 }
 
 fn qualify_expected_identity(
     certificate: &ModuleCert,
     expected: &ModuleCertRebindExpectedIdentity,
 ) -> std::result::Result<(), ModuleCertImportRebindError> {
-    if certificate.header.module != expected.module {
+    if certificate.header().module != expected.module {
         return Err(ModuleCertImportRebindError::ModuleMismatch {
             expected: expected.module.clone(),
-            actual: certificate.header.module.clone(),
+            actual: certificate.header().module.clone(),
         });
     }
     for (object, expected_hash, actual_hash) in [
         (
             HashObject::ExportBlock,
             expected.export_hash,
-            certificate.hashes.export_hash,
+            certificate.hashes().export_hash,
         ),
         (
             HashObject::AxiomReport,
             expected.axiom_report_hash,
-            certificate.hashes.axiom_report_hash,
+            certificate.hashes().axiom_report_hash,
         ),
         (
             HashObject::ModuleCertificate,
             expected.certificate_hash,
-            certificate.hashes.certificate_hash,
+            certificate.hashes().certificate_hash,
         ),
     ] {
         if expected_hash != actual_hash {

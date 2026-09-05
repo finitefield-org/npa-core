@@ -255,7 +255,6 @@ impl RewriteDiagnosticKind {
 pub enum RewriteDiagnosticTargetKind {
     Goal,
     LocalType,
-    LocalValue,
 }
 
 impl RewriteDiagnosticTargetKind {
@@ -263,7 +262,6 @@ impl RewriteDiagnosticTargetKind {
         match self {
             Self::Goal => "goal",
             Self::LocalType => "local_type",
-            Self::LocalValue => "local_value",
         }
     }
 }
@@ -973,12 +971,6 @@ enum RefineTermAstKind {
         binders: Vec<RefineTermBinder>,
         body: Box<RefineTermAst>,
     },
-    Let {
-        name: String,
-        ty: Box<RefineTermAst>,
-        value: Box<RefineTermAst>,
-        body: Box<RefineTermAst>,
-    },
     Annot {
         expr: Box<RefineTermAst>,
         ty: Box<RefineTermAst>,
@@ -1060,31 +1052,6 @@ impl RefineTermAst {
         }
     }
 
-    fn let_in(
-        start: npa_frontend::Span,
-        name: String,
-        ty: RefineTermAst,
-        value: RefineTermAst,
-        body: RefineTermAst,
-    ) -> Self {
-        let span = start.join(body.span);
-        let hole_count = ty
-            .hole_count
-            .saturating_add(value.hole_count)
-            .saturating_add(body.hole_count);
-        Self {
-            kind: RefineTermAstKind::Let {
-                name,
-                ty: Box::new(ty),
-                value: Box::new(value),
-                body: Box::new(body),
-            },
-            span,
-            has_holes: hole_count > 0,
-            hole_count,
-        }
-    }
-
     fn annot(expr: RefineTermAst, ty: RefineTermAst) -> Self {
         let span = expr.span.join(ty.span);
         let hole_count = expr.hole_count.saturating_add(ty.hole_count);
@@ -1147,7 +1114,6 @@ impl RefineTermParser<'_> {
         match self.peek_kind() {
             npa_frontend::TokenKind::Fun => self.parse_lam(),
             npa_frontend::TokenKind::Forall => self.parse_pi(),
-            npa_frontend::TokenKind::Let => self.parse_let(),
             _ => self.parse_annotation(),
         }
     }
@@ -1178,18 +1144,6 @@ impl RefineTermParser<'_> {
         self.expect_simple(npa_frontend::TokenKind::Comma, "expected ','")?;
         let body = self.parse_term()?;
         Ok(RefineTermAst::pi(start, binders, body))
-    }
-
-    fn parse_let(&mut self) -> Result<RefineTermAst> {
-        let start = self.expect_simple(npa_frontend::TokenKind::Let, "expected 'let'")?;
-        let name = self.expect_ident("expected let binding name")?;
-        self.expect_simple(npa_frontend::TokenKind::Colon, "expected ':'")?;
-        let ty = self.parse_term()?;
-        self.expect_simple(npa_frontend::TokenKind::ColonEq, "expected ':='")?;
-        let value = self.parse_term()?;
-        self.expect_simple(npa_frontend::TokenKind::In, "expected 'in'")?;
-        let body = self.parse_term()?;
-        Ok(RefineTermAst::let_in(start, name, ty, value, body))
     }
 
     fn parse_annotation(&mut self) -> Result<RefineTermAst> {
@@ -1442,14 +1396,14 @@ fn refine_term_source_canonical_bytes_from_ast(
     source: &str,
     ast: &RefineTermAst,
 ) -> Result<Vec<u8>> {
-    let mut out = tagged_bytes("npa.machine-tactic.refine-term-source.v1");
+    let mut out = tagged_bytes("npa.machine-tactic.refine-term-source.v2");
     encode_refine_term_ast_to(&mut out, source, ast)?;
     Ok(out)
 }
 
 fn refine_term_source_hash_from_ast(source: &str, ast: &RefineTermAst) -> Result<Hash> {
     Ok(hash_with_domain(
-        "npa.machine-tactic.refine-term-source.hash.v1",
+        "npa.machine-tactic.refine-term-source.hash.v2",
         &refine_term_source_canonical_bytes_from_ast(source, ast)?,
     ))
 }
@@ -1493,18 +1447,6 @@ fn encode_refine_term_ast_to(out: &mut Vec<u8>, source: &str, ast: &RefineTermAs
         RefineTermAstKind::Pi { binders, body } => {
             out.push(0x04);
             encode_refine_binders_to(out, source, binders)?;
-            encode_refine_term_ast_to(out, source, body)?;
-        }
-        RefineTermAstKind::Let {
-            name,
-            ty,
-            value,
-            body,
-        } => {
-            out.push(0x05);
-            encode_string_to(out, name);
-            encode_refine_term_ast_to(out, source, ty)?;
-            encode_refine_term_ast_to(out, source, value)?;
             encode_refine_term_ast_to(out, source, body)?;
         }
         RefineTermAstKind::Annot { expr, ty } => {
@@ -1553,12 +1495,6 @@ pub enum ProofExpr {
         ty: Expr,
         body: Box<ProofExpr>,
     },
-    Let {
-        binder: String,
-        ty: Expr,
-        value: Box<ProofExpr>,
-        body: Box<ProofExpr>,
-    },
 }
 
 impl ProofExpr {
@@ -1581,22 +1517,12 @@ impl ProofExpr {
             body: Box::new(body),
         }
     }
-
-    pub fn let_in(binder: impl Into<String>, ty: Expr, value: Self, body: Self) -> Self {
-        Self::Let {
-            binder: binder.into(),
-            ty,
-            value: Box::new(value),
-            body: Box::new(body),
-        }
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MachineLocalDecl {
     pub name: String,
     pub ty: Expr,
-    pub value: Option<Expr>,
 }
 
 impl MachineLocalDecl {
@@ -1604,15 +1530,6 @@ impl MachineLocalDecl {
         Self {
             name: name.into(),
             ty,
-            value: None,
-        }
-    }
-
-    pub fn definition(name: impl Into<String>, ty: Expr, value: Expr) -> Self {
-        Self {
-            name: name.into(),
-            ty,
-            value: Some(value),
         }
     }
 }
@@ -1963,10 +1880,8 @@ pub struct CheckedCurrentDecl {
     checked_env_fingerprint: Hash,
 }
 
-const OWNER_CERTIFICATE_FORMAT_V0_2: &str = "NPA-CERT-0.2.0";
-const OWNER_CORE_SPEC_V0_2: &str = "NPA-Core-0.2.0";
-const OWNER_CERTIFICATE_FORMAT_V0_3: &str = "NPA-CERT-0.3.0";
-const OWNER_CORE_SPEC_V0_3: &str = "NPA-Core-0.3.0";
+const OWNER_CERTIFICATE_FORMAT: &str = "NPA-CERT-0.4.0";
+const OWNER_CORE_SPEC: &str = "NPA-Core-0.4.0";
 
 fn is_opaque_core_definition(decl: &Decl) -> bool {
     matches!(
@@ -1989,17 +1904,13 @@ fn selected_owner_pair(current: &[CheckedCurrentDecl], _additional: &[Decl]) -> 
         );
     }
     (
-        OWNER_CERTIFICATE_FORMAT_V0_3.to_owned(),
-        OWNER_CORE_SPEC_V0_3.to_owned(),
+        OWNER_CERTIFICATE_FORMAT.to_owned(),
+        OWNER_CORE_SPEC.to_owned(),
     )
 }
 
 fn validate_owner_pair(certificate_format: &str, core_spec: &str) -> Result<()> {
-    if matches!(
-        (certificate_format, core_spec),
-        (OWNER_CERTIFICATE_FORMAT_V0_2, OWNER_CORE_SPEC_V0_2)
-            | (OWNER_CERTIFICATE_FORMAT_V0_3, OWNER_CORE_SPEC_V0_3)
-    ) {
+    if (certificate_format, core_spec) == (OWNER_CERTIFICATE_FORMAT, OWNER_CORE_SPEC) {
         Ok(())
     } else {
         Err(MachineTacticDiagnostic::new(
@@ -3399,11 +3310,9 @@ pub struct DiagnosticLocalSummary {
     pub machine_name: String,
     pub display_name: Option<String>,
     pub type_hash: Hash,
-    pub value_hash: Option<Hash>,
     pub dependency_ids: Vec<u32>,
     pub dependencies_truncated: bool,
     pub type_summary: DiagnosticTermSummary,
-    pub value_summary: Option<DiagnosticTermSummary>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -3415,7 +3324,7 @@ pub struct DiagnosticLocalContextSummary {
 
 impl DiagnosticLocalContextSummary {
     pub fn canonical_identity_bytes(&self) -> Vec<u8> {
-        let mut out = tagged_bytes("npa.machine-tactic.diagnostic-local-context-summary.v1");
+        let mut out = tagged_bytes("npa.machine-tactic.diagnostic-local-context-summary.v2");
         encode_u64_to(&mut out, self.total_locals);
         out.push(u8::from(self.truncated));
         encode_list_len_to(&mut out, self.locals.len());
@@ -3424,27 +3333,19 @@ impl DiagnosticLocalContextSummary {
             encode_u64_to(&mut out, u64::from(local.binder_index));
             encode_string_to(&mut out, &local.machine_name);
             encode_hash_to(&mut out, &local.type_hash);
-            encode_option_hash_to(&mut out, local.value_hash.as_ref());
             encode_list_len_to(&mut out, local.dependency_ids.len());
             for dependency_id in &local.dependency_ids {
                 encode_u64_to(&mut out, u64::from(*dependency_id));
             }
             out.push(u8::from(local.dependencies_truncated));
             encode_diagnostic_term_summary_to(&mut out, &local.type_summary);
-            match &local.value_summary {
-                Some(summary) => {
-                    out.push(1);
-                    encode_diagnostic_term_summary_to(&mut out, summary);
-                }
-                None => out.push(0),
-            }
         }
         out
     }
 
     pub fn identity_hash(&self) -> Hash {
         hash_with_domain(
-            "npa.machine-tactic.diagnostic-local-context-summary.hash.v1",
+            "npa.machine-tactic.diagnostic-local-context-summary.hash.v2",
             &self.canonical_identity_bytes(),
         )
     }
@@ -3491,16 +3392,7 @@ pub fn diagnostic_local_context_summary_with_display_names(
         }
 
         let type_summary = diagnostic_term_summary(&local.ty, budget);
-        let value_summary = local
-            .value
-            .as_ref()
-            .map(|value| diagnostic_term_summary(value, budget));
-        truncated = truncated
-            || dependencies_truncated
-            || type_summary.truncated
-            || value_summary
-                .as_ref()
-                .is_some_and(|summary| summary.truncated);
+        truncated = truncated || dependencies_truncated || type_summary.truncated;
 
         let stable_id = saturating_u32_from_usize(index);
         locals.push(DiagnosticLocalSummary {
@@ -3509,11 +3401,9 @@ pub fn diagnostic_local_context_summary_with_display_names(
             machine_name: local.name.clone(),
             display_name: display_names.get(index).cloned().flatten(),
             type_hash: core_expr_hash(&local.ty),
-            value_hash: local.value.as_ref().map(core_expr_hash),
             dependency_ids,
             dependencies_truncated,
             type_summary,
-            value_summary,
         });
     }
 
@@ -5534,14 +5424,6 @@ fn resolve_prepared_local_apply_head_index(
         ));
     }
     let index = prepared_local_index(prepared, name, "apply local head")?;
-    if goal.context[index].value.is_some() {
-        return Err(MachineTacticDiagnostic::new(
-            MachineTacticDiagnosticKind::InvalidLocalHead,
-            format!("apply local head {name:?} resolves to a let declaration"),
-        )
-        .with_goal(goal.id)
-        .with_meta(goal.meta_id));
-    }
     Ok(index)
 }
 
@@ -6913,12 +6795,6 @@ impl RefineTermChecker<'_, '_> {
             )
             .with_goal(self.goal.id)
             .with_meta(self.goal.meta_id)),
-            RefineTermAstKind::Let {
-                name,
-                ty,
-                value,
-                body,
-            } => self.infer_let(name, ty, value, body, context),
             RefineTermAstKind::Core => unreachable!("core refine AST nodes do not contain holes"),
         }
     }
@@ -7111,44 +6987,6 @@ impl RefineTermChecker<'_, '_> {
         }
         let expected = self.elaborate_core_type(ty, context)?;
         self.check_against(expr, context, &expected)
-    }
-
-    fn infer_let(
-        &mut self,
-        name: &str,
-        ty: &RefineTermAst,
-        value: &RefineTermAst,
-        body: &RefineTermAst,
-        context: &[MachineLocalDecl],
-    ) -> Result<RefineCheckedTerm> {
-        if ty.has_holes || value.has_holes {
-            return Err(MachineTacticDiagnostic::new(
-                MachineTacticDiagnosticKind::InvalidMachineTermSource,
-                "refine let types and values cannot contain holes",
-            )
-            .with_goal(self.goal.id)
-            .with_meta(self.goal.meta_id));
-        }
-        let ty_expr = self.elaborate_core_type(ty, context)?;
-        let value_checked = self.elaborate_core_check(value, context, &ty_expr)?;
-        let mut body_context = context.to_vec();
-        body_context.push(MachineLocalDecl::definition(
-            name.to_owned(),
-            ty_expr.clone(),
-            value_checked.expr.clone(),
-        ));
-        let body_checked = self.infer(body, &body_context)?;
-        let result_ty = instantiate(&body_checked.ty, &value_checked.expr).map_err(kernel_diag)?;
-        Ok(RefineCheckedTerm {
-            proof: ProofExpr::let_in(
-                name.to_owned(),
-                ty_expr,
-                ProofExpr::Core(value_checked.expr.clone()),
-                body_checked.proof,
-            ),
-            ty: result_ty,
-            core: None,
-        })
     }
 
     fn elaborate_core_check(
@@ -7527,18 +7365,6 @@ fn run_specialize_tactic_with_budget(
         &payload.local_name,
         &payload.universe_args,
     )?;
-    let local = &goal.context[local_index];
-    if local.value.is_some() {
-        return Err(MachineTacticDiagnostic::new(
-            MachineTacticDiagnosticKind::InvalidLocalHead,
-            format!(
-                "specialize local {:?} resolves to a let declaration",
-                payload.local_name
-            ),
-        )
-        .with_goal(goal.id)
-        .with_meta(goal.meta_id));
-    }
     let proof = ProofExpr::Core(local_bvar(goal.context.len(), local_index));
     let ty = kernel_infer_with_budget(
         state.env.kernel_env(),
@@ -7799,12 +7625,7 @@ fn ensure_specialize_replacement_suffix_independent(
     local_index: usize,
 ) -> Result<()> {
     for (index, local) in goal.context.iter().enumerate().skip(local_index + 1) {
-        if expr_mentions_context_abs(&local.ty, index, index, local_index)
-            || local
-                .value
-                .as_ref()
-                .is_some_and(|value| expr_mentions_context_abs(value, index, index, local_index))
-        {
+        if expr_mentions_context_abs(&local.ty, index, index, local_index) {
             return Err(MachineTacticDiagnostic::new(
                 MachineTacticDiagnosticKind::InvalidMetaDependency,
                 format!(
@@ -7980,35 +7801,6 @@ fn project_expr_to_prefix_context_at(
                 target_ctx_len + 1,
             )?,
         )),
-        Expr::Let {
-            binder,
-            ty,
-            value,
-            body,
-        } => Ok(Expr::let_in(
-            binder.clone(),
-            project_expr_to_prefix_context_at(
-                ty,
-                source_base_len,
-                keep_prefix_len,
-                source_ctx_len,
-                target_ctx_len,
-            )?,
-            project_expr_to_prefix_context_at(
-                value,
-                source_base_len,
-                keep_prefix_len,
-                source_ctx_len,
-                target_ctx_len,
-            )?,
-            project_expr_to_prefix_context_at(
-                body,
-                source_base_len,
-                keep_prefix_len,
-                source_ctx_len + 1,
-                target_ctx_len + 1,
-            )?,
-        )),
     }
 }
 
@@ -8034,13 +7826,6 @@ fn expr_mentions_context_abs(
         }
         Expr::Lam { ty, body, .. } | Expr::Pi { ty, body, .. } => {
             expr_mentions_context_abs(ty, source_base_len, source_ctx_len, target_abs)
-                || expr_mentions_context_abs(body, source_base_len, source_ctx_len + 1, target_abs)
-        }
-        Expr::Let {
-            ty, value, body, ..
-        } => {
-            expr_mentions_context_abs(ty, source_base_len, source_ctx_len, target_abs)
-                || expr_mentions_context_abs(value, source_base_len, source_ctx_len, target_abs)
                 || expr_mentions_context_abs(body, source_base_len, source_ctx_len + 1, target_abs)
         }
     }
@@ -8141,19 +7926,6 @@ fn ensure_revert_suffix_supported(goal: &MachineGoal, indices: &[usize]) -> Resu
         )
         .with_goal(goal.id)
         .with_meta(goal.meta_id));
-    }
-    for index in indices {
-        if goal.context[*index].value.is_some() {
-            return Err(MachineTacticDiagnostic::new(
-                MachineTacticDiagnosticKind::UnsupportedTacticOption,
-                format!(
-                    "revert does not support local definitions such as {:?}",
-                    goal.context[*index].name
-                ),
-            )
-            .with_goal(goal.id)
-            .with_meta(goal.meta_id));
-        }
     }
     Ok(())
 }
@@ -8607,12 +8379,7 @@ fn ensure_generalize_local_transport_supported(
     local_index: usize,
 ) -> Result<()> {
     for (index, local) in goal.context.iter().enumerate().skip(local_index + 1) {
-        if expr_mentions_context_abs(&local.ty, index, index, local_index)
-            || local
-                .value
-                .as_ref()
-                .is_some_and(|value| expr_mentions_context_abs(value, index, index, local_index))
-        {
+        if expr_mentions_context_abs(&local.ty, index, index, local_index) {
             return Err(MachineTacticDiagnostic::new(
                 MachineTacticDiagnosticKind::InvalidMetaDependency,
                 format!(
@@ -8759,35 +8526,6 @@ fn insert_context_local_at_rec(
             binder.clone(),
             insert_context_local_at_rec(
                 ty,
-                source_base_len,
-                insert_abs,
-                source_ctx_len,
-                target_ctx_len,
-            )?,
-            insert_context_local_at_rec(
-                body,
-                source_base_len,
-                insert_abs,
-                source_ctx_len + 1,
-                target_ctx_len + 1,
-            )?,
-        )),
-        Expr::Let {
-            binder,
-            ty,
-            value,
-            body,
-        } => Ok(Expr::let_in(
-            binder.clone(),
-            insert_context_local_at_rec(
-                ty,
-                source_base_len,
-                insert_abs,
-                source_ctx_len,
-                target_ctx_len,
-            )?,
-            insert_context_local_at_rec(
-                value,
                 source_base_len,
                 insert_abs,
                 source_ctx_len,
@@ -9136,23 +8874,6 @@ where
             Ok(Expr::pi(
                 binder.clone(),
                 replace_occurrences_at(ty, ty_paths.as_slice(), depth, make_replacement)?,
-                replace_occurrences_at(body, body_paths.as_slice(), depth + 1, make_replacement)?,
-            ))
-        }
-        Expr::Let {
-            binder,
-            ty,
-            value,
-            body,
-        } => {
-            let ty_paths = occurrence_child_paths(&child_paths, 0)?;
-            let value_paths = occurrence_child_paths(&child_paths, 1)?;
-            let body_paths = occurrence_child_paths(&child_paths, 2)?;
-            ensure_no_unknown_occurrence_child(&child_paths, 3)?;
-            Ok(Expr::let_in(
-                binder.clone(),
-                replace_occurrences_at(ty, ty_paths.as_slice(), depth, make_replacement)?,
-                replace_occurrences_at(value, value_paths.as_slice(), depth, make_replacement)?,
                 replace_occurrences_at(body, body_paths.as_slice(), depth + 1, make_replacement)?,
             ))
         }
@@ -12236,9 +11957,6 @@ fn run_contradiction_tactic_with_budget(
         }
         ContradictionMode::Auto => {
             for local in &goal.context {
-                if local.value.is_some() {
-                    continue;
-                }
                 match run_cases_tactic_with_budget(
                     prepared,
                     goal_id,
@@ -12644,10 +12362,7 @@ fn resolve_smt_local_exact(
     ctx: &Ctx,
     fuel: &TacticRunFuel,
 ) -> Result<Option<ProofExpr>> {
-    for (index, local) in goal.context.iter().enumerate().rev() {
-        if local.value.is_some() {
-            continue;
-        }
+    for (index, _) in goal.context.iter().enumerate().rev() {
         let proof = Expr::bvar((goal.context.len() - 1 - index) as u32);
         let local_ty = kernel_infer_with_budget(
             state.env.kernel_env(),
@@ -13145,16 +12860,6 @@ fn resolve_generalized_induction_locals(
         }
         let index = prepared_local_index(prepared, name, "general-induction generalized local")?;
         let local = &goal.context[index];
-        if local.value.is_some() {
-            return Err(MachineTacticDiagnostic::new(
-                MachineTacticDiagnosticKind::InvalidInductionTarget,
-                format!(
-                    "general-induction generalized local {name:?} resolves to a let declaration"
-                ),
-            )
-            .with_goal(goal.id)
-            .with_meta(goal.meta_id));
-        }
         if index <= major_index {
             return Err(MachineTacticDiagnostic::new(
                 MachineTacticDiagnosticKind::InvalidInductionTarget,
@@ -13394,14 +13099,6 @@ fn resolve_cases_major_target(
     let goal = prepared.goal();
     let index = prepared_local_index(prepared, local_name, "cases major premise")?;
     let local = &goal.context[index];
-    if local.value.is_some() {
-        return Err(MachineTacticDiagnostic::new(
-            MachineTacticDiagnosticKind::InvalidLocalHead,
-            format!("cases major premise {local_name:?} resolves to a let declaration"),
-        )
-        .with_goal(goal.id)
-        .with_meta(goal.meta_id));
-    }
     let prefix_ctx = local_context_to_ctx_with_budget(
         state.env.kernel_env(),
         &goal.context[..index],
@@ -14134,32 +13831,6 @@ fn replace_context_bvars_keep_at_depth(
                 depth + 1,
             )?,
         )),
-        Expr::Let {
-            binder,
-            ty,
-            value,
-            body,
-        } => Ok(Expr::let_in(
-            binder.clone(),
-            replace_context_bvars_keep_at_depth(
-                ty,
-                replacements,
-                added_after_original_context,
-                depth,
-            )?,
-            replace_context_bvars_keep_at_depth(
-                value,
-                replacements,
-                added_after_original_context,
-                depth,
-            )?,
-            replace_context_bvars_keep_at_depth(
-                body,
-                replacements,
-                added_after_original_context,
-                depth + 1,
-            )?,
-        )),
     }
 }
 
@@ -14228,35 +13899,6 @@ fn replace_cases_major_keep_at_depth(
             binder.clone(),
             replace_cases_major_keep_at_depth(
                 ty,
-                major_bvar,
-                replacement,
-                added_after_original_context,
-                depth,
-            )?,
-            replace_cases_major_keep_at_depth(
-                body,
-                major_bvar,
-                replacement,
-                added_after_original_context,
-                depth + 1,
-            )?,
-        )),
-        Expr::Let {
-            binder,
-            ty,
-            value,
-            body,
-        } => Ok(Expr::let_in(
-            binder.clone(),
-            replace_cases_major_keep_at_depth(
-                ty,
-                major_bvar,
-                replacement,
-                added_after_original_context,
-                depth,
-            )?,
-            replace_cases_major_keep_at_depth(
-                value,
                 major_bvar,
                 replacement,
                 added_after_original_context,
@@ -14646,14 +14288,6 @@ fn resolve_induction_nat_target(
     let goal = prepared.goal();
     let index = prepared_local_index(prepared, local_name, "induction-nat target")?;
     let local = &goal.context[index];
-    if local.value.is_some() {
-        return Err(MachineTacticDiagnostic::new(
-            MachineTacticDiagnosticKind::InvalidInductionTarget,
-            format!("induction-nat target {local_name:?} resolves to a let declaration"),
-        )
-        .with_goal(goal.id)
-        .with_meta(goal.meta_id));
-    }
     if index + 1 != goal.context.len() {
         return Err(MachineTacticDiagnostic::new(
             MachineTacticDiagnosticKind::InvalidInductionTarget,
@@ -14906,32 +14540,6 @@ fn replace_induction_target_keep_at_depth(
                 depth + 1,
             )?,
         )),
-        Expr::Let {
-            binder,
-            ty,
-            value,
-            body,
-        } => Ok(Expr::let_in(
-            binder.clone(),
-            replace_induction_target_keep_at_depth(
-                ty,
-                replacement,
-                added_after_original_context,
-                depth,
-            )?,
-            replace_induction_target_keep_at_depth(
-                value,
-                replacement,
-                added_after_original_context,
-                depth,
-            )?,
-            replace_induction_target_keep_at_depth(
-                body,
-                replacement,
-                added_after_original_context,
-                depth + 1,
-            )?,
-        )),
     }
 }
 
@@ -15162,17 +14770,6 @@ fn replace_simp_param_bvars(expr: &Expr, param_count: usize, depth: u32) -> Expr
             replace_simp_param_bvars(ty, param_count, depth),
             replace_simp_param_bvars(body, param_count, depth + 1),
         ),
-        Expr::Let {
-            binder,
-            ty,
-            value,
-            body,
-        } => Expr::let_in(
-            binder.clone(),
-            replace_simp_param_bvars(ty, param_count, depth),
-            replace_simp_param_bvars(value, param_count, depth),
-            replace_simp_param_bvars(body, param_count, depth + 1),
-        ),
     }
 }
 
@@ -15289,24 +14886,6 @@ fn match_simp_universe_expr(
             match_simp_universe_expr(params, pattern_ty, target_ty, solutions)
                 && match_simp_universe_expr(params, pattern_body, target_body, solutions)
         }
-        (
-            Expr::Let {
-                ty: pattern_ty,
-                value: pattern_value,
-                body: pattern_body,
-                ..
-            },
-            Expr::Let {
-                ty: target_ty,
-                value: target_value,
-                body: target_body,
-                ..
-            },
-        ) => {
-            match_simp_universe_expr(params, pattern_ty, target_ty, solutions)
-                && match_simp_universe_expr(params, pattern_value, target_value, solutions)
-                && match_simp_universe_expr(params, pattern_body, target_body, solutions)
-        }
         _ => !contains_rule_universe_param_expr(params, pattern),
     }
 }
@@ -15373,13 +14952,6 @@ fn contains_rule_universe_param_expr(params: &[String], expr: &Expr) -> bool {
         }
         Expr::Lam { ty, body, .. } | Expr::Pi { ty, body, .. } => {
             contains_rule_universe_param_expr(params, ty)
-                || contains_rule_universe_param_expr(params, body)
-        }
-        Expr::Let {
-            ty, value, body, ..
-        } => {
-            contains_rule_universe_param_expr(params, ty)
-                || contains_rule_universe_param_expr(params, value)
                 || contains_rule_universe_param_expr(params, body)
         }
     }
@@ -15472,51 +15044,6 @@ fn extend_machine_local_context_assumption_with_budget(
     )?;
     let mut out = context.to_vec();
     out.push(MachineLocalDecl::assumption(name, ty));
-    Ok(out)
-}
-
-#[allow(dead_code)]
-fn extend_machine_local_context_definition_with_budget(
-    state: &MachineProofState,
-    goal: &MachineGoal,
-    context: &[MachineLocalDecl],
-    name: String,
-    ty: Expr,
-    value: Expr,
-    fuel: &TacticRunFuel,
-) -> Result<Vec<MachineLocalDecl>> {
-    validate_local_context_extension_base(goal, context)?;
-    validate_intro_name_available(state, context, &name)
-        .map_err(|diag| attach_goal_meta(diag, goal.id, goal.meta_id))?;
-    let ctx = local_context_to_ctx_with_budget(
-        state.env.kernel_env(),
-        context,
-        &state.root.universe_params,
-        fuel,
-        goal.id,
-        goal.meta_id,
-    )?;
-    kernel_expect_sort_with_budget(
-        state.env.kernel_env(),
-        &ctx,
-        &state.root.universe_params,
-        &ty,
-        fuel,
-        goal.id,
-        goal.meta_id,
-    )?;
-    kernel_check_with_budget(
-        state.env.kernel_env(),
-        &ctx,
-        &state.root.universe_params,
-        &value,
-        &ty,
-        fuel,
-        goal.id,
-        goal.meta_id,
-    )?;
-    let mut out = context.to_vec();
-    out.push(MachineLocalDecl::definition(name, ty, value));
     Ok(out)
 }
 
@@ -16053,25 +15580,6 @@ fn check_proof_expr(
             assigning_meta,
             fuel,
         ),
-        ProofExpr::Let {
-            binder,
-            ty,
-            value,
-            body,
-        } => check_let_proof_expr(
-            env,
-            metas,
-            context,
-            universe_params,
-            binder,
-            ty,
-            value,
-            body,
-            expected,
-            allowed_new_metas,
-            assigning_meta,
-            fuel,
-        ),
         _ => {
             let checked = infer_proof_expr(
                 env,
@@ -16214,81 +15722,6 @@ fn check_lam_proof_expr(
         expr: body_checked
             .expr
             .map(|body_expr| Expr::lam(binder.to_owned(), ty.clone(), body_expr)),
-        ty: expected.clone(),
-    })
-}
-
-#[allow(clippy::too_many_arguments)]
-fn check_let_proof_expr(
-    env: &Env,
-    metas: &MetaVarStore,
-    context: &[MachineLocalDecl],
-    universe_params: &[String],
-    binder: &str,
-    ty: &Expr,
-    value: &ProofExpr,
-    body: &ProofExpr,
-    expected: &Expr,
-    allowed_new_metas: &BTreeSet<MetaVarId>,
-    assigning_meta: MetaVarId,
-    fuel: &TacticRunFuel,
-) -> Result<CheckedProofExpr> {
-    let ctx = local_context_to_ctx_with_budget(
-        env,
-        context,
-        universe_params,
-        fuel,
-        GoalId::from(assigning_meta),
-        assigning_meta,
-    )?;
-    kernel_expect_sort_with_budget(
-        env,
-        &ctx,
-        universe_params,
-        ty,
-        fuel,
-        GoalId::from(assigning_meta),
-        assigning_meta,
-    )?;
-    let value_checked = check_proof_expr(
-        env,
-        metas,
-        context,
-        universe_params,
-        value,
-        ty,
-        allowed_new_metas,
-        assigning_meta,
-        fuel,
-    )?;
-    let Some(value_expr) = value_checked.expr else {
-        return Err(MachineTacticDiagnostic::new(
-            MachineTacticDiagnosticKind::InvalidMetaDependency,
-            "let value must be a closed skeleton expression before it can extend a local context",
-        ));
-    };
-    let mut body_context = context.to_vec();
-    body_context.push(MachineLocalDecl::definition(
-        binder.to_owned(),
-        ty.clone(),
-        value_expr.clone(),
-    ));
-    let body_expected = shift(expected, 1, 0).map_err(kernel_diag)?;
-    let body_checked = check_proof_expr(
-        env,
-        metas,
-        &body_context,
-        universe_params,
-        body,
-        &body_expected,
-        allowed_new_metas,
-        assigning_meta,
-        fuel,
-    )?;
-    Ok(CheckedProofExpr {
-        expr: body_checked
-            .expr
-            .map(|body_expr| Expr::let_in(binder.to_owned(), ty.clone(), value_expr, body_expr)),
         ty: expected.clone(),
     })
 }
@@ -16456,71 +15889,6 @@ fn infer_proof_expr(
                     .expr
                     .map(|body_expr| Expr::lam(binder.clone(), ty.clone(), body_expr)),
                 ty: Expr::pi(binder.clone(), ty.clone(), body_checked.ty),
-            })
-        }
-        ProofExpr::Let {
-            binder,
-            ty,
-            value,
-            body,
-        } => {
-            let ctx = local_context_to_ctx_with_budget(
-                env,
-                context,
-                universe_params,
-                fuel,
-                GoalId::from(assigning_meta),
-                assigning_meta,
-            )?;
-            kernel_expect_sort_with_budget(
-                env,
-                &ctx,
-                universe_params,
-                ty,
-                fuel,
-                GoalId::from(assigning_meta),
-                assigning_meta,
-            )?;
-            let value_checked = check_proof_expr(
-                env,
-                metas,
-                context,
-                universe_params,
-                value,
-                ty,
-                allowed_new_metas,
-                assigning_meta,
-                fuel,
-            )?;
-            let Some(value_expr) = value_checked.expr else {
-                return Err(MachineTacticDiagnostic::new(
-                    MachineTacticDiagnosticKind::InvalidMetaDependency,
-                    "let value must be a closed skeleton expression before it can extend a local context",
-                ));
-            };
-            let mut body_context = context.to_vec();
-            body_context.push(MachineLocalDecl::definition(
-                binder.clone(),
-                ty.clone(),
-                value_expr.clone(),
-            ));
-            let body_checked = infer_proof_expr(
-                env,
-                metas,
-                &body_context,
-                universe_params,
-                body,
-                allowed_new_metas,
-                assigning_meta,
-                fuel,
-                visiting,
-            )?;
-            let result_ty = instantiate(&body_checked.ty, &value_expr).map_err(kernel_diag)?;
-            Ok(CheckedProofExpr {
-                expr: body_checked.expr.map(|body_expr| {
-                    Expr::let_in(binder.clone(), ty.clone(), value_expr, body_expr)
-                }),
-                ty: result_ty,
             })
         }
     }
@@ -16728,43 +16096,6 @@ fn expand_proof_expr_maybe(
             )?
             .map(|body| Expr::lam(binder.clone(), ty.clone(), body))
         }
-        ProofExpr::Let {
-            binder,
-            ty,
-            value,
-            body,
-        } => {
-            let value = expand_proof_expr_maybe(
-                env,
-                metas,
-                value,
-                context,
-                universe_params,
-                allowed_new_metas,
-                assigning_meta,
-                visiting,
-            )?;
-            let Some(value) = value else {
-                return Ok(None);
-            };
-            let mut body_context = context.to_vec();
-            body_context.push(MachineLocalDecl::definition(
-                binder.clone(),
-                ty.clone(),
-                value.clone(),
-            ));
-            expand_proof_expr_maybe(
-                env,
-                metas,
-                body,
-                &body_context,
-                universe_params,
-                allowed_new_metas,
-                assigning_meta,
-                visiting,
-            )?
-            .map(|body| Expr::let_in(binder.clone(), ty.clone(), value, body))
-        }
     })
 }
 
@@ -16824,26 +16155,6 @@ fn expand_proof_expr(
                 expand_proof_expr(state, body, &body_context, visiting)?,
             ))
         }
-        ProofExpr::Let {
-            binder,
-            ty,
-            value,
-            body,
-        } => {
-            let value_expr = expand_proof_expr(state, value, context, visiting)?;
-            let mut body_context = context.to_vec();
-            body_context.push(MachineLocalDecl::definition(
-                binder.clone(),
-                ty.clone(),
-                value_expr.clone(),
-            ));
-            Ok(Expr::let_in(
-                binder.clone(),
-                ty.clone(),
-                value_expr,
-                expand_proof_expr(state, body, &body_context, visiting)?,
-            ))
-        }
     }
 }
 
@@ -16880,17 +16191,6 @@ fn collect_proof_expr_binders(expr: &ProofExpr, names: &mut BTreeSet<String>) {
             collect_core_binders(ty, names);
             collect_proof_expr_binders(body, names);
         }
-        ProofExpr::Let {
-            binder,
-            ty,
-            value,
-            body,
-        } => {
-            names.insert(binder.clone());
-            collect_core_binders(ty, names);
-            collect_proof_expr_binders(value, names);
-            collect_proof_expr_binders(body, names);
-        }
     }
 }
 
@@ -16904,17 +16204,6 @@ fn collect_core_binders(expr: &Expr, names: &mut BTreeSet<String>) {
         Expr::Lam { binder, ty, body } | Expr::Pi { binder, ty, body } => {
             names.insert(binder.clone());
             collect_core_binders(ty, names);
-            collect_core_binders(body, names);
-        }
-        Expr::Let {
-            binder,
-            ty,
-            value,
-            body,
-        } => {
-            names.insert(binder.clone());
-            collect_core_binders(ty, names);
-            collect_core_binders(value, names);
             collect_core_binders(body, names);
         }
     }
@@ -18286,9 +17575,9 @@ fn match_apply_pattern(
             }
             Ok(())
         }
-        Expr::Lam { .. } | Expr::Pi { .. } | Expr::Let { .. } => Err(MachineTacticDiagnostic::new(
+        Expr::Lam { .. } | Expr::Pi { .. } => Err(MachineTacticDiagnostic::new(
             MachineTacticDiagnosticKind::AmbiguousApplyArgument,
-            "InferFromTarget under binders or let bodies is not supported",
+            "InferFromTarget under binders is not supported",
         )),
         Expr::Sort(_) | Expr::BVar(_) | Expr::Const { .. } => Err(MachineTacticDiagnostic::new(
             MachineTacticDiagnosticKind::AmbiguousApplyArgument,
@@ -18405,11 +17694,6 @@ fn contains_pattern_meta(expr: &Expr) -> bool {
         Expr::Lam { ty, body, .. } | Expr::Pi { ty, body, .. } => {
             contains_pattern_meta(ty) || contains_pattern_meta(body)
         }
-        Expr::Let {
-            ty, value, body, ..
-        } => {
-            contains_pattern_meta(ty) || contains_pattern_meta(value) || contains_pattern_meta(body)
-        }
     }
 }
 
@@ -18426,13 +17710,6 @@ fn collect_pattern_meta_ids(expr: &Expr, ids: &mut BTreeSet<PatternMetaId>) {
         }
         Expr::Lam { ty, body, .. } | Expr::Pi { ty, body, .. } => {
             collect_pattern_meta_ids(ty, ids);
-            collect_pattern_meta_ids(body, ids);
-        }
-        Expr::Let {
-            ty, value, body, ..
-        } => {
-            collect_pattern_meta_ids(ty, ids);
-            collect_pattern_meta_ids(value, ids);
             collect_pattern_meta_ids(body, ids);
         }
     }
@@ -18472,17 +17749,6 @@ fn replace_pattern_metas_at_depth(
         Expr::Pi { binder, ty, body } => Expr::pi(
             binder.clone(),
             replace_pattern_metas_at_depth(ty, solutions, depth)?,
-            replace_pattern_metas_at_depth(body, solutions, depth + 1)?,
-        ),
-        Expr::Let {
-            binder,
-            ty,
-            value,
-            body,
-        } => Expr::let_in(
-            binder.clone(),
-            replace_pattern_metas_at_depth(ty, solutions, depth)?,
-            replace_pattern_metas_at_depth(value, solutions, depth)?,
             replace_pattern_metas_at_depth(body, solutions, depth + 1)?,
         ),
     })
@@ -18697,7 +17963,6 @@ fn machine_term_elab_context(
         .map(|local| npa_frontend::MachineLocalDecl {
             name: local.name.clone(),
             ty: local.ty.clone(),
-            value: local.value.clone(),
         })
         .collect();
     npa_frontend::MachineTermElabContext::from_verified_imports_and_current_decls_in_module(
@@ -19500,22 +18765,7 @@ fn local_context_to_ctx_with_budget(
             goal_id,
             meta_id,
         )?;
-        match &local.value {
-            Some(value) => {
-                kernel_check_with_budget(
-                    env,
-                    &ctx,
-                    universe_params,
-                    value,
-                    &local.ty,
-                    fuel,
-                    goal_id,
-                    meta_id,
-                )?;
-                ctx.push_definition(local.name.clone(), local.ty.clone(), value.clone());
-            }
-            None => ctx.push_assumption(local.name.clone(), local.ty.clone()),
-        }
+        ctx.push_assumption(local.name.clone(), local.ty.clone());
     }
     Ok(ctx)
 }
@@ -19646,13 +18896,6 @@ fn contains_bound_var(expr: &Expr, target: u32) -> bool {
         Expr::Lam { ty, body, .. } | Expr::Pi { ty, body, .. } => {
             contains_bound_var(ty, target) || contains_bound_var(body, target + 1)
         }
-        Expr::Let {
-            ty, value, body, ..
-        } => {
-            contains_bound_var(ty, target)
-                || contains_bound_var(value, target)
-                || contains_bound_var(body, target + 1)
-        }
     }
 }
 
@@ -19682,13 +18925,6 @@ fn expr_contains_unresolved_universe_meta(expr: &Expr) -> bool {
         }
         Expr::Lam { ty, body, .. } | Expr::Pi { ty, body, .. } => {
             expr_contains_unresolved_universe_meta(ty)
-                || expr_contains_unresolved_universe_meta(body)
-        }
-        Expr::Let {
-            ty, value, body, ..
-        } => {
-            expr_contains_unresolved_universe_meta(ty)
-                || expr_contains_unresolved_universe_meta(value)
                 || expr_contains_unresolved_universe_meta(body)
         }
     }
@@ -19723,13 +18959,6 @@ fn collect_expr_unresolved_universe_metas(expr: &Expr, metas: &mut BTreeSet<Stri
             collect_expr_unresolved_universe_metas(ty, metas);
             collect_expr_unresolved_universe_metas(body, metas);
         }
-        Expr::Let {
-            ty, value, body, ..
-        } => {
-            collect_expr_unresolved_universe_metas(ty, metas);
-            collect_expr_unresolved_universe_metas(value, metas);
-            collect_expr_unresolved_universe_metas(body, metas);
-        }
     }
 }
 
@@ -19739,11 +18968,6 @@ fn core_expr_node_count(expr: &Expr) -> u64 {
         Expr::App(fun, arg) => 1 + core_expr_node_count(fun) + core_expr_node_count(arg),
         Expr::Lam { ty, body, .. } | Expr::Pi { ty, body, .. } => {
             1 + core_expr_node_count(ty) + core_expr_node_count(body)
-        }
-        Expr::Let {
-            ty, value, body, ..
-        } => {
-            1 + core_expr_node_count(ty) + core_expr_node_count(value) + core_expr_node_count(body)
         }
     }
 }
@@ -19755,13 +18979,6 @@ fn proof_expr_node_count(expr: &ProofExpr) -> u64 {
         ProofExpr::App(fun, arg) => 1 + proof_expr_node_count(fun) + proof_expr_node_count(arg),
         ProofExpr::Lam { ty, body, .. } => {
             1 + core_expr_node_count(ty) + proof_expr_node_count(body)
-        }
-        ProofExpr::Let {
-            ty, value, body, ..
-        } => {
-            1 + core_expr_node_count(ty)
-                + proof_expr_node_count(value)
-                + proof_expr_node_count(body)
         }
     }
 }
@@ -19778,7 +18995,6 @@ fn diagnostic_head_symbol(expr: &Expr) -> Option<String> {
         Expr::App(_, _) => None,
         Expr::Lam { .. } => Some("Lam".to_owned()),
         Expr::Pi { .. } => Some("Pi".to_owned()),
-        Expr::Let { .. } => Some("Let".to_owned()),
     }
 }
 
@@ -19811,13 +19027,6 @@ fn count_expr_nodes_bounded_to(expr: &Expr, max_nodes: u64, count: &mut u64) -> 
         }
         Expr::Lam { ty, body, .. } | Expr::Pi { ty, body, .. } => {
             count_expr_nodes_bounded_to(ty, max_nodes, count)
-                || count_expr_nodes_bounded_to(body, max_nodes, count)
-        }
-        Expr::Let {
-            ty, value, body, ..
-        } => {
-            count_expr_nodes_bounded_to(ty, max_nodes, count)
-                || count_expr_nodes_bounded_to(value, max_nodes, count)
                 || count_expr_nodes_bounded_to(body, max_nodes, count)
         }
     }
@@ -19859,13 +19068,6 @@ fn collect_expr_universe_summary(
             collect_expr_universe_summary(ty, level_count, params);
             collect_expr_universe_summary(body, level_count, params);
         }
-        Expr::Let {
-            ty, value, body, ..
-        } => {
-            collect_expr_universe_summary(ty, level_count, params);
-            collect_expr_universe_summary(value, level_count, params);
-            collect_expr_universe_summary(body, level_count, params);
-        }
     }
 }
 
@@ -19902,9 +19104,6 @@ fn collect_normalized_level_universe_summary(
 fn collect_local_dependency_ids(local: &MachineLocalDecl, prior_local_count: usize) -> Vec<u32> {
     let mut ids = BTreeSet::new();
     collect_expr_local_dependency_ids(&local.ty, prior_local_count, 0, &mut ids);
-    if let Some(value) = &local.value {
-        collect_expr_local_dependency_ids(value, prior_local_count, 0, &mut ids);
-    }
     ids.into_iter().collect()
 }
 
@@ -19932,13 +19131,6 @@ fn collect_expr_local_dependency_ids(
         }
         Expr::Lam { ty, body, .. } | Expr::Pi { ty, body, .. } => {
             collect_expr_local_dependency_ids(ty, prior_local_count, binder_depth, ids);
-            collect_expr_local_dependency_ids(body, prior_local_count, binder_depth + 1, ids);
-        }
-        Expr::Let {
-            ty, value, body, ..
-        } => {
-            collect_expr_local_dependency_ids(ty, prior_local_count, binder_depth, ids);
-            collect_expr_local_dependency_ids(value, prior_local_count, binder_depth, ids);
             collect_expr_local_dependency_ids(body, prior_local_count, binder_depth + 1, ids);
         }
     }
@@ -19972,24 +19164,12 @@ fn certificate_current_decl_hashes(
         name: module_name,
         declarations,
     };
-    if owner_certificate_format == OWNER_CERTIFICATE_FORMAT_V0_2
-        && module.declarations.iter().any(is_opaque_core_definition)
-    {
-        return Err(MachineTacticDiagnostic::new(
-            MachineTacticDiagnosticKind::UncheckedCurrentDecl,
-            "opaque current declarations require the exact v0.3 owner pair",
-        ));
-    }
-    let cert = if owner_certificate_format == OWNER_CERTIFICATE_FORMAT_V0_3 {
-        let refs = verified_imports.iter().collect::<Vec<_>>();
-        npa_cert::build_module_cert_from_import_refs_with_preferred_imports(
-            module,
-            &refs,
-            &BTreeMap::new(),
-        )
-    } else {
-        npa_cert::build_module_cert_v0_2_compat(module, &verified_imports)
-    }
+    let refs = verified_imports.iter().collect::<Vec<_>>();
+    let cert = npa_cert::build_module_cert_from_import_refs_with_preferred_imports(
+        module,
+        &refs,
+        &BTreeMap::new(),
+    )
     .map_err(|err| {
         MachineTacticDiagnostic::new(
             MachineTacticDiagnosticKind::UncheckedCurrentDecl,
@@ -20000,7 +19180,7 @@ fn certificate_current_decl_hashes(
         )
     })?;
     let target_name = Name::from_dotted(decl.name());
-    for cert_decl in &cert.declarations {
+    for cert_decl in cert.declarations() {
         if decl_payload_name(&cert, &cert_decl.decl)? == target_name {
             return Ok(CurrentDeclCertificateEvidence {
                 hashes: cert_decl.hashes.clone(),
@@ -20048,7 +19228,7 @@ fn decl_payload_name(cert: &npa_cert::ModuleCert, payload: &DeclPayload) -> Resu
         | DeclPayload::InductiveConstrained { name, .. }
         | DeclPayload::MutualInductiveBlock { name, .. } => *name,
     };
-    cert.name_table.get(name_id).cloned().ok_or_else(|| {
+    cert.name_table().get(name_id).cloned().ok_or_else(|| {
         MachineTacticDiagnostic::new(
             MachineTacticDiagnosticKind::CurrentDeclSignatureMismatch,
             "certificate materialization returned a declaration with an invalid name id",
@@ -20303,29 +19483,6 @@ fn add_certificate_term_dependency_imports(
                 pending_keys,
             )?;
         }
-        TermNode::Let { ty, value, body } => {
-            add_certificate_term_dependency_imports(
-                import,
-                *ty,
-                imports_by_key,
-                selected_keys,
-                pending_keys,
-            )?;
-            add_certificate_term_dependency_imports(
-                import,
-                *value,
-                imports_by_key,
-                selected_keys,
-                pending_keys,
-            )?;
-            add_certificate_term_dependency_imports(
-                import,
-                *body,
-                imports_by_key,
-                selected_keys,
-                pending_keys,
-            )?;
-        }
     }
     Ok(())
 }
@@ -20469,13 +19626,6 @@ fn collect_const_names_from_expr(names: &mut BTreeSet<Name>, expr: &Expr) {
             collect_const_names_from_expr(names, ty);
             collect_const_names_from_expr(names, body);
         }
-        Expr::Let {
-            ty, value, body, ..
-        } => {
-            collect_const_names_from_expr(names, ty);
-            collect_const_names_from_expr(names, value);
-            collect_const_names_from_expr(names, body);
-        }
     }
 }
 
@@ -20556,14 +19706,14 @@ fn checked_env_fingerprint_with_kernel_profile(
 }
 
 fn machine_term_source_canonical_bytes_from_frontend(frontend_canonical_bytes: &[u8]) -> Vec<u8> {
-    let mut out = tagged_bytes("npa.machine-tactic.machine-term-source.v1");
+    let mut out = tagged_bytes("npa.machine-tactic.machine-term-source.v2");
     out.extend_from_slice(frontend_canonical_bytes);
     out
 }
 
 fn machine_term_source_hash_from_frontend(frontend_canonical_bytes: &[u8]) -> Hash {
     hash_with_domain(
-        "npa.machine-tactic.machine-term-source.hash.v1",
+        "npa.machine-tactic.machine-term-source.hash.v2",
         &machine_term_source_canonical_bytes_from_frontend(frontend_canonical_bytes),
     )
 }
@@ -20599,33 +19749,33 @@ pub fn goal_id_canonical_bytes(id: GoalId) -> Vec<u8> {
 }
 
 pub fn proof_expr_canonical_bytes(expr: &ProofExpr) -> Vec<u8> {
-    let mut out = tagged_bytes("npa.machine-tactic.proof-expr.v1");
+    let mut out = tagged_bytes("npa.machine-tactic.proof-expr.v2");
     encode_proof_expr_to(&mut out, expr);
     out
 }
 
 pub fn proof_expr_hash(expr: &ProofExpr) -> Hash {
     hash_with_domain(
-        "npa.machine-tactic.proof-expr.hash.v1",
+        "npa.machine-tactic.proof-expr.hash.v2",
         &proof_expr_canonical_bytes(expr),
     )
 }
 
 pub fn machine_local_decl_canonical_bytes(local: &MachineLocalDecl) -> Vec<u8> {
-    let mut out = tagged_bytes("npa.machine-tactic.machine-local-decl.v1");
+    let mut out = tagged_bytes("npa.machine-tactic.machine-local-decl.v2");
     encode_machine_local_decl_to(&mut out, local);
     out
 }
 
 pub fn machine_local_decl_hash(local: &MachineLocalDecl) -> Hash {
     hash_with_domain(
-        "npa.machine-tactic.machine-local-decl.hash.v1",
+        "npa.machine-tactic.machine-local-decl.hash.v2",
         &machine_local_decl_canonical_bytes(local),
     )
 }
 
 pub fn machine_local_context_canonical_bytes(context: &[MachineLocalDecl]) -> Vec<u8> {
-    let mut out = tagged_bytes("npa.machine-tactic.machine-local-context.v1");
+    let mut out = tagged_bytes("npa.machine-tactic.machine-local-context.v2");
     encode_list_len_to(&mut out, context.len());
     for local in context {
         encode_machine_local_decl_to(&mut out, local);
@@ -20635,20 +19785,20 @@ pub fn machine_local_context_canonical_bytes(context: &[MachineLocalDecl]) -> Ve
 
 pub fn machine_local_context_hash(context: &[MachineLocalDecl]) -> Hash {
     hash_with_domain(
-        "npa.machine-tactic.machine-local-context.hash.v1",
+        "npa.machine-tactic.machine-local-context.hash.v2",
         &machine_local_context_canonical_bytes(context),
     )
 }
 
 pub fn checked_decl_signature_canonical_bytes(signature: &CheckedDeclSignature) -> Vec<u8> {
-    let mut out = tagged_bytes("npa.machine-tactic.checked-decl-signature.v1");
+    let mut out = tagged_bytes("npa.machine-tactic.checked-decl-signature.v2");
     encode_checked_decl_signature_to(&mut out, signature);
     out
 }
 
 pub fn checked_decl_signature_hash(signature: &CheckedDeclSignature) -> Hash {
     hash_with_domain(
-        "npa.machine-tactic.checked-decl-signature.hash.v1",
+        "npa.machine-tactic.checked-decl-signature.hash.v2",
         &checked_decl_signature_canonical_bytes(signature),
     )
 }
@@ -20662,75 +19812,134 @@ pub fn core_expr_canonical_bytes(expr: &Expr) -> Vec<u8> {
 }
 
 fn kernel_core_expr_hash(expr: &Expr) -> Hash {
-    let mut payload = Vec::new();
-    match expr {
-        Expr::Sort(level) => {
-            payload.push(0x00);
-            payload.extend(kernel_core_level_hash(&normalize_level(level.clone())));
+    fn pointer(expr: &Expr) -> usize {
+        std::ptr::from_ref(expr) as usize
+    }
+
+    let root = pointer(expr);
+    let mut hashes = std::collections::HashMap::<usize, Hash>::new();
+    let mut pending = vec![(expr, false)];
+    while let Some((expr, exiting)) = pending.pop() {
+        let key = pointer(expr);
+        if hashes.contains_key(&key) {
+            continue;
         }
-        Expr::BVar(index) => {
-            payload.push(0x01);
-            encode_u64_to(&mut payload, u64::from(*index));
+        if !exiting {
+            pending.push((expr, true));
+            match expr {
+                Expr::Sort(_) | Expr::BVar(_) | Expr::Const { .. } => {}
+                Expr::App(fun, arg)
+                | Expr::Lam {
+                    ty: fun, body: arg, ..
+                }
+                | Expr::Pi {
+                    ty: fun, body: arg, ..
+                } => {
+                    pending.push((arg, false));
+                    pending.push((fun, false));
+                }
+            }
+            continue;
         }
-        Expr::Const { name, levels } => {
-            payload.push(0x02);
-            encode_string_to(&mut payload, name);
-            encode_u64_to(&mut payload, levels.len() as u64);
-            for level in levels {
-                payload.extend(kernel_core_level_hash(&normalize_level(level.clone())));
+
+        let child_hash = |child: &Expr| hashes.get(&pointer(child)).copied().unwrap_or(ZERO_HASH);
+        let mut payload = Vec::new();
+        match expr {
+            Expr::Sort(level) => {
+                payload.push(0x00);
+                payload.extend(kernel_core_level_hash(level));
+            }
+            Expr::BVar(index) => {
+                payload.push(0x01);
+                encode_u64_to(&mut payload, u64::from(*index));
+            }
+            Expr::Const { name, levels } => {
+                payload.push(0x02);
+                encode_string_to(&mut payload, name);
+                encode_u64_to(&mut payload, levels.len() as u64);
+                for level in levels {
+                    payload.extend(kernel_core_level_hash(level));
+                }
+            }
+            Expr::App(fun, arg) => {
+                payload.push(0x03);
+                payload.extend(child_hash(fun));
+                payload.extend(child_hash(arg));
+            }
+            Expr::Lam { ty, body, .. } => {
+                payload.push(0x04);
+                payload.extend(child_hash(ty));
+                payload.extend(child_hash(body));
+            }
+            Expr::Pi { ty, body, .. } => {
+                payload.push(0x05);
+                payload.extend(child_hash(ty));
+                payload.extend(child_hash(body));
             }
         }
-        Expr::App(func, arg) => {
-            payload.push(0x03);
-            payload.extend(kernel_core_expr_hash(func));
-            payload.extend(kernel_core_expr_hash(arg));
-        }
-        Expr::Lam { ty, body, .. } => {
-            payload.push(0x04);
-            payload.extend(kernel_core_expr_hash(ty));
-            payload.extend(kernel_core_expr_hash(body));
-        }
-        Expr::Pi { ty, body, .. } => {
-            payload.push(0x05);
-            payload.extend(kernel_core_expr_hash(ty));
-            payload.extend(kernel_core_expr_hash(body));
-        }
-        Expr::Let {
-            ty, value, body, ..
-        } => {
-            payload.push(0x06);
-            payload.extend(kernel_core_expr_hash(ty));
-            payload.extend(kernel_core_expr_hash(value));
-            payload.extend(kernel_core_expr_hash(body));
-        }
+        hashes.insert(
+            key,
+            kernel_core_hash_with_domain(b"NPA-KERNEL-CORE-EXPR-0.1", &payload),
+        );
     }
-    kernel_core_hash_with_domain(b"NPA-KERNEL-CORE-EXPR-0.1", &payload)
+    hashes.get(&root).copied().unwrap_or(ZERO_HASH)
 }
 
 fn kernel_core_level_hash(level: &Level) -> Hash {
-    let mut payload = Vec::new();
-    match level {
-        Level::Zero => payload.push(0x00),
-        Level::Succ(inner) => {
-            payload.push(0x01);
-            payload.extend(kernel_core_level_hash(inner));
-        }
-        Level::Max(lhs, rhs) => {
-            payload.push(0x02);
-            payload.extend(kernel_core_level_hash(lhs));
-            payload.extend(kernel_core_level_hash(rhs));
-        }
-        Level::IMax(lhs, rhs) => {
-            payload.push(0x03);
-            payload.extend(kernel_core_level_hash(lhs));
-            payload.extend(kernel_core_level_hash(rhs));
-        }
-        Level::Param(name) => {
-            payload.push(0x04);
-            encode_string_to(&mut payload, name);
+    enum Frame {
+        Visit(Level),
+        Succ,
+        Max,
+        IMax,
+    }
+
+    let mut pending = vec![Frame::Visit(normalize_level(level.clone()))];
+    let mut hashes = Vec::<Hash>::new();
+    while let Some(frame) = pending.pop() {
+        match frame {
+            Frame::Visit(Level::Zero) => {
+                hashes.push(kernel_core_hash_with_domain(b"NPA-LEVEL-0.1", &[0x00]));
+            }
+            Frame::Visit(Level::Param(name)) => {
+                let mut payload = vec![0x04];
+                encode_string_to(&mut payload, &name);
+                hashes.push(kernel_core_hash_with_domain(b"NPA-LEVEL-0.1", &payload));
+            }
+            Frame::Visit(Level::Succ(inner)) => {
+                pending.push(Frame::Succ);
+                pending.push(Frame::Visit(*inner));
+            }
+            Frame::Visit(Level::Max(lhs, rhs)) => {
+                pending.push(Frame::Max);
+                pending.push(Frame::Visit(*rhs));
+                pending.push(Frame::Visit(*lhs));
+            }
+            Frame::Visit(Level::IMax(lhs, rhs)) => {
+                pending.push(Frame::IMax);
+                pending.push(Frame::Visit(*rhs));
+                pending.push(Frame::Visit(*lhs));
+            }
+            Frame::Succ => {
+                let child = hashes.pop().unwrap_or(ZERO_HASH);
+                let mut payload = vec![0x01];
+                payload.extend(child);
+                hashes.push(kernel_core_hash_with_domain(b"NPA-LEVEL-0.1", &payload));
+            }
+            Frame::Max | Frame::IMax => {
+                let rhs = hashes.pop().unwrap_or(ZERO_HASH);
+                let lhs = hashes.pop().unwrap_or(ZERO_HASH);
+                let mut payload = vec![if matches!(frame, Frame::Max) {
+                    0x02
+                } else {
+                    0x03
+                }];
+                payload.extend(lhs);
+                payload.extend(rhs);
+                hashes.push(kernel_core_hash_with_domain(b"NPA-LEVEL-0.1", &payload));
+            }
         }
     }
-    kernel_core_hash_with_domain(b"NPA-LEVEL-0.1", &payload)
+    hashes.pop().unwrap_or(ZERO_HASH)
 }
 
 fn kernel_core_hash_with_domain(domain: &[u8], payload: &[u8]) -> Hash {
@@ -20758,7 +19967,7 @@ pub fn machine_term_source_canonical_bytes(term: &MachineTermSource) -> Result<V
 
 pub fn machine_term_source_hash(term: &MachineTermSource) -> Result<Hash> {
     Ok(hash_with_domain(
-        "npa.machine-tactic.machine-term-source.hash.v1",
+        "npa.machine-tactic.machine-term-source.hash.v2",
         &machine_term_source_canonical_bytes(term)?,
     ))
 }
@@ -20887,7 +20096,7 @@ pub fn machine_proof_delta_hash(delta: &MachineProofDelta) -> Hash {
         encode_hash_to(&mut out, &meta.target_hash);
     }
     encode_hash_to(&mut out, &delta.to_state_fingerprint);
-    hash_with_domain("npa.machine-tactic.machine-proof-delta.v1", &out)
+    hash_with_domain("npa.machine-tactic.machine-proof-delta.v2", &out)
 }
 
 fn machine_tactic_env_hash(env: &MachineTacticEnv) -> Hash {
@@ -20930,7 +20139,7 @@ fn machine_tactic_env_hash(env: &MachineTacticEnv) -> Hash {
     encode_option_resolved_nat_to(&mut out, env.nat_family.as_ref());
     encode_hash_to(&mut out, &env.options_fingerprint);
     encode_hash_to(&mut out, &kernel_check_profile_hash(env.kernel_profile));
-    hash_with_domain("npa.machine-tactic.machine-tactic-env.v2", &out)
+    hash_with_domain("npa.machine-tactic.machine-tactic-env.v3", &out)
 }
 
 fn machine_proof_state_hash(state: &MachineProofState) -> Hash {
@@ -20967,17 +20176,17 @@ fn machine_proof_state_hash(state: &MachineProofState) -> Hash {
         &mut out,
         &kernel_check_profile_hash(state.env.kernel_profile),
     );
-    hash_with_domain("npa.machine-tactic.machine-proof-state.v1", &out)
+    hash_with_domain("npa.machine-tactic.machine-proof-state.v2", &out)
 }
 
 fn kernel_check_profile_hash(profile: MachineKernelProfile) -> Hash {
     let mut out = Vec::new();
-    encode_string_to(&mut out, "core-spec-v0.1");
-    encode_string_to(&mut out, "npa-kernel.core.v0.1");
-    encode_string_to(&mut out, "beta-delta-iota-zeta.v0.1");
+    encode_string_to(&mut out, "core-spec-v0.2");
+    encode_string_to(&mut out, "npa-kernel.core.v0.2");
+    encode_string_to(&mut out, "beta-delta-iota.v0.1");
     encode_string_to(&mut out, "levels-imax-v0.1");
     encode_string_to(&mut out, profile.as_str());
-    hash_with_domain("npa.machine-tactic.kernel-check-profile.v1", &out)
+    hash_with_domain("npa.machine-tactic.kernel-check-profile.v2", &out)
 }
 
 fn encode_diagnostic_kind_to(out: &mut Vec<u8>, kind: &MachineTacticDiagnosticKind) {
@@ -21585,18 +20794,6 @@ fn encode_proof_expr_to(out: &mut Vec<u8>, expr: &ProofExpr) {
             encode_core_expr_bytes_to(out, ty);
             encode_proof_expr_to(out, body);
         }
-        ProofExpr::Let {
-            binder,
-            ty,
-            value,
-            body,
-        } => {
-            out.push(0x04);
-            encode_string_to(out, binder);
-            encode_core_expr_bytes_to(out, ty);
-            encode_proof_expr_to(out, value);
-            encode_proof_expr_to(out, body);
-        }
     }
 }
 
@@ -21613,13 +20810,6 @@ fn encode_option_proof_expr_to(out: &mut Vec<u8>, expr: Option<&ProofExpr>) {
 fn encode_machine_local_decl_to(out: &mut Vec<u8>, local: &MachineLocalDecl) {
     encode_string_to(out, &local.name);
     encode_core_expr_bytes_to(out, &local.ty);
-    match &local.value {
-        Some(value) => {
-            out.push(1);
-            encode_core_expr_bytes_to(out, value);
-        }
-        None => out.push(0),
-    }
 }
 
 fn encode_checked_decl_signature_to(out: &mut Vec<u8>, signature: &CheckedDeclSignature) {
@@ -23445,33 +22635,18 @@ mod tests {
         .expect("trivial proof state should start")
     }
 
-    fn start_goal_with_local_definition(target: Expr) -> MachineProofState {
-        let mut state = start_trivial();
-        state.metas.get_mut(MetaVarId(0)).unwrap().assignment = Some(ProofExpr::Core(prop()));
-        state.metas.metas.insert(
-            MetaVarId(1),
-            MachineMetaVar {
-                id: MetaVarId(1),
-                goal_id: GoalId(1),
-                context: vec![MachineLocalDecl::definition("x", type0(), prop())],
-                target,
-                assignment: None,
-                creation_index: 1,
-            },
-        );
-        state.metas.next_id = 2;
-        state.open_goals = vec![GoalId(1)];
-        refresh_state_identity(&mut state);
-        validate_machine_proof_state(&state).unwrap();
-        state
-    }
-
     fn checked_term(source: &str) -> MachineTermSource {
         MachineTermSource::new_checked(source).expect("test term source should canonicalize")
     }
 
     fn checked_refine_term(source: &str) -> RefineTermSource {
         RefineTermSource::new_checked(source).expect("test refine term source should canonicalize")
+    }
+
+    fn assert_closed_output_has_no_retired_let(state: &MachineProofState) {
+        extract_closed_machine_proof(state).expect("closed proof should extract");
+        extract_closed_machine_certificate(state)
+            .expect("closed proof should pass certificate handoff");
     }
 
     fn prop_id_type() -> Expr {
@@ -23887,7 +23062,7 @@ mod tests {
     #[test]
     fn theorem_type_inner_type_mismatch_carries_hashes() {
         let spec = MachineProofSpec {
-            theorem_type: Expr::let_in("x", prop(), type0(), Expr::bvar(0)),
+            theorem_type: Expr::app(Expr::lam("x", prop(), Expr::bvar(0)), type0()),
             ..trivial_spec()
         };
         let err = start_machine_proof(
@@ -23966,7 +23141,7 @@ mod tests {
         .unwrap();
 
         assert!(closed.open_goals.is_empty());
-        extract_closed_machine_proof(&closed).unwrap();
+        assert_closed_output_has_no_retired_let(&closed);
     }
 
     #[test]
@@ -24008,6 +23183,7 @@ mod tests {
             extract_closed_machine_proof(&closed).unwrap(),
             Expr::konst("SMT.proof", vec![])
         );
+        assert_closed_output_has_no_retired_let(&closed);
     }
 
     #[test]
@@ -24024,8 +23200,8 @@ mod tests {
                 decl_interface_hash: interface_hash,
                 core_decl_hash,
                 dependency_selective_fingerprint: [9; 32],
-                owner_certificate_format: OWNER_CERTIFICATE_FORMAT_V0_2.to_owned(),
-                owner_core_spec: OWNER_CORE_SPEC_V0_2.to_owned(),
+                owner_certificate_format: OWNER_CERTIFICATE_FORMAT.to_owned(),
+                owner_core_spec: OWNER_CORE_SPEC.to_owned(),
                 prior_chain_fingerprint: [10; 32],
                 checked_env_fingerprint: [11; 32],
             },
@@ -24064,37 +23240,6 @@ mod tests {
 
     #[test]
     fn opaque_checked_current_is_private_reducible_but_import_remains_bodyless() {
-        let v0_2_empty = MachineTacticEnv::new_with_kernel_profile_and_owner_pair(
-            MachineKernelProfile::BuiltinNatEqRec,
-            Vec::new(),
-            Vec::new(),
-            MachineTacticOptions::default(),
-            OWNER_CERTIFICATE_FORMAT_V0_2,
-            OWNER_CORE_SPEC_V0_2,
-        )
-        .unwrap();
-        let v0_3_empty = MachineTacticEnv::new_with_kernel_profile_and_owner_pair(
-            MachineKernelProfile::BuiltinNatEqRec,
-            Vec::new(),
-            Vec::new(),
-            MachineTacticOptions::default(),
-            OWNER_CERTIFICATE_FORMAT_V0_3,
-            OWNER_CORE_SPEC_V0_3,
-        )
-        .unwrap();
-        assert_ne!(v0_2_empty.env_fingerprint, v0_3_empty.env_fingerprint);
-        let current_state = start_machine_proof(
-            trivial_spec(),
-            Vec::new(),
-            Vec::new(),
-            MachineTacticOptions::default(),
-        )
-        .unwrap();
-        let mut v0_3_state = current_state.clone();
-        v0_3_state.env = v0_3_empty;
-        v0_3_state.fingerprint = machine_proof_state_hash(&v0_3_state);
-        assert_eq!(current_state.fingerprint, v0_3_state.fingerprint);
-
         let opaque_decl = Decl::Def {
             name: "OpaqueCurrent.hidden".to_owned(),
             universe_params: Vec::new(),
@@ -24108,11 +23253,8 @@ mod tests {
             0,
             opaque_decl.clone(),
         )
-        .expect("opaque current declaration should check under v0.3");
-        assert_eq!(
-            checked.owner_certificate_format(),
-            OWNER_CERTIFICATE_FORMAT_V0_3
-        );
+        .expect("opaque current declaration should check under v0.4");
+        assert_eq!(checked.owner_certificate_format(), OWNER_CERTIFICATE_FORMAT);
         assert!(matches!(
             checked.core_decl(),
             Decl::Def {
@@ -24266,11 +23408,11 @@ mod tests {
     fn local_context_hash_and_prefix_are_deterministic() {
         let context = vec![
             MachineLocalDecl::assumption("A", prop()),
-            MachineLocalDecl::definition("x", Expr::bvar(0), Expr::bvar(0)),
+            MachineLocalDecl::assumption("x", Expr::bvar(0)),
         ];
         let extended = vec![
             MachineLocalDecl::assumption("A", prop()),
-            MachineLocalDecl::definition("x", Expr::bvar(0), Expr::bvar(0)),
+            MachineLocalDecl::assumption("x", Expr::bvar(0)),
             MachineLocalDecl::assumption("y", Expr::bvar(1)),
         ];
 
@@ -24355,7 +23497,7 @@ mod tests {
     fn diagnostic_summary_local_context_identity_ignores_display_names() {
         let context = vec![
             MachineLocalDecl::assumption("A", prop()),
-            MachineLocalDecl::definition("x", Expr::bvar(0), Expr::bvar(0)),
+            MachineLocalDecl::assumption("x", Expr::bvar(0)),
             MachineLocalDecl::assumption("y", Expr::bvar(1)),
         ];
         let budget = DiagnosticSummaryBudget::default();
@@ -25030,7 +24172,7 @@ mod tests {
                 let certificate_hash = if state.open_goals.is_empty() {
                     extract_closed_machine_certificate(&state)
                         .ok()
-                        .map(|handoff| handoff.certificate.hashes.certificate_hash)
+                        .map(|handoff| handoff.certificate.hashes().certificate_hash)
                 } else {
                     None
                 };
@@ -26227,6 +25369,7 @@ mod tests {
         );
         extract_closed_machine_certificate(&closed)
             .expect("ring_nf equality proof should verify source-free");
+        assert_closed_output_has_no_retired_let(&closed);
     }
 
     #[test]
@@ -26329,6 +25472,7 @@ mod tests {
         );
         extract_closed_machine_certificate(&closed)
             .expect("omega equality proof should verify source-free");
+        assert_closed_output_has_no_retired_let(&closed);
     }
 
     #[test]
@@ -26431,6 +25575,7 @@ mod tests {
         );
         extract_closed_machine_certificate(&closed)
             .expect("finite_decide equality proof should verify source-free");
+        assert_closed_output_has_no_retired_let(&closed);
     }
 
     #[test]
@@ -26459,6 +25604,7 @@ mod tests {
         assert!(matches!(proof, Expr::Lam { .. }));
         extract_closed_machine_certificate(&closed)
             .expect("finite_decide universal proof should verify source-free");
+        assert_closed_output_has_no_retired_let(&closed);
     }
 
     #[test]
@@ -26477,6 +25623,7 @@ mod tests {
         );
         extract_closed_machine_certificate(&closed)
             .expect("finite_decide Bool decision proof should verify source-free");
+        assert_closed_output_has_no_retired_let(&closed);
     }
 
     #[test]
@@ -26736,7 +25883,7 @@ mod tests {
         assert_eq!(checked_x.core_decl_hash(), checked_y.core_decl_hash());
         assert_eq!(
             checked_x.core_decl_hash(),
-            cert_x.declarations[0].hashes.decl_certificate_hash
+            cert_x.declarations()[0].hashes.decl_certificate_hash
         );
     }
 
@@ -26751,6 +25898,19 @@ mod tests {
 
         assert_eq!(core_expr_hash(&prop()), expected);
         assert_ne!(core_expr_hash(&prop()), npa_cert::core_expr_hash(&prop()));
+    }
+
+    #[test]
+    fn core_expr_machine_hash_is_stack_safe_at_structural_depth_limit() {
+        let mut expr = Expr::bvar(0);
+        for _ in 0..8_192 {
+            expr = Expr::lam("_", Expr::bvar(0), expr);
+        }
+
+        let first = core_expr_hash(&expr);
+        assert_ne!(first, ZERO_HASH);
+        assert_eq!(core_expr_hash(&expr), first);
+        std::mem::forget(expr);
     }
 
     #[test]
@@ -29979,8 +29139,7 @@ mod tests {
         )
         .expect("continuation should close from the verified local lemma");
         assert!(closed.open_goals.is_empty());
-        extract_closed_machine_certificate(&closed)
-            .expect("term-backed have should pass certificate handoff");
+        assert_closed_output_has_no_retired_let(&closed);
     }
 
     #[test]
@@ -30149,8 +29308,7 @@ mod tests {
         )
         .expect("term-backed suffices continuation should close");
         assert!(closed.open_goals.is_empty());
-        extract_closed_machine_certificate(&closed)
-            .expect("term-backed suffices should pass certificate handoff");
+        assert_closed_output_has_no_retired_let(&closed);
     }
 
     #[test]
@@ -30190,8 +29348,7 @@ mod tests {
         )
         .expect("specialized local should close the continuation");
         assert!(closed.open_goals.is_empty());
-        extract_closed_machine_certificate(&closed)
-            .expect("closed specialize proof should pass certificate handoff");
+        assert_closed_output_has_no_retired_let(&closed);
     }
 
     #[test]
@@ -30236,8 +29393,7 @@ mod tests {
         )
         .expect("replacement local should close the reintroduced suffix goal");
         assert!(closed.open_goals.is_empty());
-        extract_closed_machine_certificate(&closed)
-            .expect("closed replacement proof should pass certificate handoff");
+        assert_closed_output_has_no_retired_let(&closed);
     }
 
     #[test]
@@ -30866,43 +30022,6 @@ mod tests {
     }
 
     #[test]
-    fn apply_rejects_local_let_head() {
-        let mut state = start_trivial();
-        state.metas.get_mut(MetaVarId(0)).unwrap().assignment = Some(ProofExpr::Core(prop()));
-        state.metas.metas.insert(
-            MetaVarId(1),
-            MachineMetaVar {
-                id: MetaVarId(1),
-                goal_id: GoalId(1),
-                context: vec![MachineLocalDecl::definition("x", type0(), prop())],
-                target: type0(),
-                assignment: None,
-                creation_index: 1,
-            },
-        );
-        state.metas.next_id = 2;
-        state.open_goals = vec![GoalId(1)];
-        refresh_state_identity(&mut state);
-        validate_machine_proof_state(&state).unwrap();
-
-        let err = run_machine_tactic(
-            &state,
-            MachineTactic::Apply {
-                goal_id: GoalId(1),
-                head: TacticHead::Local {
-                    name: "x".to_owned(),
-                },
-                universe_args: Vec::new(),
-                args: Vec::new(),
-            },
-        )
-        .expect_err("local let declarations cannot be apply proof heads");
-
-        assert_eq!(err.kind, MachineTacticDiagnosticKind::InvalidLocalHead);
-        assert_eq!(state.open_goals, vec![GoalId(1)]);
-    }
-
-    #[test]
     fn apply_validation_errors_include_goal_and_meta() {
         let state = start_trivial();
         let invalid_head = run_machine_tactic(
@@ -31266,7 +30385,7 @@ mod tests {
             encode_hash_to(&mut out, &meta.target_hash);
         }
         encode_hash_to(&mut out, &delta.to_state_fingerprint);
-        let expected_hash = hash_with_domain("npa.machine-tactic.machine-proof-delta.v1", &out);
+        let expected_hash = hash_with_domain("npa.machine-tactic.machine-proof-delta.v2", &out);
 
         assert_eq!(delta.delta_hash, expected_hash);
     }
@@ -31415,13 +30534,12 @@ mod tests {
             MachineGeneratedNameKind::InductionHypothesis,
             Some("n"),
         );
-        let extended = extend_machine_local_context_definition_with_budget(
+        let extended = extend_machine_local_context_assumption_with_budget(
             &state,
             &goal,
             &extended,
             ih.clone(),
             type0(),
-            prop(),
             &fuel,
         )
         .unwrap();
@@ -31581,104 +30699,6 @@ mod tests {
     }
 
     #[test]
-    fn tactic_entry_context_conversion_consumes_conversion_fuel() {
-        let state = start_goal_with_local_definition(Expr::pi("p", prop(), prop()));
-
-        let err = run_machine_tactic_with_budget(
-            &state,
-            MachineTactic::Intro {
-                goal_id: GoalId(1),
-                name: "p".to_owned(),
-            },
-            TacticBudget {
-                max_conversion_steps: 0,
-                ..TacticBudget::default()
-            },
-        )
-        .expect_err("goal local context checking must share the tactic conversion budget");
-
-        assert_eq!(
-            err.kind,
-            MachineTacticDiagnosticKind::TacticFuelExhausted {
-                kind: TacticFuelKind::Conversion
-            }
-        );
-        assert_eq!(err.goal_id, Some(GoalId(1)));
-        assert_eq!(err.meta_id, Some(MetaVarId(1)));
-        assert_eq!(state.open_goals, vec![GoalId(1)]);
-    }
-
-    #[test]
-    fn apply_head_lookup_precedes_context_fuel() {
-        let state = start_goal_with_local_definition(type0());
-        let err = run_machine_tactic_with_budget(
-            &state,
-            MachineTactic::Apply {
-                goal_id: GoalId(1),
-                head: TacticHead::CurrentModule {
-                    name: Name::from_dotted("Test.missing"),
-                    decl_interface_hash: ZERO_HASH,
-                },
-                universe_args: Vec::new(),
-                args: Vec::new(),
-            },
-            TacticBudget {
-                max_whnf_steps: 0,
-                max_conversion_steps: 0,
-                ..TacticBudget::default()
-            },
-        )
-        .expect_err("apply head lookup must run before goal context kernel fuel is consumed");
-
-        assert_eq!(err.kind, MachineTacticDiagnosticKind::UnknownTacticHead);
-        assert_eq!(err.goal_id, Some(GoalId(1)));
-        assert_eq!(err.tactic_kind.as_deref(), Some("apply"));
-        assert_eq!(
-            err.primary_name.as_deref(),
-            Some(&Name::from_dotted("Test.missing"))
-        );
-        assert_eq!(err.meta_id, Some(MetaVarId(1)));
-        assert_eq!(state.open_goals, vec![GoalId(1)]);
-    }
-
-    #[test]
-    fn rw_rule_lookup_precedes_context_fuel() {
-        let state = start_goal_with_local_definition(eq_nat(nat_zero(), nat_zero()));
-        let err = run_machine_tactic_with_budget(
-            &state,
-            MachineTactic::Rewrite {
-                goal_id: GoalId(1),
-                rule: RewriteRuleRef {
-                    head: TacticHead::CurrentModule {
-                        name: Name::from_dotted("Test.missing"),
-                        decl_interface_hash: ZERO_HASH,
-                    },
-                    universe_args: Vec::new(),
-                    args: Vec::new(),
-                },
-                direction: RewriteDirection::Forward,
-                site: RewriteSite::EqTargetLeft,
-            },
-            TacticBudget {
-                max_whnf_steps: 0,
-                max_conversion_steps: 0,
-                ..TacticBudget::default()
-            },
-        )
-        .expect_err("rw rule lookup must run before goal context kernel fuel is consumed");
-
-        assert_eq!(err.kind, MachineTacticDiagnosticKind::UnknownTacticHead);
-        assert_eq!(err.goal_id, Some(GoalId(1)));
-        assert_eq!(err.tactic_kind.as_deref(), Some("rw"));
-        assert_eq!(
-            err.primary_name.as_deref(),
-            Some(&Name::from_dotted("Test.missing"))
-        );
-        assert_eq!(err.meta_id, Some(MetaVarId(1)));
-        assert_eq!(state.open_goals, vec![GoalId(1)]);
-    }
-
-    #[test]
     fn zero_tactic_step_budget_fails_after_input_validation() {
         let state = start_trivial();
         let budget = TacticBudget {
@@ -31824,7 +30844,7 @@ mod tests {
         assert_eq!(handoff.core_module.declarations[0].name(), "Test.thm");
         assert_eq!(
             handoff.verified_module.certificate_hash(),
-            handoff.certificate.hashes.certificate_hash
+            handoff.certificate.hashes().certificate_hash
         );
         assert_eq!(
             npa_cert::decode_module_cert(&handoff.certificate_bytes)
@@ -31935,9 +30955,9 @@ mod tests {
         let handoff = extract_closed_machine_certificate(&state)
             .expect("env-only proof dependency should not be a certificate import");
 
-        assert_eq!(handoff.certificate.imports.len(), 1);
+        assert_eq!(handoff.certificate.imports().len(), 1);
         assert_eq!(
-            handoff.certificate.imports[0].module,
+            handoff.certificate.imports()[0].module,
             Name::from_dotted("A")
         );
     }
@@ -32038,7 +31058,7 @@ mod tests {
 
         assert_eq!(
             checked.signature().decl_interface_hash(),
-            cert.declarations[0].hashes.decl_interface_hash
+            cert.declarations()[0].hashes.decl_interface_hash
         );
     }
 
@@ -32064,11 +31084,11 @@ mod tests {
 
         assert_eq!(
             import.certified_env_decl_hashes(),
-            &[cert.declarations[0].hashes.decl_certificate_hash]
+            &[cert.declarations()[0].hashes.decl_certificate_hash]
         );
         assert_ne!(
-            cert.declarations[0].hashes.decl_interface_hash,
-            cert.declarations[0].hashes.decl_certificate_hash
+            cert.declarations()[0].hashes.decl_interface_hash,
+            cert.declarations()[0].hashes.decl_certificate_hash
         );
     }
 
@@ -32134,7 +31154,7 @@ mod tests {
             name: "Test.A".to_owned(),
             universe_params: Vec::new(),
             ty: type0(),
-            proof: Expr::let_in("p", type0(), prop(), Expr::bvar(0)),
+            proof: Expr::pi("p", prop(), prop()),
         };
         let spec = MachineProofSpec {
             source_index: 2,

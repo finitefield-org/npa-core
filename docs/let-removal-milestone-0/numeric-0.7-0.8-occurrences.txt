@@ -1,0 +1,516 @@
+5d22858ffed16d75bcf01a61381abdb4040ae275:.agents/skills/prove-theorem/SKILL.md:339:   0.8`, use the reported `source.path`, `line`, `column`, `token`,
+5d22858ffed16d75bcf01a61381abdb4040ae275:.agents/skills/prove-theorem/SKILL.md:455:- With the helper lane, rebuild downstream modules only if a changed foundational module changes export hashes. With targeted `npa-cli 0.8` refresh, let the CLI compute its dependency-safe local dependent closure instead of widening the selection manually.
+5d22858ffed16d75bcf01a61381abdb4040ae275:.agents/skills/prove-theorem/references/kernel-fuel-debugging.md:19:`npa-cli 0.8` default. Use the equivalent `cargo run` command from the main
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/README.md:23:  dependencies, requires the exact path-plus-`0.8` contract, and runs every
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/certificate-term-dag-materialization-design-tasks.md:28:  later snapshot composition advances the current union schema to v0.7 and the
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/certificate-term-dag-materialization-design-tasks.md:148:  The later snapshot landing composes those histories under current schema v0.7
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/certificate-term-dag-materialization-design-tasks.md:172:  current common union is v0.7, and the active composed memory model is
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/certificate-term-dag-materialization-design-tasks.md:2430:  snapshot composition publishes current union v0.7 without rewriting v0.6.
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/certificate-term-dag-materialization-design-tasks.md:2448:- Execution result (2026-08-13): v0.6 contains the eleven term labels; v0.7 is
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/certificate-term-dag-materialization-design-tasks.md:3843:- Action: run the repository-defined v0.8 external checker in functional-only
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/certificate-term-dag-materialization-design-tasks.md:3849:- Verification: `checkers/npa-checker-ext/scripts/toolchain-v0.8.sh --functional-only`
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/certificate-term-dag-materialization-design-tasks.md:3857:- Action: run the full repository-defined v0.8 external checker gate.
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/certificate-term-dag-materialization-design-tasks.md:3861:  - Output reports v0.8.0 compatibility and release evidence passed.
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/certificate-term-dag-materialization-design-tasks.md:3862:- Verification: `checkers/npa-checker-ext/scripts/toolchain-v0.8.sh`
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/certificate-term-dag-materialization-design-tasks.md:3965:  composed v0.7/v3 identities; and separated pending release evidence from
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/certificate-term-dag-materialization-design-tasks.md:3976:  v0.7/v3 composition; v0.6/v2 remain immutable TDAG history.
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/certificate-term-dag-materialization-design.md:34:current common schema is the v0.7 union; neither that union nor the v3 model
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/certificate-term-dag-materialization-design.md:72:history with the composed current v0.7/v3 state. Final
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/kernel-fuel-hotspot-diagnostics-design-todo.md:21:  0.4.0`, `npa-api 0.4.0`, and `npa-cli 0.8.0`;
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/kernel-fuel-hotspot-diagnostics-design-todo.md:30:host assertions, and the v0.8 toolchain reference must land in the same final
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/kernel-fuel-hotspot-diagnostics-design-todo.md:106:| historical 0.6.x/0.7.x | v0.3 |
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/kernel-fuel-hotspot-diagnostics-design-todo.md:107:| current 0.8.x | v0.4 |
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/kernel-fuel-hotspot-diagnostics-design-todo.md:137:| KFH-17 | v0.8 external-checker evidence and compatibility gates | KFH-16 |
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/kernel-fuel-hotspot-diagnostics-design-todo.md:154:| 10. 0.8/v0.4 is strict and history remains readable | KFH-14, KFH-15, KFH-17 | host-pair and exact historical fixture matrix |
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/kernel-fuel-hotspot-diagnostics-design-todo.md:1021:2. Bind 0.8.x hosts to v0.4; retain 0.6.x and 0.7.x bound to v0.3 and all older
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/kernel-fuel-hotspot-diagnostics-design-todo.md:1064:- v0.4 is accepted only with 0.8.x.
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/kernel-fuel-hotspot-diagnostics-design-todo.md:1101:   0.7.0→0.8.0.
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/kernel-fuel-hotspot-diagnostics-design-todo.md:1106:   `npa-cli 0.7` to `0.8`; refresh both tracked locks without unrelated updates.
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/kernel-fuel-hotspot-diagnostics-design-todo.md:1107:4. Advance the compatibility gate's asserted current host to 0.8.0. Preserve
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/kernel-fuel-hotspot-diagnostics-design-todo.md:1114:   `CARGO_PKG_VERSION`: old verifier/build-check entries miss under 0.4/0.8 and
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/kernel-fuel-hotspot-diagnostics-design-todo.md:1139:## KFH-17: v0.8 external-checker evidence and compatibility gates
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/kernel-fuel-hotspot-diagnostics-design-todo.md:1147:- `npa-core/checkers/npa-checker-ext/scripts/toolchain-v0.8.sh` (new)
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/kernel-fuel-hotspot-diagnostics-design-todo.md:1154:1. Add `toolchain-v0.8.sh` by adapting current-gate mechanics, not by mutating
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/kernel-fuel-hotspot-diagnostics-design-todo.md:1155:   `toolchain-v0.7.sh`. Assert `npa-cli 0.8.0`, package-result v0.4, current
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/kernel-fuel-hotspot-diagnostics-design-todo.md:1159:   and captured result schema in `checker_ext_toolchain_evidence.rs` to v0.8.
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/kernel-fuel-hotspot-diagnostics-design-todo.md:1160:   Keep previously emitted v0.7 evidence immutable and explicitly historical.
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/kernel-fuel-hotspot-diagnostics-design-todo.md:1161:3. Update tests to distinguish current v0.8 evidence from retained historical
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/kernel-fuel-hotspot-diagnostics-design-todo.md:1162:   v0.7 fixtures; never mass-relabel frozen evidence strings.
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/kernel-fuel-hotspot-diagnostics-design-todo.md:1164:   v0.8; retain v0.7 commands under a historical compatibility heading.
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/kernel-fuel-hotspot-diagnostics-design-todo.md:1170:- v0.7 gate and frozen evidence are unchanged.
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/kernel-fuel-hotspot-diagnostics-design-todo.md:1171:- Current evidence asserts 0.8/v0.4 and rejects old current labels.
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/kernel-fuel-hotspot-diagnostics-design-todo.md:1180:./checkers/npa-checker-ext/scripts/toolchain-v0.8.sh --functional-only
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/kernel-fuel-hotspot-diagnostics-design-todo.md:1191:- new `npa-core/docs/npa-toolchain-reference-v0.8.0.md`
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/kernel-fuel-hotspot-diagnostics-design-todo.md:1206:1. Write the v0.8 toolchain reference with CLI flags/defaults, mode matrix,
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/kernel-fuel-hotspot-diagnostics-design-todo.md:1207:   Rust version table, package API v1 builders, 0.8/v0.4 host/result pair,
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/kernel-fuel-hotspot-diagnostics-design-todo.md:1210:2. Add the new v0.8 reference to the no-Python operator-document audit while
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/kernel-fuel-hotspot-diagnostics-design-todo.md:1211:   retaining the existing v0.5-v0.7 reference paths.
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/kernel-fuel-hotspot-diagnostics-design-todo.md:1212:3. Advance current pointers in the three npa-core overview docs to v0.8 while
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/kernel-fuel-hotspot-diagnostics-design-todo.md:1213:   retaining v0.7 as an explicitly historical reference.
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/kernel-fuel-hotspot-diagnostics-design-todo.md:1218:   current 0.7/v0.3 pair to 0.8/v0.4 and extend historical pair tables instead
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/kernel-fuel-hotspot-diagnostics-design-todo.md:1244:- No nonhistorical document calls v0.7/v0.3/v0.2 current.
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/kernel-fuel-hotspot-diagnostics-design-todo.md:1246:- The no-Python operator-document audit covers v0.5 through v0.8.
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/kernel-fuel-hotspot-diagnostics-design-todo.md:1364:./checkers/npa-checker-ext/scripts/toolchain-v0.8.sh --functional-only
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/kernel-fuel-hotspot-diagnostics-design-todo.md:1371:`npa-core/checkers/npa-checker-ext/scripts/toolchain-v0.8.sh` without
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/kernel-fuel-hotspot-diagnostics-design-todo.md:1389:- cache one-time invalidation and within-v0.8 mode-key invariance;
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/kernel-fuel-hotspot-diagnostics-design-todo.md:1390:- functional and full v0.8 external-checker toolchain gates;
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/kernel-fuel-hotspot-diagnostics-design.md:21:- `npa-cli 0.8.0`.
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/kernel-fuel-hotspot-diagnostics-design.md:59:[toolchain reference](../../npa-core/docs/npa-toolchain-reference-v0.8.0.md).
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/kernel-fuel-hotspot-diagnostics-design.md:892:`npa.package.command_result.v0.4` together with an `npa-cli 0.8.x` host-version
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/kernel-fuel-hotspot-diagnostics-design.md:893:advance. Release validation adds the host/result pair `npa-cli 0.8.x` / v0.4
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/kernel-fuel-hotspot-diagnostics-design.md:895:current `npa-cli 0.6.x` / `0.7.x` / v0.3 pair remains read-only compatibility.
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/kernel-fuel-hotspot-diagnostics-design.md:896:A v0.3 result must not be relabeled v0.4, and an 0.7.x host must not be paired
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/kernel-fuel-hotspot-diagnostics-design.md:1095:| `npa-cli` | 0.7.0 | 0.8.0 | non-exhaustive build options and `package_api::v1` gain additive selectors; host writers move to command-result v0.4 |
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/kernel-fuel-hotspot-diagnostics-design.md:1102:fixtures, release-manifest host assertions, and the v0.8 toolchain reference in
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/kernel-fuel-hotspot-diagnostics-design.md:1106:consumers whose path dependencies required `npa-cli 0.7`: `npa-web` and
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/kernel-fuel-hotspot-diagnostics-design.md:1108:files advance to 0.8 in the same change, while their `package_api::v1` call
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/kernel-fuel-hotspot-diagnostics-design.md:1115:changes built-in package-verifier checker identities, and `npa-cli 0.8.0`
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/kernel-fuel-hotspot-diagnostics-design.md:1406:- bind `npa-cli 0.8.x` to v0.4 without changing historical host/result pairs;
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/kernel-fuel-hotspot-diagnostics-design.md:1424:  captured command-result expectation from toolchain v0.7/v0.3 to v0.8/v0.4;
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/kernel-fuel-hotspot-diagnostics-design.md:1425:- leave previously emitted v0.7 evidence immutable rather than relabeling it.
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/kernel-fuel-hotspot-diagnostics-design.md:1429:- advance the adjacent-source `npa-cli` host line to 0.8.x in the same change
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/kernel-fuel-hotspot-diagnostics-design.md:1446:`checkers/npa-checker-ext/scripts/toolchain-v0.8.sh`
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/kernel-fuel-hotspot-diagnostics-design.md:1448:- add the current 0.8.0 host compatibility gate with v0.4 command-result
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/kernel-fuel-hotspot-diagnostics-design.md:1449:  evidence; retain `toolchain-v0.7.sh` unchanged as the historical 0.7 gate.
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/kernel-fuel-hotspot-diagnostics-design.md:1453:- point current adjacent-source instructions to the v0.8 gate and preserve the
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/kernel-fuel-hotspot-diagnostics-design.md:1454:  v0.7 invocation as historical compatibility documentation.
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/kernel-fuel-hotspot-diagnostics-design.md:1463:- advance the adjacent path dependency requirement from `npa-cli 0.7` to
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/kernel-fuel-hotspot-diagnostics-design.md:1464:  `npa-cli 0.8` without advancing `package_api::v1` or replacing facade
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/kernel-fuel-hotspot-diagnostics-design.md:1474:- advance the asserted current host from 0.7.0 to 0.8.0;
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/kernel-fuel-hotspot-diagnostics-design.md:1480:- add the new v0.8 toolchain reference to the operator-document audit while
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/kernel-fuel-hotspot-diagnostics-design.md:1481:  retaining the historical v0.5-v0.7 references already covered by that gate.
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/kernel-fuel-hotspot-diagnostics-design.md:1487:- add the v0.8 toolchain reference with the flag, Rust crate-version table,
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/kernel-fuel-hotspot-diagnostics-design.md:1489:  invalidation while retaining v0.7 as historical documentation;
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/kernel-fuel-hotspot-diagnostics-design.md:1492:  and external-checker gate while retaining v0.7 as historical;
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/kernel-fuel-hotspot-diagnostics-design.md:1498:  nonhistorical generated-artifact release policy/runbook from the v0.7/v0.3
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/kernel-fuel-hotspot-diagnostics-design.md:1499:  current pair to v0.8/v0.4, retaining their historical pair tables;
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/kernel-fuel-hotspot-diagnostics-design.md:1503:- audit repository-wide references to `npa-cli 0.7`, the v0.7 toolchain
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/kernel-fuel-hotspot-diagnostics-design.md:1504:  reference, and `toolchain-v0.7.sh`; update every statement that claims those
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/kernel-fuel-hotspot-diagnostics-design.md:1506:  fixtures, and explicitly historical commands as v0.7;
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/kernel-fuel-hotspot-diagnostics-design.md:1539:4. Implement the `npa-cli 0.8.x` / command-result v0.4 migration and
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/kernel-fuel-hotspot-diagnostics-design.md:1647:  0.6.x/0.7.x/v0.3 pair;
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/kernel-fuel-hotspot-diagnostics-design.md:1648:- v0.4 is accepted only with an 0.8.x host;
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/kernel-fuel-hotspot-diagnostics-design.md:1671:- the `npa-web` and proof-corpus path dependencies accept `npa-cli 0.8`, their
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/kernel-fuel-hotspot-diagnostics-design.md:1675:  0.4.0, 0.4.0, and 0.8.0 migration;
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/kernel-fuel-hotspot-diagnostics-design.md:1709:./checkers/npa-checker-ext/scripts/toolchain-v0.8.sh --functional-only
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/kernel-fuel-hotspot-diagnostics-design.md:1717:The clean-checkout Linux release run additionally executes the v0.8 toolchain
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/kernel-fuel-hotspot-diagnostics-design.md:1765:10. The 0.8.x/v0.4 host/result pair is strictly validated, all historical
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/kernel-fuel-hotspot-diagnostics-design.md:1777:    `npa-frontend 0.4.0`, `npa-api 0.4.0`, and `npa-cli 0.8.0`, with lockfile
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/kernel-fuel-hotspot-diagnostics-design.md:1779:15. Focused crate tests, `check-fast.sh`, `check-performance.sh`, the v0.8
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/kernel-fuel-hotspot-diagnostics-design.md:1855:- `npa-cli` advances to 0.8.x with package command-result v0.4 and an optional
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/kernel-fuel-hotspot-diagnostics-design.md:1856:  diagnostic sibling `kernel_fuel`; historical 0.6.x/0.7.x hosts remain bound
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/kernel-fuel-hotspot-diagnostics-design.md:1867:  0.3.0, 0.4.0, and 0.4.0 respectively alongside `npa-cli 0.8.0`.
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/kernel-fuel-hotspot-diagnostics-rollout-evidence.md:105:`npa-frontend 0.4.0`, `npa-api 0.4.0`, and `npa-cli 0.8.0`. The reviewed
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/kernel-fuel-hotspot-diagnostics-rollout-evidence.md:127:  consumer builds, v0.8 cache invalidation, and within-v0.8 mode-key invariance
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/kernel-fuel-hotspot-diagnostics-rollout-evidence.md:215:| G12 | linux-clean | `./checkers/npa-checker-ext/scripts/toolchain-v0.8.sh --functional-only` | pass | `source-free trace: matched`; `toolchain v0.8 functional compatibility passed; release evidence not evaluated` |
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/kernel-fuel-hotspot-diagnostics-rollout-evidence.md:216:| G13 | linux-clean | `./checkers/npa-checker-ext/scripts/toolchain-v0.8.sh` | pass | `source-free trace: matched`; full release evidence passed |
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/kernel-fuel-hotspot-diagnostics-rollout-evidence.md:236:npa-mathlib-downstream-proofs-generated-toolchain-v0.8.0-compat.tar.gz: OK
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/kernel-fuel-hotspot-diagnostics-rollout-evidence.md:237:toolchain v0.8.0 compatibility and release evidence passed
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/kernel-whnf-application-spine-machine-design-tasks.md:2490:- Action: execute the v0.8 toolchain gate in functional-only mode.
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/kernel-whnf-application-spine-machine-design-tasks.md:2495:- Verification: `checkers/npa-checker-ext/scripts/toolchain-v0.8.sh --functional-only`
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/kernel-whnf-application-spine-machine-design-tasks.md:2503:- Action: execute the full v0.8 toolchain gate.
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/kernel-whnf-application-spine-machine-design-tasks.md:2507:  - The final message reports v0.8.0 compatibility and release evidence passed.
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/kernel-whnf-application-spine-machine-design-tasks.md:2508:- Verification: `checkers/npa-checker-ext/scripts/toolchain-v0.8.sh`
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/kernel-whnf-application-spine-machine-design.md:1794:and the clean Linux v0.8 source-free functional and release gates also remain
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/kernel-whnf-defeq-ephemeral-memoization-design.md:15:path. The current common v0.7 measurement projection reports aggregate memo,
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/kernel-whnf-defeq-ephemeral-memoization-design.md:18:common v0.1 vocabulary and remain unchanged through v0.7; package sharding was
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/kernel-whnf-defeq-ephemeral-memoization-design.md:423:counters into the current common `npa.performance.measurements.v0.7` schema
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/kernel-whnf-defeq-ephemeral-memoization-design.md:547:  `npa.performance.measurements.v0.7` block while keeping memo selection
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/npa-checker-ref-unknown-reference-diagnostics-design.md:61:- `npa-core/docs/npa-toolchain-reference-v0.7.0.md` — was the then-current
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/npa-checker-ref-unknown-reference-diagnostics-design.md:480:`npa-core/docs/npa-toolchain-reference-v0.7.0.md` and recorded reference checker
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/opaque-definition-surface-design-todo.md:1066:  `checkers/npa-checker-ext/scripts/toolchain-v0.7.sh`, and release-manifest
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/opaque-definition-surface-design-todo.md:1089:  - Update active v0.7 external-checker scripts; retain historical v0.5/v0.6
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/opaque-definition-surface-design-todo.md:1331:  `npa-core/docs/npa-toolchain-reference-v0.7.0.md`,
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/opaque-definition-surface-design-todo.md:1385:  - `rg -n "NPA-CERT-0.2.0|NPA-Core-0.2.0|checker_raw_result.v1" README.md docs/README.md docs/index.md docs/npa-toolchain-reference-v0.7.0.md docs/npa-checker-ext-ocaml.md checkers/npa-checker-ext/README.md` and classify every remaining hit as an explicit compatibility or historical statement
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/package-artifact-ledger-direct-import-alignment-design.md:36:- `npa-core/docs/npa-toolchain-reference-v0.8.0.md` — is the current package
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/package-artifact-ledger-direct-import-alignment-design.md:290:At implementation time, the then-current v0.7 toolchain reference had to gain
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/package-artifact-ledger-direct-import-alignment-design.md:374:5. Update the then-current, now historical v0.7 toolchain reference to define
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/package-artifact-ledger-direct-import-alignment-design.md:400:- The historical v0.7 toolchain reference records the same direct-import
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/package-artifact-ledger-direct-import-alignment-design.md:401:  metadata contract; current v0.8 retains it and historical v0.6 remains
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/package-certificate-artifact-snapshot-design-tasks.md:45:- The measurement schema is `npa.performance.measurements.v0.7`; the planner
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/package-certificate-artifact-snapshot-design-tasks.md:2599:  entry points, v0.7 measurement labels, v3 planner identity, functional test
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/package-certificate-artifact-snapshot-design-tasks.md:2604:- Fixes: recorded the co-landed v0.7 union and v3 prepared-retention model;
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/package-certificate-artifact-snapshot-design.md:115:The common measurement surface is `npa.performance.measurements.v0.7`, and the
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/package-certificate-artifact-snapshot-design.md:1034:union was allocated as `npa.performance.measurements.v0.7`, retained the exact
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/package-certificate-artifact-snapshot-design.md:1037:nonzero. The exhaustive enum and v0.7 schema bump are intentional advertised
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/package-certificate-artifact-snapshot-design.md:1040:snapshot labels share one v0.7 union while the v0.6 nested field introduction
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/package-certificate-artifact-snapshot-design.md:1357:serialized fields rather than free-form counters; v0.7 retains their names and
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/package-certificate-artifact-snapshot-design.md:1376:268,435,456. The v0.6 nested struct shape remains immutable; the v0.7 closed
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/package-changed-selection-git-query-design-tasks.md:96:| GITSEL-028..067 | Closed DTO/policy, v0.5 label introduction, v0.7 current writer/reader compatibility, explicit overflow, typed identity merge, and timing-enabled build/verify projection are implemented. Timing-off remains state-free. | Complete |
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/package-changed-selection-git-query-design-tasks.md:103:| Documentation/review | The rollout document records v0.5/v0.6/v0.7 history, memory-model composition, deterministic IUT counts, external evidence boundary, formatting checks, and zero scoped review findings. | Complete |
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/package-changed-selection-git-query-design-tasks.md:2745:- Location: `npa-core/docs/npa-toolchain-reference-v0.8.0.md`
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/package-changed-selection-git-query-design-tasks.md:2752:  - `rg -n "ExecBudget|Legacy128|pathspec-from-file|package.selection_" npa-core/docs/npa-toolchain-reference-v0.8.0.md`
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/package-changed-selection-git-query-design.md:64:| Schema and strict reader | GITSEL remains the v0.5 introduction boundary; current v0.7 retains v0.5/v0.6 history and the strict reader accepts the co-landed v1/v2/v3 shard-memory shapes. | Complete |
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/package-export-output-path-validation-design.md:505:- the current `npa-core/docs/npa-toolchain-reference-v0.8.0.md` with the
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/package-fast-verifier-cost-aware-sharding-design.md:352:reports through current `npa.performance.measurements.v0.7` embedded in
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/package-fast-verifier-cost-aware-sharding-design.md:354:common v0.2 and retain the same meaning through v0.7; strict readers preserve
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/package-fast-verifier-cost-aware-sharding-design.md:491:- Scheduling telemetry uses the current common v0.7 schema (with the historical
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/package-verifier-process-memo-execution-scope-design-tasks.md:83:| Deterministic benchmark data and harness | The versioned 11-profile fixture/baseline, strict validator, package-verifier example, and performance-script matrix contract cover all blocking structural expectations without elapsed thresholds. The runtime uses one extracted full-envelope serializer; exact Off and Summary snapshot hashes plus complete root/profile/sample/counter/store/summary key-order and privacy assertions pin both variants. The Summary snapshot contains the real v0.7 measurement envelope, its exact 47-counter count and canonical order, required memo-scope counter values/units, empty detail collections, and clock shape rather than a placeholder object. | Complete |
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/package-verifier-process-memo-execution-scope-design-tasks.md:1444:- Location: `npa-core/docs/npa-toolchain-reference-v0.8.0.md`
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/package-verifier-process-memo-execution-scope-design-tasks.md:1451:  - `rg -n "PackageVerificationProcessMemoHandle|PackageVerificationProcessMemoLimits|verifier-memo off" npa-core/docs/npa-toolchain-reference-v0.8.0.md`
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/package-verifier-process-memo-execution-scope-design.md:16:| Deterministic evidence | Focused API/CLI tests and the closed 11-profile baseline cover disabled/empty zero work, closure-scoped keys and hash bytes, warm hits, capacity behavior, and post-warmup store state. The benchmark runner and tests share one full-envelope serializer whose exact Off/Summary snapshot hashes, complete nested key order, seven-sample contract, and privacy boundary are pinned; Summary uses the real v0.7 measurement envelope with its exact 47-counter count, required values/units, empty detail collections, and clock shape. | Complete |
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/package-verify-certs-committed-branch-selection-design.md:631:labels land while `npa.performance.measurements.v0.7` is current, publish the
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/package-verify-certs-committed-branch-selection-design.md:709:- `npa-core/docs/npa-toolchain-reference-v0.8.0.md`: user-facing selector and
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/proof-authoring-performance-observability-design.md:3:Status: implemented in `npa-core` with the current common v0.7 measurement
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/proof-authoring-performance-observability-design.md:29:Subsequent feature unions advanced the current output to v0.7. Strict release
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/proof-authoring-performance-observability-design.md:406:`npa.performance.measurements.v0.7`, with strict historical readers for every
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/proof-authoring-performance-observability-design.md:429:observability rollout. Current `npa-cli 0.8.x` emits
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/proof-authoring-performance-observability-design.md:601:- The current common v0.7/FastLoop v2 schemas and their strict validators are
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/proof-authoring-verified-context-cache-design.md:67:The current `npa 0.8.0 package verify-certs` command exposes:
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/reference-checker-deterministic-parallel-verification-design.md:594:When the current common schema is `npa.performance.measurements.v0.7` and this
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/reference-checker-deterministic-parallel-verification-design.md:595:design lands alone, publish strict cumulative v0.8 because accepted model enum
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/reference-checker-deterministic-parallel-verification-design.md:689:  values, counters, v0.8/next-unused strict serialization and readers.
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/reference-checker-deterministic-parallel-verification-design.md:702:- `npa-core/docs/npa-toolchain-reference-v0.8.0.md`: supported command and trust
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/reference-checker-deterministic-parallel-verification-design.md:777:- Historical measurement v0.1-v0.7 readers stay strict; the new reader rejects
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/targeted-build-certs-authoring-cache-design-todo.md:254:- **Primary files:** this document; the source design; `npa-core/crates/npa-package/src/build_check_cache.rs`; `npa-core/crates/npa-package/src/json.rs`; `npa-core/crates/npa-package/src/artifacts.rs`; `npa-core/crates/npa-cli/src/args.rs`; `npa-core/crates/npa-cli/src/package_api.rs`; `npa-core/crates/npa-cli/src/package_build.rs`; `npa-core/crates/npa-cli/tests/package_api_v1.rs`; `npa-core/crates/npa-cli/tests/package_build_certs_check.rs`; `npa-core/crates/npa-cli/tests/package_cli_args.rs`; `npa-core/docs/npa-toolchain-reference-v0.8.0.md`; performance fixture data
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/targeted-build-certs-authoring-cache-design-todo.md:831:- **Primary files:** `npa-core/crates/npa-api/src/fast_loop_measurement.rs`; `npa-core/crates/npa-cli/src/release_manifest.rs`; `npa-core/crates/npa-cli/src/package_build.rs`; `npa-core/docs/npa-toolchain-reference-v0.8.0.md`; `npa-core/scripts/check-performance.sh`; performance baselines/tests
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/targeted-build-certs-authoring-cache-design-todo.md:1230:- **Primary files:** `npa-core/crates/npa-cli/src/args.rs`; `npa-core/crates/npa-cli/src/package_api.rs`; `npa-core/README.md`; `npa-core/docs/README.md`; `npa-core/docs/index.md`; `npa-core/docs/npa-toolchain-reference-v0.8.0.md`; `.agents/skills/prove-theorem/SKILL.md`; `scripts/check-package-api-compatibility.sh`
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/targeted-build-certs-authoring-cache-design.md:70:  `npa-core/docs/npa-toolchain-reference-v0.8.0.md` — consume or document the
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/targeted-build-certs-authoring-cache-design.md:636:the v0.2 `compiler_options` projection, as required by the existing v0.8
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/targeted-build-certs-authoring-cache-performance-evidence.md:173:was effectively flat (within 0.8%). The historical TBAC-06 read-through medians
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/targeted-build-certs-external-import-closure-design.md:39:- `npa-core/docs/npa-toolchain-reference-v0.8.0.md` — defines the current
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/targeted-build-certs-external-import-closure-design.md:40:  `npa-cli 0.8.x` contract and carries targeted authoring forward with unchanged
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/targeted-build-certs-external-import-closure-design.md:439:   `npa-core/docs/npa-toolchain-reference-v0.7.0.md` that checked prerequisites
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/flt/int-019-fourth-power-canonical-leaf-proof-tasks.md:33:  `locally_accelerated=false`. The current v0.8 writer does not emit a replay
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/flt/int-019-fourth-power-canonical-leaf-proof-tasks.md:277:  - Use `ulimit -s 65520` and the repository-local `npa 0.8.0` writer with
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/flt/int-019-fourth-power-canonical-leaf-proof-tasks.md:372:  write`, and `package lock check` all passed. The v0.8 writer emitted no
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/flt/proof-roadmap.md:736:| 98 | 2026-08-25 | Re-ran the same roadmap checks after completing AUD-159 and attempting EXP-001 with both debug and release `npa 0.8.0` canonical writers; inspected the target artifact directory, manifest, and Git status after stopping each 15-minute CPU-bound run | Zero findings after cleanup. AUD-159 is complete as an owner/type audit; EXP-001 remains Pending because neither writer produced canonical bytes, and no source, placeholder hash, or stale certificate was retained. |
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/flt/proof-roadmap.md:739:| 101 | 2026-08-25 | Re-ran the same smaller fourth-power canonical write with the release `npa 0.8.0` for approximately 15 minutes at 99.9% CPU, inspected process/resource state and certificate mtime, stopped it, restored the manifest, and re-ran `/usr/bin/git diff --check` plus Git status | Zero findings after cleanup. The release writer also produced no canonical bytes; the certificate mtime/hash and manifest are unchanged, so the endpoint remains unverified and the canonical-writer bottleneck is reproducible across debug/release attempts. |
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/generated-artifact-release-policy.md:69:exist locally. Source-free authoring verification is different: current v0.8
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/generated-artifact-release-policy.md:195:Current adjacent-source evidence pairs `npa-cli 0.8.x` only with
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/generated-artifact-release-policy.md:197:0.3/0.4-to-v0.1, 0.5-to-v0.2, and 0.6/0.7-to-v0.3 host/result pairs; do not
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/generated-artifact-release-runbook.md:61:The `npa-cli 0.8.x` adapter hosts the independently versioned
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/generated-artifact-release-runbook.md:63:`NPA-Core-0.3.0` capability do not become `0.8.0`. From a workspace
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/generated-artifact-release-runbook.md:94:policy and audit bundle. The synthetic `toolchain-v0.8.0-compat` assets created
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/generated-artifact-release-runbook.md:248:| `command` / `command_result` | Exact locked checked command and unmodified result: `npa.package.command_result.v0.1` for historical CLI 0.3/0.4, `npa.package.command_result.v0.2` for historical CLI 0.5, `npa.package.command_result.v0.3` for historical CLI 0.6/0.7, or `npa.package.command_result.v0.4` for current CLI 0.8 |
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/generated-artifact-release-runbook.md:252:| `npa_cli_crate_version` | Exact compatible host crate version: historical `0.3.x`/`0.4.x`/`0.5.x`/`0.6.x`/`0.7.x` or current `0.8.x`, paired with the command-result schema above |
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/iut/shared-contract.md:31:| CLI / build | `npa 0.8.0`; release profile; same-checkout `cargo build --locked --offline --manifest-path npa-core/Cargo.toml -p npa-cli --release` |
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-agents/Cargo.lock:246:version = "0.8.7"
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-agents/Cargo.lock:285:version = "0.8.21"
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-agents/Cargo.lock:301:version = "0.7.10"
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-agents/Cargo.lock:366:version = "0.8.0"
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-agents/Cargo.lock:780: "redox_syscall 0.8.1",
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-agents/Cargo.lock:795:version = "0.8.2"
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-agents/Cargo.lock:853:version = "0.8.6"
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-agents/Cargo.lock:934:version = "0.7.0"
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-agents/Cargo.lock:955:version = "0.7.5"
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-agents/Cargo.lock:1030:version = "0.8.6"
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-agents/Cargo.lock:1069:version = "0.8.1"
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-agents/Cargo.lock:1207:version = "0.7.1"
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-agents/Cargo.lock:1291:version = "0.7.3"
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-agents/Cargo.lock:1301:version = "0.8.6"
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-agents/Cargo.lock:1314:version = "0.8.6"
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-agents/Cargo.lock:1352:version = "0.8.6"
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-agents/Cargo.lock:1365:version = "0.8.6"
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-agents/Cargo.lock:1390:version = "0.8.6"
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-agents/Cargo.lock:1434:version = "0.8.6"
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-agents/Cargo.lock:1473:version = "0.8.6"
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-agents/Cargo.lock:1564:version = "0.8.3"
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-agents/Cargo.lock:1799: "webpki-roots 1.0.8",
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-agents/Cargo.lock:1804:version = "1.0.8"
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-agents/Cargo.lock:2058:version = "0.8.3"
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-agents/Cargo.lock:2069:version = "0.8.2"
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-agents/Cargo.lock:2081:version = "0.8.52"
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-agents/Cargo.lock:2090:version = "0.8.52"
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-agents/apps/agentctl/tests/fixtures/open_problem/proof_difficulty/lemma_reuse_graph.json:21:      "centrality_score": 0.8,
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-agents/crates/agent-store/Cargo.toml:17:sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio-rustls", "postgres", "json", "uuid", "chrono", "migrate"] }
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/Cargo.lock:151:version = "0.8.0"
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/Cargo.lock:290:version = "0.8.23"
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/Cargo.lock:364:version = "0.7.15"
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/README.md:49:The current adjacent-source compatibility target is `npa-cli 0.8.0` with
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/README.md:53:See the v0.8.0 toolchain reference before consuming the programmatic package
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/README.md:55:artifact ledger audit. The v0.7.0 reference remains historical.
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/README.md:84:npa 0.8.0
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/README.md:89:The commands in this section describe the current v0.8 source CLI. External
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/README.md:276:absent, the current v0.8 source CLI also supports explicit in-memory
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/README.md:290:`npa-cli 0.8.x` / `package_api::v1` hosts `npa-checker-ext 0.3.0`. The checker
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/README.md:376:existing bytes. See [bounded theorem-premise report storage](docs/npa-toolchain-reference-v0.8.0.md#bounded-theorem-premise-report-storage)
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/README.md:414:- [Toolchain Reference v0.8.0](docs/npa-toolchain-reference-v0.8.0.md):
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/README.md:417:- [Toolchain Reference v0.7.0](docs/npa-toolchain-reference-v0.7.0.md):
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/README.md:418:  historical `npa-cli 0.7.x` compatibility reference.
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/README.md:425:  `npa-cli 0.8.x` adapter boundary.
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/README.md:490:checkers/npa-checker-ext/scripts/toolchain-v0.8.sh
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/checkers/npa-checker-ext/README.md:239:### Current v0.8 host compatibility
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/checkers/npa-checker-ext/README.md:241:On Linux, run the complete `npa-cli 0.8.0` host compatibility and ephemeral
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/checkers/npa-checker-ext/README.md:245:checkers/npa-checker-ext/scripts/toolchain-v0.8.sh
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/checkers/npa-checker-ext/README.md:254:checkers/npa-checker-ext/scripts/toolchain-v0.8.sh --functional-only
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/checkers/npa-checker-ext/README.md:263:The full v0.8 gate is a clean-checkout Linux release requirement. On platforms
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/checkers/npa-checker-ext/README.md:267:v0.8 policy preflight or any external execution. Record the remaining
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/checkers/npa-checker-ext/README.md:272:### Historical v0.7 host compatibility
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/checkers/npa-checker-ext/README.md:274:The v0.7 gate and its emitted v0.7/v0.3 evidence are frozen historical
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/checkers/npa-checker-ext/README.md:275:compatibility material. Run them only from the matching `npa-cli 0.7.0`
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/checkers/npa-checker-ext/README.md:279:checkers/npa-checker-ext/scripts/toolchain-v0.7.sh
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/checkers/npa-checker-ext/README.md:280:checkers/npa-checker-ext/scripts/toolchain-v0.7.sh --functional-only
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/checkers/npa-checker-ext/README.md:283:The historical gate intentionally rejects the current v0.8 checkout; do not
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/checkers/npa-checker-ext/README.md:284:relabel its archives, schemas, tags, or evidence as v0.8.
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/checkers/npa-checker-ext/scripts/toolchain-v0.7.sh:17:if [ "$CURRENT_VERSION" != 0.7.0 ]; then
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/checkers/npa-checker-ext/scripts/toolchain-v0.7.sh:18:  echo "toolchain v0.7 compatibility requires npa-cli 0.7.0, found $CURRENT_VERSION" >&2
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/checkers/npa-checker-ext/scripts/toolchain-v0.7.sh:41:    echo "toolchain v0.7 compatibility requires $tool" >&2
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/checkers/npa-checker-ext/scripts/toolchain-v0.7.sh:49:      echo "full toolchain v0.7 compatibility requires $tool" >&2
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/checkers/npa-checker-ext/scripts/toolchain-v0.7.sh:57:  echo "full toolchain v0.7 compatibility requires a clean candidate checkout" >&2
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/checkers/npa-checker-ext/scripts/toolchain-v0.7.sh:67:RUN_PARENT="$ROOT/target/npa-checker-ext-v0.7"
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/checkers/npa-checker-ext/scripts/toolchain-v0.7.sh:82:  printf 'toolchain-v0.7: %s\n' "$1"
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/checkers/npa-checker-ext/scripts/toolchain-v0.7.sh:99:phase "locked offline host 0.7 metadata, build, API, and adapter gates"
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/checkers/npa-checker-ext/scripts/toolchain-v0.7.sh:128:phase "deterministic fixture and v0.7 policy preflight"
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/checkers/npa-checker-ext/scripts/toolchain-v0.7.sh:347:    echo "full toolchain v0.7 compatibility changed the candidate checkout" >&2
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/checkers/npa-checker-ext/scripts/toolchain-v0.7.sh:365:  echo "toolchain v0.7 functional compatibility passed; release evidence not evaluated"
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/checkers/npa-checker-ext/scripts/toolchain-v0.7.sh:367:  echo "toolchain v0.7.0 compatibility and release evidence passed"
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/checkers/npa-checker-ext/scripts/toolchain-v0.8.sh:17:if [ "$CURRENT_VERSION" != 0.8.0 ]; then
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/checkers/npa-checker-ext/scripts/toolchain-v0.8.sh:18:  echo "toolchain v0.8 compatibility requires npa-cli 0.8.0, found $CURRENT_VERSION" >&2
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/checkers/npa-checker-ext/scripts/toolchain-v0.8.sh:41:    echo "toolchain v0.8 compatibility requires $tool" >&2
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/checkers/npa-checker-ext/scripts/toolchain-v0.8.sh:47:  echo "full toolchain v0.8 compatibility requires a clean candidate checkout" >&2
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/checkers/npa-checker-ext/scripts/toolchain-v0.8.sh:57:RUN_PARENT="$ROOT/target/npa-checker-ext-v0.8"
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/checkers/npa-checker-ext/scripts/toolchain-v0.8.sh:63:  printf 'toolchain-v0.8: preserved run directory: %s\n' "$RUN_DIR" >&2
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/checkers/npa-checker-ext/scripts/toolchain-v0.8.sh:81:  printf 'toolchain-v0.8: %s\n' "$1"
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/checkers/npa-checker-ext/scripts/toolchain-v0.8.sh:98:phase "locked offline host 0.8 metadata, build, API, and adapter gates"
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/checkers/npa-checker-ext/scripts/toolchain-v0.8.sh:127:phase "deterministic fixture and v0.8 policy preflight"
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/checkers/npa-checker-ext/scripts/toolchain-v0.8.sh:172:echo "toolchain v0.8 checker compatibility and host fail-closed boundary passed; release evidence not produced"
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/checkers/npa-checker-ext/scripts/toolchain-v0.8.sh:369:    echo "full toolchain v0.8 compatibility changed the candidate checkout" >&2
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/checkers/npa-checker-ext/scripts/toolchain-v0.8.sh:387:  echo "toolchain v0.8 functional compatibility passed; release evidence not evaluated"
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/checkers/npa-checker-ext/scripts/toolchain-v0.8.sh:389:  echo "toolchain v0.8.0 compatibility and release evidence passed"
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-api/examples/bench_package_verifier.rs:3199:                    Some("npa.performance.measurements.v0.8")
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-api/examples/support/snap_vmsp_controller.rs:51:const MEASUREMENT_SCHEMA: &str = "npa.performance.measurements.v0.8";
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-api/examples/support/term_dag_performance.rs:28:pub const MEASUREMENT_SCHEMA: &str = "npa.performance.measurements.v0.8";
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-api/src/independent_checker.rs:31217:                "runner_version":"0.8.0",
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-api/src/independent_checker.rs:31223:                "checker_version":"0.8.0",
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-api/src/independent_checker.rs:31263:                "runner_version":"0.8.0",
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-api/src/independent_checker.rs:31281:                  "checker_version":"0.8.0",
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-api/src/independent_checker.rs:32075:                stdout: m3_raw_checked("0.8.0").into_bytes(),
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-api/src/independent_checker.rs:32101:                stdout: m3_raw_checked("0.8.0").into_bytes(),
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-api/src/independent_checker.rs:33491:            version: "0.8.0".to_owned(),
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-api/src/independent_checker.rs:33792:                stdout: m3_raw_checked("0.8.0").into_bytes(),
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-api/src/independent_checker.rs:33805:        let expected_raw_hex = independent_checker_hex_bytes(m3_raw_checked("0.8.0").as_bytes());
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-api/src/independent_checker.rs:33828:                stdout: m3_raw_checked("0.8.0").into_bytes(),
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-api/src/independent_checker.rs:33842:                stdout: m3_raw_checked("0.8.1").into_bytes(),
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-api/src/independent_checker.rs:33905:              "checker_version":"0.8.0",
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-api/src/independent_checker.rs:33948:              "checker_version":"0.8.0",
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-api/src/independent_checker.rs:34027:              "checker_version":"0.8.0",
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-api/src/independent_checker.rs:34113:                stdout: m3_raw_checked("0.8.0").into_bytes(),
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-api/src/independent_checker.rs:34130:            m3_raw_checked("0.8.0").replace("npa-checker-ref", "npa-checker-other");
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-api/src/independent_checker.rs:34169:                stdout: m3_raw_checked("0.8.0").into_bytes(),
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-api/src/independent_checker.rs:34183:                stdout: m3_raw_checked("0.8.0").into_bytes(),
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-api/src/independent_checker.rs:34279:                  "checker_version":"0.8.0",
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-api/src/independent_checker.rs:34424:                    checker.checker_version.as_deref().unwrap_or("0.8.0"),
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-api/src/independent_checker.rs:34542:              "checker_version":"0.8.0",
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-api/src/independent_checker.rs:34946:              "checker_version":"0.8.0",
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-api/src/independent_checker.rs:38421:                "runner_version":"0.8.0",
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-api/src/independent_checker.rs:38428:                  "checker_version":"0.8.0",
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-api/src/independent_checker.rs:38439:                  "checker_version":"0.8.0",
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-api/src/independent_checker.rs:38447:                  "checker_version":"0.8.0",
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-api/src/performance_gate.rs:1141:    const BASELINE: &str = r#"{"schema":"npa.performance.baselines.v0.1","measurement_schema":"npa.performance.measurements.v0.8","scenarios":[{"id":"compact","status":"passed","module_count":1,"deterministic_counters":{"package.live_results":1,"package.modules_checked":1},"coverage":{"live_results_min":1,"proof_evidence_reduction_allowed":false}}],"targeted_build_certs":[],"update_policy":"Manual review only. Record the reason for every deterministic baseline change in the reviewing commit or pull request. Raw elapsed time and peak RSS are advisory evidence and must never be copied into this generic deterministic baseline."}"#;
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-api/src/performance_gate.rs:1672:            "npa.performance.measurements.v0.8",
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-api/src/performance_gate.rs:1685:            "{\"schema\":\"npa.performance.baselines.v0.1\",\"measurement_schema\":\"npa.performance.measurements.v0.8\"",
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-api/src/performance_gate.rs:1686:            "{\"measurement_schema\":\"npa.performance.measurements.v0.8\",\"schema\":\"npa.performance.baselines.v0.1\"",
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-api/src/performance_measurement.rs:23:pub const PERFORMANCE_MEASUREMENTS_SCHEMA_V0_7: &str = "npa.performance.measurements.v0.7";
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-api/src/performance_measurement.rs:24:pub const PERFORMANCE_MEASUREMENTS_SCHEMA_V0_8: &str = "npa.performance.measurements.v0.8";
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-cli/Cargo.toml:3:version = "0.8.0"
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-cli/examples/bench_package_artifact_snapshot.rs:60:const BASELINE_MEASUREMENT_SCHEMA: &str = "npa.performance.measurements.v0.8";
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-cli/examples/bench_package_artifact_snapshot.rs:1906:                "\"measurement_schema\": \"npa.performance.measurements.v0.8\",\n  \"schema\": \"npa.performance.baselines.v0.1\"",
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-cli/examples/bench_package_artifact_snapshot.rs:1910:                "\"schema\": \"npa.performance.baselines.v0.1\",\n  \"measurement_schema\": \"npa.performance.measurements.v0.8\"",
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-cli/examples/bench_package_artifact_snapshot.rs:1911:                "\"measurement_schema\": \"npa.performance.measurements.v0.8\",\n  \"schema\": \"npa.performance.baselines.v0.1\"",
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-cli/examples/bench_package_changed_selection.rs:1012:            | "npa.performance.measurements.v0.7"
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-cli/examples/bench_package_changed_selection.rs:1013:            | "npa.performance.measurements.v0.8"
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-cli/examples/bench_package_changed_selection.rs:3254:                            | "npa.performance.measurements.v0.7"
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-cli/examples/bench_package_changed_selection.rs:3255:                            | "npa.performance.measurements.v0.8"
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-cli/examples/bench_package_changed_selection.rs:3838:                "\"schema\":\"npa.performance.measurements.v0.8\"",
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-cli/examples/bench_package_changed_selection.rs:4576:            measurement_schema: "npa.performance.measurements.v0.8".to_owned(),
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-cli/src/checker_ext_toolchain_evidence.rs:27:const NPA_CLI_VERSION: &str = "0.8.0";
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-cli/src/checker_ext_toolchain_evidence.rs:31:const TOOLCHAIN_TAG: &str = "toolchain-v0.8.0-compat";
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-cli/src/checker_ext_toolchain_evidence.rs:32:const ARCHIVE_NAME: &str = "npa-mathlib-downstream-proofs-generated-toolchain-v0.8.0-compat.tar.gz";
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-cli/src/checker_ext_toolchain_evidence.rs:34:    "npa-mathlib-downstream-proofs-generated-toolchain-v0.8.0-compat.sha256";
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-cli/src/checker_ext_toolchain_evidence.rs:36:    "npa-mathlib-downstream-proofs-generated-toolchain-v0.8.0-compat-manifest.json";
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-cli/src/checker_ext_toolchain_evidence.rs:570:/// Prepare the current v0.8 checker identity, registry, axiom policy, and runner policy.
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-cli/src/checker_ext_toolchain_evidence.rs:591:    let label = "npa-checker-ext-toolchain-v0.8.0-fixture";
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-cli/src/checker_ext_toolchain_evidence.rs:959:/// Build the deterministic temporary source fixture used by the v0.8 gate.
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-cli/src/checker_ext_toolchain_evidence.rs:1015:            format!("{{\"forbidden\":\"npa-checker-ext-toolchain-v0.8.0:{label}\"}}\n").as_bytes(),
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-cli/src/checker_ext_toolchain_evidence.rs:1042:            "npa-checker-ext toolchain v0.8.0 compatibility fixture",
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-cli/src/checker_ext_toolchain_evidence.rs:3388:/// Validate the workspace package-version axes used by the v0.8 gate.
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-cli/src/checker_ext_toolchain_evidence.rs:3406:        "npa-cli metadata is not 0.8.0",
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-cli/src/checker_ext_toolchain_evidence.rs:3526:        assert!(contract.contains("toolchain-v0.8.0-compat"));
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-cli/src/checker_ext_toolchain_evidence.rs:3530:        assert!(!contract.contains("toolchain-v0.7.0-compat"));
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-cli/src/release_manifest.rs:611:    if version.starts_with("0.8.") {
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-cli/src/release_manifest.rs:613:    } else if version.starts_with("0.6.") || version.starts_with("0.7.") {
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-cli/src/release_manifest.rs:3602:            "\"schema\":\"npa.performance.measurements.v0.8\"",
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-cli/src/release_manifest.rs:3651:            "v0.2-v1", "v0.3-v1", "v0.4-v1", "v0.5-v1", "v0.6-v1", "v0.6-v2", "v0.7-v1", "v0.7-v2",
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-cli/src/release_manifest.rs:3652:            "v0.7-v3",
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-cli/src/release_manifest.rs:4068:        validate_command_result_shape(document.root(), "0.8.0").unwrap();
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-cli/src/release_manifest.rs:4076:        let error = validate_command_result_shape(relabeled.root(), "0.7.0")
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-cli/src/release_manifest.rs:4087:        let error = validate_command_result_shape(document.root(), "0.8.0")
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-cli/src/release_manifest.rs:4401:        validate_command_result_shape(document.root(), "0.8.0").unwrap();
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-cli/src/release_manifest.rs:4408:        validate_command_result_shape(historical_document.root(), "0.7.0").unwrap();
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-cli/src/release_manifest.rs:4416:        assert!(validate_command_result_shape(mismatched_document.root(), "0.8.0").is_err());
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-cli/src/release_manifest.rs:4431:            let error = validate_command_result_shape(document.root(), "0.8.0")
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-cli/src/release_manifest.rs:4556:            "\"schema\":\"npa.performance.measurements.v0.8\"",
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-cli/src/release_manifest.rs:4564:            "\"schema\":\"npa.performance.measurements.v0.8\"",
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-cli/src/release_manifest.rs:4572:            "\"schema\":\"npa.performance.measurements.v0.8\"",
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-cli/src/release_manifest.rs:4580:            "\"schema\":\"npa.performance.measurements.v0.8\"",
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-cli/src/release_manifest.rs:4588:            "\"schema\":\"npa.performance.measurements.v0.8\"",
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-cli/tests/checker_ext_toolchain_evidence.rs:13:    "\"toolchain_tag\":\"toolchain-v0.7.0-compat\"}\n",
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-cli/tests/checker_ext_toolchain_evidence.rs:16:    include_bytes!("../../../checkers/npa-checker-ext/scripts/toolchain-v0.7.sh");
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-cli/tests/checker_ext_toolchain_evidence.rs:37:    assert!(text.contains("toolchain-v0.8.0-compat"));
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-cli/tests/checker_ext_toolchain_evidence.rs:39:    assert!(text.contains("npa-cli 0.8.0"));
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-cli/tests/checker_ext_toolchain_evidence.rs:41:    assert!(text.contains("npa-mathlib-downstream-proofs-generated-toolchain-v0.8.0-compat.tar.gz"));
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-cli/tests/checker_ext_toolchain_evidence.rs:42:    assert!(text.contains("npa-mathlib-downstream-proofs-generated-toolchain-v0.8.0-compat.sha256"));
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-cli/tests/checker_ext_toolchain_evidence.rs:44:        .contains("npa-mathlib-downstream-proofs-generated-toolchain-v0.8.0-compat-manifest.json"));
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-cli/tests/checker_ext_toolchain_evidence.rs:45:    assert!(!text.contains("toolchain-v0.7.0-compat"));
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-cli/tests/checker_ext_toolchain_evidence.rs:131:    assert!(HISTORICAL_V0_7_CONTRACT.contains("toolchain-v0.7.0-compat"));
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-cli/tests/checker_ext_toolchain_evidence.rs:133:    assert!(!HISTORICAL_V0_7_CONTRACT.contains("toolchain-v0.8.0-compat"));
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-cli/tests/checker_ext_toolchain_evidence.rs:176:      {"name":"npa-cli","version":"0.8.0"},
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-cli/tests/checker_ext_toolchain_evidence.rs:197:            "{\"name\":\"npa-cli\",\"version\":\"0.8.0\"}",
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-cli/tests/checker_ext_toolchain_evidence.rs:198:            "{\"name\":\"npa-cli\",\"version\":\"0.7.0\"}",
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-cli/tests/checker_ext_toolchain_evidence.rs:207:    assert!(String::from_utf8_lossy(&rejected.stderr).contains("npa-cli metadata is not 0.8.0"));
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-cli/tests/package_api_v1.rs:24:    assert_eq!(env!("CARGO_PKG_VERSION"), "0.8.0");
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-cli/tests/package_build_certs_check.rs:2331:    assert_eq!(current.key_input.tool_version, "0.8.0");
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-cli/tests/package_build_certs_check.rs:2334:    current.key_input.tool_version = "0.7.0".to_owned();
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-cli/tests/package_build_certs_check.rs:2336:        b"schema=npa.package.build_check_tool_identity.v0.1\ncommand=package build-certs\nversion=0.7.0\n",
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-cli/tests/package_build_certs_check.rs:2365:        std::collections::BTreeSet::from(["0.7.0", "0.8.0"]),
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-cli/tests/package_timings.rs:80:    assert!(json.contains("\"measurements\":{\"schema\":\"npa.performance.measurements.v0.8\""));
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-cli/tests/package_timings.rs:440:        .contains("\"measurements\":{\"schema\":\"npa.performance.measurements.v0.8\""));
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-cli/tests/release_manifest_validator.rs:558:    for version in ["0.6.0", "0.6.12", "0.7.0", "0.7.12"] {
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-cli/tests/release_manifest_validator.rs:568:    for version in ["0.8.0", "0.8.12"] {
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-cli/tests/release_manifest_validator.rs:591:        ("0.7.0", COMMAND_RESULT_V0_1),
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-cli/tests/release_manifest_validator.rs:592:        ("0.7.0", COMMAND_RESULT_V0_2),
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-cli/tests/release_manifest_validator.rs:593:        ("0.7.0", COMMAND_RESULT_V0_4),
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-cli/tests/release_manifest_validator.rs:594:        ("0.8.0", COMMAND_RESULT_V0_1),
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-cli/tests/release_manifest_validator.rs:595:        ("0.8.0", COMMAND_RESULT_V0_2),
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-cli/tests/release_manifest_validator.rs:596:        ("0.8.0", COMMAND_RESULT_V0_3),
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-cli/tests/release_manifest_validator.rs:732:        "0.7.00",
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-cli/tests/release_manifest_validator.rs:733:        "0.7.01",
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-cli/tests/release_manifest_validator.rs:734:        "0.8.00",
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-cli/tests/release_manifest_validator.rs:735:        "0.8.01",
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-package/Cargo.toml:16:toml = "0.8"
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/docs/README.md:20:- [Toolchain Reference v0.8.0](npa-toolchain-reference-v0.8.0.md): current Rust
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/docs/README.md:29:- [Toolchain Reference v0.7.0](npa-toolchain-reference-v0.7.0.md): historical
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/docs/README.md:30:  `npa-cli 0.7.x` compatibility reference.
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/docs/README.md:54:- [Toolchain v0.8 External Checker Compatibility Gate](../checkers/npa-checker-ext/README.md):
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/docs/README.md:55:  real `npa-cli 0.8.x` facade/direct closure for `npa-checker-ext 0.3.0`, its
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/docs/README.md:65:  mode. The current v0.8 workflow additionally refreshes declared metadata and
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/docs/README.md:142:[v0.8.0 selector contract](npa-toolchain-reference-v0.8.0.md#verify-certs-selector-modes).
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/docs/README.md:159:requires it. The [v0.8.0 toolchain reference](npa-toolchain-reference-v0.8.0.md#targeted-build-check-cache)
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/docs/README.md:210:`generated/package-lock.json`, use the current v0.8 source CLI with explicit
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/docs/README.md:221:a release or published-bundle audit. See the v0.8.0 toolchain reference for the
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/docs/core-spec-v0.3.0.md:479:reason. The later `npa-cli 0.8.x` operational fuel-diagnostic migration
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/docs/npa-checker-ext-ocaml.md:56:### 1.1 Toolchain v0.8 host adapter
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/docs/npa-checker-ext-ocaml.md:58:The implemented host compatibility combination is `npa-cli 0.8.x`,
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/docs/npa-checker-ext-ocaml.md:65:0.5 hosts retain v0.2, and 0.6/0.7 hosts retain v0.3.
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/docs/npa-checker-ext-ocaml.md:68:`checkers/npa-checker-ext/scripts/toolchain-v0.8.sh`. It builds and tests the
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/docs/npa-checker-ext-ocaml.md:76:The frozen `toolchain-v0.7.sh` gate and its v0.7/v0.3 evidence remain
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/docs/npa-checker-ext-ocaml.md:77:historical compatibility material and must not be relabeled as v0.8/v0.4.
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/docs/npa-toolchain-reference-v0.5.0.md:5:contract, use the [v0.8 reference](npa-toolchain-reference-v0.8.0.md).
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/docs/npa-toolchain-reference-v0.6.0.md:5:contract, use the [v0.8 reference](npa-toolchain-reference-v0.8.0.md).
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/docs/npa-toolchain-reference-v0.7.0.md:1:# NPA Toolchain Reference v0.7.0
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/docs/npa-toolchain-reference-v0.7.0.md:3:Historical snapshot: this document preserves the v0.7 host/result contract and
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/docs/npa-toolchain-reference-v0.7.0.md:5:contract, use the [v0.8 reference](npa-toolchain-reference-v0.8.0.md).
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/docs/npa-toolchain-reference-v0.7.0.md:7:This reference describes the adjacent-source `npa-cli 0.7.x` package
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/docs/npa-toolchain-reference-v0.7.0.md:18:| Host CLI crate | `npa-cli 0.7.x` |
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/docs/npa-toolchain-reference-v0.7.0.md:34:| `npa-cli 0.6.x` / `0.7.x` | `npa.package.command_result.v0.3` |
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/docs/npa-toolchain-reference-v0.7.0.md:177:`npa-cli 0.7.x` exposes the read-only v1 Mathlib interface-proposal check:
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/docs/npa-toolchain-reference-v0.7.0.md:250:Current `npa-cli 0.7.x` source closure requires the sixth artifact.
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/docs/npa-toolchain-reference-v0.7.0.md:345:npa-core/checkers/npa-checker-ext/scripts/toolchain-v0.7.sh
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/docs/npa-toolchain-reference-v0.7.0.md:346:npa-core/checkers/npa-checker-ext/scripts/toolchain-v0.7.sh --functional-only
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/docs/npa-toolchain-reference-v0.7.0.md:349:It binds the `npa-cli 0.7.x` host to the unchanged `package_api::v1` external
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/docs/npa-toolchain-reference-v0.8.0.md:1:# NPA Toolchain Reference v0.8.0
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/docs/npa-toolchain-reference-v0.8.0.md:3:This is the current adjacent-source reference for `npa-cli 0.8.0`. It keeps
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/docs/npa-toolchain-reference-v0.8.0.md:7:the composed `npa.performance.measurements.v0.8` operational-measurement union
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/docs/npa-toolchain-reference-v0.8.0.md:13:The [v0.7 reference](npa-toolchain-reference-v0.7.0.md) is retained as an
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/docs/npa-toolchain-reference-v0.8.0.md:14:immutable historical compatibility reference. Do not relabel a v0.7 result or
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/docs/npa-toolchain-reference-v0.8.0.md:15:release record as v0.8.
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/docs/npa-toolchain-reference-v0.8.0.md:21:| Host CLI crate | `npa-cli 0.8.0` |
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/docs/npa-toolchain-reference-v0.8.0.md:24:| Common performance measurements | `npa.performance.measurements.v0.8` |
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/docs/npa-toolchain-reference-v0.8.0.md:39:| `npa-cli 0.6.x` / `0.7.x` | `npa.package.command_result.v0.3` | historical |
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/docs/npa-toolchain-reference-v0.8.0.md:40:| `npa-cli 0.8.x` | `npa.package.command_result.v0.4` | current |
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/docs/npa-toolchain-reference-v0.8.0.md:42:Cross-pairs reject. In particular, an 0.7 host cannot emit a v0.4 result and
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/docs/npa-toolchain-reference-v0.8.0.md:50:| Crate | Historical v0.7 axis | Current v0.8 axis | Source boundary |
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/docs/npa-toolchain-reference-v0.8.0.md:54:| `npa-api` | 0.3.0 | 0.4.0 | common measurement v0.8, exhaustive fast-shard memory-model additions, and nullable declaration `kernel` data |
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/docs/npa-toolchain-reference-v0.8.0.md:55:| `npa-cli` | 0.7.0 | 0.8.0 | CLI/API selectors and command-result v0.4 writers |
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/docs/npa-toolchain-reference-v0.8.0.md:61:dependency `npa-cli = "0.8"`. From the aggregate container root, verify the
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/docs/npa-toolchain-reference-v0.8.0.md:687:## Common performance measurement v0.8
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/docs/npa-toolchain-reference-v0.8.0.md:690:measurement is now strictly `npa.performance.measurements.v0.8`; exact v0.1
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/docs/npa-toolchain-reference-v0.8.0.md:691:through v0.7 inputs remain historical read-only compatibility and are validated
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/docs/npa-toolchain-reference-v0.8.0.md:719:The declaration shape introduced in v0.3 remains current through v0.8. A v0.4
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/docs/npa-toolchain-reference-v0.8.0.md:760:V0.7 retains the complete v0.6 label and nested-shape history. It introduces
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/docs/npa-toolchain-reference-v0.8.0.md:789:The v0.7-compatible
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/docs/npa-toolchain-reference-v0.8.0.md:794:saturated addition must set `estimate_overflowed`. V0.7 readers continue to
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/docs/npa-toolchain-reference-v0.8.0.md:800:V0.8 retains the complete v0.7 label table and nested report shape and adds 17
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/docs/npa-toolchain-reference-v0.8.0.md:861:built-in package-verifier checker identities and `npa-cli 0.8.0` changes
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/docs/npa-toolchain-reference-v0.8.0.md:865:Within a fixed v0.8 toolchain, neither fuel-report nor timing selection enters
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/docs/npa-toolchain-reference-v0.8.0.md:899:limits and diagnostics; no v0.8 evidence may attribute a `kernel_fuel` report
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/docs/npa-toolchain-reference-v0.8.0.md:929:checkers/npa-checker-ext/scripts/toolchain-v0.8.sh
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/docs/npa-toolchain-reference-v0.8.0.md:930:checkers/npa-checker-ext/scripts/toolchain-v0.8.sh --functional-only
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/docs/npa-toolchain-reference-v0.8.0.md:938:closure and the full release gate on clean Linux. The generated v0.8 archive,
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/docs/npa-toolchain-reference-v0.8.0.md:998:V0.8 retains the v0.7 theorem-premise report, six-part generated-artifact
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/docs/npa-toolchain-reference-v0.8.0.md:1003:[v0.7 reference](npa-toolchain-reference-v0.7.0.md); v0.8 changes their shared
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/docs/package-artifact-refresh-command-design.md:5:the current workflow documented in `npa-toolchain-reference-v0.8.0.md`, which
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/docs/package-artifact-refresh-command-design.md:820:unchanged. The v0.6-introduced behavior retained in historical v0.7 and current
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/docs/package-artifact-refresh-command-design.md:821:v0.8 instead regenerates every declared ledger in the rebuild closure from the
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/docs/package-build-selected-source-fail-fast-design.md:876:  `docs/npa-toolchain-reference-v0.8.0.md` with the implemented failure-order
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/docs/package-changed-selection-git-query-rollout.md:26:| SNAP | `co_landed_after_term` | `docs/core/package-certificate-artifact-snapshot-design.md` | its prepared-artifact counters and retained-memory model are part of the v0.7 union |
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/docs/package-changed-selection-git-query-rollout.md:27:| VMSP | `co_landed_after_term` | `docs/core/verified-module-shared-payload-design.md` | its payload-ownership counters are part of the v0.7 union |
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/docs/package-changed-selection-git-query-rollout.md:69:`npa.performance.measurements.v0.7`. It retains the GITSEL v0.5 and TERM v0.6
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/docs/promotion-origin-registry-reconciliation.md:3:Status: introduced in historical `npa-cli 0.7.x`, implemented in current
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/docs/promotion-origin-registry-reconciliation.md:4:`npa-cli 0.8.x`; v1 contract frozen on 2026-08-02.
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/docs/promotion-origin-registry-reconciliation.md:717:The historical 0.7 introduction emitted
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/docs/promotion-origin-registry-reconciliation.md:718:`npa.package.command_result.v0.3`; current 0.8 writers use the shared
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/scripts/bench-package-verifier-linear-dag-planning.sh:266:        .schema == "npa.performance.measurements.v0.8" and
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/scripts/check-performance.sh:452:        and (.observation.measurement_schema == "npa.performance.measurements.v0.5" or .observation.measurement_schema == "npa.performance.measurements.v0.6" or .observation.measurement_schema == "npa.performance.measurements.v0.7" or .observation.measurement_schema == "npa.performance.measurements.v0.8")
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/scripts/check-performance.sh:963:            and .schema == "npa.performance.measurements.v0.8" and .trusted == false and .proof_evidence == false and .mode == "summary"
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/scripts/tests/check-performance-changed-selection.sh:66:  observation='{"measurement_schema":"npa.performance.measurements.v0.8","overflowed":false,"batch_policy":"exec_budget","candidate_paths":1,"pathspec_payload_bytes":1,"effective_argv_charge_bytes":65536,"max_batch_payload_bytes":1,"max_batch_argv_charge_bytes":9,"pathspec_batches":1,"worktree_root_queries":1,"head_queries":1,"tracked_queries":1,"untracked_queries":1,"tracked_output_paths":0,"untracked_output_paths":0,"selected_paths":0}'
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/scripts/tests/check-performance-package-verifier-process-memo.sh:95:    measurements="$(jq -cn --argjson counters "$common_counters" '{schema:"npa.performance.measurements.v0.8",trusted:false,proof_evidence:false,mode:"summary",input_identity:("sha256:"+("1"*64)),counters:$counters,modules:[],module_details:{attempted:0,retained:0,omitted:0},declarations:[],declaration_details:{attempted:0,retained:0,omitted:0},candidates:[],candidate_details:{attempted:0,retained:0,omitted:0},workers:[],worker_details:{attempted:0,retained:0,omitted:0},package_sharding:null,package_layers:[],package_layer_details:{attempted:0,retained:0,omitted:0},package_shards:[],package_shard_details:{attempted:0,retained:0,omitted:0},detail_truncated:false,overflowed:false,clock:{source:"std.monotonic.instant",resolution_ns:1,coarse_stage_reads:0}}')"
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/scripts/tests/fixtures/fake-linear-dag-iut.sh:38:measurements="{\"schema\":\"npa.performance.measurements.v0.8\",\"trusted\":false,\"proof_evidence\":false,\"mode\":\"$mode\",\"input_identity\":\"sha256:1212121212121212121212121212121212121212121212121212121212121212\",\"counters\":[{\"label\":\"package.cache_results\",\"unit\":\"count\",\"value\":0},{\"label\":\"package.certificate_bytes\",\"unit\":\"bytes\",\"value\":0},{\"label\":\"package.effective_jobs\",\"unit\":\"count\",\"value\":0},{\"label\":\"package.live_results\",\"unit\":\"count\",\"value\":0},{\"label\":\"package.memo_results\",\"unit\":\"count\",\"value\":0},{\"label\":\"package.modules_checked\",\"unit\":\"count\",\"value\":0},{\"label\":\"package.requested_jobs\",\"unit\":\"count\",\"value\":4}],\"modules\":[],\"module_details\":{\"attempted\":0,\"retained\":0,\"omitted\":0},\"declarations\":[],\"declaration_details\":{\"attempted\":0,\"retained\":0,\"omitted\":0},\"candidates\":[],\"candidate_details\":{\"attempted\":0,\"retained\":0,\"omitted\":0},\"workers\":[],\"worker_details\":{\"attempted\":0,\"retained\":0,\"omitted\":0},\"package_sharding\":null,\"package_layers\":[],\"package_layer_details\":{\"attempted\":0,\"retained\":0,\"omitted\":0},\"package_shards\":[],\"package_shard_details\":{\"attempted\":0,\"retained\":0,\"omitted\":0},\"detail_truncated\":false,\"overflowed\":false,\"clock\":{\"source\":\"fake\",\"resolution_ns\":1,\"coarse_stage_reads\":0}}"
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/testdata/performance/baselines/certificate-term-dag-materialization.measurements.v0.1.json:3:  "measurement_schema": "npa.performance.measurements.v0.8",
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/testdata/performance/baselines/measurements.v0.1.json:3:  "measurement_schema": "npa.performance.measurements.v0.8",
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/testdata/performance/fixtures/common-measurement-historical-readers.v0.1.json:167:      "id": "v0.7-v1",
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/testdata/performance/fixtures/common-measurement-historical-readers.v0.1.json:169:        "schema": "npa.performance.measurements.v0.7",
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/testdata/performance/fixtures/common-measurement-historical-readers.v0.1.json:194:      "id": "v0.7-v2",
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/testdata/performance/fixtures/common-measurement-historical-readers.v0.1.json:196:        "schema": "npa.performance.measurements.v0.7",
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/testdata/performance/fixtures/common-measurement-historical-readers.v0.1.json:221:      "id": "v0.7-v3",
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/testdata/performance/fixtures/common-measurement-historical-readers.v0.1.json:223:        "schema": "npa.performance.measurements.v0.7",
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/testdata/release-manifest/README.md:10:fixture (`npa-cli 0.8.x` with `npa.package.command_result.v0.4`). The other
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/testdata/release-manifest/invalid-incompatible-cli-version.json:71:    "npa_cli_crate_version": "0.7.0",
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/testdata/release-manifest/valid-v0.2-current.json:71:    "npa_cli_crate_version": "0.8.0",
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-corpus/Cargo.lock:149:version = "0.8.0"
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-corpus/Cargo.lock:302:version = "0.8.23"
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-corpus/Cargo.lock:376:version = "0.7.15"
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-corpus/tools/proof-corpus/Cargo.toml:17:npa-cli = { path = "../../../npa-core/crates/npa-cli", version = "0.8" }
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-corpus/tools/proof-corpus/Cargo.toml:18:toml = "0.8"
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-lean-exporter/Cargo.lock:389:version = "0.8.23"
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-lean-exporter/Cargo.lock:472:version = "0.7.15"
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-lean-exporter/docs/cli-design.md:7:Last reviewed against: `npa-cli 0.8.0`, `npa-cert 0.4.0`,
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-lean-exporter/docs/cli-design.md:165:| NPA CLI compatibility | `npa-cli 0.8.x`, `package_api::v1` |
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-lean-exporter/docs/cli-design.md:175:`npa-cli 0.7.x` API. Branch dependencies are not allowed. The implementation
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-lean-exporter/docs/cli-design.md:1584:- NPA toolchain contract: `../../npa-core/docs/npa-toolchain-reference-v0.8.0.md`
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-mathlib/docs/usage-evidence-driven-interface-adoption-design-todo.md:534:  - `npa-core/docs/npa-toolchain-reference-v0.7.0.md`
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-mathlib/interface-proposals/README.md:564:The v1 command is implemented by the source `npa-cli 0.7.x` package command.
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-project-navier-stokes/docs/consultations/cauchy-real-finite-galerkin-raw-difference-inner-bound-le-local-bound-opaque-npa-proof-consultation-2026-08-29.md:433:- NPA version or checker profile: local `npa 0.8.0`、
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-project-navier-stokes/docs/consultations/cauchy-real-interval-countable-additivity-npa-proof-consultation-2026-08-16.md:582:- NPA version: `npa 0.8.0`
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-project-navier-stokes/docs/consultations/scaltrigval-001-npa-proof-consultation-2026-08-07.md:202:- NPA: `npa 0.7.0`
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-project-poincare/docs/consultations/pc-099fnd-001-monotone-bar-induction-foundation-decision-npa-proof-consultation-2026-08-18.md:263:- NPA version: `npa 0.8.0`.
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-project-poincare/docs/consultations/pc-099fnd-001-monotone-bar-induction-foundation-decision-npa-proof-consultation-2026-08-18.md:458:- NPA CLI: repository-local `npa-core/target/debug/npa`, version `0.8.0`
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-project-poincare/docs/consultations/thm-009-lagged-center-branchwise-bar-to-inductive-bar-npa-proof-consultation-2026-08-16.md:306:| 7 | Recheck the exact supporting boundary | Ran package validation and a cache-disabled, no-write seven-module source check with the repository-local NPA 0.8.0 CLI. | Both passed; the targeted run selected seven seeds, 274 local supports, and two external imports, with zero exhausted-fuel events. | The blocker is not stale source, a missing direct import, parser failure, or conversion-fuel exhaustion in the supporting modules. The check does not create the absent bridge. |
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-project-poincare/docs/consultations/thm-009-lagged-center-branchwise-bar-to-inductive-bar-npa-proof-consultation-2026-08-16.md:425:- **NPA version / profile:** repository-local `npa 0.8.0`; canonical
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-project-poincare/docs/consultations/thm-009-monotone-bar-induction-route-b-npa-proof-consultation-2026-08-17.md:408:- **NPA version / checker profile:** repository-local `npa 0.8.0`;
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-project-poincare/docs/proof-roadmap.md:166:On 2026-08-16, the local `npa 0.8.0` CLI passed `package check`. A
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-project-riemann-hypothesis/docs/rh/rh-014b-positive-power-bridge-blocker.md:521:npa 0.7.0
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-web/Cargo.lock:22:version = "0.8.9"
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-web/Cargo.lock:135:version = "0.8.6"
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-web/Cargo.lock:154:version = "0.8.21"
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-web/Cargo.lock:471:version = "0.8.4"
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-web/Cargo.lock:489:version = "0.8.11"
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-web/Cargo.lock:524: "mio 0.8.11",
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-web/Cargo.lock:560:version = "0.8.0"
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-web/Cargo.lock:672:version = "0.8.11"
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-web/Cargo.lock:756:version = "0.7.1"
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-web/Cargo.lock:863:version = "0.8.23"
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-web/Cargo.lock:1076:version = "0.7.15"
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-web/Cargo.toml:15:npa-cli = { path = "../npa-core/crates/npa-cli", version = "0.8" }
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-web/Cargo.toml:19:axum = "0.8"
+5d22858ffed16d75bcf01a61381abdb4040ae275:scripts/check-no-python-outside-npa-web.sh:57:  npa-core/docs/npa-toolchain-reference-v0.7.0.md
+5d22858ffed16d75bcf01a61381abdb4040ae275:scripts/check-no-python-outside-npa-web.sh:58:  npa-core/docs/npa-toolchain-reference-v0.8.0.md
+5d22858ffed16d75bcf01a61381abdb4040ae275:scripts/check-package-api-compatibility.sh:153:[[ $CURRENT_NPA_CLI_VERSION == 0.8.0 ]] ||
+5d22858ffed16d75bcf01a61381abdb4040ae275:scripts/check-package-api-compatibility.sh:154:  fail "current host must be npa-cli 0.8.0, found $CURRENT_NPA_CLI_VERSION"
+5d22858ffed16d75bcf01a61381abdb4040ae275:suggestions.md:21:  current v0.8 CLI. The FLT fourth-power endpoint reproduces this while the
+5d22858ffed16d75bcf01a61381abdb4040ae275:thesis/iut/main.tex:53:  aboveskip=0.8em,
+5d22858ffed16d75bcf01a61381abdb4040ae275:thesis/iut/main.tex:54:  belowskip=0.8em
+5d22858ffed16d75bcf01a61381abdb4040ae275:tools/npa-container-tools/Cargo.lock:243:version = "0.8.23"
+5d22858ffed16d75bcf01a61381abdb4040ae275:tools/npa-container-tools/Cargo.lock:302:version = "0.7.15"
+5d22858ffed16d75bcf01a61381abdb4040ae275:tools/npa-container-tools/src/consumer_manifests.rs:11:const CURRENT_NPA_CLI_COMPAT_VERSION: &str = "0.8";

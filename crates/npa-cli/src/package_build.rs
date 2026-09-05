@@ -1,8 +1,22 @@
 //! Implementation of `npa package build-certs`.
+//!
+//! The ordinary package-check result is deliberately not a public promotion
+//! target for local-authoring or cached contexts.
+//!
+//! ```compile_fail
+//! use npa_cli::package_build::PackageCertificateCheckBuild;
+//! use npa_cert::LocalAuthoringModuleBuild;
+//!
+//! fn promote(build: LocalAuthoringModuleBuild<'_>) -> PackageCertificateCheckBuild {
+//!     build.into()
+//! }
+//! ```
 
 use std::{
+    borrow::Cow,
     collections::{BTreeMap, BTreeSet},
-    fs, io,
+    ffi::OsString,
+    io,
     io::{Read as _, Write as _},
     path::{Path, PathBuf},
     sync::{
@@ -13,9 +27,10 @@ use std::{
 };
 
 use npa_api::{
-    build_legacy_std_package_module_cert, PerformanceAcceptedKernelMeasurement,
-    PerformanceDeclarationMeasurement, PerformanceMeasurementRecorder,
-    LEGACY_STD_PACKAGE_PRODUCER_PROFILE,
+    build_std_package_module_cert, PerformanceAcceptedKernelMeasurement,
+    PerformanceDeclarationMeasurement, PerformanceMeasurementLabel, PerformanceMeasurementRecorder,
+    PerformancePackageSelectionObservation, LEGACY_STD_PACKAGE_PRODUCER_PROFILE,
+    STD_PACKAGE_PRODUCER_PROFILE,
 };
 use npa_cert::{
     AxiomPolicy, ModuleCert, ModuleCertImportRebindError, ModuleCertImportRebindOutcome,
@@ -27,28 +42,27 @@ use npa_frontend::{
     compile_human_source_to_observed_built_certificate_output_with_available_import_refs,
     compile_human_source_to_observed_certificate_output_with_available_import_refs_and_axiom_policy,
     parse_human_module, parse_human_module_with_source_interfaces,
-    resolve_human_module_with_source_interfaces, FileId, HumanCompilationObservations,
-    HumanCompileOptions, HumanImportedSourceInterface, HumanItem, HumanName,
-    HumanSourceDeclarationKind, HumanSourceDeclarationMetadata, HumanSourceInterface,
+    resolve_human_module_with_source_interfaces, source_interface_with_certificate_hashes,
+    validate_human_source_lexical_structure, FileId, HumanAuthoringImport,
+    HumanCompilationObservations, HumanCompileOptions, HumanImportedSourceInterface, HumanItem,
+    HumanName, HumanSourceDeclarationKind, HumanSourceDeclarationMetadata, HumanSourceInterface,
     HumanUniverseParam, Span, VerifiedImport,
 };
 use npa_kernel::KernelWorkCounterSink;
 use npa_package::{
     build_package_lock_from_artifacts,
     build_package_lock_from_artifacts_allowing_local_hash_updates, format_package_hash,
-    package_build_check_cache_key, package_build_check_result_entry_json, package_file_hash,
-    package_graph_dependent_closure, package_graph_transitive_dependencies,
-    parse_and_validate_manifest_str, parse_package_build_check_result_entry_json,
-    parse_package_lock_json, refresh_package_artifact_ledger_metadata,
-    validate_package_lock_against_manifest_graph, PackageArtifactErrorReason,
+    package_file_hash, package_graph_dependent_closure, package_graph_transitive_dependencies,
+    parse_and_validate_manifest_str, parse_package_lock_json,
+    refresh_package_artifact_ledger_metadata, validate_package_lock_against_manifest_graph,
     PackageArtifactLedgerDeclaration, PackageArtifactLedgerDeclarationKind,
-    PackageArtifactLedgerMetadataRefreshInput, PackageBuildCheckCacheKeyInput,
-    PackageBuildCheckCachedStatus, PackageBuildCheckImportIdentity, PackageBuildCheckResultEntry,
+    PackageArtifactLedgerMetadataRefreshInput, PackageBuildCheckCachedStatus,
     PackageExternalImport, PackageHash, PackageLockArtifact, PackageLockEntry,
     PackageLockEntryOrigin, PackageLockError, PackageLockImport, PackageLockManifest,
     PackageLockManifestReference, PackageManifest, PackageModule, PackagePath,
-    ResolvedModuleImportKind, ValidatedPackageManifest, PACKAGE_BUILD_CHECK_CACHE_LAYOUT_DIR,
-    PACKAGE_BUILD_CHECK_CACHE_SCHEMA, PACKAGE_BUILD_CHECK_RESULT_SCHEMA, PACKAGE_LOCK_SCHEMA,
+    ResolvedModuleImportKind, TargetedAuthoringCertificateImportIdentity,
+    TargetedAuthoringExternalModuleInput, TargetedAuthoringLocalModuleInput,
+    ValidatedPackageManifest, PACKAGE_LOCK_SCHEMA,
 };
 use toml_edit::{DocumentMut, InlineTable, Table, Value};
 
@@ -61,17 +75,113 @@ use crate::diagnostic::{
     CommandDiagnostic, CommandDiagnosticConversionContext, CommandDiagnosticSourceContext,
     CommandKernelFuelDiagnostic, CommandResult, DiagnosticKind,
 };
-use crate::fs::{join_package_path, render_package_path};
+use crate::fs::render_package_path;
 use crate::package::{load_package_root, LoadedPackageRoot, PACKAGE_MANIFEST_PATH};
-use crate::package_verify::changed_package_paths;
-use crate::timing::PackageTimingCollector;
+use crate::package_build_cache::{
+    coalesced_build_check_cache_unavailable_diagnostic, finalize_package_build_check_cache_run,
+    finalize_package_build_check_cache_run_outcomes,
+    prepare_package_build_check_and_support_cache_sessions_observed,
+    prepare_package_build_check_cache_run, prepare_package_build_check_cache_session_observed,
+    PackageBuildCacheToolIdentityObservation, PackageBuildCheckCacheOutcomeCounts,
+    PackageBuildCheckCacheRun, PackageBuildCheckCacheSession, PackageBuildCheckCertificateIdentity,
+    TargetedAuthoringSupportCacheSession, TARGETED_EXTERNAL_CERTIFICATE_BYTES_LIMIT,
+    TARGETED_EXTERNAL_DEPENDENCY_EDGE_LIMIT, TARGETED_EXTERNAL_IMPORT_LIMIT,
+};
+use crate::package_promotion_transaction::TargetLock;
+use crate::package_verify::changed_package_paths_observed;
+use crate::source_diagnostic::{command_delimiter_context, command_source_context};
+use crate::targeted_authoring_build::{
+    build_targeted_authoring_execution_plan, checked_current_module_file_id,
+    run_targeted_authoring_local_hit, TargetedAuthoringBuildSession, TargetedAuthoringCheckPlan,
+    TargetedAuthoringCheckRun, TargetedAuthoringCurrentSnapshot, TargetedAuthoringExecutionOutcome,
+    TargetedAuthoringExecutionPlan, TargetedAuthoringImportContext,
+    TargetedAuthoringMeasurementSnapshot, TargetedAuthoringModuleAcceptance,
+    TargetedAuthoringPlannerInput, TargetedAuthoringPublicationOrigin,
+    TargetedAuthoringSupportPublicationPlanner,
+};
+use crate::timing::{
+    PackageTimingCollector, TIMING_CACHE_LOOKUP_MS, TIMING_COMPLETION_BUILD_MS,
+    TIMING_PRIORITY_BUILD_MS, TIMING_SELECTION_MS, TIMING_SOURCE_PREFLIGHT_MS,
+};
+use crate::{
+    fs::no_follow_directory::{regular_file_identity, Directory, Identity},
+    generated_artifact_writer::{
+        open_package_parent_no_follow, open_package_regular_file_no_follow,
+        read_package_regular_file_no_follow,
+    },
+};
 
 const COMMAND: &str = "package build-certs";
 const PACKAGE_LOCK_PATH: &str = "generated/package-lock.json";
-const TARGETED_EXTERNAL_IMPORT_LIMIT: usize = 65_536;
-const TARGETED_EXTERNAL_DEPENDENCY_EDGE_LIMIT: usize = 1_048_576;
-const TARGETED_EXTERNAL_CERTIFICATE_BYTES_LIMIT: usize = 256 * 1024 * 1024;
+
+fn is_std_core_builder_profile(profile: Option<&str>) -> bool {
+    matches!(
+        profile,
+        Some(STD_PACKAGE_PRODUCER_PROFILE | LEGACY_STD_PACKAGE_PRODUCER_PROFILE)
+    )
+}
 static NEXT_TEMPORARY_WRITE: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct CertificateReadVerifyTestCounts {
+    reads_by_path: BTreeMap<String, usize>,
+    verifies_by_path: BTreeMap<String, usize>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static CERTIFICATE_READ_VERIFY_TEST_COUNTS: std::cell::RefCell<Option<CertificateReadVerifyTestCounts>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn observe_certificate_read_for_test(path: &PackagePath) {
+    CERTIFICATE_READ_VERIFY_TEST_COUNTS.with(|counts| {
+        if let Some(counts) = counts.borrow_mut().as_mut() {
+            *counts
+                .reads_by_path
+                .entry(path.as_str().to_owned())
+                .or_default() += 1;
+        }
+    });
+}
+
+#[cfg(not(test))]
+fn observe_certificate_read_for_test(_path: &PackagePath) {}
+
+#[cfg(test)]
+fn observe_certificate_verify_for_test(path: &PackagePath) {
+    CERTIFICATE_READ_VERIFY_TEST_COUNTS.with(|counts| {
+        if let Some(counts) = counts.borrow_mut().as_mut() {
+            *counts
+                .verifies_by_path
+                .entry(path.as_str().to_owned())
+                .or_default() += 1;
+        }
+    });
+}
+
+#[cfg(not(test))]
+fn observe_certificate_verify_for_test(_path: &PackagePath) {}
+
+#[cfg(test)]
+thread_local! {
+    static TARGETED_REFRESH_AFTER_PREFLIGHT_TEST_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+fn run_targeted_refresh_after_preflight_test_hook() {
+    TARGETED_REFRESH_AFTER_PREFLIGHT_TEST_HOOK.with(|hook| {
+        if let Some(run) = hook.borrow_mut().take() {
+            run();
+        }
+    });
+}
+
+#[cfg(not(test))]
+fn run_targeted_refresh_after_preflight_test_hook() {}
 
 /// Operation-scoped observation state shared by every package-build path.
 ///
@@ -112,6 +222,111 @@ impl PackageBuildObservationCoordinator {
 
     fn collect_declaration_details(&self) -> bool {
         self.timings.is_detailed()
+    }
+
+    fn measurement_enabled(&self) -> bool {
+        self.measurements.is_some()
+    }
+
+    fn measurements_enabled(&self) -> bool {
+        self.timings.is_enabled()
+    }
+
+    fn time_selection<T>(&mut self, run: impl FnOnce() -> T) -> T {
+        self.timings.time_phase(TIMING_SELECTION_MS, run)
+    }
+
+    fn initialize_refresh_timings(&mut self, targeted: bool) {
+        self.timings
+            .observe_elapsed_ms(TIMING_SOURCE_PREFLIGHT_MS, 0);
+        if targeted {
+            self.timings.observe_elapsed_ms(TIMING_PRIORITY_BUILD_MS, 0);
+        }
+        self.timings
+            .observe_elapsed_ms(TIMING_COMPLETION_BUILD_MS, 0);
+    }
+
+    fn time_source_preflight<T>(&mut self, run: impl FnOnce(&mut Self) -> T) -> T {
+        self.time_refresh_phase(TIMING_SOURCE_PREFLIGHT_MS, run)
+    }
+
+    fn time_priority_build<T>(&mut self, run: impl FnOnce(&mut Self) -> T) -> T {
+        self.time_refresh_phase(TIMING_PRIORITY_BUILD_MS, run)
+    }
+
+    fn time_completion_build<T>(&mut self, run: impl FnOnce(&mut Self) -> T) -> T {
+        self.time_refresh_phase(TIMING_COMPLETION_BUILD_MS, run)
+    }
+
+    fn time_refresh_phase<T>(
+        &mut self,
+        field: &'static str,
+        run: impl FnOnce(&mut Self) -> T,
+    ) -> T {
+        if !self.timings.is_enabled() {
+            return run(self);
+        }
+        let started = Instant::now();
+        let value = run(self);
+        self.timings.observe_elapsed_ms(
+            field,
+            u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        );
+        value
+    }
+
+    fn observe_package_selection(&mut self, observation: &PerformancePackageSelectionObservation) {
+        if let Some(measurements) = self.measurements.as_mut() {
+            measurements.observe_package_selection(observation);
+        }
+    }
+
+    fn record_targeted_authoring_measurements(
+        &mut self,
+        measurements: TargetedAuthoringMeasurementSnapshot,
+    ) {
+        self.timings
+            .observe_elapsed_ms(TIMING_CACHE_LOOKUP_MS, measurements.cache_lookup_ms());
+        if let Some(recorder) = self.measurements.as_mut() {
+            measurements.record(recorder);
+        }
+    }
+
+    fn record_cache_tool_identity(
+        &mut self,
+        observation: PackageBuildCacheToolIdentityObservation,
+    ) {
+        if !observation.attempted {
+            return;
+        }
+        if let Some(recorder) = self.measurements.as_mut() {
+            recorder.add_counter(
+                PerformanceMeasurementLabel::CacheToolIdentityBytes,
+                observation.bytes,
+            );
+            recorder.add_counter(
+                PerformanceMeasurementLabel::CacheToolIdentityElapsed,
+                observation.elapsed_ns,
+            );
+        }
+    }
+
+    fn record_cache_entry_bytes(&mut self, bytes_loaded: usize, bytes_written: usize) {
+        if let Some(recorder) = self.measurements.as_mut() {
+            recorder.add_counter(
+                PerformanceMeasurementLabel::CacheBytesLoaded,
+                u64::try_from(bytes_loaded).unwrap_or(u64::MAX),
+            );
+            recorder.add_counter(
+                PerformanceMeasurementLabel::CacheBytesWritten,
+                u64::try_from(bytes_written).unwrap_or(u64::MAX),
+            );
+        }
+    }
+
+    fn record_cache_lookup_ms(&mut self, elapsed_ms: u64) {
+        self.timings
+            .observe_elapsed_ms(TIMING_CACHE_LOOKUP_MS, elapsed_ms);
     }
 
     fn record_declaration_batch(
@@ -177,16 +392,8 @@ struct PackageCertificateBuild {
 }
 
 #[derive(Clone, Debug)]
-struct LocalCertificateBuildIdentity {
-    module_index: usize,
-    source_hash: PackageHash,
-    output_certificate_format: String,
-    output_core_spec: String,
-}
-
-#[derive(Clone, Debug)]
 struct PackageCertificateCheckBuild {
-    local_certificates: Vec<LocalCertificateBuildIdentity>,
+    local_certificates: Vec<PackageBuildCheckCertificateIdentity>,
     package_lock_json: String,
     diagnostic: Option<CommandDiagnostic>,
 }
@@ -246,26 +453,6 @@ enum RefreshImportOrigin {
 }
 
 #[derive(Clone, Debug)]
-struct PackageBuildCheckCacheSummary {
-    mode: PackageBuildCheckCacheMode,
-    hits: usize,
-    misses: usize,
-    stale: usize,
-    schema_misses: usize,
-    written: usize,
-    live_builds: usize,
-    trusted: bool,
-    build_evidence: bool,
-}
-
-#[derive(Clone, Debug)]
-struct PackageBuildCheckKeyedEntry {
-    module: Name,
-    key_input: PackageBuildCheckCacheKeyInput,
-    cache_key: String,
-}
-
-#[derive(Clone, Debug)]
 struct AvailableModule {
     verified: Arc<VerifiedModule>,
     source_interface: HumanImportedSourceInterface,
@@ -311,41 +498,140 @@ impl LocalModuleCheckBuild {
     }
 }
 
-#[derive(Clone, Debug)]
-enum PackageBuildCheckCacheLookup {
-    Hit(Box<PackageBuildCheckResultEntry>),
-    Missing,
-    SchemaMiss,
-    Stale,
-}
-
-#[derive(Clone, Debug)]
-struct PackageBuildCheckCacheRun {
-    cache_dir: PathBuf,
-    keyed_entries: Vec<PackageBuildCheckKeyedEntry>,
-    lookups: Vec<PackageBuildCheckCacheLookup>,
-    summary: PackageBuildCheckCacheSummary,
-}
-
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct PendingWrite {
     path: PackagePath,
-    full_path: PathBuf,
-    temp_path: PathBuf,
+    directory: Directory,
+    leaf: OsString,
+    temp: OsString,
+    temp_identity: Identity,
     reason_code: &'static str,
     module: Option<Name>,
     previous_bytes: Option<Vec<u8>>,
+    replacement_bytes: Vec<u8>,
 }
 
 #[derive(Clone, Debug)]
 struct PackageBuildSelectionPlan {
     mode: &'static str,
+    promotion: PackageBuildSelectionPromotion,
     seeds: BTreeSet<usize>,
     rebuild: Vec<usize>,
     support_local: BTreeSet<usize>,
     support_external: BTreeSet<usize>,
     changed_external: BTreeSet<usize>,
     lock_selected: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PackageBuildSelectionPromotion {
+    None,
+    ManifestChanged,
+}
+
+impl PackageBuildSelectionPromotion {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::ManifestChanged => "manifest_changed",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct TargetedRefreshLocalPlan {
+    structural_seed_order: Vec<usize>,
+    priority_local_order: Vec<usize>,
+    priority_rebuild: BTreeSet<usize>,
+    priority_support: BTreeSet<usize>,
+    priority_external_roots: BTreeSet<usize>,
+    completion_local_order: Vec<usize>,
+    completion_rebuild: BTreeSet<usize>,
+    completion_support: BTreeSet<usize>,
+    completion_snapshot: BTreeSet<usize>,
+}
+
+impl TargetedRefreshLocalPlan {
+    fn diagnostic(&self, declared_external: usize) -> CommandDiagnostic {
+        CommandDiagnostic::info(DiagnosticKind::Build, "package_build_refresh_schedule")
+            .with_field("refresh_schedule")
+            .with_actual_value(format!(
+                "priority_rebuild={},priority_support_local={},priority_external_roots={},declared_external={},deferred_rebuild={},deferred_support_local={},snapshot_unrelated_local={}",
+                self.priority_rebuild.len(),
+                self.priority_support.len(),
+                self.priority_external_roots.len(),
+                declared_external,
+                self.completion_rebuild.len(),
+                self.completion_support.len(),
+                self.completion_snapshot.len(),
+            ))
+    }
+}
+
+#[derive(Clone, Debug)]
+struct TargetedRefreshExternalPlan {
+    priority_external_order: Vec<usize>,
+    completion_external_order: Vec<usize>,
+}
+
+#[derive(Debug)]
+struct ExternalImportDependencyDiscovery {
+    order: Vec<usize>,
+    certificate_bytes_by_index: BTreeMap<usize, Vec<u8>>,
+    dependencies_by_index: BTreeMap<usize, Vec<usize>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RefreshModuleRole {
+    CheckedSupport,
+    Rebuild,
+    UnrelatedSnapshot,
+}
+
+#[derive(Debug)]
+struct PendingPriorityMetadata {
+    verified: Arc<VerifiedModule>,
+    source_interface: HumanSourceInterface,
+}
+
+#[derive(Debug)]
+struct TargetedRefreshExecutionState {
+    external_verifier_session: VerifierSession,
+    discovered_external_bytes_by_index: BTreeMap<usize, Vec<u8>>,
+    loaded_external: BTreeSet<usize>,
+    processed_local: BTreeSet<usize>,
+    available_modules: BTreeMap<Name, RefreshAvailableModule>,
+    verified_modules_by_module: BTreeMap<Name, Arc<VerifiedModule>>,
+    artifacts_by_path: BTreeMap<PackagePath, CertificateArtifactBuffer>,
+    pending_priority_metadata_by_index: BTreeMap<usize, PendingPriorityMetadata>,
+    refreshed_modules_by_index: BTreeMap<usize, LocalModuleRefreshIdentity>,
+    stats: TargetedRefreshStats,
+}
+
+impl TargetedRefreshExecutionState {
+    fn new(candidate_count: usize) -> Self {
+        Self {
+            external_verifier_session: VerifierSession::new(),
+            discovered_external_bytes_by_index: BTreeMap::new(),
+            loaded_external: BTreeSet::new(),
+            processed_local: BTreeSet::new(),
+            available_modules: BTreeMap::new(),
+            verified_modules_by_module: BTreeMap::new(),
+            artifacts_by_path: BTreeMap::new(),
+            pending_priority_metadata_by_index: BTreeMap::new(),
+            refreshed_modules_by_index: BTreeMap::new(),
+            stats: TargetedRefreshStats {
+                candidates: candidate_count,
+                ..TargetedRefreshStats::default()
+            },
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum TargetedExternalImportSelection<'selection> {
+    Seeds(&'selection BTreeSet<usize>),
+    Ordered(&'selection [usize]),
 }
 
 #[derive(Clone, Debug, Default)]
@@ -357,6 +643,144 @@ struct TargetedRefreshStats {
     source_scans: usize,
     source_interface_reconstructions: usize,
     fallbacks: BTreeMap<&'static str, usize>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct TargetedBuildCheckStats {
+    support_selected: usize,
+    targets_selected: usize,
+    support_live_checked: usize,
+    targets_live_built: usize,
+    live_support_elapsed_ns: u64,
+    source_interface_resolution_elapsed_ns: u64,
+    fresh_target_elapsed_ns: u64,
+}
+
+impl TargetedBuildCheckStats {
+    fn new(plan: &PackageBuildSelectionPlan) -> Self {
+        Self {
+            support_selected: plan.support_local.len(),
+            targets_selected: plan.rebuild.len(),
+            ..Self::default()
+        }
+    }
+}
+
+#[derive(Debug)]
+struct TargetedBuildCheckCacheState {
+    session: PackageBuildCheckCacheSession,
+    support_session: Option<TargetedAuthoringSupportCacheSession>,
+    support_publication: Option<TargetedAuthoringSupportPublicationPlanner>,
+    support_publication_closed: bool,
+    stats: TargetedBuildCheckStats,
+    certificates: Vec<PackageBuildCheckCertificateIdentity>,
+    unavailable_diagnostic: Option<CommandDiagnostic>,
+}
+
+#[derive(Debug)]
+struct FullReadThroughSupportWarming {
+    session: TargetedAuthoringSupportCacheSession,
+    publication: Option<TargetedAuthoringSupportPublicationPlanner>,
+    detailed_diagnostics: bool,
+}
+
+impl FullReadThroughSupportWarming {
+    fn new(session: TargetedAuthoringSupportCacheSession, detailed_diagnostics: bool) -> Self {
+        Self {
+            session,
+            publication: None,
+            detailed_diagnostics,
+        }
+    }
+
+    fn prepare(
+        &mut self,
+        loaded: &LoadedPackageRoot,
+        policy: &AxiomPolicy,
+        lock_entries: &[PackageLockEntry],
+        verified_modules_by_module: &BTreeMap<Name, Arc<VerifiedModule>>,
+    ) {
+        let external_count = loaded
+            .validated
+            .manifest()
+            .imports
+            .as_deref()
+            .unwrap_or(&[])
+            .len();
+        if lock_entries.len() != external_count {
+            self.publication = Some(TargetedAuthoringSupportPublicationPlanner::disabled(
+                "external_entry_count_mismatch",
+                self.detailed_diagnostics,
+            ));
+            return;
+        }
+        let mut external_inputs = Vec::with_capacity(external_count);
+        for entry in lock_entries {
+            let Some(verified) = verified_modules_by_module.get(&entry.module) else {
+                self.publication = Some(TargetedAuthoringSupportPublicationPlanner::disabled(
+                    "external_verified_module_missing",
+                    self.detailed_diagnostics,
+                ));
+                return;
+            };
+            external_inputs.push(TargetedAuthoringExternalModuleInput {
+                module: entry.module.clone(),
+                current_certificate_file_hash: entry.certificate_file_hash,
+                actual_export_hash: PackageHash::from(verified.export_hash()),
+                actual_certificate_hash: PackageHash::from(verified.certificate_hash()),
+            });
+        }
+        self.publication = Some(TargetedAuthoringSupportPublicationPlanner::new(
+            self.session.namespace().cloned(),
+            self.session.toolchain().cloned(),
+            external_inputs,
+            policy,
+            self.detailed_diagnostics,
+        ));
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn publish_retained_module(
+        &mut self,
+        loaded: &LoadedPackageRoot,
+        module_index: usize,
+        artifact: TargetedAuthoringLocalModuleInput,
+        source: &str,
+        interface: &HumanImportedSourceInterface,
+        verified: &VerifiedModule,
+    ) {
+        let Some(publication) = self.publication.as_mut() else {
+            return;
+        };
+        let entry = publication.observe_local(
+            loaded,
+            module_index,
+            artifact,
+            source,
+            interface,
+            verified,
+            TargetedAuthoringPublicationOrigin::FullReadThroughRetainedModule,
+            false,
+            TargetedAuthoringModuleAcceptance::full_source_complete(),
+        );
+        if let Some(entry) = entry {
+            let outcome = self.session.publish(&entry, publication.budget_mut());
+            publication.record_publish_outcome(module_index, outcome);
+        }
+    }
+
+    fn take_diagnostics(&mut self) -> Vec<CommandDiagnostic> {
+        self.publication.as_mut().map_or_else(
+            Vec::new,
+            TargetedAuthoringSupportPublicationPlanner::take_diagnostics,
+        )
+    }
+
+    fn observed_cache_bytes(&self) -> (usize, usize) {
+        self.publication
+            .as_ref()
+            .map_or((0, 0), |publication| publication.observed_cache_bytes())
+    }
 }
 
 impl TargetedRefreshStats {
@@ -440,13 +864,14 @@ impl PackageBuildSelectionPlan {
         CommandDiagnostic::info(DiagnosticKind::Build, "package_build_selection")
             .with_field("selection")
             .with_actual_value(format!(
-                "mode={},seeds={},rebuild={},support_local={},support_external={},changed_external={}",
+                "mode={},seeds={},rebuild={},support_local={},support_external={},changed_external={},promotion={}",
                 self.mode,
                 self.seeds.len(),
                 self.rebuild.len(),
                 self.support_local.len(),
                 self.support_external.len(),
-                self.changed_external.len()
+                self.changed_external.len(),
+                self.promotion.as_str(),
             ))
     }
 }
@@ -489,6 +914,7 @@ fn run_package_build_certs_with_observations(
         return run_package_build_certs_check_with_cache_and_observations(
             options.common,
             options.build_check_cache,
+            options.build_check_cache_root,
             observations,
         );
     }
@@ -507,6 +933,11 @@ fn package_build_validation_diagnostic(
                 .with_actual_value(options.build_check_cache.as_str())
         }
         PackageBuildOptionsValidationError::TargetedBuildCheckCache => {
+            CommandDiagnostic::error(DiagnosticKind::Usage, "package_build_selection_invalid")
+                .with_field("--build-check-cache")
+                .with_actual_value(options.build_check_cache.as_str())
+        }
+        PackageBuildOptionsValidationError::LocalHitRequiresTargetedCheck => {
             CommandDiagnostic::error(DiagnosticKind::Usage, "package_build_selection_invalid")
                 .with_field("--build-check-cache")
                 .with_actual_value(options.build_check_cache.as_str())
@@ -532,18 +963,110 @@ fn run_targeted_package_build_certs(
         Ok(loaded) => loaded,
         Err(result) => return result,
     };
-    let plan = match resolve_package_build_selection(
-        &loaded,
-        &options.selection,
-        options.update_manifest_hashes,
-    ) {
+    let selection_is_changed = matches!(&options.selection, PackageBuildSelection::Changed);
+    let mut selection_observation = (observations.measurements_enabled() && selection_is_changed)
+        .then(PerformancePackageSelectionObservation::default);
+    let selection_result = observations.time_selection(|| {
+        resolve_package_build_selection(
+            &loaded,
+            &options.selection,
+            options.update_manifest_hashes,
+            selection_observation.as_mut(),
+        )
+    });
+    if let Some(observation) = selection_observation.as_ref() {
+        observations.observe_package_selection(observation);
+    }
+    let plan = match selection_result {
         Ok(plan) => plan,
         Err(diagnostic) => {
             return CommandResult::failed(COMMAND, loaded.root_display, vec![*diagnostic]);
         }
     };
     let selection_diagnostic = plan.diagnostic();
-    let mut refresh_plan_diagnostic = None;
+    if options.build_check_cache == PackageBuildCheckCacheMode::LocalHit {
+        let selected_external = plan
+            .support_external
+            .union(&plan.changed_external)
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let authoring_plan =
+            TargetedAuthoringCheckPlan::new(plan.rebuild.len(), plan.support_local.len(), 0);
+        let output = run_targeted_authoring_local_hit(
+            COMMAND,
+            loaded.root_display.clone(),
+            selection_diagnostic,
+            authoring_plan,
+            observations.measurement_enabled(),
+            observations.collect_declaration_details(),
+            || {
+                let external_order = external_import_dependency_plan(&loaded, &selected_external)
+                    .map_err(|diagnostic| *diagnostic)?;
+                let manifest = loaded.validated.manifest();
+                let planner_input = TargetedAuthoringPlannerInput::from_package_graph(
+                    &manifest.modules,
+                    loaded.validated.graph(),
+                    &plan.rebuild,
+                    &plan.support_local,
+                    external_order,
+                    manifest.imports.as_deref().unwrap_or(&[]).len(),
+                )?;
+                build_targeted_authoring_execution_plan(planner_input)
+            },
+            |authoring_plan, run| {
+                execute_targeted_authoring_local_hit_live(
+                    &loaded,
+                    &plan,
+                    authoring_plan,
+                    run,
+                    options.build_check_cache_root.as_deref(),
+                    observations,
+                )
+            },
+        );
+        let (result, measurements) = output.into_parts();
+        observations.record_targeted_authoring_measurements(measurements);
+        return result;
+    }
+    let refresh_plan_diagnostic;
+    let refresh_schedule_diagnostic;
+    let mut cache_state = if options.build_check_cache.uses_local_store() {
+        let (session, support_session) = if plan.support_local.is_empty() {
+            (
+                prepare_package_build_check_cache_session_observed(
+                    &loaded,
+                    options.build_check_cache_root.as_deref(),
+                    observations.measurement_enabled(),
+                ),
+                None,
+            )
+        } else {
+            let (result, support) = prepare_package_build_check_and_support_cache_sessions_observed(
+                &loaded,
+                options.build_check_cache_root.as_deref(),
+                observations.measurement_enabled(),
+            );
+            (result, Some(support))
+        };
+        observations.record_cache_tool_identity(session.tool_identity_observation());
+        let mut session = session;
+        let unavailable_diagnostic = coalesced_build_check_cache_unavailable_diagnostic(
+            "read-through",
+            &mut session,
+            support_session.as_ref(),
+        );
+        Some(TargetedBuildCheckCacheState {
+            session,
+            support_session,
+            support_publication: None,
+            support_publication_closed: false,
+            stats: TargetedBuildCheckStats::new(&plan),
+            certificates: Vec::new(),
+            unavailable_diagnostic,
+        })
+    } else {
+        None
+    };
 
     if plan.rebuild.is_empty() && (!options.update_manifest_hashes || !plan.lock_selected) {
         let selected_external = plan.changed_external.clone();
@@ -553,25 +1076,78 @@ fn run_targeted_package_build_certs(
             false,
             false,
             false,
-            Some(&selected_external),
+            Some(TargetedExternalImportSelection::Seeds(&selected_external)),
+            cache_state.as_mut(),
+            None,
+            None,
+            None,
             observations,
         ) {
-            return targeted_failed(&loaded, selection_diagnostic, *diagnostic);
+            return targeted_build_check_result_with_optional_cache(
+                &loaded,
+                selection_diagnostic,
+                cache_state,
+                Some(*diagnostic),
+                false,
+                observations,
+            );
         }
-        let mut result = CommandResult::passed(COMMAND, loaded.root_display);
-        result.diagnostics.push(selection_diagnostic);
-        return result;
+        return targeted_build_check_result_with_optional_cache(
+            &loaded,
+            selection_diagnostic,
+            cache_state,
+            None,
+            true,
+            observations,
+        );
     }
 
     if options.update_manifest_hashes {
         if let Some(diagnostic) = check_targeted_refresh_mode_targets(&loaded, &plan) {
             return targeted_failed(&loaded, selection_diagnostic, diagnostic);
         }
-        let build = match build_package_certificates_targeted_refresh(&loaded, &plan, observations)
-        {
-            Ok(build) => build,
+        let local_plan = match build_targeted_refresh_local_plan(&loaded, &plan) {
+            Ok(local_plan) => local_plan,
             Err(diagnostic) => {
                 return targeted_failed(&loaded, selection_diagnostic, *diagnostic);
+            }
+        };
+        let declared_external = loaded
+            .validated
+            .manifest()
+            .imports
+            .as_deref()
+            .unwrap_or(&[])
+            .len();
+        let schedule_diagnostic = local_plan.diagnostic(declared_external);
+        observations.initialize_refresh_timings(true);
+        let preflight = observations.time_source_preflight(|_| {
+            preflight_human_sources(&loaded, &local_plan.structural_seed_order)
+        });
+        if let Err(diagnostic) = preflight {
+            return targeted_failed_after_schedule(
+                &loaded,
+                selection_diagnostic,
+                schedule_diagnostic,
+                *diagnostic,
+            );
+        }
+        run_targeted_refresh_after_preflight_test_hook();
+        refresh_schedule_diagnostic = schedule_diagnostic;
+        let build = match build_package_certificates_targeted_refresh(
+            &loaded,
+            &plan,
+            &local_plan,
+            observations,
+        ) {
+            Ok(build) => build,
+            Err(diagnostic) => {
+                return targeted_failed_after_schedule(
+                    &loaded,
+                    selection_diagnostic,
+                    refresh_schedule_diagnostic,
+                    *diagnostic,
+                );
             }
         };
         refresh_plan_diagnostic = build
@@ -587,28 +1163,235 @@ fn run_targeted_package_build_certs(
             return targeted_failed_after_plan(
                 &loaded,
                 selection_diagnostic,
+                refresh_schedule_diagnostic,
                 refresh_plan_diagnostic,
                 diagnostic,
             );
         }
     } else {
-        let build = match build_package_certificates_targeted_check(&loaded, &plan, observations) {
+        let build = match build_package_certificates_targeted_check(
+            &loaded,
+            &plan,
+            cache_state.as_mut(),
+            None,
+            None,
+            None,
+            observations,
+        ) {
             Ok(build) => build,
             Err(diagnostic) => {
-                return targeted_failed(&loaded, selection_diagnostic, *diagnostic);
+                return targeted_build_check_result_with_optional_cache(
+                    &loaded,
+                    selection_diagnostic,
+                    cache_state,
+                    Some(*diagnostic),
+                    false,
+                    observations,
+                );
             }
         };
-        if let Some(diagnostic) = build.diagnostic {
-            return targeted_failed(&loaded, selection_diagnostic, diagnostic);
-        }
+        return targeted_build_check_result_with_optional_cache(
+            &loaded,
+            selection_diagnostic,
+            cache_state,
+            build.diagnostic,
+            true,
+            observations,
+        );
     }
 
     let mut result = CommandResult::passed(COMMAND, loaded.root_display);
     result.diagnostics.push(selection_diagnostic);
+    result.diagnostics.push(refresh_schedule_diagnostic);
     if let Some(diagnostic) = refresh_plan_diagnostic {
         result.diagnostics.push(diagnostic);
     }
     result
+}
+
+fn execute_targeted_authoring_local_hit_live(
+    loaded: &LoadedPackageRoot,
+    plan: &PackageBuildSelectionPlan,
+    authoring_plan: &TargetedAuthoringExecutionPlan,
+    run: &mut TargetedAuthoringCheckRun,
+    cache_root: Option<&Path>,
+    observations: &mut PackageBuildObservationCoordinator,
+) -> TargetedAuthoringExecutionOutcome {
+    if plan.rebuild.is_empty() {
+        return match build_targeted_refresh_inputs(
+            loaded,
+            plan,
+            false,
+            false,
+            false,
+            Some(TargetedExternalImportSelection::Ordered(
+                authoring_plan.external_order(),
+            )),
+            None,
+            Some(run),
+            Some(authoring_plan),
+            cache_root,
+            observations,
+        ) {
+            Ok(_) => {
+                run.record_completed_external_visits();
+                TargetedAuthoringExecutionOutcome::completed(None)
+            }
+            Err(diagnostic) => TargetedAuthoringExecutionOutcome::stopped(*diagnostic),
+        };
+    }
+
+    match build_package_certificates_targeted_check(
+        loaded,
+        plan,
+        None,
+        Some(authoring_plan),
+        Some(run),
+        cache_root,
+        observations,
+    ) {
+        Ok(build) => {
+            run.record_completed_external_visits();
+            TargetedAuthoringExecutionOutcome::completed(build.diagnostic)
+        }
+        Err(diagnostic) => TargetedAuthoringExecutionOutcome::stopped(*diagnostic),
+    }
+}
+
+fn targeted_build_check_result_with_optional_cache(
+    loaded: &LoadedPackageRoot,
+    selection: CommandDiagnostic,
+    cache_state: Option<TargetedBuildCheckCacheState>,
+    diagnostic: Option<CommandDiagnostic>,
+    completed: bool,
+    observations: &mut PackageBuildObservationCoordinator,
+) -> CommandResult {
+    let status = if diagnostic.is_some() {
+        PackageBuildCheckCachedStatus::Rejected
+    } else {
+        PackageBuildCheckCachedStatus::Accepted
+    };
+    let reason = diagnostic
+        .as_ref()
+        .map(|diagnostic| diagnostic.reason_code.clone());
+    let mut diagnostics = vec![selection];
+    if let Some(diagnostic) = diagnostic {
+        diagnostics.push(diagnostic);
+    }
+    if let Some(cache_state) = cache_state {
+        let TargetedBuildCheckCacheState {
+            session,
+            support_session: _,
+            mut support_publication,
+            support_publication_closed: _,
+            stats,
+            certificates,
+            unavailable_diagnostic,
+        } = cache_state;
+        let run = prepare_package_build_check_cache_run(
+            session,
+            loaded,
+            &certificates,
+            observations.measurement_enabled(),
+        );
+        observations.record_cache_lookup_ms(run.lookup_ms());
+        if let Some(unavailable) = run.unavailable_diagnostic() {
+            diagnostics.push(unavailable);
+        }
+        if let Some(unavailable) = unavailable_diagnostic {
+            diagnostics.push(unavailable);
+        }
+        let outcomes =
+            finalize_package_build_check_cache_run_outcomes(run, status, reason.as_deref());
+        let support_context_entries_written = support_publication.as_ref().map_or(
+            0,
+            TargetedAuthoringSupportPublicationPlanner::entries_written,
+        );
+        let (support_context_bytes_loaded, support_context_bytes_written) = support_publication
+            .as_ref()
+            .map_or((0, 0), |publication| publication.observed_cache_bytes());
+        if let Some(publication) = support_publication.as_mut() {
+            diagnostics.extend(publication.take_diagnostics());
+        }
+        let bytes_loaded = support_context_bytes_loaded.saturating_add(outcomes.bytes_loaded);
+        let bytes_written = support_context_bytes_written.saturating_add(outcomes.bytes_written);
+        diagnostics.push(targeted_authoring_read_through_summary_diagnostic(
+            stats,
+            completed,
+            support_context_entries_written,
+            bytes_loaded,
+            bytes_written,
+        ));
+        observations.record_targeted_authoring_measurements(
+            TargetedAuthoringMeasurementSnapshot::read_through(
+                stats.support_selected,
+                stats.support_live_checked,
+                stats.targets_live_built,
+                stats.live_support_elapsed_ns,
+                stats.source_interface_resolution_elapsed_ns,
+                stats.fresh_target_elapsed_ns,
+                bytes_loaded,
+                bytes_written,
+            ),
+        );
+        diagnostics.push(targeted_build_check_cache_summary_diagnostic(
+            stats,
+            outcomes,
+            support_context_entries_written,
+        ));
+    }
+
+    if status == PackageBuildCheckCachedStatus::Rejected {
+        CommandResult::failed(COMMAND, loaded.root_display.clone(), diagnostics)
+    } else {
+        let mut result = CommandResult::passed(COMMAND, loaded.root_display.clone());
+        result.diagnostics = diagnostics;
+        result
+    }
+}
+
+fn targeted_authoring_read_through_summary_diagnostic(
+    stats: TargetedBuildCheckStats,
+    complete: bool,
+    entries_written: usize,
+    bytes_loaded: usize,
+    bytes_written: usize,
+) -> CommandDiagnostic {
+    CommandDiagnostic::info(
+        DiagnosticKind::GeneratedArtifact,
+        "targeted_authoring_cache_summary",
+    )
+    .with_field("targeted_authoring_cache")
+    .with_actual_value(format!(
+        "mode=read-through;complete={complete};support_selected={};targets_selected={};support_live_checked={};targets_live_built={};support_context_entries_written={entries_written};support_checks_avoided=0;avoided_source_interface_resolutions=0;bytes_loaded={bytes_loaded};bytes_written={bytes_written};trusted=false;build_evidence=false;proof_evidence=false",
+        stats.support_selected,
+        stats.targets_selected,
+        stats.support_live_checked,
+        stats.targets_live_built,
+    ))
+}
+
+fn targeted_build_check_cache_summary_diagnostic(
+    stats: TargetedBuildCheckStats,
+    outcomes: PackageBuildCheckCacheOutcomeCounts,
+    support_context_entries_written: usize,
+) -> CommandDiagnostic {
+    CommandDiagnostic::info(
+        DiagnosticKind::GeneratedArtifact,
+        "build_check_cache_summary",
+    )
+    .with_field("build_check_cache")
+    .with_actual_value(format!(
+        "mode=read-through;support_live_checked={};targets_live_built={};target_result_cache_hits={};target_result_cache_misses={};target_result_cache_stale={};target_result_cache_schema_misses={};target_result_entries_written={};support_context_cache_hits=0;support_context_entries_written={};support_checks_avoided=0;avoided_source_interface_resolutions=0;trusted=false;build_evidence=false",
+        stats.support_live_checked,
+        stats.targets_live_built,
+        outcomes.hits,
+        outcomes.misses,
+        outcomes.stale,
+        outcomes.schema_misses,
+        outcomes.written,
+        support_context_entries_written,
+    ))
 }
 
 fn targeted_failed(
@@ -626,10 +1409,11 @@ fn targeted_failed(
 fn targeted_failed_after_plan(
     loaded: &LoadedPackageRoot,
     selection: CommandDiagnostic,
+    refresh_schedule: CommandDiagnostic,
     refresh_plan: Option<CommandDiagnostic>,
     diagnostic: CommandDiagnostic,
 ) -> CommandResult {
-    let mut diagnostics = vec![selection];
+    let mut diagnostics = vec![selection, refresh_schedule];
     if let Some(refresh_plan) = refresh_plan {
         diagnostics.push(refresh_plan);
     }
@@ -637,10 +1421,24 @@ fn targeted_failed_after_plan(
     CommandResult::failed(COMMAND, loaded.root_display.clone(), diagnostics)
 }
 
+fn targeted_failed_after_schedule(
+    loaded: &LoadedPackageRoot,
+    selection: CommandDiagnostic,
+    refresh_schedule: CommandDiagnostic,
+    diagnostic: CommandDiagnostic,
+) -> CommandResult {
+    CommandResult::failed(
+        COMMAND,
+        loaded.root_display.clone(),
+        vec![selection, refresh_schedule, diagnostic],
+    )
+}
+
 fn resolve_package_build_selection(
     loaded: &LoadedPackageRoot,
     selection: &PackageBuildSelection,
     refresh: bool,
+    observation: Option<&mut PerformancePackageSelectionObservation>,
 ) -> Result<PackageBuildSelectionPlan, Box<CommandDiagnostic>> {
     let manifest = loaded.validated.manifest();
     let module_by_name = manifest
@@ -686,13 +1484,14 @@ fn resolve_package_build_selection(
             for import in manifest.imports.as_deref().unwrap_or(&[]) {
                 selected_paths.insert(import.certificate.as_str().to_owned());
             }
-            let paths = changed_package_paths(&loaded.root, &selected_paths).map_err(|error| {
-                Box::new(
-                    CommandDiagnostic::error(DiagnosticKind::Internal, "git_status_failed")
-                        .with_field("--changed")
-                        .with_actual_value(error),
-                )
-            })?;
+            let paths = changed_package_paths_observed(&loaded.root, &selected_paths, observation)
+                .map_err(|error| {
+                    Box::new(
+                        CommandDiagnostic::error(DiagnosticKind::Internal, "git_status_failed")
+                            .with_field("--changed")
+                            .with_actual_value(error),
+                    )
+                })?;
             for path in paths {
                 if path == PACKAGE_MANIFEST_PATH {
                     promote_full = true;
@@ -728,9 +1527,12 @@ fn resolve_package_build_selection(
             "changed"
         }
     };
-    if promote_full {
+    let promotion = if promote_full {
         seeds.extend(0..manifest.modules.len());
-    }
+        PackageBuildSelectionPromotion::ManifestChanged
+    } else {
+        PackageBuildSelectionPromotion::None
+    };
     let rebuild = if refresh {
         package_graph_dependent_closure(loaded.validated.graph(), &seeds)
     } else {
@@ -759,6 +1561,7 @@ fn resolve_package_build_selection(
     }
     Ok(PackageBuildSelectionPlan {
         mode,
+        promotion,
         seeds,
         rebuild,
         support_local,
@@ -766,6 +1569,257 @@ fn resolve_package_build_selection(
         changed_external,
         lock_selected,
     })
+}
+
+fn build_targeted_refresh_local_plan(
+    loaded: &LoadedPackageRoot,
+    selection: &PackageBuildSelectionPlan,
+) -> Result<TargetedRefreshLocalPlan, Box<CommandDiagnostic>> {
+    let graph = loaded.validated.graph();
+    let module_count = loaded.validated.manifest().modules.len();
+    if selection
+        .seeds
+        .iter()
+        .chain(selection.rebuild.iter())
+        .chain(selection.support_local.iter())
+        .any(|index| *index >= module_count)
+    {
+        return Err(targeted_refresh_plan_invalid("local_index_out_of_range"));
+    }
+
+    let rebuild = selection.rebuild.iter().copied().collect::<BTreeSet<_>>();
+    let mut priority = selection.seeds.clone();
+    priority.extend(package_graph_transitive_dependencies(
+        graph,
+        &selection.seeds,
+    ));
+    let priority_rebuild = priority
+        .intersection(&rebuild)
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let priority_support = priority
+        .difference(&rebuild)
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let completion_rebuild = rebuild
+        .difference(&priority_rebuild)
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let completion_support = selection
+        .support_local
+        .difference(&priority_support)
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let semantic = rebuild
+        .union(&selection.support_local)
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let completion_snapshot = (0..module_count)
+        .filter(|index| !semantic.contains(index))
+        .collect::<BTreeSet<_>>();
+
+    let structural_seed_order = graph
+        .topological_order
+        .iter()
+        .copied()
+        .filter(|index| selection.seeds.contains(index))
+        .collect::<Vec<_>>();
+    let priority_local_order = graph
+        .topological_order
+        .iter()
+        .copied()
+        .filter(|index| priority.contains(index))
+        .collect::<Vec<_>>();
+    let completion_local_order = graph
+        .topological_order
+        .iter()
+        .copied()
+        .filter(|index| !priority.contains(index))
+        .collect::<Vec<_>>();
+    let mut priority_external_roots = BTreeSet::new();
+    for &module_index in &priority {
+        let Some(imports) = graph.resolved_module_imports.get(module_index) else {
+            return Err(targeted_refresh_plan_invalid("local_import_row_missing"));
+        };
+        for import in imports {
+            if let ResolvedModuleImportKind::External { import_index } = import.kind {
+                priority_external_roots.insert(import_index);
+            }
+        }
+    }
+
+    let plan = TargetedRefreshLocalPlan {
+        structural_seed_order,
+        priority_local_order,
+        priority_rebuild,
+        priority_support,
+        priority_external_roots,
+        completion_local_order,
+        completion_rebuild,
+        completion_support,
+        completion_snapshot,
+    };
+    validate_targeted_refresh_local_plan(loaded, selection, &plan)?;
+    Ok(plan)
+}
+
+fn validate_targeted_refresh_local_plan(
+    loaded: &LoadedPackageRoot,
+    selection: &PackageBuildSelectionPlan,
+    plan: &TargetedRefreshLocalPlan,
+) -> Result<(), Box<CommandDiagnostic>> {
+    let graph = loaded.validated.graph();
+    let module_count = loaded.validated.manifest().modules.len();
+    if graph.topological_order.len() != module_count {
+        return Err(targeted_refresh_plan_invalid("missing_local"));
+    }
+    let expected_structural = graph
+        .topological_order
+        .iter()
+        .copied()
+        .filter(|index| selection.seeds.contains(index))
+        .collect::<Vec<_>>();
+    if plan.structural_seed_order != expected_structural {
+        return Err(targeted_refresh_plan_invalid("structural_seed_order"));
+    }
+
+    let roles = [
+        &plan.priority_rebuild,
+        &plan.priority_support,
+        &plan.completion_rebuild,
+        &plan.completion_support,
+        &plan.completion_snapshot,
+    ];
+    let mut role_count = vec![0_u8; module_count];
+    for role in roles {
+        for &index in role {
+            let Some(count) = role_count.get_mut(index) else {
+                return Err(targeted_refresh_plan_invalid("local_index_out_of_range"));
+            };
+            *count = count.saturating_add(1);
+            if *count > 1 {
+                return Err(targeted_refresh_plan_invalid("duplicate_local"));
+            }
+        }
+    }
+    if role_count.iter().any(|count| *count != 1) {
+        return Err(targeted_refresh_plan_invalid("missing_local"));
+    }
+
+    let rebuild = selection.rebuild.iter().copied().collect::<BTreeSet<_>>();
+    let planned_rebuild = plan
+        .priority_rebuild
+        .union(&plan.completion_rebuild)
+        .copied()
+        .collect::<BTreeSet<_>>();
+    if planned_rebuild != rebuild {
+        return Err(targeted_refresh_plan_invalid("rebuild_partition_invalid"));
+    }
+    let planned_support = plan
+        .priority_support
+        .union(&plan.completion_support)
+        .copied()
+        .collect::<BTreeSet<_>>();
+    if planned_support != selection.support_local {
+        return Err(targeted_refresh_plan_invalid("support_partition_invalid"));
+    }
+    let priority = plan
+        .priority_rebuild
+        .union(&plan.priority_support)
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let completion = plan
+        .completion_rebuild
+        .union(&plan.completion_support)
+        .copied()
+        .chain(plan.completion_snapshot.iter().copied())
+        .collect::<BTreeSet<_>>();
+    let expected_priority_order = graph
+        .topological_order
+        .iter()
+        .copied()
+        .filter(|index| priority.contains(index))
+        .collect::<Vec<_>>();
+    let expected_completion_order = graph
+        .topological_order
+        .iter()
+        .copied()
+        .filter(|index| completion.contains(index))
+        .collect::<Vec<_>>();
+    if plan.priority_local_order != expected_priority_order {
+        return Err(targeted_refresh_plan_invalid("priority_local_order"));
+    }
+    if plan.completion_local_order != expected_completion_order {
+        return Err(targeted_refresh_plan_invalid("completion_local_order"));
+    }
+
+    let mut execution_order = plan.priority_local_order.clone();
+    execution_order.extend(&plan.completion_local_order);
+    if execution_order.len() != module_count {
+        return Err(targeted_refresh_plan_invalid("missing_local"));
+    }
+    let mut positions = vec![usize::MAX; module_count];
+    for (position, &index) in execution_order.iter().enumerate() {
+        let Some(slot) = positions.get_mut(index) else {
+            return Err(targeted_refresh_plan_invalid("local_index_out_of_range"));
+        };
+        if *slot != usize::MAX {
+            return Err(targeted_refresh_plan_invalid("duplicate_local"));
+        }
+        *slot = position;
+    }
+    for (consumer, imports) in graph.resolved_module_imports.iter().enumerate() {
+        for import in imports {
+            let ResolvedModuleImportKind::Local {
+                module_index: dependency,
+            } = import.kind
+            else {
+                continue;
+            };
+            if positions.get(dependency).copied().unwrap_or(usize::MAX)
+                >= positions.get(consumer).copied().unwrap_or(usize::MAX)
+            {
+                return Err(targeted_refresh_plan_invalid(
+                    "local_dependency_after_consumer",
+                ));
+            }
+        }
+    }
+
+    let external_count = loaded
+        .validated
+        .manifest()
+        .imports
+        .as_deref()
+        .unwrap_or(&[])
+        .len();
+    if plan
+        .priority_external_roots
+        .iter()
+        .any(|index| *index >= external_count)
+    {
+        return Err(targeted_refresh_plan_invalid("external_root_out_of_range"));
+    }
+    let mut expected_external_roots = BTreeSet::new();
+    for &module_index in &priority {
+        for import in &graph.resolved_module_imports[module_index] {
+            if let ResolvedModuleImportKind::External { import_index } = import.kind {
+                expected_external_roots.insert(import_index);
+            }
+        }
+    }
+    if plan.priority_external_roots != expected_external_roots {
+        return Err(targeted_refresh_plan_invalid("external_roots_invalid"));
+    }
+    Ok(())
+}
+
+fn targeted_refresh_plan_invalid(actual: &'static str) -> Box<CommandDiagnostic> {
+    Box::new(
+        CommandDiagnostic::error(DiagnosticKind::Internal, "targeted_refresh_plan_invalid")
+            .with_field("refresh_schedule")
+            .with_actual_value(actual),
+    )
 }
 
 fn check_targeted_refresh_mode_targets(
@@ -816,7 +1870,17 @@ fn run_package_build_certs_refresh_check_with_observations(
         return CommandResult::failed(COMMAND, loaded.root_display, vec![diagnostic]);
     }
 
-    let build = match build_package_certificates_refresh(&loaded, observations) {
+    observations.initialize_refresh_timings(false);
+    let structural_order = loaded.validated.graph().topological_order.clone();
+    let preflight =
+        observations.time_source_preflight(|_| preflight_human_sources(&loaded, &structural_order));
+    if let Err(diagnostic) = preflight {
+        return CommandResult::failed(COMMAND, loaded.root_display, vec![*diagnostic]);
+    }
+
+    let build = match observations.time_completion_build(|observations| {
+        build_package_certificates_refresh(&loaded, observations)
+    }) {
         Ok(build) => build,
         Err(diagnostic) => {
             return CommandResult::failed(COMMAND, loaded.root_display, vec![*diagnostic]);
@@ -833,6 +1897,10 @@ fn run_package_build_certs_refresh_check_with_observations(
 fn build_package_certificates_targeted_check(
     loaded: &LoadedPackageRoot,
     plan: &PackageBuildSelectionPlan,
+    cache_state: Option<&mut TargetedBuildCheckCacheState>,
+    authoring_plan: Option<&TargetedAuthoringExecutionPlan>,
+    authoring_run: Option<&mut TargetedAuthoringCheckRun>,
+    targeted_authoring_cache_root: Option<&Path>,
     observations: &mut PackageBuildObservationCoordinator,
 ) -> Result<PackageCertificateCheckBuild, Box<CommandDiagnostic>> {
     let selected_external = plan
@@ -840,13 +1908,21 @@ fn build_package_certificates_targeted_check(
         .union(&plan.changed_external)
         .copied()
         .collect::<BTreeSet<_>>();
+    let external_selection = authoring_plan.map_or_else(
+        || TargetedExternalImportSelection::Seeds(&selected_external),
+        |plan| TargetedExternalImportSelection::Ordered(plan.external_order()),
+    );
     let (local_modules, _artifacts, _stats) = build_targeted_refresh_inputs(
         loaded,
         plan,
         false,
         false,
         false,
-        Some(&selected_external),
+        Some(external_selection),
+        cache_state,
+        authoring_run,
+        authoring_plan,
+        targeted_authoring_cache_root,
         observations,
     )?;
     let mut local_certificates = Vec::new();
@@ -907,11 +1983,11 @@ fn build_package_certificates_targeted_check(
                     )
                 })
                 .unwrap_or(diagnostic);
-            local_certificates.push(LocalCertificateBuildIdentity {
+            local_certificates.push(PackageBuildCheckCertificateIdentity {
                 module_index: identity.module_index,
                 source_hash: identity.source_hash,
-                output_certificate_format: certificate.header.format.clone(),
-                output_core_spec: certificate.header.core_spec.clone(),
+                output_certificate_format: certificate.header().format.clone(),
+                output_core_spec: certificate.header().core_spec.clone(),
             });
             return Ok(PackageCertificateCheckBuild {
                 local_certificates,
@@ -919,11 +1995,11 @@ fn build_package_certificates_targeted_check(
                 diagnostic: Some(diagnostic),
             });
         }
-        local_certificates.push(LocalCertificateBuildIdentity {
+        local_certificates.push(PackageBuildCheckCertificateIdentity {
             module_index: identity.module_index,
             source_hash: identity.source_hash,
-            output_certificate_format: certificate.header.format.clone(),
-            output_core_spec: certificate.header.core_spec.clone(),
+            output_certificate_format: certificate.header().format.clone(),
+            output_core_spec: certificate.header().core_spec.clone(),
         });
     }
     Ok(PackageCertificateCheckBuild {
@@ -935,11 +2011,81 @@ fn build_package_certificates_targeted_check(
 
 fn build_package_certificates_targeted_refresh(
     loaded: &LoadedPackageRoot,
-    plan: &PackageBuildSelectionPlan,
+    selection: &PackageBuildSelectionPlan,
+    local_plan: &TargetedRefreshLocalPlan,
     observations: &mut PackageBuildObservationCoordinator,
 ) -> Result<PackageCertificateRefreshBuild, Box<CommandDiagnostic>> {
-    let (local_modules, unchanged_artifacts, targeted_refresh_stats) =
-        build_targeted_refresh_inputs(loaded, plan, true, true, true, None, observations)?;
+    let policy = axiom_policy_for_package(loaded);
+    let import_use_counts = package_build_import_use_counts(loaded);
+    let mut state = TargetedRefreshExecutionState::new(selection.rebuild.len());
+    let priority_empty =
+        local_plan.priority_local_order.is_empty() && local_plan.priority_external_roots.is_empty();
+    let external_plan = if priority_empty {
+        run_targeted_refresh_priority_phase(
+            loaded,
+            selection,
+            local_plan,
+            &policy,
+            &import_use_counts,
+            &mut state,
+            observations,
+        )?
+    } else {
+        observations.time_priority_build(|observations| {
+            run_targeted_refresh_priority_phase(
+                loaded,
+                selection,
+                local_plan,
+                &policy,
+                &import_use_counts,
+                &mut state,
+                observations,
+            )
+        })?
+    };
+
+    observations.time_completion_build(|observations| {
+        load_external_imports_for_targeted_refresh(
+            loaded,
+            &policy,
+            &import_use_counts,
+            &external_plan.completion_external_order,
+            false,
+            &mut state,
+        )?;
+        process_targeted_refresh_local_order(
+            loaded,
+            selection,
+            local_plan,
+            &local_plan.completion_local_order,
+            false,
+            &policy,
+            &import_use_counts,
+            &mut state,
+            observations,
+        )
+    })?;
+
+    let local_count = loaded.validated.manifest().modules.len();
+    let external_count = loaded
+        .validated
+        .manifest()
+        .imports
+        .as_deref()
+        .unwrap_or(&[])
+        .len();
+    if state.processed_local.len() != local_count {
+        return Err(targeted_refresh_plan_invalid("missing_local"));
+    }
+    if state.loaded_external.len() != external_count {
+        return Err(targeted_refresh_plan_invalid("external_partition_invalid"));
+    }
+    if state.refreshed_modules_by_index.len() != selection.rebuild.len() {
+        return Err(targeted_refresh_plan_invalid("refreshed_local_missing"));
+    }
+    let (local_modules, unchanged_artifacts) =
+        materialize_targeted_refresh_outputs(loaded, &mut state)?;
+    let targeted_refresh_stats = state.stats;
     let refreshed_manifest_source =
         refresh_manifest_hash_fields(&loaded.manifest_source, &local_modules)?;
     let refreshed_validated = parse_and_validate_refreshed_manifest(&refreshed_manifest_source)?;
@@ -960,13 +2106,111 @@ fn build_package_certificates_targeted_refresh(
     })
 }
 
+fn materialize_targeted_refresh_outputs(
+    loaded: &LoadedPackageRoot,
+    state: &mut TargetedRefreshExecutionState,
+) -> Result<
+    (
+        Vec<LocalModuleRefreshIdentity>,
+        Vec<CertificateArtifactBuffer>,
+    ),
+    Box<CommandDiagnostic>,
+> {
+    let manifest = loaded.validated.manifest();
+    let topological_order = &loaded.validated.graph().topological_order;
+    let mut local_modules = Vec::with_capacity(state.refreshed_modules_by_index.len());
+    for &module_index in topological_order {
+        if let Some(identity) = state.refreshed_modules_by_index.remove(&module_index) {
+            local_modules.push(identity);
+        }
+    }
+    if !state.refreshed_modules_by_index.is_empty() {
+        return Err(targeted_refresh_plan_invalid(
+            "refreshed_local_order_invalid",
+        ));
+    }
+
+    let mut artifacts = Vec::with_capacity(state.artifacts_by_path.len());
+    for import in manifest.imports.as_deref().unwrap_or(&[]) {
+        let artifact = state
+            .artifacts_by_path
+            .remove(&import.certificate)
+            .ok_or_else(|| targeted_refresh_plan_invalid("external_artifact_missing"))?;
+        artifacts.push(artifact);
+    }
+    for &module_index in topological_order {
+        let module = manifest
+            .modules
+            .get(module_index)
+            .ok_or_else(|| targeted_refresh_plan_invalid("local_index_out_of_range"))?;
+        if let Some(artifact) = state.artifacts_by_path.remove(&module.certificate) {
+            artifacts.push(artifact);
+        }
+    }
+    if !state.artifacts_by_path.is_empty() {
+        return Err(targeted_refresh_plan_invalid("artifact_order_invalid"));
+    }
+    Ok((local_modules, artifacts))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_targeted_refresh_priority_phase(
+    loaded: &LoadedPackageRoot,
+    selection: &PackageBuildSelectionPlan,
+    local_plan: &TargetedRefreshLocalPlan,
+    policy: &AxiomPolicy,
+    import_use_counts: &BTreeMap<Name, usize>,
+    state: &mut TargetedRefreshExecutionState,
+    observations: &mut PackageBuildObservationCoordinator,
+) -> Result<TargetedRefreshExternalPlan, Box<CommandDiagnostic>> {
+    let discovery =
+        external_import_dependency_discovery(loaded, &local_plan.priority_external_roots)?;
+    let external_plan = build_targeted_refresh_external_plan(
+        loaded,
+        &local_plan.priority_external_roots,
+        &discovery,
+    )?;
+    state.discovered_external_bytes_by_index = discovery.certificate_bytes_by_index;
+    load_external_imports_for_targeted_refresh(
+        loaded,
+        policy,
+        import_use_counts,
+        &external_plan.priority_external_order,
+        true,
+        state,
+    )?;
+    if !state.discovered_external_bytes_by_index.is_empty() {
+        return Err(targeted_refresh_plan_invalid(
+            "external_discovery_bytes_not_consumed",
+        ));
+    }
+    process_targeted_refresh_local_order(
+        loaded,
+        selection,
+        local_plan,
+        &local_plan.priority_local_order,
+        true,
+        policy,
+        import_use_counts,
+        state,
+        observations,
+    )?;
+    finalize_targeted_refresh_priority_metadata(loaded, local_plan, state)?;
+    Ok(external_plan)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn build_targeted_refresh_inputs(
     loaded: &LoadedPackageRoot,
     plan: &PackageBuildSelectionPlan,
     snapshot_unrelated: bool,
     refresh_metadata: bool,
     interface_aware: bool,
-    selected_external: Option<&BTreeSet<usize>>,
+    selected_external: Option<TargetedExternalImportSelection<'_>>,
+    mut targeted_check_cache: Option<&mut TargetedBuildCheckCacheState>,
+    mut targeted_authoring_run: Option<&mut TargetedAuthoringCheckRun>,
+    targeted_authoring_plan: Option<&TargetedAuthoringExecutionPlan>,
+    targeted_authoring_cache_root: Option<&Path>,
     observations: &mut PackageBuildObservationCoordinator,
 ) -> Result<
     (
@@ -981,9 +2225,13 @@ fn build_targeted_refresh_inputs(
     let mut available_modules = BTreeMap::new();
     let mut verified_modules_by_module = BTreeMap::new();
     let mut artifacts = Vec::new();
-    let selected_external = selected_external
-        .map(|seeds| external_import_dependency_plan(loaded, seeds))
-        .transpose()?;
+    let selected_external = match selected_external {
+        Some(TargetedExternalImportSelection::Seeds(seeds)) => {
+            Some(Cow::Owned(external_import_dependency_plan(loaded, seeds)?))
+        }
+        Some(TargetedExternalImportSelection::Ordered(order)) => Some(Cow::Borrowed(order)),
+        None => None,
+    };
     if let Some(diagnostic) = load_external_imports(
         loaded,
         &policy,
@@ -994,6 +2242,44 @@ fn build_targeted_refresh_inputs(
         selected_external.as_deref(),
     ) {
         return Err(Box::new(diagnostic));
+    }
+    if let Some(cache) = targeted_check_cache.as_deref_mut() {
+        let external_inputs = targeted_authoring_external_inputs(
+            loaded,
+            selected_external.as_deref().unwrap_or(&[]),
+            &artifacts,
+            &verified_modules_by_module,
+        );
+        if let Some(session) = cache.support_session.as_ref() {
+            cache.support_publication = Some(match external_inputs {
+                Ok(external_inputs) => TargetedAuthoringSupportPublicationPlanner::new(
+                    session.namespace().cloned(),
+                    session.toolchain().cloned(),
+                    external_inputs,
+                    &policy,
+                    observations.collect_declaration_details(),
+                ),
+                Err(_) => TargetedAuthoringSupportPublicationPlanner::disabled(
+                    "external_identity_unavailable",
+                    observations.collect_declaration_details(),
+                ),
+            });
+        }
+    }
+    if let Some(run) = targeted_authoring_run.as_deref_mut() {
+        let external_inputs = targeted_authoring_external_inputs(
+            loaded,
+            selected_external.as_deref().unwrap_or(&[]),
+            &artifacts,
+            &verified_modules_by_module,
+        )?;
+        run.prepare_support_lookup(
+            loaded,
+            targeted_authoring_cache_root,
+            external_inputs,
+            &policy,
+        )
+        .map_err(Box::new)?;
     }
     let mut refresh_available_modules = available_modules
         .into_iter()
@@ -1015,6 +2301,38 @@ fn build_targeted_refresh_inputs(
         candidates: plan.rebuild.len(),
         ..TargetedRefreshStats::default()
     };
+    if let Some(authoring_plan) = targeted_authoring_plan {
+        let Some(run) = targeted_authoring_run else {
+            return Err(Box::new(
+                CommandDiagnostic::error(
+                    DiagnosticKind::Internal,
+                    "targeted_authoring_plan_invalid",
+                )
+                .with_actual_value("execution_plan_without_run"),
+            ));
+        };
+        if let Some(diagnostic) = build_local_modules_for_targeted_authoring_check(
+            loaded,
+            &policy,
+            &import_use_counts,
+            &mut refresh_available_modules,
+            &mut verified_modules_by_module,
+            &mut local_modules,
+            &mut artifacts,
+            authoring_plan,
+            run,
+            observations,
+        ) {
+            return Err(Box::new(diagnostic));
+        }
+        return Ok((local_modules, artifacts, targeted_refresh_stats));
+    }
+    if targeted_authoring_run.is_some() {
+        return Err(Box::new(
+            CommandDiagnostic::error(DiagnosticKind::Internal, "targeted_authoring_plan_invalid")
+                .with_actual_value("run_without_execution_plan"),
+        ));
+    }
     if let Some(diagnostic) = build_local_modules_for_refresh(
         loaded,
         &policy,
@@ -1030,6 +2348,8 @@ fn build_targeted_refresh_inputs(
         Some(&plan.seeds),
         interface_aware,
         &mut targeted_refresh_stats,
+        targeted_check_cache,
+        targeted_authoring_run,
         observations,
     ) {
         return Err(Box::new(diagnostic));
@@ -1050,7 +2370,17 @@ fn run_package_build_certs_refresh_write_with_observations(
         return CommandResult::failed(COMMAND, loaded.root_display, vec![diagnostic]);
     }
 
-    let build = match build_package_certificates_refresh(&loaded, observations) {
+    observations.initialize_refresh_timings(false);
+    let structural_order = loaded.validated.graph().topological_order.clone();
+    let preflight =
+        observations.time_source_preflight(|_| preflight_human_sources(&loaded, &structural_order));
+    if let Err(diagnostic) = preflight {
+        return CommandResult::failed(COMMAND, loaded.root_display, vec![*diagnostic]);
+    }
+
+    let build = match observations.time_completion_build(|observations| {
+        build_package_certificates_refresh(&loaded, observations)
+    }) {
         Ok(build) => build,
         Err(diagnostic) => {
             return CommandResult::failed(COMMAND, loaded.root_display, vec![*diagnostic]);
@@ -1118,6 +2448,8 @@ fn build_package_certificates_refresh(
         None,
         false,
         &mut ignored_targeted_stats,
+        None,
+        None,
         observations,
     ) {
         return Err(Box::new(diagnostic));
@@ -1222,15 +2554,7 @@ fn check_refreshed_package_build(
         else {
             continue;
         };
-        let full_path = match join_package_path(
-            &loaded.root,
-            metadata_path,
-            format!("modules[{}].meta", module.module_index),
-        ) {
-            Ok(path) => path,
-            Err(diagnostic) => return Some(*diagnostic),
-        };
-        let actual_bytes = match fs::read(full_path) {
+        let actual_bytes = match read_package_regular_file_no_follow(&loaded.root, metadata_path) {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 return Some(
@@ -1792,6 +3116,7 @@ pub fn run_package_build_certs_check_with_cache(
 fn run_package_build_certs_check_with_cache_and_observations(
     options: PackageCommonOptions,
     build_check_cache: PackageBuildCheckCacheMode,
+    build_check_cache_root: Option<PathBuf>,
     observations: &mut PackageBuildObservationCoordinator,
 ) -> CommandResult {
     let loaded = match load_package_root(&options.root, COMMAND) {
@@ -1799,60 +3124,131 @@ fn run_package_build_certs_check_with_cache_and_observations(
         Err(result) => return result,
     };
 
-    let cache_cwd = if build_check_cache.uses_local_store() {
-        match std::env::current_dir() {
-            Ok(cwd) => Some(cwd),
-            Err(error) => {
-                return CommandResult::failed(
-                    COMMAND,
-                    loaded.root_display,
-                    vec![CommandDiagnostic::error(
-                        DiagnosticKind::Internal,
-                        "build_check_cache_cwd_unavailable",
-                    )
-                    .with_actual_value(error.to_string())],
+    let has_retained_local_module = loaded
+        .validated
+        .graph()
+        .resolved_module_imports
+        .iter()
+        .flatten()
+        .any(|import| matches!(import.kind, ResolvedModuleImportKind::Local { .. }));
+    let (cache_session, mut support_warming, cache_unavailable_diagnostic) =
+        if build_check_cache.uses_local_store() {
+            if has_retained_local_module {
+                let (mut result, support) =
+                    prepare_package_build_check_and_support_cache_sessions_observed(
+                        &loaded,
+                        build_check_cache_root.as_deref(),
+                        observations.measurement_enabled(),
+                    );
+                let unavailable = coalesced_build_check_cache_unavailable_diagnostic(
+                    "read-through",
+                    &mut result,
+                    Some(&support),
                 );
+                (
+                    Some(result),
+                    Some(FullReadThroughSupportWarming::new(
+                        support,
+                        observations.collect_declaration_details(),
+                    )),
+                    unavailable,
+                )
+            } else {
+                (
+                    Some(prepare_package_build_check_cache_session_observed(
+                        &loaded,
+                        build_check_cache_root.as_deref(),
+                        observations.measurement_enabled(),
+                    )),
+                    None,
+                    None,
+                )
             }
-        }
-    } else {
-        None
-    };
+        } else {
+            (None, None, None)
+        };
+    if let Some(session) = cache_session.as_ref() {
+        observations.record_cache_tool_identity(session.tool_identity_observation());
+    }
 
-    let build = match build_package_certificates_check(&loaded, observations) {
-        Ok(build) => build,
-        Err(diagnostic) => {
-            return CommandResult::failed(COMMAND, loaded.root_display, vec![*diagnostic]);
-        }
-    };
+    let build =
+        match build_package_certificates_check(&loaded, support_warming.as_mut(), observations) {
+            Ok(build) => build,
+            Err(diagnostic) => {
+                let mut diagnostics = vec![*diagnostic];
+                if let Some(unavailable) = cache_session
+                    .as_ref()
+                    .and_then(PackageBuildCheckCacheSession::unavailable_diagnostic)
+                {
+                    diagnostics.push(unavailable);
+                }
+                if let Some(unavailable) = cache_unavailable_diagnostic {
+                    diagnostics.push(unavailable);
+                }
+                if let Some(warming) = support_warming.as_mut() {
+                    let (bytes_loaded, bytes_written) = warming.observed_cache_bytes();
+                    observations.record_cache_entry_bytes(bytes_loaded, bytes_written);
+                    diagnostics.extend(warming.take_diagnostics());
+                }
+                return CommandResult::failed(COMMAND, loaded.root_display, diagnostics);
+            }
+        };
 
-    let cache_run = if build_check_cache.uses_local_store() {
-        let cache_cwd = cache_cwd.as_ref().expect("cache cwd captured above");
-        Some(prepare_build_check_cache_run(
+    if let Some(warming) = support_warming.as_ref() {
+        let (bytes_loaded, bytes_written) = warming.observed_cache_bytes();
+        observations.record_cache_entry_bytes(bytes_loaded, bytes_written);
+    }
+
+    let cache_run = cache_session.map(|session| {
+        let run = prepare_package_build_check_cache_run(
+            session,
             &loaded,
             &build.local_certificates,
-            cache_cwd,
-        ))
-    } else {
-        None
-    };
+            observations.measurement_enabled(),
+        );
+        observations.record_cache_lookup_ms(run.lookup_ms());
+        run
+    });
 
     if build.diagnostic.is_some() {
-        return build_check_result_with_optional_cache(
+        let mut result = build_check_result_with_optional_cache(
             loaded.root_display,
             cache_run,
             build.diagnostic,
+            cache_unavailable_diagnostic,
+            observations,
         );
+        if let Some(warming) = support_warming.as_mut() {
+            result.diagnostics.extend(warming.take_diagnostics());
+        }
+        return result;
     }
 
     if let Some(diagnostic) = check_package_lock(&loaded, &build.package_lock_json) {
-        return build_check_result_with_optional_cache(
+        let mut result = build_check_result_with_optional_cache(
             loaded.root_display,
             cache_run,
             Some(diagnostic),
+            cache_unavailable_diagnostic,
+            observations,
         );
+        if let Some(warming) = support_warming.as_mut() {
+            result.diagnostics.extend(warming.take_diagnostics());
+        }
+        return result;
     }
 
-    build_check_result_with_optional_cache(loaded.root_display, cache_run, None)
+    let mut result = build_check_result_with_optional_cache(
+        loaded.root_display,
+        cache_run,
+        None,
+        cache_unavailable_diagnostic,
+        observations,
+    );
+    if let Some(warming) = support_warming.as_mut() {
+        result.diagnostics.extend(warming.take_diagnostics());
+    }
+    result
 }
 
 /// Run certificate rebuild write mode.
@@ -2091,6 +3487,7 @@ fn axiom_policy_for_package(loaded: &LoadedPackageRoot) -> AxiomPolicy {
 
 fn build_package_certificates_check(
     loaded: &LoadedPackageRoot,
+    mut support_warming: Option<&mut FullReadThroughSupportWarming>,
     observations: &mut PackageBuildObservationCoordinator,
 ) -> Result<PackageCertificateCheckBuild, Box<CommandDiagnostic>> {
     let policy = axiom_policy_for_package(loaded);
@@ -2110,6 +3507,9 @@ fn build_package_certificates_check(
     ) {
         return Err(Box::new(diagnostic));
     }
+    if let Some(warming) = support_warming.as_deref_mut() {
+        warming.prepare(loaded, &policy, &lock_entries, &verified_modules_by_module);
+    }
 
     if let Some(diagnostic) = build_local_modules_for_check(
         loaded,
@@ -2119,6 +3519,7 @@ fn build_package_certificates_check(
         &mut verified_modules_by_module,
         &mut lock_entries,
         &mut local_certificates,
+        support_warming,
         observations,
     ) {
         return Ok(PackageCertificateCheckBuild {
@@ -2169,8 +3570,19 @@ fn external_import_dependency_plan(
     loaded: &LoadedPackageRoot,
     seeds: &BTreeSet<usize>,
 ) -> Result<Vec<usize>, Box<CommandDiagnostic>> {
+    Ok(external_import_dependency_discovery(loaded, seeds)?.order)
+}
+
+fn external_import_dependency_discovery(
+    loaded: &LoadedPackageRoot,
+    seeds: &BTreeSet<usize>,
+) -> Result<ExternalImportDependencyDiscovery, Box<CommandDiagnostic>> {
     if seeds.is_empty() {
-        return Ok(Vec::new());
+        return Ok(ExternalImportDependencyDiscovery {
+            order: Vec::new(),
+            certificate_bytes_by_index: BTreeMap::new(),
+            dependencies_by_index: BTreeMap::new(),
+        });
     }
     let limits = TARGETED_EXTERNAL_DEPENDENCY_LIMITS;
     let imports = loaded
@@ -2190,35 +3602,57 @@ fn external_import_dependency_plan(
         .map(|import| import.module.clone())
         .collect::<Vec<_>>();
     let mut certificate_bytes = 0;
-    external_import_dependency_order(&import_modules, seeds, limits, |index, remaining_edges| {
-        let import = &imports[index];
-        let remaining_bytes = limits.max_certificate_bytes - certificate_bytes;
-        let bytes = read_certificate_bytes_for_external_dependency_discovery(
-            loaded,
-            import,
-            index,
-            remaining_bytes,
-            limits.max_certificate_bytes,
-        )?;
-        certificate_bytes += bytes.len();
-        let decoded = npa_cert::decode_module_cert(&bytes)
-            .map_err(|error| Box::new(external_certificate_rejected(import, &error)))?;
-        let mut dependencies = BTreeSet::new();
-        for dependency in &decoded.imports {
-            let Some(dependency) = import_indices.get(&dependency.module).copied() else {
-                continue;
-            };
-            if dependencies.insert(dependency) && dependencies.len() > remaining_edges {
-                return Err(Box::new(external_import_closure_limit_exceeded(
-                    Some(&import.module),
-                    Some(index),
-                    "dependency_edges",
-                    limits.max_dependency_edges,
-                    limits.max_dependency_edges.saturating_add(1),
-                )));
+    let mut certificate_bytes_by_index = BTreeMap::new();
+    let mut dependencies_by_index = BTreeMap::new();
+    let order = external_import_dependency_order(
+        &import_modules,
+        seeds,
+        limits,
+        |index, remaining_edges| {
+            let import = &imports[index];
+            let remaining_bytes = limits.max_certificate_bytes - certificate_bytes;
+            let bytes = read_certificate_bytes_for_external_dependency_discovery(
+                loaded,
+                import,
+                index,
+                remaining_bytes,
+                limits.max_certificate_bytes,
+            )?;
+            certificate_bytes += bytes.len();
+            let decoded = npa_cert::decode_module_cert(&bytes)
+                .map_err(|error| Box::new(external_certificate_rejected(import, &error)))?;
+            let mut dependencies = BTreeSet::new();
+            for dependency in decoded.imports() {
+                let Some(dependency) = import_indices.get(&dependency.module).copied() else {
+                    continue;
+                };
+                if dependencies.insert(dependency) && dependencies.len() > remaining_edges {
+                    return Err(Box::new(external_import_closure_limit_exceeded(
+                        Some(&import.module),
+                        Some(index),
+                        "dependency_edges",
+                        limits.max_dependency_edges,
+                        limits.max_dependency_edges.saturating_add(1),
+                    )));
+                }
             }
-        }
-        Ok(dependencies.into_iter().collect())
+            let dependencies = dependencies.into_iter().collect::<Vec<_>>();
+            if certificate_bytes_by_index.insert(index, bytes).is_some()
+                || dependencies_by_index
+                    .insert(index, dependencies.clone())
+                    .is_some()
+            {
+                return Err(targeted_refresh_plan_invalid(
+                    "external_dependency_duplicate",
+                ));
+            }
+            Ok(dependencies)
+        },
+    )?;
+    Ok(ExternalImportDependencyDiscovery {
+        order,
+        certificate_bytes_by_index,
+        dependencies_by_index,
     })
 }
 
@@ -2413,6 +3847,195 @@ fn external_import_index_out_of_range(index: usize, import_count: usize) -> Comm
     .with_actual_value(index.to_string())
 }
 
+fn build_targeted_refresh_external_plan(
+    loaded: &LoadedPackageRoot,
+    roots: &BTreeSet<usize>,
+    discovery: &ExternalImportDependencyDiscovery,
+) -> Result<TargetedRefreshExternalPlan, Box<CommandDiagnostic>> {
+    let import_count = loaded
+        .validated
+        .manifest()
+        .imports
+        .as_deref()
+        .unwrap_or(&[])
+        .len();
+    let priority_set = discovery.order.iter().copied().collect::<BTreeSet<_>>();
+    if priority_set.len() != discovery.order.len()
+        || priority_set.iter().any(|index| *index >= import_count)
+    {
+        return Err(targeted_refresh_plan_invalid("external_partition_invalid"));
+    }
+    if !roots.is_subset(&priority_set) {
+        return Err(targeted_refresh_plan_invalid("external_root_missing"));
+    }
+    if discovery
+        .certificate_bytes_by_index
+        .keys()
+        .copied()
+        .collect::<BTreeSet<_>>()
+        != priority_set
+        || discovery
+            .dependencies_by_index
+            .keys()
+            .copied()
+            .collect::<BTreeSet<_>>()
+            != priority_set
+    {
+        return Err(targeted_refresh_plan_invalid("external_partition_invalid"));
+    }
+
+    let mut positions = BTreeMap::new();
+    for (position, &index) in discovery.order.iter().enumerate() {
+        positions.insert(index, position);
+    }
+    for (&consumer, dependencies) in &discovery.dependencies_by_index {
+        let Some(&consumer_position) = positions.get(&consumer) else {
+            return Err(targeted_refresh_plan_invalid("external_partition_invalid"));
+        };
+        for dependency in dependencies {
+            if positions.get(dependency).copied().unwrap_or(usize::MAX) >= consumer_position {
+                return Err(targeted_refresh_plan_invalid(
+                    "external_dependency_after_consumer",
+                ));
+            }
+        }
+    }
+
+    let completion_external_order = (0..import_count)
+        .filter(|index| !priority_set.contains(index))
+        .collect::<Vec<_>>();
+    if discovery.order.len() + completion_external_order.len() != import_count {
+        return Err(targeted_refresh_plan_invalid("external_partition_invalid"));
+    }
+    Ok(TargetedRefreshExternalPlan {
+        priority_external_order: discovery.order.clone(),
+        completion_external_order,
+    })
+}
+
+fn load_external_imports_for_targeted_refresh(
+    loaded: &LoadedPackageRoot,
+    policy: &AxiomPolicy,
+    import_use_counts: &BTreeMap<Name, usize>,
+    import_order: &[usize],
+    require_discovered_bytes: bool,
+    state: &mut TargetedRefreshExecutionState,
+) -> Result<(), Box<CommandDiagnostic>> {
+    let imports = loaded
+        .validated
+        .manifest()
+        .imports
+        .as_deref()
+        .unwrap_or(&[]);
+    for &index in import_order {
+        let Some(import) = imports.get(index) else {
+            return Err(Box::new(external_import_index_out_of_range(
+                index,
+                imports.len(),
+            )));
+        };
+        if state.loaded_external.contains(&index) {
+            return Err(targeted_refresh_plan_invalid("external_loaded_twice"));
+        }
+        if state.artifacts_by_path.contains_key(&import.certificate)
+            || state
+                .refreshed_modules_by_index
+                .values()
+                .any(|identity| identity.certificate_path == import.certificate)
+        {
+            return Err(duplicate_refresh_artifact_path(&import.certificate));
+        }
+        let bytes = if require_discovered_bytes {
+            state
+                .discovered_external_bytes_by_index
+                .remove(&index)
+                .ok_or_else(|| targeted_refresh_plan_invalid("external_discovery_bytes_missing"))?
+        } else {
+            read_certificate_bytes(
+                loaded,
+                &import.certificate,
+                format!("imports[{index}].certificate"),
+            )?
+        };
+        observe_certificate_verify_for_test(&import.certificate);
+        let verified =
+            npa_cert::verify_module_cert(&bytes, &mut state.external_verifier_session, policy)
+                .map_err(|error| Box::new(external_certificate_rejected(import, &error)))?;
+        if verified.module() != &import.module {
+            return Err(Box::new(
+                CommandDiagnostic::error(DiagnosticKind::Build, "certificate_module_mismatch")
+                    .with_module(import.module.as_dotted())
+                    .with_path(format!("imports[{index}].certificate"))
+                    .with_field("module")
+                    .with_expected_value(import.module.as_dotted())
+                    .with_actual_value(verified.module().as_dotted()),
+            ));
+        }
+        let actual_export_hash = PackageHash::from(verified.export_hash());
+        if actual_export_hash != import.export_hash {
+            return Err(Box::new(hash_mismatch(
+                "export_hash_mismatch",
+                format!("imports[{index}].export_hash"),
+                "export_hash",
+                import.export_hash,
+                actual_export_hash,
+            )));
+        }
+        let actual_certificate_hash = PackageHash::from(verified.certificate_hash());
+        if actual_certificate_hash != import.certificate_hash {
+            return Err(Box::new(hash_mismatch(
+                "certificate_hash_mismatch",
+                format!("imports[{index}].certificate_hash"),
+                "certificate_hash",
+                import.certificate_hash,
+                actual_certificate_hash,
+            )));
+        }
+
+        let verified = Arc::new(verified);
+        if state
+            .verified_modules_by_module
+            .insert(import.module.clone(), Arc::clone(&verified))
+            .is_some()
+        {
+            return Err(targeted_refresh_plan_invalid(
+                "external_verified_module_duplicate",
+            ));
+        }
+        let remaining_uses = import_use_counts
+            .get(&import.module)
+            .copied()
+            .unwrap_or_default();
+        if remaining_uses > 0
+            && state
+                .available_modules
+                .insert(
+                    import.module.clone(),
+                    RefreshAvailableModule {
+                        source_interface: fallback_imported_source_interface(&verified),
+                        verified,
+                        remaining_uses,
+                        origin: RefreshImportOrigin::External,
+                    },
+                )
+                .is_some()
+        {
+            return Err(targeted_refresh_plan_invalid(
+                "external_available_module_duplicate",
+            ));
+        }
+        state.artifacts_by_path.insert(
+            import.certificate.clone(),
+            CertificateArtifactBuffer {
+                path: import.certificate.clone(),
+                bytes,
+            },
+        );
+        state.loaded_external.insert(index);
+    }
+    Ok(())
+}
+
 fn external_certificate_rejected(
     import: &PackageExternalImport,
     error: &impl std::fmt::Debug,
@@ -2500,7 +4123,7 @@ fn load_external_imports_for_check(
             }
         };
         let imports = match package_lock_imports_for_certificate(
-            &decoded.imports,
+            decoded.imports(),
             &format!("imports[{index}].certificate.imports"),
             &import.module,
         ) {
@@ -2512,9 +4135,9 @@ fn load_external_imports_for_check(
             origin: PackageLockEntryOrigin::External,
             certificate: import.certificate.clone(),
             certificate_file_hash: package_file_hash(&bytes),
-            export_hash: PackageHash::from(decoded.hashes.export_hash),
-            axiom_report_hash: PackageHash::from(decoded.hashes.axiom_report_hash),
-            certificate_hash: PackageHash::from(decoded.hashes.certificate_hash),
+            export_hash: PackageHash::from(decoded.hashes().export_hash),
+            axiom_report_hash: PackageHash::from(decoded.hashes().axiom_report_hash),
+            certificate_hash: PackageHash::from(decoded.hashes().certificate_hash),
             imports,
             package: Some(import.package.clone()),
             version: Some(import.version.clone()),
@@ -2549,7 +4172,8 @@ fn build_local_modules_for_check(
     available_modules: &mut BTreeMap<Name, AvailableModule>,
     verified_modules_by_module: &mut BTreeMap<Name, Arc<VerifiedModule>>,
     lock_entries: &mut Vec<PackageLockEntry>,
-    local_certificates: &mut Vec<LocalCertificateBuildIdentity>,
+    local_certificates: &mut Vec<PackageBuildCheckCertificateIdentity>,
+    mut support_warming: Option<&mut FullReadThroughSupportWarming>,
     observations: &mut PackageBuildObservationCoordinator,
 ) -> Option<CommandDiagnostic> {
     let compile_options = observations.compile_options();
@@ -2606,21 +4230,20 @@ fn build_local_modules_for_check(
             .iter()
             .map(Arc::as_ref)
             .collect::<Vec<_>>();
-        let available_verified_module_refs = verified_modules_by_module
-            .values()
-            .map(Arc::as_ref)
-            .collect::<Vec<_>>();
+        let available_verified_module_refs = available_verified_module_refs_for_direct_imports(
+            &direct_verified_modules,
+            verified_modules_by_module,
+        );
 
-        let built = if module.producer_profile.as_deref()
-            == Some(LEGACY_STD_PACKAGE_PRODUCER_PROFILE)
-        {
-            let (certificate, generated_bytes, verified, source_interface) =
-                match build_legacy_std_package_certificate(
+        let built = if is_std_core_builder_profile(module.producer_profile.as_deref()) {
+            let (certificate, generated_bytes, verified, source_interface, _) =
+                match build_std_core_builder_package_certificate(
                     module_index,
                     module,
                     &source,
                     &direct_verified_module_refs,
                     policy,
+                    false,
                 ) {
                     Ok(output) => output,
                     Err(diagnostic) => return Some(*diagnostic),
@@ -2752,8 +4375,8 @@ fn build_local_modules_for_check(
         };
         let certificate = built.certificate();
         let generated_bytes = built.generated_bytes();
-        let output_certificate_format = certificate.header.format.clone();
-        let output_core_spec = certificate.header.core_spec.clone();
+        let output_certificate_format = certificate.header().format.clone();
+        let output_core_spec = certificate.header().core_spec.clone();
 
         if let Some(diagnostic) =
             check_generated_axiom_policy(loaded, module_index, module, certificate)
@@ -2797,18 +4420,25 @@ fn build_local_modules_for_check(
                     )
                 })
                 .unwrap_or(diagnostic);
-            local_certificates.push(LocalCertificateBuildIdentity {
+            local_certificates.push(PackageBuildCheckCertificateIdentity {
                 module_index,
                 source_hash,
-                output_certificate_format: certificate.header.format.clone(),
-                output_core_spec: certificate.header.core_spec.clone(),
+                output_certificate_format: certificate.header().format.clone(),
+                output_core_spec: certificate.header().core_spec.clone(),
             });
             return Some(diagnostic);
         }
-        drop(source);
+        let warming_artifact = (support_warming.is_some() && remaining_uses > 0).then(|| {
+            targeted_authoring_local_input_from_accepted_certificate(
+                module,
+                source_hash,
+                certificate,
+                generated_bytes,
+            )
+        });
 
         let imports = match package_lock_imports_for_certificate(
-            &certificate.imports,
+            certificate.imports(),
             &format!("modules[{module_index}].certificate.imports"),
             &module.module,
         ) {
@@ -2820,21 +4450,21 @@ fn build_local_modules_for_check(
             origin: PackageLockEntryOrigin::Local,
             certificate: module.certificate.clone(),
             certificate_file_hash: package_file_hash(generated_bytes),
-            export_hash: PackageHash::from(certificate.hashes.export_hash),
-            axiom_report_hash: PackageHash::from(certificate.hashes.axiom_report_hash),
-            certificate_hash: PackageHash::from(certificate.hashes.certificate_hash),
+            export_hash: PackageHash::from(certificate.hashes().export_hash),
+            axiom_report_hash: PackageHash::from(certificate.hashes().axiom_report_hash),
+            certificate_hash: PackageHash::from(certificate.hashes().certificate_hash),
             imports,
             package: None,
             version: None,
         };
-        if certificate.header.module != module.module {
+        if certificate.header().module != module.module {
             return Some(
                 CommandDiagnostic::error(DiagnosticKind::Build, "certificate_module_mismatch")
                     .with_module(module.module.as_dotted())
                     .with_path(format!("modules[{module_index}].certificate"))
                     .with_field("module")
                     .with_expected_value(module.module.as_dotted())
-                    .with_actual_value(certificate.header.module.as_dotted()),
+                    .with_actual_value(certificate.header().module.as_dotted()),
             );
         }
         let (export_hash, certificate_hash, verified, source_interface) = match built {
@@ -2844,8 +4474,8 @@ fn build_local_modules_for_check(
                 verified,
                 source_interface,
             } => {
-                let export_hash = certificate.hashes.export_hash;
-                let certificate_hash = certificate.hashes.certificate_hash;
+                let export_hash = certificate.hashes().export_hash;
+                let certificate_hash = certificate.hashes().certificate_hash;
                 drop(generated_bytes);
                 (
                     export_hash,
@@ -2859,8 +4489,8 @@ fn build_local_modules_for_check(
                 generated_bytes,
                 source_interface,
             } => {
-                let export_hash = certificate.hashes.export_hash;
-                let certificate_hash = certificate.hashes.certificate_hash;
+                let export_hash = certificate.hashes().export_hash;
+                let certificate_hash = certificate.hashes().certificate_hash;
                 if remaining_uses > 0 {
                     let Some(source_interface) = source_interface else {
                         return Some(
@@ -2960,6 +4590,18 @@ fn build_local_modules_for_check(
                 certificate_hash: Some(certificate_hash),
                 source_interface,
             };
+            if let (Some(warming), Some(artifact)) =
+                (support_warming.as_deref_mut(), warming_artifact)
+            {
+                warming.publish_retained_module(
+                    loaded,
+                    module_index,
+                    artifact,
+                    &source,
+                    &imported_source_interface,
+                    &verified,
+                );
+            }
             available_modules.insert(
                 module.module.clone(),
                 AvailableModule {
@@ -2969,14 +4611,76 @@ fn build_local_modules_for_check(
                 },
             );
         }
-        local_certificates.push(LocalCertificateBuildIdentity {
+        local_certificates.push(PackageBuildCheckCertificateIdentity {
             module_index,
             source_hash,
             output_certificate_format,
             output_core_spec,
         });
+        drop(source);
     }
     None
+}
+
+fn targeted_authoring_external_inputs(
+    loaded: &LoadedPackageRoot,
+    external_order: &[usize],
+    artifacts: &[CertificateArtifactBuffer],
+    verified_modules_by_module: &BTreeMap<Name, Arc<VerifiedModule>>,
+) -> Result<Vec<TargetedAuthoringExternalModuleInput>, Box<CommandDiagnostic>> {
+    if external_order.len() != artifacts.len() {
+        return Err(Box::new(
+            CommandDiagnostic::error(DiagnosticKind::Internal, "targeted_authoring_plan_invalid")
+                .with_field("external_artifacts")
+                .with_actual_value("external_artifact_count_mismatch"),
+        ));
+    }
+    let imports = loaded
+        .validated
+        .manifest()
+        .imports
+        .as_deref()
+        .unwrap_or(&[]);
+    external_order
+        .iter()
+        .copied()
+        .zip(artifacts)
+        .map(|(index, artifact)| {
+            let import = imports.get(index).ok_or_else(|| {
+                Box::new(external_import_index_out_of_range(index, imports.len()))
+            })?;
+            if artifact.path != import.certificate {
+                return Err(Box::new(
+                    CommandDiagnostic::error(
+                        DiagnosticKind::Internal,
+                        "targeted_authoring_plan_invalid",
+                    )
+                    .with_module(import.module.as_dotted())
+                    .with_field("external_artifacts")
+                    .with_actual_value("external_artifact_order_mismatch"),
+                ));
+            }
+            let verified = verified_modules_by_module
+                .get(&import.module)
+                .ok_or_else(|| {
+                    Box::new(
+                        CommandDiagnostic::error(
+                            DiagnosticKind::Internal,
+                            "targeted_authoring_plan_invalid",
+                        )
+                        .with_module(import.module.as_dotted())
+                        .with_field("external_artifacts")
+                        .with_actual_value("external_verified_module_missing"),
+                    )
+                })?;
+            Ok(TargetedAuthoringExternalModuleInput {
+                module: import.module.clone(),
+                current_certificate_file_hash: package_file_hash(&artifact.bytes),
+                actual_export_hash: PackageHash::from(verified.export_hash()),
+                actual_certificate_hash: PackageHash::from(verified.certificate_hash()),
+            })
+        })
+        .collect()
 }
 
 fn load_external_imports(
@@ -3088,11 +4792,138 @@ fn load_checked_local_module_for_refresh(
     artifacts: &mut Vec<CertificateArtifactBuffer>,
     compile_options: &HumanCompileOptions,
 ) -> Option<CommandDiagnostic> {
+    let mut source_interface_elapsed_ns = 0;
+    load_checked_local_module_for_refresh_with_snapshot(
+        loaded,
+        policy,
+        import_use_counts,
+        module_index,
+        require_current_source,
+        available_modules,
+        verified_modules_by_module,
+        artifacts,
+        compile_options,
+        None,
+        false,
+        &mut source_interface_elapsed_ns,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn load_checked_local_module_for_refresh_observed(
+    loaded: &LoadedPackageRoot,
+    policy: &AxiomPolicy,
+    import_use_counts: &BTreeMap<Name, usize>,
+    module_index: usize,
+    require_current_source: bool,
+    available_modules: &mut BTreeMap<Name, RefreshAvailableModule>,
+    verified_modules_by_module: &mut BTreeMap<Name, Arc<VerifiedModule>>,
+    artifacts: &mut Vec<CertificateArtifactBuffer>,
+    compile_options: &HumanCompileOptions,
+) -> (Option<CommandDiagnostic>, u64) {
+    let mut source_interface_elapsed_ns = 0;
+    let diagnostic = load_checked_local_module_for_refresh_with_snapshot(
+        loaded,
+        policy,
+        import_use_counts,
+        module_index,
+        require_current_source,
+        available_modules,
+        verified_modules_by_module,
+        artifacts,
+        compile_options,
+        None,
+        true,
+        &mut source_interface_elapsed_ns,
+    );
+    (diagnostic, source_interface_elapsed_ns)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn load_checked_local_module_for_refresh_from_snapshot(
+    loaded: &LoadedPackageRoot,
+    policy: &AxiomPolicy,
+    import_use_counts: &BTreeMap<Name, usize>,
+    module_index: usize,
+    available_modules: &mut BTreeMap<Name, RefreshAvailableModule>,
+    verified_modules_by_module: &mut BTreeMap<Name, Arc<VerifiedModule>>,
+    artifacts: &mut Vec<CertificateArtifactBuffer>,
+    compile_options: &HumanCompileOptions,
+    snapshot: TargetedAuthoringCurrentSnapshot,
+) -> Option<CommandDiagnostic> {
+    let mut source_interface_elapsed_ns = 0;
+    load_checked_local_module_for_refresh_with_snapshot(
+        loaded,
+        policy,
+        import_use_counts,
+        module_index,
+        true,
+        available_modules,
+        verified_modules_by_module,
+        artifacts,
+        compile_options,
+        Some(snapshot),
+        false,
+        &mut source_interface_elapsed_ns,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn load_checked_local_module_for_refresh_from_snapshot_observed(
+    loaded: &LoadedPackageRoot,
+    policy: &AxiomPolicy,
+    import_use_counts: &BTreeMap<Name, usize>,
+    module_index: usize,
+    available_modules: &mut BTreeMap<Name, RefreshAvailableModule>,
+    verified_modules_by_module: &mut BTreeMap<Name, Arc<VerifiedModule>>,
+    artifacts: &mut Vec<CertificateArtifactBuffer>,
+    compile_options: &HumanCompileOptions,
+    snapshot: TargetedAuthoringCurrentSnapshot,
+) -> (Option<CommandDiagnostic>, u64) {
+    let mut source_interface_elapsed_ns = 0;
+    let diagnostic = load_checked_local_module_for_refresh_with_snapshot(
+        loaded,
+        policy,
+        import_use_counts,
+        module_index,
+        true,
+        available_modules,
+        verified_modules_by_module,
+        artifacts,
+        compile_options,
+        Some(snapshot),
+        true,
+        &mut source_interface_elapsed_ns,
+    );
+    (diagnostic, source_interface_elapsed_ns)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn load_checked_local_module_for_refresh_with_snapshot(
+    loaded: &LoadedPackageRoot,
+    policy: &AxiomPolicy,
+    import_use_counts: &BTreeMap<Name, usize>,
+    module_index: usize,
+    require_current_source: bool,
+    available_modules: &mut BTreeMap<Name, RefreshAvailableModule>,
+    verified_modules_by_module: &mut BTreeMap<Name, Arc<VerifiedModule>>,
+    artifacts: &mut Vec<CertificateArtifactBuffer>,
+    compile_options: &HumanCompileOptions,
+    snapshot: Option<TargetedAuthoringCurrentSnapshot>,
+    observe_source_interface: bool,
+    source_interface_elapsed_ns: &mut u64,
+) -> Option<CommandDiagnostic> {
     let module = &loaded.validated.manifest().modules[module_index];
+    let (snapshot_source, snapshot_certificate_bytes) = snapshot
+        .map(TargetedAuthoringCurrentSnapshot::into_parts)
+        .map_or((None, None), |(source, bytes)| (Some(source), Some(bytes)));
     let support_source = if require_current_source {
-        let source = match read_source(loaded, module_index, module) {
-            Ok(source) => source,
-            Err(diagnostic) => return Some(*diagnostic),
+        let source = match snapshot_source {
+            Some(source) => source,
+            None => match read_source(loaded, module_index, module) {
+                Ok(source) => source,
+                Err(diagnostic) => return Some(*diagnostic),
+            },
         };
         let actual = package_file_hash(source.as_bytes());
         if actual != module.expected_source_hash {
@@ -3115,13 +4946,16 @@ fn load_checked_local_module_for_refresh(
         None
     };
 
-    let bytes = match read_certificate_bytes(
-        loaded,
-        &module.certificate,
-        format!("modules[{module_index}].certificate"),
-    ) {
-        Ok(bytes) => bytes,
-        Err(diagnostic) => return Some(*diagnostic),
+    let bytes = match snapshot_certificate_bytes {
+        Some(bytes) => bytes,
+        None => match read_certificate_bytes(
+            loaded,
+            &module.certificate,
+            format!("modules[{module_index}].certificate"),
+        ) {
+            Ok(bytes) => bytes,
+            Err(diagnostic) => return Some(*diagnostic),
+        },
     };
     let certificate = match npa_cert::decode_module_cert(&bytes) {
         Ok(certificate) => certificate,
@@ -3164,37 +4998,24 @@ fn load_checked_local_module_for_refresh(
                 .with_actual_value(verified.module().as_dotted()),
         );
     }
-    let source_interface = match support_source.as_deref() {
-        Some(source)
-            if module.producer_profile.as_deref() == Some(LEGACY_STD_PACKAGE_PRODUCER_PROFILE) =>
-        {
-            match checked_local_legacy_support_source_interface(
-                loaded,
-                module_index,
-                module,
-                source,
-                available_modules,
-                &certificate,
-                &verified,
-            ) {
-                Ok(source_interface) => source_interface,
-                Err(diagnostic) => return Some(*diagnostic),
-            }
-        }
-        Some(source) => match checked_local_support_source_interface(
-            loaded,
-            module_index,
-            module,
-            source,
-            available_modules,
-            &certificate,
-            &verified,
-            compile_options,
-        ) {
-            Ok(source_interface) => source_interface,
-            Err(diagnostic) => return Some(*diagnostic),
-        },
-        None => fallback_imported_source_interface(&verified),
+    let source_interface_started = observe_source_interface.then(Instant::now);
+    let source_interface = checked_local_source_interface_for_refresh(
+        loaded,
+        module_index,
+        module,
+        support_source.as_deref(),
+        available_modules,
+        &certificate,
+        &verified,
+        compile_options,
+    );
+    if let Some(started) = source_interface_started {
+        *source_interface_elapsed_ns = source_interface_elapsed_ns
+            .saturating_add(u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX));
+    }
+    let source_interface = match source_interface {
+        Ok(source_interface) => source_interface,
+        Err(diagnostic) => return Some(*diagnostic),
     };
     if let Some(diagnostic) =
         check_generated_manifest_hashes(module_index, module, &certificate, &bytes)
@@ -3230,6 +5051,43 @@ fn load_checked_local_module_for_refresh(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn checked_local_source_interface_for_refresh(
+    loaded: &LoadedPackageRoot,
+    module_index: usize,
+    module: &PackageModule,
+    support_source: Option<&str>,
+    available_modules: &mut BTreeMap<Name, RefreshAvailableModule>,
+    certificate: &ModuleCert,
+    verified: &VerifiedModule,
+    compile_options: &HumanCompileOptions,
+) -> Result<HumanImportedSourceInterface, Box<CommandDiagnostic>> {
+    match support_source {
+        Some(source) if is_std_core_builder_profile(module.producer_profile.as_deref()) => {
+            checked_local_std_core_builder_support_source_interface(
+                loaded,
+                module_index,
+                module,
+                source,
+                available_modules,
+                certificate,
+                verified,
+            )
+        }
+        Some(source) => checked_local_support_source_interface(
+            loaded,
+            module_index,
+            module,
+            source,
+            available_modules,
+            certificate,
+            verified,
+            compile_options,
+        ),
+        None => Ok(fallback_imported_source_interface(verified)),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn checked_local_support_source_interface(
     loaded: &LoadedPackageRoot,
     module_index: usize,
@@ -3240,12 +5098,12 @@ fn checked_local_support_source_interface(
     verified: &VerifiedModule,
     compile_options: &HumanCompileOptions,
 ) -> Result<HumanImportedSourceInterface, Box<CommandDiagnostic>> {
-    let file_id = FileId(u32::try_from(module_index).map_err(|_| {
+    let file_id = checked_current_module_file_id(module_index).map_err(|error| {
         Box::new(
-            CommandDiagnostic::error(DiagnosticKind::Internal, "module_index_out_of_range")
+            CommandDiagnostic::error(DiagnosticKind::Internal, error.reason_code())
                 .with_module(module.module.as_dotted()),
         )
-    })?);
+    })?;
     let (direct_verified_modules, direct_source_interfaces) =
         take_refresh_direct_import_context(loaded, module_index, available_modules)?;
     let verified_imports = direct_verified_modules
@@ -3302,11 +5160,14 @@ fn checked_local_support_source_interface(
         module: module.module.clone(),
         export_hash: verified.export_hash(),
         certificate_hash: Some(verified.certificate_hash()),
-        source_interface: resolved.state.source_interfaces.current,
+        source_interface: source_interface_with_certificate_hashes(
+            resolved.state.source_interfaces.current,
+            certificate,
+        ),
     })
 }
 
-fn checked_local_legacy_support_source_interface(
+fn checked_local_std_core_builder_support_source_interface(
     loaded: &LoadedPackageRoot,
     module_index: usize,
     module: &PackageModule,
@@ -3315,7 +5176,7 @@ fn checked_local_legacy_support_source_interface(
     certificate: &ModuleCert,
     verified: &VerifiedModule,
 ) -> Result<HumanImportedSourceInterface, Box<CommandDiagnostic>> {
-    let source_imports = legacy_std_source_skeleton_imports(module_index, module, source)?;
+    let source_imports = std_core_builder_source_skeleton_imports(module_index, module, source)?;
     let (_direct_verified_modules, direct_source_interfaces) =
         take_refresh_direct_import_context(loaded, module_index, available_modules)?;
     if let Some(diagnostic) = check_observable_import_drift(
@@ -3336,6 +5197,7 @@ type RefreshModuleBuildOutput = (
     VerifiedModule,
     HumanSourceInterface,
     Option<Vec<Name>>,
+    u64,
 );
 
 #[allow(clippy::too_many_arguments)]
@@ -3350,21 +5212,19 @@ fn build_refresh_module_from_source(
     policy: &AxiomPolicy,
     observations: &mut PackageBuildObservationCoordinator,
 ) -> Result<RefreshModuleBuildOutput, Box<CommandDiagnostic>> {
-    let (certificate, generated_bytes, verified, source_interface) = if module
-        .producer_profile
-        .as_deref()
-        == Some(LEGACY_STD_PACKAGE_PRODUCER_PROFILE)
-    {
-        build_legacy_std_package_certificate(
-            module_index,
-            module,
-            source,
-            direct_verified_module_refs,
-            policy,
-        )?
-    } else {
-        let compile_options = observations.compile_options();
-        let observed =
+    let (certificate, generated_bytes, verified, source_interface, verification_elapsed_ns) =
+        if is_std_core_builder_profile(module.producer_profile.as_deref()) {
+            build_std_core_builder_package_certificate(
+                module_index,
+                module,
+                source,
+                direct_verified_module_refs,
+                policy,
+                observations.measurement_enabled(),
+            )?
+        } else {
+            let compile_options = observations.compile_options();
+            let observed =
             compile_human_source_to_observed_certificate_output_with_available_import_refs_and_axiom_policy(
                 file_id,
                 module.module.clone(),
@@ -3387,24 +5247,29 @@ fn build_refresh_module_from_source(
                     error,
                 ))
             })?;
-        observations.record_declaration_batch(&module.module, observed.observations);
-        let output = observed.output;
-        let generated_bytes =
-            npa_cert::encode_module_cert(&output.certificate).map_err(|error| {
-                Box::new(
-                    CommandDiagnostic::error(DiagnosticKind::Build, "certificate_encode_failed")
+            let verification_elapsed_ns = observed.observations.source_free_verification_elapsed_ns;
+            let output = observed.output;
+            observations.record_declaration_batch(&module.module, observed.observations);
+            let generated_bytes =
+                npa_cert::encode_module_cert(&output.certificate).map_err(|error| {
+                    Box::new(
+                        CommandDiagnostic::error(
+                            DiagnosticKind::Build,
+                            "certificate_encode_failed",
+                        )
                         .with_module(module.module.as_dotted())
                         .with_path(format!("modules[{module_index}].certificate"))
                         .with_actual_value(format!("{error:?}")),
-                )
-            })?;
-        (
-            output.certificate,
-            generated_bytes,
-            output.verified_module,
-            output.source_interface,
-        )
-    };
+                    )
+                })?;
+            (
+                output.certificate,
+                generated_bytes,
+                output.verified_module,
+                output.source_interface,
+                verification_elapsed_ns,
+            )
+        };
     let source_imports = human_source_imports(file_id, source, direct_source_interfaces);
     Ok((
         certificate,
@@ -3412,7 +5277,63 @@ fn build_refresh_module_from_source(
         verified,
         source_interface,
         source_imports,
+        verification_elapsed_ns,
     ))
+}
+
+fn transitive_module_dependency_names(
+    roots: impl IntoIterator<Item = Name>,
+    mut imports_for: impl FnMut(&Name) -> Option<Vec<Name>>,
+) -> BTreeSet<Name> {
+    let mut required = BTreeSet::new();
+    let mut pending = roots.into_iter().collect::<Vec<_>>();
+    while let Some(module) = pending.pop() {
+        if !required.insert(module.clone()) {
+            continue;
+        }
+        if let Some(imports) = imports_for(&module) {
+            pending.extend(imports);
+        }
+    }
+    required
+}
+
+/// Keep the Human kernel environment scoped to the selected module's verified
+/// import closure. Unrelated package modules may legitimately export the same
+/// unqualified declaration name; exposing every previously built module would
+/// make those unrelated exports participate in transitive dependency lookup.
+fn available_verified_module_refs_for_direct_imports<'a>(
+    direct: &'a [Arc<VerifiedModule>],
+    available: &'a BTreeMap<Name, Arc<VerifiedModule>>,
+) -> Vec<&'a VerifiedModule> {
+    let direct_by_module = direct
+        .iter()
+        .map(|module| (module.module().clone(), module.as_ref()))
+        .collect::<BTreeMap<_, _>>();
+    let roots = direct_by_module.keys().cloned().collect::<Vec<_>>();
+    let required = transitive_module_dependency_names(roots, |module| {
+        direct_by_module
+            .get(module)
+            .copied()
+            .or_else(|| available.get(module).map(Arc::as_ref))
+            .map(|verified| {
+                verified
+                    .imports()
+                    .iter()
+                    .map(|import| import.module.clone())
+                    .collect()
+            })
+    });
+
+    required
+        .iter()
+        .filter_map(|module| {
+            direct_by_module
+                .get(module)
+                .copied()
+                .or_else(|| available.get(module).map(Arc::as_ref))
+        })
+        .collect()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3453,10 +5374,11 @@ fn qualify_dependent_refresh(
         Ok(certificate) => certificate,
         Err(_) => return Ok(QualifiedDependentRefresh::Fallback("certificate_structure")),
     };
-    if previous.header.module != module.module
-        || PackageHash::from(previous.hashes.export_hash) != module.expected_export_hash
-        || PackageHash::from(previous.hashes.axiom_report_hash) != module.expected_axiom_report_hash
-        || PackageHash::from(previous.hashes.certificate_hash) != module.expected_certificate_hash
+    if previous.header().module != module.module
+        || PackageHash::from(previous.hashes().export_hash) != module.expected_export_hash
+        || PackageHash::from(previous.hashes().axiom_report_hash)
+            != module.expected_axiom_report_hash
+        || PackageHash::from(previous.hashes().certificate_hash) != module.expected_certificate_hash
     {
         return Ok(QualifiedDependentRefresh::Fallback("certificate_identity"));
     }
@@ -3476,8 +5398,8 @@ fn qualify_dependent_refresh(
     };
     stats.source_interface_reconstructions += 1;
 
-    let mut mapped_imports = Vec::with_capacity(previous.imports.len());
-    for import in &previous.imports {
+    let mut mapped_imports = Vec::with_capacity(previous.imports().len());
+    for import in previous.imports() {
         let Some(verified) = verified_modules_by_module.get(&import.module) else {
             return Ok(QualifiedDependentRefresh::Fallback("certificate_imports"));
         };
@@ -3577,7 +5499,7 @@ fn reconstruct_qualified_source_interface(
         return None;
     }
     let certificate_imports = certificate
-        .imports
+        .imports()
         .iter()
         .map(|import| (&import.module, import))
         .collect::<BTreeMap<_, _>>();
@@ -3603,6 +5525,1168 @@ fn reconstruct_qualified_source_interface(
     Some((source_imports, resolved.state.source_interfaces.current))
 }
 
+type TargetedAuthoringContextMap<'session> =
+    BTreeMap<Name, TargetedAuthoringImportContext<'session>>;
+
+#[allow(clippy::too_many_arguments)]
+fn build_local_modules_for_targeted_authoring_check(
+    loaded: &LoadedPackageRoot,
+    policy: &AxiomPolicy,
+    import_use_counts: &BTreeMap<Name, usize>,
+    available_modules: &mut BTreeMap<Name, RefreshAvailableModule>,
+    verified_modules_by_module: &mut BTreeMap<Name, Arc<VerifiedModule>>,
+    local_modules: &mut Vec<LocalModuleRefreshIdentity>,
+    artifacts: &mut Vec<CertificateArtifactBuffer>,
+    execution_plan: &TargetedAuthoringExecutionPlan,
+    run: &mut TargetedAuthoringCheckRun,
+    observations: &mut PackageBuildObservationCoordinator,
+) -> Option<CommandDiagnostic> {
+    let compile_options = observations.compile_options();
+    let authoring_session = TargetedAuthoringBuildSession::new();
+    let mut authoring_contexts = TargetedAuthoringContextMap::new();
+    let mut authoring_source_interfaces = BTreeMap::new();
+
+    for (module, available) in available_modules.iter() {
+        authoring_contexts.insert(
+            module.clone(),
+            authoring_session.register_shared_live_support(Arc::clone(&available.verified)),
+        );
+        authoring_source_interfaces.insert(module.clone(), available.source_interface.clone());
+    }
+
+    let mut pending_contexts_adopted = false;
+    for &module_index in execution_plan.combined_local_order() {
+        let module = &loaded.validated.manifest().modules[module_index];
+        if !execution_plan.is_explicit_target(module_index) {
+            run.record_live_support_visit(module_index);
+            if run.should_capture_pre_target_snapshot(module_index) {
+                let snapshot = run.time_current_byte_validation_for(module_index, || {
+                    read_targeted_authoring_local_snapshot(loaded, module_index, module)
+                });
+                let (artifact, snapshot) = match snapshot {
+                    Ok(snapshot) => snapshot,
+                    Err(diagnostic) => return Some(*diagnostic),
+                };
+                if let Err(diagnostic) = run.lookup_pre_target_support(
+                    loaded,
+                    module_index,
+                    artifact,
+                    snapshot,
+                    verified_modules_by_module,
+                    policy,
+                ) {
+                    return Some(diagnostic);
+                }
+                let promoted = match run.resolve_reached_pre_target_support(module_index) {
+                    Ok(promoted) => promoted,
+                    Err(diagnostic) => return Some(diagnostic),
+                };
+                for promoted_index in promoted {
+                    let snapshot = match run.take_retained_snapshot(promoted_index) {
+                        Ok(snapshot) => snapshot,
+                        Err(diagnostic) => return Some(diagnostic),
+                    };
+                    let publication_source = snapshot.source().to_owned();
+                    let live_started = run.measurement_enabled().then(Instant::now);
+                    let (diagnostic, source_interface_elapsed_ns) = if run.measurement_enabled() {
+                        load_checked_local_module_for_refresh_from_snapshot_observed(
+                            loaded,
+                            policy,
+                            import_use_counts,
+                            promoted_index,
+                            available_modules,
+                            verified_modules_by_module,
+                            artifacts,
+                            &compile_options,
+                            snapshot,
+                        )
+                    } else {
+                        (
+                            load_checked_local_module_for_refresh_from_snapshot(
+                                loaded,
+                                policy,
+                                import_use_counts,
+                                promoted_index,
+                                available_modules,
+                                verified_modules_by_module,
+                                artifacts,
+                                &compile_options,
+                                snapshot,
+                            ),
+                            0,
+                        )
+                    };
+                    if let Some(started) = live_started {
+                        run.record_live_support_elapsed(
+                            u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                        );
+                        run.record_source_interface_resolution_elapsed(source_interface_elapsed_ns);
+                    }
+                    if let Some(diagnostic) = diagnostic {
+                        return Some(diagnostic);
+                    }
+                    let closure_used_cached_context =
+                        match targeted_direct_closure_used_cached_context(
+                            loaded,
+                            promoted_index,
+                            &authoring_contexts,
+                        ) {
+                            Ok(value) => value,
+                            Err(diagnostic) => return Some(diagnostic),
+                        };
+                    if let Err(diagnostic) = retain_targeted_live_authoring_context(
+                        loaded,
+                        promoted_index,
+                        &authoring_session,
+                        available_modules,
+                        verified_modules_by_module,
+                        &mut authoring_contexts,
+                        &mut authoring_source_interfaces,
+                    ) {
+                        return Some(*diagnostic);
+                    }
+                    if let Err(diagnostic) = run.record_live_support_completion(promoted_index) {
+                        return Some(diagnostic);
+                    }
+                    let promoted_module =
+                        &loaded.validated.manifest().modules[promoted_index].module;
+                    let Some(available) = available_modules.get(promoted_module) else {
+                        return Some(targeted_authoring_execution_invalid(
+                            "published_support_interface_missing",
+                        ));
+                    };
+                    let Some(verified) = verified_modules_by_module.get(promoted_module) else {
+                        return Some(targeted_authoring_execution_invalid(
+                            "published_support_verified_module_missing",
+                        ));
+                    };
+                    run.publish_accepted_live_support(
+                        loaded,
+                        promoted_index,
+                        &publication_source,
+                        &available.source_interface,
+                        verified,
+                        closure_used_cached_context,
+                    );
+                    if let Err(diagnostic) = consume_and_release_targeted_local_producers(
+                        loaded,
+                        promoted_index,
+                        run,
+                        available_modules,
+                        verified_modules_by_module,
+                        &mut authoring_contexts,
+                        &mut authoring_source_interfaces,
+                    ) {
+                        return Some(diagnostic);
+                    }
+                }
+                continue;
+            }
+
+            let live_started = run.measurement_enabled().then(Instant::now);
+            let (diagnostic, source_interface_elapsed_ns) = if run.measurement_enabled() {
+                load_checked_local_module_for_refresh_observed(
+                    loaded,
+                    policy,
+                    import_use_counts,
+                    module_index,
+                    true,
+                    available_modules,
+                    verified_modules_by_module,
+                    artifacts,
+                    &compile_options,
+                )
+            } else {
+                (
+                    load_checked_local_module_for_refresh(
+                        loaded,
+                        policy,
+                        import_use_counts,
+                        module_index,
+                        true,
+                        available_modules,
+                        verified_modules_by_module,
+                        artifacts,
+                        &compile_options,
+                    ),
+                    0,
+                )
+            };
+            if let Some(started) = live_started {
+                run.record_live_support_elapsed(
+                    u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                );
+                run.record_source_interface_resolution_elapsed(source_interface_elapsed_ns);
+            }
+            if let Some(diagnostic) = diagnostic {
+                return Some(diagnostic);
+            }
+            if let Err(diagnostic) = retain_targeted_live_authoring_context(
+                loaded,
+                module_index,
+                &authoring_session,
+                available_modules,
+                verified_modules_by_module,
+                &mut authoring_contexts,
+                &mut authoring_source_interfaces,
+            ) {
+                return Some(*diagnostic);
+            }
+            if let Err(diagnostic) = run.record_live_support_completion(module_index) {
+                return Some(diagnostic);
+            }
+            if let Err(diagnostic) = consume_and_release_targeted_local_producers(
+                loaded,
+                module_index,
+                run,
+                available_modules,
+                verified_modules_by_module,
+                &mut authoring_contexts,
+                &mut authoring_source_interfaces,
+            ) {
+                return Some(diagnostic);
+            }
+            continue;
+        }
+
+        let forced_live = execution_plan.is_forced_live(module_index);
+        if let Err(diagnostic) = run.record_target_attempt(module_index, forced_live) {
+            return Some(diagnostic);
+        }
+        if !forced_live && !pending_contexts_adopted {
+            let adopted = match run.adopt_remaining_cached_support(&authoring_session) {
+                Ok(adopted) => adopted,
+                Err(diagnostic) => return Some(diagnostic),
+            };
+            for cached in adopted {
+                let (cached_index, context, source_interface) = cached.into_parts();
+                let cached_module = source_interface.module.clone();
+                if authoring_contexts
+                    .insert(cached_module.clone(), context)
+                    .is_some()
+                    || authoring_source_interfaces
+                        .insert(cached_module, source_interface)
+                        .is_some()
+                {
+                    return Some(targeted_authoring_execution_invalid(
+                        "cached_authoring_context_duplicate",
+                    ));
+                }
+                if let Err(diagnostic) = consume_and_release_targeted_local_producers(
+                    loaded,
+                    cached_index,
+                    run,
+                    available_modules,
+                    verified_modules_by_module,
+                    &mut authoring_contexts,
+                    &mut authoring_source_interfaces,
+                ) {
+                    return Some(diagnostic);
+                }
+            }
+            pending_contexts_adopted = true;
+        }
+
+        let source = match read_source(loaded, module_index, module) {
+            Ok(source) => source,
+            Err(diagnostic) => return Some(*diagnostic),
+        };
+        let source_hash = package_file_hash(source.as_bytes());
+        let file_id = match checked_current_module_file_id(module_index) {
+            Ok(file_id) => file_id,
+            Err(error) => {
+                return Some(
+                    CommandDiagnostic::error(DiagnosticKind::Internal, error.reason_code())
+                        .with_module(module.module.as_dotted()),
+                )
+            }
+        };
+
+        if forced_live {
+            let (direct_verified_modules, direct_source_interfaces) =
+                match take_refresh_direct_import_context(loaded, module_index, available_modules) {
+                    Ok(imports) => imports,
+                    Err(diagnostic) => return Some(*diagnostic),
+                };
+            let direct_verified_module_refs = direct_verified_modules
+                .iter()
+                .map(Arc::as_ref)
+                .collect::<Vec<_>>();
+            let available_verified_module_refs = available_verified_module_refs_for_direct_imports(
+                &direct_verified_modules,
+                verified_modules_by_module,
+            );
+            let (
+                certificate,
+                generated_bytes,
+                verified,
+                source_interface,
+                source_imports,
+                verification_elapsed_ns,
+            ) = match build_refresh_module_from_source(
+                module_index,
+                module,
+                &source,
+                file_id,
+                &direct_verified_module_refs,
+                &available_verified_module_refs,
+                &direct_source_interfaces,
+                policy,
+                observations,
+            ) {
+                Ok(output) => output,
+                Err(diagnostic) => return Some(*diagnostic),
+            };
+            run.record_fresh_target_verification_elapsed(verification_elapsed_ns);
+            if let Some(diagnostic) = validate_targeted_authoring_target_output(
+                loaded,
+                module_index,
+                module,
+                source_imports.as_deref(),
+                &direct_source_interfaces,
+                &certificate,
+            ) {
+                return Some(diagnostic);
+            }
+            let imported_source_interface = HumanImportedSourceInterface {
+                module: module.module.clone(),
+                export_hash: certificate.hashes().export_hash,
+                certificate_hash: Some(certificate.hashes().certificate_hash),
+                source_interface,
+            };
+            let verified = Arc::new(verified);
+            let retain = match run.register_target_lifetime(module_index, true) {
+                Ok(retain) => retain,
+                Err(diagnostic) => return Some(diagnostic),
+            };
+            if retain {
+                verified_modules_by_module.insert(module.module.clone(), Arc::clone(&verified));
+                available_modules.insert(
+                    module.module.clone(),
+                    RefreshAvailableModule {
+                        verified: Arc::clone(&verified),
+                        source_interface: imported_source_interface.clone(),
+                        remaining_uses: import_use_counts
+                            .get(&module.module)
+                            .copied()
+                            .unwrap_or_default(),
+                        origin: RefreshImportOrigin::Local,
+                    },
+                );
+                authoring_contexts.insert(
+                    module.module.clone(),
+                    authoring_session.register_shared_fresh_target(verified),
+                );
+                authoring_source_interfaces
+                    .insert(module.module.clone(), imported_source_interface);
+            }
+            push_targeted_authoring_local_identity(
+                local_modules,
+                module_index,
+                module,
+                source_hash,
+                source_imports,
+                &certificate,
+                generated_bytes,
+            );
+        } else {
+            let (direct_authoring_imports, available_authoring_imports, direct_source_interfaces) =
+                match targeted_authoring_import_context(
+                    loaded,
+                    module_index,
+                    &authoring_contexts,
+                    &authoring_source_interfaces,
+                ) {
+                    Ok(imports) => imports,
+                    Err(diagnostic) => return Some(*diagnostic),
+                };
+            let build = match authoring_session.compile_human_target(
+                file_id,
+                module.module.clone(),
+                &source,
+                &direct_authoring_imports,
+                &available_authoring_imports,
+                &direct_source_interfaces,
+                &compile_options,
+                policy,
+                observations.kernel_work_counter_sink(),
+                observations.collect_declaration_details(),
+            ) {
+                Ok(build) => build,
+                Err(error) => {
+                    return Some(frontend_build_failed(
+                        module_index,
+                        module,
+                        file_id,
+                        &source,
+                        &direct_source_interfaces,
+                        error,
+                    ))
+                }
+            };
+            run.record_fresh_target_verification_elapsed(
+                build
+                    .compilation_observations()
+                    .source_free_verification_elapsed_ns,
+            );
+            observations
+                .record_declaration_batch(&module.module, build.compilation_observations().clone());
+            let generated_bytes = build.certificate_bytes().to_vec();
+            let certificate = match npa_cert::decode_module_cert(&generated_bytes) {
+                Ok(certificate) => certificate,
+                Err(error) => {
+                    return Some(
+                        CommandDiagnostic::error(
+                            DiagnosticKind::Build,
+                            "certificate_decode_failed",
+                        )
+                        .with_module(module.module.as_dotted())
+                        .with_path(render_package_path(&module.certificate))
+                        .with_actual_value(format!("{error:?}")),
+                    )
+                }
+            };
+            let source_imports = human_source_imports(file_id, &source, &direct_source_interfaces);
+            if let Some(diagnostic) = validate_targeted_authoring_target_output(
+                loaded,
+                module_index,
+                module,
+                source_imports.as_deref(),
+                &direct_source_interfaces,
+                &certificate,
+            ) {
+                return Some(diagnostic);
+            }
+            let retain = match run.register_target_lifetime(module_index, false) {
+                Ok(retain) => retain,
+                Err(diagnostic) => return Some(diagnostic),
+            };
+            if retain {
+                authoring_contexts.insert(module.module.clone(), build.fresh_import_context());
+                authoring_source_interfaces
+                    .insert(module.module.clone(), build.imported_source_interface());
+            }
+            push_targeted_authoring_local_identity(
+                local_modules,
+                module_index,
+                module,
+                source_hash,
+                source_imports,
+                &certificate,
+                generated_bytes,
+            );
+        }
+
+        if let Err(diagnostic) = consume_and_release_targeted_local_producers(
+            loaded,
+            module_index,
+            run,
+            available_modules,
+            verified_modules_by_module,
+            &mut authoring_contexts,
+            &mut authoring_source_interfaces,
+        ) {
+            return Some(diagnostic);
+        }
+        run.record_target_completion();
+    }
+    None
+}
+
+#[allow(clippy::too_many_arguments)]
+fn retain_targeted_live_authoring_context<'session>(
+    loaded: &LoadedPackageRoot,
+    module_index: usize,
+    session: &'session TargetedAuthoringBuildSession,
+    available_modules: &BTreeMap<Name, RefreshAvailableModule>,
+    verified_modules_by_module: &BTreeMap<Name, Arc<VerifiedModule>>,
+    authoring_contexts: &mut TargetedAuthoringContextMap<'session>,
+    authoring_source_interfaces: &mut BTreeMap<Name, HumanImportedSourceInterface>,
+) -> Result<(), Box<CommandDiagnostic>> {
+    let module = &loaded.validated.manifest().modules[module_index];
+    let verified = verified_modules_by_module
+        .get(&module.module)
+        .ok_or_else(|| {
+            Box::new(targeted_authoring_execution_invalid(
+                "live_verified_module_missing",
+            ))
+        })?;
+    let source_interface = available_modules
+        .get(&module.module)
+        .map(|available| available.source_interface.clone())
+        .ok_or_else(|| {
+            Box::new(targeted_authoring_execution_invalid(
+                "live_source_interface_missing",
+            ))
+        })?;
+    if authoring_contexts
+        .insert(
+            module.module.clone(),
+            session.register_shared_live_support(Arc::clone(verified)),
+        )
+        .is_some()
+        || authoring_source_interfaces
+            .insert(module.module.clone(), source_interface)
+            .is_some()
+    {
+        return Err(Box::new(targeted_authoring_execution_invalid(
+            "live_authoring_context_duplicate",
+        )));
+    }
+    Ok(())
+}
+
+type TargetedAuthoringImportSet<'session> = (
+    Vec<HumanAuthoringImport<'session>>,
+    Vec<HumanAuthoringImport<'session>>,
+    Vec<HumanImportedSourceInterface>,
+);
+
+fn targeted_authoring_import_context<'session>(
+    loaded: &LoadedPackageRoot,
+    module_index: usize,
+    authoring_contexts: &TargetedAuthoringContextMap<'session>,
+    authoring_source_interfaces: &BTreeMap<Name, HumanImportedSourceInterface>,
+) -> Result<TargetedAuthoringImportSet<'session>, Box<CommandDiagnostic>> {
+    let mut direct_imports = Vec::new();
+    let mut direct_source_interfaces = Vec::new();
+    for (import_index, import) in loaded.validated.graph().resolved_module_imports[module_index]
+        .iter()
+        .enumerate()
+    {
+        let path = format!("modules[{module_index}].imports[{import_index}]");
+        let context = authoring_contexts.get(&import.module).ok_or_else(|| {
+            Box::new(
+                targeted_authoring_execution_invalid("authoring_import_unavailable")
+                    .with_module(import.module.as_dotted())
+                    .with_path(path.clone()),
+            )
+        })?;
+        let authoring_import = context.authoring_import().map_err(|error| {
+            Box::new(
+                targeted_authoring_execution_invalid("authoring_import_projection_failed")
+                    .with_module(import.module.as_dotted())
+                    .with_path(path.clone())
+                    .with_actual_value(format!("{error:?}")),
+            )
+        })?;
+        let actual_export_hash = PackageHash::from(authoring_import.export_hash());
+        if actual_export_hash != import.export_hash {
+            return Err(Box::new(hash_mismatch(
+                "export_hash_mismatch",
+                format!("{path}.export_hash"),
+                "export_hash",
+                import.export_hash,
+                actual_export_hash,
+            )));
+        }
+        let actual_certificate_hash = authoring_import
+            .certificate_hash()
+            .map(PackageHash::from)
+            .ok_or_else(|| {
+                Box::new(
+                    targeted_authoring_execution_invalid("authoring_certificate_hash_missing")
+                        .with_module(import.module.as_dotted())
+                        .with_path(format!("{path}.certificate_hash")),
+                )
+            })?;
+        if actual_certificate_hash != import.certificate_hash {
+            return Err(Box::new(hash_mismatch(
+                "certificate_hash_mismatch",
+                format!("{path}.certificate_hash"),
+                "certificate_hash",
+                import.certificate_hash,
+                actual_certificate_hash,
+            )));
+        }
+        let source_interface = authoring_source_interfaces
+            .get(&import.module)
+            .cloned()
+            .ok_or_else(|| {
+                Box::new(
+                    targeted_authoring_execution_invalid("authoring_source_interface_missing")
+                        .with_module(import.module.as_dotted())
+                        .with_path(path),
+                )
+            })?;
+        direct_imports.push(authoring_import);
+        direct_source_interfaces.push(source_interface);
+    }
+    let available_imports = authoring_contexts
+        .values()
+        .map(TargetedAuthoringImportContext::authoring_import)
+        .collect::<npa_cert::Result<Vec<_>>>()
+        .map_err(|error| {
+            Box::new(
+                targeted_authoring_execution_invalid("available_authoring_projection_failed")
+                    .with_actual_value(format!("{error:?}")),
+            )
+        })?;
+    Ok((direct_imports, available_imports, direct_source_interfaces))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn consume_and_release_targeted_local_producers(
+    loaded: &LoadedPackageRoot,
+    consumer_index: usize,
+    run: &mut TargetedAuthoringCheckRun,
+    available_modules: &mut BTreeMap<Name, RefreshAvailableModule>,
+    verified_modules_by_module: &mut BTreeMap<Name, Arc<VerifiedModule>>,
+    authoring_contexts: &mut TargetedAuthoringContextMap<'_>,
+    authoring_source_interfaces: &mut BTreeMap<Name, HumanImportedSourceInterface>,
+) -> Result<(), CommandDiagnostic> {
+    for released_index in run.consume_local_consumer(consumer_index)? {
+        let module = &loaded.validated.manifest().modules[released_index].module;
+        available_modules.remove(module);
+        verified_modules_by_module.remove(module);
+        authoring_contexts.remove(module);
+        authoring_source_interfaces.remove(module);
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_targeted_authoring_target_output(
+    loaded: &LoadedPackageRoot,
+    module_index: usize,
+    module: &PackageModule,
+    source_imports: Option<&[Name]>,
+    direct_source_interfaces: &[HumanImportedSourceInterface],
+    certificate: &ModuleCert,
+) -> Option<CommandDiagnostic> {
+    if let Some(diagnostic) =
+        check_generated_axiom_policy(loaded, module_index, module, certificate)
+    {
+        return Some(diagnostic);
+    }
+    if certificate.header().module != module.module {
+        return Some(
+            CommandDiagnostic::error(DiagnosticKind::Build, "certificate_module_mismatch")
+                .with_module(module.module.as_dotted())
+                .with_path(format!("modules[{module_index}].certificate"))
+                .with_field("module")
+                .with_expected_value(module.module.as_dotted())
+                .with_actual_value(certificate.header().module.as_dotted()),
+        );
+    }
+    if let Some(source_imports) = source_imports {
+        if let Some(diagnostic) = check_observable_import_drift(
+            module_index,
+            module,
+            source_imports,
+            certificate,
+            direct_source_interfaces,
+        ) {
+            return Some(diagnostic);
+        }
+    }
+    let expected_imports = match package_lock_imports_for_source_interfaces(
+        direct_source_interfaces,
+        &format!("modules[{module_index}].imports"),
+        &module.module,
+    ) {
+        Ok(imports) => imports,
+        Err(diagnostic) => return Some(*diagnostic),
+    };
+    if let Some(diagnostic) = check_refreshed_certificate_import_identities(
+        module_index,
+        &module.module,
+        &expected_imports,
+        certificate.imports(),
+    ) {
+        return Some(diagnostic);
+    }
+    None
+}
+
+fn targeted_direct_closure_used_cached_context(
+    loaded: &LoadedPackageRoot,
+    module_index: usize,
+    authoring_contexts: &TargetedAuthoringContextMap<'_>,
+) -> Result<bool, CommandDiagnostic> {
+    let imports = loaded
+        .validated
+        .graph()
+        .resolved_module_imports
+        .get(module_index)
+        .ok_or_else(|| targeted_authoring_execution_invalid("publication_import_row_missing"))?;
+    for import in imports {
+        if !matches!(import.kind, ResolvedModuleImportKind::Local { .. }) {
+            continue;
+        }
+        let context = authoring_contexts.get(&import.module).ok_or_else(|| {
+            targeted_authoring_execution_invalid("publication_import_context_missing")
+        })?;
+        if context.closure_used_cached_context() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn push_targeted_authoring_local_identity(
+    local_modules: &mut Vec<LocalModuleRefreshIdentity>,
+    module_index: usize,
+    module: &PackageModule,
+    source_hash: PackageHash,
+    source_imports: Option<Vec<Name>>,
+    certificate: &ModuleCert,
+    generated_bytes: Vec<u8>,
+) {
+    local_modules.push(LocalModuleRefreshIdentity {
+        module_index,
+        module: module.module.clone(),
+        source_hash,
+        source_imports,
+        certificate_file_hash: package_file_hash(&generated_bytes),
+        export_hash: PackageHash::from(certificate.hashes().export_hash),
+        axiom_report_hash: PackageHash::from(certificate.hashes().axiom_report_hash),
+        certificate_hash: PackageHash::from(certificate.hashes().certificate_hash),
+        certificate_path: module.certificate.clone(),
+        certificate_bytes: generated_bytes,
+        metadata_path: None,
+        metadata_bytes: None,
+    });
+}
+
+fn targeted_authoring_execution_invalid(reason: &'static str) -> CommandDiagnostic {
+    CommandDiagnostic::error(DiagnosticKind::Internal, "targeted_authoring_plan_invalid")
+        .with_actual_value(reason)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn process_targeted_refresh_local_order(
+    loaded: &LoadedPackageRoot,
+    selection: &PackageBuildSelectionPlan,
+    local_plan: &TargetedRefreshLocalPlan,
+    order: &[usize],
+    priority_phase: bool,
+    policy: &AxiomPolicy,
+    import_use_counts: &BTreeMap<Name, usize>,
+    state: &mut TargetedRefreshExecutionState,
+    observations: &mut PackageBuildObservationCoordinator,
+) -> Result<(), Box<CommandDiagnostic>> {
+    let compile_options = observations.compile_options();
+    let local_module_names = loaded
+        .validated
+        .manifest()
+        .modules
+        .iter()
+        .map(|module| module.module.clone())
+        .collect::<BTreeSet<_>>();
+    for &module_index in order {
+        if !state.processed_local.insert(module_index) {
+            return Err(targeted_refresh_plan_invalid("local_processed_twice"));
+        }
+        let role = targeted_refresh_module_role(local_plan, module_index, priority_phase)?;
+        match role {
+            RefreshModuleRole::CheckedSupport | RefreshModuleRole::UnrelatedSnapshot => {
+                let module = loaded
+                    .validated
+                    .manifest()
+                    .modules
+                    .get(module_index)
+                    .ok_or_else(|| targeted_refresh_plan_invalid("local_index_out_of_range"))?;
+                if state
+                    .verified_modules_by_module
+                    .contains_key(&module.module)
+                {
+                    return Err(targeted_refresh_plan_invalid(
+                        "local_verified_module_duplicate",
+                    ));
+                }
+                let mut artifacts = Vec::new();
+                if let Some(diagnostic) = load_checked_local_module_for_refresh(
+                    loaded,
+                    policy,
+                    import_use_counts,
+                    module_index,
+                    role == RefreshModuleRole::CheckedSupport,
+                    &mut state.available_modules,
+                    &mut state.verified_modules_by_module,
+                    &mut artifacts,
+                    &compile_options,
+                ) {
+                    return Err(Box::new(diagnostic));
+                }
+                for artifact in artifacts {
+                    insert_targeted_refresh_artifact(state, artifact)?;
+                }
+            }
+            RefreshModuleRole::Rebuild => process_targeted_refresh_rebuild_module(
+                loaded,
+                selection,
+                module_index,
+                priority_phase,
+                policy,
+                import_use_counts,
+                &local_module_names,
+                &compile_options,
+                state,
+                observations,
+            )?,
+        }
+    }
+    Ok(())
+}
+
+fn targeted_refresh_module_role(
+    plan: &TargetedRefreshLocalPlan,
+    module_index: usize,
+    priority_phase: bool,
+) -> Result<RefreshModuleRole, Box<CommandDiagnostic>> {
+    let role = if priority_phase {
+        if plan.priority_rebuild.contains(&module_index) {
+            Some(RefreshModuleRole::Rebuild)
+        } else if plan.priority_support.contains(&module_index) {
+            Some(RefreshModuleRole::CheckedSupport)
+        } else {
+            None
+        }
+    } else if plan.completion_rebuild.contains(&module_index) {
+        Some(RefreshModuleRole::Rebuild)
+    } else if plan.completion_support.contains(&module_index) {
+        Some(RefreshModuleRole::CheckedSupport)
+    } else if plan.completion_snapshot.contains(&module_index) {
+        Some(RefreshModuleRole::UnrelatedSnapshot)
+    } else {
+        None
+    };
+    role.ok_or_else(|| targeted_refresh_plan_invalid("local_role_missing"))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn process_targeted_refresh_rebuild_module(
+    loaded: &LoadedPackageRoot,
+    selection: &PackageBuildSelectionPlan,
+    module_index: usize,
+    defer_metadata: bool,
+    policy: &AxiomPolicy,
+    import_use_counts: &BTreeMap<Name, usize>,
+    local_module_names: &BTreeSet<Name>,
+    compile_options: &HumanCompileOptions,
+    state: &mut TargetedRefreshExecutionState,
+    observations: &mut PackageBuildObservationCoordinator,
+) -> Result<(), Box<CommandDiagnostic>> {
+    let module = loaded
+        .validated
+        .manifest()
+        .modules
+        .get(module_index)
+        .ok_or_else(|| targeted_refresh_plan_invalid("local_index_out_of_range"))?;
+    if state.artifacts_by_path.contains_key(&module.certificate)
+        || state
+            .refreshed_modules_by_index
+            .values()
+            .any(|identity| identity.certificate_path == module.certificate)
+    {
+        return Err(duplicate_refresh_artifact_path(&module.certificate));
+    }
+    let source = read_source(loaded, module_index, module)?;
+    state.stats.source_scans = state.stats.source_scans.saturating_add(1);
+    let source_hash = package_file_hash(source.as_bytes());
+    let file_id = u32::try_from(module_index).map(FileId).map_err(|_| {
+        Box::new(
+            CommandDiagnostic::error(DiagnosticKind::Internal, "module_index_out_of_range")
+                .with_module(module.module.as_dotted()),
+        )
+    })?;
+    let (direct_verified_modules, direct_source_interfaces) =
+        take_refresh_direct_import_context(loaded, module_index, &mut state.available_modules)?;
+    let expected_imports = package_lock_imports_for_source_interfaces(
+        &direct_source_interfaces,
+        &format!("modules[{module_index}].imports"),
+        &module.module,
+    )?;
+    let direct_verified_module_refs = direct_verified_modules
+        .iter()
+        .map(Arc::as_ref)
+        .collect::<Vec<_>>();
+    let available_verified_module_refs = available_verified_module_refs_for_direct_imports(
+        &direct_verified_modules,
+        &state.verified_modules_by_module,
+    );
+    let is_nonseed = !selection.seeds.contains(&module_index);
+    let may_reuse = is_nonseed && !is_std_core_builder_profile(module.producer_profile.as_deref());
+    let qualified = if may_reuse {
+        Some(qualify_dependent_refresh(
+            loaded,
+            policy,
+            module_index,
+            module,
+            &source,
+            source_hash,
+            file_id,
+            &direct_verified_modules,
+            &direct_source_interfaces,
+            &state.verified_modules_by_module,
+            local_module_names,
+            &mut state.stats,
+            compile_options,
+        )?)
+    } else if is_nonseed {
+        Some(QualifiedDependentRefresh::Fallback("producer_profile"))
+    } else {
+        None
+    };
+    let (certificate, generated_bytes, verified, source_interface, source_imports, _) =
+        match qualified {
+            Some(QualifiedDependentRefresh::Unchanged {
+                certificate,
+                bytes,
+                verified,
+                source_interface,
+                source_imports,
+            }) => {
+                state.stats.unchanged = state.stats.unchanged.saturating_add(1);
+                (
+                    certificate,
+                    bytes,
+                    verified,
+                    source_interface,
+                    Some(source_imports),
+                    0,
+                )
+            }
+            Some(QualifiedDependentRefresh::Rebound {
+                certificate,
+                bytes,
+                verified,
+                source_interface,
+                source_imports,
+            }) => {
+                state.stats.certificate_rebinds = state.stats.certificate_rebinds.saturating_add(1);
+                (
+                    certificate,
+                    bytes,
+                    verified,
+                    source_interface,
+                    Some(source_imports),
+                    0,
+                )
+            }
+            fallback => {
+                state.stats.source_rebuilds = state.stats.source_rebuilds.saturating_add(1);
+                if let Some(QualifiedDependentRefresh::Fallback(reason)) = fallback {
+                    state.stats.record_fallback(reason);
+                }
+                build_refresh_module_from_source(
+                    module_index,
+                    module,
+                    &source,
+                    file_id,
+                    &direct_verified_module_refs,
+                    &available_verified_module_refs,
+                    &direct_source_interfaces,
+                    policy,
+                    observations,
+                )?
+            }
+        };
+    if let Some(diagnostic) =
+        check_generated_axiom_policy(loaded, module_index, module, &certificate)
+    {
+        return Err(Box::new(diagnostic));
+    }
+    if verified.module() != &module.module {
+        return Err(Box::new(
+            CommandDiagnostic::error(DiagnosticKind::Build, "certificate_module_mismatch")
+                .with_module(module.module.as_dotted())
+                .with_path(format!("modules[{module_index}].certificate"))
+                .with_field("module")
+                .with_expected_value(module.module.as_dotted())
+                .with_actual_value(verified.module().as_dotted()),
+        ));
+    }
+    if let Some(source_imports) = source_imports.as_deref() {
+        if let Some(diagnostic) = check_observable_import_drift(
+            module_index,
+            module,
+            source_imports,
+            &certificate,
+            &direct_source_interfaces,
+        ) {
+            return Err(Box::new(diagnostic));
+        }
+    }
+    if let Some(diagnostic) = check_refreshed_certificate_import_identities(
+        module_index,
+        &module.module,
+        &expected_imports,
+        certificate.imports(),
+    ) {
+        return Err(Box::new(diagnostic));
+    }
+
+    let certificate_file_hash = package_file_hash(&generated_bytes);
+    let export_hash = PackageHash::from(certificate.hashes().export_hash);
+    let axiom_report_hash = PackageHash::from(certificate.hashes().axiom_report_hash);
+    let certificate_hash = PackageHash::from(certificate.hashes().certificate_hash);
+    let pending_source_interface =
+        (defer_metadata && module.meta.is_some()).then(|| source_interface.clone());
+    let (metadata_path, metadata_bytes) = if defer_metadata {
+        (None, None)
+    } else {
+        refreshed_module_metadata(
+            loaded,
+            module_index,
+            module,
+            &verified,
+            &source_interface,
+            source_hash,
+            certificate_file_hash,
+            axiom_report_hash,
+        )?
+    };
+    drop(source);
+    let remaining_uses = import_use_counts
+        .get(&module.module)
+        .copied()
+        .unwrap_or_default();
+    let verified = Arc::new(verified);
+    if state
+        .verified_modules_by_module
+        .insert(module.module.clone(), Arc::clone(&verified))
+        .is_some()
+    {
+        return Err(targeted_refresh_plan_invalid(
+            "local_verified_module_duplicate",
+        ));
+    }
+    if remaining_uses > 0
+        && state
+            .available_modules
+            .insert(
+                module.module.clone(),
+                RefreshAvailableModule {
+                    verified: Arc::clone(&verified),
+                    source_interface: HumanImportedSourceInterface {
+                        module: module.module.clone(),
+                        export_hash: certificate.hashes().export_hash,
+                        certificate_hash: Some(certificate.hashes().certificate_hash),
+                        source_interface,
+                    },
+                    remaining_uses,
+                    origin: RefreshImportOrigin::Local,
+                },
+            )
+            .is_some()
+    {
+        return Err(targeted_refresh_plan_invalid(
+            "local_available_module_duplicate",
+        ));
+    }
+    let identity = LocalModuleRefreshIdentity {
+        module_index,
+        module: module.module.clone(),
+        source_hash,
+        source_imports,
+        certificate_file_hash,
+        export_hash,
+        axiom_report_hash,
+        certificate_hash,
+        certificate_path: module.certificate.clone(),
+        certificate_bytes: generated_bytes,
+        metadata_path,
+        metadata_bytes,
+    };
+    if state
+        .refreshed_modules_by_index
+        .insert(module_index, identity)
+        .is_some()
+    {
+        return Err(targeted_refresh_plan_invalid("local_refreshed_twice"));
+    }
+    if let Some(source_interface) = pending_source_interface {
+        if state
+            .pending_priority_metadata_by_index
+            .insert(
+                module_index,
+                PendingPriorityMetadata {
+                    verified,
+                    source_interface,
+                },
+            )
+            .is_some()
+        {
+            return Err(targeted_refresh_plan_invalid("priority_metadata_duplicate"));
+        }
+    }
+    Ok(())
+}
+
+fn finalize_targeted_refresh_priority_metadata(
+    loaded: &LoadedPackageRoot,
+    local_plan: &TargetedRefreshLocalPlan,
+    state: &mut TargetedRefreshExecutionState,
+) -> Result<(), Box<CommandDiagnostic>> {
+    for &module_index in &local_plan.priority_local_order {
+        let Some(pending) = state
+            .pending_priority_metadata_by_index
+            .remove(&module_index)
+        else {
+            continue;
+        };
+        let module = loaded
+            .validated
+            .manifest()
+            .modules
+            .get(module_index)
+            .ok_or_else(|| targeted_refresh_plan_invalid("local_index_out_of_range"))?;
+        let identity = state
+            .refreshed_modules_by_index
+            .get_mut(&module_index)
+            .ok_or_else(|| targeted_refresh_plan_invalid("priority_identity_missing"))?;
+        if identity.metadata_path.is_some() || identity.metadata_bytes.is_some() {
+            return Err(targeted_refresh_plan_invalid(
+                "priority_metadata_already_finalized",
+            ));
+        }
+        let (metadata_path, metadata_bytes) = refreshed_module_metadata(
+            loaded,
+            module_index,
+            module,
+            &pending.verified,
+            &pending.source_interface,
+            identity.source_hash,
+            identity.certificate_file_hash,
+            identity.axiom_report_hash,
+        )?;
+        identity.metadata_path = metadata_path;
+        identity.metadata_bytes = metadata_bytes;
+    }
+    if !state.pending_priority_metadata_by_index.is_empty() {
+        return Err(targeted_refresh_plan_invalid(
+            "priority_metadata_not_finalized",
+        ));
+    }
+    Ok(())
+}
+
+fn insert_targeted_refresh_artifact(
+    state: &mut TargetedRefreshExecutionState,
+    artifact: CertificateArtifactBuffer,
+) -> Result<(), Box<CommandDiagnostic>> {
+    if state.artifacts_by_path.contains_key(&artifact.path)
+        || state
+            .refreshed_modules_by_index
+            .values()
+            .any(|identity| identity.certificate_path == artifact.path)
+    {
+        return Err(duplicate_refresh_artifact_path(&artifact.path));
+    }
+    state
+        .artifacts_by_path
+        .insert(artifact.path.clone(), artifact);
+    Ok(())
+}
+
+fn duplicate_refresh_artifact_path(path: &PackagePath) -> Box<CommandDiagnostic> {
+    Box::new(CommandDiagnostic::from_package_lock_error(
+        &PackageLockError::duplicate_certificate_path("artifacts", path.as_str()),
+    ))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_local_modules_for_refresh(
     loaded: &LoadedPackageRoot,
@@ -3619,6 +6703,8 @@ fn build_local_modules_for_refresh(
     targeted_seeds: Option<&BTreeSet<usize>>,
     interface_aware: bool,
     targeted_stats: &mut TargetedRefreshStats,
+    mut targeted_check_cache: Option<&mut TargetedBuildCheckCacheState>,
+    mut targeted_authoring_run: Option<&mut TargetedAuthoringCheckRun>,
     observations: &mut PackageBuildObservationCoordinator,
 ) -> Option<CommandDiagnostic> {
     let compile_options = observations.compile_options();
@@ -3636,20 +6722,257 @@ fn build_local_modules_for_refresh(
             if !is_support && !snapshot_unrelated {
                 continue;
             }
-            if let Some(diagnostic) = load_checked_local_module_for_refresh(
-                loaded,
-                policy,
-                import_use_counts,
-                module_index,
-                is_support,
-                available_modules,
-                verified_modules_by_module,
-                unchanged_artifacts,
-                &compile_options,
-            ) {
+            if is_support {
+                if let Some(cache) = targeted_check_cache.as_deref_mut() {
+                    cache.stats.support_live_checked =
+                        cache.stats.support_live_checked.saturating_add(1);
+                }
+                if let Some(run) = targeted_authoring_run.as_deref_mut() {
+                    run.record_live_support_visit(module_index);
+                    let captured_pre_target = run.should_capture_pre_target_snapshot(module_index);
+                    if captured_pre_target {
+                        let snapshot = run.time_current_byte_validation_for(module_index, || {
+                            read_targeted_authoring_local_snapshot(loaded, module_index, module)
+                        });
+                        let (artifact, snapshot) = match snapshot {
+                            Ok(snapshot) => snapshot,
+                            Err(diagnostic) => return Some(*diagnostic),
+                        };
+                        if let Err(diagnostic) = run.lookup_pre_target_support(
+                            loaded,
+                            module_index,
+                            artifact,
+                            snapshot,
+                            verified_modules_by_module,
+                            policy,
+                        ) {
+                            return Some(diagnostic);
+                        }
+                    }
+                    if captured_pre_target {
+                        let promoted = match run.resolve_reached_pre_target_support(module_index) {
+                            Ok(promoted) => promoted,
+                            Err(diagnostic) => return Some(diagnostic),
+                        };
+                        for promoted_index in promoted {
+                            let snapshot = match run.take_retained_snapshot(promoted_index) {
+                                Ok(snapshot) => snapshot,
+                                Err(diagnostic) => return Some(diagnostic),
+                            };
+                            let live_started = run.measurement_enabled().then(Instant::now);
+                            let (diagnostic, source_interface_elapsed_ns) =
+                                if run.measurement_enabled() {
+                                    load_checked_local_module_for_refresh_from_snapshot_observed(
+                                        loaded,
+                                        policy,
+                                        import_use_counts,
+                                        promoted_index,
+                                        available_modules,
+                                        verified_modules_by_module,
+                                        unchanged_artifacts,
+                                        &compile_options,
+                                        snapshot,
+                                    )
+                                } else {
+                                    (
+                                        load_checked_local_module_for_refresh_from_snapshot(
+                                            loaded,
+                                            policy,
+                                            import_use_counts,
+                                            promoted_index,
+                                            available_modules,
+                                            verified_modules_by_module,
+                                            unchanged_artifacts,
+                                            &compile_options,
+                                            snapshot,
+                                        ),
+                                        0,
+                                    )
+                                };
+                            if let Some(started) = live_started {
+                                run.record_live_support_elapsed(
+                                    u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                                );
+                                run.record_source_interface_resolution_elapsed(
+                                    source_interface_elapsed_ns,
+                                );
+                            }
+                            if let Some(diagnostic) = diagnostic {
+                                return Some(diagnostic);
+                            }
+                            if let Err(diagnostic) =
+                                run.record_live_support_completion(promoted_index)
+                            {
+                                return Some(diagnostic);
+                            }
+                        }
+                        continue;
+                    }
+                }
+            }
+            let warming_snapshot = if is_support
+                && targeted_check_cache
+                    .as_deref()
+                    .is_some_and(|cache| !cache.support_publication_closed)
+            {
+                let (artifact, snapshot) =
+                    match read_targeted_authoring_local_snapshot(loaded, module_index, module) {
+                        Ok(snapshot) => snapshot,
+                        Err(diagnostic) => return Some(*diagnostic),
+                    };
+                Some((artifact, snapshot.source().to_owned(), snapshot))
+            } else {
+                None
+            };
+            let mut warming_publication = None;
+            let observe_authoring_live = targeted_authoring_run
+                .as_deref()
+                .is_some_and(TargetedAuthoringCheckRun::measurement_enabled);
+            let observe_read_through_live =
+                is_support && targeted_check_cache.is_some() && observations.measurement_enabled();
+            let observe_live = observe_authoring_live || observe_read_through_live;
+            let live_started = observe_live.then(Instant::now);
+            let (load_diagnostic, source_interface_elapsed_ns) = match warming_snapshot {
+                Some((artifact, source, snapshot)) => {
+                    warming_publication = Some((artifact, source));
+                    if observe_live {
+                        load_checked_local_module_for_refresh_from_snapshot_observed(
+                            loaded,
+                            policy,
+                            import_use_counts,
+                            module_index,
+                            available_modules,
+                            verified_modules_by_module,
+                            unchanged_artifacts,
+                            &compile_options,
+                            snapshot,
+                        )
+                    } else {
+                        (
+                            load_checked_local_module_for_refresh_from_snapshot(
+                                loaded,
+                                policy,
+                                import_use_counts,
+                                module_index,
+                                available_modules,
+                                verified_modules_by_module,
+                                unchanged_artifacts,
+                                &compile_options,
+                                snapshot,
+                            ),
+                            0,
+                        )
+                    }
+                }
+                None => {
+                    if observe_live {
+                        load_checked_local_module_for_refresh_observed(
+                            loaded,
+                            policy,
+                            import_use_counts,
+                            module_index,
+                            is_support,
+                            available_modules,
+                            verified_modules_by_module,
+                            unchanged_artifacts,
+                            &compile_options,
+                        )
+                    } else {
+                        (
+                            load_checked_local_module_for_refresh(
+                                loaded,
+                                policy,
+                                import_use_counts,
+                                module_index,
+                                is_support,
+                                available_modules,
+                                verified_modules_by_module,
+                                unchanged_artifacts,
+                                &compile_options,
+                            ),
+                            0,
+                        )
+                    }
+                }
+            };
+            if let (Some(run), Some(started)) =
+                (targeted_authoring_run.as_deref_mut(), live_started)
+            {
+                run.record_live_support_elapsed(
+                    u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                );
+                run.record_source_interface_resolution_elapsed(source_interface_elapsed_ns);
+            }
+            if observe_read_through_live {
+                if let (Some(cache), Some(started)) =
+                    (targeted_check_cache.as_deref_mut(), live_started)
+                {
+                    cache.stats.live_support_elapsed_ns =
+                        cache.stats.live_support_elapsed_ns.saturating_add(
+                            u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                        );
+                    cache.stats.source_interface_resolution_elapsed_ns = cache
+                        .stats
+                        .source_interface_resolution_elapsed_ns
+                        .saturating_add(source_interface_elapsed_ns);
+                }
+            }
+            if let Some(diagnostic) = load_diagnostic {
                 return Some(diagnostic);
             }
+            if let (Some((artifact, source)), Some(cache)) =
+                (warming_publication, targeted_check_cache.as_deref_mut())
+            {
+                let accepted = available_modules
+                    .get(&module.module)
+                    .zip(verified_modules_by_module.get(&module.module));
+                if let Some((available, verified)) = accepted {
+                    if let Some(publication) = cache.support_publication.as_mut() {
+                        let entry = publication.observe_local(
+                            loaded,
+                            module_index,
+                            artifact,
+                            &source,
+                            &available.source_interface,
+                            verified,
+                            TargetedAuthoringPublicationOrigin::TargetedReadThroughSupport,
+                            false,
+                            TargetedAuthoringModuleAcceptance::checked_certificate_complete(),
+                        );
+                        if let Some(entry) = entry {
+                            if let Some(session) = cache.support_session.as_mut() {
+                                let outcome = session.publish(&entry, publication.budget_mut());
+                                publication.record_publish_outcome(module_index, outcome);
+                            }
+                        }
+                    }
+                } else {
+                    cache.support_publication =
+                        Some(TargetedAuthoringSupportPublicationPlanner::disabled(
+                            "accepted_interface_unavailable",
+                            observations.collect_declaration_details(),
+                        ));
+                }
+            }
+            if is_support {
+                if let Some(run) = targeted_authoring_run.as_deref_mut() {
+                    if let Err(diagnostic) = run.record_live_support_completion(module_index) {
+                        return Some(diagnostic);
+                    }
+                }
+            }
             continue;
+        }
+        if let Some(cache) = targeted_check_cache.as_deref_mut() {
+            cache.support_publication_closed = true;
+        }
+        if let Some(cache) = targeted_check_cache.as_deref_mut() {
+            cache.stats.targets_live_built = cache.stats.targets_live_built.saturating_add(1);
+        }
+        if let Some(run) = targeted_authoring_run.as_deref_mut() {
+            if let Err(diagnostic) = run.record_target_attempt(module_index, false) {
+                return Some(diagnostic);
+            }
         }
         let source = match read_source(loaded, module_index, module) {
             Ok(source) => source,
@@ -3685,14 +7008,14 @@ fn build_local_modules_for_refresh(
             .iter()
             .map(Arc::as_ref)
             .collect::<Vec<_>>();
-        let available_verified_module_refs = verified_modules_by_module
-            .values()
-            .map(Arc::as_ref)
-            .collect::<Vec<_>>();
+        let available_verified_module_refs = available_verified_module_refs_for_direct_imports(
+            &direct_verified_modules,
+            verified_modules_by_module,
+        );
         let is_nonseed = targeted_seeds.is_some_and(|seeds| !seeds.contains(&module_index));
         let may_reuse = interface_aware
             && is_nonseed
-            && module.producer_profile.as_deref() != Some(LEGACY_STD_PACKAGE_PRODUCER_PROFILE);
+            && !is_std_core_builder_profile(module.producer_profile.as_deref());
         let qualified = if may_reuse {
             match qualify_dependent_refresh(
                 loaded,
@@ -3717,63 +7040,80 @@ fn build_local_modules_for_refresh(
         } else {
             None
         };
-        let (certificate, generated_bytes, verified, source_interface, source_imports) =
-            match qualified {
-                Some(QualifiedDependentRefresh::Unchanged {
+        let (
+            certificate,
+            generated_bytes,
+            verified,
+            source_interface,
+            source_imports,
+            verification_elapsed_ns,
+        ) = match qualified {
+            Some(QualifiedDependentRefresh::Unchanged {
+                certificate,
+                bytes,
+                verified,
+                source_interface,
+                source_imports,
+            }) => {
+                targeted_stats.unchanged += 1;
+                (
                     certificate,
                     bytes,
                     verified,
                     source_interface,
-                    source_imports,
-                }) => {
-                    targeted_stats.unchanged += 1;
-                    (
-                        certificate,
-                        bytes,
-                        verified,
-                        source_interface,
-                        Some(source_imports),
-                    )
-                }
-                Some(QualifiedDependentRefresh::Rebound {
+                    Some(source_imports),
+                    0,
+                )
+            }
+            Some(QualifiedDependentRefresh::Rebound {
+                certificate,
+                bytes,
+                verified,
+                source_interface,
+                source_imports,
+            }) => {
+                targeted_stats.certificate_rebinds += 1;
+                (
                     certificate,
                     bytes,
                     verified,
                     source_interface,
-                    source_imports,
-                }) => {
-                    targeted_stats.certificate_rebinds += 1;
-                    (
-                        certificate,
-                        bytes,
-                        verified,
-                        source_interface,
-                        Some(source_imports),
-                    )
+                    Some(source_imports),
+                    0,
+                )
+            }
+            fallback => {
+                if interface_aware {
+                    targeted_stats.source_rebuilds += 1;
                 }
-                fallback => {
-                    if interface_aware {
-                        targeted_stats.source_rebuilds += 1;
-                    }
-                    if let Some(QualifiedDependentRefresh::Fallback(reason)) = fallback {
-                        targeted_stats.record_fallback(reason);
-                    }
-                    match build_refresh_module_from_source(
-                        module_index,
-                        module,
-                        &source,
-                        file_id,
-                        &direct_verified_module_refs,
-                        &available_verified_module_refs,
-                        &direct_source_interfaces,
-                        policy,
-                        observations,
-                    ) {
-                        Ok(output) => output,
-                        Err(diagnostic) => return Some(*diagnostic),
-                    }
+                if let Some(QualifiedDependentRefresh::Fallback(reason)) = fallback {
+                    targeted_stats.record_fallback(reason);
                 }
-            };
+                match build_refresh_module_from_source(
+                    module_index,
+                    module,
+                    &source,
+                    file_id,
+                    &direct_verified_module_refs,
+                    &available_verified_module_refs,
+                    &direct_source_interfaces,
+                    policy,
+                    observations,
+                ) {
+                    Ok(output) => output,
+                    Err(diagnostic) => return Some(*diagnostic),
+                }
+            }
+        };
+        if let Some(cache) = targeted_check_cache.as_deref_mut() {
+            cache.stats.fresh_target_elapsed_ns = cache
+                .stats
+                .fresh_target_elapsed_ns
+                .saturating_add(verification_elapsed_ns);
+        }
+        if let Some(run) = targeted_authoring_run.as_deref_mut() {
+            run.record_fresh_target_verification_elapsed(verification_elapsed_ns);
+        }
         if let Some(diagnostic) =
             check_generated_axiom_policy(loaded, module_index, module, &certificate)
         {
@@ -3804,25 +7144,25 @@ fn build_local_modules_for_refresh(
             module_index,
             &module.module,
             &expected_imports,
-            &certificate.imports,
+            certificate.imports(),
         ) {
             return Some(diagnostic);
         }
 
         let certificate_file_hash = package_file_hash(&generated_bytes);
-        let export_hash = PackageHash::from(certificate.hashes.export_hash);
-        let axiom_report_hash = PackageHash::from(certificate.hashes.axiom_report_hash);
-        let certificate_hash = PackageHash::from(certificate.hashes.certificate_hash);
+        let export_hash = PackageHash::from(certificate.hashes().export_hash);
+        let axiom_report_hash = PackageHash::from(certificate.hashes().axiom_report_hash);
+        let certificate_hash = PackageHash::from(certificate.hashes().certificate_hash);
         let (metadata_path, metadata_bytes) = if refresh_metadata {
             match refreshed_module_metadata(
                 loaded,
                 module_index,
                 module,
-                &certificate,
                 &verified,
                 &source_interface,
                 source_hash,
                 certificate_file_hash,
+                axiom_report_hash,
             ) {
                 Ok(metadata) => metadata,
                 Err(diagnostic) => return Some(*diagnostic),
@@ -3840,8 +7180,8 @@ fn build_local_modules_for_refresh(
         if remaining_uses > 0 {
             let imported_source_interface = HumanImportedSourceInterface {
                 module: module.module.clone(),
-                export_hash: certificate.hashes.export_hash,
-                certificate_hash: Some(certificate.hashes.certificate_hash),
+                export_hash: certificate.hashes().export_hash,
+                certificate_hash: Some(certificate.hashes().certificate_hash),
                 source_interface,
             };
             available_modules.insert(
@@ -3853,6 +7193,16 @@ fn build_local_modules_for_refresh(
                     origin: RefreshImportOrigin::Local,
                 },
             );
+        }
+        if let Some(cache) = targeted_check_cache.as_deref_mut() {
+            cache
+                .certificates
+                .push(PackageBuildCheckCertificateIdentity {
+                    module_index,
+                    source_hash,
+                    output_certificate_format: certificate.header().format.clone(),
+                    output_core_spec: certificate.header().core_spec.clone(),
+                });
         }
         local_modules.push(LocalModuleRefreshIdentity {
             module_index,
@@ -3868,8 +7218,100 @@ fn build_local_modules_for_refresh(
             metadata_path,
             metadata_bytes,
         });
+        if let Some(run) = targeted_authoring_run.as_deref_mut() {
+            run.record_target_completion();
+        }
     }
     None
+}
+
+fn read_targeted_authoring_local_snapshot(
+    loaded: &LoadedPackageRoot,
+    module_index: usize,
+    module: &PackageModule,
+) -> Result<
+    (
+        TargetedAuthoringLocalModuleInput,
+        TargetedAuthoringCurrentSnapshot,
+    ),
+    Box<CommandDiagnostic>,
+> {
+    let source = read_source(loaded, module_index, module)?;
+    let current_source_hash = package_file_hash(source.as_bytes());
+    if current_source_hash != module.expected_source_hash {
+        return Err(Box::new(
+            CommandDiagnostic::error(
+                DiagnosticKind::HashMismatch,
+                "selection_dependency_source_stale",
+            )
+            .with_module(module.module.as_dotted())
+            .with_path(render_package_path(&module.source))
+            .with_field(format!("modules[{module_index}].expected_source_hash"))
+            .with_hashes(
+                format_package_hash(&module.expected_source_hash),
+                format_package_hash(&current_source_hash),
+            ),
+        ));
+    }
+    let certificate_bytes = read_certificate_bytes(
+        loaded,
+        &module.certificate,
+        format!("modules[{module_index}].certificate"),
+    )?;
+    let certificate = npa_cert::decode_module_cert(&certificate_bytes).map_err(|error| {
+        Box::new(
+            CommandDiagnostic::error(DiagnosticKind::Build, "certificate_decode_failed")
+                .with_module(module.module.as_dotted())
+                .with_path(render_package_path(&module.certificate))
+                .with_actual_value(format!("{error:?}")),
+        )
+    })?;
+    let artifact = TargetedAuthoringLocalModuleInput {
+        module: module.module.clone(),
+        current_source_hash,
+        current_certificate_file_hash: package_file_hash(&certificate_bytes),
+        actual_export_hash: PackageHash::from(certificate.hashes().export_hash),
+        actual_axiom_report_hash: PackageHash::from(certificate.hashes().axiom_report_hash),
+        actual_certificate_hash: PackageHash::from(certificate.hashes().certificate_hash),
+        certificate_imports: certificate
+            .imports()
+            .iter()
+            .map(|import| TargetedAuthoringCertificateImportIdentity {
+                module: import.module.clone(),
+                export_hash: PackageHash::from(import.export_hash),
+                certificate_hash: import.certificate_hash.map(PackageHash::from),
+            })
+            .collect(),
+    };
+    Ok((
+        artifact,
+        TargetedAuthoringCurrentSnapshot::new(source, certificate_bytes),
+    ))
+}
+
+fn targeted_authoring_local_input_from_accepted_certificate(
+    module: &PackageModule,
+    current_source_hash: PackageHash,
+    certificate: &ModuleCert,
+    certificate_bytes: &[u8],
+) -> TargetedAuthoringLocalModuleInput {
+    TargetedAuthoringLocalModuleInput {
+        module: module.module.clone(),
+        current_source_hash,
+        current_certificate_file_hash: package_file_hash(certificate_bytes),
+        actual_export_hash: PackageHash::from(certificate.hashes().export_hash),
+        actual_axiom_report_hash: PackageHash::from(certificate.hashes().axiom_report_hash),
+        actual_certificate_hash: PackageHash::from(certificate.hashes().certificate_hash),
+        certificate_imports: certificate
+            .imports()
+            .iter()
+            .map(|import| TargetedAuthoringCertificateImportIdentity {
+                module: import.module.clone(),
+                export_hash: PackageHash::from(import.export_hash),
+                certificate_hash: import.certificate_hash.map(PackageHash::from),
+            })
+            .collect(),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3877,11 +7319,11 @@ fn refreshed_module_metadata(
     loaded: &LoadedPackageRoot,
     module_index: usize,
     module: &PackageModule,
-    certificate: &ModuleCert,
     verified: &VerifiedModule,
     source_interface: &HumanSourceInterface,
     source_hash: PackageHash,
     certificate_file_hash: PackageHash,
+    axiom_report_hash: PackageHash,
 ) -> Result<RefreshedModuleMetadata, Box<CommandDiagnostic>> {
     let Some(metadata_path) = module.meta.clone() else {
         return Ok((None, None));
@@ -3935,19 +7377,24 @@ fn refreshed_module_metadata(
         source_hash,
         certificate_file_hash,
         PackageHash::from(verified.export_hash()),
-        PackageHash::from(certificate.hashes.axiom_report_hash),
+        axiom_report_hash,
         PackageHash::from(verified.certificate_hash()),
         module.imports.clone(),
         axioms,
         declarations,
     );
-    let full_path = join_package_path(
-        &loaded.root,
-        &metadata_path,
-        format!("modules[{module_index}].meta"),
-    )?;
-    let existing = match fs::read_to_string(&full_path) {
-        Ok(existing) => Some(existing),
+    let existing = match read_package_regular_file_no_follow(&loaded.root, &metadata_path) {
+        Ok(existing) => Some(String::from_utf8(existing).map_err(|_| {
+            Box::new(
+                CommandDiagnostic::error(
+                    DiagnosticKind::GeneratedArtifact,
+                    "module_metadata_refresh_failed",
+                )
+                .with_module(module.module.as_dotted())
+                .with_path(render_package_path(&metadata_path))
+                .with_actual_value("metadata is not readable UTF-8"),
+            )
+        })?),
         Err(error) if error.kind() == io::ErrorKind::NotFound => None,
         Err(_) => {
             return Err(Box::new(
@@ -4084,28 +7531,28 @@ fn build_local_modules(
             .iter()
             .map(Arc::as_ref)
             .collect::<Vec<_>>();
-        let available_verified_module_refs = verified_modules_by_module
-            .values()
-            .map(Arc::as_ref)
-            .collect::<Vec<_>>();
+        let available_verified_module_refs = available_verified_module_refs_for_direct_imports(
+            &direct_verified_modules,
+            verified_modules_by_module,
+        );
 
-        let (certificate, generated_bytes, verified, source_interface) = if module
-            .producer_profile
-            .as_deref()
-            == Some(LEGACY_STD_PACKAGE_PRODUCER_PROFILE)
-        {
-            match build_legacy_std_package_certificate(
-                module_index,
-                module,
-                &source,
-                &direct_verified_module_refs,
-                policy,
-            ) {
-                Ok(output) => output,
-                Err(diagnostic) => return Some(*diagnostic),
-            }
-        } else {
-            let observed =
+        let (certificate, generated_bytes, verified, source_interface) =
+            if is_std_core_builder_profile(module.producer_profile.as_deref()) {
+                match build_std_core_builder_package_certificate(
+                    module_index,
+                    module,
+                    &source,
+                    &direct_verified_module_refs,
+                    policy,
+                    false,
+                ) {
+                    Ok((certificate, bytes, verified, interface, _)) => {
+                        (certificate, bytes, verified, interface)
+                    }
+                    Err(diagnostic) => return Some(*diagnostic),
+                }
+            } else {
+                let observed =
                 match compile_human_source_to_observed_certificate_output_with_available_import_refs_and_axiom_policy(
                     file_id,
                     module.module.clone(),
@@ -4130,29 +7577,29 @@ fn build_local_modules(
                         ));
                     }
                 };
-            observations.record_declaration_batch(&module.module, observed.observations);
-            let output = observed.output;
-            let generated_bytes = match npa_cert::encode_module_cert(&output.certificate) {
-                Ok(bytes) => bytes,
-                Err(error) => {
-                    return Some(
-                        CommandDiagnostic::error(
-                            DiagnosticKind::Build,
-                            "certificate_encode_failed",
-                        )
-                        .with_module(module.module.as_dotted())
-                        .with_path(format!("modules[{module_index}].certificate"))
-                        .with_actual_value(format!("{error:?}")),
-                    );
-                }
+                observations.record_declaration_batch(&module.module, observed.observations);
+                let output = observed.output;
+                let generated_bytes = match npa_cert::encode_module_cert(&output.certificate) {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        return Some(
+                            CommandDiagnostic::error(
+                                DiagnosticKind::Build,
+                                "certificate_encode_failed",
+                            )
+                            .with_module(module.module.as_dotted())
+                            .with_path(format!("modules[{module_index}].certificate"))
+                            .with_actual_value(format!("{error:?}")),
+                        );
+                    }
+                };
+                (
+                    output.certificate,
+                    generated_bytes,
+                    output.verified_module,
+                    output.source_interface,
+                )
             };
-            (
-                output.certificate,
-                generated_bytes,
-                output.verified_module,
-                output.source_interface,
-            )
-        };
 
         if let Some(diagnostic) =
             check_generated_axiom_policy(loaded, module_index, module, &certificate)
@@ -4187,8 +7634,8 @@ fn build_local_modules(
 
         let imported_source_interface = HumanImportedSourceInterface {
             module: module.module.clone(),
-            export_hash: certificate.hashes.export_hash,
-            certificate_hash: Some(certificate.hashes.certificate_hash),
+            export_hash: certificate.hashes().export_hash,
+            certificate_hash: Some(certificate.hashes().certificate_hash),
             source_interface,
         };
         let remaining_uses = import_use_counts
@@ -4668,47 +8115,53 @@ fn take_direct_import_context(
     Ok((direct_verified_modules, direct_source_interfaces))
 }
 
-fn build_legacy_std_package_certificate(
+type StdCoreBuilderPackageCertificateBuild = (
+    ModuleCert,
+    Vec<u8>,
+    VerifiedModule,
+    HumanSourceInterface,
+    u64,
+);
+
+fn build_std_core_builder_package_certificate(
     module_index: usize,
     module: &PackageModule,
     source: &str,
     direct_verified_modules: &[&VerifiedModule],
     policy: &AxiomPolicy,
-) -> Result<(ModuleCert, Vec<u8>, VerifiedModule, HumanSourceInterface), Box<CommandDiagnostic>> {
-    validate_legacy_std_source_skeleton(module_index, module, source)?;
+    observe_verification: bool,
+) -> Result<StdCoreBuilderPackageCertificateBuild, Box<CommandDiagnostic>> {
+    validate_std_core_builder_source_skeleton(module_index, module, source)?;
     let direct_verified_module_values = direct_verified_modules
         .iter()
         .map(|module| (*module).clone())
         .collect::<Vec<_>>();
-    let certificate = match build_legacy_std_package_module_cert(
-        &module.module,
-        &direct_verified_module_values,
-    ) {
-        Some(Ok(certificate)) => certificate,
-        Some(Err(error)) => {
-            return Err(Box::new(
-                CommandDiagnostic::error(DiagnosticKind::Build, "certificate_build_failed")
+    let certificate =
+        match build_std_package_module_cert(&module.module, &direct_verified_module_values) {
+            Some(Ok(certificate)) => certificate,
+            Some(Err(error)) => {
+                return Err(Box::new(
+                    CommandDiagnostic::error(DiagnosticKind::Build, "certificate_build_failed")
+                        .with_module(module.module.as_dotted())
+                        .with_path(format!("modules[{module_index}].certificate"))
+                        .with_actual_value(format!("{error:?}")),
+                ));
+            }
+            None => {
+                return Err(Box::new(
+                    CommandDiagnostic::error(
+                        DiagnosticKind::Build,
+                        "unsupported_std_core_builder_module",
+                    )
                     .with_module(module.module.as_dotted())
-                    .with_path(format!("modules[{module_index}].certificate"))
-                    .with_actual_value(format!("{error:?}")),
-            ));
-        }
-        None => {
-            return Err(Box::new(
-                CommandDiagnostic::error(DiagnosticKind::Build, "unsupported_legacy_std_module")
-                    .with_module(module.module.as_dotted())
-                    .with_path(format!("modules[{module_index}].producer_profile"))
-                    .with_field("producer_profile")
-                    .with_expected_value(LEGACY_STD_PACKAGE_PRODUCER_PROFILE)
-                    .with_actual_value(
-                        module
-                            .producer_profile
-                            .as_deref()
-                            .unwrap_or("<missing-producer-profile>"),
-                    ),
-            ));
-        }
-    };
+                    .with_path(format!("modules[{module_index}].module"))
+                    .with_field("module")
+                    .with_expected_value("Std.Logic.Eq|Std.Nat.Basic")
+                    .with_actual_value(module.module.as_dotted()),
+                ));
+            }
+        };
+    let verification_started = observe_verification.then(Instant::now);
     let verified = npa_cert::verify_built_module_cert_with_import_refs(
         &certificate,
         direct_verified_modules,
@@ -4722,6 +8175,9 @@ fn build_legacy_std_package_certificate(
                 .with_actual_value(format!("{error:?}")),
         )
     })?;
+    let verification_elapsed_ns = verification_started.map_or(0, |started| {
+        u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX)
+    });
     let generated_bytes = npa_cert::encode_module_cert(&certificate).map_err(|error| {
         Box::new(
             CommandDiagnostic::error(DiagnosticKind::Build, "certificate_encode_failed")
@@ -4731,15 +8187,21 @@ fn build_legacy_std_package_certificate(
         )
     })?;
     let source_interface = fallback_imported_source_interface(&verified).source_interface;
-    Ok((certificate, generated_bytes, verified, source_interface))
+    Ok((
+        certificate,
+        generated_bytes,
+        verified,
+        source_interface,
+        verification_elapsed_ns,
+    ))
 }
 
-fn validate_legacy_std_source_skeleton(
+fn validate_std_core_builder_source_skeleton(
     module_index: usize,
     module: &PackageModule,
     source: &str,
 ) -> Result<(), Box<CommandDiagnostic>> {
-    let actual_imports = legacy_std_source_skeleton_imports(module_index, module, source)?;
+    let actual_imports = std_core_builder_source_skeleton_imports(module_index, module, source)?;
     if actual_imports != module.imports {
         return Err(Box::new(
             CommandDiagnostic::error(DiagnosticKind::Build, "source_imports_mismatch")
@@ -4753,7 +8215,7 @@ fn validate_legacy_std_source_skeleton(
     Ok(())
 }
 
-fn legacy_std_source_skeleton_imports(
+fn std_core_builder_source_skeleton_imports(
     module_index: usize,
     module: &PackageModule,
     source: &str,
@@ -4802,18 +8264,45 @@ fn read_source(
     module_index: usize,
     module: &PackageModule,
 ) -> Result<String, Box<CommandDiagnostic>> {
-    let path = join_package_path(
-        &loaded.root,
-        &module.source,
-        format!("modules[{module_index}].source"),
-    )?;
-    fs::read_to_string(path).map_err(|_| {
-        Box::new(
-            CommandDiagnostic::error(DiagnosticKind::ArtifactIo, "source_missing")
-                .with_module(module.module.as_dotted())
-                .with_path(render_package_path(&module.source)),
-        )
-    })
+    let _ = module_index;
+    read_package_regular_file_no_follow(&loaded.root, &module.source)
+        .and_then(|bytes| String::from_utf8(bytes).map_err(io::Error::other))
+        .map_err(|_| {
+            Box::new(
+                CommandDiagnostic::error(DiagnosticKind::ArtifactIo, "source_missing")
+                    .with_module(module.module.as_dotted())
+                    .with_path(render_package_path(&module.source)),
+            )
+        })
+}
+
+fn preflight_human_sources(
+    loaded: &LoadedPackageRoot,
+    module_order: &[usize],
+) -> Result<(), Box<CommandDiagnostic>> {
+    let modules = &loaded.validated.manifest().modules;
+    for &module_index in module_order {
+        let module = modules
+            .get(module_index)
+            .ok_or_else(|| targeted_refresh_plan_invalid("local_index_out_of_range"))?;
+        let source = read_source(loaded, module_index, module)?;
+        let file_id = u32::try_from(module_index).map(FileId).map_err(|_| {
+            Box::new(
+                CommandDiagnostic::error(DiagnosticKind::Internal, "module_index_out_of_range")
+                    .with_module(module.module.as_dotted()),
+            )
+        })?;
+        validate_human_source_lexical_structure(file_id, &source).map_err(|error| {
+            Box::new(frontend_preflight_failed(
+                module_index,
+                module,
+                file_id,
+                &source,
+                error,
+            ))
+        })?;
+    }
+    Ok(())
 }
 
 fn read_certificate_bytes(
@@ -4821,12 +8310,12 @@ fn read_certificate_bytes(
     path: &PackagePath,
     manifest_field_path: impl Into<String>,
 ) -> Result<Vec<u8>, Box<CommandDiagnostic>> {
-    let path = path.clone();
-    let full_path = join_package_path(&loaded.root, &path, manifest_field_path)?;
-    fs::read(full_path).map_err(|_| {
+    let _ = manifest_field_path.into();
+    observe_certificate_read_for_test(path);
+    read_package_regular_file_no_follow(&loaded.root, path).map_err(|_| {
         Box::new(
             CommandDiagnostic::error(DiagnosticKind::ArtifactIo, "certificate_missing")
-                .with_path(render_package_path(&path)),
+                .with_path(render_package_path(path)),
         )
     })
 }
@@ -4838,17 +8327,14 @@ fn read_certificate_bytes_for_external_dependency_discovery(
     remaining_bytes: usize,
     total_limit: usize,
 ) -> Result<Vec<u8>, Box<CommandDiagnostic>> {
-    let full_path = join_package_path(
-        &loaded.root,
-        &import.certificate,
-        format!("imports[{index}].certificate"),
-    )?;
-    let file = fs::File::open(full_path).map_err(|_| {
-        Box::new(
-            CommandDiagnostic::error(DiagnosticKind::ArtifactIo, "certificate_missing")
-                .with_path(render_package_path(&import.certificate)),
-        )
-    })?;
+    observe_certificate_read_for_test(&import.certificate);
+    let file =
+        open_package_regular_file_no_follow(&loaded.root, &import.certificate).map_err(|_| {
+            Box::new(
+                CommandDiagnostic::error(DiagnosticKind::ArtifactIo, "certificate_missing")
+                    .with_path(render_package_path(&import.certificate)),
+            )
+        })?;
     let bytes = read_bytes_through_limit(file, remaining_bytes).map_err(|_| {
         Box::new(
             CommandDiagnostic::error(DiagnosticKind::ArtifactIo, "certificate_missing")
@@ -4889,8 +8375,8 @@ fn check_generated_axiom_policy(
         .allowed_axioms
         .iter()
         .collect::<BTreeSet<&Name>>();
-    for axiom in &certificate.axiom_report.module_axioms {
-        let Some(name) = certificate.name_table.get(axiom.name) else {
+    for axiom in &certificate.axiom_report().module_axioms {
+        let Some(name) = certificate.name_table().get(axiom.name) else {
             return Some(
                 CommandDiagnostic::error(DiagnosticKind::Build, "certificate_axiom_name_missing")
                     .with_module(module.module.as_dotted())
@@ -4928,7 +8414,7 @@ fn check_generated_manifest_hashes(
         ));
     }
 
-    let actual_export_hash = PackageHash::from(certificate.hashes.export_hash);
+    let actual_export_hash = PackageHash::from(certificate.hashes().export_hash);
     if actual_export_hash != module.expected_export_hash {
         return Some(hash_mismatch(
             "export_hash_mismatch",
@@ -4939,7 +8425,7 @@ fn check_generated_manifest_hashes(
         ));
     }
 
-    let actual_axiom_report_hash = PackageHash::from(certificate.hashes.axiom_report_hash);
+    let actual_axiom_report_hash = PackageHash::from(certificate.hashes().axiom_report_hash);
     if actual_axiom_report_hash != module.expected_axiom_report_hash {
         return Some(hash_mismatch(
             "axiom_report_hash_mismatch",
@@ -4950,7 +8436,7 @@ fn check_generated_manifest_hashes(
         ));
     }
 
-    let actual_certificate_hash = PackageHash::from(certificate.hashes.certificate_hash);
+    let actual_certificate_hash = PackageHash::from(certificate.hashes().certificate_hash);
     if actual_certificate_hash != module.expected_certificate_hash {
         return Some(hash_mismatch(
             "certificate_hash_mismatch",
@@ -4992,7 +8478,7 @@ fn check_observable_import_drift(
     direct_source_interfaces: &[HumanImportedSourceInterface],
 ) -> Option<CommandDiagnostic> {
     let certificate_imports = certificate
-        .imports
+        .imports()
         .iter()
         .map(|import| import.module.clone())
         .collect::<Vec<_>>();
@@ -5026,7 +8512,7 @@ fn check_observable_import_drift(
         );
     }
     let certificate_by_module = certificate
-        .imports
+        .imports()
         .iter()
         .map(|import| (&import.module, import))
         .collect::<BTreeMap<_, _>>();
@@ -5091,7 +8577,7 @@ fn check_existing_certificate_import_drift(
     .ok()?;
     let certificate = npa_cert::decode_module_cert(&bytes).ok()?;
     let certificate_imports = certificate
-        .imports
+        .imports()
         .iter()
         .map(|import| import.module.clone())
         .collect::<Vec<_>>();
@@ -5125,7 +8611,7 @@ fn check_existing_certificate_import_drift(
         );
     }
     let certificate_by_module = certificate
-        .imports
+        .imports()
         .iter()
         .map(|import| (&import.module, import))
         .collect::<BTreeMap<_, _>>();
@@ -5198,11 +8684,9 @@ fn check_package_lock(
     regenerated_lock_json: &str,
 ) -> Option<CommandDiagnostic> {
     let lock_path = PackagePath::new(PACKAGE_LOCK_PATH);
-    let full_lock_path = match join_package_path(&loaded.root, &lock_path, "package_lock.path") {
-        Ok(path) => path,
-        Err(diagnostic) => return Some(*diagnostic),
-    };
-    let lock_source = match fs::read_to_string(&full_lock_path) {
+    let lock_source = match read_package_regular_file_no_follow(&loaded.root, &lock_path)
+        .and_then(|bytes| String::from_utf8(bytes).map_err(io::Error::other))
+    {
         Ok(source) => source,
         Err(_) => {
             return Some(
@@ -5229,31 +8713,12 @@ fn check_package_lock(
     None
 }
 
-fn prepare_build_check_cache_run(
-    loaded: &LoadedPackageRoot,
-    certificates: &[LocalCertificateBuildIdentity],
-    cache_cwd: &Path,
-) -> PackageBuildCheckCacheRun {
-    let keyed_entries = package_build_check_cache_key_inputs(loaded, certificates);
-    let cache_dir = cache_cwd.join(PACKAGE_BUILD_CHECK_CACHE_LAYOUT_DIR);
-    let lookups = keyed_entries
-        .iter()
-        .map(|entry| read_package_build_check_cache_lookup(&cache_dir, &entry.cache_key))
-        .collect::<Vec<_>>();
-    let mut summary = PackageBuildCheckCacheSummary::new(PackageBuildCheckCacheMode::ReadThrough);
-    summary.live_builds = certificates.len();
-    PackageBuildCheckCacheRun {
-        cache_dir,
-        keyed_entries,
-        lookups,
-        summary,
-    }
-}
-
 fn build_check_result_with_optional_cache(
     root_display: String,
     cache_run: Option<PackageBuildCheckCacheRun>,
     diagnostic: Option<CommandDiagnostic>,
+    cache_unavailable_diagnostic: Option<CommandDiagnostic>,
+    observations: &mut PackageBuildObservationCoordinator,
 ) -> CommandResult {
     let status = if diagnostic.is_some() {
         PackageBuildCheckCachedStatus::Rejected
@@ -5268,9 +8733,17 @@ fn build_check_result_with_optional_cache(
     if let Some(diagnostic) = diagnostic {
         diagnostics.push(diagnostic);
     }
+    if let Some(unavailable) = cache_unavailable_diagnostic {
+        diagnostics.push(unavailable);
+    }
     if let Some(run) = cache_run {
-        let summary = finalize_build_check_cache_run(run, status, reason.as_deref());
-        diagnostics.push(package_build_check_cache_summary_diagnostic(&summary));
+        if let Some(unavailable) = run.unavailable_diagnostic() {
+            diagnostics.push(unavailable);
+        }
+        let (summary, outcomes) =
+            finalize_package_build_check_cache_run(run, status, reason.as_deref());
+        observations.record_cache_entry_bytes(outcomes.bytes_loaded, outcomes.bytes_written);
+        diagnostics.push(summary);
     }
 
     if status == PackageBuildCheckCachedStatus::Rejected {
@@ -5282,252 +8755,26 @@ fn build_check_result_with_optional_cache(
     }
 }
 
-fn finalize_build_check_cache_run(
-    mut run: PackageBuildCheckCacheRun,
-    status: PackageBuildCheckCachedStatus,
-    diagnostic_reason: Option<&str>,
-) -> PackageBuildCheckCacheSummary {
-    for (keyed, lookup) in run.keyed_entries.iter().zip(run.lookups.iter()) {
-        let expected_entry =
-            package_build_check_cache_result_entry(keyed, status, diagnostic_reason);
-        match lookup {
-            PackageBuildCheckCacheLookup::Hit(entry)
-                if package_build_check_cache_entries_equal(entry, &expected_entry) =>
-            {
-                run.summary.hits += 1;
-            }
-            PackageBuildCheckCacheLookup::Hit(_entry) => {
-                run.summary.stale += 1;
-                if write_package_build_check_cache_entry(&run.cache_dir, &expected_entry) {
-                    run.summary.written += 1;
-                }
-            }
-            PackageBuildCheckCacheLookup::Missing => {
-                run.summary.misses += 1;
-                if write_package_build_check_cache_entry(&run.cache_dir, &expected_entry) {
-                    run.summary.written += 1;
-                }
-            }
-            PackageBuildCheckCacheLookup::SchemaMiss => {
-                run.summary.schema_misses += 1;
-                if write_package_build_check_cache_entry(&run.cache_dir, &expected_entry) {
-                    run.summary.written += 1;
-                }
-            }
-            PackageBuildCheckCacheLookup::Stale => {
-                run.summary.stale += 1;
-                if write_package_build_check_cache_entry(&run.cache_dir, &expected_entry) {
-                    run.summary.written += 1;
-                }
-            }
-        }
-    }
-    run.summary
-}
-
-fn package_build_check_cache_entries_equal(
-    actual: &PackageBuildCheckResultEntry,
-    expected: &PackageBuildCheckResultEntry,
-) -> bool {
-    package_build_check_result_entry_json(actual) == package_build_check_result_entry_json(expected)
-}
-
-fn package_build_check_cache_key_inputs(
-    loaded: &LoadedPackageRoot,
-    certificates: &[LocalCertificateBuildIdentity],
-) -> Vec<PackageBuildCheckKeyedEntry> {
-    let manifest = loaded.validated.manifest();
-    certificates
-        .iter()
-        .map(|certificate| {
-            let module = &manifest.modules[certificate.module_index];
-            let direct_imports = loaded.validated.graph().resolved_module_imports
-                [certificate.module_index]
-                .iter()
-                .map(|import| PackageBuildCheckImportIdentity {
-                    module: import.module.clone(),
-                    export_hash: import.export_hash,
-                    certificate_hash: import.certificate_hash,
-                })
-                .collect::<Vec<_>>();
-            let key_input = PackageBuildCheckCacheKeyInput {
-                schema: PACKAGE_BUILD_CHECK_CACHE_SCHEMA.to_owned(),
-                tool_version: env!("CARGO_PKG_VERSION").to_owned(),
-                tool_build_hash: package_build_check_tool_build_hash(),
-                package_core_profile: manifest.core_spec.clone(),
-                package_certificate_profile: manifest.certificate_format.clone(),
-                output_certificate_format: certificate.output_certificate_format.clone(),
-                output_core_spec: certificate.output_core_spec.clone(),
-                module: module.module.clone(),
-                source_hash: certificate.source_hash,
-                expected_source_hash: module.expected_source_hash,
-                direct_imports,
-                compiler_options: package_build_check_compiler_options(module),
-                package_metadata_mode: "check".to_owned(),
-                producer_profile: module.producer_profile.clone(),
-                expected_certificate_file_hash: module.expected_certificate_file_hash,
-                expected_export_hash: module.expected_export_hash,
-                expected_axiom_report_hash: module.expected_axiom_report_hash,
-                expected_certificate_hash: module.expected_certificate_hash,
-            };
-            let cache_key = package_build_check_cache_key(&key_input);
-            PackageBuildCheckKeyedEntry {
-                module: module.module.clone(),
-                key_input,
-                cache_key,
-            }
-        })
-        .collect()
-}
-
-fn package_build_check_compiler_options(module: &PackageModule) -> Vec<String> {
-    let mut options = vec![
-        "frontend=human".to_owned(),
-        "human_compile_options=default".to_owned(),
-        "axiom_policy=package".to_owned(),
-    ];
-    if module.producer_profile.as_deref() == Some(LEGACY_STD_PACKAGE_PRODUCER_PROFILE) {
-        options.push(format!(
-            "producer_profile={LEGACY_STD_PACKAGE_PRODUCER_PROFILE}"
-        ));
-    }
-    options
-}
-
-fn package_build_check_tool_build_hash() -> PackageHash {
-    package_file_hash(
-        format!(
-            "schema=npa.package.build_check_tool_identity.v0.1\ncommand={COMMAND}\nversion={}\n",
-            env!("CARGO_PKG_VERSION")
-        )
-        .as_bytes(),
-    )
-}
-
-fn read_package_build_check_cache_lookup(
-    cache_dir: &Path,
-    cache_key: &str,
-) -> PackageBuildCheckCacheLookup {
-    let path = package_build_check_cache_entry_path(cache_dir, cache_key);
-    let source = match fs::read_to_string(path) {
-        Ok(source) => source,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return PackageBuildCheckCacheLookup::Missing;
-        }
-        Err(_) => return PackageBuildCheckCacheLookup::Stale,
-    };
-    match parse_package_build_check_result_entry_json(&source) {
-        Ok(entry) if entry.cache_key == cache_key => {
-            PackageBuildCheckCacheLookup::Hit(Box::new(entry))
-        }
-        Ok(_) => PackageBuildCheckCacheLookup::Stale,
-        Err(error) if error.reason_code == PackageArtifactErrorReason::UnsupportedSchema => {
-            PackageBuildCheckCacheLookup::SchemaMiss
-        }
-        Err(_) => PackageBuildCheckCacheLookup::Stale,
-    }
-}
-
-fn write_package_build_check_cache_entry(
-    cache_dir: &Path,
-    entry: &PackageBuildCheckResultEntry,
-) -> bool {
-    if fs::create_dir_all(cache_dir).is_err() {
-        return false;
-    }
-    let path = package_build_check_cache_entry_path(cache_dir, &entry.cache_key);
-    let temp_index = NEXT_TEMPORARY_WRITE.fetch_add(1, Ordering::SeqCst);
-    let temp_path = cache_dir.join(format!(
-        ".{}.{}.tmp",
-        entry.cache_key.trim_start_matches("sha256:"),
-        temp_index
-    ));
-    let json = package_build_check_result_entry_json(entry);
-    if fs::write(&temp_path, json).is_err() {
-        return false;
-    }
-    match fs::rename(&temp_path, &path) {
-        Ok(()) => true,
-        Err(_) => {
-            let _ = fs::remove_file(temp_path);
-            false
-        }
-    }
-}
-
-fn package_build_check_cache_entry_path(cache_dir: &Path, cache_key: &str) -> PathBuf {
-    cache_dir.join(format!("{cache_key}.json"))
-}
-
-fn package_build_check_cache_result_entry(
-    keyed: &PackageBuildCheckKeyedEntry,
-    status: PackageBuildCheckCachedStatus,
-    diagnostic_reason: Option<&str>,
-) -> PackageBuildCheckResultEntry {
-    PackageBuildCheckResultEntry {
-        schema: PACKAGE_BUILD_CHECK_RESULT_SCHEMA.to_owned(),
-        cache_key: keyed.cache_key.clone(),
-        trusted: false,
-        build_evidence: false,
-        key_input: keyed.key_input.clone(),
-        status,
-        diagnostic_reason: diagnostic_reason.map(ToOwned::to_owned),
-        trust_boundary: format!(
-            "cache entry for {} is not proof evidence or build evidence; live build comparison dominates",
-            keyed.module.as_dotted()
-        ),
-    }
-}
-
-impl PackageBuildCheckCacheSummary {
-    fn new(mode: PackageBuildCheckCacheMode) -> Self {
-        Self {
-            mode,
-            hits: 0,
-            misses: 0,
-            stale: 0,
-            schema_misses: 0,
-            written: 0,
-            live_builds: 0,
-            trusted: false,
-            build_evidence: false,
-        }
-    }
-
-    fn diagnostic_value(&self) -> String {
-        format!(
-            "mode={};hits={};misses={};stale={};schema_misses={};written={};live_builds={};trusted={};build_evidence={}",
-            self.mode.as_str(),
-            self.hits,
-            self.misses,
-            self.stale,
-            self.schema_misses,
-            self.written,
-            self.live_builds,
-            self.trusted,
-            self.build_evidence
-        )
-    }
-}
-
-fn package_build_check_cache_summary_diagnostic(
-    summary: &PackageBuildCheckCacheSummary,
-) -> CommandDiagnostic {
-    CommandDiagnostic::info(
-        DiagnosticKind::GeneratedArtifact,
-        "build_check_cache_summary",
-    )
-    .with_field("build_check_cache")
-    .with_actual_value(summary.diagnostic_value())
-}
-
 fn write_package_build(
     loaded: &LoadedPackageRoot,
     build: &PackageCertificateBuild,
 ) -> Option<CommandDiagnostic> {
+    let mutation_lock = match TargetLock::acquire(&loaded.root) {
+        Ok(lock) => lock,
+        Err(_) => {
+            return Some(
+                CommandDiagnostic::error(
+                    DiagnosticKind::ArtifactIo,
+                    "package_build_concurrent_update",
+                )
+                .with_path(PACKAGE_MANIFEST_PATH),
+            )
+        }
+    };
     let mut pending = Vec::new();
     for certificate in &build.local_certificates {
         match prepare_pending_write(
+            &mutation_lock,
             &loaded.root,
             &certificate.path,
             format!("modules[{}].certificate", certificate.module_index),
@@ -5538,7 +8785,7 @@ fn write_package_build(
             Ok(Some(write)) => pending.push(write),
             Ok(None) => {}
             Err(diagnostic) => {
-                cleanup_pending_writes(&pending);
+                cleanup_pending_writes(&mutation_lock, &pending);
                 return Some(*diagnostic);
             }
         }
@@ -5546,6 +8793,7 @@ fn write_package_build(
 
     let lock_path = PackagePath::new(PACKAGE_LOCK_PATH);
     match prepare_pending_write(
+        &mutation_lock,
         &loaded.root,
         &lock_path,
         "package_lock.path",
@@ -5556,18 +8804,30 @@ fn write_package_build(
         Ok(Some(write)) => pending.push(write),
         Ok(None) => {}
         Err(diagnostic) => {
-            cleanup_pending_writes(&pending);
+            cleanup_pending_writes(&mutation_lock, &pending);
             return Some(*diagnostic);
         }
     }
 
-    commit_pending_writes(&pending)
+    commit_pending_writes(&mutation_lock, &pending)
 }
 
 fn write_refreshed_package_build(
     loaded: &LoadedPackageRoot,
     build: &PackageCertificateRefreshBuild,
 ) -> Option<CommandDiagnostic> {
+    let mutation_lock = match TargetLock::acquire(&loaded.root) {
+        Ok(lock) => lock,
+        Err(_) => {
+            return Some(
+                CommandDiagnostic::error(
+                    DiagnosticKind::ArtifactIo,
+                    "package_build_concurrent_update",
+                )
+                .with_path(PACKAGE_MANIFEST_PATH),
+            )
+        }
+    };
     let mut pending = Vec::new();
     let local_modules = match refresh_modules_by_manifest_order(
         &build.local_modules,
@@ -5579,6 +8839,7 @@ fn write_refreshed_package_build(
 
     for module in local_modules {
         match prepare_pending_write(
+            &mutation_lock,
             &loaded.root,
             &module.certificate_path,
             format!("modules[{}].certificate", module.module_index),
@@ -5589,7 +8850,7 @@ fn write_refreshed_package_build(
             Ok(Some(write)) => pending.push(write),
             Ok(None) => {}
             Err(diagnostic) => {
-                cleanup_pending_writes(&pending);
+                cleanup_pending_writes(&mutation_lock, &pending);
                 return Some(*diagnostic);
             }
         }
@@ -5597,6 +8858,7 @@ fn write_refreshed_package_build(
 
     let manifest_path = PackagePath::new(PACKAGE_MANIFEST_PATH);
     match prepare_pending_write(
+        &mutation_lock,
         &loaded.root,
         &manifest_path,
         "$.manifest",
@@ -5607,7 +8869,7 @@ fn write_refreshed_package_build(
         Ok(Some(write)) => pending.push(write),
         Ok(None) => {}
         Err(diagnostic) => {
-            cleanup_pending_writes(&pending);
+            cleanup_pending_writes(&mutation_lock, &pending);
             return Some(*diagnostic);
         }
     }
@@ -5618,7 +8880,7 @@ fn write_refreshed_package_build(
     ) {
         Ok(local_modules) => local_modules,
         Err(diagnostic) => {
-            cleanup_pending_writes(&pending);
+            cleanup_pending_writes(&mutation_lock, &pending);
             return Some(*diagnostic);
         }
     };
@@ -5629,6 +8891,7 @@ fn write_refreshed_package_build(
             continue;
         };
         match prepare_pending_write(
+            &mutation_lock,
             &loaded.root,
             metadata_path,
             format!("modules[{}].meta", module.module_index),
@@ -5639,7 +8902,7 @@ fn write_refreshed_package_build(
             Ok(Some(write)) => pending.push(write),
             Ok(None) => {}
             Err(diagnostic) => {
-                cleanup_pending_writes(&pending);
+                cleanup_pending_writes(&mutation_lock, &pending);
                 return Some(*diagnostic);
             }
         }
@@ -5647,6 +8910,7 @@ fn write_refreshed_package_build(
 
     let lock_path = PackagePath::new(PACKAGE_LOCK_PATH);
     match prepare_pending_write(
+        &mutation_lock,
         &loaded.root,
         &lock_path,
         "package_lock.path",
@@ -5657,15 +8921,16 @@ fn write_refreshed_package_build(
         Ok(Some(write)) => pending.push(write),
         Ok(None) => {}
         Err(diagnostic) => {
-            cleanup_pending_writes(&pending);
+            cleanup_pending_writes(&mutation_lock, &pending);
             return Some(*diagnostic);
         }
     }
 
-    commit_pending_writes(&pending)
+    commit_pending_writes(&mutation_lock, &pending)
 }
 
 fn prepare_pending_write(
+    mutation_lock: &TargetLock,
     root: &Path,
     package_path: &PackagePath,
     manifest_field_path: impl Into<String>,
@@ -5673,11 +8938,20 @@ fn prepare_pending_write(
     reason_code: &'static str,
     module: Option<Name>,
 ) -> Result<Option<PendingWrite>, Box<CommandDiagnostic>> {
-    let full_path = join_package_path(root, package_path, manifest_field_path)?;
-    let previous_bytes = match fs::read(&full_path) {
-        Ok(existing) if existing == bytes => return Ok(None),
-        Ok(existing) => Some(existing),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+    // Retain the exact parent directory capability for the transaction's
+    // complete lifetime. Commit, rollback, and cleanup never re-resolve it.
+    let _ = manifest_field_path.into();
+    let (directory, leaf) =
+        open_package_parent_no_follow(root, package_path, true).map_err(|_| {
+            Box::new(write_artifact_diagnostic(
+                reason_code,
+                package_path,
+                module.as_ref(),
+            ))
+        })?;
+    let previous_bytes = match read_directory_entry(&directory, &leaf) {
+        Ok(Some(existing)) if existing == bytes => return Ok(None),
+        Ok(existing) => existing,
         Err(_) => {
             return Err(Box::new(write_artifact_diagnostic(
                 reason_code,
@@ -5687,50 +8961,60 @@ fn prepare_pending_write(
         }
     };
 
-    if let Some(parent) = full_path.parent() {
-        if fs::create_dir_all(parent).is_err() {
-            return Err(Box::new(write_artifact_diagnostic(
-                reason_code,
-                package_path,
-                module.as_ref(),
-            )));
-        }
-    }
-
-    let temp_path = match write_unique_temporary_file(&full_path, bytes) {
-        Ok(path) => path,
-        Err(_) => {
-            return Err(Box::new(write_artifact_diagnostic(
-                reason_code,
-                package_path,
-                module.as_ref(),
-            )));
-        }
-    };
-    if !temp_path.exists() {
-        return Err(Box::new(write_artifact_diagnostic(
-            reason_code,
-            package_path,
-            module.as_ref(),
-        )));
-    }
-
+    let (temp, temp_identity) =
+        match write_unique_temporary_file(mutation_lock, &directory, &leaf, bytes) {
+            Ok(value) => value,
+            Err(_) => {
+                return Err(Box::new(write_artifact_diagnostic(
+                    reason_code,
+                    package_path,
+                    module.as_ref(),
+                )));
+            }
+        };
     Ok(Some(PendingWrite {
         path: package_path.clone(),
-        full_path,
-        temp_path,
+        directory,
+        leaf,
+        temp,
+        temp_identity,
         reason_code,
         module,
         previous_bytes,
+        replacement_bytes: bytes.to_vec(),
     }))
 }
 
-fn commit_pending_writes(pending: &[PendingWrite]) -> Option<CommandDiagnostic> {
+fn commit_pending_writes(
+    mutation_lock: &TargetLock,
+    pending: &[PendingWrite],
+) -> Option<CommandDiagnostic> {
     let mut committed = Vec::new();
     for write in pending {
-        if fs::rename(&write.temp_path, &write.full_path).is_err() {
-            cleanup_pending_writes(pending);
-            if let Some(diagnostic) = rollback_pending_writes(&committed) {
+        let unchanged = mutation_lock.ensure_target_identity().is_ok()
+            && read_directory_entry(&write.directory, &write.leaf)
+                .map(|current| current == write.previous_bytes)
+                .unwrap_or(false);
+        if !unchanged
+            || mutation_lock
+                .replace_file_under_lock(&write.directory, &write.temp, &write.leaf)
+                .and_then(|_| write.directory.sync_all())
+                .and_then(|_| mutation_lock.ensure_target_identity())
+                .and_then(|_| {
+                    if read_directory_entry(&write.directory, &write.leaf)?.as_deref()
+                        == Some(write.replacement_bytes.as_slice())
+                    {
+                        Ok(())
+                    } else {
+                        Err(io::Error::other(
+                            "package build destination bytes changed after publication",
+                        ))
+                    }
+                })
+                .is_err()
+        {
+            cleanup_pending_writes(mutation_lock, pending);
+            if let Some(diagnostic) = rollback_pending_writes(mutation_lock, &committed) {
                 return Some(diagnostic);
             }
             return Some(write_artifact_diagnostic(
@@ -5744,59 +9028,109 @@ fn commit_pending_writes(pending: &[PendingWrite]) -> Option<CommandDiagnostic> 
     None
 }
 
-fn cleanup_pending_writes(pending: &[PendingWrite]) {
+fn cleanup_pending_writes(mutation_lock: &TargetLock, pending: &[PendingWrite]) {
     for write in pending {
-        let _ = fs::remove_file(&write.temp_path);
+        let Ok(Some(file)) = write.directory.open_regular_file(&write.temp) else {
+            continue;
+        };
+        let Ok(identity) = regular_file_identity(&file) else {
+            continue;
+        };
+        if identity == write.temp_identity {
+            let _ = mutation_lock.remove_regular_file_under_lock(
+                &write.directory,
+                &write.temp,
+                identity,
+            );
+        }
     }
 }
 
-fn rollback_pending_writes(committed: &[&PendingWrite]) -> Option<CommandDiagnostic> {
+fn rollback_pending_writes(
+    mutation_lock: &TargetLock,
+    committed: &[&PendingWrite],
+) -> Option<CommandDiagnostic> {
     for write in committed.iter().rev() {
+        if mutation_lock.ensure_target_identity().is_err()
+            || read_directory_entry(&write.directory, &write.leaf)
+                .ok()
+                .flatten()
+                .as_deref()
+                != Some(write.replacement_bytes.as_slice())
+        {
+            return Some(rollback_diagnostic(write));
+        }
         let restored = match &write.previous_bytes {
-            Some(bytes) => fs::write(&write.full_path, bytes),
-            None => fs::remove_file(&write.full_path),
+            Some(bytes) => {
+                write_unique_temporary_file(mutation_lock, &write.directory, &write.leaf, bytes)
+                    .and_then(|(temporary, temporary_identity)| {
+                        let result = mutation_lock.replace_file_under_lock(
+                            &write.directory,
+                            &temporary,
+                            &write.leaf,
+                        );
+                        if result.is_err() {
+                            let _ = mutation_lock.remove_regular_file_under_lock(
+                                &write.directory,
+                                &temporary,
+                                temporary_identity,
+                            );
+                        }
+                        result
+                            .and_then(|_| write.directory.sync_all())
+                            .and_then(|_| mutation_lock.ensure_target_identity())
+                    })
+            }
+            None => write
+                .directory
+                .open_regular_file(&write.leaf)
+                .and_then(|file| {
+                    let file = file.ok_or_else(|| {
+                        io::Error::other("published package build artifact disappeared")
+                    })?;
+                    let identity = regular_file_identity(&file)?;
+                    mutation_lock
+                        .remove_regular_file_under_lock(&write.directory, &write.leaf, identity)
+                        .and_then(|_| write.directory.sync_all())
+                }),
         };
         if restored.is_err() {
-            let diagnostic =
-                CommandDiagnostic::error(DiagnosticKind::ArtifactIo, "artifact_rollback_failed")
-                    .with_path(render_package_path(&write.path));
-            return Some(if let Some(module) = &write.module {
-                diagnostic.with_module(module.as_dotted())
-            } else {
-                diagnostic
-            });
+            return Some(rollback_diagnostic(write));
         }
     }
     None
 }
 
-fn temporary_write_path(path: &Path, sequence: usize) -> PathBuf {
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("artifact");
-    path.with_file_name(format!(
+fn temporary_write_name(leaf: &std::ffi::OsStr, sequence: usize) -> OsString {
+    OsString::from(format!(
         ".{file_name}.npa-build-certs.{}.{}.tmp",
         std::process::id(),
-        sequence
+        sequence,
+        file_name = leaf.to_string_lossy(),
     ))
 }
 
-fn write_unique_temporary_file(path: &Path, bytes: &[u8]) -> io::Result<PathBuf> {
+fn write_unique_temporary_file(
+    mutation_lock: &TargetLock,
+    directory: &Directory,
+    leaf: &std::ffi::OsStr,
+    bytes: &[u8],
+) -> io::Result<(OsString, Identity)> {
+    mutation_lock.ensure_target_identity()?;
     for _ in 0..1024 {
         let sequence = NEXT_TEMPORARY_WRITE.fetch_add(1, Ordering::Relaxed);
-        let temp_path = temporary_write_path(path, sequence);
-        match fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp_path)
-        {
+        let temp = temporary_write_name(leaf, sequence);
+        match directory.create_new_regular_file(&temp) {
             Ok(mut file) => {
+                let identity = regular_file_identity(&file)?;
                 if let Err(error) = file.write_all(bytes).and_then(|_| file.sync_all()) {
-                    let _ = fs::remove_file(&temp_path);
+                    drop(file);
+                    let _ =
+                        mutation_lock.remove_regular_file_under_lock(directory, &temp, identity);
                     return Err(error);
                 }
-                return Ok(temp_path);
+                mutation_lock.ensure_target_identity()?;
+                return Ok((temp, identity));
             }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(error) => return Err(error),
@@ -5806,6 +9140,45 @@ fn write_unique_temporary_file(path: &Path, bytes: &[u8]) -> io::Result<PathBuf>
         io::ErrorKind::AlreadyExists,
         "unable to allocate unique package build temporary file",
     ))
+}
+
+fn read_directory_entry(
+    directory: &Directory,
+    leaf: &std::ffi::OsStr,
+) -> io::Result<Option<Vec<u8>>> {
+    let Some(mut file) = directory.open_regular_file(leaf)? else {
+        return Ok(None);
+    };
+    const MAX_TRANSACTION_ARTIFACT_BYTES: u64 = 134_217_728;
+    let metadata = file.metadata()?;
+    if metadata.len() > MAX_TRANSACTION_ARTIFACT_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "package build artifact exceeds the transaction byte limit",
+        ));
+    }
+    let mut bytes = Vec::new();
+    std::io::Read::by_ref(&mut file)
+        .take(MAX_TRANSACTION_ARTIFACT_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_TRANSACTION_ARTIFACT_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "package build artifact exceeds the transaction byte limit",
+        ));
+    }
+    Ok(Some(bytes))
+}
+
+fn rollback_diagnostic(write: &PendingWrite) -> CommandDiagnostic {
+    let diagnostic =
+        CommandDiagnostic::error(DiagnosticKind::ArtifactIo, "artifact_rollback_failed")
+            .with_path(render_package_path(&write.path));
+    if let Some(module) = &write.module {
+        diagnostic.with_module(module.as_dotted())
+    } else {
+        diagnostic
+    }
 }
 
 fn write_artifact_diagnostic(
@@ -5882,6 +9255,37 @@ fn frontend_build_failed(
     direct_source_interfaces: &[HumanImportedSourceInterface],
     error: npa_frontend::HumanDiagnostic,
 ) -> CommandDiagnostic {
+    frontend_build_failed_with_context(
+        module_index,
+        module,
+        file_id,
+        source,
+        direct_source_interfaces,
+        error,
+        true,
+    )
+}
+
+fn frontend_preflight_failed(
+    module_index: usize,
+    module: &PackageModule,
+    file_id: FileId,
+    source: &str,
+    error: npa_frontend::HumanDiagnostic,
+) -> CommandDiagnostic {
+    frontend_build_failed_with_context(module_index, module, file_id, source, &[], error, false)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn frontend_build_failed_with_context(
+    module_index: usize,
+    module: &PackageModule,
+    file_id: FileId,
+    source: &str,
+    direct_source_interfaces: &[HumanImportedSourceInterface],
+    error: npa_frontend::HumanDiagnostic,
+    include_declaration: bool,
+) -> CommandDiagnostic {
     let primary_span = error.primary_span;
     let phase = error
         .payload
@@ -5918,6 +9322,13 @@ fn frontend_build_failed(
             )
         })
     });
+    let delimiter = error
+        .payload
+        .as_ref()
+        .and_then(|payload| payload.delimiter.as_ref())
+        .and_then(|delimiter| {
+            command_delimiter_context(&module.source, file_id, source, delimiter)
+        });
     let mut diagnostic = CommandDiagnostic::error(DiagnosticKind::Build, "build_failed")
         .with_module(module.module.as_dotted())
         .with_path(format!("modules[{module_index}].source"))
@@ -5934,19 +9345,24 @@ fn frontend_build_failed(
     if let Some(kernel_fuel) = kernel_fuel {
         diagnostic = diagnostic.with_kernel_fuel(kernel_fuel);
     }
+    if let Some(delimiter) = delimiter {
+        diagnostic = diagnostic.with_delimiter(delimiter);
+    }
 
-    match frontend_source_context(
+    match frontend_source_context_with_declaration(
         &module.source,
         file_id,
         source,
         direct_source_interfaces,
         primary_span,
+        include_declaration,
     ) {
         Some(context) => diagnostic.with_source(context),
         None => diagnostic,
     }
 }
 
+#[cfg(test)]
 fn frontend_source_context(
     source_path: &PackagePath,
     file_id: FileId,
@@ -5954,41 +9370,28 @@ fn frontend_source_context(
     direct_source_interfaces: &[HumanImportedSourceInterface],
     span: Span,
 ) -> Option<CommandDiagnosticSourceContext> {
-    if span.file_id != file_id || span.start.0 > span.end.0 {
-        return None;
-    }
-    let end = usize::try_from(span.end.0).ok()?;
-    if end > source.len() {
-        return None;
-    }
+    frontend_source_context_with_declaration(
+        source_path,
+        file_id,
+        source,
+        direct_source_interfaces,
+        span,
+        true,
+    )
+}
 
-    let mut context = CommandDiagnosticSourceContext::new(
-        render_package_path(source_path),
-        span.start.0,
-        span.end.0,
-    )?;
-    let start = usize::try_from(span.start.0).ok()?;
-    if source.is_char_boundary(start) {
-        let prefix = &source[..start];
-        let line_usize = prefix.bytes().filter(|byte| *byte == b'\n').count() + 1;
-        let line_start = prefix.rfind('\n').map_or(0, |index| index + 1);
-        let column_usize = source[line_start..start].chars().count() + 1;
-        if let (Ok(line), Ok(column)) = (u32::try_from(line_usize), u32::try_from(column_usize)) {
-            context = context.with_display_location(line, column);
-        }
-    }
-    if start < end
-        && source.is_char_boundary(start)
-        && source.is_char_boundary(end)
-        && end - start <= 64
-    {
-        let token = &source[start..end];
-        if !token.chars().any(char::is_control) && !token.chars().all(char::is_whitespace) {
-            context = context.with_token(token);
-        }
-    }
-    let declaration =
-        frontend_containing_declaration(file_id, source, direct_source_interfaces, span);
+fn frontend_source_context_with_declaration(
+    source_path: &PackagePath,
+    file_id: FileId,
+    source: &str,
+    direct_source_interfaces: &[HumanImportedSourceInterface],
+    span: Span,
+    include_declaration: bool,
+) -> Option<CommandDiagnosticSourceContext> {
+    let context = command_source_context(source_path, file_id, source, span)?;
+    let declaration = include_declaration
+        .then(|| frontend_containing_declaration(file_id, source, direct_source_interfaces, span))
+        .flatten();
 
     Some(match declaration {
         Some(declaration) => context.with_declaration(declaration),
@@ -6101,17 +9504,270 @@ mod tests {
         check_refreshed_certificate_import_identities, external_import_dependency_order,
         format_package_hash, frontend_source_context, normalize_allowed_refresh_hash_fields,
         parse_and_validate_manifest_str, read_bytes_through_limit,
-        refresh_manifest_hash_fields_for_modules, DiagnosticKind, ExternalImportDependencyLimits,
-        FileId, HumanImportedSourceInterface, HumanName, HumanSourceInterface,
-        ManifestHashRefreshIdentity, Name, PackageHash, PackageLockImport, PackagePath, Span,
-        TARGETED_EXTERNAL_DEPENDENCY_LIMITS,
+        refresh_manifest_hash_fields_for_modules, transitive_module_dependency_names,
+        CertificateReadVerifyTestCounts, CommandResult, DiagnosticKind,
+        ExternalImportDependencyLimits, FileId, HumanImportedSourceInterface, HumanName,
+        HumanSourceInterface, KernelFuelReportMode, ManifestHashRefreshIdentity, Name,
+        PackageBuildObservationCoordinator, PackageHash, PackageLockImport, PackagePath,
+        PackageTimingMode, PerformancePackageSelectionObservation, Span,
+        CERTIFICATE_READ_VERIFY_TEST_COUNTS, TARGETED_EXTERNAL_DEPENDENCY_LIMITS,
+        TARGETED_REFRESH_AFTER_PREFLIGHT_TEST_HOOK, TIMING_SELECTION_MS,
     };
+    use crate::package_api::v1::{common_options, refresh_artifacts_check};
+    use npa_api::{PerformanceMeasurementLabel, PerformancePackageSelectionBatchPolicy};
     use npa_frontend::{
         HumanNotationAssociativity, HumanNotationKind, HumanSourceNotationMetadata,
     };
-    use std::{collections::BTreeSet, io::Cursor};
+    use std::{
+        collections::BTreeSet,
+        fs,
+        io::Cursor,
+        path::{Path, PathBuf},
+    };
 
     const FRONTEND_SOURCE_PATH: &str = "Proofs/Ai/ExplicitFinite/source.npa";
+
+    #[test]
+    fn available_import_dependency_closure_excludes_unrelated_modules() {
+        let dependencies = [
+            ("Fixture.Direct", vec!["Fixture.Base"]),
+            ("Fixture.Base", vec!["Fixture.Foundation"]),
+            ("Fixture.Foundation", vec![]),
+            ("Fixture.UnrelatedDuplicate", vec!["Fixture.Other"]),
+            ("Fixture.Other", vec![]),
+        ]
+        .into_iter()
+        .map(|(module, imports)| {
+            (
+                Name::from_dotted(module),
+                imports
+                    .into_iter()
+                    .map(Name::from_dotted)
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+
+        let closure =
+            transitive_module_dependency_names([Name::from_dotted("Fixture.Direct")], |module| {
+                dependencies.get(module).cloned()
+            });
+
+        assert_eq!(
+            closure,
+            ["Fixture.Base", "Fixture.Direct", "Fixture.Foundation"]
+                .into_iter()
+                .map(Name::from_dotted)
+                .collect()
+        );
+        assert!(!closure.contains(&Name::from_dotted("Fixture.UnrelatedDuplicate")));
+    }
+
+    struct CopiedPackageFixture {
+        path: PathBuf,
+    }
+
+    impl CopiedPackageFixture {
+        fn proofs(label: &str) -> Self {
+            let source =
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/package/proofs");
+            let path = std::env::temp_dir().join(format!(
+                "npa-cli-package-build-unit-{}-{label}",
+                std::process::id()
+            ));
+            if path.exists() {
+                fs::remove_dir_all(&path).unwrap();
+            }
+            copy_test_tree(&source, &path);
+            Self { path }
+        }
+    }
+
+    impl Drop for CopiedPackageFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn copy_test_tree(source: &Path, destination: &Path) {
+        fs::create_dir_all(destination).unwrap();
+        for entry in fs::read_dir(source).unwrap() {
+            let entry = entry.unwrap();
+            let source_path = entry.path();
+            let destination_path = destination.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_test_tree(&source_path, &destination_path);
+            } else {
+                fs::copy(source_path, destination_path).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn targeted_refresh_rereads_selected_source_after_structural_preflight() {
+        let fixture = CopiedPackageFixture::proofs("post-preflight-source-replacement");
+        let selected_source = fixture.path.join("Proofs/Ai/Basic/source.npa");
+        TARGETED_REFRESH_AFTER_PREFLIGHT_TEST_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                fs::write(selected_source, "def replaced_bad : Type := (\n").unwrap();
+            }));
+        });
+
+        let result = super::run_package_build_certs(
+            refresh_artifacts_check(common_options(&fixture.path, true))
+                .with_modules(vec![Name::from_dotted("Proofs.Ai.Basic")]),
+        );
+        TARGETED_REFRESH_AFTER_PREFLIGHT_TEST_HOOK.with(|hook| {
+            hook.borrow_mut().take();
+        });
+
+        assert_eq!(
+            result.exit_code(),
+            crate::diagnostic::CommandExitCode::PackageFailure
+        );
+        assert_eq!(result.diagnostics.len(), 3);
+        assert_eq!(result.diagnostics[0].reason_code, "package_build_selection");
+        assert_eq!(
+            result.diagnostics[1].reason_code,
+            "package_build_refresh_schedule"
+        );
+        assert_eq!(result.diagnostics[2].reason_code, "build_failed");
+        assert_eq!(
+            result.diagnostics[2].module.as_deref(),
+            Some("Proofs.Ai.Basic")
+        );
+        assert_eq!(result.diagnostics[2].field.as_deref(), Some("parser"));
+    }
+
+    #[test]
+    fn targeted_refresh_reads_and_verifies_each_declared_external_once() {
+        let fixture = CopiedPackageFixture::proofs("priority-external-single-read");
+        CERTIFICATE_READ_VERIFY_TEST_COUNTS.with(|counts| {
+            *counts.borrow_mut() = Some(CertificateReadVerifyTestCounts::default());
+        });
+
+        let result = super::run_package_build_certs(
+            refresh_artifacts_check(common_options(&fixture.path, true))
+                .with_modules(vec![Name::from_dotted("Proofs.Ai.EqReasoning")]),
+        );
+        let counts = CERTIFICATE_READ_VERIFY_TEST_COUNTS.with(|counts| {
+            counts
+                .borrow_mut()
+                .take()
+                .expect("certificate observer was installed")
+        });
+
+        assert_eq!(
+            result.exit_code(),
+            crate::diagnostic::CommandExitCode::Success,
+            "{:?}",
+            result.diagnostics
+        );
+        for path in [
+            "vendor/npa-std/Std/Logic/Eq/certificate.npcert",
+            "vendor/npa-std/Std/Nat/Basic/certificate.npcert",
+        ] {
+            assert_eq!(counts.reads_by_path.get(path), Some(&1), "read {path}");
+            assert_eq!(counts.verifies_by_path.get(path), Some(&1), "verify {path}");
+        }
+    }
+
+    fn assert_changed_selection_observation_coordinator_contract() {
+        let observation = PerformancePackageSelectionObservation {
+            batch_policy: PerformancePackageSelectionBatchPolicy::ExecBudget,
+            candidate_paths: 3,
+            pathspec_batches: 1,
+            tracked_queries: 1,
+            untracked_queries: 1,
+            selected_paths: 2,
+            ..PerformancePackageSelectionObservation::default()
+        };
+
+        let mut off = PackageBuildObservationCoordinator::new(
+            KernelFuelReportMode::Off,
+            PackageTimingMode::Off,
+        );
+        assert!(!off.measurement_enabled());
+        assert!(!off.measurements_enabled());
+        let mut off_called = false;
+        assert_eq!(
+            off.time_selection(|| {
+                off_called = true;
+                7
+            }),
+            7
+        );
+        assert!(off_called);
+        off.observe_package_selection(&observation);
+        assert!(off
+            .finish(CommandResult::passed("test", "root"))
+            .timings
+            .is_none());
+
+        let mut summary = PackageBuildObservationCoordinator::new(
+            KernelFuelReportMode::Off,
+            PackageTimingMode::Summary,
+        );
+        assert!(summary.measurement_enabled());
+        assert!(summary.measurements_enabled());
+        assert_eq!(summary.time_selection(|| 11), 11);
+        summary.observe_package_selection(&observation);
+        let result = summary.finish(CommandResult::passed("test", "root"));
+        let timings = result.timings.expect("summary timing envelope");
+        assert!(timings
+            .metrics
+            .iter()
+            .any(|metric| metric.field == TIMING_SELECTION_MS));
+        let measurements = timings.measurements.expect("selection measurements");
+        assert!(measurements.counters.iter().any(|counter| {
+            counter.label == PerformanceMeasurementLabel::PackageSelectionCandidatePaths
+                && counter.value == 3
+        }));
+        assert!(measurements.counters.iter().any(|counter| {
+            counter.label == PerformanceMeasurementLabel::PackageSelectionChangedPaths
+                && counter.value == 2
+        }));
+
+        let source = include_str!("package_build.rs");
+        let allocate = source
+            .find("(observations.measurements_enabled() && selection_is_changed)")
+            .expect("changed selection observation is enablement-gated");
+        let time = source[allocate..]
+            .find("observations.time_selection(||")
+            .map(|index| allocate + index)
+            .expect("complete selection is timed");
+        let thread = source[time..]
+            .find("selection_observation.as_mut()")
+            .map(|index| time + index)
+            .expect("operation observation is threaded into selection");
+        let project = source[thread..]
+            .find("observations.observe_package_selection(observation)")
+            .map(|index| thread + index)
+            .expect("selection observation is projected");
+        let propagate = source[project..]
+            .find("let plan = match selection_result")
+            .map(|index| project + index)
+            .expect("selection result is propagated after projection");
+        assert!(allocate < time && time < thread && thread < project && project < propagate);
+    }
+
+    macro_rules! changed_selection_exact_test {
+        ($name:ident) => {
+            #[test]
+            fn $name() {
+                assert_changed_selection_observation_coordinator_contract();
+            }
+        };
+    }
+
+    changed_selection_exact_test!(observation_coordinator_reports_measurement_enablement);
+    changed_selection_exact_test!(observation_coordinator_times_selection_only_when_enabled);
+    changed_selection_exact_test!(observation_coordinator_projects_selection);
+    changed_selection_exact_test!(changed_selection_threads_operation_observation);
+    changed_selection_exact_test!(changed_build_allocates_selection_observation_only_when_enabled);
+    changed_selection_exact_test!(changed_build_times_complete_selection);
+    changed_selection_exact_test!(changed_build_projects_selection_observation);
+    changed_selection_exact_test!(changed_build_projects_selection_before_result_propagation);
 
     #[test]
     fn package_build_certs_external_import_dependency_order_handles_deep_chains_iteratively() {

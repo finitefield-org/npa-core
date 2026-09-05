@@ -1907,6 +1907,25 @@ mod tests {
     }
 
     #[test]
+    fn accepts_reconciliation_after_source_backed_version_gap() {
+        let v2 = empty_v2();
+        let migrated = migrate_promotion_origin_registry_v2_to_v3(&v2).unwrap();
+        let first = append_empty_event(
+            &migrated,
+            package_file_hash(v2.canonical_json().unwrap().as_bytes()),
+            projection("0.2.1", 1),
+            projection("0.2.4", 8),
+        );
+        let second = append_empty_event(
+            &first,
+            package_file_hash(first.canonical_json().unwrap().as_bytes()),
+            projection("0.2.8", 30),
+            projection("0.2.9", 40),
+        );
+        validate_promotion_origin_registry_v3_transition(&first, &second).unwrap();
+    }
+
+    #[test]
     fn accepts_catalog_event_after_unrecorded_version_only_snapshot() {
         let v2 = empty_v2();
         let migrated = migrate_promotion_origin_registry_v2_to_v3(&v2).unwrap();
@@ -1922,8 +1941,39 @@ mod tests {
             projection("0.2.7", 9),
             projection("0.2.8", 10),
         );
-
         validate_promotion_origin_registry_v3_transition(&first, &second).unwrap();
+    }
+
+    #[test]
+    fn rejects_overlapping_or_conflicting_reconciliation_intervals() {
+        let v2 = empty_v2();
+        let migrated = migrate_promotion_origin_registry_v2_to_v3(&v2).unwrap();
+        let first = append_empty_event(
+            &migrated,
+            package_file_hash(v2.canonical_json().unwrap().as_bytes()),
+            projection("0.2.1", 1),
+            projection("0.2.4", 8),
+        );
+        let valid = append_empty_event(
+            &first,
+            package_file_hash(first.canonical_json().unwrap().as_bytes()),
+            projection("0.2.4", 8),
+            projection("0.2.9", 40),
+        );
+
+        let mut overlapping = valid.clone();
+        let overlapping_event = overlapping.catalog_change_events.last_mut().unwrap();
+        overlapping_event.previous_target = projection("0.2.3", 30);
+        overlapping_event.change_set_hash = catalog_change_set_hash(overlapping_event).unwrap();
+        overlapping_event.event_id = catalog_change_event_id(overlapping_event).unwrap();
+        assert!(overlapping.refresh_hash().is_err());
+
+        let mut conflicting = valid;
+        let conflicting_event = conflicting.catalog_change_events.last_mut().unwrap();
+        conflicting_event.previous_target = projection("0.2.4", 30);
+        conflicting_event.change_set_hash = catalog_change_set_hash(conflicting_event).unwrap();
+        conflicting_event.event_id = catalog_change_event_id(conflicting_event).unwrap();
+        assert!(conflicting.refresh_hash().is_err());
     }
 
     #[test]

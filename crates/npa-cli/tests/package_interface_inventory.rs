@@ -261,6 +261,38 @@ fn interface_inventory_symlink_source_is_rejected_before_reading_target() {
     let _ = fs::remove_dir_all(root);
 }
 
+#[cfg(unix)]
+#[test]
+fn interface_inventory_symlink_root_preserves_the_frozen_diagnostic() {
+    use std::os::unix::fs::symlink;
+
+    let target = write_temp_source(
+        "root-symlink-target",
+        "Mathlib/Logic/Function/Defs.lean",
+        b"theorem Function.comp_assoc : True := by exact True.intro\n",
+    );
+    let root = temp_root("root-symlink");
+    let _ = fs::remove_file(&root);
+    let _ = fs::remove_dir_all(&root);
+    symlink(&target, &root).unwrap();
+
+    let result = result_for(
+        &root,
+        &["Mathlib/Logic/Function/Defs.lean"],
+        &["Function.comp_assoc"],
+    );
+    let output = result.interface_inventory.as_deref().unwrap();
+    assert_eq!(output.status, "invalid");
+    assert!(output
+        .diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.reason == "root_symlink"));
+    assert!(output.rows.is_empty());
+
+    fs::remove_file(root).unwrap();
+    fs::remove_dir_all(target).unwrap();
+}
+
 #[test]
 fn interface_inventory_oversized_source_is_rejected_before_source_scan() {
     let root = temp_root("oversized");

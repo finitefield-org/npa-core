@@ -16,9 +16,9 @@ use crate::{
 
 const CLOSURE_DOMAIN: &[u8] = b"NPA-DECLARATION-CLOSURE-v1\0";
 const EDGE_DOMAIN: &[u8] = b"NPA-DECLARATION-CLOSURE-EDGES-v1\0";
-const PROJECTION_DOMAIN: &[u8] = b"NPA-DECLARATION-CLOSURE-PROJECTION-v1\0";
+const PROJECTION_DOMAIN: &[u8] = b"NPA-DECLARATION-CLOSURE-PROJECTION-v2\0";
 const PROJECTION_LEVEL_DOMAIN: &[u8] = b"NPA-DECLARATION-CLOSURE-PROJECTION-LEVEL-v1\0";
-const PROJECTION_TERM_DOMAIN: &[u8] = b"NPA-DECLARATION-CLOSURE-PROJECTION-TERM-v1\0";
+const PROJECTION_TERM_DOMAIN: &[u8] = b"NPA-DECLARATION-CLOSURE-PROJECTION-TERM-v2\0";
 
 /// Stable certificate declaration kind used by declaration promotion.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -423,8 +423,51 @@ pub fn declaration_dependency_closure(
     externalized: &BTreeMap<GlobalDeclarationIdentity, GlobalDeclarationIdentity>,
     limits: DeclarationClosureLimits,
 ) -> Result<DeclarationClosure, DeclarationClosureError> {
+    declaration_dependency_closure_with_transported_externalizations(
+        modules,
+        roots,
+        source_families,
+        externalized,
+        &BTreeSet::new(),
+        limits,
+    )
+}
+
+/// Compute a bounded dependency closure while permitting exact, caller-
+/// attested namespace transports whose declaration interface hash changed.
+///
+/// Every transported row must be an exact row of `externalized`, preserve the
+/// declaration name and kind, change only its module-bound interface hash, and
+/// be listed explicitly. Callers are responsible for independently validating
+/// the semantic transport evidence before using this entry point.
+pub fn declaration_dependency_closure_with_transported_externalizations(
+    modules: &BTreeMap<ModuleName, VerifiedModule>,
+    roots: &BTreeSet<GlobalDeclarationIdentity>,
+    source_families: &ValidatedSourceDeclarationFamilies,
+    externalized: &BTreeMap<GlobalDeclarationIdentity, GlobalDeclarationIdentity>,
+    transported_externalizations: &BTreeSet<(GlobalDeclarationIdentity, GlobalDeclarationIdentity)>,
+    limits: DeclarationClosureLimits,
+) -> Result<DeclarationClosure, DeclarationClosureError> {
     check_limit("requested_roots", limits.requested_roots, roots.len())?;
     check_limit("loaded_modules", limits.loaded_modules, modules.len())?;
+    check_limit(
+        "dependency_edges",
+        limits.dependency_edges,
+        transported_externalizations.len(),
+    )?;
+    for (source, target) in transported_externalizations {
+        if externalized.get(source) != Some(target)
+            || source.module == target.module
+            || source.name != target.name
+            || source.kind != target.kind
+            || source.decl_interface_hash == target.decl_interface_hash
+        {
+            return Err(DeclarationClosureError::for_identity(
+                DeclarationClosureErrorReason::IdentityMismatch,
+                source.clone(),
+            ));
+        }
+    }
 
     let indexes = modules
         .iter()
@@ -616,9 +659,12 @@ pub fn declaration_dependency_closure(
                 }
                 let mapping = externalized.get(&target.identity);
                 if let Some(mapped) = mapping {
+                    let transported = transported_externalizations
+                        .contains(&(target.identity.clone(), mapped.clone()));
                     if mapped.name != target.identity.name
                         || mapped.kind != target.identity.kind
-                        || mapped.decl_interface_hash != target.identity.decl_interface_hash
+                        || (mapped.decl_interface_hash != target.identity.decl_interface_hash
+                            && !transported)
                     {
                         return Err(DeclarationClosureError::for_identity(
                             DeclarationClosureErrorReason::IdentityMismatch,
@@ -1373,17 +1419,6 @@ fn projection_tables(
                     );
                 }
             }
-            TermNode::Let { ty, value, body } => {
-                payload.push(6);
-                for child in [ty, value, body] {
-                    payload.extend_from_slice(
-                        term_hashes
-                            .get(*child)
-                            .and_then(Option::as_ref)
-                            .ok_or_else(|| DeclarationClosureError::invalid("term_table.index"))?,
-                    );
-                }
-            }
         }
         term_hashes[term_id] = Some(domain_hash(PROJECTION_TERM_DOMAIN, &payload));
     }
@@ -1421,9 +1456,6 @@ fn projection_term_ids(
             }
             TermNode::Lam { ty, body } | TermNode::Pi { ty, body } => {
                 pending.extend([*ty, *body]);
-            }
-            TermNode::Let { ty, value, body } => {
-                pending.extend([*ty, *value, *body]);
             }
         }
     }
@@ -2150,6 +2182,62 @@ mod tests {
     }
 
     #[test]
+    fn transported_externalization_requires_one_exact_hash_changing_row() {
+        let module = verify(fixture_module("Fixture.TransportSource"));
+        let root = export_identity(&module, "alias");
+        let support = export_identity(&module, "id");
+        let modules = BTreeMap::from([(module.module().clone(), module)]);
+        let transported = GlobalDeclarationIdentity {
+            module: Name::from_dotted("Mathlib.TransportTarget"),
+            decl_interface_hash: [9; 32],
+            ..support.clone()
+        };
+        let externalized = BTreeMap::from([(support.clone(), transported.clone())]);
+
+        let error = declaration_dependency_closure(
+            &modules,
+            &BTreeSet::from([root.clone()]),
+            &ValidatedSourceDeclarationFamilies::default(),
+            &externalized,
+            DeclarationClosureLimits::default(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.reason,
+            DeclarationClosureErrorReason::IdentityMismatch
+        );
+
+        let closure = declaration_dependency_closure_with_transported_externalizations(
+            &modules,
+            &BTreeSet::from([root.clone()]),
+            &ValidatedSourceDeclarationFamilies::default(),
+            &externalized,
+            &BTreeSet::from([(support.clone(), transported.clone())]),
+            DeclarationClosureLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(closure.externalized, vec![(support.clone(), transported)]);
+
+        let forged_target = GlobalDeclarationIdentity {
+            name: Name::from_dotted("other"),
+            ..externalized[&support].clone()
+        };
+        let error = declaration_dependency_closure_with_transported_externalizations(
+            &modules,
+            &BTreeSet::from([root]),
+            &ValidatedSourceDeclarationFamilies::default(),
+            &externalized,
+            &BTreeSet::from([(support.clone(), forged_target)]),
+            DeclarationClosureLimits::default(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.reason,
+            DeclarationClosureErrorReason::IdentityMismatch
+        );
+    }
+
+    #[test]
     fn normalized_projection_is_equal_after_exact_module_mapping() {
         let source = verify(fixture_module("Fixture.Source"));
         let target = verify(fixture_module("Mathlib.Target"));
@@ -2301,28 +2389,30 @@ mod tests {
             .unwrap()
             .decl_index;
         let module = modules.get_mut(&module_name).unwrap();
-        let mut shared = match &module.declarations[alias_index].decl {
-            DeclPayload::Def { ty, .. } => *ty,
-            other => panic!("expected alias definition, got {other:?}"),
-        };
-        module.term_table.push(TermNode::Const {
-            global_ref: GlobalRef::Local {
-                decl_index: usize::MAX,
-            },
-            levels: Vec::new(),
-        });
-        for _ in 0..18 {
-            let parent = module.term_table.len();
-            module.term_table.push(TermNode::Pi {
-                ty: shared,
-                body: shared,
+        module.mutate_certificate_parts_for_test(|parts| {
+            let mut shared = match &parts.declarations[alias_index].decl {
+                DeclPayload::Def { ty, .. } => *ty,
+                other => panic!("expected alias definition, got {other:?}"),
+            };
+            parts.term_table.push(TermNode::Const {
+                global_ref: GlobalRef::Local {
+                    decl_index: usize::MAX,
+                },
+                levels: Vec::new(),
             });
-            shared = parent;
-        }
-        match &mut module.declarations[alias_index].decl {
-            DeclPayload::Def { ty, .. } => *ty = shared,
-            other => panic!("expected alias definition, got {other:?}"),
-        }
+            for _ in 0..18 {
+                let parent = parts.term_table.len();
+                parts.term_table.push(TermNode::Pi {
+                    ty: shared,
+                    body: shared,
+                });
+                shared = parent;
+            }
+            match &mut parts.declarations[alias_index].decl {
+                DeclPayload::Def { ty, .. } => *ty = shared,
+                other => panic!("expected alias definition, got {other:?}"),
+            }
+        });
 
         let projection =
             normalized_declaration_closure_projection(&modules, &closure, &BTreeMap::new())

@@ -7,18 +7,22 @@ use npa_api::{
     JsonDocument, JsonValue, JsonValueKind, PerformanceMeasurementLabel,
     PERFORMANCE_CANDIDATE_DETAIL_LIMIT, PERFORMANCE_DECLARATION_DETAIL_LIMIT,
     PERFORMANCE_MEASUREMENTS_SCHEMA_V0_1, PERFORMANCE_MEASUREMENTS_SCHEMA_V0_2,
-    PERFORMANCE_MEASUREMENTS_SCHEMA_V0_3, PERFORMANCE_MODULE_DETAIL_LIMIT,
+    PERFORMANCE_MEASUREMENTS_SCHEMA_V0_3, PERFORMANCE_MEASUREMENTS_SCHEMA_V0_4,
+    PERFORMANCE_MEASUREMENTS_SCHEMA_V0_5, PERFORMANCE_MEASUREMENTS_SCHEMA_V0_6,
+    PERFORMANCE_MEASUREMENTS_SCHEMA_V0_7, PERFORMANCE_MEASUREMENTS_SCHEMA_V0_8,
+    PERFORMANCE_MEASUREMENTS_SCHEMA_V0_9, PERFORMANCE_MODULE_DETAIL_LIMIT,
     PERFORMANCE_WORKER_DETAIL_LIMIT,
 };
 
 const V0_1_SCHEMA: &str = "npa.generated_artifact_release_manifest.v0.1";
 const V0_2_SCHEMA: &str = "npa.generated_artifact_release_manifest.v0.2";
-const VALIDATION_SCHEMA: &str = "npa.generated_artifact_release_manifest.validation.v0.1";
+const V0_3_SCHEMA: &str = "npa.generated_artifact_release_manifest.v0.3";
+const VALIDATION_SCHEMA: &str = "npa.generated_artifact_release_manifest.validation.v0.2";
 const COMMAND_RESULT_SCHEMA_V0_1: &str = "npa.package.command_result.v0.1";
 const COMMAND_RESULT_SCHEMA_V0_2: &str = "npa.package.command_result.v0.2";
 const COMMAND_RESULT_SCHEMA_V0_3: &str = "npa.package.command_result.v0.3";
-const COMMAND_RESULT_SCHEMA_V0_4: &str = "npa.package.command_result.v0.4";
-const KERNEL_FUEL_DIAGNOSTIC_SCHEMA_V0_1: &str = "npa.kernel-fuel-diagnostic.v0.1";
+const COMMAND_RESULT_SCHEMA_V0_5: &str = "npa.package.command_result.v0.5";
+const KERNEL_FUEL_DIAGNOSTIC_SCHEMA_V0_2: &str = "npa.kernel-fuel-diagnostic.v0.2";
 const TIMINGS_SCHEMA_V0_1: &str = "npa.package.timings.v0.1";
 const TIMINGS_SCHEMA_V0_2: &str = "npa.package.timings.v0.2";
 const PACKAGE_LOCK_RELATIVE_PATH: &str = "generated/package-lock.json";
@@ -103,7 +107,7 @@ const DIAGNOSTIC_OPTIONAL_FIELDS_V0_3: &[&str] = &[
     "source",
     "conversion",
 ];
-const DIAGNOSTIC_OPTIONAL_FIELDS_V0_4: &[&str] = &[
+const DIAGNOSTIC_OPTIONAL_FIELDS_V0_5: &[&str] = &[
     "module",
     "path",
     "field",
@@ -117,7 +121,7 @@ const DIAGNOSTIC_OPTIONAL_FIELDS_V0_4: &[&str] = &[
     "kernel_fuel",
 ];
 
-const KERNEL_WORK_FIELDS: &[&str; 10] = &[
+const KERNEL_WORK_FIELDS: &[&str; 9] = &[
     "check_calls",
     "infer_calls",
     "whnf_calls",
@@ -126,7 +130,6 @@ const KERNEL_WORK_FIELDS: &[&str; 10] = &[
     "beta_steps",
     "delta_steps",
     "iota_steps",
-    "zeta_steps",
     "physical_reductions",
 ];
 
@@ -188,6 +191,36 @@ pub fn validate_release_manifest(
     source: &str,
     require_v0_2: bool,
 ) -> Result<ReleaseManifestValidation, ReleaseManifestValidationError> {
+    validate_release_manifest_with_requirement(
+        source,
+        if require_v0_2 {
+            RequiredManifestSchema::V0_2OrNewer
+        } else {
+            RequiredManifestSchema::Any
+        },
+    )
+}
+
+/// Validate one current v0.3 generated-artifact release manifest.
+///
+/// This function performs no filesystem, network, process, or asset I/O.
+pub fn validate_current_release_manifest(
+    source: &str,
+) -> Result<ReleaseManifestValidation, ReleaseManifestValidationError> {
+    validate_release_manifest_with_requirement(source, RequiredManifestSchema::CurrentV0_3)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RequiredManifestSchema {
+    Any,
+    V0_2OrNewer,
+    CurrentV0_3,
+}
+
+fn validate_release_manifest_with_requirement(
+    source: &str,
+    requirement: RequiredManifestSchema,
+) -> Result<ReleaseManifestValidation, ReleaseManifestValidationError> {
     let document = JsonDocument::parse(source).map_err(|error| {
         ReleaseManifestValidationError::new(format!(
             "invalid JSON at byte {}: {:?}",
@@ -195,7 +228,7 @@ pub fn validate_release_manifest(
         ))
     })?;
     reject_duplicate_fields(document.root())?;
-    validate_manifest(document.root(), require_v0_2)
+    validate_manifest(document.root(), requirement)
 }
 
 fn reject_duplicate_fields(value: &JsonValue<'_>) -> Result<(), ReleaseManifestValidationError> {
@@ -525,11 +558,11 @@ fn rust_target_is_valid(text: &str) -> bool {
 fn cli_version_is_valid(text: &str) -> bool {
     let fields = text.split('.').collect::<Vec<_>>();
     fields.len() == 3
-        && fields[0] == "0"
-        && matches!(fields[1], "3" | "4" | "5" | "6" | "7" | "8")
-        && !fields[2].is_empty()
-        && fields[2].bytes().all(|byte| byte.is_ascii_digit())
-        && (fields[2] == "0" || !fields[2].starts_with('0'))
+        && fields.iter().all(|field| {
+            !field.is_empty()
+                && field.bytes().all(|byte| byte.is_ascii_digit())
+                && (*field == "0" || !field.starts_with('0'))
+        })
 }
 
 fn require_matching_text<'value>(
@@ -605,16 +638,46 @@ fn validate_retained_manifest(
     Ok(generated_hashes)
 }
 
-fn command_result_schema_for_cli(version: &str) -> &'static str {
-    if version.starts_with("0.8.") {
-        COMMAND_RESULT_SCHEMA_V0_4
-    } else if version.starts_with("0.6.") || version.starts_with("0.7.") {
-        COMMAND_RESULT_SCHEMA_V0_3
-    } else if version.starts_with("0.5.") {
-        COMMAND_RESULT_SCHEMA_V0_2
-    } else {
-        COMMAND_RESULT_SCHEMA_V0_1
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CliHostDisposition {
+    manifest_schema: &'static str,
+    command_result_schema: &'static str,
+}
+
+fn cli_host_disposition(version: &str) -> Option<CliHostDisposition> {
+    if !cli_version_is_valid(version) {
+        return None;
     }
+    let mut fields = version.split('.');
+    let major = fields.next()?.parse::<u64>().ok()?;
+    let minor = fields.next()?.parse::<u64>().ok()?;
+    let patch = fields.next()?.parse::<u64>().ok()?;
+    if fields.next().is_some() {
+        return None;
+    }
+    match (major, minor, patch) {
+        (0, 3 | 4, _) => Some(CliHostDisposition {
+            manifest_schema: V0_2_SCHEMA,
+            command_result_schema: COMMAND_RESULT_SCHEMA_V0_1,
+        }),
+        (0, 5, _) => Some(CliHostDisposition {
+            manifest_schema: V0_2_SCHEMA,
+            command_result_schema: COMMAND_RESULT_SCHEMA_V0_2,
+        }),
+        (0, 6, _) => Some(CliHostDisposition {
+            manifest_schema: V0_2_SCHEMA,
+            command_result_schema: COMMAND_RESULT_SCHEMA_V0_3,
+        }),
+        (0, 9, 0) => Some(CliHostDisposition {
+            manifest_schema: V0_3_SCHEMA,
+            command_result_schema: COMMAND_RESULT_SCHEMA_V0_5,
+        }),
+        _ => None,
+    }
+}
+
+fn command_result_schema_for_cli(version: &str) -> Option<&'static str> {
+    cli_host_disposition(version).map(|disposition| disposition.command_result_schema)
 }
 
 fn validate_diagnostic_source(
@@ -629,7 +692,7 @@ fn validate_diagnostic_source(
         where_,
         if matches!(
             schema,
-            COMMAND_RESULT_SCHEMA_V0_3 | COMMAND_RESULT_SCHEMA_V0_4
+            COMMAND_RESULT_SCHEMA_V0_3 | COMMAND_RESULT_SCHEMA_V0_5
         ) {
             &["declaration", "line", "column", "token"]
         } else {
@@ -715,7 +778,7 @@ fn validate_diagnostic_conversion(
         let head = require_text(value(&conversion, field), &format!("{where_}.{field}"))?;
         let valid = matches!(
             head,
-            "sort" | "bound_variable" | "application" | "lambda" | "pi" | "let" | "unknown"
+            "sort" | "bound_variable" | "application" | "lambda" | "pi" | "unknown"
         ) || head.strip_prefix("constant:").is_some_and(|name| {
             !name.is_empty() && name.len() <= 256 && !name.chars().any(char::is_control)
         });
@@ -852,11 +915,10 @@ fn validate_kernel_work(
     if !overflowed {
         let reductions = counters[5]
             .checked_add(counters[6])
-            .and_then(|sum| sum.checked_add(counters[7]))
-            .and_then(|sum| sum.checked_add(counters[8]));
-        if reductions != Some(counters[9]) {
+            .and_then(|sum| sum.checked_add(counters[7]));
+        if reductions != Some(counters[8]) {
             return Err(ReleaseManifestValidationError::new(format!(
-                "{where_}.physical_reductions must equal beta + delta + iota + zeta"
+                "{where_}.physical_reductions must equal beta + delta + iota"
             )));
         }
     }
@@ -1058,7 +1120,7 @@ fn validate_kernel_fuel_diagnostic(
         where_,
         &[],
     )?;
-    if value(&diagnostic, "schema").string_value() != Some(KERNEL_FUEL_DIAGNOSTIC_SCHEMA_V0_1) {
+    if value(&diagnostic, "schema").string_value() != Some(KERNEL_FUEL_DIAGNOSTIC_SCHEMA_V0_2) {
         return Err(ReleaseManifestValidationError::new(format!(
             "{where_}.schema is unsupported"
         )));
@@ -1320,14 +1382,17 @@ fn validate_command_result_shape<'value, 'source>(
             COMMAND_RESULT_SCHEMA_V0_1
                 | COMMAND_RESULT_SCHEMA_V0_2
                 | COMMAND_RESULT_SCHEMA_V0_3
-                | COMMAND_RESULT_SCHEMA_V0_4
+                | COMMAND_RESULT_SCHEMA_V0_5
         )
     ) {
         return Err(ReleaseManifestValidationError::new(
             "verification.command_result.schema is unsupported",
         ));
     }
-    if schema.expect("supported schema") != command_result_schema_for_cli(npa_cli_version) {
+    let expected_schema = command_result_schema_for_cli(npa_cli_version).ok_or_else(|| {
+        ReleaseManifestValidationError::new("verification.npa_cli_crate_version is unsupported")
+    })?;
+    if schema.expect("supported schema") != expected_schema {
         return Err(ReleaseManifestValidationError::new(
             "verification.command_result.schema does not match verification.npa_cli_crate_version",
         ));
@@ -1357,7 +1422,7 @@ fn validate_command_result_shape<'value, 'source>(
         Some(COMMAND_RESULT_SCHEMA_V0_1) => DIAGNOSTIC_OPTIONAL_FIELDS_V0_1,
         Some(COMMAND_RESULT_SCHEMA_V0_2) => DIAGNOSTIC_OPTIONAL_FIELDS_V0_2,
         Some(COMMAND_RESULT_SCHEMA_V0_3) => DIAGNOSTIC_OPTIONAL_FIELDS_V0_3,
-        _ => DIAGNOSTIC_OPTIONAL_FIELDS_V0_4,
+        _ => DIAGNOSTIC_OPTIONAL_FIELDS_V0_5,
     };
     for (index, raw_diagnostic) in diagnostics.iter().enumerate() {
         let where_ = format!("verification.command_result.diagnostics[{index}]");
@@ -1419,6 +1484,7 @@ fn validate_command_result_shape<'value, 'source>(
     }
 
     if result.contains_key("timings") {
+        let current_command_result = schema == Some(COMMAND_RESULT_SCHEMA_V0_5);
         let timings = require_object(
             value(&result, "timings"),
             "verification.command_result.timings",
@@ -1427,6 +1493,11 @@ fn validate_command_result_shape<'value, 'source>(
         if !matches!(schema, Some(TIMINGS_SCHEMA_V0_1 | TIMINGS_SCHEMA_V0_2)) {
             return Err(ReleaseManifestValidationError::new(
                 "verification.command_result.timings has an invalid schema",
+            ));
+        }
+        if current_command_result && schema != Some(TIMINGS_SCHEMA_V0_2) {
+            return Err(ReleaseManifestValidationError::new(
+                "current command_result requires package timings v0.2",
             ));
         }
         let v0_2 = schema == Some(TIMINGS_SCHEMA_V0_2);
@@ -1478,7 +1549,21 @@ fn validate_command_result_shape<'value, 'source>(
                     "timings must be untrusted",
                 ));
             }
-            validate_performance_measurements(value(&timings, "measurements"), timing_mode)?;
+            let measurements = value(&timings, "measurements");
+            validate_performance_measurements(measurements, timing_mode)?;
+            if current_command_result
+                && require_object(
+                    measurements,
+                    "verification.command_result.timings.measurements",
+                )?
+                .get("schema")
+                .and_then(|value| value.string_value())
+                    != Some(PERFORMANCE_MEASUREMENTS_SCHEMA_V0_9)
+            {
+                return Err(ReleaseManifestValidationError::new(
+                    "current command_result requires performance measurements v0.9",
+                ));
+            }
         }
         if require_bool(
             value(&timings, "build_evidence"),
@@ -1506,23 +1591,69 @@ fn validate_command_result_shape<'value, 'source>(
     Ok(result)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PackageShardingMeasurementSchema {
+    V1Only,
+    TermMaterialization,
+    PreparedRetention,
+}
+
+impl PackageShardingMeasurementSchema {
+    fn has_term_fields(self) -> bool {
+        !matches!(self, Self::V1Only)
+    }
+
+    fn accepts_memory_model(self, memory_model: &str) -> bool {
+        match self {
+            Self::V1Only => memory_model == "npa.fast-shard-memory.v1",
+            Self::TermMaterialization => matches!(
+                memory_model,
+                "npa.fast-shard-memory.v1" | "npa.fast-shard-memory.v2-term-materialization"
+            ),
+            Self::PreparedRetention => matches!(
+                memory_model,
+                "npa.fast-shard-memory.v1"
+                    | "npa.fast-shard-memory.v2-term-materialization"
+                    | "npa.fast-shard-memory.v3-term-materialization-prepared-retention"
+            ),
+        }
+    }
+}
+
 fn validate_performance_measurements(
     raw: &JsonValue<'_>,
     expected_mode: &str,
 ) -> Result<(), ReleaseManifestValidationError> {
     const WHERE: &str = "verification.command_result.timings.measurements";
     let report = require_object(raw, WHERE)?;
-    let (has_package_sharding_schema, has_declaration_kernel) =
-        match value(&report, "schema").string_value() {
-            Some(PERFORMANCE_MEASUREMENTS_SCHEMA_V0_1) => (false, false),
-            Some(PERFORMANCE_MEASUREMENTS_SCHEMA_V0_2) => (true, false),
-            Some(PERFORMANCE_MEASUREMENTS_SCHEMA_V0_3) => (true, true),
-            _ => {
-                return Err(ReleaseManifestValidationError::new(format!(
-                    "{WHERE}.schema is unsupported"
-                )))
-            }
-        };
+    let measurement_schema = value(&report, "schema").string_value();
+    let (package_sharding_schema, has_declaration_kernel) = match measurement_schema {
+        Some(PERFORMANCE_MEASUREMENTS_SCHEMA_V0_1) => (None, false),
+        Some(PERFORMANCE_MEASUREMENTS_SCHEMA_V0_2) => {
+            (Some(PackageShardingMeasurementSchema::V1Only), false)
+        }
+        Some(PERFORMANCE_MEASUREMENTS_SCHEMA_V0_3)
+        | Some(PERFORMANCE_MEASUREMENTS_SCHEMA_V0_4)
+        | Some(PERFORMANCE_MEASUREMENTS_SCHEMA_V0_5) => {
+            (Some(PackageShardingMeasurementSchema::V1Only), true)
+        }
+        Some(PERFORMANCE_MEASUREMENTS_SCHEMA_V0_6) => (
+            Some(PackageShardingMeasurementSchema::TermMaterialization),
+            true,
+        ),
+        Some(PERFORMANCE_MEASUREMENTS_SCHEMA_V0_7)
+        | Some(PERFORMANCE_MEASUREMENTS_SCHEMA_V0_8)
+        | Some(PERFORMANCE_MEASUREMENTS_SCHEMA_V0_9) => (
+            Some(PackageShardingMeasurementSchema::PreparedRetention),
+            true,
+        ),
+        _ => {
+            return Err(ReleaseManifestValidationError::new(format!(
+                "{WHERE}.schema is unsupported"
+            )))
+        }
+    };
+    let has_package_sharding_schema = package_sharding_schema.is_some();
     let mut required_fields = vec![
         "schema",
         "trusted",
@@ -1607,22 +1738,14 @@ fn validate_performance_measurements(
             )));
         }
         previous_label = Some(label);
-        let Some(expected) = PerformanceMeasurementLabel::ALL
-            .iter()
-            .copied()
-            .find(|candidate| candidate.as_str() == label)
-        else {
+        let Some(expected) = PerformanceMeasurementLabel::from_schema_identifier(
+            measurement_schema.expect("supported measurement schema"),
+            label,
+        ) else {
             return Err(ReleaseManifestValidationError::new(format!(
-                "{where_}.label is unknown"
+                "{where_}.label is unknown or unavailable in its schema"
             )));
         };
-        if !has_package_sharding_schema
-            && expected == PerformanceMeasurementLabel::PackageAvoidedBaseContextCloneBytes
-        {
-            return Err(ReleaseManifestValidationError::new(format!(
-                "{where_}.label is unavailable in {PERFORMANCE_MEASUREMENTS_SCHEMA_V0_1}"
-            )));
-        }
         if value(&counter, "unit").string_value() != Some(expected.unit().as_str()) {
             return Err(ReleaseManifestValidationError::new(format!(
                 "{where_}.unit disagrees with its label"
@@ -1809,8 +1932,13 @@ fn validate_performance_measurements(
         previous_worker = Some(key);
     }
     let (package_layer_len, package_shard_len) = if has_package_sharding_schema {
-        let has_package_sharding =
-            validate_package_sharding_summary(value(&report, "package_sharding"), WHERE)?;
+        let package_sharding_schema =
+            package_sharding_schema.expect("package-sharding schema was checked above");
+        let has_package_sharding = validate_package_sharding_summary(
+            value(&report, "package_sharding"),
+            WHERE,
+            package_sharding_schema,
+        )?;
         let package_layers = require_array(
             value(&report, "package_layers"),
             &format!("{WHERE}.package_layers"),
@@ -1819,25 +1947,28 @@ fn validate_performance_measurements(
         for (index, raw_layer) in package_layers.iter().enumerate() {
             let where_ = format!("{WHERE}.package_layers[{index}]");
             let layer = require_object(raw_layer, &where_)?;
-            require_fields(
-                &layer,
-                &[
-                    "layer_index",
-                    "runnable_width",
-                    "estimated_total_cost",
-                    "estimated_max_shard_cost",
-                    "requested_jobs",
-                    "effective_jobs",
-                    "reduction_reason",
-                    "shared_base_context_bytes",
-                    "per_worker_bytes",
-                    "memory_budget_bytes",
-                    "estimate_overflowed",
-                    "elapsed_ns",
-                ],
-                &where_,
-                &[],
-            )?;
+            let mut layer_fields = vec![
+                "layer_index",
+                "runnable_width",
+                "estimated_total_cost",
+                "estimated_max_shard_cost",
+                "requested_jobs",
+                "effective_jobs",
+                "reduction_reason",
+                "shared_base_context_bytes",
+                "per_worker_bytes",
+                "memory_budget_bytes",
+                "estimate_overflowed",
+                "elapsed_ns",
+            ];
+            if package_sharding_schema.has_term_fields() {
+                layer_fields.extend_from_slice(&[
+                    "prepared_shared_bytes",
+                    "combined_shared_bytes",
+                    "term_materialization_bytes_per_worker",
+                ]);
+            }
+            require_fields(&layer, &layer_fields, &where_, &[])?;
             let layer_index = require_measurement_u64(
                 value(&layer, "layer_index"),
                 &format!("{where_}.layer_index"),
@@ -1848,7 +1979,7 @@ fn validate_performance_measurements(
                 )));
             }
             previous_layer = Some(layer_index);
-            for field in [
+            let mut numeric_fields = vec![
                 "runnable_width",
                 "estimated_total_cost",
                 "estimated_max_shard_cost",
@@ -1858,8 +1989,53 @@ fn validate_performance_measurements(
                 "per_worker_bytes",
                 "memory_budget_bytes",
                 "elapsed_ns",
-            ] {
+            ];
+            if package_sharding_schema.has_term_fields() {
+                numeric_fields.extend_from_slice(&[
+                    "prepared_shared_bytes",
+                    "combined_shared_bytes",
+                    "term_materialization_bytes_per_worker",
+                ]);
+            }
+            for field in numeric_fields {
                 require_measurement_u64(value(&layer, field), &format!("{where_}.{field}"))?;
+            }
+            let estimate_overflowed = require_bool(
+                value(&layer, "estimate_overflowed"),
+                &format!("{where_}.estimate_overflowed"),
+            )?;
+            if package_sharding_schema.has_term_fields() {
+                let shared_base_context_bytes = require_measurement_u64(
+                    value(&layer, "shared_base_context_bytes"),
+                    &format!("{where_}.shared_base_context_bytes"),
+                )?;
+                let prepared_shared_bytes = require_measurement_u64(
+                    value(&layer, "prepared_shared_bytes"),
+                    &format!("{where_}.prepared_shared_bytes"),
+                )?;
+                let combined_shared_bytes = require_measurement_u64(
+                    value(&layer, "combined_shared_bytes"),
+                    &format!("{where_}.combined_shared_bytes"),
+                )?;
+                let term_materialization_bytes_per_worker = require_measurement_u64(
+                    value(&layer, "term_materialization_bytes_per_worker"),
+                    &format!("{where_}.term_materialization_bytes_per_worker"),
+                )?;
+                let summary = require_object(
+                    value(&report, "package_sharding"),
+                    &format!("{WHERE}.package_sharding"),
+                )?;
+                validate_fast_shard_memory_fields(
+                    value(&summary, "memory_model")
+                        .string_value()
+                        .expect("summary memory model was already validated"),
+                    shared_base_context_bytes,
+                    prepared_shared_bytes,
+                    combined_shared_bytes,
+                    term_materialization_bytes_per_worker,
+                    estimate_overflowed,
+                    &where_,
+                )?;
             }
             if require_measurement_u64(
                 value(&layer, "memory_budget_bytes"),
@@ -1867,16 +2043,12 @@ fn validate_performance_measurements(
             )? != 1_073_741_824
             {
                 return Err(ReleaseManifestValidationError::new(format!(
-                    "{where_}.memory_budget_bytes disagrees with npa.fast-shard-memory.v1"
+                    "{where_}.memory_budget_bytes disagrees with the declared memory model"
                 )));
             }
             validate_fast_shard_reduction_reason(
                 value(&layer, "reduction_reason"),
                 &format!("{where_}.reduction_reason"),
-            )?;
-            require_bool(
-                value(&layer, "estimate_overflowed"),
-                &format!("{where_}.estimate_overflowed"),
             )?;
         }
         let package_shards = require_array(
@@ -2117,39 +2289,44 @@ fn validate_package_module_sharding(
 fn validate_package_sharding_summary(
     raw: &JsonValue<'_>,
     parent_where: &str,
+    schema: PackageShardingMeasurementSchema,
 ) -> Result<bool, ReleaseManifestValidationError> {
     let where_ = format!("{parent_where}.package_sharding");
     if raw.kind() == JsonValueKind::Null {
         return Ok(false);
     }
     let measurement = require_object(raw, &where_)?;
-    require_fields(
-        &measurement,
-        &[
-            "cost_model",
-            "memory_model",
-            "import_weight",
-            "memory_budget_bytes",
-            "fixed_worker_bytes",
-            "scratch_multiplier",
-            "requested_jobs",
-            "effective_jobs",
-            "reduction_reason",
-            "shared_base_context_bytes",
-            "per_worker_bytes",
-            "avoided_base_context_clone_bytes",
-            "estimate_overflowed",
-            "critical_path_cost",
-            "critical_path_module_count",
-            "critical_path_identity",
-            "critical_path_checker_elapsed_ns",
-            "barrier_elapsed_ns",
-        ],
-        &where_,
-        &[],
-    )?;
+    let mut fields = vec![
+        "cost_model",
+        "memory_model",
+        "import_weight",
+        "memory_budget_bytes",
+        "fixed_worker_bytes",
+        "scratch_multiplier",
+        "requested_jobs",
+        "effective_jobs",
+        "reduction_reason",
+        "shared_base_context_bytes",
+        "per_worker_bytes",
+        "avoided_base_context_clone_bytes",
+        "estimate_overflowed",
+        "critical_path_cost",
+        "critical_path_module_count",
+        "critical_path_identity",
+        "critical_path_checker_elapsed_ns",
+        "barrier_elapsed_ns",
+    ];
+    if schema.has_term_fields() {
+        fields.extend_from_slice(&[
+            "prepared_shared_bytes",
+            "combined_shared_bytes",
+            "term_materialization_bytes_per_worker",
+        ]);
+    }
+    require_fields(&measurement, &fields, &where_, &[])?;
+    let memory_model = value(&measurement, "memory_model").string_value();
     if value(&measurement, "cost_model").string_value() != Some("npa.fast-shard-cost.v1")
-        || value(&measurement, "memory_model").string_value() != Some("npa.fast-shard-memory.v1")
+        || !memory_model.is_some_and(|memory_model| schema.accepts_memory_model(memory_model))
     {
         return Err(ReleaseManifestValidationError::new(format!(
             "{where_} has an unsupported model identifier"
@@ -2169,7 +2346,7 @@ fn validate_package_sharding_summary(
             )));
         }
     }
-    for field in [
+    let mut numeric_fields = vec![
         "import_weight",
         "memory_budget_bytes",
         "fixed_worker_bytes",
@@ -2183,22 +2360,91 @@ fn validate_package_sharding_summary(
         "critical_path_module_count",
         "critical_path_checker_elapsed_ns",
         "barrier_elapsed_ns",
-    ] {
+    ];
+    if schema.has_term_fields() {
+        numeric_fields.extend_from_slice(&[
+            "prepared_shared_bytes",
+            "combined_shared_bytes",
+            "term_materialization_bytes_per_worker",
+        ]);
+    }
+    for field in numeric_fields {
         require_measurement_u64(value(&measurement, field), &format!("{where_}.{field}"))?;
+    }
+    let estimate_overflowed = require_bool(
+        value(&measurement, "estimate_overflowed"),
+        &format!("{where_}.estimate_overflowed"),
+    )?;
+    if schema.has_term_fields() {
+        validate_fast_shard_memory_fields(
+            memory_model.expect("memory model was already validated"),
+            require_measurement_u64(
+                value(&measurement, "shared_base_context_bytes"),
+                &format!("{where_}.shared_base_context_bytes"),
+            )?,
+            require_measurement_u64(
+                value(&measurement, "prepared_shared_bytes"),
+                &format!("{where_}.prepared_shared_bytes"),
+            )?,
+            require_measurement_u64(
+                value(&measurement, "combined_shared_bytes"),
+                &format!("{where_}.combined_shared_bytes"),
+            )?,
+            require_measurement_u64(
+                value(&measurement, "term_materialization_bytes_per_worker"),
+                &format!("{where_}.term_materialization_bytes_per_worker"),
+            )?,
+            estimate_overflowed,
+            &where_,
+        )?;
     }
     validate_fast_shard_reduction_reason(
         value(&measurement, "reduction_reason"),
         &format!("{where_}.reduction_reason"),
-    )?;
-    require_bool(
-        value(&measurement, "estimate_overflowed"),
-        &format!("{where_}.estimate_overflowed"),
     )?;
     verification_hash(
         value(&measurement, "critical_path_identity"),
         &format!("{where_}.critical_path_identity"),
     )?;
     Ok(true)
+}
+
+fn validate_fast_shard_memory_fields(
+    memory_model: &str,
+    shared_base_context_bytes: u64,
+    prepared_shared_bytes: u64,
+    combined_shared_bytes: u64,
+    term_materialization_bytes_per_worker: u64,
+    estimate_overflowed: bool,
+    where_: &str,
+) -> Result<(), ReleaseManifestValidationError> {
+    let combined = shared_base_context_bytes.checked_add(prepared_shared_bytes);
+    let combined_matches = combined_shared_bytes == combined.unwrap_or(u64::MAX);
+    let overflow_is_reported = combined.is_some() || estimate_overflowed;
+    let model_matches = match memory_model {
+        "npa.fast-shard-memory.v1" => {
+            prepared_shared_bytes == 0
+                && combined_shared_bytes == shared_base_context_bytes
+                && term_materialization_bytes_per_worker == 0
+        }
+        "npa.fast-shard-memory.v2-term-materialization" => {
+            prepared_shared_bytes == 0
+                && combined_shared_bytes == shared_base_context_bytes
+                && term_materialization_bytes_per_worker == 268_435_456
+        }
+        "npa.fast-shard-memory.v3-term-materialization-prepared-retention" => {
+            combined_matches
+                && overflow_is_reported
+                && term_materialization_bytes_per_worker == 268_435_456
+        }
+        _ => false,
+    };
+    if !model_matches {
+        return Err(ReleaseManifestValidationError::new(format!(
+            "{where_} disagrees with its declared memory model"
+        )));
+    }
+    Ok(())
 }
 
 fn validate_fast_shard_reduction_reason(
@@ -3191,9 +3437,23 @@ fn validate_verification(
     value_: &JsonValue<'_>,
     generated_hashes: &BTreeMap<String, String>,
     package_root: &str,
+    manifest_schema: &str,
 ) -> Result<(), ReleaseManifestValidationError> {
     let verification = require_object(value_, "verification")?;
     require_fields(&verification, VERIFICATION_FIELDS, "verification", &[])?;
+    let npa_cli_version = require_matching_text(
+        value(&verification, "npa_cli_crate_version"),
+        "verification.npa_cli_crate_version",
+        cli_version_is_valid,
+    )?;
+    let host = cli_host_disposition(npa_cli_version).ok_or_else(|| {
+        ReleaseManifestValidationError::new("verification.npa_cli_crate_version is unsupported")
+    })?;
+    if host.manifest_schema != manifest_schema {
+        return Err(ReleaseManifestValidationError::new(
+            "verification.npa_cli_crate_version is unsupported for manifest.schema",
+        ));
+    }
     if value(&verification, "package_lock_mode").string_value() != Some("checked") {
         return Err(ReleaseManifestValidationError::new(
             "verification.package_lock_mode must be 'checked'",
@@ -3253,11 +3513,6 @@ fn validate_verification(
         "verification.npa_core_tree_hash",
         |text| require_lower_hex(text, 40) || require_lower_hex(text, 64),
     )?;
-    let npa_cli_version = require_matching_text(
-        value(&verification, "npa_cli_crate_version"),
-        "verification.npa_cli_crate_version",
-        cli_version_is_valid,
-    )?;
     let cargo_manifest_path = require_locator(
         value(&verification, "cargo_manifest_path"),
         "verification.cargo_manifest_path",
@@ -3314,16 +3569,20 @@ fn validate_verification(
 
 fn validate_manifest(
     value_: &JsonValue<'_>,
-    require_v0_2: bool,
+    requirement: RequiredManifestSchema,
 ) -> Result<ReleaseManifestValidation, ReleaseManifestValidationError> {
     let root = require_object(value_, "manifest")?;
     match root.get("schema").and_then(|value| value.string_value()) {
         Some(V0_1_SCHEMA) => {
             require_fields(&root, BASE_FIELDS, "manifest", &[])?;
             validate_retained_manifest(&root)?;
-            if require_v0_2 {
+            if !matches!(requirement, RequiredManifestSchema::Any) {
                 return Err(ReleaseManifestValidationError::new(
-                    "historical v0.1 evidence does not satisfy --require-v0.2",
+                    if matches!(requirement, RequiredManifestSchema::CurrentV0_3) {
+                        "historical v0.1 evidence does not satisfy --require-v0.3"
+                    } else {
+                        "historical v0.1 evidence does not satisfy --require-v0.2"
+                    },
                 ));
             }
             Ok(ReleaseManifestValidation {
@@ -3341,10 +3600,33 @@ fn validate_manifest(
                 value(&root, "verification"),
                 &generated_hashes,
                 package_root,
+                V0_2_SCHEMA,
             )?;
+            if matches!(requirement, RequiredManifestSchema::CurrentV0_3) {
+                return Err(ReleaseManifestValidationError::new(
+                    "historical v0.2 evidence does not satisfy --require-v0.3",
+                ));
+            }
             Ok(ReleaseManifestValidation {
                 input_schema: V0_2_SCHEMA,
-                evidence_classification: "checked-v0.2",
+                evidence_classification: "historical-v0.2",
+            })
+        }
+        Some(V0_3_SCHEMA) => {
+            let mut required = BASE_FIELDS.to_vec();
+            required.push("verification");
+            require_fields(&root, &required, "manifest", &[])?;
+            let generated_hashes = validate_retained_manifest(&root)?;
+            let package_root = require_text(value(&root, "package_root"), "package_root")?;
+            validate_verification(
+                value(&root, "verification"),
+                &generated_hashes,
+                package_root,
+                V0_3_SCHEMA,
+            )?;
+            Ok(ReleaseManifestValidation {
+                input_schema: V0_3_SCHEMA,
+                evidence_classification: "checked-v0.3",
             })
         }
         _ => Err(ReleaseManifestValidationError::new(
@@ -3356,8 +3638,9 @@ fn validate_manifest(
 #[cfg(test)]
 mod tests {
     use super::{
-        shell_words, validate_command_result_shape, validate_kernel_fuel_diagnostic,
-        validate_performance_measurements, validate_timestamp, JsonDocument,
+        shell_words, validate_command_result_shape, validate_diagnostic_conversion,
+        validate_kernel_fuel_diagnostic, validate_performance_measurements, validate_timestamp,
+        JsonDocument,
     };
     use npa_api::{
         performance_measurement_report_json, PerformanceAcceptedKernelMeasurement,
@@ -3367,7 +3650,11 @@ mod tests {
         PerformanceMeasurementLabel, PerformanceMeasurementMode, PerformanceMeasurementRecorder,
         PerformanceModuleMeasurement, PerformancePackageShardCostModel,
         PerformancePackageShardMemoryModel, PerformancePackageShardReductionReason,
-        PerformancePackageShardingMeasurement,
+        PerformancePackageShardingMeasurement, PERFORMANCE_MEASUREMENTS_SCHEMA_V0_1,
+        PERFORMANCE_MEASUREMENTS_SCHEMA_V0_2, PERFORMANCE_MEASUREMENTS_SCHEMA_V0_3,
+        PERFORMANCE_MEASUREMENTS_SCHEMA_V0_4, PERFORMANCE_MEASUREMENTS_SCHEMA_V0_5,
+        PERFORMANCE_MEASUREMENTS_SCHEMA_V0_6, PERFORMANCE_MEASUREMENTS_SCHEMA_V0_8,
+        PERFORMANCE_MEASUREMENTS_SCHEMA_V0_9,
     };
 
     #[test]
@@ -3407,6 +3694,14 @@ mod tests {
         let valid = JsonDocument::parse(&json).unwrap();
         validate_performance_measurements(valid.root(), "summary").unwrap();
 
+        let legacy_v0_4 = legacy_performance_measurements_v0_4(&json);
+        let legacy = JsonDocument::parse(&legacy_v0_4).unwrap();
+        validate_performance_measurements(legacy.root(), "summary").unwrap();
+
+        let legacy_v0_3 = legacy_performance_measurements_v0_3(&json);
+        let legacy = JsonDocument::parse(&legacy_v0_3).unwrap();
+        validate_performance_measurements(legacy.root(), "summary").unwrap();
+
         let legacy_v0_2 = legacy_performance_measurements_v0_2(&json);
         let legacy = JsonDocument::parse(&legacy_v0_2).unwrap();
         validate_performance_measurements(legacy.root(), "summary").unwrap();
@@ -3425,7 +3720,7 @@ mod tests {
         );
 
         let old_schema_with_new_shape = json.replacen(
-            "\"schema\":\"npa.performance.measurements.v0.3\"",
+            "\"schema\":\"npa.performance.measurements.v0.9\"",
             "\"schema\":\"npa.performance.measurements.v0.1\"",
             1,
         );
@@ -3469,6 +3764,134 @@ mod tests {
     }
 
     #[test]
+    fn common_measurement_historical_v0_2_through_v0_7_frozen_matrix_is_exact() {
+        const SOURCE: &str = include_str!(
+            "../../../testdata/performance/fixtures/common-measurement-historical-readers.v0.1.json"
+        );
+        const IDS: &[&str] = &[
+            "v0.2-v1", "v0.3-v1", "v0.4-v1", "v0.5-v1", "v0.6-v1", "v0.6-v2", "v0.7-v1", "v0.7-v2",
+            "v0.7-v3",
+        ];
+
+        let document = JsonDocument::parse(SOURCE).expect("frozen historical-reader fixture");
+        let root = document.root().object_members().expect("fixture object");
+        assert_eq!(
+            root.iter().map(|member| member.key()).collect::<Vec<_>>(),
+            ["schema", "cases"]
+        );
+        assert_eq!(
+            root[0].value().string_value(),
+            Some("npa.performance.historical-reader-fixtures.v0.1")
+        );
+        let cases = root[1].value().array_elements().expect("fixture cases");
+        assert_eq!(cases.len(), IDS.len());
+        for (case, expected_id) in cases.iter().zip(IDS) {
+            let fields = case.object_members().expect("historical fixture case");
+            assert_eq!(
+                fields.iter().map(|member| member.key()).collect::<Vec<_>>(),
+                ["id", "measurement"]
+            );
+            assert_eq!(fields[0].value().string_value(), Some(*expected_id));
+            validate_performance_measurements(fields[1].value(), "summary")
+                .unwrap_or_else(|error| panic!("{expected_id}: {error}"));
+        }
+    }
+
+    #[test]
+    fn common_measurement_vocabularies_are_closed_ordered_and_unit_checked() {
+        let mut recorder = PerformanceMeasurementRecorder::new(PerformanceMeasurementMode::Summary);
+        recorder.add_counter(PerformanceMeasurementLabel::CacheContextSchemaMisses, 1);
+        recorder.add_counter(PerformanceMeasurementLabel::CacheContextStale, 2);
+        recorder.add_counter(
+            PerformanceMeasurementLabel::PackageSelectionCandidatePaths,
+            3,
+        );
+        recorder.add_counter(PerformanceMeasurementLabel::CertificateTermRootRequests, 4);
+        recorder.add_counter(PerformanceMeasurementLabel::PackageModulePayloadsFrozen, 5);
+        let current = performance_measurement_report_json(&recorder.report().unwrap());
+        let document = JsonDocument::parse(&current).unwrap();
+        validate_performance_measurements(document.root(), "summary").unwrap();
+
+        for historical_schema in [
+            PERFORMANCE_MEASUREMENTS_SCHEMA_V0_1,
+            PERFORMANCE_MEASUREMENTS_SCHEMA_V0_2,
+            PERFORMANCE_MEASUREMENTS_SCHEMA_V0_3,
+            PERFORMANCE_MEASUREMENTS_SCHEMA_V0_4,
+            PERFORMANCE_MEASUREMENTS_SCHEMA_V0_5,
+            PERFORMANCE_MEASUREMENTS_SCHEMA_V0_6,
+        ] {
+            let historical = match historical_schema {
+                PERFORMANCE_MEASUREMENTS_SCHEMA_V0_1 => {
+                    legacy_performance_measurements_v0_1(&current)
+                }
+                PERFORMANCE_MEASUREMENTS_SCHEMA_V0_2 => {
+                    legacy_performance_measurements_v0_2(&current)
+                }
+                PERFORMANCE_MEASUREMENTS_SCHEMA_V0_3 => {
+                    legacy_performance_measurements_v0_3(&current)
+                }
+                PERFORMANCE_MEASUREMENTS_SCHEMA_V0_4 => {
+                    legacy_performance_measurements_v0_4(&current)
+                }
+                PERFORMANCE_MEASUREMENTS_SCHEMA_V0_5 => {
+                    legacy_performance_measurements_v0_5(&current)
+                }
+                PERFORMANCE_MEASUREMENTS_SCHEMA_V0_6 => {
+                    legacy_performance_measurements_v0_6(&current)
+                }
+                _ => unreachable!(),
+            };
+            let document = JsonDocument::parse(&historical).unwrap();
+            let error = validate_performance_measurements(document.root(), "summary")
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("unknown or unavailable"),
+                "{historical_schema}: {error}"
+            );
+        }
+
+        let counter = "{\"label\":\"cache.context_schema_misses\",\"unit\":\"count\",\"value\":1}";
+        let duplicate = current.replacen(counter, &format!("{counter},{counter}"), 1);
+        let document = JsonDocument::parse(&duplicate).unwrap();
+        let error = validate_performance_measurements(document.root(), "summary")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("duplicated"), "{error}");
+
+        let unknown = current.replacen("cache.context_schema_misses", "cache.unknown", 1);
+        let document = JsonDocument::parse(&unknown).unwrap();
+        let error = validate_performance_measurements(document.root(), "summary")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unknown or unavailable"), "{error}");
+
+        let wrong_unit = current.replacen(
+            "\"label\":\"cache.context_schema_misses\",\"unit\":\"count\"",
+            "\"label\":\"cache.context_schema_misses\",\"unit\":\"bytes\"",
+            1,
+        );
+        let document = JsonDocument::parse(&wrong_unit).unwrap();
+        let error = validate_performance_measurements(document.root(), "summary")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unit disagrees"), "{error}");
+
+        let first = "{\"label\":\"cache.context_schema_misses\",\"unit\":\"count\",\"value\":1}";
+        let second = "{\"label\":\"cache.context_stale\",\"unit\":\"count\",\"value\":2}";
+        let reversed = current.replacen(
+            &format!("{first},{second}"),
+            &format!("{second},{first}"),
+            1,
+        );
+        let document = JsonDocument::parse(&reversed).unwrap();
+        let error = validate_performance_measurements(document.root(), "summary")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("canonical order"), "{error}");
+    }
+
+    #[test]
     fn common_measurement_validator_accepts_historical_detailed_v0_1_shape() {
         let mut recorder =
             PerformanceMeasurementRecorder::new(PerformanceMeasurementMode::Detailed);
@@ -3501,7 +3924,10 @@ mod tests {
             effective_jobs: 2,
             reduction_reason: PerformancePackageShardReductionReason::RunnableWidth,
             shared_base_context_bytes: 10,
+            prepared_shared_bytes: 0,
+            combined_shared_bytes: 10,
             per_worker_bytes: 20,
+            term_materialization_bytes_per_worker: 0,
             avoided_base_context_clone_bytes: 20,
             estimate_overflowed: false,
             critical_path_cost: 30,
@@ -3513,6 +3939,51 @@ mod tests {
         let json = performance_measurement_report_json(&recorder.report().unwrap());
         let valid = JsonDocument::parse(&json).unwrap();
         validate_performance_measurements(valid.root(), "summary").unwrap();
+
+        let historical_v1_shape = json
+            .replace(",\"prepared_shared_bytes\":0", "")
+            .replace(",\"combined_shared_bytes\":10", "")
+            .replace(",\"term_materialization_bytes_per_worker\":0", "");
+        for schema in [
+            PERFORMANCE_MEASUREMENTS_SCHEMA_V0_2,
+            PERFORMANCE_MEASUREMENTS_SCHEMA_V0_3,
+            PERFORMANCE_MEASUREMENTS_SCHEMA_V0_4,
+            PERFORMANCE_MEASUREMENTS_SCHEMA_V0_5,
+        ] {
+            let historical =
+                historical_v1_shape.replacen(PERFORMANCE_MEASUREMENTS_SCHEMA_V0_9, schema, 1);
+            let document = JsonDocument::parse(&historical).unwrap();
+            validate_performance_measurements(document.root(), "summary")
+                .unwrap_or_else(|error| panic!("{schema} genuine v1 shape: {error}"));
+        }
+        let v0_5_with_future_fields = json.replacen(
+            PERFORMANCE_MEASUREMENTS_SCHEMA_V0_9,
+            PERFORMANCE_MEASUREMENTS_SCHEMA_V0_5,
+            1,
+        );
+        let document = JsonDocument::parse(&v0_5_with_future_fields).unwrap();
+        assert!(validate_performance_measurements(document.root(), "summary").is_err());
+
+        let v0_6_v1 = json.replacen(
+            PERFORMANCE_MEASUREMENTS_SCHEMA_V0_9,
+            PERFORMANCE_MEASUREMENTS_SCHEMA_V0_6,
+            1,
+        );
+        let document = JsonDocument::parse(&v0_6_v1).unwrap();
+        validate_performance_measurements(document.root(), "summary").unwrap();
+        let v0_6_v2 = v0_6_v1
+            .replacen(
+                "npa.fast-shard-memory.v1",
+                "npa.fast-shard-memory.v2-term-materialization",
+                1,
+            )
+            .replacen(
+                "\"term_materialization_bytes_per_worker\":0",
+                "\"term_materialization_bytes_per_worker\":268435456",
+                1,
+            );
+        let document = JsonDocument::parse(&v0_6_v2).unwrap();
+        validate_performance_measurements(document.root(), "summary").unwrap();
 
         let unknown_cost_model = json.replacen(
             "\"cost_model\":\"npa.fast-shard-cost.v1\"",
@@ -3533,10 +4004,60 @@ mod tests {
         let inconsistent_weight = json.replacen("\"import_weight\":4096", "\"import_weight\":1", 1);
         let inconsistent_weight = JsonDocument::parse(&inconsistent_weight).unwrap();
         assert!(validate_performance_measurements(inconsistent_weight.root(), "summary").is_err());
+
+        let mut v3 = PerformanceMeasurementRecorder::new(PerformanceMeasurementMode::Summary);
+        v3.set_package_sharding(PerformancePackageShardingMeasurement {
+            cost_model: PerformancePackageShardCostModel::FastShardCostV1,
+            memory_model:
+                PerformancePackageShardMemoryModel::FastShardMemoryV3TermMaterializationPreparedRetention,
+            import_weight: 4_096,
+            memory_budget_bytes: 1_073_741_824,
+            fixed_worker_bytes: 8_388_608,
+            scratch_multiplier: 4,
+            requested_jobs: 4,
+            effective_jobs: 2,
+            reduction_reason: PerformancePackageShardReductionReason::RunnableWidth,
+            shared_base_context_bytes: 10,
+            prepared_shared_bytes: 4,
+            combined_shared_bytes: 14,
+            per_worker_bytes: 268_435_476,
+            term_materialization_bytes_per_worker: 268_435_456,
+            avoided_base_context_clone_bytes: 20,
+            estimate_overflowed: false,
+            critical_path_cost: 30,
+            critical_path_module_count: 2,
+            critical_path_identity: format!("sha256:{}", "00".repeat(32)),
+            critical_path_checker_elapsed_ns: 40,
+            barrier_elapsed_ns: 50,
+        });
+        let v3 = performance_measurement_report_json(&v3.report().unwrap());
+        let document = JsonDocument::parse(&v3).unwrap();
+        validate_performance_measurements(document.root(), "summary").unwrap();
+        let v0_6_with_v3 = v3.replacen(
+            PERFORMANCE_MEASUREMENTS_SCHEMA_V0_9,
+            PERFORMANCE_MEASUREMENTS_SCHEMA_V0_6,
+            1,
+        );
+        let document = JsonDocument::parse(&v0_6_with_v3).unwrap();
+        assert!(validate_performance_measurements(document.root(), "summary").is_err());
+        let mismatched_combined = v3.replacen(
+            "\"combined_shared_bytes\":14",
+            "\"combined_shared_bytes\":13",
+            1,
+        );
+        let document = JsonDocument::parse(&mismatched_combined).unwrap();
+        assert!(validate_performance_measurements(document.root(), "summary").is_err());
+        let wrong_term_charge = v3.replacen(
+            "\"term_materialization_bytes_per_worker\":268435456",
+            "\"term_materialization_bytes_per_worker\":0",
+            1,
+        );
+        let document = JsonDocument::parse(&wrong_term_charge).unwrap();
+        assert!(validate_performance_measurements(document.root(), "summary").is_err());
     }
 
     #[test]
-    fn common_measurement_v0_3_requires_and_strictly_validates_declaration_kernel() {
+    fn common_measurement_v0_3_and_v0_4_require_and_strictly_validate_declaration_kernel() {
         let mut recorder =
             PerformanceMeasurementRecorder::new(PerformanceMeasurementMode::Detailed);
         recorder.record_declaration(PerformanceDeclarationMeasurement {
@@ -3557,6 +4078,9 @@ mod tests {
         });
         let current = performance_measurement_report_json(&recorder.report().unwrap());
         let document = JsonDocument::parse(&current).unwrap();
+        validate_performance_measurements(document.root(), "detailed").unwrap();
+        let historical_v0_3 = legacy_performance_measurements_v0_3(&current);
+        let document = JsonDocument::parse(&historical_v0_3).unwrap();
         validate_performance_measurements(document.root(), "detailed").unwrap();
         assert!(current.contains("\"kernel\":null"));
         assert!(current.contains("\"subsystem\":\"fast_kernel\""));
@@ -3594,11 +4118,19 @@ mod tests {
             ),
             (
                 current.replacen(
-                    "\"physical_reductions\":21",
-                    "\"physical_reductions\":22",
+                    "\"physical_reductions\":13",
+                    "\"physical_reductions\":14",
                     1,
                 ),
                 "physical_reductions",
+            ),
+            (
+                current.replacen(
+                    "\"iota_steps\":7",
+                    "\"iota_steps\":7,\"zeta_steps\":0",
+                    1,
+                ),
+                "unknown field 'zeta_steps'",
             ),
             (
                 current.replace("\"capacity\":256", "\"capacity\":255"),
@@ -3652,7 +4184,7 @@ mod tests {
     }
 
     #[test]
-    fn command_result_v0_4_kernel_fuel_accepts_conversion_and_whnf_exact_shapes() {
+    fn command_result_v0_5_kernel_fuel_accepts_conversion_and_whnf_exact_shapes() {
         let conversion = valid_conversion_context_json();
         let conversion_fuel = valid_conversion_fuel_json();
         validate_kernel_fuel_json(&conversion_fuel, Some(conversion)).unwrap();
@@ -3660,17 +4192,17 @@ mod tests {
         let whnf_fuel = valid_whnf_fuel_json();
         validate_kernel_fuel_json(&whnf_fuel, None).unwrap();
 
-        let source = v0_4_command_result_with_fuel(&conversion_fuel, Some(conversion));
+        let source = v0_5_command_result_with_fuel(&conversion_fuel, Some(conversion));
         let document = JsonDocument::parse(&source).unwrap();
-        validate_command_result_shape(document.root(), "0.8.0").unwrap();
+        validate_command_result_shape(document.root(), "0.9.0").unwrap();
 
         let relabeled = source.replacen(
-            "npa.package.command_result.v0.4",
+            "npa.package.command_result.v0.5",
             "npa.package.command_result.v0.3",
             1,
         );
         let relabeled = JsonDocument::parse(&relabeled).unwrap();
-        let error = validate_command_result_shape(relabeled.root(), "0.7.0")
+        let error = validate_command_result_shape(relabeled.root(), "0.6.0")
             .unwrap_err()
             .to_string();
         assert!(error.contains("unknown field 'kernel_fuel'"), "{error}");
@@ -3681,14 +4213,14 @@ mod tests {
             1,
         );
         let document = JsonDocument::parse(&unknown_diagnostic).unwrap();
-        let error = validate_command_result_shape(document.root(), "0.8.0")
+        let error = validate_command_result_shape(document.root(), "0.9.0")
             .unwrap_err()
             .to_string();
         assert!(error.contains("unknown field 'unknown'"), "{error}");
     }
 
     #[test]
-    fn command_result_v0_4_kernel_fuel_accepts_honest_overflow_and_synthetic_hotsets() {
+    fn command_result_v0_5_kernel_fuel_accepts_honest_overflow_and_synthetic_hotsets() {
         let conversion = valid_conversion_context_json();
         let operation_overflow = with_top_overflowed(
             valid_conversion_fuel_json()
@@ -3725,7 +4257,7 @@ mod tests {
     }
 
     #[test]
-    fn command_result_v0_4_kernel_fuel_rejects_numbers_arithmetic_and_cross_object_mismatches() {
+    fn command_result_v0_5_kernel_fuel_rejects_numbers_arithmetic_and_cross_object_mismatches() {
         let valid = valid_conversion_fuel_json();
         let conversion = valid_conversion_context_json();
         for (changed, expected) in [
@@ -3751,8 +4283,8 @@ mod tests {
             ),
             (
                 valid.replacen(
-                    "\"physical_reductions\":4821102",
-                    "\"physical_reductions\":4821103",
+                    "\"physical_reductions\":4821095",
+                    "\"physical_reductions\":4821096",
                     1,
                 ),
                 "physical_reductions",
@@ -3808,7 +4340,7 @@ mod tests {
     }
 
     #[test]
-    fn command_result_v0_4_kernel_fuel_rejects_closed_vocabularies_and_bounds() {
+    fn command_result_v0_5_kernel_fuel_rejects_closed_vocabularies_and_bounds() {
         let valid = valid_conversion_fuel_json();
         let conversion = valid_conversion_context_json();
         let mut unknown_top = valid.clone();
@@ -3873,8 +4405,8 @@ mod tests {
             ),
             (
                 valid.replace(
-                    "npa.kernel-fuel-diagnostic.v0.1",
                     "npa.kernel-fuel-diagnostic.v0.2",
+                    "npa.kernel-fuel-diagnostic.v0.1",
                 ),
                 "schema is unsupported",
             ),
@@ -3913,10 +4445,27 @@ mod tests {
             let error = validate_kernel_fuel_json(&changed, Some(conversion)).unwrap_err();
             assert!(error.contains(expected), "expected {expected}: {error}");
         }
+
+        for retired_head in [
+            conversion.replace("\"lhs_head\":\"application\"", "\"lhs_head\":\"let\""),
+            conversion.replace(
+                "\"rhs_head\":\"constant:A.expected\"",
+                "\"rhs_head\":\"let\"",
+            ),
+        ] {
+            let retired_head = JsonDocument::parse(&retired_head).unwrap();
+            let error = validate_diagnostic_conversion(retired_head.root(), "conversion")
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("is not a bounded expression head"),
+                "{error}"
+            );
+        }
     }
 
     #[test]
-    fn command_result_v0_4_kernel_fuel_rejects_invalid_hotsets() {
+    fn command_result_v0_5_kernel_fuel_rejects_invalid_hotsets() {
         let valid = valid_conversion_fuel_with_hotset();
         let conversion = valid_conversion_context_json();
         let duplicate = valid.replace("MyProject.Residue.normalize", "MyProject.Expr.eval");
@@ -3986,31 +4535,80 @@ mod tests {
     }
 
     #[test]
-    fn command_result_validator_accepts_integrated_timing_v0_2() {
+    fn command_result_validator_accepts_current_nested_measurements_for_live_verification() {
         let mut recorder = PerformanceMeasurementRecorder::new(PerformanceMeasurementMode::Summary);
         recorder.add_counter(PerformanceMeasurementLabel::PackageModulesChecked, 2);
         let measurements =
             performance_measurement_report_json(&recorder.report().expect("enabled report"));
         let source = format!(
-            "{{\"schema\":\"npa.package.command_result.v0.4\",\"command\":\"package verify-certs\",\"root\":\".\",\"status\":\"passed\",\"diagnostics\":[{{\"kind\":\"GeneratedArtifact\",\"reason_code\":\"package_verified\",\"severity\":\"info\"}}],\"artifacts\":[],\"timings\":{{\"schema\":\"npa.package.timings.v0.2\",\"mode\":\"summary\",\"unit\":\"ms\",\"proof_evidence\":false,\"build_evidence\":false,\"trusted\":false,\"total_ms\":1,\"measurements\":{measurements}}}}}"
+            "{{\"schema\":\"npa.package.command_result.v0.5\",\"command\":\"package verify-certs\",\"root\":\".\",\"status\":\"passed\",\"diagnostics\":[{{\"kind\":\"GeneratedArtifact\",\"reason_code\":\"package_verified\",\"severity\":\"info\"}}],\"artifacts\":[],\"timings\":{{\"schema\":\"npa.package.timings.v0.2\",\"mode\":\"summary\",\"unit\":\"ms\",\"proof_evidence\":false,\"build_evidence\":false,\"trusted\":false,\"total_ms\":1,\"measurements\":{measurements}}}}}"
         );
         let document = JsonDocument::parse(&source).unwrap();
-        validate_command_result_shape(document.root(), "0.8.0").unwrap();
+        validate_command_result_shape(document.root(), "0.9.0").unwrap();
+
+        let prior_measurements = measurements.replacen(
+            PERFORMANCE_MEASUREMENTS_SCHEMA_V0_9,
+            PERFORMANCE_MEASUREMENTS_SCHEMA_V0_8,
+            1,
+        );
+        let prior_measurements_source = source.replace(&measurements, &prior_measurements);
+        let prior_measurements_document = JsonDocument::parse(&prior_measurements_source).unwrap();
+        let error = validate_command_result_shape(prior_measurements_document.root(), "0.9.0")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("requires performance measurements v0.9"),
+            "{error}"
+        );
+
+        let prior_timings = source
+            .replace(
+                "\"schema\":\"npa.package.timings.v0.2\"",
+                "\"schema\":\"npa.package.timings.v0.1\"",
+            )
+            .replace(
+                ",\"trusted\":false,\"total_ms\":1,\"measurements\":",
+                ",\"total_ms\":1,\"discarded_measurements\":",
+            );
+        let prior_timings_document = JsonDocument::parse(&prior_timings).unwrap();
+        let error = validate_command_result_shape(prior_timings_document.root(), "0.9.0")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("requires package timings v0.2"), "{error}");
 
         let historical_measurements = legacy_performance_measurements_v0_2(&measurements);
         let historical_source = format!(
             "{{\"schema\":\"npa.package.command_result.v0.3\",\"command\":\"package verify-certs\",\"root\":\".\",\"status\":\"passed\",\"diagnostics\":[{{\"kind\":\"GeneratedArtifact\",\"reason_code\":\"package_verified\",\"severity\":\"info\"}}],\"artifacts\":[],\"timings\":{{\"schema\":\"npa.package.timings.v0.2\",\"mode\":\"summary\",\"unit\":\"ms\",\"proof_evidence\":false,\"build_evidence\":false,\"trusted\":false,\"total_ms\":1,\"measurements\":{historical_measurements}}}}}"
         );
         let historical_document = JsonDocument::parse(&historical_source).unwrap();
-        validate_command_result_shape(historical_document.root(), "0.7.0").unwrap();
+        validate_command_result_shape(historical_document.root(), "0.6.0").unwrap();
 
         let mismatched_measurements =
             measurements.replacen("\"mode\":\"summary\"", "\"mode\":\"detailed\"", 1);
         let mismatched_source = format!(
-            "{{\"schema\":\"npa.package.command_result.v0.4\",\"command\":\"package verify-certs\",\"root\":\".\",\"status\":\"passed\",\"diagnostics\":[{{\"kind\":\"GeneratedArtifact\",\"reason_code\":\"package_verified\",\"severity\":\"info\"}}],\"artifacts\":[],\"timings\":{{\"schema\":\"npa.package.timings.v0.2\",\"mode\":\"summary\",\"unit\":\"ms\",\"proof_evidence\":false,\"build_evidence\":false,\"trusted\":false,\"total_ms\":1,\"measurements\":{mismatched_measurements}}}}}"
+            "{{\"schema\":\"npa.package.command_result.v0.5\",\"command\":\"package verify-certs\",\"root\":\".\",\"status\":\"passed\",\"diagnostics\":[{{\"kind\":\"GeneratedArtifact\",\"reason_code\":\"package_verified\",\"severity\":\"info\"}}],\"artifacts\":[],\"timings\":{{\"schema\":\"npa.package.timings.v0.2\",\"mode\":\"summary\",\"unit\":\"ms\",\"proof_evidence\":false,\"build_evidence\":false,\"trusted\":false,\"total_ms\":1,\"measurements\":{mismatched_measurements}}}}}"
         );
         let mismatched_document = JsonDocument::parse(&mismatched_source).unwrap();
-        assert!(validate_command_result_shape(mismatched_document.root(), "0.8.0").is_err());
+        assert!(validate_command_result_shape(mismatched_document.root(), "0.9.0").is_err());
+    }
+
+    #[test]
+    fn release_targeted_authoring_differential_rejects_local_hit_build_certs_results_regardless_of_nested_schema(
+    ) {
+        let mut recorder = PerformanceMeasurementRecorder::new(PerformanceMeasurementMode::Summary);
+        recorder.add_counter(PerformanceMeasurementLabel::CacheContextHits, 1);
+        let current = performance_measurement_report_json(&recorder.report().unwrap());
+        let historical = legacy_performance_measurements_v0_3(&current);
+
+        for measurements in [&current, &historical] {
+            let source = r#"{"schema":"npa.package.command_result.v0.5","command":"package build-certs","root":".","status":"passed","diagnostics":[{"kind":"GeneratedArtifact","reason_code":"targeted_authoring_cache_local_only","severity":"info","field":"targeted_authoring_cache","actual_value":"trusted=false;build_evidence=false;proof_evidence=false;locally_accelerated=false"}],"artifacts":[],"timings":{"schema":"npa.package.timings.v0.2","mode":"summary","unit":"ms","proof_evidence":false,"build_evidence":false,"trusted":false,"total_ms":1,"measurements":__MEASUREMENTS__}}"#
+                .replace("__MEASUREMENTS__", measurements);
+            let document = JsonDocument::parse(&source).unwrap();
+            let error = validate_command_result_shape(document.root(), "0.9.0")
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("must be 'package verify-certs'"), "{error}");
+        }
     }
 
     fn valid_conversion_context_json() -> &'static str {
@@ -4057,8 +4655,7 @@ mod tests {
                 beta_steps: 6,
                 delta_steps: 0,
                 iota_steps: 7,
-                zeta_steps: 8,
-                physical_reductions: 21,
+                physical_reductions: 13,
                 overflowed: false,
             },
             retained_delta_constants: PerformanceKernelDeltaHotsetSummary {
@@ -4077,7 +4674,7 @@ mod tests {
     }
 
     fn valid_conversion_fuel_json() -> String {
-        "{\"schema\":\"npa.kernel-fuel-diagnostic.v0.1\",\"trusted\":false,\"proof_evidence\":false,\"subsystem\":\"fast_kernel\",\"resource\":\"conversion\",\"failed_operation\":{\"fuel\":{\"budget\":5000000,\"spent\":5000000,\"remaining\":0,\"exhausted\":true,\"overflowed\":false},\"work\":{\"check_calls\":0,\"infer_calls\":0,\"whnf_calls\":9120,\"defeq_calls\":4187,\"quick_equality_hits\":203,\"beta_steps\":64,\"delta_steps\":4821031,\"iota_steps\":0,\"zeta_steps\":7,\"physical_reductions\":4821102,\"overflowed\":false}},\"declaration\":{\"fuel\":{\"whnf\":{\"calls\":114,\"logical_spent\":18342,\"successful_operation_fuel\":18342,\"exhausted_operation_fuel\":0,\"overflowed\":false},\"conversion\":{\"calls\":27,\"logical_spent\":5000218,\"successful_operation_fuel\":218,\"exhausted_operation_fuel\":5000000,\"overflowed\":false}},\"work\":{\"check_calls\":1,\"infer_calls\":12,\"whnf_calls\":9234,\"defeq_calls\":4214,\"quick_equality_hits\":210,\"beta_steps\":64,\"delta_steps\":4821100,\"iota_steps\":0,\"zeta_steps\":7,\"physical_reductions\":4821171,\"overflowed\":false},\"overflowed\":false},\"comparison_path\":{\"steps\":[\"app_argument\",\"pi_body\",\"whnf_left\",\"app_function\"],\"truncated\":false},\"retained_delta_constants\":null,\"overflowed\":false}"
+        "{\"schema\":\"npa.kernel-fuel-diagnostic.v0.2\",\"trusted\":false,\"proof_evidence\":false,\"subsystem\":\"fast_kernel\",\"resource\":\"conversion\",\"failed_operation\":{\"fuel\":{\"budget\":5000000,\"spent\":5000000,\"remaining\":0,\"exhausted\":true,\"overflowed\":false},\"work\":{\"check_calls\":0,\"infer_calls\":0,\"whnf_calls\":9120,\"defeq_calls\":4187,\"quick_equality_hits\":203,\"beta_steps\":64,\"delta_steps\":4821031,\"iota_steps\":0,\"physical_reductions\":4821095,\"overflowed\":false}},\"declaration\":{\"fuel\":{\"whnf\":{\"calls\":114,\"logical_spent\":18342,\"successful_operation_fuel\":18342,\"exhausted_operation_fuel\":0,\"overflowed\":false},\"conversion\":{\"calls\":27,\"logical_spent\":5000218,\"successful_operation_fuel\":218,\"exhausted_operation_fuel\":5000000,\"overflowed\":false}},\"work\":{\"check_calls\":1,\"infer_calls\":12,\"whnf_calls\":9234,\"defeq_calls\":4214,\"quick_equality_hits\":210,\"beta_steps\":64,\"delta_steps\":4821100,\"iota_steps\":0,\"physical_reductions\":4821164,\"overflowed\":false},\"overflowed\":false},\"comparison_path\":{\"steps\":[\"app_argument\",\"pi_body\",\"whnf_left\",\"app_function\"],\"truncated\":false},\"retained_delta_constants\":null,\"overflowed\":false}"
             .to_owned()
     }
 
@@ -4120,18 +4717,50 @@ mod tests {
         .map_err(|error| error.to_string())
     }
 
-    fn v0_4_command_result_with_fuel(fuel: &str, conversion: Option<&str>) -> String {
+    fn v0_5_command_result_with_fuel(fuel: &str, conversion: Option<&str>) -> String {
         let conversion = conversion
             .map(|conversion| format!(",\"conversion\":{conversion}"))
             .unwrap_or_default();
         format!(
-            "{{\"schema\":\"npa.package.command_result.v0.4\",\"command\":\"package verify-certs\",\"root\":\".\",\"status\":\"passed\",\"diagnostics\":[{{\"kind\":\"KernelFuelExhausted\",\"reason_code\":\"kernel_fuel_exhausted\",\"severity\":\"info\"{conversion},\"kernel_fuel\":{fuel}}}],\"artifacts\":[]}}"
+            "{{\"schema\":\"npa.package.command_result.v0.5\",\"command\":\"package verify-certs\",\"root\":\".\",\"status\":\"passed\",\"diagnostics\":[{{\"kind\":\"KernelFuelExhausted\",\"reason_code\":\"kernel_fuel_exhausted\",\"severity\":\"info\"{conversion},\"kernel_fuel\":{fuel}}}],\"artifacts\":[]}}"
+        )
+    }
+
+    fn legacy_performance_measurements_v0_4(current: &str) -> String {
+        current.replacen(
+            "\"schema\":\"npa.performance.measurements.v0.9\"",
+            "\"schema\":\"npa.performance.measurements.v0.4\"",
+            1,
+        )
+    }
+
+    fn legacy_performance_measurements_v0_5(current: &str) -> String {
+        current.replacen(
+            "\"schema\":\"npa.performance.measurements.v0.9\"",
+            "\"schema\":\"npa.performance.measurements.v0.5\"",
+            1,
+        )
+    }
+
+    fn legacy_performance_measurements_v0_6(current: &str) -> String {
+        current.replacen(
+            "\"schema\":\"npa.performance.measurements.v0.9\"",
+            "\"schema\":\"npa.performance.measurements.v0.6\"",
+            1,
+        )
+    }
+
+    fn legacy_performance_measurements_v0_3(current: &str) -> String {
+        current.replacen(
+            "\"schema\":\"npa.performance.measurements.v0.9\"",
+            "\"schema\":\"npa.performance.measurements.v0.3\"",
+            1,
         )
     }
 
     fn legacy_performance_measurements_v0_2(current: &str) -> String {
         current.replacen(
-            "\"schema\":\"npa.performance.measurements.v0.3\"",
+            "\"schema\":\"npa.performance.measurements.v0.9\"",
             "\"schema\":\"npa.performance.measurements.v0.2\"",
             1,
         )
@@ -4149,5 +4778,16 @@ mod tests {
                 "\"schema\":\"npa.performance.measurements.v0.1\"",
                 1,
             )
+    }
+
+    #[test]
+    fn package_selection_labels_follow_resolved_schema_introduction() {
+        common_measurement_historical_v0_2_through_v0_7_frozen_matrix_is_exact();
+    }
+
+    #[test]
+    fn shared_payload_manifest_selected_schema() {
+        common_measurement_historical_v0_2_through_v0_7_frozen_matrix_is_exact();
+        command_result_validator_accepts_current_nested_measurements_for_live_verification();
     }
 }

@@ -1,9 +1,6 @@
 //! Implementation of `npa package aggregate-l2-acceptance`.
 
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    fs,
-};
+use std::collections::{BTreeMap, BTreeSet};
 
 use npa_package::{
     merge_l2_acceptance_v2_entries, package_file_hash, parse_l2_acceptance_policy_json,
@@ -16,6 +13,7 @@ use crate::{
     args::PackageL2AcceptanceAggregateOptions,
     diagnostic::{CommandArtifact, CommandDiagnostic, CommandResult, DiagnosticKind},
     fs::render_package_path,
+    generated_artifact_writer::{read_package_regular_file_no_follow, read_regular_file_no_follow},
     governance_writer::{
         confined_governance_path, lock_governance_artifact, write_governance_artifact,
         GovernanceArtifactLock, GovernanceOutputPolicy,
@@ -61,8 +59,8 @@ impl L2AcceptanceFileSnapshot {
         if let Some(bytes) = self.files.get(path) {
             return Ok(bytes.clone());
         }
-        let full = confined_governance_path(root, path, path.as_str(), reason)?;
-        let bytes = fs::read(full).map_err(|_| diagnostic(reason, path.as_str()))?;
+        let bytes = read_package_regular_file_no_follow(root, path)
+            .map_err(|_| diagnostic(reason, path.as_str()))?;
         self.capture(path.clone(), bytes)
     }
 }
@@ -77,15 +75,14 @@ pub fn run_package_aggregate_l2_acceptance(
     };
     let root_display = loaded.root_display.clone();
     let out = PackagePath::new(options.out.to_string_lossy());
-    let full_out = match confined_governance_path(
+    if let Err(diagnostic) = confined_governance_path(
         &loaded.root,
         &out,
         "--out",
         "l2_aggregate_output_not_package_relative",
     ) {
-        Ok(path) => path,
-        Err(diagnostic) => return CommandResult::failed(COMMAND, root_display, vec![*diagnostic]),
-    };
+        return CommandResult::failed(COMMAND, root_display, vec![*diagnostic]);
+    }
     let in_place = options
         .existing
         .as_ref()
@@ -99,7 +96,13 @@ pub fn run_package_aggregate_l2_acceptance(
     let bytes = output.bytes;
     let existing_snapshot = output.existing_snapshot;
     if options.check {
-        if !check_output_matches(&full_out, &bytes, existing_snapshot.as_deref(), in_place) {
+        if !check_output_matches(
+            &loaded.root,
+            &out,
+            &bytes,
+            existing_snapshot.as_deref(),
+            in_place,
+        ) {
             return CommandResult::failed(
                 COMMAND,
                 root_display,
@@ -147,7 +150,8 @@ pub fn run_package_aggregate_l2_acceptance(
 }
 
 fn check_output_matches(
-    full_out: &std::path::Path,
+    root: &std::path::Path,
+    output: &PackagePath,
     expected: &[u8],
     existing_snapshot: Option<&[u8]>,
     in_place: bool,
@@ -155,7 +159,10 @@ fn check_output_matches(
     if in_place {
         existing_snapshot == Some(expected)
     } else {
-        fs::read(full_out).ok().as_deref() == Some(expected)
+        read_package_regular_file_no_follow(root, output)
+            .ok()
+            .as_deref()
+            == Some(expected)
     }
 }
 
@@ -164,7 +171,7 @@ fn aggregate(
     options: &PackageL2AcceptanceAggregateOptions,
     in_place_lock: &mut Option<GovernanceArtifactLock>,
 ) -> Result<AggregatedAcceptance, Box<CommandDiagnostic>> {
-    let policy_bytes = fs::read(&options.policy)
+    let policy_bytes = read_regular_file_no_follow(&options.policy)
         .map_err(|_| diagnostic("l2_aggregate_policy_mismatch", "--policy"))?;
     let policy = parse_l2_acceptance_policy_json(
         std::str::from_utf8(&policy_bytes)
@@ -666,6 +673,8 @@ fn diagnostic(reason: &str, path: &str) -> Box<CommandDiagnostic> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use super::*;
 
     #[test]
@@ -694,19 +703,22 @@ mod tests {
         let _ = fs::remove_file(&missing);
 
         assert!(check_output_matches(
-            &missing,
+            missing.parent().unwrap(),
+            &PackagePath::new(missing.file_name().unwrap().to_string_lossy()),
             b"captured",
             Some(b"captured"),
             true,
         ));
         assert!(!check_output_matches(
-            &missing,
+            missing.parent().unwrap(),
+            &PackagePath::new(missing.file_name().unwrap().to_string_lossy()),
             b"captured",
             Some(b"different"),
             true,
         ));
         assert!(!check_output_matches(
-            &missing,
+            missing.parent().unwrap(),
+            &PackagePath::new(missing.file_name().unwrap().to_string_lossy()),
             b"captured",
             Some(b"captured"),
             false,

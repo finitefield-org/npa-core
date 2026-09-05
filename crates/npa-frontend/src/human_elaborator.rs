@@ -6,25 +6,28 @@ use std::time::{Duration, Instant};
 use crate::{
     builtin_machine_callable_profile,
     elaborator::{
+        certificate_import_indices_and_providers_for_authoring_imports,
         certificate_import_refs_and_providers_for_module_refs, certificate_import_refs_for_module,
         combined_verified_module_refs, kernel_env_from_verified_imports,
         kernel_env_from_verified_imports_observed,
     },
     machine_callable_profile_from_human_binders, parse_human_module_with_source_interfaces,
-    resolve_human_module_with_source_interfaces, DefinitionReducibility, HumanBinder,
-    HumanBinderKind, HumanCompilationObservations, HumanCompileOptions, HumanDeclValue,
-    HumanDeclarationObservation, HumanDiagnostic, HumanDiagnosticConversionContext,
-    HumanDiagnosticKind, HumanDiagnosticPayload, HumanDiagnosticPhase, HumanExpr,
-    HumanGeneratedDeclarationKind, HumanGlobalRef, HumanGlobalScopeEntry, HumanHoleGoal,
-    HumanHoleGoalLocal, HumanImplicitMode, HumanImportedSourceInterface, HumanItem,
-    HumanKernelDeclarationSummary, HumanKernelFuelDiagnostic, HumanLevel, HumanName,
-    HumanResolvedName, HumanResolvedNameUse, HumanResolvedNotationEntry, HumanResolvedNotationUse,
-    HumanResult, HumanSourceDeclarationKind, HumanSourceDeclarationMetadata, HumanSourceInterface,
-    HumanTacticScript, HumanTypeclassClassMetadata, HumanTypeclassInstanceMetadata,
-    HumanTypeclassSearchOutput, HumanTypeclassSearchPolicy, HumanTypeclassSearchStatus,
-    HumanUniverseMismatchContext, HumanUnsolvedMeta, HumanUnsolvedMetaKind, MachineBinder,
-    MachineCallableBinderVisibility, MachineCheckedCurrentDecl, MachineCheckedCurrentGeneratedDecl,
-    MachineDecl, MachineDiagnosticKind, MachineLevel, MachineLocalDecl, MachineName, MachineTerm,
+    resolve_human_module_with_source_interfaces,
+    resolver::{frontend_import_views_equal, FrontendImportView},
+    DefinitionReducibility, HumanAuthoringImport, HumanBinder, HumanBinderKind,
+    HumanCompilationObservations, HumanCompileOptions, HumanDeclValue, HumanDeclarationObservation,
+    HumanDiagnostic, HumanDiagnosticConversionContext, HumanDiagnosticKind, HumanDiagnosticPayload,
+    HumanDiagnosticPhase, HumanExpr, HumanGeneratedDeclarationKind, HumanGlobalRef,
+    HumanGlobalScopeEntry, HumanHoleGoal, HumanHoleGoalLocal, HumanImplicitMode,
+    HumanImportedSourceInterface, HumanItem, HumanKernelDeclarationSummary,
+    HumanKernelFuelDiagnostic, HumanLevel, HumanName, HumanResolvedName, HumanResolvedNameUse,
+    HumanResolvedNotationEntry, HumanResolvedNotationUse, HumanResult, HumanSourceDeclarationKind,
+    HumanSourceDeclarationMetadata, HumanSourceInterface, HumanTacticScript,
+    HumanTypeclassClassMetadata, HumanTypeclassInstanceMetadata, HumanTypeclassSearchOutput,
+    HumanTypeclassSearchPolicy, HumanTypeclassSearchStatus, HumanUniverseMismatchContext,
+    HumanUnsolvedMeta, HumanUnsolvedMetaKind, MachineBinder, MachineCallableBinderVisibility,
+    MachineCheckedCurrentDecl, MachineCheckedCurrentGeneratedDecl, MachineDecl,
+    MachineDiagnosticKind, MachineLevel, MachineLocalDecl, MachineName, MachineTerm,
     MachineUniverseParam, ResolvedHumanModule, Span, VerifiedImport,
     HUMAN_DECLARATION_OBSERVATION_LIMIT,
 };
@@ -179,7 +182,7 @@ impl HumanPendingCompilationObservations {
         if !self.enabled {
             return Ok(HumanCompilationObservations::default());
         }
-        let certificate_attempted = match u64::try_from(certificate.declarations.len()) {
+        let certificate_attempted = match u64::try_from(certificate.declarations().len()) {
             Ok(attempted) => attempted,
             Err(_) => {
                 self.overflowed = true;
@@ -209,10 +212,10 @@ impl HumanPendingCompilationObservations {
         self.omitted = 0;
         let mut previous_key: Option<(u64, String)> = None;
         for (declaration_index, certificate_declaration) in
-            certificate.declarations.iter().enumerate()
+            certificate.declarations().iter().enumerate()
         {
             let certificate_name = human_certificate_declaration_name(
-                &certificate.name_table,
+                certificate.name_table(),
                 certificate_declaration,
             )
             .ok_or_else(|| {
@@ -250,7 +253,7 @@ impl HumanPendingCompilationObservations {
             previous_key = Some(key);
 
             let (term_nodes, overflowed) = human_certificate_declaration_term_nodes(
-                &certificate.term_table,
+                certificate.term_table(),
                 certificate_declaration,
             );
             observation.term_nodes = term_nodes;
@@ -292,6 +295,7 @@ impl HumanPendingCompilationObservations {
             attempted: self.attempted,
             omitted: self.omitted,
             overflowed: self.overflowed,
+            source_free_verification_elapsed_ns: 0,
         })
     }
 }
@@ -337,6 +341,90 @@ pub struct HumanCertificateCompileOutput {
 pub struct HumanObservedCertificateCompileOutput {
     pub output: HumanCertificateCompileOutput,
     pub observations: HumanCompilationObservations,
+}
+
+/// Non-authoritative Human certificate output produced in a retained authoring session.
+///
+/// The generated bytes, frontend observations, extracted source interface, and
+/// fresh command-local context remain separate. This type deliberately exposes
+/// neither a [`npa_cert::VerifiedModule`] nor a cache-publication capability.
+///
+/// ```compile_fail
+/// use npa_cert::VerifiedModule;
+/// use npa_frontend::HumanAuthoringCertificateCompileOutput;
+///
+/// fn promote(output: HumanAuthoringCertificateCompileOutput<'_>) -> VerifiedModule {
+///     output.into()
+/// }
+/// ```
+#[derive(Debug)]
+pub struct HumanAuthoringCertificateCompileOutput<'session> {
+    certificate_bytes: Vec<u8>,
+    compilation_observations: HumanCompilationObservations,
+    authoring_observations: npa_cert::LocalAuthoringBuildObservations,
+    source_interface: HumanSourceInterface,
+    fresh_context: npa_cert::LocalAuthoringImportContext<'session>,
+}
+
+impl<'session> HumanAuthoringCertificateCompileOutput<'session> {
+    /// Return the ephemeral canonical certificate bytes generated by this build.
+    pub fn certificate_bytes(&self) -> &[u8] {
+        &self.certificate_bytes
+    }
+
+    /// Return bounded frontend compilation observations.
+    pub fn compilation_observations(&self) -> &HumanCompilationObservations {
+        &self.compilation_observations
+    }
+
+    /// Return non-authoritative certificate-authoring observations.
+    pub fn authoring_observations(&self) -> &npa_cert::LocalAuthoringBuildObservations {
+        &self.authoring_observations
+    }
+
+    /// Return the extracted source-interface input for neutral DTO adaptation.
+    pub fn source_interface(&self) -> &HumanSourceInterface {
+        &self.source_interface
+    }
+
+    /// Borrow the fresh context for a later authoring build in this session.
+    pub fn fresh_context(&self) -> &npa_cert::LocalAuthoringImportContext<'session> {
+        &self.fresh_context
+    }
+
+    /// Return whether any cached context affected this fresh context's closure.
+    pub fn closure_used_cached_context(&self) -> bool {
+        self.fresh_context.closure_used_cached_context()
+    }
+
+    /// Fresh authoring output is permanently ineligible for cache publication.
+    pub const fn is_publication_eligible(&self) -> bool {
+        false
+    }
+
+    /// Human authoring output never constitutes proof evidence.
+    pub const fn is_proof_evidence(&self) -> bool {
+        false
+    }
+
+    /// Separate every non-authoritative output component for a private caller wrapper.
+    pub fn into_parts(
+        self,
+    ) -> (
+        Vec<u8>,
+        HumanCompilationObservations,
+        npa_cert::LocalAuthoringBuildObservations,
+        HumanSourceInterface,
+        npa_cert::LocalAuthoringImportContext<'session>,
+    ) {
+        (
+            self.certificate_bytes,
+            self.compilation_observations,
+            self.authoring_observations,
+            self.source_interface,
+            self.fresh_context,
+        )
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -449,6 +537,26 @@ pub struct HumanTacticTermInferOutput {
     pub inferred_type: Expr,
 }
 
+/// Authoring-only certificate import selection.
+///
+/// Indices refer to the input authoring-import slice. The selected imports
+/// remain opaque and cannot be converted into ordinary verification evidence.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HumanAuthoringCertificateImportSelection {
+    import_indices: Vec<usize>,
+    preferred_imports: BTreeMap<npa_cert::Name, npa_cert::ImportEntry>,
+}
+
+impl HumanAuthoringCertificateImportSelection {
+    pub fn import_indices(&self) -> &[usize] {
+        &self.import_indices
+    }
+
+    pub fn preferred_imports(&self) -> &BTreeMap<npa_cert::Name, npa_cert::ImportEntry> {
+        &self.preferred_imports
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 struct HumanTacticGlobalScope {
     current: Vec<HumanGlobalScopeEntry>,
@@ -468,6 +576,42 @@ pub fn elaborate_human_module(
         verified_imports,
         options,
     )
+}
+
+/// Elaborate a resolved Human module against opaque authoring imports.
+pub fn elaborate_human_module_with_authoring_imports(
+    module_name: npa_cert::ModuleName,
+    module: ResolvedHumanModule,
+    authoring_imports: &[HumanAuthoringImport<'_>],
+    options: &HumanCompileOptions,
+) -> HumanResult<npa_cert::CoreModule> {
+    elaborate_human_module_with_available_authoring_imports(
+        module_name,
+        module,
+        authoring_imports,
+        authoring_imports,
+        options,
+    )
+}
+
+/// Elaborate using direct and transitively available opaque authoring imports.
+pub fn elaborate_human_module_with_available_authoring_imports(
+    module_name: npa_cert::ModuleName,
+    module: ResolvedHumanModule,
+    direct_imports: &[HumanAuthoringImport<'_>],
+    available_imports: &[HumanAuthoringImport<'_>],
+    options: &HumanCompileOptions,
+) -> HumanResult<npa_cert::CoreModule> {
+    elaborate_human_module_with_available_imports_observed(
+        module_name,
+        &module,
+        direct_imports,
+        available_imports,
+        options,
+        None,
+        false,
+    )
+    .map(|output| output.core_module)
 }
 
 fn elaborate_human_module_with_available_imports(
@@ -490,11 +634,11 @@ fn elaborate_human_module_with_available_imports(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn elaborate_human_module_with_available_imports_observed(
+fn elaborate_human_module_with_available_imports_observed<T: FrontendImportView>(
     module_name: npa_cert::ModuleName,
     module: &ResolvedHumanModule,
-    direct_imports: &[VerifiedImport],
-    available_imports: &[VerifiedImport],
+    direct_imports: &[T],
+    available_imports: &[T],
     options: &HumanCompileOptions,
     work_counter_sink: Option<&KernelWorkCounterSink>,
     collect_declaration_details: bool,
@@ -1129,6 +1273,37 @@ pub fn certificate_imports_for_human_core_module(
         })
 }
 
+/// Select the opaque authoring imports and preferred providers required by a
+/// lowered Human module.
+pub fn certificate_authoring_import_selection_for_human_core_module(
+    core: &npa_cert::CoreModule,
+    active_imports: &[HumanImportedSourceInterface],
+    authoring_imports: &[HumanAuthoringImport<'_>],
+    file_id: crate::FileId,
+) -> HumanResult<HumanAuthoringCertificateImportSelection> {
+    let active_import_indices = active_human_authoring_import_indices_from_source_interfaces(
+        active_imports,
+        authoring_imports,
+        file_id,
+    )?;
+    certificate_import_indices_and_providers_for_authoring_imports(
+        core,
+        &active_import_indices,
+        authoring_imports,
+        file_id,
+    )
+    .map(
+        |(import_indices, preferred_imports)| HumanAuthoringCertificateImportSelection {
+            import_indices,
+            preferred_imports,
+        },
+    )
+    .map_err(|diagnostic| {
+        human_certificate_import_diagnostic(Span::empty(file_id), diagnostic)
+            .with_phase(HumanDiagnosticPhase::CertificateHandoff)
+    })
+}
+
 pub fn compile_human_source_to_certificate(
     file_id: crate::FileId,
     module_name: npa_cert::ModuleName,
@@ -1363,10 +1538,11 @@ pub fn compile_human_source_to_observed_certificate_output_with_available_import
         )?;
     let HumanObservedBuiltCertificateCompileOutput {
         output: built,
-        observations,
+        mut observations,
     } = observed_built;
     let certificate_imports =
         combined_verified_module_refs(direct_verified_modules, available_verified_modules);
+    let verification_started = work_counter_sink.is_some().then(Instant::now);
     let verified_module = npa_cert::verify_built_module_cert_with_import_refs(
         &built.certificate,
         &certificate_imports,
@@ -1380,6 +1556,10 @@ pub fn compile_human_source_to_observed_certificate_output_with_available_import
         )
         .with_phase(HumanDiagnosticPhase::CertificateHandoff)
     })?;
+    if let Some(started) = verification_started {
+        observations.source_free_verification_elapsed_ns =
+            u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    }
     Ok(HumanObservedCertificateCompileOutput {
         output: HumanCertificateCompileOutput {
             certificate: built.certificate,
@@ -1388,6 +1568,134 @@ pub fn compile_human_source_to_observed_certificate_output_with_available_import
         },
         observations,
     })
+}
+
+/// Compile Human source through the command-local authoring-only certificate lane.
+///
+/// Direct imports drive source resolution. The available slice additionally
+/// supplies transitive certificate dependencies, exactly as in the ordinary
+/// sibling API. Every selected import must have been projected from a context
+/// owned by `session`.
+#[allow(clippy::too_many_arguments)]
+pub fn compile_human_source_to_authoring_certificate_output_with_available_imports_and_axiom_policy<
+    'session,
+>(
+    session: &'session npa_cert::LocalAuthoringVerifierSession,
+    file_id: crate::FileId,
+    module_name: npa_cert::ModuleName,
+    source: &str,
+    direct_authoring_imports: &[HumanAuthoringImport<'session>],
+    available_authoring_imports: &[HumanAuthoringImport<'session>],
+    imported_source_interfaces: &[HumanImportedSourceInterface],
+    options: &HumanCompileOptions,
+    axiom_policy: &npa_cert::AxiomPolicy,
+    work_counter_sink: Option<&KernelWorkCounterSink>,
+    collect_declaration_details: bool,
+) -> HumanResult<HumanAuthoringCertificateCompileOutput<'session>> {
+    let parsed =
+        parse_human_module_with_source_interfaces(file_id, source, imported_source_interfaces)?;
+    let resolved = crate::resolve_human_module_with_authoring_imports_and_source_interfaces(
+        module_name.clone(),
+        parsed,
+        direct_authoring_imports,
+        imported_source_interfaces,
+        options,
+    )?;
+    let active_import_indices = active_human_import_indices(&resolved, direct_authoring_imports)
+        .map_err(|diagnostic| diagnostic.with_default_phase(HumanDiagnosticPhase::Resolver))?;
+    let observed_core = elaborate_human_module_with_available_imports_observed(
+        module_name,
+        &resolved,
+        direct_authoring_imports,
+        available_authoring_imports,
+        options,
+        work_counter_sink,
+        collect_declaration_details,
+    )
+    .map_err(|diagnostic| diagnostic.with_default_phase(HumanDiagnosticPhase::Elaborator))?;
+    let source_interface = resolved.state.source_interfaces.current;
+    let certificate_authoring_imports =
+        combined_human_authoring_imports(direct_authoring_imports, available_authoring_imports);
+    let (certificate_import_indices, preferred_imports) =
+        certificate_import_indices_and_providers_for_authoring_imports(
+            &observed_core.core_module,
+            &active_import_indices,
+            &certificate_authoring_imports,
+            file_id,
+        )
+        .map_err(|err| {
+            human_certificate_import_diagnostic(source_span(file_id, source), err)
+                .with_phase(HumanDiagnosticPhase::CertificateHandoff)
+        })?;
+    let certificate_imports = certificate_import_indices
+        .iter()
+        .map(|index| certificate_authoring_imports[*index].local_authoring_context())
+        .collect::<npa_cert::Result<Vec<_>>>()
+        .map_err(|err| human_authoring_certificate_diagnostic(file_id, source, "handoff", err))?;
+    let built = session
+        .build_module_cert(
+            observed_core.core_module,
+            &certificate_imports,
+            &preferred_imports,
+        )
+        .map_err(|err| human_authoring_certificate_diagnostic(file_id, source, "handoff", err))?;
+    let source_interface =
+        source_interface_with_certificate_hashes(source_interface, built.certificate());
+    let mut compilation_observations = observed_core
+        .observations
+        .finish(built.certificate(), source_span(file_id, source))?;
+    let verification_started = work_counter_sink.is_some().then(Instant::now);
+    let checked = session
+        .check_built_module_cert(built, &certificate_imports, axiom_policy)
+        .map_err(|err| {
+            human_authoring_certificate_diagnostic(file_id, source, "verification", err)
+        })?;
+    if let Some(started) = verification_started {
+        compilation_observations.source_free_verification_elapsed_ns =
+            u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    }
+    let (certificate_bytes, authoring_observations, fresh_context) = checked.into_parts();
+
+    Ok(HumanAuthoringCertificateCompileOutput {
+        certificate_bytes,
+        compilation_observations,
+        authoring_observations,
+        source_interface,
+        fresh_context,
+    })
+}
+
+fn combined_human_authoring_imports<'session>(
+    direct_imports: &[HumanAuthoringImport<'session>],
+    available_imports: &[HumanAuthoringImport<'session>],
+) -> Vec<HumanAuthoringImport<'session>> {
+    let mut seen = BTreeSet::new();
+    let mut combined = Vec::new();
+    for import in direct_imports.iter().chain(available_imports) {
+        let key = (
+            import.module().clone(),
+            import.export_hash(),
+            import.certificate_hash(),
+        );
+        if seen.insert(key) {
+            combined.push(import.clone());
+        }
+    }
+    combined
+}
+
+fn human_authoring_certificate_diagnostic(
+    file_id: crate::FileId,
+    source: &str,
+    operation: &str,
+    err: npa_cert::CertError,
+) -> HumanDiagnostic {
+    HumanDiagnostic::error(
+        HumanDiagnosticKind::KernelRejected,
+        source_span(file_id, source),
+        format!("certificate certificate {operation} rejected Human source: {err:?}"),
+    )
+    .with_phase(HumanDiagnosticPhase::CertificateHandoff)
 }
 
 pub fn compile_human_source_to_built_certificate_output_with_import_refs(
@@ -1724,11 +2032,6 @@ fn human_certificate_declaration_term_nodes(
                 pending.push(*ty);
                 pending.push(*body);
             }
-            npa_cert::TermNode::Let { ty, value, body } => {
-                pending.push(*ty);
-                pending.push(*value);
-                pending.push(*body);
-            }
             npa_cert::TermNode::Sort(_)
             | npa_cert::TermNode::BVar(_)
             | npa_cert::TermNode::Const { .. } => {}
@@ -1795,20 +2098,22 @@ fn source_span(file_id: crate::FileId, source: &str) -> Span {
 }
 
 fn human_module_owner_pair() -> (&'static str, &'static str) {
-    ("NPA-CERT-0.3.0", "NPA-Core-0.3.0")
+    ("NPA-CERT-0.4.0", "NPA-Core-0.4.0")
 }
 
-fn source_interface_with_certificate_hashes(
+/// Bind reconstructed Human source-interface declarations to the hashes in
+/// the already accepted certificate export block.
+pub fn source_interface_with_certificate_hashes(
     mut source_interface: HumanSourceInterface,
     cert: &npa_cert::ModuleCert,
 ) -> HumanSourceInterface {
     let module_name = source_interface.module.clone();
     let export_facts: BTreeMap<_, _> = cert
-        .export_block
+        .export_block()
         .iter()
         .map(|entry| {
             (
-                cert.name_table[entry.name].clone(),
+                cert.name_table()[entry.name].clone(),
                 (entry.decl_interface_hash, entry.reducibility),
             )
         })
@@ -2151,7 +2456,7 @@ fn add_human_kernel_imports_to_env(
 ) -> HumanResult<()> {
     let mut pending = imports
         .iter()
-        .flat_map(|import| kernel_decls_for_human_import(import))
+        .flat_map(|import| kernel_decls_for_human_import(*import))
         .collect::<Vec<_>>();
 
     while !pending.is_empty() {
@@ -2207,9 +2512,9 @@ fn add_human_kernel_imports_to_env(
     Ok(())
 }
 
-fn human_kernel_env_from_verified_imports(
-    active_imports: &[&VerifiedImport],
-    available_imports: &[VerifiedImport],
+fn human_kernel_env_from_verified_imports<T: FrontendImportView>(
+    active_imports: &[&T],
+    available_imports: &[T],
     span: Span,
     observation: &HumanKernelObservation,
 ) -> HumanResult<Env> {
@@ -2401,7 +2706,7 @@ fn human_tactic_callable_signatures(
 
 fn human_imported_source_interface_profile(
     imported_source_interfaces: &[HumanImportedSourceInterface],
-    import: &VerifiedImport,
+    import: &impl FrontendImportView,
     export: &crate::VerifiedExport,
 ) -> Option<Vec<MachineCallableBinderVisibility>> {
     human_source_interface_profile_for_export(imported_source_interfaces, import, export)
@@ -2409,7 +2714,7 @@ fn human_imported_source_interface_profile(
 
 fn human_import_signature(
     imported_source_interfaces: &[HumanImportedSourceInterface],
-    import: &VerifiedImport,
+    import: &impl FrontendImportView,
     export: &crate::VerifiedExport,
 ) -> HumanCallableSignature {
     if human_import_export_uses_builtin_eq_rec(import, export) {
@@ -2442,7 +2747,7 @@ fn human_builtin_eq_rec_signature() -> HumanCallableSignature {
 }
 
 fn human_import_global_ref(
-    import: &VerifiedImport,
+    import: &impl FrontendImportView,
     export: &crate::VerifiedExport,
 ) -> HumanGlobalRef {
     if human_import_export_uses_builtin_eq_rec(import, export) {
@@ -2450,7 +2755,7 @@ fn human_import_global_ref(
     }
 
     HumanGlobalRef::Imported {
-        module: import.module.clone(),
+        module: import.module().clone(),
         name: export.name.clone(),
         decl_interface_hash: export.decl_interface_hash,
     }
@@ -2466,25 +2771,25 @@ fn human_builtin_eq_rec_ref() -> HumanGlobalRef {
 }
 
 fn human_import_export_uses_builtin_eq_rec(
-    import: &VerifiedImport,
+    import: &impl FrontendImportView,
     export: &crate::VerifiedExport,
 ) -> bool {
     export.name.as_dotted() == "Eq.rec"
         && import
-            .kernel_decls
+            .kernel_declarations()
             .iter()
             .any(|decl| matches!(decl, Decl::Inductive { name, .. } if name == "Eq"))
 }
 
 fn human_source_interface_profile_for_export(
     imported_source_interfaces: &[HumanImportedSourceInterface],
-    import: &VerifiedImport,
+    import: &impl FrontendImportView,
     export: &crate::VerifiedExport,
 ) -> Option<Vec<MachineCallableBinderVisibility>> {
     for interface in imported_source_interfaces.iter().filter(|interface| {
-        interface.module == import.module
-            && interface.export_hash == import.export_hash
-            && interface.certificate_hash == import.certificate_hash
+        interface.module == *import.module()
+            && interface.export_hash == import.export_hash()
+            && interface.certificate_hash == import.certificate_hash()
     }) {
         if let Some(decl) = interface.source_interface.declarations.iter().find(|decl| {
             decl.kind != HumanSourceDeclarationKind::Imported
@@ -2671,21 +2976,6 @@ impl HumanTacticTermResolver<'_> {
             HumanExpr::Lam { binders, body, .. } | HumanExpr::Pi { binders, body, .. } => {
                 let mut nested = locals.clone();
                 self.resolve_binders(binders, &mut nested)?;
-                self.resolve_expr(body, &mut nested)?;
-            }
-            HumanExpr::Let {
-                name,
-                ty,
-                value,
-                body,
-                ..
-            } => {
-                if let Some(ty) = ty {
-                    self.resolve_expr(ty, locals)?;
-                }
-                self.resolve_expr(value, locals)?;
-                let mut nested = locals.clone();
-                nested.push(name.clone());
                 self.resolve_expr(body, &mut nested)?;
             }
             HumanExpr::Annot { expr, ty, .. } => {
@@ -3078,11 +3368,11 @@ fn elaborate_human_tactic_term_infer_with_plan(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn elaborate_human_module_with_notation_plan_observed(
+fn elaborate_human_module_with_notation_plan_observed<T: FrontendImportView>(
     module_name: npa_cert::ModuleName,
     module: &ResolvedHumanModule,
-    direct_imports: &[VerifiedImport],
-    available_imports: &[VerifiedImport],
+    direct_imports: &[T],
+    available_imports: &[T],
     notation_plan: &[usize],
     options: &HumanCompileOptions,
     work_counter_sink: Option<&KernelWorkCounterSink>,
@@ -3431,13 +3721,6 @@ fn human_expr_notation_use_count(expr: &HumanExpr) -> usize {
         HumanExpr::Lam { binders, body, .. } | HumanExpr::Pi { binders, body, .. } => {
             human_binders_notation_use_count(binders) + human_expr_notation_use_count(body)
         }
-        HumanExpr::Let {
-            ty, value, body, ..
-        } => {
-            ty.as_deref().map_or(0, human_expr_notation_use_count)
-                + human_expr_notation_use_count(value)
-                + human_expr_notation_use_count(body)
-        }
         HumanExpr::Annot { expr, ty, .. } => {
             human_expr_notation_use_count(expr) + human_expr_notation_use_count(ty)
         }
@@ -3652,17 +3935,6 @@ impl<'a> HumanUniverseSpineSolver<'a> {
                 self.resolve_implicit_expr_at(Arc::unwrap_or_clone(ty), depth),
                 self.resolve_implicit_expr_at(Arc::unwrap_or_clone(body), depth + 1),
             ),
-            Expr::Let {
-                binder,
-                ty,
-                value,
-                body,
-            } => Expr::let_in(
-                binder,
-                self.resolve_implicit_expr_at(Arc::unwrap_or_clone(ty), depth),
-                self.resolve_implicit_expr_at(Arc::unwrap_or_clone(value), depth),
-                self.resolve_implicit_expr_at(Arc::unwrap_or_clone(body), depth + 1),
-            ),
             Expr::Sort(level) => Expr::sort(self.resolve_level(level)),
             Expr::Const { name, levels } => Expr::konst(
                 name,
@@ -3761,36 +4033,6 @@ impl<'a> HumanUniverseSpineSolver<'a> {
                 self.unify_expr(
                     Arc::unwrap_or_clone(lhs_ty),
                     Arc::unwrap_or_clone(rhs_ty),
-                    span,
-                )?;
-                self.unify_expr(
-                    self.resolve_implicit_expr_at(Arc::unwrap_or_clone(lhs_body), 1),
-                    self.resolve_implicit_expr_at(Arc::unwrap_or_clone(rhs_body), 1),
-                    span,
-                )
-            }
-            (
-                Expr::Let {
-                    ty: lhs_ty,
-                    value: lhs_value,
-                    body: lhs_body,
-                    ..
-                },
-                Expr::Let {
-                    ty: rhs_ty,
-                    value: rhs_value,
-                    body: rhs_body,
-                    ..
-                },
-            ) => {
-                self.unify_expr(
-                    Arc::unwrap_or_clone(lhs_ty),
-                    Arc::unwrap_or_clone(rhs_ty),
-                    span,
-                )?;
-                self.unify_expr(
-                    Arc::unwrap_or_clone(lhs_value),
-                    Arc::unwrap_or_clone(rhs_value),
                     span,
                 )?;
                 self.unify_expr(
@@ -3984,7 +4226,6 @@ struct HumanMetaContextSnapshot {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct HumanMetaLocalSnapshot {
     ty: MachineTerm,
-    value: Option<MachineTerm>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -4516,13 +4757,6 @@ fn expr_contains_spine_implicit(id: HumanSpineImplicitId, expr: &Expr) -> bool {
         Expr::Lam { ty, body, .. } | Expr::Pi { ty, body, .. } => {
             expr_contains_spine_implicit(id, ty) || expr_contains_spine_implicit(id, body)
         }
-        Expr::Let {
-            ty, value, body, ..
-        } => {
-            expr_contains_spine_implicit(id, ty)
-                || expr_contains_spine_implicit(id, value)
-                || expr_contains_spine_implicit(id, body)
-        }
     }
 }
 
@@ -4591,19 +4825,6 @@ fn canonicalize_machine_term_for_meta_context(term: &MachineTerm) -> MachineTerm
         },
         MachineTerm::Pi { binders, body, .. } => MachineTerm::Pi {
             binders: canonicalize_machine_binders_for_meta_context(binders),
-            body: Box::new(canonicalize_machine_term_for_meta_context(body)),
-            span,
-        },
-        MachineTerm::Let {
-            name,
-            ty,
-            value,
-            body,
-            ..
-        } => MachineTerm::Let {
-            name: name.clone(),
-            ty: Box::new(canonicalize_machine_term_for_meta_context(ty)),
-            value: Box::new(canonicalize_machine_term_for_meta_context(value)),
             body: Box::new(canonicalize_machine_term_for_meta_context(body)),
             span,
         },
@@ -4706,18 +4927,6 @@ fn render_machine_term(term: &MachineTerm) -> String {
             render_machine_binders(binders),
             render_machine_term(body)
         ),
-        MachineTerm::Let {
-            name,
-            ty,
-            value,
-            body,
-            ..
-        } => format!(
-            "(let {name} : {} := {} in {})",
-            render_machine_term(ty),
-            render_machine_term(value),
-            render_machine_term(body)
-        ),
         MachineTerm::Annot { expr, ty, .. } => {
             format!(
                 "({} : {})",
@@ -4778,11 +4987,6 @@ struct HumanElaboratedBinder {
 struct HumanLocalDecl {
     name: String,
     ty: Expr,
-    // Read only through the mirrored kernel `Ctx` (kernel `lookup_value`);
-    // kept here so the human-side context stays self-describing in Debug
-    // output and for future human-level lookups.
-    #[allow(dead_code)]
-    value: Option<Expr>,
 }
 
 // Locals are `Arc` so the frequent nested-scope context clones are refcount
@@ -4799,20 +5003,7 @@ struct HumanLocalContext {
 impl HumanLocalContext {
     fn push_assumption(&mut self, name: String, ty: Expr) {
         self.kernel.push_assumption("", ty.clone());
-        self.locals.push(Arc::new(HumanLocalDecl {
-            name,
-            ty,
-            value: None,
-        }));
-    }
-
-    fn push_definition(&mut self, name: String, ty: Expr, value: Expr) {
-        self.kernel.push_definition("", ty.clone(), value.clone());
-        self.locals.push(Arc::new(HumanLocalDecl {
-            name,
-            ty,
-            value: Some(value),
-        }));
+        self.locals.push(Arc::new(HumanLocalDecl { name, ty }));
     }
 
     fn lookup_bvar(&self, name: &str) -> Option<u32> {
@@ -4860,12 +5051,7 @@ impl HumanLocalContext {
 fn human_local_context_from_machine(locals: &[MachineLocalDecl]) -> HumanLocalContext {
     let mut context = HumanLocalContext::default();
     for local in locals {
-        match &local.value {
-            Some(value) => {
-                context.push_definition(local.name.clone(), local.ty.clone(), value.clone())
-            }
-            None => context.push_assumption(local.name.clone(), local.ty.clone()),
-        }
+        context.push_assumption(local.name.clone(), local.ty.clone());
     }
     context
 }
@@ -4876,10 +5062,10 @@ struct HumanBidirectionalElaborator {
 }
 
 impl HumanBidirectionalElaborator {
-    fn new(
+    fn new<T: FrontendImportView>(
         module: &ResolvedHumanModule,
-        direct_imports: &[VerifiedImport],
-        available_imports: &[VerifiedImport],
+        direct_imports: &[T],
+        available_imports: &[T],
         options: &HumanCompileOptions,
         work_counter_sink: Option<&KernelWorkCounterSink>,
     ) -> HumanResult<Self> {
@@ -5339,27 +5525,6 @@ impl HumanBidirectionalElaborator {
                     });
                 (pi, Expr::sort(pi_sort))
             }
-            MachineTerm::Let {
-                name,
-                ty,
-                value,
-                body,
-                span,
-            } => {
-                let (ty_expr, ty_type) = self.infer_human_expr(ty, locals, delta)?;
-                self.expect_human_sort(&ty_type, locals, delta, ty.span())?;
-                let value_expr = self.check_human_expr(value, &ty_expr, locals, delta)?;
-                let mut nested = locals.clone();
-                nested.push_definition(name.clone(), ty_expr.clone(), value_expr.clone());
-                let (body_expr, body_ty) = self.infer_human_expr(body, &nested, delta)?;
-                let result_ty = subst::instantiate(&body_ty, &value_expr).map_err(|err| {
-                    human_kernel_expr_diagnostic(*span, err, "Human let result type")
-                })?;
-                (
-                    Expr::let_in(name.clone(), ty_expr, value_expr, body_expr),
-                    result_ty,
-                )
-            }
             MachineTerm::Annot { expr, ty, span: _ } => {
                 let (ty_expr, ty_type) = self.infer_human_expr(ty, locals, delta)?;
                 self.expect_human_sort(&ty_type, locals, delta, ty.span())?;
@@ -5650,16 +5815,11 @@ struct HumanLoweringLocalContext {
 struct HumanLoweringLocalDecl {
     name: String,
     ty: MachineTerm,
-    value: Option<MachineTerm>,
 }
 
 impl HumanLoweringLocalContext {
     fn push_assumption(&mut self, name: String, ty: MachineTerm) {
-        self.locals.push(HumanLoweringLocalDecl {
-            name,
-            ty,
-            value: None,
-        });
+        self.locals.push(HumanLoweringLocalDecl { name, ty });
     }
 
     /// Scope marker for push/truncate nesting: `lower_expr` used to clone
@@ -5675,14 +5835,6 @@ impl HumanLoweringLocalContext {
         self.locals.truncate(mark);
     }
 
-    fn push_definition(&mut self, name: String, ty: MachineTerm, value: MachineTerm) {
-        self.locals.push(HumanLoweringLocalDecl {
-            name,
-            ty,
-            value: Some(value),
-        });
-    }
-
     fn from_machine_locals(locals: &[MachineLocalDecl]) -> Self {
         let span = Span::empty(crate::FileId(0));
         let mut lowering = Self::default();
@@ -5690,22 +5842,8 @@ impl HumanLoweringLocalContext {
         for local in locals {
             let ty = core_expr_to_machine_term(&local.ty, &core_locals, span)
                 .unwrap_or_else(|| human_tactic_meta_fallback_machine_term(span));
-            match &local.value {
-                Some(value) => {
-                    let value_term = core_expr_to_machine_term(value, &core_locals, span)
-                        .unwrap_or_else(|| human_tactic_meta_fallback_machine_term(span));
-                    lowering.push_definition(local.name.clone(), ty.clone(), value_term);
-                    core_locals.push_definition(
-                        local.name.clone(),
-                        local.ty.clone(),
-                        value.clone(),
-                    );
-                }
-                None => {
-                    lowering.push_assumption(local.name.clone(), ty);
-                    core_locals.push_assumption(local.name.clone(), local.ty.clone());
-                }
-            }
+            lowering.push_assumption(local.name.clone(), ty);
+            core_locals.push_assumption(local.name.clone(), local.ty.clone());
         }
         lowering
     }
@@ -5717,10 +5855,6 @@ impl HumanLoweringLocalContext {
                 .iter()
                 .map(|local| HumanMetaLocalSnapshot {
                     ty: canonicalize_machine_term_for_meta_context(&local.ty),
-                    value: local
-                        .value
-                        .as_ref()
-                        .map(canonicalize_machine_term_for_meta_context),
                 })
                 .collect(),
         }
@@ -5732,7 +5866,6 @@ impl HumanLoweringLocalContext {
             .map(|local| HumanHoleGoalLocal {
                 name: local.name.clone(),
                 ty: render_machine_term(&local.ty),
-                value: local.value.as_ref().map(render_machine_term),
             })
             .collect()
     }
@@ -5820,10 +5953,10 @@ enum HumanTypeclassSearchResult {
 }
 
 impl HumanImplicitInserter {
-    fn new(
+    fn new<T: FrontendImportView>(
         module: &ResolvedHumanModule,
-        direct_imports: &[VerifiedImport],
-        available_imports: &[VerifiedImport],
+        direct_imports: &[T],
+        available_imports: &[T],
         options: &HumanCompileOptions,
         work_counter_sink: Option<&KernelWorkCounterSink>,
     ) -> HumanResult<Self> {
@@ -5839,7 +5972,7 @@ impl HumanImplicitInserter {
             .iter()
             .copied()
             .chain(available_imports.iter())
-            .flat_map(|import| import.exports.iter())
+            .flat_map(|import| import.exports().iter())
             .filter(|export| export.reducibility == Some(npa_cert::CertReducibility::Opaque))
             .map(|export| export.name.as_dotted())
             .collect();
@@ -5877,8 +6010,8 @@ impl HumanImplicitInserter {
         }
     }
 
-    fn add_import_signatures(&mut self, import: &VerifiedImport) {
-        for export in &import.exports {
+    fn add_import_signatures(&mut self, import: &impl FrontendImportView) {
+        for export in import.exports() {
             self.signatures.insert(
                 export.name.as_dotted(),
                 human_import_signature(&self.imported_source_interfaces, import, export),
@@ -6605,27 +6738,6 @@ impl HumanImplicitInserter {
                     span,
                 })
             }
-            MachineTerm::Let {
-                name,
-                ty,
-                value,
-                body,
-                span,
-            } => {
-                let ty = self.insert_term(*ty, locals, delta)?;
-                let value = self.insert_term(*value, locals, delta)?;
-                let ty_expr = self.elaborate_machine_term(&ty, locals, delta)?;
-                let value_expr = self.elaborate_machine_term(&value, locals, delta)?;
-                let mut nested_locals = locals.clone();
-                nested_locals.push_definition(name.clone(), ty_expr, value_expr);
-                Ok(MachineTerm::Let {
-                    name,
-                    ty: Box::new(ty),
-                    value: Box::new(value),
-                    body: Box::new(self.insert_term(*body, &mut nested_locals, delta)?),
-                    span,
-                })
-            }
             MachineTerm::Annot { expr, ty, span } => Ok(MachineTerm::Annot {
                 expr: Box::new(self.insert_term(*expr, locals, delta)?),
                 ty: Box::new(self.insert_term(*ty, locals, delta)?),
@@ -7096,19 +7208,6 @@ impl HumanImplicitInserter {
                 let body = self.elaborate_machine_term(body, &nested, delta)?;
                 human_close_pi(&elaborated_binders, body)
             }
-            MachineTerm::Let {
-                name,
-                ty,
-                value,
-                body,
-                ..
-            } => {
-                let ty = self.elaborate_machine_term(ty, locals, delta)?;
-                let value = self.elaborate_machine_term(value, locals, delta)?;
-                let mut nested = locals.clone();
-                nested.push_definition(name.clone(), ty, value);
-                self.elaborate_machine_term(body, &nested, delta)?
-            }
             MachineTerm::Annot { expr, .. } => self.elaborate_machine_term(expr, locals, delta)?,
         })
     }
@@ -7467,16 +7566,16 @@ fn render_human_core_level(level: &Level) -> Option<String> {
     render(&normalized, &mut remaining)
 }
 
-fn add_human_builtin_eq_rec_import_bridge<'a>(
+fn add_human_builtin_eq_rec_import_bridge<'a, T: FrontendImportView + 'a>(
     env: &mut Env,
-    imports: impl IntoIterator<Item = &'a VerifiedImport>,
+    imports: impl IntoIterator<Item = &'a T>,
     span: Span,
     context: &str,
     observation: &HumanKernelObservation,
 ) -> HumanResult<()> {
     let needs_eq_rec = imports.into_iter().any(|import| {
         import
-            .exports
+            .exports()
             .iter()
             .any(|export| human_import_export_uses_builtin_eq_rec(import, export))
     });
@@ -7597,13 +7696,6 @@ fn collect_const_names_from_human_expr(names: &mut BTreeSet<npa_cert::Name>, exp
         }
         Expr::Lam { ty, body, .. } | Expr::Pi { ty, body, .. } => {
             collect_const_names_from_human_expr(names, ty);
-            collect_const_names_from_human_expr(names, body);
-        }
-        Expr::Let {
-            ty, value, body, ..
-        } => {
-            collect_const_names_from_human_expr(names, ty);
-            collect_const_names_from_human_expr(names, value);
             collect_const_names_from_human_expr(names, body);
         }
     }
@@ -7839,10 +7931,10 @@ fn human_diagnosed_kernel_decl_diagnostic(
     )
 }
 
-fn active_human_imports<'a>(
+fn active_human_imports<'a, T: FrontendImportView>(
     module: &ResolvedHumanModule,
-    verified_imports: &'a [VerifiedImport],
-) -> HumanResult<Vec<&'a VerifiedImport>> {
+    verified_imports: &'a [T],
+) -> HumanResult<Vec<&'a T>> {
     active_human_import_indices(module, verified_imports).map(|indices| {
         indices
             .into_iter()
@@ -7851,9 +7943,9 @@ fn active_human_imports<'a>(
     })
 }
 
-fn active_human_import_indices(
+fn active_human_import_indices<T: FrontendImportView>(
     module: &ResolvedHumanModule,
-    verified_imports: &[VerifiedImport],
+    verified_imports: &[T],
 ) -> HumanResult<Vec<usize>> {
     let mut seen = BTreeSet::new();
     let mut imports = Vec::new();
@@ -7894,6 +7986,35 @@ fn active_human_import_indices_from_source_interfaces(
                     import.module == active.module
                         && import.export_hash == active.export_hash
                         && import.certificate_hash == active.certificate_hash
+                })
+                .ok_or_else(|| {
+                    HumanDiagnostic::error(
+                        HumanDiagnosticKind::MissingVerifiedImport,
+                        Span::empty(file_id),
+                        format!(
+                            "missing verified import for active Human import {}",
+                            active.module.as_dotted()
+                        ),
+                    )
+                })
+        })
+        .collect()
+}
+
+fn active_human_authoring_import_indices_from_source_interfaces(
+    active_imports: &[HumanImportedSourceInterface],
+    authoring_imports: &[HumanAuthoringImport<'_>],
+    file_id: crate::FileId,
+) -> HumanResult<Vec<usize>> {
+    active_imports
+        .iter()
+        .map(|active| {
+            authoring_imports
+                .iter()
+                .position(|import| {
+                    import.module() == &active.module
+                        && import.export_hash() == active.export_hash
+                        && import.certificate_hash() == active.certificate_hash
                 })
                 .ok_or_else(|| {
                     HumanDiagnostic::error(
@@ -8007,8 +8128,8 @@ fn validate_by_proof_map_indices(
     .with_phase(HumanDiagnosticPhase::Elaborator))
 }
 
-fn find_human_verified_import_index(
-    verified_imports: &[VerifiedImport],
+fn find_human_verified_import_index<T: FrontendImportView>(
+    verified_imports: &[T],
     import_module: &npa_cert::ModuleName,
     import_name: &HumanName,
     span: Span,
@@ -8016,7 +8137,7 @@ fn find_human_verified_import_index(
     let mut matches = verified_imports
         .iter()
         .enumerate()
-        .filter(|(_, import)| &import.module == import_module);
+        .filter(|(_, import)| import.module() == import_module);
     let Some((first_index, first)) = matches.next() else {
         return Err(HumanDiagnostic::error(
             HumanDiagnosticKind::MissingVerifiedImport,
@@ -8028,7 +8149,7 @@ fn find_human_verified_import_index(
         ));
     };
 
-    if matches.any(|(_, import)| import != first) {
+    if matches.any(|(_, import)| !frontend_import_views_equal(import, first)) {
         return Err(HumanDiagnostic::error(
             HumanDiagnosticKind::AmbiguousName,
             span,
@@ -8070,13 +8191,13 @@ fn human_certificate_import_diagnostic(
     )
 }
 
-fn kernel_decls_for_human_import(import: &VerifiedImport) -> Vec<Decl> {
-    if !import.kernel_decls.is_empty() {
-        return import.kernel_decls.clone();
+fn kernel_decls_for_human_import(import: &impl FrontendImportView) -> Vec<Decl> {
+    if !import.kernel_declarations().is_empty() {
+        return import.kernel_declarations().to_vec();
     }
 
     import
-        .exports
+        .exports()
         .iter()
         .map(|export| Decl::Axiom {
             name: export.name.as_dotted(),
@@ -8174,18 +8295,6 @@ fn rename_machine_local_in_place(term: &mut MachineTerm, from: &str, to: &str, s
                     body_shadowed = true;
                 }
             }
-            rename_machine_local_in_place(body, from, to, body_shadowed);
-        }
-        MachineTerm::Let {
-            name,
-            ty,
-            value,
-            body,
-            ..
-        } => {
-            rename_machine_local_in_place(ty, from, to, shadowed);
-            rename_machine_local_in_place(value, from, to, shadowed);
-            let body_shadowed = shadowed || name == from;
             rename_machine_local_in_place(body, from, to, body_shadowed);
         }
         MachineTerm::Annot { expr, ty, .. } => {
@@ -8405,24 +8514,6 @@ fn core_expr_to_machine_term(
                 span,
             })
         }
-        Expr::Let {
-            binder,
-            ty,
-            value,
-            body,
-        } => {
-            let ty_term = core_expr_to_machine_term(ty, locals, span)?;
-            let value_term = core_expr_to_machine_term(value, locals, span)?;
-            let mut nested = locals.clone();
-            nested.push_definition(binder.clone(), (**ty).clone(), (**value).clone());
-            Some(MachineTerm::Let {
-                name: binder.clone(),
-                ty: Box::new(ty_term),
-                value: Box::new(value_term),
-                body: Box::new(core_expr_to_machine_term(body, &nested, span)?),
-                span,
-            })
-        }
     }
 }
 
@@ -8480,10 +8571,10 @@ struct HumanToMachineLowering<'a> {
 }
 
 impl<'a> HumanToMachineLowering<'a> {
-    fn new(
+    fn new<T: FrontendImportView>(
         module: &'a ResolvedHumanModule,
-        direct_imports: &[VerifiedImport],
-        available_imports: &[VerifiedImport],
+        direct_imports: &[T],
+        available_imports: &[T],
         notation_plan: &'a [usize],
         options: &HumanCompileOptions,
         work_counter_sink: Option<&KernelWorkCounterSink>,
@@ -9491,33 +9582,6 @@ impl<'a> HumanToMachineLowering<'a> {
                 context.truncate_scope(scope);
                 MachineTerm::Pi {
                     binders,
-                    body: Box::new(body),
-                    span,
-                }
-            }
-            HumanExpr::Let {
-                name,
-                ty,
-                value,
-                body,
-                span,
-            } => {
-                let Some(ty) = ty else {
-                    return Err(HumanDiagnostic::not_implemented(
-                        span,
-                        "unannotated Human let lowering",
-                    ));
-                };
-                let ty = self.lower_expr(*ty, context, None)?;
-                let value = self.lower_expr(*value, context, Some(Cow::Borrowed(&ty)))?;
-                let scope = context.scope_mark();
-                context.push_definition(name.as_dotted(), ty.clone(), value.clone());
-                let body = self.lower_expr(*body, context, expected)?;
-                context.truncate_scope(scope);
-                MachineTerm::Let {
-                    name: name.as_dotted(),
-                    ty: Box::new(ty),
-                    value: Box::new(value),
                     body: Box::new(body),
                     span,
                 }
@@ -10587,7 +10651,6 @@ fn human_match_typeclass_expr(
             )?),
             _ => Ok(false),
         },
-        Expr::Let { .. } => Ok(false),
     }
 }
 
@@ -10725,41 +10788,6 @@ fn human_replace_candidate_bvars(
                 None => return Ok(None),
             },
         ),
-        Expr::Let {
-            binder,
-            ty,
-            value,
-            body,
-        } => Expr::let_in(
-            binder.clone(),
-            match human_replace_candidate_bvars(
-                ty,
-                candidate_context_len,
-                local_depth,
-                term_assignments,
-            )? {
-                Some(ty) => ty,
-                None => return Ok(None),
-            },
-            match human_replace_candidate_bvars(
-                value,
-                candidate_context_len,
-                local_depth,
-                term_assignments,
-            )? {
-                Some(value) => value,
-                None => return Ok(None),
-            },
-            match human_replace_candidate_bvars(
-                body,
-                candidate_context_len,
-                local_depth + 1,
-                term_assignments,
-            )? {
-                Some(body) => body,
-                None => return Ok(None),
-            },
-        ),
     }))
 }
 
@@ -10785,21 +10813,6 @@ fn human_candidate_expr_has_only_telescope_bvars(
         }
         Expr::Lam { ty, body, .. } | Expr::Pi { ty, body, .. } => {
             human_candidate_expr_has_only_telescope_bvars(ty, candidate_context_len, local_depth)
-                && human_candidate_expr_has_only_telescope_bvars(
-                    body,
-                    candidate_context_len,
-                    local_depth + 1,
-                )
-        }
-        Expr::Let {
-            ty, value, body, ..
-        } => {
-            human_candidate_expr_has_only_telescope_bvars(ty, candidate_context_len, local_depth)
-                && human_candidate_expr_has_only_telescope_bvars(
-                    value,
-                    candidate_context_len,
-                    local_depth,
-                )
                 && human_candidate_expr_has_only_telescope_bvars(
                     body,
                     candidate_context_len,
@@ -10899,18 +10912,6 @@ fn human_encode_expr_key(out: &mut Vec<u8>, expr: &Expr) {
             out.push(0x05);
             human_encode_key_string(out, binder);
             human_encode_expr_key(out, ty);
-            human_encode_expr_key(out, body);
-        }
-        Expr::Let {
-            binder,
-            ty,
-            value,
-            body,
-        } => {
-            out.push(0x06);
-            human_encode_key_string(out, binder);
-            human_encode_expr_key(out, ty);
-            human_encode_expr_key(out, value);
             human_encode_expr_key(out, body);
         }
     }
@@ -11106,7 +11107,9 @@ mod tests {
         collect_declaration_details: bool,
     ) {
         if !collect_declaration_details {
-            assert_eq!(observations, &HumanCompilationObservations::default());
+            let mut non_timing = observations.clone();
+            non_timing.source_free_verification_elapsed_ns = 0;
+            assert_eq!(non_timing, HumanCompilationObservations::default());
             return;
         }
 
@@ -11132,13 +11135,6 @@ mod tests {
             }
             Expr::Lam { ty, body, .. } | Expr::Pi { ty, body, .. } => {
                 expr_contains_const(ty, expected) || expr_contains_const(body, expected)
-            }
-            Expr::Let {
-                ty, value, body, ..
-            } => {
-                expr_contains_const(ty, expected)
-                    || expr_contains_const(value, expected)
-                    || expr_contains_const(body, expected)
             }
             Expr::Sort(_) | Expr::BVar(_) => false,
         }
@@ -11221,14 +11217,14 @@ mod tests {
             &HumanCompileOptions::default(),
         )
         .expect("later Human declarations should see a checked local opaque body");
-        assert_eq!(output.certificate.header.format, "NPA-CERT-0.3.0");
-        assert_eq!(output.certificate.header.core_spec, "NPA-Core-0.3.0");
+        assert_eq!(output.certificate.header().format, "NPA-CERT-0.4.0");
+        assert_eq!(output.certificate.header().core_spec, "NPA-Core-0.4.0");
         assert_eq!(
             output.source_interface.declarations[0].definition_reducibility,
             Some(DefinitionReducibility::Opaque)
         );
         assert!(matches!(
-            output.certificate.declarations[0].decl,
+            output.certificate.declarations()[0].decl,
             npa_cert::DeclPayload::Def {
                 reducibility: npa_cert::CertReducibility::Opaque,
                 ..
@@ -11335,6 +11331,18 @@ mod tests {
         (import, source_interface, verified)
     }
 
+    fn imported_source_interface(
+        import: &VerifiedImport,
+        source_interface: HumanSourceInterface,
+    ) -> HumanImportedSourceInterface {
+        HumanImportedSourceInterface {
+            module: import.module.clone(),
+            export_hash: import.export_hash,
+            certificate_hash: import.certificate_hash,
+            source_interface,
+        }
+    }
+
     fn export_ty(name: &str) -> Expr {
         match name {
             "Nat" => Expr::sort(type0()),
@@ -11357,13 +11365,6 @@ mod tests {
             }
             Expr::Lam { ty, body, .. } | Expr::Pi { ty, body, .. } => {
                 collect_const_level_args(ty, target, out);
-                collect_const_level_args(body, target, out);
-            }
-            Expr::Let {
-                ty, value, body, ..
-            } => {
-                collect_const_level_args(ty, target, out);
-                collect_const_level_args(value, target, out);
                 collect_const_level_args(body, target, out);
             }
             Expr::Sort(_) | Expr::BVar(_) => {}
@@ -11404,13 +11405,6 @@ mod tests {
             }
             Expr::Lam { ty, body, .. } | Expr::Pi { ty, body, .. } => {
                 expr_has_internal_human_meta(ty) || expr_has_internal_human_meta(body)
-            }
-            Expr::Let {
-                ty, value, body, ..
-            } => {
-                expr_has_internal_human_meta(ty)
-                    || expr_has_internal_human_meta(value)
-                    || expr_has_internal_human_meta(body)
             }
             Expr::BVar(_) => false,
         }
@@ -11489,7 +11483,7 @@ mod tests {
 
     fn assert_certificate_has_no_internal_human_metas(cert: &npa_cert::ModuleCert) {
         assert!(
-            cert.name_table.iter().all(|name| {
+            cert.name_table().iter().all(|name| {
                 let dotted = name.as_dotted();
                 !dotted.starts_with(HUMAN_UNIVERSE_META_PREFIX)
                     && !dotted.starts_with(HUMAN_SPINE_IMPLICIT_PREFIX)
@@ -11565,10 +11559,10 @@ theorem use : P := p",
         )
         .expect("Human axiom source should build a certificate certificate");
 
-        assert_eq!(cert.axiom_report.module_axioms.len(), 1);
-        let axiom_ref = &cert.axiom_report.module_axioms[0];
+        assert_eq!(cert.axiom_report().module_axioms.len(), 1);
+        let axiom_ref = &cert.axiom_report().module_axioms[0];
         assert_eq!(
-            cert.name_table[axiom_ref.name],
+            cert.name_table()[axiom_ref.name],
             npa_cert::Name::from_dotted("P")
         );
 
@@ -11606,8 +11600,8 @@ theorem use : P := p",
         )
         .expect("available but unimported verified modules should not enter the certificate");
 
-        assert!(cert.imports.is_empty());
-        assert_eq!(cert.axiom_report.module_axioms.len(), 1);
+        assert!(cert.imports().is_empty());
+        assert_eq!(cert.axiom_report().module_axioms.len(), 1);
     }
 
     #[test]
@@ -11825,13 +11819,16 @@ instance Nat.add_inst : Add Nat where
         )
         .expect("Human typeclass certificate should compile");
 
-        let certificate_hash = output.certificate.hashes.certificate_hash;
+        let certificate_hash = output.certificate.hashes().certificate_hash;
         let mut metadata = output.source_interface.clone();
         metadata.typeclass_instances[0].priority += 1;
         metadata.typeclass_classes[0].fields[0].name.parts = vec!["broken".to_owned()];
 
         assert_ne!(metadata, output.source_interface);
-        assert_eq!(certificate_hash, output.certificate.hashes.certificate_hash);
+        assert_eq!(
+            certificate_hash,
+            output.certificate.hashes().certificate_hash
+        );
     }
 
     #[test]
@@ -12036,8 +12033,8 @@ instance Nat.add_inst : Add Nat where
         .expect("source certificate should still compile");
 
         assert_eq!(
-            before.certificate.hashes.certificate_hash,
-            after.certificate.hashes.certificate_hash
+            before.certificate.hashes().certificate_hash,
+            after.certificate.hashes().certificate_hash
         );
         assert!(!search.search_trace.is_empty());
     }
@@ -12126,17 +12123,17 @@ inductive Nat : Type where
         )
         .expect("Human simple inductive should build a certificate certificate");
 
-        assert!(cert.export_block.iter().any(|entry| {
+        assert!(cert.export_block().iter().any(|entry| {
             entry.kind == npa_cert::ExportKind::Constructor
-                && cert.name_table[entry.name] == npa_cert::Name::from_dotted("Nat.zero")
+                && cert.name_table()[entry.name] == npa_cert::Name::from_dotted("Nat.zero")
         }));
-        assert!(cert.export_block.iter().any(|entry| {
+        assert!(cert.export_block().iter().any(|entry| {
             entry.kind == npa_cert::ExportKind::Constructor
-                && cert.name_table[entry.name] == npa_cert::Name::from_dotted("Nat.succ")
+                && cert.name_table()[entry.name] == npa_cert::Name::from_dotted("Nat.succ")
         }));
-        assert!(cert.export_block.iter().any(|entry| {
+        assert!(cert.export_block().iter().any(|entry| {
             entry.kind == npa_cert::ExportKind::Recursor
-                && cert.name_table[entry.name] == npa_cert::Name::from_dotted("Nat.rec")
+                && cert.name_table()[entry.name] == npa_cert::Name::from_dotted("Nat.rec")
         }));
     }
 
@@ -12218,9 +12215,9 @@ inductive Nat : Type where
         let cert = output.certificate;
         let source_interface = output.source_interface;
         let export_hash = |name: &str| {
-            cert.export_block
+            cert.export_block()
                 .iter()
-                .find(|entry| cert.name_table[entry.name] == npa_cert::Name::from_dotted(name))
+                .find(|entry| cert.name_table()[entry.name] == npa_cert::Name::from_dotted(name))
                 .map(|entry| entry.decl_interface_hash)
                 .expect("expected source interface name to be exported")
         };
@@ -12304,10 +12301,10 @@ def copy_eq_rec.{u,v} :
 
         let axioms = output
             .certificate
-            .axiom_report
+            .axiom_report()
             .module_axioms
             .iter()
-            .map(|axiom| output.certificate.name_table[axiom.name].as_dotted())
+            .map(|axiom| output.certificate.name_table()[axiom.name].as_dotted())
             .collect::<Vec<_>>();
         assert_eq!(axioms, vec!["Eq.rec"]);
     }
@@ -12544,8 +12541,8 @@ def use_id.{u} {A : Sort u} (x : A) : A := id x";
         .expect("second Human certificate should build");
 
         assert_eq!(
-            first.hashes.certificate_hash,
-            second.hashes.certificate_hash
+            first.hashes().certificate_hash,
+            second.hashes().certificate_hash
         );
         assert_certificate_has_no_internal_human_metas(&first);
         assert_certificate_has_no_internal_human_metas(&second);
@@ -12957,9 +12954,13 @@ inductive FunctionAliasWrapper.{u} (Carrier : Sort u) : Sort max 1 u where
             observation.diagnostic_options.fuel_report,
             KernelFuelReportMode::Failure
         );
-        let mut env =
-            human_kernel_env_from_verified_imports(&[], &[], Span::empty(FileId(4)), &observation)
-                .unwrap();
+        let mut env = human_kernel_env_from_verified_imports::<VerifiedImport>(
+            &[],
+            &[],
+            Span::empty(FileId(4)),
+            &observation,
+        )
+        .unwrap();
         add_human_builtin_decls_for_names(
             &mut env,
             &BTreeSet::from([npa_cert::Name::from_dotted("Nat")]),
@@ -13036,7 +13037,7 @@ def id (x : A) : A := x";
         )
         .unwrap();
 
-        let observed = elaborate_human_module_with_available_imports_observed(
+        let observed = elaborate_human_module_with_available_imports_observed::<VerifiedImport>(
             module_name.clone(),
             &resolved,
             &[],
@@ -13196,7 +13197,7 @@ def use (n : Sort 2) : Sort 2 := n + Type";
         .unwrap();
         let plans = notation_candidate_plans(&resolved, options.max_notation_candidates).unwrap();
 
-        let first_error = match elaborate_human_module_with_notation_plan_observed(
+        let first_error = match elaborate_human_module_with_notation_plan_observed::<VerifiedImport>(
             module_name.clone(),
             &resolved,
             &[],
@@ -13209,15 +13210,10 @@ def use (n : Sort 2) : Sort 2 := n + Type";
             Ok(_) => panic!("first notation plan should fail"),
             Err(error) => error,
         };
-        let aggregate_error = match elaborate_human_module_with_available_imports_observed(
-            module_name,
-            &resolved,
-            &[],
-            &[],
-            &options,
-            None,
-            true,
-        ) {
+        let aggregate_error = match elaborate_human_module_with_available_imports_observed::<
+            VerifiedImport,
+        >(module_name, &resolved, &[], &[], &options, None, true)
+        {
             Ok(_) => panic!("all notation plans should fail"),
             Err(error) => error,
         };
@@ -13475,7 +13471,6 @@ theorem bad (n : Nat) : Eq.{1} Nat n n := Eq.refl n",
         let local_context = vec![MachineLocalDecl {
             name: "n".to_owned(),
             ty: nat(),
-            value: None,
         }];
         let context = HumanTacticTermElabContext::from_request(HumanTacticTermElabContextRequest {
             direct_imports: &imports,
@@ -13514,7 +13509,6 @@ theorem bad (n : Nat) : Eq.{1} Nat n n := Eq.refl n",
         let local_context = vec![MachineLocalDecl {
             name: "n".to_owned(),
             ty: nat(),
-            value: None,
         }];
         let context = HumanTacticTermElabContext::from_request(HumanTacticTermElabContextRequest {
             direct_imports: &imports,
@@ -13743,8 +13737,8 @@ def foo : forall (A : Type), Type := fun A => A",
         )
         .expect("proof start should use a local body for the preceding opaque definition");
 
-        assert_eq!(prepared.proof.owner_certificate_format, "NPA-CERT-0.3.0");
-        assert_eq!(prepared.proof.owner_core_spec, "NPA-Core-0.3.0");
+        assert_eq!(prepared.proof.owner_certificate_format, "NPA-CERT-0.4.0");
+        assert_eq!(prepared.proof.owner_core_spec, "NPA-Core-0.4.0");
         assert!(matches!(
             prepared.proof.prior_declarations[0],
             Decl::Def {
@@ -13903,6 +13897,348 @@ def use : A := a ++ a";
     }
 
     #[test]
+    fn human_import_interface_parity_projects_every_consumed_field() {
+        let (ordinary, _, verified) =
+            verified_human_import("Lib", "axiom A : Type\ndef choose (x y : A) : A := x");
+        let session = npa_cert::LocalAuthoringVerifierSession::new();
+        let context = session.register_verified_module(&verified);
+        let cached = HumanAuthoringImport::from_local_authoring_context(&context)
+            .expect("a retained local context should project into the frontend");
+        let live = HumanAuthoringImport::from_verified_module(&verified);
+
+        for authoring in [&cached, &live] {
+            assert_eq!(authoring.module(), &ordinary.module);
+            assert_eq!(authoring.export_hash(), ordinary.export_hash);
+            assert_eq!(authoring.certificate_hash(), ordinary.certificate_hash);
+            assert_eq!(authoring.exports(), ordinary.exports);
+            assert_eq!(
+                authoring.declaration_interface_hashes(),
+                &ordinary.decl_interface_hashes
+            );
+            assert_eq!(authoring.kernel_declarations(), ordinary.kernel_decls);
+            assert_eq!(
+                authoring.kernel_declaration_dependencies(),
+                &ordinary.kernel_decl_dependencies
+            );
+            assert!(!authoring.is_proof_evidence());
+        }
+    }
+
+    #[test]
+    fn authoring_import_resolution_elaboration_and_origins_match_ordinary() {
+        let (ordinary, source_interface, verified) = verified_human_import(
+            "Lib",
+            "axiom A : Type\ndef choose (x y : A) : A := x\ninfixl:65 \" ++ \" => choose",
+        );
+        let session = npa_cert::LocalAuthoringVerifierSession::new();
+        let context = session.register_verified_module(&verified);
+        let authoring = HumanAuthoringImport::from_local_authoring_context(&context).unwrap();
+        let source = "import Lib\naxiom a : A\ndef use : A := a ++ a";
+        let parsed = parse_human_module_with_source_interfaces(
+            FileId(7),
+            source,
+            std::slice::from_ref(&source_interface),
+        )
+        .unwrap();
+
+        let ordinary_resolved = resolve_human_module_with_source_interfaces(
+            npa_cert::Name::from_dotted("Consumer"),
+            parsed.clone(),
+            std::slice::from_ref(&ordinary),
+            std::slice::from_ref(&source_interface),
+            &HumanCompileOptions::default(),
+        )
+        .unwrap();
+        let authoring_resolved =
+            crate::resolve_human_module_with_authoring_imports_and_source_interfaces(
+                npa_cert::Name::from_dotted("Consumer"),
+                parsed,
+                std::slice::from_ref(&authoring),
+                std::slice::from_ref(&source_interface),
+                &HumanCompileOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(authoring_resolved, ordinary_resolved);
+        assert!(authoring_resolved.resolved_notations.iter().any(|use_| {
+            matches!(
+                use_.candidates.as_slice(),
+                [HumanGlobalRef::Imported {
+                    module,
+                    name,
+                    decl_interface_hash,
+                }] if module.as_dotted() == "Lib"
+                    && name.as_dotted() == "choose"
+                    && ordinary
+                        .decl_interface_hashes
+                        .get(name)
+                        .is_some_and(|expected| expected == decl_interface_hash)
+            )
+        }));
+        assert!(authoring_resolved
+            .notation_table
+            .iter()
+            .any(|notation| notation.token == "++" && notation.span.file_id == FileId(0)));
+
+        let ordinary_core = elaborate_human_module(
+            npa_cert::Name::from_dotted("Consumer"),
+            ordinary_resolved,
+            std::slice::from_ref(&ordinary),
+            &HumanCompileOptions::default(),
+        )
+        .unwrap();
+        let authoring_core = elaborate_human_module_with_authoring_imports(
+            npa_cert::Name::from_dotted("Consumer"),
+            authoring_resolved,
+            std::slice::from_ref(&authoring),
+            &HumanCompileOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(authoring_core, ordinary_core);
+    }
+
+    #[test]
+    fn authoring_import_transitive_kernel_and_preferred_selection_match_ordinary() {
+        let (base_import, base_interface, base_verified) =
+            verified_human_import("Base", "axiom A : Type");
+        let mid_output =
+            compile_human_source_to_certificate_output_with_available_import_refs_and_axiom_policy(
+                FileId(1),
+                npa_cert::Name::from_dotted("Mid"),
+                "import Base\ndef B : Type := A",
+                &[&base_verified],
+                &[&base_verified],
+                std::slice::from_ref(&base_interface),
+                &HumanCompileOptions::default(),
+                &npa_cert::AxiomPolicy::normal(),
+            )
+            .unwrap();
+        let mid_verified = mid_output.verified_module;
+        let mid_import = VerifiedImport::from(&mid_verified);
+        let mid_interface = imported_source_interface(&mid_import, mid_output.source_interface);
+
+        let source = "import Mid\naxiom use : B";
+        let parsed = parse_human_module_with_source_interfaces(
+            FileId(2),
+            source,
+            std::slice::from_ref(&mid_interface),
+        )
+        .unwrap();
+        let ordinary_resolved = resolve_human_module_with_source_interfaces(
+            npa_cert::Name::from_dotted("Consumer"),
+            parsed.clone(),
+            std::slice::from_ref(&mid_import),
+            std::slice::from_ref(&mid_interface),
+            &HumanCompileOptions::default(),
+        )
+        .unwrap();
+
+        let session = npa_cert::LocalAuthoringVerifierSession::new();
+        let mid_context = session.register_verified_module(&mid_verified);
+        let base_context = session.register_verified_module(&base_verified);
+        let authoring_imports = [
+            HumanAuthoringImport::from_local_authoring_context(&mid_context).unwrap(),
+            HumanAuthoringImport::from_local_authoring_context(&base_context).unwrap(),
+        ];
+        let authoring_resolved =
+            crate::resolve_human_module_with_authoring_imports_and_source_interfaces(
+                npa_cert::Name::from_dotted("Consumer"),
+                parsed,
+                &authoring_imports[..1],
+                std::slice::from_ref(&mid_interface),
+                &HumanCompileOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(authoring_resolved, ordinary_resolved);
+
+        let ordinary_missing_dependency = elaborate_human_module_with_available_imports(
+            npa_cert::Name::from_dotted("Consumer"),
+            ordinary_resolved.clone(),
+            std::slice::from_ref(&mid_import),
+            std::slice::from_ref(&mid_import),
+            &HumanCompileOptions::default(),
+        )
+        .expect_err("the ordinary lane should require Base for Mid.B");
+        let authoring_missing_dependency = elaborate_human_module_with_available_authoring_imports(
+            npa_cert::Name::from_dotted("Consumer"),
+            authoring_resolved.clone(),
+            &authoring_imports[..1],
+            &authoring_imports[..1],
+            &HumanCompileOptions::default(),
+        )
+        .expect_err("the authoring lane should require Base for Mid.B");
+        assert_eq!(authoring_missing_dependency, ordinary_missing_dependency);
+
+        let ordinary_available = [mid_import.clone(), base_import];
+        let ordinary_core = elaborate_human_module_with_available_imports(
+            npa_cert::Name::from_dotted("Consumer"),
+            ordinary_resolved,
+            &ordinary_available[..1],
+            &ordinary_available,
+            &HumanCompileOptions::default(),
+        )
+        .unwrap();
+        let authoring_core = elaborate_human_module_with_available_authoring_imports(
+            npa_cert::Name::from_dotted("Consumer"),
+            authoring_resolved,
+            &authoring_imports[..1],
+            &authoring_imports,
+            &HumanCompileOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(authoring_core, ordinary_core);
+
+        let ordinary_modules = [&mid_verified, &base_verified];
+        let (ordinary_selected, ordinary_preferred) =
+            certificate_import_refs_and_providers_for_module_refs(
+                &ordinary_core,
+                &[0],
+                &ordinary_modules,
+                FileId(2),
+            )
+            .unwrap();
+        let authoring_selection = certificate_authoring_import_selection_for_human_core_module(
+            &authoring_core,
+            std::slice::from_ref(&mid_interface),
+            &authoring_imports,
+            FileId(2),
+        )
+        .unwrap();
+        assert_eq!(authoring_selection.import_indices(), &[0, 1]);
+        assert_eq!(
+            authoring_selection
+                .import_indices()
+                .iter()
+                .map(|index| authoring_imports[*index].module().clone())
+                .collect::<Vec<_>>(),
+            ordinary_selected
+                .iter()
+                .map(|module| module.module().clone())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(authoring_selection.preferred_imports(), &ordinary_preferred);
+        assert_eq!(
+            authoring_selection
+                .preferred_imports()
+                .get(&npa_cert::Name::from_dotted("B"))
+                .map(|entry| entry.module.clone()),
+            Some(npa_cert::Name::from_dotted("Mid"))
+        );
+        assert_eq!(
+            authoring_selection
+                .preferred_imports()
+                .get(&npa_cert::Name::from_dotted("A"))
+                .map(|entry| entry.module.clone()),
+            Some(npa_cert::Name::from_dotted("Base"))
+        );
+
+        let ordinary_selection_error = certificate_import_refs_and_providers_for_module_refs(
+            &ordinary_core,
+            &[0],
+            &[&mid_verified],
+            FileId(2),
+        )
+        .unwrap_err();
+        let authoring_selection_error =
+            certificate_import_indices_and_providers_for_authoring_imports(
+                &authoring_core,
+                &[0],
+                &authoring_imports[..1],
+                FileId(2),
+            )
+            .unwrap_err();
+        assert_eq!(authoring_selection_error, ordinary_selection_error);
+    }
+
+    #[test]
+    fn authoring_import_diagnostics_and_duplicate_declarations_match_ordinary() {
+        let (left_import, left_interface, left_verified) =
+            verified_human_import("Left", "axiom Shared : Type");
+        let (right_import, right_interface, right_verified) =
+            verified_human_import("Right", "axiom Shared : Type");
+        let active_interface = left_interface.clone();
+        let source_interfaces = [left_interface, right_interface];
+        let parsed = parse_human_module_with_source_interfaces(
+            FileId(9),
+            "import Left\nimport Right\naxiom use : Shared",
+            &source_interfaces,
+        )
+        .unwrap();
+        let ordinary_imports = [left_import, right_import];
+        let ordinary_error = resolve_human_module_with_source_interfaces(
+            npa_cert::Name::from_dotted("Consumer"),
+            parsed.clone(),
+            &ordinary_imports,
+            &source_interfaces,
+            &HumanCompileOptions::default(),
+        )
+        .expect_err("duplicate imported declarations should be ambiguous");
+
+        let session = npa_cert::LocalAuthoringVerifierSession::new();
+        let left_context = session.register_verified_module(&left_verified);
+        let right_context = session.register_verified_module(&right_verified);
+        let authoring_imports = [
+            HumanAuthoringImport::from_local_authoring_context(&left_context).unwrap(),
+            HumanAuthoringImport::from_local_authoring_context(&right_context).unwrap(),
+        ];
+        let authoring_error =
+            crate::resolve_human_module_with_authoring_imports_and_source_interfaces(
+                npa_cert::Name::from_dotted("Consumer"),
+                parsed,
+                &authoring_imports,
+                &source_interfaces,
+                &HumanCompileOptions::default(),
+            )
+            .expect_err("authoring imports must preserve duplicate declaration behavior");
+        assert_eq!(authoring_error, ordinary_error);
+
+        let missing = parse_human_module_with_source_interfaces(
+            FileId(10),
+            "import Missing\naxiom use : Prop",
+            &[],
+        )
+        .unwrap();
+        let ordinary_missing = resolve_human_module_with_source_interfaces(
+            npa_cert::Name::from_dotted("Consumer"),
+            missing.clone(),
+            &[],
+            &[],
+            &HumanCompileOptions::default(),
+        )
+        .unwrap_err();
+        let authoring_missing =
+            crate::resolve_human_module_with_authoring_imports_and_source_interfaces(
+                npa_cert::Name::from_dotted("Consumer"),
+                missing,
+                &[],
+                &[],
+                &HumanCompileOptions::default(),
+            )
+            .unwrap_err();
+        assert_eq!(authoring_missing, ordinary_missing);
+
+        let empty_core = npa_cert::CoreModule {
+            name: npa_cert::Name::from_dotted("Consumer"),
+            declarations: Vec::new(),
+        };
+        let ordinary_active_missing = certificate_imports_for_human_core_module(
+            &empty_core,
+            std::slice::from_ref(&active_interface),
+            &[],
+            FileId(11),
+        )
+        .unwrap_err();
+        let authoring_active_missing =
+            certificate_authoring_import_selection_for_human_core_module(
+                &empty_core,
+                std::slice::from_ref(&active_interface),
+                &[],
+                FileId(11),
+            )
+            .unwrap_err();
+        assert_eq!(authoring_active_missing, ordinary_active_missing);
+    }
+
+    #[test]
     fn grouped_binder_annotation_is_lowered_before_group_locals_enter_scope() {
         let module = compile_human_source_to_core(
             FileId(0),
@@ -14040,7 +14376,7 @@ def bad : Type := F",
             npa_cert::Name::from_dotted("Test"),
             "\
 import Std.Nat.Basic
-def bad_named_hole : Nat := let x : Nat := ?m in ?m",
+def bad_named_hole : Nat := (fun (x : Nat) => ?m) ?m",
             &imports,
             &HumanCompileOptions::default(),
         )
@@ -14053,10 +14389,10 @@ def bad_named_hole : Nat := let x : Nat := ?m in ?m",
         assert_eq!(payload.phase, Some(HumanDiagnosticPhase::Elaborator));
         assert_eq!(payload.hole_goals.len(), 2);
         assert_eq!(payload.hole_goals[0].hole.as_deref(), Some("?m"));
-        assert_eq!(payload.hole_goals[0].context.len(), 0);
+        assert_eq!(payload.hole_goals[0].context.len(), 1);
+        assert_eq!(payload.hole_goals[0].context[0].name, "x");
         assert_eq!(payload.hole_goals[1].hole.as_deref(), Some("?m"));
-        assert_eq!(payload.hole_goals[1].context.len(), 1);
-        assert_eq!(payload.hole_goals[1].context[0].name, "x");
+        assert_eq!(payload.hole_goals[1].context.len(), 0);
     }
 
     #[test]

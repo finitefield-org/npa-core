@@ -1,0 +1,858 @@
+{
+  "schema": "npa.kernel-whnf-application-spine.fixtures.v0.1",
+  "warmup": 1,
+  "samples": 9,
+  "whnf_fuel": 100000,
+  "conversion_fuel": 5000000,
+  "micro_scenarios": [
+    {
+      "id": "opaque-neutral-head.w32.memo-off",
+      "kind": "opaque-neutral-head",
+      "width": 32,
+      "mode": "memo-off",
+      "trailing_arguments": 0,
+      "machine_only": false,
+      "deterministic_baseline_key": "opaque-neutral-head.w32.memo-off"
+    },
+    {
+      "id": "opaque-neutral-head.w32.repetition-probe",
+      "kind": "opaque-neutral-head",
+      "width": 32,
+      "mode": "repetition-probe",
+      "trailing_arguments": 0,
+      "machine_only": false,
+      "deterministic_baseline_key": "opaque-neutral-head.w32.repetition-probe"
+    },
+    {
+      "id": "opaque-neutral-head.w32.ephemeral",
+      "kind": "opaque-neutral-head",
+      "width": 32,
+      "mode": "ephemeral",
+      "trailing_arguments": 0,
+      "machine_only": false,
+      "deterministic_baseline_key": "opaque-neutral-head.w32.ephemeral"
+    },
+    {
+      "id": "opaque-neutral-head.w128.memo-off",
+      "kind": "opaque-neutral-head",
+      "width": 128,
+      "mode": "memo-off",
+      "trailing_arguments": 0,
+      "machine_only": false,
+      "deterministic_baseline_key": "opaque-neutral-head.w128.memo-off"
+    },
+    {
+      "id": "opaque-neutral-head.w128.repetition-probe",
+      "kind": "opaque-neutral-head",
+      "width": 128,
+      "mode": "repetition-probe",
+      "trailing_arguments": 0,
+      "machine_only": false,
+      "deterministic_baseline_key": "opaque-neutral-head.w128.repetition-probe"
+    },
+    {
+      "id": "opaque-neutral-head.w128.ephemeral",
+      "kind": "opaque-neutral-head",
+      "width": 128,
+      "mode": "ephemeral",
+      "trailing_arguments": 0,
+      "machine_only": false,
+      "deterministic_baseline_key": "opaque-neutral-head.w128.ephemeral"
+    },
+    {
+      "id": "opaque-neutral-head.w512.memo-off",
+      "kind": "opaque-neutral-head",
+      "width": 512,
+      "mode": "memo-off",
+      "trailing_arguments": 0,
+      "machine_only": false,
+      "deterministic_baseline_key": "opaque-neutral-head.w512.memo-off"
+    },
+    {
+      "id": "opaque-neutral-head.w512.repetition-probe",
+      "kind": "opaque-neutral-head",
+      "width": 512,
+      "mode": "repetition-probe",
+      "trailing_arguments": 0,
+      "machine_only": false,
+      "deterministic_baseline_key": "opaque-neutral-head.w512.repetition-probe"
+    },
+    {
+      "id": "opaque-neutral-head.w512.ephemeral",
+      "kind": "opaque-neutral-head",
+      "width": 512,
+      "mode": "ephemeral",
+      "trailing_arguments": 0,
+      "machine_only": false,
+      "deterministic_baseline_key": "opaque-neutral-head.w512.ephemeral"
+    },
+    {
+      "id": "opaque-neutral-head.w2048.memo-off",
+      "kind": "opaque-neutral-head",
+      "width": 2048,
+      "mode": "memo-off",
+      "trailing_arguments": 0,
+      "machine_only": false,
+      "deterministic_baseline_key": "opaque-neutral-head.w2048.memo-off"
+    },
+    {
+      "id": "opaque-neutral-head.w2048.repetition-probe",
+      "kind": "opaque-neutral-head",
+      "width": 2048,
+      "mode": "repetition-probe",
+      "trailing_arguments": 0,
+      "machine_only": false,
+      "deterministic_baseline_key": "opaque-neutral-head.w2048.repetition-probe"
+    },
+    {
+      "id": "opaque-neutral-head.w2048.ephemeral",
+      "kind": "opaque-neutral-head",
+      "width": 2048,
+      "mode": "ephemeral",
+      "trailing_arguments": 0,
+      "machine_only": false,
+      "deterministic_baseline_key": "opaque-neutral-head.w2048.ephemeral"
+    },
+    {
+      "id": "opaque-neutral-head.w8192.memo-off",
+      "kind": "opaque-neutral-head",
+      "width": 8192,
+      "mode": "memo-off",
+      "trailing_arguments": 0,
+      "machine_only": true,
+      "deterministic_baseline_key": null
+    },
+    {
+      "id": "opaque-neutral-head.w8192.repetition-probe",
+      "kind": "opaque-neutral-head",
+      "width": 8192,
+      "mode": "repetition-probe",
+      "trailing_arguments": 0,
+      "machine_only": true,
+      "deterministic_baseline_key": null
+    },
+    {
+      "id": "opaque-neutral-head.w8192.ephemeral",
+      "kind": "opaque-neutral-head",
+      "width": 8192,
+      "mode": "ephemeral",
+      "trailing_arguments": 0,
+      "machine_only": true,
+      "deterministic_baseline_key": null
+    },
+    {
+      "id": "partial-recursor.w32.memo-off",
+      "kind": "partial-recursor",
+      "width": 32,
+      "mode": "memo-off",
+      "trailing_arguments": 0,
+      "machine_only": false,
+      "deterministic_baseline_key": "partial-recursor.w32.memo-off"
+    },
+    {
+      "id": "partial-recursor.w32.repetition-probe",
+      "kind": "partial-recursor",
+      "width": 32,
+      "mode": "repetition-probe",
+      "trailing_arguments": 0,
+      "machine_only": false,
+      "deterministic_baseline_key": "partial-recursor.w32.repetition-probe"
+    },
+    {
+      "id": "partial-recursor.w32.ephemeral",
+      "kind": "partial-recursor",
+      "width": 32,
+      "mode": "ephemeral",
+      "trailing_arguments": 0,
+      "machine_only": false,
+      "deterministic_baseline_key": "partial-recursor.w32.ephemeral"
+    },
+    {
+      "id": "partial-recursor.w128.memo-off",
+      "kind": "partial-recursor",
+      "width": 128,
+      "mode": "memo-off",
+      "trailing_arguments": 0,
+      "machine_only": false,
+      "deterministic_baseline_key": "partial-recursor.w128.memo-off"
+    },
+    {
+      "id": "partial-recursor.w128.repetition-probe",
+      "kind": "partial-recursor",
+      "width": 128,
+      "mode": "repetition-probe",
+      "trailing_arguments": 0,
+      "machine_only": false,
+      "deterministic_baseline_key": "partial-recursor.w128.repetition-probe"
+    },
+    {
+      "id": "partial-recursor.w128.ephemeral",
+      "kind": "partial-recursor",
+      "width": 128,
+      "mode": "ephemeral",
+      "trailing_arguments": 0,
+      "machine_only": false,
+      "deterministic_baseline_key": "partial-recursor.w128.ephemeral"
+    },
+    {
+      "id": "partial-recursor.w512.memo-off",
+      "kind": "partial-recursor",
+      "width": 512,
+      "mode": "memo-off",
+      "trailing_arguments": 0,
+      "machine_only": false,
+      "deterministic_baseline_key": "partial-recursor.w512.memo-off"
+    },
+    {
+      "id": "partial-recursor.w512.repetition-probe",
+      "kind": "partial-recursor",
+      "width": 512,
+      "mode": "repetition-probe",
+      "trailing_arguments": 0,
+      "machine_only": false,
+      "deterministic_baseline_key": "partial-recursor.w512.repetition-probe"
+    },
+    {
+      "id": "partial-recursor.w512.ephemeral",
+      "kind": "partial-recursor",
+      "width": 512,
+      "mode": "ephemeral",
+      "trailing_arguments": 0,
+      "machine_only": false,
+      "deterministic_baseline_key": "partial-recursor.w512.ephemeral"
+    },
+    {
+      "id": "partial-recursor.w2048.memo-off",
+      "kind": "partial-recursor",
+      "width": 2048,
+      "mode": "memo-off",
+      "trailing_arguments": 0,
+      "machine_only": false,
+      "deterministic_baseline_key": "partial-recursor.w2048.memo-off"
+    },
+    {
+      "id": "partial-recursor.w2048.repetition-probe",
+      "kind": "partial-recursor",
+      "width": 2048,
+      "mode": "repetition-probe",
+      "trailing_arguments": 0,
+      "machine_only": false,
+      "deterministic_baseline_key": "partial-recursor.w2048.repetition-probe"
+    },
+    {
+      "id": "partial-recursor.w2048.ephemeral",
+      "kind": "partial-recursor",
+      "width": 2048,
+      "mode": "ephemeral",
+      "trailing_arguments": 0,
+      "machine_only": false,
+      "deterministic_baseline_key": "partial-recursor.w2048.ephemeral"
+    },
+    {
+      "id": "partial-recursor.w8192.memo-off",
+      "kind": "partial-recursor",
+      "width": 8192,
+      "mode": "memo-off",
+      "trailing_arguments": 0,
+      "machine_only": true,
+      "deterministic_baseline_key": null
+    },
+    {
+      "id": "partial-recursor.w8192.repetition-probe",
+      "kind": "partial-recursor",
+      "width": 8192,
+      "mode": "repetition-probe",
+      "trailing_arguments": 0,
+      "machine_only": true,
+      "deterministic_baseline_key": null
+    },
+    {
+      "id": "partial-recursor.w8192.ephemeral",
+      "kind": "partial-recursor",
+      "width": 8192,
+      "mode": "ephemeral",
+      "trailing_arguments": 0,
+      "machine_only": true,
+      "deterministic_baseline_key": null
+    },
+    {
+      "id": "saturated-neutral-major.w32.memo-off",
+      "kind": "saturated-neutral-major",
+      "width": 32,
+      "mode": "memo-off",
+      "trailing_arguments": 8,
+      "machine_only": false,
+      "deterministic_baseline_key": "saturated-neutral-major.w32.memo-off"
+    },
+    {
+      "id": "saturated-neutral-major.w32.repetition-probe",
+      "kind": "saturated-neutral-major",
+      "width": 32,
+      "mode": "repetition-probe",
+      "trailing_arguments": 8,
+      "machine_only": false,
+      "deterministic_baseline_key": "saturated-neutral-major.w32.repetition-probe"
+    },
+    {
+      "id": "saturated-neutral-major.w32.ephemeral",
+      "kind": "saturated-neutral-major",
+      "width": 32,
+      "mode": "ephemeral",
+      "trailing_arguments": 8,
+      "machine_only": false,
+      "deterministic_baseline_key": "saturated-neutral-major.w32.ephemeral"
+    },
+    {
+      "id": "saturated-neutral-major.w128.memo-off",
+      "kind": "saturated-neutral-major",
+      "width": 128,
+      "mode": "memo-off",
+      "trailing_arguments": 8,
+      "machine_only": false,
+      "deterministic_baseline_key": "saturated-neutral-major.w128.memo-off"
+    },
+    {
+      "id": "saturated-neutral-major.w128.repetition-probe",
+      "kind": "saturated-neutral-major",
+      "width": 128,
+      "mode": "repetition-probe",
+      "trailing_arguments": 8,
+      "machine_only": false,
+      "deterministic_baseline_key": "saturated-neutral-major.w128.repetition-probe"
+    },
+    {
+      "id": "saturated-neutral-major.w128.ephemeral",
+      "kind": "saturated-neutral-major",
+      "width": 128,
+      "mode": "ephemeral",
+      "trailing_arguments": 8,
+      "machine_only": false,
+      "deterministic_baseline_key": "saturated-neutral-major.w128.ephemeral"
+    },
+    {
+      "id": "saturated-neutral-major.w512.memo-off",
+      "kind": "saturated-neutral-major",
+      "width": 512,
+      "mode": "memo-off",
+      "trailing_arguments": 8,
+      "machine_only": false,
+      "deterministic_baseline_key": "saturated-neutral-major.w512.memo-off"
+    },
+    {
+      "id": "saturated-neutral-major.w512.repetition-probe",
+      "kind": "saturated-neutral-major",
+      "width": 512,
+      "mode": "repetition-probe",
+      "trailing_arguments": 8,
+      "machine_only": false,
+      "deterministic_baseline_key": "saturated-neutral-major.w512.repetition-probe"
+    },
+    {
+      "id": "saturated-neutral-major.w512.ephemeral",
+      "kind": "saturated-neutral-major",
+      "width": 512,
+      "mode": "ephemeral",
+      "trailing_arguments": 8,
+      "machine_only": false,
+      "deterministic_baseline_key": "saturated-neutral-major.w512.ephemeral"
+    },
+    {
+      "id": "saturated-neutral-major.w2048.memo-off",
+      "kind": "saturated-neutral-major",
+      "width": 2048,
+      "mode": "memo-off",
+      "trailing_arguments": 8,
+      "machine_only": false,
+      "deterministic_baseline_key": "saturated-neutral-major.w2048.memo-off"
+    },
+    {
+      "id": "saturated-neutral-major.w2048.repetition-probe",
+      "kind": "saturated-neutral-major",
+      "width": 2048,
+      "mode": "repetition-probe",
+      "trailing_arguments": 8,
+      "machine_only": false,
+      "deterministic_baseline_key": "saturated-neutral-major.w2048.repetition-probe"
+    },
+    {
+      "id": "saturated-neutral-major.w2048.ephemeral",
+      "kind": "saturated-neutral-major",
+      "width": 2048,
+      "mode": "ephemeral",
+      "trailing_arguments": 8,
+      "machine_only": false,
+      "deterministic_baseline_key": "saturated-neutral-major.w2048.ephemeral"
+    },
+    {
+      "id": "saturated-neutral-major.w8192.memo-off",
+      "kind": "saturated-neutral-major",
+      "width": 8192,
+      "mode": "memo-off",
+      "trailing_arguments": 8,
+      "machine_only": true,
+      "deterministic_baseline_key": null
+    },
+    {
+      "id": "saturated-neutral-major.w8192.repetition-probe",
+      "kind": "saturated-neutral-major",
+      "width": 8192,
+      "mode": "repetition-probe",
+      "trailing_arguments": 8,
+      "machine_only": true,
+      "deterministic_baseline_key": null
+    },
+    {
+      "id": "saturated-neutral-major.w8192.ephemeral",
+      "kind": "saturated-neutral-major",
+      "width": 8192,
+      "mode": "ephemeral",
+      "trailing_arguments": 8,
+      "machine_only": true,
+      "deterministic_baseline_key": null
+    },
+    {
+      "id": "matching-constructor.w32.memo-off",
+      "kind": "matching-constructor",
+      "width": 32,
+      "mode": "memo-off",
+      "trailing_arguments": 8,
+      "machine_only": false,
+      "deterministic_baseline_key": "matching-constructor.w32.memo-off"
+    },
+    {
+      "id": "matching-constructor.w32.repetition-probe",
+      "kind": "matching-constructor",
+      "width": 32,
+      "mode": "repetition-probe",
+      "trailing_arguments": 8,
+      "machine_only": false,
+      "deterministic_baseline_key": "matching-constructor.w32.repetition-probe"
+    },
+    {
+      "id": "matching-constructor.w32.ephemeral",
+      "kind": "matching-constructor",
+      "width": 32,
+      "mode": "ephemeral",
+      "trailing_arguments": 8,
+      "machine_only": false,
+      "deterministic_baseline_key": "matching-constructor.w32.ephemeral"
+    },
+    {
+      "id": "matching-constructor.w128.memo-off",
+      "kind": "matching-constructor",
+      "width": 128,
+      "mode": "memo-off",
+      "trailing_arguments": 8,
+      "machine_only": false,
+      "deterministic_baseline_key": "matching-constructor.w128.memo-off"
+    },
+    {
+      "id": "matching-constructor.w128.repetition-probe",
+      "kind": "matching-constructor",
+      "width": 128,
+      "mode": "repetition-probe",
+      "trailing_arguments": 8,
+      "machine_only": false,
+      "deterministic_baseline_key": "matching-constructor.w128.repetition-probe"
+    },
+    {
+      "id": "matching-constructor.w128.ephemeral",
+      "kind": "matching-constructor",
+      "width": 128,
+      "mode": "ephemeral",
+      "trailing_arguments": 8,
+      "machine_only": false,
+      "deterministic_baseline_key": "matching-constructor.w128.ephemeral"
+    },
+    {
+      "id": "matching-constructor.w512.memo-off",
+      "kind": "matching-constructor",
+      "width": 512,
+      "mode": "memo-off",
+      "trailing_arguments": 8,
+      "machine_only": false,
+      "deterministic_baseline_key": "matching-constructor.w512.memo-off"
+    },
+    {
+      "id": "matching-constructor.w512.repetition-probe",
+      "kind": "matching-constructor",
+      "width": 512,
+      "mode": "repetition-probe",
+      "trailing_arguments": 8,
+      "machine_only": false,
+      "deterministic_baseline_key": "matching-constructor.w512.repetition-probe"
+    },
+    {
+      "id": "matching-constructor.w512.ephemeral",
+      "kind": "matching-constructor",
+      "width": 512,
+      "mode": "ephemeral",
+      "trailing_arguments": 8,
+      "machine_only": false,
+      "deterministic_baseline_key": "matching-constructor.w512.ephemeral"
+    },
+    {
+      "id": "matching-constructor.w2048.memo-off",
+      "kind": "matching-constructor",
+      "width": 2048,
+      "mode": "memo-off",
+      "trailing_arguments": 8,
+      "machine_only": false,
+      "deterministic_baseline_key": "matching-constructor.w2048.memo-off"
+    },
+    {
+      "id": "matching-constructor.w2048.repetition-probe",
+      "kind": "matching-constructor",
+      "width": 2048,
+      "mode": "repetition-probe",
+      "trailing_arguments": 8,
+      "machine_only": false,
+      "deterministic_baseline_key": "matching-constructor.w2048.repetition-probe"
+    },
+    {
+      "id": "matching-constructor.w2048.ephemeral",
+      "kind": "matching-constructor",
+      "width": 2048,
+      "mode": "ephemeral",
+      "trailing_arguments": 8,
+      "machine_only": false,
+      "deterministic_baseline_key": "matching-constructor.w2048.ephemeral"
+    },
+    {
+      "id": "matching-constructor.w8192.memo-off",
+      "kind": "matching-constructor",
+      "width": 8192,
+      "mode": "memo-off",
+      "trailing_arguments": 8,
+      "machine_only": true,
+      "deterministic_baseline_key": null
+    },
+    {
+      "id": "matching-constructor.w8192.repetition-probe",
+      "kind": "matching-constructor",
+      "width": 8192,
+      "mode": "repetition-probe",
+      "trailing_arguments": 8,
+      "machine_only": true,
+      "deterministic_baseline_key": null
+    },
+    {
+      "id": "matching-constructor.w8192.ephemeral",
+      "kind": "matching-constructor",
+      "width": 8192,
+      "mode": "ephemeral",
+      "trailing_arguments": 8,
+      "machine_only": true,
+      "deterministic_baseline_key": null
+    },
+    {
+      "id": "delta-exposed-long-spine.w32.memo-off",
+      "kind": "delta-exposed-long-spine",
+      "width": 32,
+      "mode": "memo-off",
+      "trailing_arguments": 0,
+      "machine_only": false,
+      "deterministic_baseline_key": "delta-exposed-long-spine.w32.memo-off"
+    },
+    {
+      "id": "delta-exposed-long-spine.w32.repetition-probe",
+      "kind": "delta-exposed-long-spine",
+      "width": 32,
+      "mode": "repetition-probe",
+      "trailing_arguments": 0,
+      "machine_only": false,
+      "deterministic_baseline_key": "delta-exposed-long-spine.w32.repetition-probe"
+    },
+    {
+      "id": "delta-exposed-long-spine.w32.ephemeral",
+      "kind": "delta-exposed-long-spine",
+      "width": 32,
+      "mode": "ephemeral",
+      "trailing_arguments": 0,
+      "machine_only": false,
+      "deterministic_baseline_key": "delta-exposed-long-spine.w32.ephemeral"
+    },
+    {
+      "id": "delta-exposed-long-spine.w128.memo-off",
+      "kind": "delta-exposed-long-spine",
+      "width": 128,
+      "mode": "memo-off",
+      "trailing_arguments": 0,
+      "machine_only": false,
+      "deterministic_baseline_key": "delta-exposed-long-spine.w128.memo-off"
+    },
+    {
+      "id": "delta-exposed-long-spine.w128.repetition-probe",
+      "kind": "delta-exposed-long-spine",
+      "width": 128,
+      "mode": "repetition-probe",
+      "trailing_arguments": 0,
+      "machine_only": false,
+      "deterministic_baseline_key": "delta-exposed-long-spine.w128.repetition-probe"
+    },
+    {
+      "id": "delta-exposed-long-spine.w128.ephemeral",
+      "kind": "delta-exposed-long-spine",
+      "width": 128,
+      "mode": "ephemeral",
+      "trailing_arguments": 0,
+      "machine_only": false,
+      "deterministic_baseline_key": "delta-exposed-long-spine.w128.ephemeral"
+    },
+    {
+      "id": "delta-exposed-long-spine.w512.memo-off",
+      "kind": "delta-exposed-long-spine",
+      "width": 512,
+      "mode": "memo-off",
+      "trailing_arguments": 0,
+      "machine_only": false,
+      "deterministic_baseline_key": "delta-exposed-long-spine.w512.memo-off"
+    },
+    {
+      "id": "delta-exposed-long-spine.w512.repetition-probe",
+      "kind": "delta-exposed-long-spine",
+      "width": 512,
+      "mode": "repetition-probe",
+      "trailing_arguments": 0,
+      "machine_only": false,
+      "deterministic_baseline_key": "delta-exposed-long-spine.w512.repetition-probe"
+    },
+    {
+      "id": "delta-exposed-long-spine.w512.ephemeral",
+      "kind": "delta-exposed-long-spine",
+      "width": 512,
+      "mode": "ephemeral",
+      "trailing_arguments": 0,
+      "machine_only": false,
+      "deterministic_baseline_key": "delta-exposed-long-spine.w512.ephemeral"
+    },
+    {
+      "id": "delta-exposed-long-spine.w2048.memo-off",
+      "kind": "delta-exposed-long-spine",
+      "width": 2048,
+      "mode": "memo-off",
+      "trailing_arguments": 0,
+      "machine_only": false,
+      "deterministic_baseline_key": "delta-exposed-long-spine.w2048.memo-off"
+    },
+    {
+      "id": "delta-exposed-long-spine.w2048.repetition-probe",
+      "kind": "delta-exposed-long-spine",
+      "width": 2048,
+      "mode": "repetition-probe",
+      "trailing_arguments": 0,
+      "machine_only": false,
+      "deterministic_baseline_key": "delta-exposed-long-spine.w2048.repetition-probe"
+    },
+    {
+      "id": "delta-exposed-long-spine.w2048.ephemeral",
+      "kind": "delta-exposed-long-spine",
+      "width": 2048,
+      "mode": "ephemeral",
+      "trailing_arguments": 0,
+      "machine_only": false,
+      "deterministic_baseline_key": "delta-exposed-long-spine.w2048.ephemeral"
+    },
+    {
+      "id": "delta-exposed-long-spine.w8192.memo-off",
+      "kind": "delta-exposed-long-spine",
+      "width": 8192,
+      "mode": "memo-off",
+      "trailing_arguments": 0,
+      "machine_only": true,
+      "deterministic_baseline_key": null
+    },
+    {
+      "id": "delta-exposed-long-spine.w8192.repetition-probe",
+      "kind": "delta-exposed-long-spine",
+      "width": 8192,
+      "mode": "repetition-probe",
+      "trailing_arguments": 0,
+      "machine_only": true,
+      "deterministic_baseline_key": null
+    },
+    {
+      "id": "delta-exposed-long-spine.w8192.ephemeral",
+      "kind": "delta-exposed-long-spine",
+      "width": 8192,
+      "mode": "ephemeral",
+      "trailing_arguments": 0,
+      "machine_only": true,
+      "deterministic_baseline_key": null
+    },
+    {
+      "id": "retained-function-ephemeral-defeq.w32.memo-off",
+      "kind": "retained-function-ephemeral-defeq",
+      "width": 32,
+      "mode": "memo-off",
+      "trailing_arguments": 1,
+      "machine_only": false,
+      "deterministic_baseline_key": "retained-function-ephemeral-defeq.w32.memo-off"
+    },
+    {
+      "id": "retained-function-ephemeral-defeq.w32.repetition-probe",
+      "kind": "retained-function-ephemeral-defeq",
+      "width": 32,
+      "mode": "repetition-probe",
+      "trailing_arguments": 1,
+      "machine_only": false,
+      "deterministic_baseline_key": "retained-function-ephemeral-defeq.w32.repetition-probe"
+    },
+    {
+      "id": "retained-function-ephemeral-defeq.w32.ephemeral",
+      "kind": "retained-function-ephemeral-defeq",
+      "width": 32,
+      "mode": "ephemeral",
+      "trailing_arguments": 1,
+      "machine_only": false,
+      "deterministic_baseline_key": "retained-function-ephemeral-defeq.w32.ephemeral"
+    },
+    {
+      "id": "retained-function-ephemeral-defeq.w128.memo-off",
+      "kind": "retained-function-ephemeral-defeq",
+      "width": 128,
+      "mode": "memo-off",
+      "trailing_arguments": 1,
+      "machine_only": false,
+      "deterministic_baseline_key": "retained-function-ephemeral-defeq.w128.memo-off"
+    },
+    {
+      "id": "retained-function-ephemeral-defeq.w128.repetition-probe",
+      "kind": "retained-function-ephemeral-defeq",
+      "width": 128,
+      "mode": "repetition-probe",
+      "trailing_arguments": 1,
+      "machine_only": false,
+      "deterministic_baseline_key": "retained-function-ephemeral-defeq.w128.repetition-probe"
+    },
+    {
+      "id": "retained-function-ephemeral-defeq.w128.ephemeral",
+      "kind": "retained-function-ephemeral-defeq",
+      "width": 128,
+      "mode": "ephemeral",
+      "trailing_arguments": 1,
+      "machine_only": false,
+      "deterministic_baseline_key": "retained-function-ephemeral-defeq.w128.ephemeral"
+    },
+    {
+      "id": "retained-function-ephemeral-defeq.w512.memo-off",
+      "kind": "retained-function-ephemeral-defeq",
+      "width": 512,
+      "mode": "memo-off",
+      "trailing_arguments": 1,
+      "machine_only": false,
+      "deterministic_baseline_key": "retained-function-ephemeral-defeq.w512.memo-off"
+    },
+    {
+      "id": "retained-function-ephemeral-defeq.w512.repetition-probe",
+      "kind": "retained-function-ephemeral-defeq",
+      "width": 512,
+      "mode": "repetition-probe",
+      "trailing_arguments": 1,
+      "machine_only": false,
+      "deterministic_baseline_key": "retained-function-ephemeral-defeq.w512.repetition-probe"
+    },
+    {
+      "id": "retained-function-ephemeral-defeq.w512.ephemeral",
+      "kind": "retained-function-ephemeral-defeq",
+      "width": 512,
+      "mode": "ephemeral",
+      "trailing_arguments": 1,
+      "machine_only": false,
+      "deterministic_baseline_key": "retained-function-ephemeral-defeq.w512.ephemeral"
+    },
+    {
+      "id": "retained-function-ephemeral-defeq.w2048.memo-off",
+      "kind": "retained-function-ephemeral-defeq",
+      "width": 2048,
+      "mode": "memo-off",
+      "trailing_arguments": 1,
+      "machine_only": false,
+      "deterministic_baseline_key": "retained-function-ephemeral-defeq.w2048.memo-off"
+    },
+    {
+      "id": "retained-function-ephemeral-defeq.w2048.repetition-probe",
+      "kind": "retained-function-ephemeral-defeq",
+      "width": 2048,
+      "mode": "repetition-probe",
+      "trailing_arguments": 1,
+      "machine_only": false,
+      "deterministic_baseline_key": "retained-function-ephemeral-defeq.w2048.repetition-probe"
+    },
+    {
+      "id": "retained-function-ephemeral-defeq.w2048.ephemeral",
+      "kind": "retained-function-ephemeral-defeq",
+      "width": 2048,
+      "mode": "ephemeral",
+      "trailing_arguments": 1,
+      "machine_only": false,
+      "deterministic_baseline_key": "retained-function-ephemeral-defeq.w2048.ephemeral"
+    },
+    {
+      "id": "retained-function-ephemeral-defeq.w8192.memo-off",
+      "kind": "retained-function-ephemeral-defeq",
+      "width": 8192,
+      "mode": "memo-off",
+      "trailing_arguments": 1,
+      "machine_only": true,
+      "deterministic_baseline_key": null
+    },
+    {
+      "id": "retained-function-ephemeral-defeq.w8192.repetition-probe",
+      "kind": "retained-function-ephemeral-defeq",
+      "width": 8192,
+      "mode": "repetition-probe",
+      "trailing_arguments": 1,
+      "machine_only": true,
+      "deterministic_baseline_key": null
+    },
+    {
+      "id": "retained-function-ephemeral-defeq.w8192.ephemeral",
+      "kind": "retained-function-ephemeral-defeq",
+      "width": 8192,
+      "mode": "ephemeral",
+      "trailing_arguments": 1,
+      "machine_only": true,
+      "deterministic_baseline_key": null
+    }
+  ],
+  "package_scenarios": [
+    {
+      "id": "checked-package.off",
+      "kind": "checked-package",
+      "package_root": "testdata/package/proofs",
+      "package_manifest": "testdata/package/proofs/npa-package.toml",
+      "package_lock": "checked",
+      "kernel_mode": "off",
+      "cache_policy": "none",
+      "deterministic_baseline_keys": [
+        "checked-package.off"
+      ]
+    },
+    {
+      "id": "checked-package.ephemeral",
+      "kind": "checked-package",
+      "package_root": "testdata/package/proofs",
+      "package_manifest": "testdata/package/proofs/npa-package.toml",
+      "package_lock": "checked",
+      "kernel_mode": "ephemeral",
+      "cache_policy": "none",
+      "deterministic_baseline_keys": [
+        "checked-package.ephemeral"
+      ]
+    },
+    {
+      "id": "checked-package.compare",
+      "kind": "checked-package",
+      "package_root": "testdata/package/proofs",
+      "package_manifest": "testdata/package/proofs/npa-package.toml",
+      "package_lock": "checked",
+      "kernel_mode": "compare",
+      "cache_policy": "none",
+      "deterministic_baseline_keys": [
+        "checked-package.off",
+        "checked-package.ephemeral"
+      ]
+    }
+  ]
+}

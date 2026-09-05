@@ -7,17 +7,18 @@ This document is both the implementation specification and the release-evidence
 contract. `crates/npa-checker-ref` remains the source-free Rust reference
 checker, while `checkers/npa-checker-ext/` contains the independent OCaml
 implementation and its conformance gates. The standalone executable now checks
-current v0.3.0 plus exact v0.2.0, v0.1.2, and v0.1 compatibility certificates
-end to end,
-including indexed, mutual, and exact approved nested inductives, recursive
-high-trust imports, v0.3 local opaque-transparency closure, sealed exports,
-axiom policy, and raw-result v2 rendering.
+only the exact `NPA-CERT-0.4.0` / `NPA-Core-0.4.0` pair end to end. This
+includes the six-form term grammar, indexed, mutual, and exact approved nested
+inductives, recursive high-trust imports, current local opaque-transparency
+closure, sealed exports, axiom policy, and raw-result v2 rendering. Old,
+unknown, and mixed pairs fail at the header boundary.
 
 `npa-checker-ext` counts as release / high-trust evidence only when the built
 executable is resolved from a runner-owned checker registry and the runner
 validates its policy, binary hash, checker identity, and build hash. The real
-package gate in `scripts/differential.sh` exercises that contract; an unpinned
-local build is still not release evidence by itself.
+binary and raw-result gates in `scripts/differential.sh` exercise the direct
+identity binding and fail-closed facade boundary; an unpinned local build is
+still not release evidence by itself.
 
 ---
 
@@ -53,40 +54,36 @@ output:
   deterministic checker_raw_result JSON
 ```
 
-### 1.1 Toolchain v0.8 host adapter
+### 1.1 Transitional host adapters
 
-The implemented host compatibility combination is `npa-cli 0.8.x`,
-`package_api::v1`, and `npa-checker-ext 0.3.0`. The checker advertises
-`NPA-CERT-0.3.0` / `NPA-Core-0.3.0` capability and decodes that current pair
-plus exact v0.2.0, v0.1.2, and v0.1 compatibility pairs. Raw-result v2 records
-the capability pair separately from the actual decoded input pair. The host
-crate version does not change checker semantics or machine-result v1. The
-current host emits command-result v0.4; historical 0.3/0.4 hosts retain v0.1,
-0.5 hosts retain v0.2, and 0.6/0.7 hosts retain v0.3.
+The standalone checker is `npa-checker-ext 0.4.0` and advertises only
+`NPA-CERT-0.4.0` / `NPA-Core-0.4.0`. Raw-result v2 records this capability pair
+separately from the exact decoded input pair. The v0.8 host script is retained
+only as migration material until the v0.9 host and evidence work lands; it is
+not a v0.4 compatibility or release gate.
 
-The Linux closure gate is
-`checkers/npa-checker-ext/scripts/toolchain-v0.8.sh`. It runs the real checker
-through the v1 facade and the exact direct checked external command with one
-job, cache/memo off, canonical runner-policy identity, raw-byte-pinned policy
-inputs, and immutable sealed execution. Its `--functional-only` form is a
-dirty-tree developer gate and explicitly does not create release evidence.
-The full form also creates disposable generated-artifact manifest v0.2 assets,
-validates their bytes, and deletes them on exit.
+`checkers/npa-checker-ext/scripts/differential.sh` is the Milestone 4 gate. It
+checks the standalone executable directly, validates raw results through the
+Rust runner schema, compiles and tests the transitional facade argument
+contract, and checks the package facade's policy/registry boundary. Full
+v0.9-host adoption belongs to Milestone 5. A facade that cannot provide
+descendant-owned memory/timeout enforcement and authenticated step accounting
+returns `external_checker_supervisor_unavailable` before creating imports or
+results.
 
 The frozen `toolchain-v0.7.sh` gate and its v0.7/v0.3 evidence remain
-historical compatibility material and must not be relabeled as v0.8/v0.4.
+historical compatibility material and must not be relabeled as v0.9/v0.4.
 
 The obsolete v0.3/v0.4 host scripts and their dedicated compatibility tests
 have been removed. Their design records are historical context only and are
 not supported operator contracts.
 
 Ordinary external checked verification, a byte-validated v0.2 release envelope,
-and `verified_high_trust` are distinct outcomes. The first two do not acquire
-the separate release/challenge policy bundle required by the third. The host
-may create only `generated/checker-imports/.../external/` and
-`generated/checker-results/.../external/`; unsupported immutable staging fails
-with `checker_binary_immutable_snapshot_unsupported` and cannot emit a checked
-artifact.
+and `verified_high_trust` are distinct outcomes. None is currently produced by
+the disabled host runner. Immutable staging failures use
+`checker_binary_immutable_snapshot_unsupported`; a platform with staging but no
+complete resource supervisor uses `external_checker_supervisor_unavailable`.
+Both fail before generated checker-import or checker-result mutation.
 
 Reasons for choosing OCaml:
 
@@ -149,10 +146,9 @@ Forbidden:
 Allowed:
 
 ```text
-- docs/core-spec-v0.3.0.md
-- docs/core-spec-v0.2.0.md
+- docs/core-spec-v0.4.0.md
 - public certificate and toolchain reference docs in docs/
-- canonical certificate fixtures
+- canonical v0.4 certificate fixtures and the shared fixture matrix
 - public CLI / JSON schema contract
 - golden hash fixtures
 - differential test result
@@ -202,7 +198,7 @@ select or override the checker executable.
 ## 5. Raw result JSON
 
 `npa-checker-ext` outputs `npa.independent-checker.checker_raw_result.v2`.
-`certificate_format` / `core_spec` advertise the checker 0.3.0 capability;
+`certificate_format` / `core_spec` advertise the checker 0.4.0 capability;
 `input_certificate_format` / `input_core_spec` bind the exact decoded input.
 The input fields are absent only when header validation fails before an exact
 pair is known. A checked result always contains both pairs.
@@ -213,12 +209,12 @@ checked result:
 {
   "schema": "npa.independent-checker.checker_raw_result.v2",
   "checker_id": "npa-checker-ext",
-  "checker_version": "0.3.0",
+  "checker_version": "0.4.0",
   "checker_build_hash": "sha256:...",
-  "certificate_format": "NPA-CERT-0.3.0",
-  "core_spec": "NPA-Core-0.3.0",
-  "input_certificate_format": "NPA-CERT-0.3.0",
-  "input_core_spec": "NPA-Core-0.3.0",
+  "certificate_format": "NPA-CERT-0.4.0",
+  "core_spec": "NPA-Core-0.4.0",
+  "input_certificate_format": "NPA-CERT-0.4.0",
+  "input_core_spec": "NPA-Core-0.4.0",
   "status": "checked",
   "module": "Std.Nat.Basic",
   "certificate_hash": "sha256:...",
@@ -233,12 +229,12 @@ failed result:
 {
   "schema": "npa.independent-checker.checker_raw_result.v2",
   "checker_id": "npa-checker-ext",
-  "checker_version": "0.3.0",
+  "checker_version": "0.4.0",
   "checker_build_hash": "sha256:...",
-  "certificate_format": "NPA-CERT-0.3.0",
-  "core_spec": "NPA-Core-0.3.0",
-  "input_certificate_format": "NPA-CERT-0.2.0",
-  "input_core_spec": "NPA-Core-0.2.0",
+  "certificate_format": "NPA-CERT-0.4.0",
+  "core_spec": "NPA-Core-0.4.0",
+  "input_certificate_format": "NPA-CERT-0.4.0",
+  "input_core_spec": "NPA-Core-0.4.0",
   "status": "failed",
   "module": "Std.Nat.Basic",
   "certificate_hash": "sha256:...",
@@ -306,10 +302,7 @@ The checker accepts only canonical binary `.npcert`.
 Checked targets:
 
 ```text
-- current header pair = NPA-CERT-0.3.0 / NPA-Core-0.3.0
-- compatibility header pair = NPA-CERT-0.2.0 / NPA-Core-0.2.0
-- compatibility header pair = NPA-CERT-0.1.2 / NPA-Core-0.1.2
-- compatibility header pair = NPA-CERT-0.1 / NPA-Core-0.1
+- exact header pair = NPA-CERT-0.4.0 / NPA-Core-0.4.0
 - module name grammar
 - import table
 - name table
@@ -336,16 +329,21 @@ The decoder rejects:
 - trailing bytes
 ```
 
-V0.3 dependency entries are tagged as interface or local implementation
-dependencies. The checker independently reconstructs reachability through
-later declaration types, reducible aliases, and already checked same-module
-opaque bodies. A local implementation edge must name an earlier opaque
-definition and match both its interface and certificate hashes. Missing,
+The decoder reads both bounded header strings before selecting semantics, then
+rejects every old, unknown, or mixed pair before decoding the module name or
+any body-owned data. Tag `0x06` is permanently retired and rejects immediately
+without reading child IDs or allocating from its tail.
+
+V0.4 declaration-certificate dependency entries are tagged as interface or
+local-implementation dependencies. The checker independently reconstructs
+reachability through later declaration types, reducible aliases, and already
+checked same-module opaque bodies. A local implementation edge must name an
+earlier opaque definition and match both its interface and certificate hashes. Missing,
 surplus, wrong-kind, later-target, and hash-mismatched edges reject with the
 same structured reason used by the fast and Rust reference checkers. The
 private reducible view is installed only after the opaque body checks; export
 and every imported environment retain the declaration as opaque without its
-body. Pre-v0.3 inputs keep immediate opacity.
+body. There is no compatibility decoder for pre-v0.4 inputs.
 
 In the OCaml implementation, the decoded AST is stored as algebraic data types,
 not strings. de Bruijn indexes, level expressions, global references, and
@@ -439,8 +437,9 @@ Required:
 
 ```text
 - sort / universe level validation
-- Pi / Lam / App / Let
+- the exact Sort / BVar / Const / App / Lam / Pi term grammar
 - local de Bruijn scope check
+- assumption-only local contexts
 - builtin / imported / local global reference resolution
 - axiom declaration check
 - reducible definition check
@@ -459,7 +458,6 @@ conversion:
 - alpha-equivalence through de Bruijn representation
 - beta reduction
 - delta reduction for reducible definitions only
-- zeta reduction for let
 - iota reduction for supported recursors
 - opaque theorem unfolding forbidden
 - deterministic fuel / step bound
@@ -545,7 +543,10 @@ based on canonical names and `decl_interface_hash`.
 - each conversion/typechecking fuel budget: 100,000 steps
 ```
 
-The runner separately owns `max_memory_mb` and `timeout_ms`.
+The runner separately owns `max_memory_mb` and `timeout_ms`. It must also report
+an authenticated step count for the policy's `max_steps`; an absent counter is
+not represented as zero. A host without a complete supervisor/protocol for
+these three requirements must not launch the external checker.
 
 Timeout / resource exhaustion enforced by the runner is represented as
 `timeout` / `resource_exhausted` in the runner-owned `MachineCheckResult`, not as
@@ -605,7 +606,7 @@ ext_env.ml
   checked environment and public environment
 
 ext_typecheck.ml
-  inference, checking, definitional equality, and beta/delta/iota/zeta reduction
+  inference, checking, definitional equality, and beta/delta/iota reduction
 
 ext_inductive.ml
   positivity and recursor shape checks
@@ -630,7 +631,9 @@ bytes/name/level/term
   -> cli/result
 ```
 
-Design the system so that only `ext_cli` touches the filesystem.
+Only the CLI and explicit source-free import/session readers touch the
+filesystem; decoding, hashing, and semantic modules operate on supplied bytes
+and checked environments.
 
 ---
 
@@ -667,11 +670,16 @@ npa-checker-ext:
 
 For release / high-trust, mismatches in checked / failed status, module name,
 export_hash, certificate_hash, or axiom_report_hash are release blockers.
-Natural-language error message equality is not required.
+Negative cases follow the shared matrix's stable checker-specific kind and
+reason; natural-language error message equality is not required.
 
 ---
 
 ## 14. Completed milestones
+
+The M0–M9 labels below record the original checker bring-up. Their current
+implementation is governed by the strict v0.4 rules above; historical formats
+are not accepted merely because they appear in this chronology.
 
 M0: repository and build identity
 
@@ -703,25 +711,25 @@ unsigned varints allow only minimal ULEB128 and reject unexpected EOF,
 non-minimal encoding, u64 overflow, and host length overflow. This layer does
 not reference the filesystem, source parser, or JSON rendering.
 
-The original M1-02 slice decoded the legacy `NPA-CERT-0.1` /
-`NPA-Core-0.1` header and the name grammar source-free. The completed
-version-aware decoder now also accepts all current and compatibility header
-pairs listed in Section 6. Module names and name table entries are stored as
-structured component lists in `Ext_name.t`. Empty names, empty components,
-dotted components, invalid UTF-8, and duplicate name table entries are rejected
-as decode errors with reason codes.
+The original M1-02 slice decoded a historical header and the name grammar
+source-free. The current decoder reads the two bounded header strings and
+accepts only the exact pair listed in Section 6. Module names and name table
+entries are stored as structured component lists in `Ext_name.t`. Empty names,
+empty components, dotted components, invalid UTF-8, and duplicate name table
+entries are rejected as decode errors with reason codes.
 
 M1-03 decodes `LevelTable` and `TermTable` source-free. Levels are stored as
 OCaml algebraic data types `Zero` / `Succ` / `Max` / `Imax` / `Param`, and terms
-as `Sort` / `BVar` / `Const` / `App` / `Lam` / `Pi` / `Let`, then passed to later
-checkers without returning to source text. Level children and term children
-follow table topological order and can reference only earlier entries. Universe
-level references in `Sort` and `Const`, plus name references in `Param` and
-global references, are rejected as `dangling_reference` if they do not exist in
-the relevant table. Unknown tags become deterministic errors with section and
-byte offset. Level entries that change after normalization, such as
-`Max Zero u`, duplicate term entries, and unresolved universe metavariable names
-containing `?` are rejected before semantic trust.
+as `Sort` / `BVar` / `Const` / `App` / `Lam` / `Pi`, then passed to later
+checkers without returning to source text. Retired tag `0x06` is an immediate
+`unknown_tag` error. Level children and term children follow table topological
+order and can reference only earlier entries. Universe level references in
+`Sort` and `Const`, plus name references in `Param` and global references, are
+rejected as `dangling_reference` if they do not exist in the relevant table.
+Unknown tags become deterministic errors with section and byte offset. Level
+entries that change after normalization, such as `Max Zero u`, duplicate term
+entries, and unresolved universe metavariable names containing `?` are rejected
+before semantic trust.
 
 M1-04 decodes the remaining top-level sections after the header source-free:
 imports, declarations, export block, axiom report, optional core feature report,
@@ -731,11 +739,9 @@ mutual inductive block. Dependency entries and axiom references are decoded
 while preserving the structure of `GlobalRef`, canonical names, and hash bytes.
 Export entries keep name, kind, universe params, type, optional body, type/body
 hash, optional reducibility/opacity, interface hash, and axiom dependencies.
-Because this legacy export layout cannot carry declaration universe
-constraints, public-environment construction rejects an export owned by a
-constrained declaration with kind `unsupported_schema_version`, reason
-`constrained_export_requires_format_upgrade`, and section `export_block`.
-Unconstrained exports carry an explicitly empty signature-constraint vector.
+The v0.4 export layout always carries the signature-constraint vector, including
+an explicit empty vector for unconstrained exports, and public-environment
+construction preserves those constraints.
 Duplicate declaration names, dangling term references in the export block, and
 dangling local declaration references in export axiom dependencies become
 deterministic decode errors. However, declaration count mismatches in the axiom
@@ -760,7 +766,8 @@ M3: import store
 M4: minimal type checker
 
 ```text
-- sort/Pi/Lam/App/Let
+- sort/BVar/Const/Pi/Lam/App
+- assumption-only local contexts
 - local/imported/global references
 - theorem and definition check
 ```
@@ -768,7 +775,7 @@ M4: minimal type checker
 M5: conversion
 
 ```text
-- beta/delta/iota/zeta
+- beta/delta/iota
 - opaque theorem unfolding boundary
 - deterministic fuel
 ```
@@ -817,7 +824,7 @@ checker:
 
 ```text
 - tests fix that source, tactics, replay, and AI traces are not read
-- valid Phase 8 MVP certificate corpus is accepted without source
+- valid v0.4 certificate corpus is accepted without source
 - required mutation corpus is rejected with deterministic structured errors
 - checked module identity matches npa-checker-ref
 - high-trust import closure can be constructed from external checker results
@@ -825,7 +832,12 @@ checker:
 - checker binary hash and identity manifest are pinned by runner policy
 - first-release pass/fail is defined even without a checker identity manifest signature
 - missing external checker does not generate a verified_high_trust artifact
+- a descendant-owning supervisor enforces memory and timeout and records an
+  authenticated checker step count
 ```
+
+When the final supervisor condition is unmet, the package command is
+deliberately fail-closed and does not claim external-checker proof evidence.
 
 These conditions are exercised by `scripts/test.sh` and
 `scripts/differential.sh`. Whether external-checker evidence is required for a

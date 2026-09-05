@@ -9,10 +9,10 @@ use std::{
 
 use npa_api::{PackageArtifactReferenceSummaryMode, PackageArtifactVerifiedModule};
 use npa_cert::{
-    declaration_dependency_closure, resolve_verified_declaration_export, DeclarationClosure,
-    DeclarationClosureKind, DeclarationClosureLimits, GlobalDeclarationIdentity, Name,
-    ValidatedSourceDeclarationFamilies, ValidatedSourceDeclarationFamily,
-    DECLARATION_CLOSURE_LIMITS_V1,
+    declaration_dependency_closure_with_transported_externalizations,
+    resolve_verified_declaration_export, DeclarationClosure, DeclarationClosureKind,
+    DeclarationClosureLimits, GlobalDeclarationIdentity, Name, ValidatedSourceDeclarationFamilies,
+    ValidatedSourceDeclarationFamily, DECLARATION_CLOSURE_LIMITS_V1,
 };
 use npa_frontend::{
     bind_human_source_interface_to_verified_import, collect_human_source_declaration_families,
@@ -23,15 +23,17 @@ use npa_frontend::{
     HumanSelectedDeclaration, HumanSourceDeclarationFamilies, Span, VerifiedImport,
 };
 use npa_package::{
-    package_file_hash, parse_declaration_promotion_request_json,
-    promotion_plan_v2_dependency_edge_hash, DeclarationPromotionRequest,
-    DeclarationPromotionRootKind, MathlibPromotionPlanV2, PackageArtifactOrigin, PackageHash,
-    PackageLockEntryOrigin, PackagePath, PromotionGovernanceV2, PromotionLifecycle,
-    PromotionOriginEntryV2, PromotionPackageSnapshot, PromotionPlanEndpoint,
-    PromotionPlanV2Declaration, PromotionPlanV2DependencyMapping, PromotionPlanV2EquivalentSource,
-    PromotionPlanV2Identity, PromotionPlanV2Root, PromotionSelectionV2, PromotionSourceModule,
-    PromotionSourceSpan, PromotionTargetSnapshotV2, MATHLIB_DECLARATION_PROMOTION_REQUEST_SCHEMA,
-    MATHLIB_PROMOTION_PLAN_V2_SCHEMA, MATHLIB_PROMOTION_REGISTRY_PATH, PACKAGE_PUBLISH_PLAN_PATH,
+    active_catalog_routes, package_file_hash, parse_declaration_promotion_request_json,
+    promotion_plan_v2_dependency_edge_hash, DeclarationClosureRegistryEntry,
+    DeclarationPromotionRequest, DeclarationPromotionRootKind, MathlibPromotionPlanV2,
+    PackageArtifactOrigin, PackageHash, PackageLockEntryOrigin, PackagePath,
+    PromotionDeclarationTargetRevision, PromotionGovernanceV2, PromotionLifecycle,
+    PromotionOriginEntryV2, PromotionOriginEntryV3, PromotionPackageSnapshot,
+    PromotionPlanEndpoint, PromotionPlanV2Declaration, PromotionPlanV2DependencyMapping,
+    PromotionPlanV2EquivalentSource, PromotionPlanV2Identity, PromotionPlanV2Root,
+    PromotionSelectionV2, PromotionSourceModule, PromotionSourceSpan, PromotionTargetSnapshotV2,
+    MATHLIB_DECLARATION_PROMOTION_REQUEST_SCHEMA, MATHLIB_PROMOTION_PLAN_V2_SCHEMA,
+    MATHLIB_PROMOTION_REGISTRY_PATH, PACKAGE_PUBLISH_PLAN_PATH,
     PACKAGE_VERIFIED_EXPORT_SUMMARY_PATH,
 };
 
@@ -42,6 +44,7 @@ use crate::{
     },
     diagnostic::{CommandArtifact, CommandDiagnostic, CommandResult, DiagnosticKind},
     fs::render_package_root,
+    generated_artifact_writer::read_package_regular_file_no_follow,
     governance_writer::{
         confined_governance_path, write_governance_artifact, GovernanceOutputPolicy,
     },
@@ -156,6 +159,13 @@ pub fn run_package_prepare_declaration_promotion(
             );
         }
     }
+    let registry_bytes = match read_baseline(
+        &options.target_baseline_root,
+        MATHLIB_PROMOTION_REGISTRY_PATH,
+    ) {
+        Ok(bytes) => bytes,
+        Err(diagnostic) => return CommandResult::failed(COMMAND, root_display, vec![*diagnostic]),
+    };
     let registry_validation = run_package_validate_promotion_origin_registry(
         PackageValidatePromotionOriginRegistryOptions {
             common: PackageCommonOptions {
@@ -169,6 +179,33 @@ pub fn run_package_prepare_declaration_promotion(
     if registry_validation.status != crate::diagnostic::CommandStatus::Passed {
         return CommandResult::failed(COMMAND, root_display, registry_validation.diagnostics);
     }
+    if read_baseline(
+        &options.target_baseline_root,
+        MATHLIB_PROMOTION_REGISTRY_PATH,
+    )
+    .ok()
+    .as_deref()
+        != Some(registry_bytes.as_slice())
+    {
+        return failed(
+            &root_display,
+            "promotion_declaration_dependency_mapping_stale",
+            MATHLIB_PROMOTION_REGISTRY_PATH,
+        );
+    }
+    let registry = match std::str::from_utf8(&registry_bytes)
+        .ok()
+        .and_then(|source| parse_promotion_origin_registry_versioned(source).ok())
+    {
+        Some(registry) => registry,
+        None => {
+            return failed(
+                &root_display,
+                "promotion_declaration_dependency_mapping_stale",
+                MATHLIB_PROMOTION_REGISTRY_PATH,
+            )
+        }
+    };
     if !request_matches_snapshots(&request, &source, &baseline) {
         return failed(
             &root_display,
@@ -352,7 +389,13 @@ pub fn run_package_prepare_declaration_promotion(
         .values()
         .map(|record| (record.key.module.clone(), record.verified_module.clone()))
         .collect::<BTreeMap<_, _>>();
-    let (externalized, mapping_routes) = match declaration_mappings(&request, &source, &baseline) {
+    let (externalized, mapping_routes) = match declaration_mappings(
+        &request,
+        &options.common.root,
+        &source,
+        &baseline,
+        &registry,
+    ) {
         Ok(value) => value,
         Err((reason, name)) => {
             return failed_with_declaration(
@@ -364,11 +407,13 @@ pub fn run_package_prepare_declaration_promotion(
             )
         }
     };
-    let closure = match declaration_dependency_closure(
+    let transported_externalizations = transported_declaration_externalizations(&externalized);
+    let closure = match declaration_dependency_closure_with_transported_externalizations(
         &modules,
         &roots,
         &families,
         &externalized,
+        &transported_externalizations,
         DeclarationClosureLimits::default(),
     ) {
         Ok(closure) => closure,
@@ -474,26 +519,6 @@ pub fn run_package_prepare_declaration_promotion(
     {
         Ok(bytes) => bytes,
         Err(diagnostic) => return CommandResult::failed(COMMAND, root_display, vec![*diagnostic]),
-    };
-    let registry_bytes = match read_baseline(
-        &options.target_baseline_root,
-        MATHLIB_PROMOTION_REGISTRY_PATH,
-    ) {
-        Ok(bytes) => bytes,
-        Err(diagnostic) => return CommandResult::failed(COMMAND, root_display, vec![*diagnostic]),
-    };
-    let registry = match std::str::from_utf8(&registry_bytes)
-        .ok()
-        .and_then(|source| parse_promotion_origin_registry_versioned(source).ok())
-    {
-        Some(registry) => registry,
-        None => {
-            return failed(
-                &root_display,
-                "promotion_declaration_dependency_mapping_stale",
-                MATHLIB_PROMOTION_REGISTRY_PATH,
-            )
-        }
     };
     if let Some(target) = request
         .dependency_mappings
@@ -1078,6 +1103,16 @@ type MappingRoutes = BTreeMap<(Name, Name), MappingRoute>;
 type DeclarationMappings = BTreeMap<GlobalDeclarationIdentity, GlobalDeclarationIdentity>;
 type DeclarationMappingResult = Result<(DeclarationMappings, MappingRoutes), (&'static str, Name)>;
 
+pub(crate) fn transported_declaration_externalizations(
+    externalized: &BTreeMap<GlobalDeclarationIdentity, GlobalDeclarationIdentity>,
+) -> BTreeSet<(GlobalDeclarationIdentity, GlobalDeclarationIdentity)> {
+    externalized
+        .iter()
+        .filter(|(source, target)| source.decl_interface_hash != target.decl_interface_hash)
+        .map(|(source, target)| (source.clone(), target.clone()))
+        .collect()
+}
+
 fn source_local_externalized_axiom<'a>(
     closure: &'a DeclarationClosure,
     routes: &MappingRoutes,
@@ -1164,8 +1199,10 @@ fn declaration_closure_failure_diagnostic(
 
 fn declaration_mappings(
     request: &DeclarationPromotionRequest,
+    source_root: &Path,
     source: &LoadedPackageAuditSnapshot,
     target: &LoadedPackageAuditSnapshot,
+    registry: &ParsedPromotionOriginRegistry,
 ) -> DeclarationMappingResult {
     let mut identities = BTreeMap::new();
     let mut routes = BTreeMap::new();
@@ -1197,8 +1234,20 @@ fn declaration_mappings(
                 continue;
             };
             let compatible = source_identity.identity.kind == target_identity.identity.kind
-                && source_identity.identity.decl_interface_hash
-                    == target_identity.identity.decl_interface_hash;
+                && (source_identity.identity.decl_interface_hash
+                    == target_identity.identity.decl_interface_hash
+                    || registry_attests_transported_declaration_mapping(
+                        registry,
+                        &row.source,
+                        &row.target,
+                        source_root,
+                        source,
+                        target,
+                        source_record,
+                        target_record,
+                        &source_identity.identity,
+                        &target_identity.identity,
+                    ));
             if compatible
                 && (identities
                     .insert(
@@ -1226,6 +1275,195 @@ fn declaration_mappings(
     Ok((identities, routes))
 }
 
+#[allow(clippy::too_many_arguments)]
+/// Accept a namespace-rebound declaration identity only through the exact
+/// active declaration-promotion route that certified the rebind.
+///
+/// Renaming an inductive owner's module changes its generated family interface
+/// hashes even when verified normalized-closure materialization established
+/// semantic identity. Ordinary mappings still require direct interface-hash
+/// equality; this path additionally binds the selected source declaration,
+/// the route owner, and the active target revision to that prior attestation.
+pub(crate) fn registry_attests_transported_declaration_mapping(
+    registry: &ParsedPromotionOriginRegistry,
+    source_endpoint: &PromotionPlanEndpoint,
+    target_endpoint: &PromotionPlanEndpoint,
+    source_root: &Path,
+    source: &LoadedPackageAuditSnapshot,
+    target: &LoadedPackageAuditSnapshot,
+    source_record: &PackageArtifactVerifiedModule,
+    target_record: &PackageArtifactVerifiedModule,
+    source_identity: &GlobalDeclarationIdentity,
+    target_identity: &GlobalDeclarationIdentity,
+) -> bool {
+    if source_endpoint.origin != PackageArtifactOrigin::Local
+        || target_endpoint.origin != PackageArtifactOrigin::Local
+        || source_identity.module != source_endpoint.module
+        || target_identity.module != target_endpoint.module
+        || source_identity.name != target_identity.name
+        || source_identity.kind != target_identity.kind
+        || source_identity.decl_interface_hash == target_identity.decl_interface_hash
+    {
+        return false;
+    }
+
+    let Some(source_module) = source
+        .snapshot
+        .validated
+        .manifest()
+        .modules
+        .iter()
+        .find(|module| module.module == source_endpoint.module)
+    else {
+        return false;
+    };
+    let Some(target_module) = target
+        .snapshot
+        .validated
+        .manifest()
+        .modules
+        .iter()
+        .find(|module| module.module == target_endpoint.module)
+    else {
+        return false;
+    };
+    let Ok(source_bytes) = read_confined(
+        source_root,
+        &source_module.source,
+        "promotion_declaration_dependency_mapping_stale",
+    ) else {
+        return false;
+    };
+    if package_file_hash(&source_bytes) != source_module.expected_source_hash {
+        return false;
+    }
+
+    let entry_attests = |entry: &DeclarationClosureRegistryEntry,
+                         revision: &PromotionDeclarationTargetRevision| {
+        let source_identity_attested = entry.source_module == source_endpoint.module
+            && entry.canonical_source.package == source_endpoint.package
+            && declaration_entry_contains_mapping(entry, source_identity, target_identity);
+        entry.lifecycle == "active"
+            && entry.source_module == source_endpoint.module
+            && entry.target_module == target_endpoint.module
+            && (source_identity_attested
+                || std::iter::once(&entry.canonical_source)
+                    .chain(entry.equivalent_sources.iter())
+                    .any(|origin| {
+                        declaration_source_origin_matches(
+                            origin,
+                            source_endpoint,
+                            source,
+                            source_module,
+                            source_record,
+                        )
+                    }))
+            && declaration_target_revision_matches(revision, target_module, target_record)
+    };
+
+    match registry {
+        ParsedPromotionOriginRegistry::V1(_) => false,
+        ParsedPromotionOriginRegistry::V2(registry) => registry.entries.iter().any(|entry| {
+            let PromotionOriginEntryV2::DeclarationClosureV1(entry) = entry else {
+                return false;
+            };
+            let [revision] = entry.target_revisions.as_slice() else {
+                return false;
+            };
+            entry_attests(entry, revision)
+        }),
+        ParsedPromotionOriginRegistry::V3(registry) => {
+            let Ok(routes) = active_catalog_routes(registry) else {
+                return false;
+            };
+            let Some((owner, effective_revision)) = routes.get(&target_endpoint.module.as_dotted())
+            else {
+                return false;
+            };
+            registry.entries.iter().any(|entry| {
+                let PromotionOriginEntryV3::SourceV2(PromotionOriginEntryV2::DeclarationClosureV1(
+                    entry,
+                )) = entry
+                else {
+                    return false;
+                };
+                owner.owner_kind == "declaration_closure_v1"
+                    && owner.owner_id == entry.promotion_id
+                    && owner.target_module == entry.target_module
+                    && entry_attests(entry, effective_revision)
+            })
+        }
+    }
+}
+
+fn declaration_source_origin_matches(
+    origin: &PromotionPlanV2EquivalentSource,
+    source_endpoint: &PromotionPlanEndpoint,
+    source: &LoadedPackageAuditSnapshot,
+    source_module: &npa_package::PackageModule,
+    source_record: &PackageArtifactVerifiedModule,
+) -> bool {
+    let manifest = source.snapshot.validated.manifest();
+    origin.package == source_endpoint.package
+        && origin.version == source_endpoint.version
+        && origin.source_module == source_endpoint.module
+        && manifest.package == source_endpoint.package
+        && manifest.version == source_endpoint.version
+        && source_module.expected_source_hash == origin.source_file_hash
+        && source_module.expected_certificate_file_hash == origin.certificate_file_hash
+        && source_module.expected_certificate_hash == origin.certificate_hash
+        && source_module.expected_export_hash == origin.export_hash
+        && source_record.certificate.file_hash == origin.certificate_file_hash
+        && source_record.key.certificate_hash == origin.certificate_hash
+        && source_record.key.export_hash == origin.export_hash
+}
+
+fn declaration_entry_contains_mapping(
+    entry: &DeclarationClosureRegistryEntry,
+    source: &GlobalDeclarationIdentity,
+    target: &GlobalDeclarationIdentity,
+) -> bool {
+    declaration_closure_contains_mapping(&entry.source_module, &entry.closure, source, target)
+}
+
+fn declaration_closure_contains_mapping(
+    source_module: &Name,
+    closure: &[PromotionPlanV2Declaration],
+    source: &GlobalDeclarationIdentity,
+    target: &GlobalDeclarationIdentity,
+) -> bool {
+    let source_hash = PackageHash::from(source.decl_interface_hash);
+    closure.iter().any(|declaration| {
+        (declaration.source_name == source.name
+            && declaration.target_name == target.name
+            && declaration.certificate_kind == source.kind.as_str()
+            && declaration.decl_interface_hash == source_hash)
+            || (source.name == target.name
+                && declaration.generated_exports.iter().any(|generated| {
+                    generated.module == *source_module
+                        && generated.name == source.name
+                        && generated.kind == source.kind.as_str()
+                        && generated.decl_interface_hash == source_hash
+                }))
+    })
+}
+
+fn declaration_target_revision_matches(
+    revision: &PromotionDeclarationTargetRevision,
+    target_module: &npa_package::PackageModule,
+    target_record: &PackageArtifactVerifiedModule,
+) -> bool {
+    target_module.expected_source_hash == revision.target_source_file_hash
+        && target_module.expected_certificate_file_hash == revision.target_certificate_file_hash
+        && target_module.expected_certificate_hash == revision.target_certificate_hash
+        && target_module.expected_export_hash == revision.target_export_hash
+        && target_module.expected_axiom_report_hash == revision.target_axiom_report_hash
+        && target_record.certificate.file_hash == revision.target_certificate_file_hash
+        && target_record.key.certificate_hash == revision.target_certificate_hash
+        && target_record.key.export_hash == revision.target_export_hash
+        && target_record.axiom_report_hash == revision.target_axiom_report_hash
+}
+
 pub(crate) fn endpoint_record<'a>(
     snapshot: &'a LoadedPackageAuditSnapshot,
     endpoint: &PromotionPlanEndpoint,
@@ -1249,9 +1487,14 @@ pub(crate) fn endpoint_record<'a>(
                 && lock.version.as_ref() == Some(&endpoint.version)
         }
     };
-    identity_matches
-        .then(|| record_for(snapshot, &endpoint.module))
-        .flatten()
+    if identity_matches {
+        return record_for(snapshot, &endpoint.module);
+    }
+    (endpoint.origin == PackageArtifactOrigin::External
+        && lock.origin == PackageLockEntryOrigin::External
+        && lock.package.as_ref() == Some(&endpoint.package))
+    .then(|| record_for(snapshot, &endpoint.module))
+    .flatten()
 }
 
 pub(crate) fn plan_roots(
@@ -1699,14 +1942,8 @@ fn read_declaration_source_with_limit(
             actual: *cumulative_source_bytes,
         });
     }
-    let full = confined_governance_path(
-        root,
-        path,
-        path.as_str(),
-        "promotion_declaration_source_extraction_unsupported",
-    )
-    .map_err(|_| DeclarationSourceExtractionError::Unsupported)?;
-    let file = fs::File::open(full).map_err(|_| DeclarationSourceExtractionError::Unsupported)?;
+    let file = crate::generated_artifact_writer::open_package_regular_file_no_follow(root, path)
+        .map_err(|_| DeclarationSourceExtractionError::Unsupported)?;
     let file_bytes = file
         .metadata()
         .map_err(|_| DeclarationSourceExtractionError::Unsupported)?
@@ -1747,8 +1984,7 @@ fn read_confined(
     path: &PackagePath,
     reason: &str,
 ) -> Result<Vec<u8>, Box<CommandDiagnostic>> {
-    let full = confined_governance_path(root, path, path.as_str(), reason)?;
-    fs::read(full).map_err(|_| {
+    read_package_regular_file_no_follow(root, path).map_err(|_| {
         Box::new(
             CommandDiagnostic::error(DiagnosticKind::ArtifactIo, reason).with_path(path.as_str()),
         )
@@ -1833,6 +2069,104 @@ mod tests {
         PromotionAuditLocation, PromotionEvidence, PromotionLegacyTargetReservation,
         PromotionReservedTheorem, PromotionTargetRevision,
     };
+
+    #[test]
+    fn transported_inductive_family_members_require_attested_source_identities() {
+        let source_module = Name::from_dotted("Proofs.Source.Numbers");
+        let target_module = Name::from_dotted("Mathlib.Data.Numbers");
+        let owner_name = Name::from_dotted("Number");
+        let constructor_name = Name::from_dotted("Number.ofNat");
+        let source_hash = [1; 32];
+        let closure = vec![PromotionPlanV2Declaration {
+            role: "root".to_owned(),
+            source_name: owner_name.clone(),
+            target_name: owner_name.clone(),
+            certificate_kind: "inductive".to_owned(),
+            human_kind: "inductive".to_owned(),
+            source_decl_index: 0,
+            decl_interface_hash: PackageHash::from(source_hash),
+            decl_certificate_hash: PackageHash::new([2; 32]),
+            type_hash: PackageHash::new([3; 32]),
+            body_hash: None,
+            item_span: PromotionSourceSpan { start: 0, end: 10 },
+            family_owner: owner_name.clone(),
+            family_members: vec![owner_name.clone(), constructor_name.clone()],
+            generated_exports: vec![PromotionPlanV2Identity {
+                module: source_module.clone(),
+                name: constructor_name.clone(),
+                kind: "constructor".to_owned(),
+                decl_interface_hash: PackageHash::from(source_hash),
+            }],
+            direct_dependencies: Vec::new(),
+        }];
+        let identity = |module: &Name,
+                        name: &Name,
+                        kind: DeclarationClosureKind,
+                        decl_interface_hash| GlobalDeclarationIdentity {
+            module: module.clone(),
+            name: name.clone(),
+            kind,
+            decl_interface_hash,
+        };
+        let source_owner = identity(
+            &source_module,
+            &owner_name,
+            DeclarationClosureKind::Inductive,
+            source_hash,
+        );
+        let target_owner = identity(
+            &target_module,
+            &owner_name,
+            DeclarationClosureKind::Inductive,
+            [4; 32],
+        );
+        let source_constructor = identity(
+            &source_module,
+            &constructor_name,
+            DeclarationClosureKind::Constructor,
+            source_hash,
+        );
+        let target_constructor = identity(
+            &target_module,
+            &constructor_name,
+            DeclarationClosureKind::Constructor,
+            [4; 32],
+        );
+
+        assert!(declaration_closure_contains_mapping(
+            &source_module,
+            &closure,
+            &source_owner,
+            &target_owner,
+        ));
+        assert!(declaration_closure_contains_mapping(
+            &source_module,
+            &closure,
+            &source_constructor,
+            &target_constructor,
+        ));
+
+        let forged_source = GlobalDeclarationIdentity {
+            decl_interface_hash: [9; 32],
+            ..source_constructor.clone()
+        };
+        assert!(!declaration_closure_contains_mapping(
+            &source_module,
+            &closure,
+            &forged_source,
+            &target_constructor,
+        ));
+        let renamed_target = GlobalDeclarationIdentity {
+            name: Name::from_dotted("Number.other"),
+            ..target_constructor
+        };
+        assert!(!declaration_closure_contains_mapping(
+            &source_module,
+            &closure,
+            &source_constructor,
+            &renamed_target,
+        ));
+    }
 
     #[test]
     fn local_mapping_targets_require_active_registry_ownership() {

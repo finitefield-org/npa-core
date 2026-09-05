@@ -1383,6 +1383,43 @@ mod tests {
     }
 
     #[test]
+    fn extraction_preserves_trailing_parentheses_in_selected_item() {
+        let file_id = FileId(9);
+        let source =
+            "def keep (P : Prop) : Prop := (((fun Q => Q) P))\n\ndef drop (P : Prop) : Prop := P\n";
+        let families = collect_human_source_declaration_families(file_id, source, &[]).unwrap();
+        let keep = families
+            .families
+            .iter()
+            .find(|family| family.owner.as_dotted() == "keep")
+            .unwrap();
+        let selection = HumanDeclarationSelection {
+            source_module: npa_cert::Name::from_dotted("Fixture.Source"),
+            target_module: npa_cert::Name::from_dotted("Mathlib.Target"),
+            declarations: vec![HumanSelectedDeclaration {
+                name: keep.owner.clone(),
+                kind: HumanDeclarationFamilyMemberKind::Definition,
+                item_span: keep.item_span,
+                decl_interface_hash: [7; 32],
+            }],
+        };
+
+        let extracted = extract_human_declaration_source(
+            file_id,
+            source,
+            &[],
+            &selection,
+            &HumanGlobalMapping { rows: Vec::new() },
+        )
+        .unwrap();
+
+        assert_eq!(
+            extracted.source,
+            "def keep (P : Prop) : Prop := (((fun Q => Q) P))\n"
+        );
+    }
+
+    #[test]
     fn extraction_splits_one_source_import_across_mapped_target_modules() {
         let file_id = FileId(10);
         let source = "import Std.Source\n\ndef keep : Prop := Std.left -> Std.right\n";

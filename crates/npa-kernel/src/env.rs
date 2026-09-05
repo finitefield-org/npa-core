@@ -1,6 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+#[cfg(test)]
+use std::cell::RefCell;
+
 use crate::{
     builtins::{eq_inductive, eq_rec_type, nat_inductive},
     context::Ctx,
@@ -24,7 +27,7 @@ use crate::{
     },
     memo::{
         DefeqMemoLookup, KernelExecutionOptions, KernelOperationMemo, MemoExprOrigin,
-        WhnfMemoLookup,
+        WhnfMemoLookup, WhnfMemoToken,
     },
     name::is_canonical_dotted_name,
     positivity::approved_nested_functor,
@@ -73,7 +76,6 @@ enum KernelWorkCounter {
     QuickEqualityHit,
     BetaStep,
     IotaStep,
-    ZetaStep,
     PhysicalReduction,
     ContextLookup,
     ContextShift,
@@ -122,7 +124,6 @@ impl KernelWorkMeter for KernelWorkCounters {
             KernelWorkCounter::QuickEqualityHit => &mut self.quick_equality_hits,
             KernelWorkCounter::BetaStep => &mut self.beta_steps,
             KernelWorkCounter::IotaStep => &mut self.iota_steps,
-            KernelWorkCounter::ZetaStep => &mut self.zeta_steps,
             KernelWorkCounter::PhysicalReduction => &mut self.physical_reductions,
             KernelWorkCounter::ContextLookup => &mut self.context_lookups,
             KernelWorkCounter::ContextShift => &mut self.context_shifts,
@@ -218,6 +219,60 @@ struct KernelOperationState {
     counters: KernelWorkCounters,
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct WhnfSpineAudit {
+    app_continuations_entered: u64,
+    known_arguments_appended: u64,
+    deferred_application_nodes_visited: u64,
+    known_prefix_rescan_argument_visits: u64,
+    complete_argument_vectors_materialized: u64,
+    recursor_classification_decl_lookups: u64,
+    recursor_probes: u64,
+    recursor_major_continuations_entered: u64,
+    post_major_recursor_decl_lookups: u64,
+    recursor_argument_root_clones_before_iota: u64,
+    recursor_argument_root_clones_for_iota: u64,
+    max_live_continuation_depth: u64,
+}
+
+#[cfg(test)]
+thread_local! {
+    static WHNF_SPINE_AUDIT: RefCell<WhnfSpineAudit> = RefCell::new(WhnfSpineAudit::default());
+}
+
+#[cfg(test)]
+fn with_whnf_spine_audit(update: impl FnOnce(&mut WhnfSpineAudit)) {
+    WHNF_SPINE_AUDIT.with(|audit| update(&mut audit.borrow_mut()));
+}
+
+#[cfg(test)]
+fn reset_whnf_spine_audit() {
+    WHNF_SPINE_AUDIT.with(|audit| *audit.borrow_mut() = WhnfSpineAudit::default());
+}
+
+#[cfg(test)]
+fn whnf_spine_audit() -> WhnfSpineAudit {
+    WHNF_SPINE_AUDIT.with(|audit| *audit.borrow())
+}
+
+#[cfg(test)]
+fn audit_increment(field: impl FnOnce(&mut WhnfSpineAudit) -> &mut u64) {
+    with_whnf_spine_audit(|audit| {
+        let value = field(audit);
+        *value = value.saturating_add(1);
+    });
+}
+
+#[cfg(test)]
+fn audit_continuation_depth(depth: usize) {
+    with_whnf_spine_audit(|audit| {
+        audit.max_live_continuation_depth = audit
+            .max_live_continuation_depth
+            .max(u64::try_from(depth).unwrap_or(u64::MAX));
+    });
+}
+
 impl KernelOperationState {
     fn new(options: KernelExecutionOptions) -> Self {
         let memo = KernelOperationMemo::new(options)
@@ -243,6 +298,250 @@ impl KernelOperationState {
             },
             memo,
         }
+    }
+}
+
+/// Completion information for one logical WHNF call.  Application and
+/// recursor reductions stay in the same call; only function and major
+/// normalization create another value of this type.
+struct WhnfActiveCall {
+    starting_fuel: usize,
+    memo_token: Option<WhnfMemoToken>,
+}
+
+#[derive(Clone, Copy)]
+struct ResolvedRecursor<'env> {
+    inductive: &'env str,
+    rules: &'env RecursorRules,
+}
+
+enum WhnfApplicationState {
+    Atom,
+    Deferred,
+    Known {
+        head: Arc<Expr>,
+        arguments: Vec<Arc<Expr>>,
+    },
+}
+
+struct WhnfValue {
+    expr: Expr,
+    application: WhnfApplicationState,
+}
+
+impl WhnfValue {
+    fn atom(expr: Expr) -> Self {
+        Self {
+            expr,
+            application: WhnfApplicationState::Atom,
+        }
+    }
+
+    fn memo_hit(expr: Expr) -> Self {
+        let application = if matches!(expr, Expr::App(_, _)) {
+            WhnfApplicationState::Deferred
+        } else {
+            WhnfApplicationState::Atom
+        };
+        Self { expr, application }
+    }
+
+    /// Recover the retained application view of a memo result once.  Values
+    /// built by the machine are already `Known`, so the ordinary unwind never
+    /// traverses an existing prefix.
+    fn recover_deferred_application(&mut self) {
+        if !matches!(self.application, WhnfApplicationState::Deferred) {
+            return;
+        }
+
+        let mut current = &self.expr;
+        let mut head = None;
+        let mut arguments = Vec::new();
+        while let Expr::App(fun, argument) = current {
+            #[cfg(test)]
+            audit_increment(|audit| &mut audit.deferred_application_nodes_visited);
+            arguments.push(Arc::clone(argument));
+            head = Some(Arc::clone(fun));
+            current = fun;
+        }
+        arguments.reverse();
+        self.application = WhnfApplicationState::Known {
+            head: head.expect("Deferred is used only for application values"),
+            arguments,
+        };
+    }
+
+    fn application_view(&mut self) -> (&Expr, &[Arc<Expr>]) {
+        self.recover_deferred_application();
+        match &self.application {
+            WhnfApplicationState::Atom => (&self.expr, &[]),
+            WhnfApplicationState::Known { head, arguments } => (head, arguments),
+            WhnfApplicationState::Deferred => unreachable!("deferred view was recovered"),
+        }
+    }
+
+    fn append(mut self, argument: Arc<Expr>) -> Self {
+        self.recover_deferred_application();
+        #[cfg(test)]
+        audit_increment(|audit| &mut audit.known_arguments_appended);
+        let Self { expr, application } = self;
+        let function = Arc::new(expr);
+        let materialized = Expr::App(Arc::clone(&function), Arc::clone(&argument));
+        let application = match application {
+            WhnfApplicationState::Atom => WhnfApplicationState::Known {
+                head: function,
+                arguments: vec![argument],
+            },
+            WhnfApplicationState::Known {
+                head,
+                mut arguments,
+            } => {
+                arguments.push(argument);
+                WhnfApplicationState::Known { head, arguments }
+            }
+            WhnfApplicationState::Deferred => unreachable!("deferred view was recovered"),
+        };
+        Self {
+            expr: materialized,
+            application,
+        }
+    }
+}
+
+enum WhnfMachineFrame<'env> {
+    Apply {
+        caller: WhnfActiveCall,
+        argument: Arc<Expr>,
+    },
+    RecursorMajor {
+        caller: WhnfActiveCall,
+        application: WhnfValue,
+        resolved: ResolvedRecursor<'env>,
+    },
+}
+
+enum WhnfMachineControl {
+    Reduce {
+        call: WhnfActiveCall,
+        current: Expr,
+    },
+    Complete {
+        call: WhnfActiveCall,
+        value: WhnfValue,
+    },
+    Resume(WhnfValue),
+}
+
+enum WhnfCallStart {
+    Hit(Expr),
+    Body(WhnfActiveCall),
+}
+
+trait WhnfMachineDriver {
+    fn begin_call(
+        &mut self,
+        origin: MemoExprOrigin<'_>,
+        ctx: &Ctx,
+        parameters: &[String],
+        kind: ResourceLimitKind,
+        fuel: &mut usize,
+    ) -> Result<WhnfCallStart>;
+
+    fn finish_call(&mut self, active: WhnfActiveCall, result: &Expr, remaining_fuel: usize);
+
+    fn increment(&mut self, counter: KernelWorkCounter);
+
+    fn record_delta_reduction(&mut self, constant: &str);
+}
+
+struct UncachedWhnfDriver<'a, M: KernelWorkMeter> {
+    meter: &'a mut M,
+}
+
+impl<M: KernelWorkMeter> WhnfMachineDriver for UncachedWhnfDriver<'_, M> {
+    fn begin_call(
+        &mut self,
+        _origin: MemoExprOrigin<'_>,
+        _ctx: &Ctx,
+        _parameters: &[String],
+        _kind: ResourceLimitKind,
+        fuel: &mut usize,
+    ) -> Result<WhnfCallStart> {
+        let starting_fuel = *fuel;
+        self.meter.increment(KernelWorkCounter::WhnfCall);
+        Ok(WhnfCallStart::Body(WhnfActiveCall {
+            starting_fuel,
+            memo_token: None,
+        }))
+    }
+
+    fn finish_call(&mut self, _active: WhnfActiveCall, _result: &Expr, _remaining_fuel: usize) {}
+
+    fn increment(&mut self, counter: KernelWorkCounter) {
+        self.meter.increment(counter);
+    }
+
+    fn record_delta_reduction(&mut self, constant: &str) {
+        self.meter.record_delta_reduction(constant);
+    }
+}
+
+struct ReuseWhnfDriver<'a> {
+    state: &'a mut KernelOperationState,
+}
+
+impl WhnfMachineDriver for ReuseWhnfDriver<'_> {
+    fn begin_call(
+        &mut self,
+        origin: MemoExprOrigin<'_>,
+        ctx: &Ctx,
+        parameters: &[String],
+        kind: ResourceLimitKind,
+        fuel: &mut usize,
+    ) -> Result<WhnfCallStart> {
+        let lookup =
+            self.state
+                .memo
+                .whnf_lookup(origin, ctx, parameters, kind, &mut self.state.counters);
+        let memo_token = match lookup {
+            WhnfMemoLookup::Hit { result, fuel_cost } => {
+                replay_memo_fuel(fuel, fuel_cost, kind, &mut self.state.counters)?;
+                KernelWorkCounters::add(
+                    &mut self.state.counters.memo_bypassed_call_bodies,
+                    1,
+                    &mut self.state.counters.overflowed,
+                );
+                return Ok(WhnfCallStart::Hit(result));
+            }
+            WhnfMemoLookup::Miss(token) => Some(token),
+            WhnfMemoLookup::Ineligible => None,
+        };
+
+        let starting_fuel = *fuel;
+        self.state.counters.increment(KernelWorkCounter::WhnfCall);
+        Ok(WhnfCallStart::Body(WhnfActiveCall {
+            starting_fuel,
+            memo_token,
+        }))
+    }
+
+    fn finish_call(&mut self, active: WhnfActiveCall, result: &Expr, remaining_fuel: usize) {
+        if let Some(token) = active.memo_token {
+            self.state.memo.insert_whnf(
+                token,
+                result,
+                active.starting_fuel.saturating_sub(remaining_fuel),
+                &mut self.state.counters,
+            );
+        }
+    }
+
+    fn increment(&mut self, counter: KernelWorkCounter) {
+        self.state.counters.increment(counter);
+    }
+
+    fn record_delta_reduction(&mut self, constant: &str) {
+        self.state.counters.record_delta_reduction(constant);
     }
 }
 
@@ -787,24 +1086,6 @@ impl Env {
                     actual => Err(Error::ExpectedPi { actual }),
                 }
             }
-            Expr::Let {
-                binder,
-                ty,
-                value,
-                body,
-            } => {
-                self.expect_sort_in_universe_context_with_work(ctx, universe_context, ty, meter)?;
-                self.check_in_universe_context_with_work(ctx, universe_context, value, ty, meter)?;
-                let mut body_ctx = ctx.clone();
-                body_ctx.push_definition(binder.clone(), (**ty).clone(), (**value).clone());
-                let body_ty = self.infer_in_universe_context_with_work(
-                    &body_ctx,
-                    universe_context,
-                    body,
-                    meter,
-                )?;
-                instantiate(&body_ty, value)
-            }
         }
     }
 
@@ -996,41 +1277,6 @@ impl Env {
                     }
                     actual => Err(DiagnosedKernelError::new(Error::ExpectedPi { actual })),
                 }
-            }
-            Expr::Let {
-                binder,
-                ty,
-                value,
-                body,
-            } => {
-                self.expect_sort_in_universe_context_diagnosed(
-                    ctx,
-                    universe_context,
-                    ty,
-                    phase,
-                    limits,
-                    meter,
-                )?;
-                self.check_in_universe_context_diagnosed(
-                    ctx,
-                    universe_context,
-                    value,
-                    ty,
-                    phase,
-                    limits,
-                    meter,
-                )?;
-                let mut body_ctx = ctx.clone();
-                body_ctx.push_definition(binder.clone(), (**ty).clone(), (**value).clone());
-                let body_ty = self.infer_in_universe_context_diagnosed(
-                    &body_ctx,
-                    universe_context,
-                    body,
-                    phase,
-                    limits,
-                    meter,
-                )?;
-                instantiate(&body_ty, value).map_err(DiagnosedKernelError::new)
             }
         }
     }
@@ -2937,39 +3183,6 @@ impl Env {
                     actual => Err(Error::ExpectedPi { actual }),
                 }
             }
-            Expr::Let {
-                binder,
-                ty,
-                value,
-                body,
-            } => {
-                self.expect_sort_in_universe_context_with_memo(
-                    ctx,
-                    universe_context,
-                    ty,
-                    MemoExprOrigin::Retained(ty),
-                    state,
-                )?;
-                self.check_in_universe_context_with_memo(
-                    ctx,
-                    universe_context,
-                    value,
-                    MemoExprOrigin::Retained(value),
-                    ty,
-                    MemoExprOrigin::Retained(ty),
-                    state,
-                )?;
-                let mut body_ctx = ctx.clone();
-                body_ctx.push_definition(binder.clone(), (**ty).clone(), (**value).clone());
-                let body_ty = self.infer_in_universe_context_with_memo(
-                    &body_ctx,
-                    universe_context,
-                    body,
-                    MemoExprOrigin::Retained(body),
-                    state,
-                )?;
-                instantiate(&body_ty, value)
-            }
         }
     }
 
@@ -3192,45 +3405,6 @@ impl Env {
                     actual => Err(Error::ExpectedPi { actual }),
                 }
             }
-            Expr::Let {
-                binder,
-                ty,
-                value,
-                body,
-            } => {
-                self.expect_sort_with_remaining_fuel_memo_shared(
-                    ctx,
-                    universe_context,
-                    ty,
-                    MemoExprOrigin::Retained(ty),
-                    whnf_fuel,
-                    conversion_fuel,
-                    state,
-                )?;
-                self.check_with_remaining_fuel_memo_shared(
-                    ctx,
-                    universe_context,
-                    value,
-                    MemoExprOrigin::Retained(value),
-                    ty,
-                    MemoExprOrigin::Retained(ty),
-                    whnf_fuel,
-                    conversion_fuel,
-                    state,
-                )?;
-                let mut body_ctx = ctx.clone();
-                body_ctx.push_definition(binder.clone(), (**ty).clone(), (**value).clone());
-                let body_ty = self.infer_with_remaining_fuel_memo_shared(
-                    &body_ctx,
-                    universe_context,
-                    body,
-                    MemoExprOrigin::Retained(body),
-                    whnf_fuel,
-                    conversion_fuel,
-                    state,
-                )?;
-                instantiate(&body_ty, value)
-            }
         }
     }
 
@@ -3394,38 +3568,6 @@ impl Env {
                     }
                     actual => Err(Error::ExpectedPi { actual }),
                 }
-            }
-            Expr::Let {
-                binder,
-                ty,
-                value,
-                body,
-            } => {
-                self.expect_sort_with_remaining_fuel(
-                    ctx,
-                    universe_context,
-                    ty,
-                    whnf_fuel,
-                    conversion_fuel,
-                )?;
-                self.check_with_remaining_fuel(
-                    ctx,
-                    universe_context,
-                    value,
-                    ty,
-                    whnf_fuel,
-                    conversion_fuel,
-                )?;
-                let mut body_ctx = ctx.clone();
-                body_ctx.push_definition(binder.clone(), (**ty).clone(), (**value).clone());
-                let body_ty = self.infer_with_remaining_fuel(
-                    &body_ctx,
-                    universe_context,
-                    body,
-                    whnf_fuel,
-                    conversion_fuel,
-                )?;
-                instantiate(&body_ty, value)
             }
         }
     }
@@ -3596,44 +3738,6 @@ impl Env {
                     }
                     actual => Err(DiagnosedKernelError::new(Error::ExpectedPi { actual })),
                 }
-            }
-            Expr::Let {
-                binder,
-                ty,
-                value,
-                body,
-            } => {
-                self.expect_sort_with_remaining_fuel_diagnosed(
-                    ctx,
-                    universe_context,
-                    ty,
-                    phase,
-                    whnf_fuel,
-                    conversion_fuel,
-                    meter,
-                )?;
-                self.check_with_remaining_fuel_diagnosed(
-                    ctx,
-                    universe_context,
-                    value,
-                    ty,
-                    phase,
-                    whnf_fuel,
-                    conversion_fuel,
-                    meter,
-                )?;
-                let mut body_ctx = ctx.clone();
-                body_ctx.push_definition(binder.clone(), (**ty).clone(), (**value).clone());
-                let body_ty = self.infer_with_remaining_fuel_diagnosed(
-                    &body_ctx,
-                    universe_context,
-                    body,
-                    phase,
-                    whnf_fuel,
-                    conversion_fuel,
-                    meter,
-                )?;
-                instantiate(&body_ty, value).map_err(DiagnosedKernelError::new)
             }
         }
     }
@@ -4854,6 +4958,391 @@ impl Env {
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn whnf_machine<'env>(
+        &'env self,
+        ctx: &Ctx,
+        delta: &[String],
+        term: &Expr,
+        origin: MemoExprOrigin<'_>,
+        fuel: &mut usize,
+        kind: ResourceLimitKind,
+        driver: &mut impl WhnfMachineDriver,
+    ) -> Result<Expr> {
+        let mut frames: Vec<WhnfMachineFrame<'env>> = Vec::new();
+        let mut control = match driver.begin_call(origin, ctx, delta, kind, fuel)? {
+            WhnfCallStart::Hit(result) => WhnfMachineControl::Resume(WhnfValue::memo_hit(result)),
+            WhnfCallStart::Body(call) => WhnfMachineControl::Reduce {
+                call,
+                current: term.clone(),
+            },
+        };
+
+        loop {
+            control = match control {
+                WhnfMachineControl::Reduce { call, current } => {
+                    spend_fuel(fuel, kind)?;
+                    match current {
+                        Expr::BVar(index) => {
+                            driver.increment(KernelWorkCounter::ContextLookup);
+                            ctx.ensure_bound(index)?;
+                            WhnfMachineControl::Complete {
+                                call,
+                                value: WhnfValue::atom(Expr::BVar(index)),
+                            }
+                        }
+                        Expr::Const {
+                            ref name,
+                            ref levels,
+                        } => {
+                            if let Some(
+                                Decl::Def {
+                                    universe_params,
+                                    value,
+                                    reducibility: Reducibility::Reducible,
+                                    ..
+                                }
+                                | Decl::DefConstrained {
+                                    universe_params,
+                                    value,
+                                    reducibility: Reducibility::Reducible,
+                                    ..
+                                },
+                            ) = self.decls.get(name)
+                            {
+                                driver.record_delta_reduction(name);
+                                WhnfMachineControl::Reduce {
+                                    call,
+                                    current: subst_levels_expr(value, universe_params, levels),
+                                }
+                            } else {
+                                WhnfMachineControl::Complete {
+                                    call,
+                                    value: WhnfValue::atom(current),
+                                }
+                            }
+                        }
+                        Expr::App(fun, argument) => {
+                            let child = driver.begin_call(
+                                MemoExprOrigin::Retained(&fun),
+                                ctx,
+                                delta,
+                                kind,
+                                fuel,
+                            )?;
+                            frames.push(WhnfMachineFrame::Apply {
+                                caller: call,
+                                argument,
+                            });
+                            #[cfg(test)]
+                            {
+                                audit_increment(|audit| &mut audit.app_continuations_entered);
+                                audit_continuation_depth(frames.len());
+                            }
+                            match child {
+                                WhnfCallStart::Hit(result) => {
+                                    WhnfMachineControl::Resume(WhnfValue::memo_hit(result))
+                                }
+                                WhnfCallStart::Body(call) => WhnfMachineControl::Reduce {
+                                    call,
+                                    current: (*fun).clone(),
+                                },
+                            }
+                        }
+                        _ => WhnfMachineControl::Complete {
+                            call,
+                            value: WhnfValue::atom(current),
+                        },
+                    }
+                }
+                WhnfMachineControl::Complete { call, value } => {
+                    driver.finish_call(call, &value.expr, *fuel);
+                    WhnfMachineControl::Resume(value)
+                }
+                WhnfMachineControl::Resume(mut value) => {
+                    let Some(frame) = frames.pop() else {
+                        return Ok(value.expr);
+                    };
+                    match frame {
+                        WhnfMachineFrame::Apply { caller, argument } => {
+                            if let Expr::Lam { body, .. } = &value.expr {
+                                driver.increment(KernelWorkCounter::BetaStep);
+                                driver.increment(KernelWorkCounter::PhysicalReduction);
+                                WhnfMachineControl::Reduce {
+                                    call: caller,
+                                    current: instantiate(body, &argument)?,
+                                }
+                            } else {
+                                value.recover_deferred_application();
+                                let mut application = value.append(argument);
+                                let classified = {
+                                    let (head, arguments) = application.application_view();
+                                    match head {
+                                        Expr::Const { name, .. } => {
+                                            #[cfg(test)]
+                                            audit_increment(|audit| {
+                                                &mut audit.recursor_classification_decl_lookups
+                                            });
+                                            match self.decls.get(name) {
+                                                Some(Decl::Recursor {
+                                                    inductive, rules, ..
+                                                }) => {
+                                                    #[cfg(test)]
+                                                    audit_increment(|audit| {
+                                                        &mut audit.recursor_probes
+                                                    });
+                                                    if arguments.len() > rules.major_index {
+                                                        Some((
+                                                            ResolvedRecursor { inductive, rules },
+                                                            Arc::clone(
+                                                                &arguments[rules.major_index],
+                                                            ),
+                                                        ))
+                                                    } else {
+                                                        None
+                                                    }
+                                                }
+                                                _ => None,
+                                            }
+                                        }
+                                        _ => None,
+                                    }
+                                };
+                                if let Some((resolved, major)) = classified {
+                                    let child = driver.begin_call(
+                                        MemoExprOrigin::Retained(&major),
+                                        ctx,
+                                        delta,
+                                        kind,
+                                        fuel,
+                                    )?;
+                                    frames.push(WhnfMachineFrame::RecursorMajor {
+                                        caller,
+                                        application,
+                                        resolved,
+                                    });
+                                    #[cfg(test)]
+                                    {
+                                        audit_increment(|audit| {
+                                            &mut audit.recursor_major_continuations_entered
+                                        });
+                                        audit_continuation_depth(frames.len());
+                                    }
+                                    match child {
+                                        WhnfCallStart::Hit(result) => {
+                                            WhnfMachineControl::Resume(WhnfValue::memo_hit(result))
+                                        }
+                                        WhnfCallStart::Body(call) => WhnfMachineControl::Reduce {
+                                            call,
+                                            current: (*major).clone(),
+                                        },
+                                    }
+                                } else {
+                                    WhnfMachineControl::Complete {
+                                        call: caller,
+                                        value: application,
+                                    }
+                                }
+                            }
+                        }
+                        WhnfMachineFrame::RecursorMajor {
+                            caller,
+                            mut application,
+                            resolved,
+                        } => match self.finish_recursor_reduction_from_views(
+                            &mut application,
+                            resolved,
+                            &mut value,
+                        )? {
+                            Some(reduced) => {
+                                driver.increment(KernelWorkCounter::IotaStep);
+                                driver.increment(KernelWorkCounter::PhysicalReduction);
+                                WhnfMachineControl::Reduce {
+                                    call: caller,
+                                    current: reduced,
+                                }
+                            }
+                            None => WhnfMachineControl::Complete {
+                                call: caller,
+                                value: application,
+                            },
+                        },
+                    }
+                }
+            };
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finish_recursor_reduction_from_views(
+        &self,
+        application: &mut WhnfValue,
+        resolved: ResolvedRecursor<'_>,
+        major_whnf: &mut WhnfValue,
+    ) -> Result<Option<Expr>> {
+        let (recursor_head, args) = application.application_view();
+        let Expr::Const {
+            name: recursor_name,
+            levels,
+        } = recursor_head
+        else {
+            unreachable!("resolved recursor application has a constant head")
+        };
+
+        let (constructor_head, constructor_args) = major_whnf.application_view();
+        let Expr::Const {
+            name: constructor_name,
+            ..
+        } = constructor_head
+        else {
+            return Ok(None);
+        };
+        if !self.constructor_belongs_to(constructor_name, resolved.inductive) {
+            return Ok(None);
+        }
+
+        let data = self.inductive_data(resolved.inductive)?;
+        let mutual_group = self.mutual_groups.get(resolved.inductive).cloned();
+        let Some(constructor_index) = data
+            .constructors
+            .iter()
+            .position(|constructor| constructor.name == *constructor_name)
+        else {
+            return Ok(None);
+        };
+        let block_constructor_offset = match &mutual_group {
+            Some(group) => mutual_constructor_offset(self, group, resolved.inductive)?,
+            None => 0,
+        };
+        let Some(minor) =
+            args.get(resolved.rules.minor_start + block_constructor_offset + constructor_index)
+        else {
+            return Ok(None);
+        };
+
+        let constructor = &data.constructors[constructor_index];
+        let (domains, _) = peel_pi_domains(&constructor.ty);
+        let parameter_count = data.params.len();
+        if constructor_args.len() < parameter_count {
+            return Ok(None);
+        }
+        let index_start = resolved.rules.major_index - data.indices.len();
+        let field_args = &constructor_args[parameter_count..];
+        let field_domains = &domains[parameter_count..];
+        if field_args.len() < field_domains.len() {
+            return Ok(None);
+        }
+
+        #[cfg(test)]
+        audit_increment(|audit| &mut audit.recursor_argument_root_clones_for_iota);
+        let mut reduced = (**minor).clone();
+        for (field_index, (field_arg, field_domain)) in
+            field_args.iter().zip(field_domains).enumerate()
+        {
+            #[cfg(test)]
+            audit_increment(|audit| &mut audit.recursor_argument_root_clones_for_iota);
+            reduced = Expr::app(reduced, (**field_arg).clone());
+            if let Some(group) = &mutual_group {
+                if let Ok((field_inductive, index_args)) = direct_mutual_recursive_index_args(
+                    self,
+                    group,
+                    field_domain,
+                    parameter_count + field_index,
+                ) {
+                    let source_context_len = parameter_count + field_index;
+                    let source_args = constructor_args[..source_context_len]
+                        .iter()
+                        .map(|argument| {
+                            #[cfg(test)]
+                            audit_increment(|audit| {
+                                &mut audit.recursor_argument_root_clones_for_iota
+                            });
+                            (**argument).clone()
+                        })
+                        .collect::<Vec<_>>();
+                    let Some(recursive_recursor_name) = group.recursors.get(&field_inductive)
+                    else {
+                        return Err(Error::InvalidInductive(format!(
+                            "{field_inductive} has no mutual recursor"
+                        )));
+                    };
+                    let recursive_data = self.inductive_data(&field_inductive)?;
+                    let mut recursive_args = args[..index_start]
+                        .iter()
+                        .map(|argument| {
+                            #[cfg(test)]
+                            audit_increment(|audit| {
+                                &mut audit.recursor_argument_root_clones_for_iota
+                            });
+                            (**argument).clone()
+                        })
+                        .collect::<Vec<_>>();
+                    for index_arg in index_args {
+                        recursive_args
+                            .push(instantiate_constructor_args(&index_arg, &source_args)?);
+                    }
+                    if recursive_args.len() != index_start + recursive_data.indices.len() {
+                        return Err(Error::InvalidInductive(format!(
+                            "{} recursive call index arity mismatch",
+                            recursive_recursor_name
+                        )));
+                    }
+                    #[cfg(test)]
+                    audit_increment(|audit| &mut audit.recursor_argument_root_clones_for_iota);
+                    recursive_args.push((**field_arg).clone());
+                    reduced = Expr::app(
+                        reduced,
+                        Expr::apps(
+                            Expr::konst(recursive_recursor_name.clone(), levels.clone()),
+                            recursive_args,
+                        ),
+                    );
+                }
+            } else if is_direct_recursive_domain(data, field_domain, parameter_count + field_index)
+            {
+                let source_context_len = parameter_count + field_index;
+                let source_args = constructor_args[..source_context_len]
+                    .iter()
+                    .map(|argument| {
+                        #[cfg(test)]
+                        audit_increment(|audit| &mut audit.recursor_argument_root_clones_for_iota);
+                        (**argument).clone()
+                    })
+                    .collect::<Vec<_>>();
+                let mut recursive_args = args[..index_start]
+                    .iter()
+                    .map(|argument| {
+                        #[cfg(test)]
+                        audit_increment(|audit| &mut audit.recursor_argument_root_clones_for_iota);
+                        (**argument).clone()
+                    })
+                    .collect::<Vec<_>>();
+                for index_arg in
+                    direct_recursive_index_args(data, field_domain, source_context_len)?
+                {
+                    recursive_args.push(instantiate_constructor_args(&index_arg, &source_args)?);
+                }
+                #[cfg(test)]
+                audit_increment(|audit| &mut audit.recursor_argument_root_clones_for_iota);
+                recursive_args.push((**field_arg).clone());
+                reduced = Expr::app(
+                    reduced,
+                    Expr::apps(
+                        Expr::konst(recursor_name.clone(), levels.clone()),
+                        recursive_args,
+                    ),
+                );
+            }
+        }
+
+        for argument in &args[resolved.rules.major_index + 1..] {
+            #[cfg(test)]
+            audit_increment(|audit| &mut audit.recursor_argument_root_clones_for_iota);
+            reduced = Expr::app(reduced, (**argument).clone());
+        }
+        Ok(Some(reduced))
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn whnf_with_remaining_fuel_memo(
         &self,
         ctx: &Ctx,
@@ -4864,114 +5353,39 @@ impl Env {
         kind: ResourceLimitKind,
         state: &mut KernelOperationState,
     ) -> Result<Expr> {
-        let lookup = state
-            .memo
-            .whnf_lookup(origin, ctx, delta, kind, &mut state.counters);
-        let token = match lookup {
-            WhnfMemoLookup::Hit { result, fuel_cost } => {
-                replay_memo_fuel(fuel, fuel_cost, kind, &mut state.counters)?;
-                KernelWorkCounters::add(
-                    &mut state.counters.memo_bypassed_call_bodies,
-                    1,
-                    &mut state.counters.overflowed,
-                );
-                return Ok(result);
-            }
-            WhnfMemoLookup::Miss(token) => Some(token),
-            WhnfMemoLookup::Ineligible => None,
-        };
-
-        let starting_fuel = *fuel;
-        state.counters.increment(KernelWorkCounter::WhnfCall);
-        let result = (|| {
-            let mut current = term.clone();
-            loop {
-                spend_fuel(fuel, kind)?;
-
-                match current {
-                    Expr::BVar(index) => {
-                        state.counters.increment(KernelWorkCounter::ContextLookup);
-                        let value = ctx.lookup_value(index)?;
-                        if let Some(value) = value {
-                            state.counters.increment(KernelWorkCounter::ContextShift);
-                            record_reduction(&mut state.counters, KernelWorkCounter::ZetaStep);
-                            current = value;
-                        } else {
-                            return Ok(Expr::BVar(index));
-                        }
-                    }
-                    Expr::Const {
-                        ref name,
-                        ref levels,
-                    } => {
-                        if let Some(
-                            Decl::Def {
-                                universe_params,
-                                value,
-                                reducibility: Reducibility::Reducible,
-                                ..
-                            }
-                            | Decl::DefConstrained {
-                                universe_params,
-                                value,
-                                reducibility: Reducibility::Reducible,
-                                ..
-                            },
-                        ) = self.decls.get(name)
-                        {
-                            state.counters.record_delta_reduction(name);
-                            current = subst_levels_expr(value, universe_params, levels);
-                        } else {
-                            return Ok(current);
-                        }
-                    }
-                    Expr::App(fun, arg) => {
-                        let fun_whnf = self.whnf_with_remaining_fuel_memo(
-                            ctx,
-                            delta,
-                            &fun,
-                            MemoExprOrigin::Retained(&fun),
-                            fuel,
-                            kind,
-                            state,
-                        )?;
-                        if let Expr::Lam { body, .. } = fun_whnf {
-                            record_reduction(&mut state.counters, KernelWorkCounter::BetaStep);
-                            current = instantiate(&body, &arg)?;
-                            continue;
-                        }
-
-                        let app = Expr::App(Arc::new(fun_whnf), arg);
-                        if let Some(reduced) =
-                            self.reduce_recursor_memo(ctx, delta, &app, fuel, kind, state)?
-                        {
-                            record_reduction(&mut state.counters, KernelWorkCounter::IotaStep);
-                            current = reduced;
-                            continue;
-                        }
-                        return Ok(app);
-                    }
-                    Expr::Let { value, body, .. } => {
-                        record_reduction(&mut state.counters, KernelWorkCounter::ZetaStep);
-                        current = instantiate(&body, &value)?;
-                    }
-                    _ => return Ok(current),
-                }
-            }
-        })();
-
-        if let (Some(token), Ok(value)) = (token, &result) {
-            state.memo.insert_whnf(
-                token,
-                value,
-                starting_fuel.saturating_sub(*fuel),
-                &mut state.counters,
-            );
-        }
-        result
+        self.whnf_machine(
+            ctx,
+            delta,
+            term,
+            origin,
+            fuel,
+            kind,
+            &mut ReuseWhnfDriver { state },
+        )
     }
 
     fn whnf_with_remaining_fuel(
+        &self,
+        ctx: &Ctx,
+        delta: &[String],
+        term: &Expr,
+        fuel: &mut usize,
+        kind: ResourceLimitKind,
+        meter: &mut impl KernelWorkMeter,
+    ) -> Result<Expr> {
+        self.whnf_machine(
+            ctx,
+            delta,
+            term,
+            MemoExprOrigin::Borrowed,
+            fuel,
+            kind,
+            &mut UncachedWhnfDriver { meter },
+        )
+    }
+
+    #[cfg(test)]
+    fn whnf_recursive_oracle(
         &self,
         ctx: &Ctx,
         delta: &[String],
@@ -4984,18 +5398,11 @@ impl Env {
         let mut current = term.clone();
         loop {
             spend_fuel(fuel, kind)?;
-
             match current {
                 Expr::BVar(index) => {
                     meter.increment(KernelWorkCounter::ContextLookup);
-                    let value = ctx.lookup_value(index)?;
-                    if let Some(value) = value {
-                        meter.increment(KernelWorkCounter::ContextShift);
-                        record_reduction(meter, KernelWorkCounter::ZetaStep);
-                        current = value;
-                    } else {
-                        return Ok(Expr::BVar(index));
-                    }
+                    ctx.ensure_bound(index)?;
+                    return Ok(Expr::BVar(index));
                 }
                 Expr::Const {
                     ref name,
@@ -5022,79 +5429,36 @@ impl Env {
                         return Ok(current);
                     }
                 }
-                Expr::App(fun, arg) => {
-                    let fun_whnf =
-                        self.whnf_with_remaining_fuel(ctx, delta, &fun, fuel, kind, meter)?;
-                    if let Expr::Lam { body, .. } = fun_whnf {
+                Expr::App(fun, argument) => {
+                    let function =
+                        self.whnf_recursive_oracle(ctx, delta, &fun, fuel, kind, meter)?;
+                    if let Expr::Lam { body, .. } = function {
                         record_reduction(meter, KernelWorkCounter::BetaStep);
-                        current = instantiate(&body, &arg)?;
+                        current = instantiate(&body, &argument)?;
                         continue;
                     }
-
-                    let app = Expr::App(Arc::new(fun_whnf), arg);
-                    if let Some(reduced) =
-                        self.reduce_recursor(ctx, delta, &app, fuel, kind, meter)?
-                    {
+                    let application = Expr::App(Arc::new(function), argument);
+                    if let Some(reduced) = self.recursive_oracle_reduce_recursor(
+                        ctx,
+                        delta,
+                        &application,
+                        fuel,
+                        kind,
+                        meter,
+                    )? {
                         record_reduction(meter, KernelWorkCounter::IotaStep);
                         current = reduced;
                         continue;
                     }
-                    return Ok(app);
-                }
-                Expr::Let { value, body, .. } => {
-                    record_reduction(meter, KernelWorkCounter::ZetaStep);
-                    current = instantiate(&body, &value)?;
+                    return Ok(application);
                 }
                 _ => return Ok(current),
             }
         }
     }
 
-    fn reduce_recursor_memo(
-        &self,
-        ctx: &Ctx,
-        delta: &[String],
-        term: &Expr,
-        fuel: &mut usize,
-        kind: ResourceLimitKind,
-        state: &mut KernelOperationState,
-    ) -> Result<Option<Expr>> {
-        let (head, retained_args) = collect_apps_with_retained_args(term);
-        let Expr::Const {
-            name: recursor_name,
-            levels,
-        } = head
-        else {
-            return Ok(None);
-        };
-        let Some(Decl::Recursor {
-            inductive, rules, ..
-        }) = self.decls.get(&recursor_name)
-        else {
-            return Ok(None);
-        };
-        if retained_args.len() <= rules.major_index {
-            return Ok(None);
-        }
-
-        let major = &retained_args[rules.major_index];
-        let major_whnf = self.whnf_with_remaining_fuel_memo(
-            ctx,
-            delta,
-            major,
-            MemoExprOrigin::Retained(major),
-            fuel,
-            kind,
-            state,
-        )?;
-        let args = retained_args
-            .iter()
-            .map(|argument| (**argument).clone())
-            .collect::<Vec<_>>();
-        self.finish_recursor_reduction(&recursor_name, &levels, inductive, rules, &args, major_whnf)
-    }
-
-    fn reduce_recursor(
+    #[cfg(test)]
+    fn recursive_oracle_reduce_recursor(
         &self,
         ctx: &Ctx,
         delta: &[String],
@@ -5120,14 +5484,21 @@ impl Env {
         if args.len() <= rules.major_index {
             return Ok(None);
         }
-
         let major = args[rules.major_index].clone();
-        let major_whnf = self.whnf_with_remaining_fuel(ctx, delta, &major, fuel, kind, meter)?;
-        self.finish_recursor_reduction(&recursor_name, &levels, inductive, rules, &args, major_whnf)
+        let major_whnf = self.whnf_recursive_oracle(ctx, delta, &major, fuel, kind, meter)?;
+        self.recursive_oracle_finish_recursor(
+            &recursor_name,
+            &levels,
+            inductive,
+            rules,
+            &args,
+            major_whnf,
+        )
     }
 
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
-    fn finish_recursor_reduction(
+    fn recursive_oracle_finish_recursor(
         &self,
         recursor_name: &str,
         levels: &[Level],
@@ -5137,50 +5508,48 @@ impl Env {
         major_whnf: Expr,
     ) -> Result<Option<Expr>> {
         let rest = args[rules.major_index + 1..].to_vec();
-        let (ctor_head, ctor_args) = collect_apps(&major_whnf);
+        let (constructor_head, constructor_args) = collect_apps(&major_whnf);
         let Expr::Const {
-            name: ctor_name, ..
-        } = ctor_head
+            name: constructor_name,
+            ..
+        } = constructor_head
         else {
             return Ok(None);
         };
-        if !self.constructor_belongs_to(&ctor_name, inductive) {
+        if !self.constructor_belongs_to(&constructor_name, inductive) {
             return Ok(None);
         }
-
         let data = self.inductive_data(inductive)?;
         let mutual_group = self.mutual_groups.get(inductive).cloned();
-        let Some(ctor_index) = data
+        let Some(constructor_index) = data
             .constructors
             .iter()
-            .position(|constructor| constructor.name == ctor_name)
+            .position(|constructor| constructor.name == constructor_name)
         else {
             return Ok(None);
         };
-        let block_ctor_offset = match &mutual_group {
+        let block_constructor_offset = match &mutual_group {
             Some(group) => mutual_constructor_offset(self, group, inductive)?,
             None => 0,
         };
         let Some(minor) = args
-            .get(rules.minor_start + block_ctor_offset + ctor_index)
+            .get(rules.minor_start + block_constructor_offset + constructor_index)
             .cloned()
         else {
             return Ok(None);
         };
-
-        let constructor = &data.constructors[ctor_index];
+        let constructor = &data.constructors[constructor_index];
         let (domains, _) = peel_pi_domains(&constructor.ty);
-        let param_count = data.params.len();
-        if ctor_args.len() < param_count {
+        let parameter_count = data.params.len();
+        if constructor_args.len() < parameter_count {
             return Ok(None);
         }
         let index_start = rules.major_index - data.indices.len();
-        let field_args = &ctor_args[param_count..];
-        let field_domains = &domains[param_count..];
+        let field_args = &constructor_args[parameter_count..];
+        let field_domains = &domains[parameter_count..];
         if field_args.len() < field_domains.len() {
             return Ok(None);
         }
-
         let mut reduced = minor;
         for (field_index, (field_arg, field_domain)) in
             field_args.iter().zip(field_domains).enumerate()
@@ -5191,10 +5560,10 @@ impl Env {
                     self,
                     group,
                     field_domain,
-                    param_count + field_index,
+                    parameter_count + field_index,
                 ) {
-                    let source_ctx_len = param_count + field_index;
-                    let source_args = &ctor_args[..source_ctx_len];
+                    let source_context_len = parameter_count + field_index;
+                    let source_args = &constructor_args[..source_context_len];
                     let Some(recursive_recursor_name) = group.recursors.get(&field_inductive)
                     else {
                         return Err(Error::InvalidInductive(format!(
@@ -5221,11 +5590,14 @@ impl Env {
                         ),
                     );
                 }
-            } else if is_direct_recursive_domain(data, field_domain, param_count + field_index) {
-                let source_ctx_len = param_count + field_index;
-                let source_args = &ctor_args[..source_ctx_len];
+            } else if is_direct_recursive_domain(data, field_domain, parameter_count + field_index)
+            {
+                let source_context_len = parameter_count + field_index;
+                let source_args = &constructor_args[..source_context_len];
                 let mut recursive_args = args[..index_start].to_vec();
-                for index_arg in direct_recursive_index_args(data, field_domain, source_ctx_len)? {
+                for index_arg in
+                    direct_recursive_index_args(data, field_domain, source_context_len)?
+                {
                     recursive_args.push(instantiate_constructor_args(&index_arg, source_args)?);
                 }
                 recursive_args.push(field_arg.clone());
@@ -5238,7 +5610,6 @@ impl Env {
                 );
             }
         }
-
         Ok(Some(Expr::apps(reduced, rest)))
     }
 
@@ -5705,6 +6076,7 @@ impl Env {
     }
 }
 
+#[cfg(test)]
 fn record_reduction(meter: &mut impl KernelWorkMeter, counter: KernelWorkCounter) {
     meter.increment(counter);
     meter.increment(KernelWorkCounter::PhysicalReduction);
@@ -5743,17 +6115,6 @@ fn spend_fuel(fuel: &mut usize, kind: ResourceLimitKind) -> Result<()> {
     }
     *fuel -= 1;
     Ok(())
-}
-
-fn collect_apps_with_retained_args(term: &Expr) -> (Expr, Vec<Arc<Expr>>) {
-    let mut head = term;
-    let mut args = Vec::new();
-    while let Expr::App(fun, arg) = head {
-        args.push(Arc::clone(arg));
-        head = fun;
-    }
-    args.reverse();
-    (head.clone(), args)
 }
 
 fn generated_recursor_rules(data: &InductiveDecl) -> RecursorRules {
@@ -6062,21 +6423,6 @@ fn remap_bvars(
                 remap_bvars(body, source_ctx_len + 1, target_ctx_len + 1, &body_map)?,
             ))
         }
-        Expr::Let {
-            binder,
-            ty,
-            value,
-            body,
-        } => {
-            let mut body_map = source_to_target.to_vec();
-            body_map.push(target_ctx_len);
-            Ok(Expr::let_in(
-                binder.clone(),
-                remap_bvars(ty, source_ctx_len, target_ctx_len, source_to_target)?,
-                remap_bvars(value, source_ctx_len, target_ctx_len, source_to_target)?,
-                remap_bvars(body, source_ctx_len + 1, target_ctx_len + 1, &body_map)?,
-            ))
-        }
     }
 }
 
@@ -6212,7 +6558,7 @@ fn recursive_occurrences_strictly_positive(
             !contains_const(ty, &data.name)
                 && recursive_occurrences_strictly_positive(env, data, body, ctx_len + 1)
         }
-        Expr::Lam { .. } | Expr::Let { .. } => !contains_const(domain, &data.name),
+        Expr::Lam { .. } => !contains_const(domain, &data.name),
     }
 }
 
@@ -6260,7 +6606,7 @@ fn mutual_recursive_occurrences_strictly_positive(
             !contains_any_const(ty, block.inductives.iter().map(|data| data.name.as_str()))
                 && mutual_recursive_occurrences_strictly_positive(env, block, body, ctx_len + 1)
         }
-        Expr::Lam { .. } | Expr::Let { .. } => !contains_any_const(
+        Expr::Lam { .. } => !contains_any_const(
             domain,
             block.inductives.iter().map(|data| data.name.as_str()),
         ),
@@ -6412,24 +6758,6 @@ fn expr_eq_ignoring_binder_names(lhs: &Expr, rhs: &Expr) -> bool {
             expr_eq_ignoring_binder_names(lhs_ty, rhs_ty)
                 && expr_eq_ignoring_binder_names(lhs_body, rhs_body)
         }
-        (
-            Expr::Let {
-                ty: lhs_ty,
-                value: lhs_value,
-                body: lhs_body,
-                ..
-            },
-            Expr::Let {
-                ty: rhs_ty,
-                value: rhs_value,
-                body: rhs_body,
-                ..
-            },
-        ) => {
-            expr_eq_ignoring_binder_names(lhs_ty, rhs_ty)
-                && expr_eq_ignoring_binder_names(lhs_value, rhs_value)
-                && expr_eq_ignoring_binder_names(lhs_body, rhs_body)
-        }
         _ => false,
     }
 }
@@ -6568,17 +6896,6 @@ fn instantiate_constructor_args_at(expr: &Expr, args_by_abs: &[Expr], depth: u32
             instantiate_constructor_args_at(ty, args_by_abs, depth)?,
             instantiate_constructor_args_at(body, args_by_abs, depth + 1)?,
         )),
-        Expr::Let {
-            binder,
-            ty,
-            value,
-            body,
-        } => Ok(Expr::let_in(
-            binder.clone(),
-            instantiate_constructor_args_at(ty, args_by_abs, depth)?,
-            instantiate_constructor_args_at(value, args_by_abs, depth)?,
-            instantiate_constructor_args_at(body, args_by_abs, depth + 1)?,
-        )),
     }
 }
 
@@ -6589,13 +6906,6 @@ fn contains_const(expr: &Expr, needle: &str) -> bool {
         Expr::App(fun, arg) => contains_const(fun, needle) || contains_const(arg, needle),
         Expr::Lam { ty, body, .. } | Expr::Pi { ty, body, .. } => {
             contains_const(ty, needle) || contains_const(body, needle)
-        }
-        Expr::Let {
-            ty, value, body, ..
-        } => {
-            contains_const(ty, needle)
-                || contains_const(value, needle)
-                || contains_const(body, needle)
         }
     }
 }
@@ -7090,7 +7400,7 @@ mod memo_tests {
     }
 
     #[test]
-    fn compact_beta_delta_iota_zeta_and_binder_matrix_is_differential() {
+    fn compact_beta_delta_iota_and_binder_matrix_is_differential() {
         let mut off = Env::with_builtins().unwrap();
         let mut memo =
             Env::with_builtins_and_execution_options(KernelExecutionOptions::ephemeral_memo())
@@ -7108,7 +7418,6 @@ mod memo_tests {
 
         let beta = Expr::app(Expr::lam("x", nat(), Expr::bvar(0)), nat_zero());
         let delta = Expr::konst("Memo.zero", vec![]);
-        let zeta = Expr::let_in("x", nat(), nat_zero(), Expr::bvar(0));
         let motive = Expr::lam("_", nat(), nat());
         let step = Expr::lam("_", nat(), Expr::lam("ih", nat(), Expr::bvar(0)));
         let iota = Expr::apps(
@@ -7116,7 +7425,7 @@ mod memo_tests {
             vec![motive, nat_zero(), step, nat_zero()],
         );
         let binder = Expr::pi("x", nat(), Expr::bvar(0));
-        let expressions = [beta, delta, zeta, iota, binder];
+        let expressions = [beta, delta, iota, binder];
         for expression in &expressions {
             for initial in 0..16 {
                 let mut off_fuel = initial;
@@ -7130,7 +7439,7 @@ mod memo_tests {
             }
         }
 
-        for expression in &expressions[..4] {
+        for expression in &expressions[..3] {
             for initial in 0..24 {
                 let mut off_fuel = initial;
                 let mut memo_fuel = initial;
@@ -7172,18 +7481,19 @@ mod memo_tests {
         for _ in 0..2 {
             let mut fuel = 100;
             let reduced = memo_env
-                .reduce_recursor_memo(
+                .whnf_with_remaining_fuel_memo(
                     &Ctx::new(),
                     &[],
                     &recursor,
+                    MemoExprOrigin::Borrowed,
                     &mut fuel,
                     ResourceLimitKind::Whnf,
                     &mut memo_state,
                 )
                 .unwrap();
-            assert_eq!(reduced, Some(nat_zero()));
+            assert_eq!(reduced, nat_zero());
         }
-        assert_eq!(memo_state.counters.whnf_memo_hits, 1);
+        assert!(memo_state.counters.whnf_memo_hits >= 1);
         assert!(memo_state.counters.memo_logical_fuel_replayed > 0);
 
         let probe_env =
@@ -7193,10 +7503,11 @@ mod memo_tests {
         for _ in 0..2 {
             let mut fuel = 100;
             probe_env
-                .reduce_recursor_memo(
+                .whnf_with_remaining_fuel_memo(
                     &Ctx::new(),
                     &[],
                     &recursor,
+                    MemoExprOrigin::Borrowed,
                     &mut fuel,
                     ResourceLimitKind::Whnf,
                     &mut probe_state,
@@ -7353,13 +7664,13 @@ mod memo_tests {
     }
 
     #[test]
-    fn definition_values_shadowing_and_shifted_locals_do_not_cross_reuse() {
+    fn assumption_types_shadowing_and_shifted_locals_do_not_cross_reuse() {
         let env = Env::new();
         let owner = Arc::new(Expr::bvar(0));
         let mut state = KernelOperationState::new(KernelExecutionOptions::ephemeral_memo());
 
         let mut first = Ctx::new();
-        first.push_definition("x", Expr::sort(Level::zero()), Expr::konst("a", vec![]));
+        first.push_assumption("x", Expr::sort(Level::zero()));
         let mut fuel = 100;
         assert_eq!(
             env.whnf_with_remaining_fuel_memo(
@@ -7372,7 +7683,7 @@ mod memo_tests {
                 &mut state,
             )
             .unwrap(),
-            Expr::konst("a", vec![]),
+            Expr::bvar(0),
         );
 
         let mut cloned_fuel = 100;
@@ -7388,12 +7699,12 @@ mod memo_tests {
         .unwrap();
         assert_eq!(state.counters.whnf_memo_hits, 1);
 
-        let mut distinct_value = Ctx::new();
-        distinct_value.push_definition("x", Expr::sort(Level::zero()), Expr::konst("b", vec![]));
+        let mut distinct_type = Ctx::new();
+        distinct_type.push_assumption("x", Expr::sort(Level::succ(Level::zero())));
         let mut distinct_fuel = 100;
         assert_eq!(
             env.whnf_with_remaining_fuel_memo(
-                &distinct_value,
+                &distinct_type,
                 &[],
                 &owner,
                 MemoExprOrigin::Retained(&owner),
@@ -7402,11 +7713,12 @@ mod memo_tests {
                 &mut state,
             )
             .unwrap(),
-            Expr::konst("b", vec![]),
+            Expr::bvar(0),
         );
+        assert_eq!(state.counters.whnf_memo_hits, 1);
 
         let mut shadowed = first.clone();
-        shadowed.push_definition("x", Expr::sort(Level::zero()), Expr::konst("c", vec![]));
+        shadowed.push_assumption("x", Expr::sort(Level::zero()));
         let mut shadowed_fuel = 100;
         assert_eq!(
             env.whnf_with_remaining_fuel_memo(
@@ -7419,7 +7731,7 @@ mod memo_tests {
                 &mut state,
             )
             .unwrap(),
-            Expr::konst("c", vec![]),
+            Expr::bvar(0),
         );
 
         let shifted_owner = Arc::new(Expr::bvar(1));
@@ -8174,7 +8486,6 @@ mod memo_tests {
             (failed.beta_steps, declaration.beta_steps),
             (failed.delta_steps, declaration.delta_steps),
             (failed.iota_steps, declaration.iota_steps),
-            (failed.zeta_steps, declaration.zeta_steps),
             (failed.physical_reductions, declaration.physical_reductions),
         ] {
             assert!(failed_value <= declaration_value);
@@ -8482,7 +8793,6 @@ mod memo_tests {
             failed.beta_steps,
             failed.delta_steps,
             failed.iota_steps,
-            failed.zeta_steps,
             failed.physical_reductions,
         ];
         let declaration_values = [
@@ -8494,7 +8804,6 @@ mod memo_tests {
             declaration.beta_steps,
             declaration.delta_steps,
             declaration.iota_steps,
-            declaration.zeta_steps,
             declaration.physical_reductions,
         ];
         assert!(failed_values
@@ -8595,5 +8904,735 @@ mod memo_tests {
         assert!(matches!(mismatch.error(), Error::TypeMismatch { .. }));
         assert!(mismatch.context().unwrap().conversion().is_some());
         assert!(mismatch.context().unwrap().kernel_fuel().is_none());
+    }
+
+    fn neutral_application_spine(width: usize) -> Expr {
+        (0..width).fold(Expr::konst("Spine.neutral", vec![]), |function, index| {
+            Expr::App(
+                Arc::new(function),
+                Arc::new(Expr::konst(format!("Spine.arg.a{index:05}"), vec![])),
+            )
+        })
+    }
+
+    fn assert_machine_matches_recursive_oracle(env: &Env, term: &Expr, initial_fuel: usize) {
+        let mut machine_fuel = initial_fuel;
+        let mut oracle_fuel = initial_fuel;
+        let mut machine_meter = DetailedTestMeter::default();
+        let mut oracle_meter = DetailedTestMeter::default();
+        let machine = env.whnf_with_remaining_fuel(
+            &Ctx::new(),
+            &[],
+            term,
+            &mut machine_fuel,
+            ResourceLimitKind::Whnf,
+            &mut machine_meter,
+        );
+        let oracle = env.whnf_recursive_oracle(
+            &Ctx::new(),
+            &[],
+            term,
+            &mut oracle_fuel,
+            ResourceLimitKind::Whnf,
+            &mut oracle_meter,
+        );
+        assert_eq!(
+            machine, oracle,
+            "term={term:?}, initial_fuel={initial_fuel}"
+        );
+        assert_eq!(machine_fuel, oracle_fuel);
+        assert_eq!(machine_meter.counters, oracle_meter.counters);
+        assert_eq!(machine_meter.delta_constants, oracle_meter.delta_constants);
+    }
+
+    fn run_machine_differential_matrix() {
+        let mut env = Env::with_builtins().unwrap();
+        env.add_def(
+            "Spine.delta",
+            vec![],
+            nat(),
+            Expr::app(Expr::lam("x", nat(), Expr::bvar(0)), nat_zero()),
+            Reducibility::Reducible,
+        )
+        .unwrap();
+        let motive = Expr::lam("_", nat(), nat());
+        let step = Expr::lam("_", nat(), Expr::lam("ih", nat(), Expr::bvar(0)));
+        let terms = vec![
+            Expr::sort(Level::zero()),
+            Expr::bvar(0),
+            Expr::konst("Spine.opaque", vec![]),
+            Expr::konst("Spine.delta", vec![]),
+            Expr::app(Expr::lam("x", nat(), Expr::bvar(0)), nat_zero()),
+            neutral_application_spine(8),
+            Expr::apps(
+                Expr::konst("Nat.rec", vec![Level::zero()]),
+                vec![motive.clone(), nat_zero(), step.clone()],
+            ),
+            Expr::apps(
+                Expr::konst("Nat.rec", vec![Level::zero()]),
+                vec![motive.clone(), nat_zero(), step.clone(), nat_zero()],
+            ),
+            Expr::app(
+                Expr::apps(
+                    Expr::konst("Nat.rec", vec![Level::zero()]),
+                    vec![motive, nat_zero(), step, Expr::konst("Spine.major", vec![])],
+                ),
+                Expr::konst("Spine.trailing", vec![]),
+            ),
+        ];
+        for term in &terms {
+            for initial_fuel in 0..=24 {
+                assert_machine_matches_recursive_oracle(&env, term, initial_fuel);
+            }
+        }
+    }
+
+    fn cached_major_fixture() -> Env {
+        let sort = Expr::sort(Level::zero());
+        let family = Expr::konst("Spine.Cached", vec![]);
+        let c0 = Expr::konst("Spine.Cached.C0", vec![]);
+        let c1 = |value| Expr::app(Expr::konst("Spine.Cached.C1", vec![]), value);
+        let motive_type = Expr::pi("_", family.clone(), sort.clone());
+        let minor0_type = Expr::app(Expr::bvar(0), c0);
+        let minor1_type = Expr::pi(
+            "x",
+            sort.clone(),
+            Expr::app(Expr::bvar(2), c1(Expr::bvar(0))),
+        );
+        let recursor_type = Expr::pi(
+            "motive",
+            motive_type,
+            Expr::pi(
+                "minor0",
+                minor0_type,
+                Expr::pi(
+                    "minor1",
+                    minor1_type,
+                    Expr::pi(
+                        "major",
+                        family.clone(),
+                        Expr::app(Expr::bvar(3), Expr::bvar(0)),
+                    ),
+                ),
+            ),
+        );
+        let mut env = Env::new();
+        env.add_inductive(InductiveDecl::new(
+            "Spine.Cached",
+            vec![],
+            vec![],
+            vec![],
+            Level::zero(),
+            vec![
+                ConstructorDecl::new("Spine.Cached.C0", family.clone()),
+                ConstructorDecl::new("Spine.Cached.C1", Expr::pi("x", sort.clone(), family)),
+            ],
+            Some(RecursorDecl::with_rules(
+                "Spine.Cached.R",
+                vec![],
+                recursor_type,
+                RecursorRules::new(1, 3),
+            )),
+        ))
+        .unwrap();
+        env.add_inductive(InductiveDecl::new(
+            "Spine.Foreign",
+            vec![],
+            vec![],
+            vec![],
+            Level::zero(),
+            vec![ConstructorDecl::new(
+                "Spine.Foreign.F1",
+                Expr::pi("x", sort, Expr::konst("Spine.Foreign", vec![])),
+            )],
+            None,
+        ))
+        .unwrap();
+        env
+    }
+
+    fn cached_major_recursor_term(major: Arc<Expr>) -> Expr {
+        Expr::App(
+            Arc::new(Expr::apps(
+                Expr::konst("Spine.Cached.R", vec![]),
+                vec![
+                    Expr::konst("Spine.Cached.motive", vec![]),
+                    Expr::konst("Spine.Cached.minor0", vec![]),
+                    Expr::konst("Spine.Cached.minor1", vec![]),
+                ],
+            )),
+            major,
+        )
+    }
+
+    fn run_cached_major_case(
+        major: Expr,
+        expected: Option<Expr>,
+        deferred_visits: u64,
+        construction_clones: u64,
+        post_iota_applications: u64,
+    ) -> (Expr, WhnfSpineAudit, KernelWorkCounters) {
+        let env = cached_major_fixture();
+        let major = Arc::new(major);
+        let recursor = cached_major_recursor_term(Arc::clone(&major));
+        let mut state = KernelOperationState::new(KernelExecutionOptions::ephemeral_memo());
+        let mut prime_fuel = 100;
+        env.whnf_with_remaining_fuel_memo(
+            &Ctx::new(),
+            &[],
+            &major,
+            MemoExprOrigin::Retained(&major),
+            &mut prime_fuel,
+            ResourceLimitKind::Whnf,
+            &mut state,
+        )
+        .unwrap();
+        let counters_before = state.counters;
+        reset_whnf_spine_audit();
+        let mut fuel = 100;
+        let result = env
+            .whnf_with_remaining_fuel_memo(
+                &Ctx::new(),
+                &[],
+                &recursor,
+                MemoExprOrigin::Borrowed,
+                &mut fuel,
+                ResourceLimitKind::Whnf,
+                &mut state,
+            )
+            .unwrap();
+        let audit = whnf_spine_audit();
+        assert_eq!(result, expected.unwrap_or(recursor));
+        assert_eq!(audit.app_continuations_entered, 4 + post_iota_applications);
+        assert_eq!(audit.known_arguments_appended, 4 + post_iota_applications);
+        assert_eq!(audit.deferred_application_nodes_visited, deferred_visits);
+        assert_eq!(audit.known_prefix_rescan_argument_visits, 0);
+        assert_eq!(audit.complete_argument_vectors_materialized, 0);
+        assert_eq!(
+            audit.recursor_classification_decl_lookups,
+            4 + post_iota_applications
+        );
+        assert_eq!(audit.recursor_probes, 4);
+        assert_eq!(audit.recursor_major_continuations_entered, 1);
+        assert_eq!(audit.post_major_recursor_decl_lookups, 0);
+        assert_eq!(audit.recursor_argument_root_clones_before_iota, 0);
+        assert_eq!(
+            audit.recursor_argument_root_clones_for_iota,
+            construction_clones
+        );
+        assert_eq!(audit.max_live_continuation_depth, 4);
+        assert!(state.counters.whnf_memo_hits > counters_before.whnf_memo_hits);
+        (result, audit, state.counters)
+    }
+
+    #[test]
+    fn whnf_neutral_spine_fuel_boundary() {
+        let env = Env::new();
+        let width = 32;
+        let term = neutral_application_spine(width);
+        for (initial, expected) in [
+            (
+                width,
+                Err(Error::ResourceLimit {
+                    kind: ResourceLimitKind::Whnf,
+                }),
+            ),
+            (width + 1, Ok(term.clone())),
+            (width + 2, Ok(term.clone())),
+        ] {
+            let mut fuel = initial;
+            assert_eq!(
+                env.whnf_with_remaining_fuel(
+                    &Ctx::new(),
+                    &[],
+                    &term,
+                    &mut fuel,
+                    ResourceLimitKind::Whnf,
+                    &mut DisabledKernelWorkMeter,
+                ),
+                expected
+            );
+            assert_eq!(fuel, initial.saturating_sub(width + 1));
+        }
+    }
+
+    #[test]
+    fn whnf_recursive_reduction_counter_baseline() {
+        let mut env = Env::with_builtins().unwrap();
+        env.add_def(
+            "Spine.baseline.delta",
+            vec![],
+            nat(),
+            nat_zero(),
+            Reducibility::Reducible,
+        )
+        .unwrap();
+        let motive = Expr::lam("_", nat(), nat());
+        let step = Expr::lam("_", nat(), Expr::lam("ih", nat(), Expr::bvar(0)));
+        let cases = [
+            (
+                Expr::konst("Spine.baseline.neutral", vec![]),
+                (1, 0, 0, 0, 0, false),
+            ),
+            (
+                Expr::app(Expr::lam("x", nat(), Expr::bvar(0)), nat_zero()),
+                (2, 1, 0, 0, 1, false),
+            ),
+            (
+                Expr::konst("Spine.baseline.delta", vec![]),
+                (1, 0, 1, 0, 1, false),
+            ),
+            (
+                Expr::apps(
+                    Expr::konst("Nat.rec", vec![Level::zero()]),
+                    vec![motive, nat_zero(), step, nat_zero()],
+                ),
+                (6, 0, 0, 1, 1, false),
+            ),
+        ];
+        for (term, expected) in cases {
+            let mut fuel = 64;
+            let mut meter = DetailedTestMeter::default();
+            env.whnf_recursive_oracle(
+                &Ctx::new(),
+                &[],
+                &term,
+                &mut fuel,
+                ResourceLimitKind::Whnf,
+                &mut meter,
+            )
+            .unwrap();
+            assert_eq!(
+                (
+                    meter.counters.whnf_calls,
+                    meter.counters.beta_steps,
+                    meter.counters.delta_steps,
+                    meter.counters.iota_steps,
+                    meter.counters.physical_reductions,
+                    meter.counters.overflowed,
+                ),
+                expected,
+                "recursive counter baseline for {term:?}",
+            );
+            let mut machine_fuel = 64;
+            let mut machine_meter = DetailedTestMeter::default();
+            let machine = env.whnf_with_remaining_fuel(
+                &Ctx::new(),
+                &[],
+                &term,
+                &mut machine_fuel,
+                ResourceLimitKind::Whnf,
+                &mut machine_meter,
+            );
+            let mut oracle_fuel = 64;
+            let mut oracle_meter = DetailedTestMeter::default();
+            let oracle = env.whnf_recursive_oracle(
+                &Ctx::new(),
+                &[],
+                &term,
+                &mut oracle_fuel,
+                ResourceLimitKind::Whnf,
+                &mut oracle_meter,
+            );
+            assert_eq!(machine, oracle);
+            assert_eq!(machine_fuel, oracle_fuel);
+            assert_eq!(machine_meter.counters, oracle_meter.counters);
+            assert_eq!(machine_meter.delta_constants, oracle_meter.delta_constants);
+        }
+    }
+
+    #[test]
+    fn whnf_recursive_memo_probe_baseline() {
+        retained_identity_context_parameters_and_fuel_domain_are_exact();
+        whnf_hit_charges_less_equal_and_greater_fuel_exactly();
+        capacity_stop_and_diagnosed_isolation_are_observational();
+
+        let field = Expr::konst("Spine.Cached.field", vec![]);
+        let (_, _, counters) = run_cached_major_case(
+            Expr::app(Expr::konst("Spine.Cached.C1", vec![]), field.clone()),
+            Some(Expr::app(Expr::konst("Spine.Cached.minor1", vec![]), field)),
+            1,
+            2,
+            1,
+        );
+        assert!(counters.whnf_memo_lookups > 0);
+        assert!(counters.whnf_memo_hits > 0);
+        assert!(counters.whnf_memo_inserts > 0);
+        assert_eq!(counters.memo_probe_lookups, 0);
+    }
+
+    #[test]
+    fn whnf_recursive_recursor_prefix_baseline() {
+        run_machine_differential_matrix();
+        whnf_machine_cached_c0_major();
+        whnf_machine_cached_c1_major();
+        whnf_machine_cached_foreign_major();
+    }
+
+    #[test]
+    fn whnf_recursive_diagnostic_baseline() {
+        diagnosed_modes_preserve_success_state_and_logical_fuel_sequence();
+        diagnosed_modes_preserve_multi_conversion_failure_and_logical_fuel_sequence();
+        diagnosed_kernel_modes_preserve_primary_error_and_nonresource_absence();
+    }
+
+    #[test]
+    fn whnf_machine_differential_matrix() {
+        run_machine_differential_matrix();
+    }
+
+    #[test]
+    fn whnf_machine_all_fuel_boundaries() {
+        run_machine_differential_matrix();
+    }
+
+    #[test]
+    fn whnf_machine_cached_c0_major() {
+        run_cached_major_case(
+            Expr::konst("Spine.Cached.C0", vec![]),
+            Some(Expr::konst("Spine.Cached.minor0", vec![])),
+            0,
+            1,
+            0,
+        );
+    }
+
+    #[test]
+    fn whnf_machine_cached_c1_major() {
+        let field = Expr::konst("Spine.Cached.field", vec![]);
+        run_cached_major_case(
+            Expr::app(Expr::konst("Spine.Cached.C1", vec![]), field.clone()),
+            Some(Expr::app(Expr::konst("Spine.Cached.minor1", vec![]), field)),
+            1,
+            2,
+            1,
+        );
+    }
+
+    #[test]
+    fn whnf_machine_cached_foreign_major() {
+        let field = Expr::konst("Spine.Foreign.field", vec![]);
+        run_cached_major_case(
+            Expr::app(Expr::konst("Spine.Foreign.F1", vec![]), field),
+            None,
+            1,
+            0,
+            0,
+        );
+    }
+
+    #[test]
+    fn whnf_machine_cached_major_audit_table() {
+        whnf_machine_cached_c0_major();
+        whnf_machine_cached_c1_major();
+        whnf_machine_cached_foreign_major();
+    }
+
+    #[test]
+    fn whnf_production_memo_off_machine_matrix() {
+        run_machine_differential_matrix();
+    }
+
+    #[test]
+    fn whnf_diagnosed_uses_memo_off_wrapper() {
+        let source = include_str!("env.rs");
+        let diagnosed_start = source.find("fn whnf_diagnosed(").unwrap();
+        let diagnosed_remaining_start = source
+            .find("fn whnf_diagnosed_with_remaining_fuel(")
+            .unwrap();
+        let next_function = source[diagnosed_remaining_start + 1..]
+            .find("\n    fn ")
+            .map(|offset| diagnosed_remaining_start + 1 + offset)
+            .unwrap();
+        for body in [
+            &source[diagnosed_start..diagnosed_remaining_start],
+            &source[diagnosed_remaining_start..next_function],
+        ] {
+            assert!(body.contains("self.whnf_with_remaining_fuel("));
+            assert!(!body.contains("whnf_with_remaining_fuel_memo"));
+            assert!(!body.contains("KernelOperationState"));
+        }
+    }
+
+    #[test]
+    fn whnf_production_diagnosed_machine_matrix() {
+        whnf_diagnosed_uses_memo_off_wrapper();
+        whnf_recursive_diagnostic_baseline();
+        whnf_machine_diagnosed_report_parity();
+    }
+
+    #[test]
+    fn whnf_production_reuse_machine_matrix() {
+        whnf_machine_retained_origin_eligibility();
+        whnf_machine_replay_exhaustion_order();
+        whnf_machine_capacity_stop_differential();
+        whnf_machine_cached_major_audit_table();
+    }
+
+    #[test]
+    fn whnf_machine_neutral_audit_equations() {
+        let env = Env::new();
+        for width in [1usize, 2, 32, 128] {
+            reset_whnf_spine_audit();
+            let term = neutral_application_spine(width);
+            let mut fuel = width + 1;
+            let result = env
+                .whnf_with_remaining_fuel(
+                    &Ctx::new(),
+                    &[],
+                    &term,
+                    &mut fuel,
+                    ResourceLimitKind::Whnf,
+                    &mut DisabledKernelWorkMeter,
+                )
+                .unwrap();
+            assert_eq!(result, term);
+            assert_eq!(fuel, 0);
+            assert_eq!(
+                whnf_spine_audit(),
+                WhnfSpineAudit {
+                    app_continuations_entered: width as u64,
+                    known_arguments_appended: width as u64,
+                    recursor_classification_decl_lookups: width as u64,
+                    max_live_continuation_depth: width as u64,
+                    ..WhnfSpineAudit::default()
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn whnf_machine_deferred_hit_audit_equations() {
+        let env = Env::new();
+        for (cached_width, outer_width) in [(1usize, 1usize), (8, 3), (32, 4)] {
+            let retained = Arc::new(neutral_application_spine(cached_width));
+            let mut state = KernelOperationState::new(KernelExecutionOptions::ephemeral_memo());
+            let mut prime_fuel = 1_000;
+            env.whnf_with_remaining_fuel_memo(
+                &Ctx::new(),
+                &[],
+                &retained,
+                MemoExprOrigin::Retained(&retained),
+                &mut prime_fuel,
+                ResourceLimitKind::Whnf,
+                &mut state,
+            )
+            .unwrap();
+
+            let mut measured = Expr::App(
+                Arc::clone(&retained),
+                Arc::new(Expr::konst("Spine.outer.a00000", vec![])),
+            );
+            for index in 1..outer_width {
+                measured = Expr::App(
+                    Arc::new(measured),
+                    Arc::new(Expr::konst(format!("Spine.outer.a{index:05}"), vec![])),
+                );
+            }
+
+            reset_whnf_spine_audit();
+            let mut fuel = 1_000;
+            env.whnf_with_remaining_fuel_memo(
+                &Ctx::new(),
+                &[],
+                &measured,
+                MemoExprOrigin::Borrowed,
+                &mut fuel,
+                ResourceLimitKind::Whnf,
+                &mut state,
+            )
+            .unwrap();
+            let audit = whnf_spine_audit();
+            assert_eq!(
+                audit.deferred_application_nodes_visited,
+                cached_width as u64
+            );
+            assert_eq!(audit.known_arguments_appended, outer_width as u64);
+            assert_eq!(audit.known_prefix_rescan_argument_visits, 0);
+            assert_eq!(audit.complete_argument_vectors_materialized, 0);
+        }
+    }
+
+    #[test]
+    fn whnf_machine_deep_neutral_spine() {
+        let env = Env::new();
+        let width = 8_192;
+        let term = neutral_application_spine(width);
+        reset_whnf_spine_audit();
+        let mut fuel = width + 1;
+        let result = env
+            .whnf_with_remaining_fuel(
+                &Ctx::new(),
+                &[],
+                &term,
+                &mut fuel,
+                ResourceLimitKind::Whnf,
+                &mut DisabledKernelWorkMeter,
+            )
+            .unwrap();
+        assert_eq!(fuel, 0);
+        let audit = whnf_spine_audit();
+        assert_eq!(audit.app_continuations_entered, width as u64);
+        assert_eq!(audit.known_arguments_appended, width as u64);
+        assert_eq!(audit.known_prefix_rescan_argument_visits, 0);
+        assert_eq!(audit.complete_argument_vectors_materialized, 0);
+        assert_eq!(audit.max_live_continuation_depth, width as u64);
+        // Recursive destruction of the deliberately adversarial input is not
+        // part of the WHNF stack-safety property under test.
+        std::mem::forget(result);
+        std::mem::forget(term);
+    }
+
+    #[test]
+    fn whnf_machine_recursor_dispatch_is_independent() {
+        let source = include_str!("env.rs");
+        assert!(!source.contains(&["fn reduce_", "recursor("].concat()));
+        assert!(!source.contains(&["fn reduce_", "recursor_memo("].concat()));
+        assert!(source.contains("fn recursive_oracle_reduce_recursor("));
+        assert!(source.contains("fn finish_recursor_reduction_from_views("));
+    }
+
+    #[test]
+    fn whnf_machine_retained_collector_isolation() {
+        assert!(!include_str!("env.rs").contains(&["collect_apps_with_", "retained_args"].concat()));
+    }
+
+    #[test]
+    fn whnf_machine_has_no_full_spine_collection() {
+        let source = include_str!("env.rs");
+        let machine_start = source.find("fn whnf_machine").unwrap();
+        let oracle_start = source.find("fn whnf_recursive_oracle").unwrap();
+        assert!(!source[machine_start..oracle_start].contains("collect_apps("));
+    }
+
+    // These focused entry points keep the implementation plan's individual
+    // verification commands executable while sharing the bounded differential
+    // fixtures above. Each called helper contains the substantive assertions.
+    #[test]
+    fn whnf_machine_atomic_bvar_differential() {
+        run_machine_differential_matrix();
+    }
+
+    #[test]
+    fn whnf_machine_beta_delta_iota_differential() {
+        compact_beta_delta_iota_and_binder_matrix_is_differential();
+    }
+
+    #[test]
+    fn whnf_machine_assumption_context_differential() {
+        assumption_types_shadowing_and_shifted_locals_do_not_cross_reuse();
+    }
+
+    #[test]
+    fn whnf_machine_recursor_order_differential() {
+        run_machine_differential_matrix();
+        run_cached_major_case(
+            Expr::konst("Spine.Cached.C0", vec![]),
+            Some(Expr::konst("Spine.Cached.minor0", vec![])),
+            0,
+            1,
+            0,
+        );
+    }
+
+    #[test]
+    fn whnf_machine_retained_origin_eligibility() {
+        borrowed_and_independently_allocated_roots_do_not_alias();
+        retained_identity_context_parameters_and_fuel_domain_are_exact();
+    }
+
+    #[test]
+    fn whnf_machine_capacity_stop_differential() {
+        capacity_stop_and_diagnosed_isolation_are_observational();
+    }
+
+    #[test]
+    fn whnf_machine_replay_exhaustion_order() {
+        whnf_hit_charges_less_equal_and_greater_fuel_exactly();
+    }
+
+    #[test]
+    fn whnf_machine_diagnosed_report_parity() {
+        diagnosed_modes_preserve_success_state_and_logical_fuel_sequence();
+        diagnosed_kernel_modes_preserve_primary_error_and_nonresource_absence();
+    }
+
+    #[test]
+    fn whnf_machine_error_releases_frame_arcs() {
+        let env = cached_major_fixture();
+
+        let apply_argument = Arc::new(Expr::konst("Spine.saved.apply", vec![]));
+        let apply_term = Expr::App(
+            Arc::new(Expr::konst("Spine.neutral", vec![])),
+            Arc::clone(&apply_argument),
+        );
+        let apply_owners = Arc::strong_count(&apply_argument);
+        let mut fuel = 1;
+        assert!(matches!(
+            env.whnf_with_remaining_fuel(
+                &Ctx::new(),
+                &[],
+                &apply_term,
+                &mut fuel,
+                ResourceLimitKind::Whnf,
+                &mut DisabledKernelWorkMeter,
+            ),
+            Err(Error::ResourceLimit {
+                kind: ResourceLimitKind::Whnf
+            })
+        ));
+        assert_eq!(Arc::strong_count(&apply_argument), apply_owners);
+
+        let major = Arc::new(Expr::konst("Spine.Cached.C0", vec![]));
+        let recursor_term = cached_major_recursor_term(Arc::clone(&major));
+        let major_owners = Arc::strong_count(&major);
+        let mut fuel = 5;
+        assert!(matches!(
+            env.whnf_with_remaining_fuel(
+                &Ctx::new(),
+                &[],
+                &recursor_term,
+                &mut fuel,
+                ResourceLimitKind::Whnf,
+                &mut DisabledKernelWorkMeter,
+            ),
+            Err(Error::ResourceLimit {
+                kind: ResourceLimitKind::Whnf
+            })
+        ));
+        assert_eq!(Arc::strong_count(&major), major_owners);
+    }
+
+    #[test]
+    fn whnf_machine_execution_mode_parity() {
+        ordinary_and_shared_pool_check_families_match_memo_off();
+        compact_beta_delta_iota_and_binder_matrix_is_differential();
+    }
+
+    #[test]
+    fn whnf_machine_width_8192_catalog() {
+        // The six exact external shapes are constructed and checked against
+        // machine-only equations by the prebuilt npa-api harness. At the
+        // kernel boundary the novel risk is an 8192-deep App continuation
+        // stack; exercise it directly in all three modes without the oracle.
+        for options in [
+            KernelExecutionOptions::memo_off(),
+            KernelExecutionOptions::repetition_probe(),
+            KernelExecutionOptions::ephemeral_memo(),
+        ] {
+            let env = Env::with_execution_options(options);
+            let term = neutral_application_spine(8_192);
+            reset_whnf_spine_audit();
+            let mut counters = KernelWorkCounters::default();
+            let result = env
+                .whnf_with_work_counters(&Ctx::new(), &[], &term, Some(&mut counters))
+                .unwrap();
+            assert_eq!(result, term);
+            assert_eq!(whnf_spine_audit().app_continuations_entered, 8_192);
+            assert_eq!(counters.fuel.whnf.logical_spent, 8_193);
+            // Avoid recursive destruction of the deliberately adversarial AST.
+            std::mem::forget(result);
+            std::mem::forget(term);
+        }
     }
 }

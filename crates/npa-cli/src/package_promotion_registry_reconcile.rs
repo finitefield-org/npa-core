@@ -10,14 +10,14 @@ use npa_api::PackageArtifactReferenceSummaryMode;
 use npa_package::{
     active_catalog_routes, catalog_change_event_id, catalog_change_set_hash, catalog_target_id,
     catalog_target_revision_hash, migrate_promotion_origin_registry_v1_to_v3,
-    migrate_promotion_origin_registry_v2_to_v3, package_file_hash,
+    migrate_promotion_origin_registry_v2_to_v3, package_file_hash, parse_and_validate_manifest_str,
     parse_catalog_registry_sync_attestation_json,
     validate_catalog_registry_sync_attestation_against_transition, CatalogAddedTarget,
     CatalogAttestationRef, CatalogChangeEvent, CatalogChangeRequestRef, CatalogGovernanceFileRef,
     CatalogLifecycleChange, CatalogRegistryComparison, CatalogRegistryInputIdentity,
     CatalogRegistrySyncAttestation, CatalogRevisedRoute, CatalogTargetEntry, CatalogTargetEvidence,
-    CatalogTargetProjection, PackageHash, PackagePath, PromotionDeclarationTargetRevision,
-    PromotionDeclarationTargetTheorem, PromotionOriginEntryV3,
+    CatalogTargetProjection, PackageHash, PackageManifest, PackagePath,
+    PromotionDeclarationTargetRevision, PromotionDeclarationTargetTheorem, PromotionOriginEntryV3,
     MATHLIB_CATALOG_REGISTRY_SYNC_ATTESTATION_SCHEMA, MATHLIB_PROMOTION_REGISTRY_PATH,
     PACKAGE_PUBLISH_PLAN_PATH, PACKAGE_VERIFIED_EXPORT_SUMMARY_PATH,
 };
@@ -33,10 +33,14 @@ use crate::{
     diagnostic::{
         CommandArtifact, CommandDiagnostic, CommandResult, CommandStatus, DiagnosticKind,
     },
-    fs::render_package_root,
+    fs::{no_follow_directory::open_absolute_directory, render_package_root},
+    generated_artifact_writer::{
+        open_package_parent_no_follow, read_package_regular_file_no_follow,
+    },
     governance_writer::{
-        confined_governance_path, replace_governance_artifact_if_unchanged,
-        write_governance_artifact, GovernanceOutputPolicy,
+        confined_governance_path, read_governance_artifact,
+        replace_governance_artifact_if_unchanged, write_governance_artifact,
+        GovernanceOutputPolicy,
     },
     package_api::v1::build_certs_check,
     package_artifacts::{
@@ -59,6 +63,13 @@ use crate::{
 const COMMAND: &str = "package reconcile-promotion-origin-registry";
 const REASON: &str = "promotion_registry_reconciliation";
 const MANIFEST_PATH: &str = "npa-package.toml";
+const LEGACY_V0_8_CERTIFICATE_HEADER: &[u8] = b"\x0eNPA-CERT-0.3.0\x0eNPA-Core-0.3.0";
+
+struct PreviousPackageState {
+    manifest: PackageManifest,
+    projection: CatalogTargetProjection,
+    revisions: BTreeMap<String, PromotionDeclarationTargetRevision>,
+}
 
 /// Validate and optionally apply one arbitrary older-to-newer catalog transition.
 pub fn run_package_reconcile_promotion_origin_registry(
@@ -134,7 +145,7 @@ pub fn run_package_reconcile_promotion_origin_registry(
             "--previous-target-root",
         );
     }
-    let _target_lock = match if options.apply {
+    let target_lock = match if options.apply {
         TargetLock::acquire(&options.common.root)
     } else {
         TargetLock::acquire_shared(&options.common.root)
@@ -156,7 +167,7 @@ pub fn run_package_reconcile_promotion_origin_registry(
         );
     }
     let registry_path = PackagePath::new(MATHLIB_PROMOTION_REGISTRY_PATH);
-    let registry_full = match confined_governance_path(
+    let registry_bytes = match read_governance_artifact(
         &options.common.root,
         &registry_path,
         MATHLIB_PROMOTION_REGISTRY_PATH,
@@ -164,16 +175,6 @@ pub fn run_package_reconcile_promotion_origin_registry(
     ) {
         Ok(value) => value,
         Err(diagnostic) => return CommandResult::failed(COMMAND, root_display, vec![*diagnostic]),
-    };
-    let registry_bytes = match fs::read(&registry_full) {
-        Ok(value) => value,
-        Err(_) => {
-            return failed(
-                &options.common.root,
-                "promotion_registry_noncanonical",
-                MATHLIB_PROMOTION_REGISTRY_PATH,
-            )
-        }
     };
     let registry_source = match std::str::from_utf8(&registry_bytes) {
         Ok(value) => value,
@@ -226,26 +227,87 @@ pub fn run_package_reconcile_promotion_origin_registry(
         }
         ParsedPromotionOriginRegistry::V3(value) => value,
     };
-    for gate in immutable_previous_root_gates(previous_root)
-        .into_iter()
-        .chain(root_gates(&options.common.root))
+    if options.legacy_previous_v0_8_checkpoint
+        && !matches!(transition_base, ParsedPromotionOriginRegistry::V3(_))
     {
+        return failed(
+            &options.common.root,
+            "promotion_registry_reconciliation_legacy_checkpoint_invalid",
+            MATHLIB_PROMOTION_REGISTRY_PATH,
+        );
+    }
+    let mut old_routes = match active_catalog_routes(&proposed) {
+        Ok(value) => value,
+        Err(_) => {
+            return failed(
+                &options.common.root,
+                "promotion_registry_noncanonical",
+                MATHLIB_PROMOTION_REGISTRY_PATH,
+            )
+        }
+    };
+    let mut gates = root_gates(&options.common.root);
+    if !options.legacy_previous_v0_8_checkpoint {
+        let mut previous_gates = immutable_previous_root_gates(previous_root);
+        previous_gates.append(&mut gates);
+        gates = previous_gates;
+    }
+    for gate in gates {
         if gate.status != CommandStatus::Passed {
             return CommandResult::failed(COMMAND, root_display, gate.diagnostics);
         }
     }
-    let previous = match load_snapshot(previous_root) {
-        Ok(value) => value,
-        Err(result) => return result,
+    let previous = if options.legacy_previous_v0_8_checkpoint {
+        match load_legacy_previous_state(previous_root, &proposed, &old_routes) {
+            Ok(value) => value,
+            Err(path) => {
+                return failed(
+                    &options.common.root,
+                    "promotion_registry_reconciliation_legacy_checkpoint_invalid",
+                    path,
+                )
+            }
+        }
+    } else {
+        let loaded = match load_snapshot(previous_root) {
+            Ok(value) => value,
+            Err(result) => return result,
+        };
+        if let Err(diagnostic) = validate_checked_generated(&loaded) {
+            return CommandResult::failed(COMMAND, root_display, vec![*diagnostic]);
+        }
+        let projection = match projection(previous_root, &loaded) {
+            Ok(value) => value,
+            Err(path) => {
+                return failed(
+                    &options.common.root,
+                    "promotion_registry_reconciliation_projection_invalid",
+                    path,
+                )
+            }
+        };
+        let revisions = match package_revisions(previous_root, &loaded) {
+            Ok(value) => value,
+            Err(path) => {
+                return failed(
+                    &options.common.root,
+                    "promotion_registry_reconciliation_previous_target_mismatch",
+                    path,
+                )
+            }
+        };
+        PreviousPackageState {
+            manifest: loaded.snapshot.validated.manifest().clone(),
+            projection,
+            revisions,
+        }
     };
     let current = match load_snapshot(&options.common.root) {
         Ok(value) => value,
         Err(result) => return result,
     };
-    for loaded in [&previous, &current] {
-        if let Err(diagnostic) = validate_checked_generated(loaded) {
-            return CommandResult::failed(COMMAND, root_display, vec![*diagnostic]);
-        }
+    if let Err(diagnostic) = validate_checked_generated(&current) {
+        return CommandResult::failed(COMMAND, root_display, vec![*diagnostic]);
     }
     let current_common = PackageCommonOptions {
         root: options.common.root.clone(),
@@ -268,7 +330,7 @@ pub fn run_package_reconcile_promotion_origin_registry(
             return CommandResult::failed(COMMAND, root_display, gate.diagnostics);
         }
     }
-    let previous_manifest = previous.snapshot.validated.manifest();
+    let previous_manifest = &previous.manifest;
     let current_manifest = current.snapshot.validated.manifest();
     if previous_manifest.package != proposed.target_package
         || current_manifest.package != proposed.target_package
@@ -283,16 +345,7 @@ pub fn run_package_reconcile_promotion_origin_registry(
             "--previous-target-root",
         );
     }
-    let previous_projection = match projection(previous_root, &previous) {
-        Ok(value) => value,
-        Err(path) => {
-            return failed(
-                &options.common.root,
-                "promotion_registry_reconciliation_projection_invalid",
-                path,
-            )
-        }
-    };
+    let previous_projection = previous.projection.clone();
     let current_projection = match projection(&options.common.root, &current) {
         Ok(value) => value,
         Err(path) => {
@@ -303,7 +356,7 @@ pub fn run_package_reconcile_promotion_origin_registry(
             )
         }
     };
-    let audit_full = match confined_governance_path(
+    let audit_bytes = match read_governance_artifact(
         &options.common.root,
         &audit,
         "--audit",
@@ -311,16 +364,6 @@ pub fn run_package_reconcile_promotion_origin_registry(
     ) {
         Ok(value) => value,
         Err(diagnostic) => return CommandResult::failed(COMMAND, root_display, vec![*diagnostic]),
-    };
-    let audit_bytes = match fs::read(audit_full) {
-        Ok(value) => value,
-        Err(_) => {
-            return failed(
-                &options.common.root,
-                "promotion_registry_reconciliation_audit_invalid",
-                "--audit",
-            )
-        }
     };
     if std::str::from_utf8(&audit_bytes).is_err() {
         return failed(
@@ -335,7 +378,7 @@ pub fn run_package_reconcile_promotion_origin_registry(
     };
     let request = match request_path {
         Some(path) => {
-            let full = match confined_governance_path(
+            let bytes = match read_governance_artifact(
                 &options.common.root,
                 &path,
                 "--request",
@@ -344,16 +387,6 @@ pub fn run_package_reconcile_promotion_origin_registry(
                 Ok(value) => value,
                 Err(diagnostic) => {
                     return CommandResult::failed(COMMAND, root_display, vec![*diagnostic])
-                }
-            };
-            let bytes = match fs::read(full) {
-                Ok(value) => value,
-                Err(_) => {
-                    return failed(
-                        &options.common.root,
-                        "promotion_registry_reconciliation_request_invalid",
-                        "--request",
-                    )
                 }
             };
             let source = match std::str::from_utf8(&bytes) {
@@ -406,24 +439,23 @@ pub fn run_package_reconcile_promotion_origin_registry(
             && last.request == request.as_ref().map(|(_, reference)| reference.clone())
             && last.attestation.path == out
         {
-            let existing_attestation = confined_governance_path(
+            let existing_attestation = read_governance_artifact(
                 &options.common.root,
                 &out,
                 "--out",
                 "promotion_registry_reconciliation_attestation_invalid",
             )
-            .ok()
-            .and_then(|path| fs::read(path).ok());
+            .ok();
             if existing_attestation.as_deref().is_some_and(|bytes| {
                 parse_catalog_registry_sync_attestation_json(
                     std::str::from_utf8(bytes).unwrap_or_default(),
                 )
                 .is_ok_and(|attestation| {
-                    comparison_rows_for_packages(
+                    comparison_rows_for_revisions(
                         &proposed,
                         last,
-                        previous_root,
-                        &previous,
+                        &attestation.input_registry.schema,
+                        &previous.revisions,
                         &options.common.root,
                         &current,
                     )
@@ -460,26 +492,7 @@ pub fn run_package_reconcile_promotion_origin_registry(
             );
         }
     }
-    let mut old_routes = match active_catalog_routes(&proposed) {
-        Ok(value) => value,
-        Err(_) => {
-            return failed(
-                &options.common.root,
-                "promotion_registry_noncanonical",
-                MATHLIB_PROMOTION_REGISTRY_PATH,
-            )
-        }
-    };
-    let previous_revisions = match package_revisions(previous_root, &previous) {
-        Ok(value) => value,
-        Err(path) => {
-            return failed(
-                &options.common.root,
-                "promotion_registry_reconciliation_previous_target_mismatch",
-                path,
-            )
-        }
-    };
+    let previous_revisions = previous.revisions;
     if old_routes.len() != previous_revisions.len()
         || old_routes.iter().any(|(module, (_, stored))| {
             previous_revisions
@@ -932,6 +945,7 @@ pub fn run_package_reconcile_promotion_origin_registry(
     if !inputs_still_match(
         previous_root,
         &options.common.root,
+        options.legacy_previous_v0_8_checkpoint,
         &previous_projection,
         &current_projection,
         &previous_revisions,
@@ -939,7 +953,7 @@ pub fn run_package_reconcile_promotion_origin_registry(
         &audit_ref,
         &audit_bytes,
         request.as_ref(),
-        &registry_full,
+        &registry_path,
         &registry_bytes,
     ) {
         return failed(
@@ -1020,14 +1034,12 @@ pub fn run_package_reconcile_promotion_origin_registry(
             diagnostics,
         );
     }
-    if let Ok(path) = confined_governance_path(
+    let _ = remove_recovery_journal_if_unchanged(
         &options.common.root,
         &journal,
-        "--recover",
-        "promotion_registry_reconciliation_recovery_invalid",
-    ) {
-        let _ = fs::remove_file(path);
-    }
+        journal_bytes.as_bytes(),
+        &target_lock,
+    );
     result
 }
 
@@ -1044,6 +1056,9 @@ fn root_gates(root: &Path) -> Vec<CommandResult> {
             common,
             checker: PackageChecker::Reference,
             changed: false,
+            modules: Vec::new(),
+            base: None,
+            modules_requested: false,
             audit_cache: PackageAuditCacheMode::Off,
             verifier_memo: PackageVerifierMemoMode::Off,
             jobs: 1,
@@ -1069,6 +1084,9 @@ fn immutable_previous_root_gates(root: &Path) -> Vec<CommandResult> {
             common,
             checker: PackageChecker::Reference,
             changed: false,
+            modules: Vec::new(),
+            base: None,
+            modules_requested: false,
             audit_cache: PackageAuditCacheMode::Off,
             verifier_memo: PackageVerifierMemoMode::Off,
             jobs: 1,
@@ -1094,13 +1112,159 @@ fn load_snapshot(
     )
 }
 
+/// Load the exact pre-v0.4 catalog checkpoint without teaching the current
+/// certificate decoder how to accept the retired pair. The caller must have
+/// verified this immutable root with the pinned v0.8 checker first. Here we
+/// bind every raw package identity to the already append-only registry state,
+/// and we require every local certificate to advertise the retired v0.3 pair.
+fn load_legacy_previous_state(
+    root: &Path,
+    registry: &npa_package::PromotionOriginRegistryV3,
+    expected_revisions: &BTreeMap<
+        String,
+        (
+            npa_package::CatalogRouteRef,
+            PromotionDeclarationTargetRevision,
+        ),
+    >,
+) -> Result<PreviousPackageState, String> {
+    let manifest = read_legacy_manifest(root)?;
+    let projection = projection_for_manifest(root, &manifest)?;
+    if registry.target_package != manifest.package
+        || registry
+            .catalog_change_events
+            .last()
+            .is_none_or(|event| event.target != projection)
+    {
+        return Err(MATHLIB_PROMOTION_REGISTRY_PATH.to_owned());
+    }
+    let revisions = legacy_revisions_from_manifest(root, &manifest, expected_revisions)?;
+    Ok(PreviousPackageState {
+        manifest,
+        projection,
+        revisions,
+    })
+}
+
+fn read_legacy_manifest(root: &Path) -> Result<PackageManifest, String> {
+    let path = PackagePath::new(MANIFEST_PATH);
+    let bytes =
+        read_package_regular_file_no_follow(root, &path).map_err(|_| MANIFEST_PATH.to_owned())?;
+    let source = std::str::from_utf8(&bytes).map_err(|_| MANIFEST_PATH.to_owned())?;
+    parse_and_validate_manifest_str(source)
+        .map(|validated| validated.into_manifest())
+        .map_err(|_| MANIFEST_PATH.to_owned())
+}
+
+fn legacy_revisions_from_manifest(
+    root: &Path,
+    manifest: &PackageManifest,
+    expected: &BTreeMap<
+        String,
+        (
+            npa_package::CatalogRouteRef,
+            PromotionDeclarationTargetRevision,
+        ),
+    >,
+) -> Result<BTreeMap<String, PromotionDeclarationTargetRevision>, String> {
+    if manifest.modules.len() != expected.len() {
+        return Err("$.entries".to_owned());
+    }
+    manifest
+        .modules
+        .iter()
+        .map(|module| {
+            let name = module.module.as_dotted();
+            let (_, stored) = expected.get(&name).ok_or_else(|| name.clone())?;
+            if legacy_revision_is_incomplete(stored) {
+                return Err(name);
+            }
+            let certificate_bytes = read_package_regular_file_no_follow(root, &module.certificate)
+                .map_err(|_| module.certificate.as_str().to_owned())?;
+            if !is_legacy_v0_8_certificate(&certificate_bytes) {
+                return Err(module.certificate.as_str().to_owned());
+            }
+            let revision = PromotionDeclarationTargetRevision {
+                target_version: stored.target_version.clone(),
+                target_source_file_hash: hash_file(root, module.source.as_str())?,
+                target_meta_file_hash: module
+                    .meta
+                    .as_ref()
+                    .map_or(Ok(PackageHash::new([0; 32])), |path| {
+                        hash_file(root, path.as_str())
+                    })?,
+                target_replay_file_hash: module
+                    .replay
+                    .as_ref()
+                    .map_or(Ok(PackageHash::new([0; 32])), |path| {
+                        hash_file(root, path.as_str())
+                    })?,
+                target_certificate_file_hash: package_file_hash(&certificate_bytes),
+                target_certificate_hash: module.expected_certificate_hash,
+                target_export_hash: module.expected_export_hash,
+                target_axiom_report_hash: module.expected_axiom_report_hash,
+                theorems: stored.theorems.clone(),
+            };
+            if revision.target_source_file_hash != module.expected_source_hash
+                || revision.target_certificate_file_hash != module.expected_certificate_file_hash
+                || !same_complete_artifacts(stored, &revision)
+            {
+                return Err(name);
+            }
+            Ok((module.module.as_dotted(), revision))
+        })
+        .collect()
+}
+
+fn legacy_previous_inputs_match(
+    root: &Path,
+    projection: &CatalogTargetProjection,
+    revisions: &BTreeMap<String, PromotionDeclarationTargetRevision>,
+) -> bool {
+    let Ok(manifest) = read_legacy_manifest(root) else {
+        return false;
+    };
+    let expected = revisions
+        .iter()
+        .map(|(module, revision)| {
+            (
+                module.clone(),
+                (
+                    npa_package::CatalogRouteRef {
+                        owner_kind: "checkpoint_input".to_owned(),
+                        owner_id: PackageHash::new([0; 32]),
+                        target_module: npa_cert::Name::from_dotted(module),
+                    },
+                    revision.clone(),
+                ),
+            )
+        })
+        .collect();
+    projection_for_manifest(root, &manifest).ok().as_ref() == Some(projection)
+        && legacy_revisions_from_manifest(root, &manifest, &expected)
+            .ok()
+            .as_ref()
+            == Some(revisions)
+}
+
+fn is_legacy_v0_8_certificate(bytes: &[u8]) -> bool {
+    bytes.starts_with(LEGACY_V0_8_CERTIFICATE_HEADER)
+}
+
 fn projection(
     root: &Path,
     loaded: &crate::package_artifacts::LoadedPackageAuditSnapshot,
 ) -> Result<CatalogTargetProjection, String> {
+    projection_for_manifest(root, loaded.snapshot.validated.manifest())
+}
+
+fn projection_for_manifest(
+    root: &Path,
+    manifest: &PackageManifest,
+) -> Result<CatalogTargetProjection, String> {
     Ok(CatalogTargetProjection {
-        package: loaded.snapshot.validated.manifest().package.clone(),
-        version: loaded.snapshot.validated.manifest().version.clone(),
+        package: manifest.package.clone(),
+        version: manifest.version.clone(),
         manifest_file_hash: hash_file(root, MANIFEST_PATH)?,
         package_lock_file_hash: hash_file(root, PACKAGE_LOCK_PATH)?,
         axiom_report_file_hash: hash_file(root, PACKAGE_AXIOM_REPORT_PATH)?,
@@ -1242,52 +1406,42 @@ fn previous_revision_hashes(
         .collect()
 }
 
-fn comparison_rows_for_packages(
+fn comparison_rows_for_revisions(
     registry: &npa_package::PromotionOriginRegistryV3,
     event: &CatalogChangeEvent,
-    previous_root: &Path,
-    previous: &crate::package_artifacts::LoadedPackageAuditSnapshot,
+    input_schema: &str,
+    previous_revisions: &BTreeMap<String, PromotionDeclarationTargetRevision>,
     current_root: &Path,
     current: &crate::package_artifacts::LoadedPackageAuditSnapshot,
 ) -> Option<Vec<CatalogRegistryComparison>> {
-    let Ok(previous) = package_revisions(previous_root, previous) else {
-        return None;
-    };
     let Ok(current) = package_revisions(current_root, current) else {
         return None;
     };
-    let Ok(active) = active_catalog_routes(registry) else {
+    let previous_registry = reconstruct_previous_registry(registry, input_schema)?;
+    let Ok(previous_registry) = registry_as_v3(&previous_registry) else {
         return None;
     };
-    let mut old = BTreeMap::new();
-    for (module, revision) in previous {
-        let route = active
-            .get(&module)
-            .map(|(route, _)| route.clone())
-            .or_else(|| {
-                event
-                    .lifecycle_changes
-                    .iter()
-                    .flat_map(|change| &change.old_routes)
-                    .find(|route| route.target_module.as_dotted() == module)
-                    .cloned()
-            });
-        let route = route?;
-        old.insert(module, (route, revision));
+    let Ok(mut old) = active_catalog_routes(&previous_registry) else {
+        return None;
+    };
+    if old.len() != previous_revisions.len()
+        || old.iter().any(|(module, (_, stored))| {
+            previous_revisions
+                .get(module)
+                .is_none_or(|actual| !same_artifacts(stored, actual))
+        })
+    {
+        return None;
+    }
+    for (module, (_, revision)) in &mut old {
+        complete_legacy_revision(revision, previous_revisions.get(module)?);
     }
     Some(comparison_rows(&old, &current, event))
 }
 
 fn hash_file(root: &Path, path: &str) -> Result<PackageHash, String> {
     let logical = PackagePath::new(path);
-    let full = confined_governance_path(
-        root,
-        &logical,
-        path,
-        "promotion_registry_reconciliation_input_invalid",
-    )
-    .map_err(|_| path.to_owned())?;
-    fs::read(full)
+    read_package_regular_file_no_follow(root, &logical)
         .map(|bytes| package_file_hash(&bytes))
         .map_err(|_| path.to_owned())
 }
@@ -1325,20 +1479,55 @@ fn governance_path(
 }
 
 fn pending_recovery_journal(root: &Path) -> Option<std::path::PathBuf> {
-    fs::read_dir(root.join("target/registry-reconciliation"))
+    let directory = open_absolute_directory(root, false)
         .ok()?
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .find(|path| {
-            path.extension()
-                .is_some_and(|extension| extension == "json")
-        })
+        .open_or_create_directory(std::ffi::OsStr::new("target"), false)
+        .ok()?
+        .open_or_create_directory(std::ffi::OsStr::new("registry-reconciliation"), false)
+        .ok()?;
+    directory.entry_names().ok()?.into_iter().find_map(|name| {
+        (Path::new(&name).extension() == Some(std::ffi::OsStr::new("json"))
+            && directory
+                .open_regular_file(&name)
+                .is_ok_and(|file| file.is_some()))
+        .then(|| root.join("target/registry-reconciliation").join(name))
+    })
+}
+
+fn remove_recovery_journal_if_unchanged(
+    root: &Path,
+    path: &PackagePath,
+    expected: &[u8],
+    target_lock: &TargetLock,
+) -> std::io::Result<()> {
+    let (directory, leaf) = open_package_parent_no_follow(root, path, false)?;
+    let mut file = directory
+        .open_regular_file(&leaf)?
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "journal unavailable"))?;
+    let identity = crate::fs::no_follow_directory::regular_file_identity(&file)?;
+    use std::io::Read as _;
+    let mut bytes = Vec::new();
+    std::io::Read::by_ref(&mut file)
+        .take((MAX_RECOVERY_JOURNAL_BYTES as u64) + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes != expected || bytes.len() > MAX_RECOVERY_JOURNAL_BYTES {
+        return Err(std::io::Error::other("recovery journal changed"));
+    }
+    let current = directory
+        .open_regular_file(&leaf)?
+        .ok_or_else(|| std::io::Error::other("recovery journal disappeared"))?;
+    if crate::fs::no_follow_directory::regular_file_identity(&current)? != identity {
+        return Err(std::io::Error::other("recovery journal identity changed"));
+    }
+    target_lock.remove_regular_file_under_lock(&directory, &leaf, identity)?;
+    directory.sync_all()
 }
 
 #[allow(clippy::too_many_arguments)]
 fn inputs_still_match(
     previous_root: &Path,
     current_root: &Path,
+    legacy_previous_v0_8_checkpoint: bool,
     previous_projection: &CatalogTargetProjection,
     current_projection: &CatalogTargetProjection,
     previous_revisions: &BTreeMap<String, PromotionDeclarationTargetRevision>,
@@ -1349,31 +1538,21 @@ fn inputs_still_match(
         npa_package::CatalogRegistryChangeRequest,
         CatalogChangeRequestRef,
     )>,
-    registry_path: &Path,
+    registry_path: &PackagePath,
     registry_bytes: &[u8],
 ) -> bool {
-    let current_audit = confined_governance_path(
-        current_root,
-        &audit.path,
-        audit.path.as_str(),
-        "promotion_registry_reconciliation_audit_invalid",
-    )
-    .ok()
-    .and_then(|path| fs::read(path).ok());
-    if fs::read(registry_path).ok().as_deref() != Some(registry_bytes)
+    let current_audit = read_package_regular_file_no_follow(current_root, &audit.path).ok();
+    if read_package_regular_file_no_follow(current_root, registry_path)
+        .ok()
+        .as_deref()
+        != Some(registry_bytes)
         || current_audit.as_deref() != Some(audit_bytes)
     {
         return false;
     }
     if let Some((expected, reference)) = request {
-        let Some(bytes) = confined_governance_path(
-            current_root,
-            &reference.path,
-            reference.path.as_str(),
-            "promotion_registry_reconciliation_request_invalid",
-        )
-        .ok()
-        .and_then(|path| fs::read(path).ok()) else {
+        let Some(bytes) = read_package_regular_file_no_follow(current_root, &reference.path).ok()
+        else {
             return false;
         };
         let parsed = std::str::from_utf8(&bytes).ok().and_then(|source| {
@@ -1383,15 +1562,20 @@ fn inputs_still_match(
             return false;
         }
     }
-    let Ok(previous) = load_snapshot(previous_root) else {
-        return false;
-    };
     let Ok(current) = load_snapshot(current_root) else {
         return false;
     };
-    projection(previous_root, &previous).ok().as_ref() == Some(previous_projection)
+    let previous_matches = if legacy_previous_v0_8_checkpoint {
+        legacy_previous_inputs_match(previous_root, previous_projection, previous_revisions)
+    } else {
+        let Ok(previous) = load_snapshot(previous_root) else {
+            return false;
+        };
+        projection(previous_root, &previous).ok().as_ref() == Some(previous_projection)
+            && package_revisions(previous_root, &previous).ok().as_ref() == Some(previous_revisions)
+    };
+    previous_matches
         && projection(current_root, &current).ok().as_ref() == Some(current_projection)
-        && package_revisions(previous_root, &previous).ok().as_ref() == Some(previous_revisions)
         && package_revisions(current_root, &current).ok().as_ref() == Some(current_revisions)
 }
 
@@ -1834,7 +2018,7 @@ fn recover(root: &Path, path: &Path) -> CommandResult {
         }
     };
     let logical = PackagePath::new(raw);
-    let full = match confined_governance_path(
+    let journal_bytes = match read_governance_artifact(
         root,
         &logical,
         "--recover",
@@ -1843,11 +2027,11 @@ fn recover(root: &Path, path: &Path) -> CommandResult {
         Ok(value) => value,
         Err(diagnostic) => return CommandResult::failed(COMMAND, root_display, vec![*diagnostic]),
     };
-    let _target_lock = match TargetLock::acquire(root) {
+    let target_lock = match TargetLock::acquire(root) {
         Ok(value) => value,
         Err(_) => return failed(root, "promotion_registry_concurrent_update", "--root"),
     };
-    let source = match fs::read_to_string(&full) {
+    let source = match String::from_utf8(journal_bytes.clone()) {
         Ok(value) => value,
         Err(_) => {
             return failed(
@@ -1878,7 +2062,7 @@ fn recover(root: &Path, path: &Path) -> CommandResult {
         );
     }
     let registry_path = PackagePath::new(MATHLIB_PROMOTION_REGISTRY_PATH);
-    let registry_full = match confined_governance_path(
+    let existing = match read_governance_artifact(
         root,
         &registry_path,
         MATHLIB_PROMOTION_REGISTRY_PATH,
@@ -1886,16 +2070,6 @@ fn recover(root: &Path, path: &Path) -> CommandResult {
     ) {
         Ok(value) => value,
         Err(diagnostic) => return CommandResult::failed(COMMAND, root_display, vec![*diagnostic]),
-    };
-    let existing = match fs::read(&registry_full) {
-        Ok(value) => value,
-        Err(_) => {
-            return failed(
-                root,
-                "promotion_registry_reconciliation_recovery_invalid",
-                MATHLIB_PROMOTION_REGISTRY_PATH,
-            )
-        }
     };
     let proposed = std::str::from_utf8(&journal.registry)
         .ok()
@@ -1985,14 +2159,13 @@ fn recover(root: &Path, path: &Path) -> CommandResult {
             return CommandResult::failed(COMMAND, root_display, vec![*diagnostic]);
         }
     }
-    let actual_attestation = confined_governance_path(
+    let actual_attestation = read_governance_artifact(
         root,
         &journal.out,
         journal.out.as_str(),
         "promotion_registry_reconciliation_recovery_invalid",
     )
-    .ok()
-    .and_then(|path| fs::read(path).ok());
+    .ok();
     match recovery_disposition(
         &existing,
         &journal.registry,
@@ -2042,7 +2215,7 @@ fn recover(root: &Path, path: &Path) -> CommandResult {
     if validation.status != CommandStatus::Passed {
         return validation;
     }
-    if fs::remove_file(full).is_err() {
+    if remove_recovery_journal_if_unchanged(root, &logical, &journal_bytes, &target_lock).is_err() {
         return failed(
             root,
             "promotion_registry_reconciliation_recovery_cleanup_failed",
@@ -2102,7 +2275,9 @@ fn decode_hex(value: &str) -> Option<Vec<u8>> {
     }
     value
         .as_bytes()
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| {
             let digit = |byte: u8| match byte {
                 b'0'..=b'9' => Some(byte - b'0'),
@@ -2289,6 +2464,19 @@ mod tests {
             catalog_target_revision_hash(&overlaid).unwrap(),
             catalog_target_revision_hash(&complete).unwrap()
         );
+    }
+
+    #[test]
+    fn legacy_checkpoint_certificate_probe_requires_the_exact_header_pair() {
+        assert!(is_legacy_v0_8_certificate(
+            b"\x0eNPA-CERT-0.3.0\x0eNPA-Core-0.3.0\x03Foo"
+        ));
+        assert!(!is_legacy_v0_8_certificate(
+            b"prefix\x0eNPA-CERT-0.3.0\x0eNPA-Core-0.3.0"
+        ));
+        assert!(!is_legacy_v0_8_certificate(
+            b"\x0eNPA-CERT-0.3.0\x0eNPA-Core-0.4.0"
+        ));
     }
 
     #[test]

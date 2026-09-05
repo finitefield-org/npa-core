@@ -16,7 +16,7 @@ use std::fmt;
 pub const PROOF_LOCAL_CONTEXT_BINDER_FINGERPRINT_HASH_DOMAIN: &str =
     "npa.proof.local-context-binder-fingerprint.v1";
 pub const PROOF_LOCAL_STATEMENT_GENERALIZATION_HASH_DOMAIN: &str =
-    "npa.proof.local-statement-generalization.v1";
+    "npa.proof.local-statement-generalization.v2";
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ProofSemanticValidationProfile {
@@ -470,26 +470,12 @@ pub struct ProofLocalContextCapture {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ProofLocalStatementGeneralizationPolicy {
-    pub unfold_local_definitions: bool,
-}
-
-impl Default for ProofLocalStatementGeneralizationPolicy {
-    fn default() -> Self {
-        Self {
-            unfold_local_definitions: true,
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProofLocalStatementGeneralization {
     pub source_context_hash: Hash,
     pub source_statement_hash: Hash,
     pub captured_local_indices: Vec<u32>,
     pub binders: Vec<ProofLocalStatementGeneralizationBinder>,
     pub minimized_universe_params: Vec<String>,
-    pub unfold_local_definitions: bool,
     pub generalized_statement_hash: Hash,
 }
 
@@ -498,7 +484,6 @@ pub struct ProofLocalStatementGeneralizationBinder {
     pub local_index: u32,
     pub local_decl_hash: Hash,
     pub type_hash: Hash,
-    pub value_hash: Option<Hash>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1015,7 +1000,6 @@ pub fn validate_proof_local_context_capture(
 pub fn generalize_local_context_statement(
     context: &[MachineLocalDecl],
     statement: &Expr,
-    policy: &ProofLocalStatementGeneralizationPolicy,
 ) -> Result<ProofLocalStatementGeneralization, ProofLocalContextValidationError> {
     validate_context_declarations(context)?;
     let mut captured = BTreeSet::new();
@@ -1040,16 +1024,10 @@ pub fn generalize_local_context_statement(
         .map(|local_index| {
             let local = &context[*local_index as usize];
             collect_expr_universe_params(&local.ty, &mut universe_params);
-            if policy.unfold_local_definitions {
-                if let Some(value) = &local.value {
-                    collect_expr_universe_params(value, &mut universe_params);
-                }
-            }
             ProofLocalStatementGeneralizationBinder {
                 local_index: *local_index,
                 local_decl_hash: machine_local_decl_hash(local),
                 type_hash: core_expr_hash(&local.ty),
-                value_hash: local.value.as_ref().map(core_expr_hash),
             }
         })
         .collect::<Vec<_>>();
@@ -1060,7 +1038,6 @@ pub fn generalize_local_context_statement(
         captured_local_indices,
         binders,
         minimized_universe_params: universe_params.into_iter().collect(),
-        unfold_local_definitions: policy.unfold_local_definitions,
         generalized_statement_hash: [0; 32],
     };
     generalization.generalized_statement_hash =
@@ -1075,10 +1052,7 @@ pub fn validate_local_context_generalization(
 ) -> Result<(), ProofLocalContextValidationError> {
     validate_context_declarations(context)?;
     validate_captured_local_indices(context, &generalization.captured_local_indices)?;
-    let policy = ProofLocalStatementGeneralizationPolicy {
-        unfold_local_definitions: generalization.unfold_local_definitions,
-    };
-    let expected = generalize_local_context_statement(context, statement, &policy)?;
+    let expected = generalize_local_context_statement(context, statement)?;
     if generalization.source_context_hash != expected.source_context_hash {
         return Err(ProofLocalContextValidationError::new(
             ProofLocalContextValidationErrorKind::ContextHashMismatch {
@@ -1170,15 +1144,12 @@ pub fn proof_local_statement_generalization_hash(
         encode_u64_to(&mut out, u64::from(binder.local_index));
         encode_hash_to(&mut out, &binder.local_decl_hash);
         encode_hash_to(&mut out, &binder.type_hash);
-        encode_option_hash_to(&mut out, binder.value_hash.as_ref());
     }
     encode_string_to(&mut out, "minimized_universe_params");
     encode_len_to(&mut out, generalization.minimized_universe_params.len());
     for param in &generalization.minimized_universe_params {
         encode_string_to(&mut out, param);
     }
-    encode_string_to(&mut out, "unfold_local_definitions");
-    out.push(u8::from(generalization.unfold_local_definitions));
     sha256_hash(&out)
 }
 
@@ -1317,9 +1288,6 @@ fn validate_context_declarations(
     for (index, local) in context.iter().enumerate() {
         let mut refs = BTreeSet::new();
         collect_expr_local_indices(&local.ty, index, 0, Some(index as u32), &mut refs)?;
-        if let Some(value) = &local.value {
-            collect_expr_local_indices(value, index, 0, Some(index as u32), &mut refs)?;
-        }
     }
     Ok(())
 }
@@ -1395,9 +1363,6 @@ fn local_dependency_indices(
         Some(local_index as u32),
         &mut deps,
     )?;
-    if let Some(value) = &local.value {
-        collect_expr_local_indices(value, local_index, 0, Some(local_index as u32), &mut deps)?;
-    }
     Ok(deps)
 }
 
@@ -1443,19 +1408,6 @@ fn collect_expr_local_indices(
                 ids,
             )?;
         }
-        Expr::Let {
-            ty, value, body, ..
-        } => {
-            collect_expr_local_indices(ty, local_count, binder_depth, owner_local_index, ids)?;
-            collect_expr_local_indices(value, local_count, binder_depth, owner_local_index, ids)?;
-            collect_expr_local_indices(
-                body,
-                local_count,
-                binder_depth + 1,
-                owner_local_index,
-                ids,
-            )?;
-        }
     }
     Ok(())
 }
@@ -1475,13 +1427,6 @@ fn collect_expr_universe_params(expr: &Expr, params: &mut BTreeSet<String>) {
         }
         Expr::Lam { ty, body, .. } | Expr::Pi { ty, body, .. } => {
             collect_expr_universe_params(ty, params);
-            collect_expr_universe_params(body, params);
-        }
-        Expr::Let {
-            ty, value, body, ..
-        } => {
-            collect_expr_universe_params(ty, params);
-            collect_expr_universe_params(value, params);
             collect_expr_universe_params(body, params);
         }
     }
@@ -1530,16 +1475,6 @@ fn encode_string_to(out: &mut Vec<u8>, value: &str) {
 fn encode_hash_to(out: &mut Vec<u8>, hash: &Hash) {
     out.push(b'h');
     out.extend(hash);
-}
-
-fn encode_option_hash_to(out: &mut Vec<u8>, hash: Option<&Hash>) {
-    match hash {
-        Some(hash) => {
-            out.push(1);
-            encode_hash_to(out, hash);
-        }
-        None => out.push(0),
-    }
 }
 
 fn encode_u64_to(out: &mut Vec<u8>, value: u64) {
@@ -1804,7 +1739,6 @@ mod tests {
             captured_local_indices: Vec::new(),
             binders: Vec::new(),
             minimized_universe_params: Vec::new(),
-            unfold_local_definitions: true,
             generalized_statement_hash: lemma_hash,
         };
         let mut future_lemma = base_sketch.clone();
@@ -1863,12 +1797,8 @@ mod tests {
             MachineLocalDecl::assumption("x", Expr::bvar(0)),
         ];
         let statement = Expr::bvar(0);
-        let generalization = generalize_local_context_statement(
-            &context,
-            &statement,
-            &ProofLocalStatementGeneralizationPolicy::default(),
-        )
-        .expect("generalization should be computed");
+        let generalization = generalize_local_context_statement(&context, &statement)
+            .expect("generalization should be computed");
         assert_eq!(generalization.captured_local_indices, vec![0, 1]);
         assert_eq!(generalization.binders.len(), 2);
         validate_local_context_generalization(&context, &statement, &generalization)
@@ -1913,12 +1843,8 @@ mod tests {
         ));
 
         let empty_context = Vec::new();
-        let err = generalize_local_context_statement(
-            &empty_context,
-            &Expr::bvar(0),
-            &ProofLocalStatementGeneralizationPolicy::default(),
-        )
-        .expect_err("statement cannot reference locals outside context");
+        let err = generalize_local_context_statement(&empty_context, &Expr::bvar(0))
+            .expect_err("statement cannot reference locals outside context");
         assert!(matches!(
             err.kind(),
             ProofLocalContextValidationErrorKind::LocalScopeEscape { .. }

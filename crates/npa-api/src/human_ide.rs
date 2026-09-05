@@ -17,7 +17,7 @@
 /// may adapt source text, display payloads, and future IDE state, but they must
 /// not implicitly allocate Machine sessions or widen `/machine/*` request
 /// grammar.
-pub const HUMAN_IDE_API_PROFILE: &str = "npa.human-ide-api.v1";
+pub const HUMAN_IDE_API_PROFILE: &str = "npa.human-ide-api.v2";
 
 /// Human IDE API boundary descriptor exported separately from Machine API.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

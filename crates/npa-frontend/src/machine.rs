@@ -149,13 +149,6 @@ pub enum MachineTerm {
         body: Box<MachineTerm>,
         span: Span,
     },
-    Let {
-        name: String,
-        ty: Box<MachineTerm>,
-        value: Box<MachineTerm>,
-        body: Box<MachineTerm>,
-        span: Span,
-    },
     Annot {
         expr: Box<MachineTerm>,
         ty: Box<MachineTerm>,
@@ -174,7 +167,6 @@ impl MachineTerm {
             | Self::App { span, .. }
             | Self::Lam { span, .. }
             | Self::Pi { span, .. }
-            | Self::Let { span, .. }
             | Self::Annot { span, .. } => *span,
         }
     }
@@ -205,7 +197,6 @@ impl Default for MachineCompileOptions {
 pub struct MachineLocalDecl {
     pub name: String,
     pub ty: npa_kernel::Expr,
-    pub value: Option<npa_kernel::Expr>,
 }
 
 #[derive(Clone, Debug)]

@@ -1,15 +1,25 @@
 //! Deterministic evidence support for the current external-checker toolchain gate.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::{OsStr, OsString};
 use std::fmt::Write as _;
-use std::fs;
-use std::os::unix::fs::{symlink, PermissionsExt};
+use std::io::{self, Read as _};
 use std::path::{Component, Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, ExitStatus, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use npa_api::{JsonDocument, JsonValue, JsonValueKind};
 use npa_cert::decode_module_cert_header;
 use sha2::{Digest, Sha256};
+
+use crate::fs::no_follow_directory::{
+    open_absolute_directory, regular_file_identity, Directory, DirectoryChild, Identity,
+};
+use crate::generated_artifact_writer::{
+    read_regular_file_no_follow, write_regular_file_atomic_no_follow,
+    write_regular_file_atomic_no_follow_with_mode,
+};
 
 const SCHEMA: &str = "npa.checker_ext.toolchain_v0_8";
 const POLICY_ID: &str = "npa-checker-ext-toolchain-v0-8-compat";
@@ -40,6 +50,13 @@ const RETAINED_JSON: [&str; 6] = [
     "verified-export-summary.json",
 ];
 const MUTABLE_PREFIXES: [&str; 2] = ["generated/checker-imports/", "generated/checker-results/"];
+const MAX_EVIDENCE_FILE_BYTES: usize = 128 * 1024 * 1024;
+const MAX_ARCHIVE_ENTRIES: usize = 65_536;
+const MAX_ARCHIVE_DEPTH: usize = 128;
+const MAX_ARCHIVE_PAYLOAD_BYTES: usize = 96 * 1024 * 1024;
+const MAX_ARCHIVE_PATH_BYTES: usize = 16 * 1024 * 1024;
+const MAX_ARCHIVE_TAR_BYTES: usize = 112 * 1024 * 1024;
+const MAX_ARCHIVE_GZIP_BYTES: usize = 120 * 1024 * 1024;
 
 /// Failure returned by the evidence policy and schema layer.
 #[derive(Debug)]
@@ -67,10 +84,10 @@ enum Value {
 
 impl Value {
     fn parse_file(path: &Path) -> Result<Self> {
-        let source = fs::read_to_string(path).map_err(|error| {
-            EvidenceError(format!("cannot read JSON {}: {error}", path.display()))
-        })?;
-        let document = JsonDocument::parse(&source).map_err(|error| {
+        let bytes = read_bytes(path)?;
+        let source = std::str::from_utf8(&bytes)
+            .map_err(|_| EvidenceError(format!("JSON {} is not UTF-8", path.display())))?;
+        let document = JsonDocument::parse(source).map_err(|error| {
             EvidenceError(format!(
                 "cannot parse JSON {} at byte {}",
                 path.display(),
@@ -249,17 +266,103 @@ fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 fn read_bytes(path: &Path) -> Result<Vec<u8>> {
-    fs::read(path)
-        .map_err(|error| EvidenceError(format!("cannot read {}: {error}", path.display())))
+    let bytes = read_regular_file_no_follow(path)
+        .map_err(|error| EvidenceError(format!("cannot read {}: {error}", path.display())))?;
+    require(
+        bytes.len() <= MAX_EVIDENCE_FILE_BYTES,
+        format!(
+            "evidence input exceeds the {} byte limit: {}",
+            MAX_EVIDENCE_FILE_BYTES,
+            path.display()
+        ),
+    )?;
+    Ok(bytes)
 }
 
 fn write_json(path: &Path, value: &Value) -> Result<Vec<u8>> {
     let bytes = value.canonical().into_bytes();
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|error| EvidenceError(error.to_string()))?;
-    }
-    fs::write(path, &bytes).map_err(|error| EvidenceError(error.to_string()))?;
+    write_regular_file_atomic_no_follow(path, &bytes)
+        .map_err(|error| EvidenceError(error.to_string()))?;
     Ok(bytes)
+}
+
+fn read_opened_regular_file(
+    mut file: std::fs::File,
+    label: &Path,
+    maximum_bytes: usize,
+) -> Result<Vec<u8>> {
+    use std::io::Read as _;
+
+    let metadata = file
+        .metadata()
+        .map_err(|error| EvidenceError(format!("cannot inspect {}: {error}", label.display())))?;
+    require(
+        metadata.len() <= maximum_bytes as u64,
+        format!(
+            "evidence input exceeds the {maximum_bytes} byte limit: {}",
+            label.display()
+        ),
+    )?;
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    std::io::Read::by_ref(&mut file)
+        .take(maximum_bytes as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| EvidenceError(format!("cannot read {}: {error}", label.display())))?;
+    require(
+        bytes.len() <= maximum_bytes,
+        format!(
+            "evidence input grew beyond the {maximum_bytes} byte limit: {}",
+            label.display()
+        ),
+    )?;
+    Ok(bytes)
+}
+
+fn require_named_directory_identity(
+    parent: &Directory,
+    name: &std::ffi::OsStr,
+    expected: Identity,
+    label: &Path,
+) -> Result<()> {
+    let DirectoryChild::Directory(reopened) = parent
+        .open_child(name)
+        .map_err(|error| EvidenceError(format!("cannot reopen {}: {error}", label.display())))?
+    else {
+        return Err(EvidenceError(format!(
+            "directory was replaced during evidence traversal: {}",
+            label.display()
+        )));
+    };
+    require(
+        reopened
+            .identity()
+            .map_err(|error| EvidenceError(error.to_string()))?
+            == expected,
+        format!(
+            "directory identity changed during evidence traversal: {}",
+            label.display()
+        ),
+    )
+}
+
+fn require_named_file_identity(
+    parent: &Directory,
+    name: &std::ffi::OsStr,
+    expected: Identity,
+    label: &Path,
+) -> Result<()> {
+    let reopened = parent
+        .open_regular_file(name)
+        .map_err(|error| EvidenceError(format!("cannot reopen {}: {error}", label.display())))?
+        .ok_or_else(|| EvidenceError(format!("file disappeared: {}", label.display())))?;
+    require(
+        regular_file_identity(&reopened).map_err(|error| EvidenceError(error.to_string()))?
+            == expected,
+        format!(
+            "file identity changed during evidence traversal: {}",
+            label.display()
+        ),
+    )
 }
 
 fn require(condition: bool, message: impl Into<String>) -> Result<()> {
@@ -270,6 +373,24 @@ fn require(condition: bool, message: impl Into<String>) -> Result<()> {
     }
 }
 
+fn require_unchanged_catalog(
+    directory: &Directory,
+    expected: &[std::ffi::OsString],
+    label: &Path,
+) -> Result<()> {
+    let mut actual = directory
+        .entry_names()
+        .map_err(|error| EvidenceError(format!("cannot relist {}: {error}", label.display())))?;
+    actual.sort_by(|left, right| left.as_encoded_bytes().cmp(right.as_encoded_bytes()));
+    require(
+        actual == expected,
+        format!(
+            "directory catalog changed during evidence traversal: {}",
+            label.display()
+        ),
+    )
+}
+
 fn canonical(path: &Path) -> Result<PathBuf> {
     path.canonicalize()
         .map_err(|error| EvidenceError(format!("cannot resolve {}: {error}", path.display())))
@@ -277,19 +398,113 @@ fn canonical(path: &Path) -> Result<PathBuf> {
 
 fn run_git(root: &Path, args: &[&str], environment: &[(&str, &str)]) -> Result<String> {
     let mut command = Command::new("/usr/bin/git");
-    command.arg("-C").arg(root).args(args);
+    command
+        .env_clear()
+        .env("LC_ALL", "C")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .arg("-c")
+        .arg("core.fsmonitor=false")
+        .arg("-c")
+        .arg("core.hooksPath=/dev/null")
+        .arg("-C")
+        .arg(root)
+        .args(args);
     command.envs(environment.iter().copied());
-    let result = command
-        .output()
-        .map_err(|error| EvidenceError(error.to_string()))?;
+    let (status, stdout, stderr) = run_bounded_command(
+        &mut command,
+        Duration::from_secs(120),
+        16 * 1024 * 1024,
+        1024 * 1024,
+    )?;
     require(
-        result.status.success(),
+        status.success(),
         format!(
             "git command failed: {}",
-            String::from_utf8_lossy(&result.stderr).trim()
+            String::from_utf8_lossy(&stderr).trim()
         ),
     )?;
-    Ok(String::from_utf8_lossy(&result.stdout).trim().to_owned())
+    Ok(String::from_utf8_lossy(&stdout).trim().to_owned())
+}
+
+fn run_bounded_command(
+    command: &mut Command,
+    timeout: Duration,
+    stdout_limit: usize,
+    stderr_limit: usize,
+) -> Result<(ExitStatus, Vec<u8>, Vec<u8>)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        command.process_group(0);
+    }
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| EvidenceError(error.to_string()))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| EvidenceError("bounded command stdout was not piped".into()))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| EvidenceError("bounded command stderr was not piped".into()))?;
+    let stdout_reader = thread::spawn(move || read_bounded_stream(stdout, stdout_limit));
+    let stderr_reader = thread::spawn(move || read_bounded_stream(stderr, stderr_limit));
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|error| EvidenceError(error.to_string()))?
+        {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            #[cfg(unix)]
+            {
+                let process_group = i32::try_from(child.id()).unwrap_or(i32::MAX);
+                // SAFETY: the child was placed in a fresh process group whose
+                // id equals its pid. Failure is followed by direct-child kill.
+                let _ = unsafe { libc::kill(-process_group, libc::SIGKILL) };
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(EvidenceError(
+                "bounded command exceeded its deadline".into(),
+            ));
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| EvidenceError("bounded stdout reader panicked".into()))?
+        .map_err(|error| EvidenceError(error.to_string()))?;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| EvidenceError("bounded stderr reader panicked".into()))?
+        .map_err(|error| EvidenceError(error.to_string()))?;
+    Ok((status, stdout, stderr))
+}
+
+fn read_bounded_stream(mut stream: impl io::Read, limit: usize) -> io::Result<Vec<u8>> {
+    let maximum = limit
+        .checked_add(1)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "stream limit overflow"))?;
+    let mut bytes = Vec::with_capacity(maximum.min(64 * 1024));
+    stream
+        .by_ref()
+        .take(maximum as u64)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > limit {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "bounded command output exceeded its byte limit",
+        ));
+    }
+    Ok(bytes)
 }
 
 fn parse_version_record(bytes: &[u8]) -> Result<BTreeMap<String, String>> {
@@ -363,19 +578,15 @@ pub fn prepare_inputs(root: &Path, checker: &Path, version_file: &Path) -> Resul
     let version_bytes = read_bytes(version_file)?;
     let observed = parse_version_record(&version_bytes)?;
     let checker_target = root.join(CHECKER_PATH);
-    fs::create_dir_all(checker_target.parent().unwrap())
-        .map_err(|error| EvidenceError(error.to_string()))?;
-    fs::write(&checker_target, &checker_bytes).map_err(|error| EvidenceError(error.to_string()))?;
-    fs::set_permissions(&checker_target, fs::Permissions::from_mode(0o755))
+    write_regular_file_atomic_no_follow_with_mode(&checker_target, &checker_bytes, 0o755)
         .map_err(|error| EvidenceError(error.to_string()))?;
     let checker_hash = sha256_bytes(&checker_bytes);
 
     let axiom_bytes =
         b"format = \"npa.independent-checker.axiom_policy.v1\"\nallowed_axioms = []\n";
     let axiom_path = root.join(AXIOM_POLICY_PATH);
-    fs::create_dir_all(axiom_path.parent().unwrap())
+    write_regular_file_atomic_no_follow(&axiom_path, axiom_bytes)
         .map_err(|error| EvidenceError(error.to_string()))?;
-    fs::write(&axiom_path, axiom_bytes).map_err(|error| EvidenceError(error.to_string()))?;
     let axiom_hash = sha256_bytes(axiom_bytes);
     let label = "npa-checker-ext-toolchain-v0.8.0-fixture";
     let runner_build_hash = fixture_hash(&format!("{RUNNER_ID}:{RUNNER_VERSION}"));
@@ -623,73 +834,164 @@ pub fn prepare_inputs(root: &Path, checker: &Path, version_file: &Path) -> Resul
 }
 
 fn copy_tree(source: &Path, destination: &Path) -> Result<()> {
-    fs::create_dir(destination).map_err(|error| EvidenceError(error.to_string()))?;
-    let mut entries = fs::read_dir(source)
-        .map_err(|error| EvidenceError(error.to_string()))?
-        .collect::<std::result::Result<Vec<_>, _>>()
+    let source_directory = open_absolute_directory(source, false)
+        .map_err(|error| EvidenceError(format!("cannot open fixture source: {error}")))?;
+    let source_identity = source_directory
+        .identity()
         .map_err(|error| EvidenceError(error.to_string()))?;
-    entries.sort_by_key(|entry| entry.file_name());
-    for entry in entries {
-        let path = entry.path();
-        let target = destination.join(entry.file_name());
-        let metadata =
-            fs::symlink_metadata(&path).map_err(|error| EvidenceError(error.to_string()))?;
-        if metadata.file_type().is_symlink() {
-            symlink(
-                fs::read_link(path).map_err(|error| EvidenceError(error.to_string()))?,
-                target,
-            )
-            .map_err(|error| EvidenceError(error.to_string()))?;
-        } else if metadata.is_dir() {
-            copy_tree(&path, &target)?;
-        } else if metadata.is_file() {
-            fs::copy(path, target).map_err(|error| EvidenceError(error.to_string()))?;
+    let destination_parent = open_absolute_directory(
+        destination
+            .parent()
+            .ok_or_else(|| EvidenceError("fixture destination has no parent".into()))?,
+        false,
+    )
+    .map_err(|error| EvidenceError(error.to_string()))?;
+    let destination_name = destination
+        .file_name()
+        .ok_or_else(|| EvidenceError("fixture destination has no name".into()))?;
+    let destination_directory = destination_parent
+        .create_new_directory(destination_name)
+        .map_err(|error| EvidenceError(error.to_string()))?;
+    let mut copied_entries = 0usize;
+    let mut copied_bytes = 0usize;
+    copy_open_tree(
+        &source_directory,
+        &destination_directory,
+        Path::new("fixture"),
+        0,
+        &mut copied_entries,
+        &mut copied_bytes,
+    )?;
+    let reopened = open_absolute_directory(source, false)
+        .map_err(|error| EvidenceError(format!("cannot reopen fixture source: {error}")))?;
+    require(
+        reopened
+            .identity()
+            .map_err(|error| EvidenceError(error.to_string()))?
+            == source_identity,
+        "fixture source identity changed during copy",
+    )
+}
+
+fn copy_open_tree(
+    source: &Directory,
+    destination: &Directory,
+    relative: &Path,
+    depth: usize,
+    copied_entries: &mut usize,
+    copied_bytes: &mut usize,
+) -> Result<()> {
+    const MAX_FIXTURE_DEPTH: usize = 64;
+    const MAX_FIXTURE_ENTRIES: usize = 16_384;
+
+    require(depth <= MAX_FIXTURE_DEPTH, "fixture tree depth exceeds 64")?;
+    let mut names = source
+        .entry_names()
+        .map_err(|error| EvidenceError(format!("cannot list {}: {error}", relative.display())))?;
+    names.sort_by(|left, right| left.as_encoded_bytes().cmp(right.as_encoded_bytes()));
+    for name in &names {
+        *copied_entries = copied_entries
+            .checked_add(1)
+            .ok_or_else(|| EvidenceError("fixture entry count overflowed".into()))?;
+        require(
+            *copied_entries <= MAX_FIXTURE_ENTRIES,
+            "fixture tree entry count exceeds 16384",
+        )?;
+        let child_label = relative.join(name);
+        match source.open_child(name) {
+            Ok(DirectoryChild::Directory(child)) => {
+                let identity = child
+                    .identity()
+                    .map_err(|error| EvidenceError(error.to_string()))?;
+                let target = destination
+                    .create_new_directory(name)
+                    .map_err(|error| EvidenceError(error.to_string()))?;
+                copy_open_tree(
+                    &child,
+                    &target,
+                    &child_label,
+                    depth + 1,
+                    copied_entries,
+                    copied_bytes,
+                )?;
+                require_named_directory_identity(source, name, identity, &child_label)?;
+            }
+            Ok(DirectoryChild::Regular(file)) => {
+                let identity = regular_file_identity(&file)
+                    .map_err(|error| EvidenceError(error.to_string()))?;
+                let bytes = read_opened_regular_file(file, &child_label, MAX_EVIDENCE_FILE_BYTES)?;
+                *copied_bytes = copied_bytes
+                    .checked_add(bytes.len())
+                    .ok_or_else(|| EvidenceError("fixture byte total overflowed".into()))?;
+                require(
+                    *copied_bytes <= 512 * 1024 * 1024,
+                    "fixture tree exceeds the 512 MiB aggregate byte limit",
+                )?;
+                let mut output = destination
+                    .create_new_regular_file(name)
+                    .map_err(|error| EvidenceError(error.to_string()))?;
+                use std::io::Write as _;
+                output
+                    .write_all(&bytes)
+                    .and_then(|()| output.sync_all())
+                    .map_err(|error| EvidenceError(error.to_string()))?;
+                require_named_file_identity(source, name, identity, &child_label)?;
+            }
+            Err(error) if error.raw_os_error() == Some(libc::ELOOP) => {
+                let target = source
+                    .read_symbolic_link(name)
+                    .map_err(|error| EvidenceError(error.to_string()))?;
+                destination
+                    .create_symbolic_link(&target, name)
+                    .map_err(|error| EvidenceError(error.to_string()))?;
+            }
+            Err(error) => {
+                return Err(EvidenceError(format!(
+                    "cannot inspect fixture entry {}: {error}",
+                    child_label.display()
+                )));
+            }
         }
     }
-    Ok(())
+    require_unchanged_catalog(source, &names, relative)
 }
 
 /// Build the deterministic temporary source fixture used by the v0.8 gate.
 pub fn prepare_fixture(run_dir: &Path, fixture: &Path, core_root: &Path) -> Result<String> {
-    let run_dir = if run_dir.exists() {
-        canonical(run_dir)?
-    } else {
-        run_dir.to_path_buf()
-    };
-    if run_dir.exists() {
-        require(
-            fs::read_dir(&run_dir)
-                .map_err(|error| EvidenceError(error.to_string()))?
-                .next()
-                .is_none(),
-            format!("run directory is not empty: {}", run_dir.display()),
-        )?;
-    } else {
-        fs::create_dir_all(&run_dir).map_err(|error| EvidenceError(error.to_string()))?;
-    }
+    let run_dir = run_dir.to_path_buf();
+    let run_directory = open_absolute_directory(&run_dir, true)
+        .map_err(|error| EvidenceError(error.to_string()))?;
+    require(
+        run_directory
+            .entry_names()
+            .map_err(|error| EvidenceError(error.to_string()))?
+            .is_empty(),
+        format!("run directory is not empty: {}", run_dir.display()),
+    )?;
     let fixture = canonical(fixture)?;
     let core_root = canonical(core_root)?;
     let source = run_dir.join("source");
     let package = source.join("proofs");
-    fs::create_dir(&source).map_err(|error| EvidenceError(error.to_string()))?;
-    for path in [run_dir.join("evidence"), run_dir.join("assets")] {
-        fs::create_dir(path).map_err(|error| EvidenceError(error.to_string()))?;
-    }
+    let source_directory = run_directory
+        .create_new_directory(OsStr::new("source"))
+        .map_err(|error| EvidenceError(error.to_string()))?;
+    source_directory
+        .create_new_directory(OsStr::new("proofs"))
+        .map_err(|error| EvidenceError(error.to_string()))?;
+    let evidence_directory = run_directory
+        .create_new_directory(OsStr::new("evidence"))
+        .map_err(|error| EvidenceError(error.to_string()))?;
+    run_directory
+        .create_new_directory(OsStr::new("assets"))
+        .map_err(|error| EvidenceError(error.to_string()))?;
     for label in ["facade", "direct-1", "direct-final"] {
-        fs::create_dir(run_dir.join("evidence").join(label))
+        evidence_directory
+            .create_new_directory(OsStr::new(label))
             .map_err(|error| EvidenceError(error.to_string()))?;
     }
     copy_tree(&fixture, &package)?;
     let generated = package.join("generated");
-    let mut actual = fs::read_dir(&generated)
-        .map_err(|error| EvidenceError(error.to_string()))?
-        .filter_map(|entry| entry.ok())
-        .filter(|entry| {
-            entry.path().is_file() && entry.path().extension().is_some_and(|ext| ext == "json")
-        })
-        .map(|entry| entry.file_name().to_string_lossy().into_owned())
-        .collect::<Vec<_>>();
-    actual.sort();
+    let actual = direct_regular_names_with_extension(&generated, "json")?;
     require(
         actual == RETAINED_JSON,
         format!("fixture top-level generated JSON mismatch: got {actual:?}"),
@@ -708,17 +1010,15 @@ pub fn prepare_fixture(run_dir: &Path, fixture: &Path, core_root: &Path) -> Resu
     ];
     for (locator, label) in sentinels {
         let path = package.join(locator);
-        fs::create_dir_all(path.parent().unwrap())
-            .map_err(|error| EvidenceError(error.to_string()))?;
-        fs::write(
-            path,
-            format!("{{\"forbidden\":\"npa-checker-ext-toolchain-v0.8.0:{label}\"}}\n"),
+        write_regular_file_atomic_no_follow(
+            &path,
+            format!("{{\"forbidden\":\"npa-checker-ext-toolchain-v0.8.0:{label}\"}}\n").as_bytes(),
         )
         .map_err(|error| EvidenceError(error.to_string()))?;
     }
-    fs::write(
-        source.join(".gitignore"),
-        "/npa-core\n/proofs/ci/\n/proofs/tools/\n/proofs/generated/\n",
+    write_regular_file_atomic_no_follow(
+        &source.join(".gitignore"),
+        b"/npa-core\n/proofs/ci/\n/proofs/tools/\n/proofs/generated/\n",
     )
     .map_err(|error| EvidenceError(error.to_string()))?;
     run_git(&source, &["init", "--object-format=sha1", "--quiet"], &[])?;
@@ -760,7 +1060,8 @@ pub fn prepare_fixture(run_dir: &Path, fixture: &Path, core_root: &Path) -> Resu
         .is_empty(),
         "temporary source repository is not clean after commit",
     )?;
-    symlink(core_root, source.join("npa-core"))
+    source_directory
+        .create_symbolic_link(core_root.as_os_str(), OsStr::new("npa-core"))
         .map_err(|error| EvidenceError(error.to_string()))?;
     let lock = Value::parse_file(&generated.join("package-lock.json"))?;
     require(
@@ -878,18 +1179,32 @@ pub fn prepare_fixture(run_dir: &Path, fixture: &Path, core_root: &Path) -> Resu
     .canonical())
 }
 
-fn walk_files(root: &Path, path: &Path, output: &mut BTreeMap<String, Value>) -> Result<()> {
-    let mut entries = fs::read_dir(path)
-        .map_err(|error| EvidenceError(error.to_string()))?
-        .collect::<std::result::Result<Vec<_>, _>>()
+fn walk_files(
+    directory: &Directory,
+    relative_directory: &Path,
+    output: &mut BTreeMap<String, Value>,
+    entry_count: &mut usize,
+    total_bytes: &mut usize,
+) -> Result<()> {
+    const MAX_INVENTORY_ENTRIES: usize = 65_536;
+    const MAX_INVENTORY_BYTES: usize = 1024 * 1024 * 1024;
+
+    let mut names = directory
+        .entry_names()
         .map_err(|error| EvidenceError(error.to_string()))?;
-    entries.sort_by_key(|entry| entry.file_name());
-    for entry in entries {
-        let path = entry.path();
-        let relative = path
-            .strip_prefix(root)
-            .unwrap()
-            .to_string_lossy()
+    names.sort_by(|left, right| left.as_encoded_bytes().cmp(right.as_encoded_bytes()));
+    for name in &names {
+        *entry_count = entry_count
+            .checked_add(1)
+            .ok_or_else(|| EvidenceError("inventory entry count overflowed".into()))?;
+        require(
+            *entry_count <= MAX_INVENTORY_ENTRIES,
+            "inventory tree exceeds the 65536 entry limit",
+        )?;
+        let relative_path = relative_directory.join(name);
+        let relative = relative_path
+            .to_str()
+            .ok_or_else(|| EvidenceError("inventory path is not UTF-8".into()))?
             .replace('\\', "/");
         if relative == ".git"
             || relative.starts_with(".git/")
@@ -899,47 +1214,88 @@ fn walk_files(root: &Path, path: &Path, output: &mut BTreeMap<String, Value>) ->
         {
             continue;
         }
-        let metadata =
-            fs::symlink_metadata(&path).map_err(|error| EvidenceError(error.to_string()))?;
-        if metadata.file_type().is_symlink() {
-            output.insert(
-                relative,
-                Value::object([
-                    ("kind", Value::string("symlink")),
-                    (
-                        "target",
-                        Value::string(
-                            fs::read_link(path)
-                                .map_err(|error| EvidenceError(error.to_string()))?
-                                .to_string_lossy(),
-                        ),
-                    ),
-                ]),
-            );
-        } else if metadata.is_dir() {
-            walk_files(root, &path, output)?;
-        } else if metadata.is_file() {
-            output.insert(
-                relative,
-                Value::object([
-                    ("kind", Value::string("file")),
-                    ("sha256", Value::string(sha256_bytes(&read_bytes(&path)?))),
-                ]),
-            );
+        match directory.open_child(name) {
+            Ok(DirectoryChild::Directory(child)) => {
+                let identity = child
+                    .identity()
+                    .map_err(|error| EvidenceError(error.to_string()))?;
+                walk_files(&child, &relative_path, output, entry_count, total_bytes)?;
+                require_named_directory_identity(directory, name, identity, &relative_path)?;
+            }
+            Ok(DirectoryChild::Regular(file)) => {
+                let identity = regular_file_identity(&file)
+                    .map_err(|error| EvidenceError(error.to_string()))?;
+                let bytes =
+                    read_opened_regular_file(file, &relative_path, MAX_EVIDENCE_FILE_BYTES)?;
+                *total_bytes = total_bytes
+                    .checked_add(bytes.len())
+                    .ok_or_else(|| EvidenceError("inventory byte total overflowed".into()))?;
+                require(
+                    *total_bytes <= MAX_INVENTORY_BYTES,
+                    "inventory tree exceeds the 1 GiB aggregate byte limit",
+                )?;
+                require_named_file_identity(directory, name, identity, &relative_path)?;
+                output.insert(
+                    relative,
+                    Value::object([
+                        ("kind", Value::string("file")),
+                        ("sha256", Value::string(sha256_bytes(&bytes))),
+                    ]),
+                );
+            }
+            Err(error) if error.raw_os_error() == Some(libc::ELOOP) => {
+                let target = directory
+                    .read_symbolic_link(name)
+                    .map_err(|error| EvidenceError(error.to_string()))?;
+                let target = target
+                    .to_str()
+                    .ok_or_else(|| EvidenceError("symbolic-link target is not UTF-8".into()))?;
+                output.insert(
+                    relative,
+                    Value::object([
+                        ("kind", Value::string("symlink")),
+                        ("target", Value::string(target)),
+                    ]),
+                );
+            }
+            Err(error) => {
+                return Err(EvidenceError(format!(
+                    "cannot inspect inventory entry {}: {error}",
+                    relative_path.display()
+                )));
+            }
         }
     }
-    Ok(())
+    require_unchanged_catalog(directory, &names, relative_directory)
 }
 
 /// Inventory protected package files and explicitly named host artifacts.
 pub fn inventory(root: &Path, extras: &[PathBuf]) -> Result<String> {
     let root = canonical(root)?;
-    require(
-        root.is_dir(),
-        format!("inventory root is not a directory: {}", root.display()),
-    )?;
+    let root_directory = open_absolute_directory(&root, false)
+        .map_err(|error| EvidenceError(format!("cannot open inventory root: {error}")))?;
+    let root_identity = root_directory
+        .identity()
+        .map_err(|error| EvidenceError(error.to_string()))?;
     let mut files = BTreeMap::new();
-    walk_files(&root, &root, &mut files)?;
+    let mut inventory_entries = 0usize;
+    let mut inventory_bytes = 0usize;
+    walk_files(
+        &root_directory,
+        Path::new(""),
+        &mut files,
+        &mut inventory_entries,
+        &mut inventory_bytes,
+    )?;
+    let reopened_root = open_absolute_directory(&root, false)
+        .map_err(|error| EvidenceError(format!("cannot reopen inventory root: {error}")))?;
+    require(
+        reopened_root
+            .identity()
+            .map_err(|error| EvidenceError(error.to_string()))?
+            == root_identity,
+        "inventory root identity changed during traversal",
+    )?;
     let mut extra_files = BTreeMap::new();
     for extra in extras {
         let resolved = canonical(extra)?;
@@ -1192,11 +1548,15 @@ pub fn capture_run(
         "checked-lock provenance mismatch",
     )?;
     let mut seen_artifacts = BTreeSet::new();
-    fs::create_dir_all(evidence_dir.join("machine-results"))
+    let evidence_directory = open_absolute_directory(evidence_dir, true)
         .map_err(|error| EvidenceError(error.to_string()))?;
-    fs::create_dir_all(evidence_dir.join("raw-results"))
+    evidence_directory
+        .open_or_create_directory(OsStr::new("machine-results"), true)
         .map_err(|error| EvidenceError(error.to_string()))?;
-    fs::write(evidence_dir.join("command-result.json"), &command_bytes)
+    evidence_directory
+        .open_or_create_directory(OsStr::new("raw-results"), true)
+        .map_err(|error| EvidenceError(error.to_string()))?;
+    write_regular_file_atomic_no_follow(&evidence_dir.join("command-result.json"), &command_bytes)
         .map_err(|error| EvidenceError(error.to_string()))?;
     let mut records = Vec::new();
     for index in 0..2 {
@@ -1250,13 +1610,16 @@ pub fn capture_run(
             .ok_or_else(|| EvidenceError(format!("proof identity missing for {module}")))?;
         validate_machine_result(&machine, &raw, module, proof, &preflight)?;
         let name = format!("{index:02}-{module}.json");
-        fs::write(
-            evidence_dir.join("machine-results").join(&name),
+        write_regular_file_atomic_no_follow(
+            &evidence_dir.join("machine-results").join(&name),
             &machine_bytes,
         )
         .map_err(|error| EvidenceError(error.to_string()))?;
-        fs::write(evidence_dir.join("raw-results").join(&name), &raw_bytes)
-            .map_err(|error| EvidenceError(error.to_string()))?;
+        write_regular_file_atomic_no_follow(
+            &evidence_dir.join("raw-results").join(&name),
+            &raw_bytes,
+        )
+        .map_err(|error| EvidenceError(error.to_string()))?;
         records.push(Value::object([
             ("artifact_path", Value::string(locator)),
             (
@@ -1464,19 +1827,11 @@ fn resolve_core_identity(core_root: &Path, require_clean: bool) -> Result<Value>
 }
 
 fn rust_identity() -> Result<(String, String)> {
-    let output = Command::new("rustc")
-        .arg("-vV")
-        .output()
-        .map_err(|error| EvidenceError(error.to_string()))?;
-    require(
-        output.status.success(),
-        format!(
-            "rustc -vV failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        ),
-    )?;
-    let text = String::from_utf8(output.stdout)
-        .map_err(|_| EvidenceError("rustc -vV output is not UTF-8".into()))?;
+    // Bind evidence to the compiler that actually built this executable. An
+    // ambient `rustc` on PATH can differ after the build and is not part of
+    // the executable's build closure.
+    let text = String::from_utf8(hex_decode(env!("NPA_CLI_BUILD_RUSTC_VV_HEX"))?)
+        .map_err(|_| EvidenceError("embedded rustc -vV output is not UTF-8".into()))?;
     let mut lines = text.lines();
     let toolchain = lines
         .next()
@@ -1861,19 +2216,20 @@ pub fn check_trace(
         .ok_or_else(|| EvidenceError("trace prefix has no name".into()))?
         .to_string_lossy();
     let parent = trace_prefix.parent().unwrap_or(Path::new("."));
-    let mut trace_files = fs::read_dir(parent)
+    let parent_directory =
+        open_absolute_directory(parent, false).map_err(|error| EvidenceError(error.to_string()))?;
+    let prefix = format!("{prefix_name}.");
+    let mut trace_files = parent_directory
+        .entry_names()
         .map_err(|error| EvidenceError(error.to_string()))?
-        .filter_map(|entry| entry.ok())
-        .filter(|entry| {
-            entry
-                .file_name()
-                .to_string_lossy()
-                .strip_prefix(&format!("{prefix_name}."))
-                .is_some_and(|suffix| suffix.bytes().all(|byte| byte.is_ascii_digit()))
+        .into_iter()
+        .filter_map(|name| {
+            let name_text = name.to_str()?;
+            let suffix = name_text.strip_prefix(&prefix)?;
+            (!suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())).then_some(name)
         })
-        .map(|entry| entry.path())
         .collect::<Vec<_>>();
-    trace_files.sort();
+    trace_files.sort_by(|left, right| left.as_encoded_bytes().cmp(right.as_encoded_bytes()));
     require(
         !trace_files.is_empty(),
         format!("no per-PID trace logs found for {}", trace_prefix.display()),
@@ -1893,11 +2249,19 @@ pub fn check_trace(
     let mut calls = BTreeMap::<u64, Vec<String>>::new();
     let mut checker_argv = BTreeMap::<u64, BTreeMap<String, PathBuf>>::new();
     let mut parent_of = BTreeMap::<u64, u64>::new();
-    for path in &trace_files {
-        let text = fs::read_to_string(path).map_err(|error| {
-            EvidenceError(format!("cannot read trace log {}: {error}", path.display()))
-        })?;
-        let lines = joined_trace_lines(path, &text)?;
+    for file_name in &trace_files {
+        let path = parent.join(file_name);
+        let file = parent_directory
+            .open_regular_file(file_name)
+            .map_err(|error| EvidenceError(format!("cannot open trace log: {error}")))?
+            .ok_or_else(|| EvidenceError("trace log disappeared".into()))?;
+        let identity =
+            regular_file_identity(&file).map_err(|error| EvidenceError(error.to_string()))?;
+        let bytes = read_opened_regular_file(file, &path, MAX_EVIDENCE_FILE_BYTES)?;
+        require_named_file_identity(&parent_directory, file_name, identity, &path)?;
+        let text = std::str::from_utf8(&bytes)
+            .map_err(|_| EvidenceError(format!("trace log is not UTF-8: {}", path.display())))?;
+        let lines = joined_trace_lines(&path, text)?;
         let pid = path
             .extension()
             .and_then(|value| value.to_str())
@@ -2318,16 +2682,130 @@ fn tar_header(name: &str, mode: u32, size: u64, kind: u8) -> Result<[u8; 512]> {
     Ok(header)
 }
 
-fn append_tar_payload(output: &mut Vec<u8>, bytes: &[u8]) {
-    output.extend_from_slice(bytes);
-    let remainder = bytes.len() % 512;
-    if remainder != 0 {
-        output.resize(output.len() + 512 - remainder, 0);
+const fn gzip_crc32_table() -> [u32; 256] {
+    let mut table = [0u32; 256];
+    let mut index = 0usize;
+    while index < table.len() {
+        let mut value = index as u32;
+        let mut bit = 0;
+        while bit < 8 {
+            value = if value & 1 == 1 {
+                0xedb8_8320 ^ (value >> 1)
+            } else {
+                value >> 1
+            };
+            bit += 1;
+        }
+        table[index] = value;
+        index += 1;
+    }
+    table
+}
+
+const GZIP_CRC32_TABLE: [u32; 256] = gzip_crc32_table();
+
+/// Deterministic gzip stream using bounded, uncompressed DEFLATE blocks.
+///
+/// Stored blocks avoid an external compressor process and its bidirectional
+/// pipe/deadline hazards. The archive remains an ordinary RFC 1952 gzip file;
+/// compression ratio is intentionally traded for a closed memory/work bound.
+struct DeterministicGzip {
+    bytes: Vec<u8>,
+    crc32: u32,
+    input_bytes: usize,
+}
+
+impl DeterministicGzip {
+    fn new() -> Self {
+        Self {
+            // ID1, ID2, CM=deflate, FLG=0, MTIME=0, XFL=0, OS=unknown.
+            bytes: vec![0x1f, 0x8b, 0x08, 0, 0, 0, 0, 0, 0, 255],
+            crc32: u32::MAX,
+            input_bytes: 0,
+        }
+    }
+
+    fn write_tar_bytes(&mut self, bytes: &[u8]) -> Result<()> {
+        let next_input = self
+            .input_bytes
+            .checked_add(bytes.len())
+            .ok_or_else(|| EvidenceError("archive tar size overflowed".into()))?;
+        require(
+            next_input <= MAX_ARCHIVE_TAR_BYTES,
+            format!("archive tar exceeds the {MAX_ARCHIVE_TAR_BYTES} byte limit"),
+        )?;
+        let block_count = bytes.len().div_ceil(usize::from(u16::MAX));
+        let encoded_bytes = bytes
+            .len()
+            .checked_add(block_count.saturating_mul(5))
+            .ok_or_else(|| EvidenceError("archive gzip size overflowed".into()))?;
+        let next_output = self
+            .bytes
+            .len()
+            .checked_add(encoded_bytes)
+            .ok_or_else(|| EvidenceError("archive gzip size overflowed".into()))?;
+        require(
+            next_output <= MAX_ARCHIVE_GZIP_BYTES,
+            format!("archive gzip exceeds the {MAX_ARCHIVE_GZIP_BYTES} byte limit"),
+        )?;
+        self.bytes
+            .try_reserve_exact(encoded_bytes)
+            .map_err(|_| EvidenceError("cannot reserve bounded archive gzip output".into()))?;
+        for chunk in bytes.chunks(usize::from(u16::MAX)) {
+            // BFINAL=0, BTYPE=00, followed by byte alignment already provided
+            // by the dedicated header byte.
+            self.bytes.push(0);
+            let length = u16::try_from(chunk.len())
+                .map_err(|_| EvidenceError("stored DEFLATE block overflowed".into()))?;
+            self.bytes.extend_from_slice(&length.to_le_bytes());
+            self.bytes.extend_from_slice(&(!length).to_le_bytes());
+            self.bytes.extend_from_slice(chunk);
+        }
+        for byte in bytes {
+            let table_index = usize::try_from((self.crc32 ^ u32::from(*byte)) & 0xff)
+                .map_err(|_| EvidenceError("gzip CRC index overflowed".into()))?;
+            self.crc32 = GZIP_CRC32_TABLE[table_index] ^ (self.crc32 >> 8);
+        }
+        self.input_bytes = next_input;
+        Ok(())
+    }
+
+    fn write_zeroes(&mut self, mut count: usize) -> Result<()> {
+        const ZEROES: [u8; 8192] = [0; 8192];
+        while count != 0 {
+            let chunk = count.min(ZEROES.len());
+            self.write_tar_bytes(&ZEROES[..chunk])?;
+            count -= chunk;
+        }
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<Vec<u8>> {
+        // Empty final stored block: BFINAL=1, BTYPE=00, LEN=0, NLEN=0xffff.
+        self.bytes.extend_from_slice(&[1, 0, 0, 0xff, 0xff]);
+        self.bytes.extend_from_slice(&(!self.crc32).to_le_bytes());
+        let input_size = u32::try_from(self.input_bytes)
+            .map_err(|_| EvidenceError("gzip input size overflowed".into()))?;
+        self.bytes.extend_from_slice(&input_size.to_le_bytes());
+        require(
+            self.bytes.len() <= MAX_ARCHIVE_GZIP_BYTES,
+            format!("archive gzip exceeds the {MAX_ARCHIVE_GZIP_BYTES} byte limit"),
+        )?;
+        Ok(self.bytes)
     }
 }
 
+fn append_tar_payload(output: &mut DeterministicGzip, bytes: &[u8]) -> Result<()> {
+    output.write_tar_bytes(bytes)?;
+    let remainder = bytes.len() % 512;
+    if remainder != 0 {
+        output.write_zeroes(512 - remainder)?;
+    }
+    Ok(())
+}
+
 fn append_tar_entry(
-    output: &mut Vec<u8>,
+    output: &mut DeterministicGzip,
     name: &str,
     mode: u32,
     kind: u8,
@@ -2336,94 +2814,220 @@ fn append_tar_entry(
     if name.len() > 100 {
         let mut long_name = name.as_bytes().to_vec();
         long_name.push(0);
-        output.extend_from_slice(&tar_header(
+        output.write_tar_bytes(&tar_header(
             "././@LongLink",
             0,
             long_name.len() as u64,
             b'L',
-        )?);
-        append_tar_payload(output, &long_name);
+        )?)?;
+        append_tar_payload(output, &long_name)?;
     }
-    output.extend_from_slice(&tar_header(name, mode, bytes.len() as u64, kind)?);
-    append_tar_payload(output, bytes);
+    output.write_tar_bytes(&tar_header(name, mode, bytes.len() as u64, kind)?)?;
+    append_tar_payload(output, bytes)?;
     Ok(())
 }
 
-fn collect_archive_paths(directory: &Path, output: &mut Vec<PathBuf>) -> Result<()> {
-    let mut entries = fs::read_dir(directory)
-        .map_err(|error| EvidenceError(format!("cannot read archive input: {error}")))?
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(|error| EvidenceError(format!("cannot read archive input: {error}")))?;
-    entries.sort_by_key(|entry| entry.path());
-    for entry in entries {
-        let path = entry.path();
-        let metadata = fs::symlink_metadata(&path)
-            .map_err(|error| EvidenceError(format!("cannot inspect archive input: {error}")))?;
-        require(
-            metadata.is_dir() || metadata.is_file(),
-            format!(
-                "archive input has unsupported file type: {}",
-                path.display()
-            ),
-        )?;
-        output.push(path.clone());
-        if metadata.is_dir() {
-            collect_archive_paths(&path, output)?;
-        }
-    }
-    Ok(())
-}
-
-fn write_deterministic_generated_archive(generated: &Path, archive: &Path) -> Result<()> {
-    require(generated.is_dir(), "final generated tree is missing")?;
-    let mut paths = vec![generated.to_path_buf()];
-    collect_archive_paths(generated, &mut paths)?;
-    let mut tar_bytes = Vec::new();
-    for path in paths {
-        let metadata = fs::symlink_metadata(&path)
-            .map_err(|error| EvidenceError(format!("cannot inspect archive input: {error}")))?;
-        let relative = path.strip_prefix(generated).unwrap();
-        let mut name = Path::new("proofs/generated")
-            .join(relative)
-            .to_string_lossy()
-            .replace('\\', "/");
-        if metadata.is_dir() {
-            if !name.ends_with('/') {
-                name.push('/');
-            }
-            append_tar_entry(&mut tar_bytes, &name, 0o755, b'5', &[])?;
-        } else {
-            append_tar_entry(&mut tar_bytes, &name, 0o644, b'0', &read_bytes(&path)?)?;
-        }
-    }
-    tar_bytes.resize(tar_bytes.len() + 1024, 0);
-    let remainder = tar_bytes.len() % 10_240;
+fn write_deterministic_generated_archive(
+    generated: &Path,
+    archive: &Path,
+) -> Result<BTreeMap<String, String>> {
+    let generated_directory = open_absolute_directory(generated, false)
+        .map_err(|error| EvidenceError(format!("cannot open generated tree: {error}")))?;
+    let generated_identity = generated_directory
+        .identity()
+        .map_err(|error| EvidenceError(error.to_string()))?;
+    let mut gzip = DeterministicGzip::new();
+    append_tar_entry(&mut gzip, "proofs/generated/", 0o755, b'5', &[])?;
+    let mut archive_entries = 0usize;
+    let mut archive_payload_bytes = 0usize;
+    let mut snapshot_files = BTreeMap::new();
+    append_open_directory_to_tar_iterative(
+        &generated_directory,
+        Path::new("proofs/generated"),
+        &mut gzip,
+        &mut archive_entries,
+        &mut archive_payload_bytes,
+        &mut snapshot_files,
+    )?;
+    let reopened_generated = open_absolute_directory(generated, false)
+        .map_err(|error| EvidenceError(format!("cannot reopen generated tree: {error}")))?;
+    require(
+        reopened_generated
+            .identity()
+            .map_err(|error| EvidenceError(error.to_string()))?
+            == generated_identity,
+        "generated tree identity changed during archive creation",
+    )?;
+    gzip.write_zeroes(1024)?;
+    let remainder = gzip.input_bytes % 10_240;
     if remainder != 0 {
-        tar_bytes.resize(tar_bytes.len() + 10_240 - remainder, 0);
+        gzip.write_zeroes(10_240 - remainder)?;
     }
-    let tar_path = archive.with_extension("tar.tmp");
-    fs::write(&tar_path, tar_bytes).map_err(|error| EvidenceError(error.to_string()))?;
-    let compressed = Command::new("gzip")
-        .args(["-9n", "-c"])
-        .arg(&tar_path)
-        .output()
-        .map_err(|error| EvidenceError(format!("cannot execute gzip: {error}")))?;
-    let _ = fs::remove_file(&tar_path);
-    require(
-        compressed.status.success(),
-        format!(
-            "gzip failed: {}",
-            String::from_utf8_lossy(&compressed.stderr).trim()
-        ),
-    )?;
-    let mut gzip_bytes = compressed.stdout;
-    require(
-        gzip_bytes.len() >= 10 && gzip_bytes[..3] == [0x1f, 0x8b, 0x08],
-        "gzip output has an invalid header",
-    )?;
-    gzip_bytes[8] = 2;
-    gzip_bytes[9] = 255;
-    fs::write(archive, gzip_bytes).map_err(|error| EvidenceError(error.to_string()))
+    let gzip_bytes = gzip.finish()?;
+    write_regular_file_atomic_no_follow(archive, &gzip_bytes)
+        .map_err(|error| EvidenceError(error.to_string()))?;
+    Ok(snapshot_files)
+}
+
+struct ArchiveFrame<'a> {
+    directory: &'a Directory,
+    owned_directory: Option<Directory>,
+    archive_directory: PathBuf,
+    names: Vec<OsString>,
+    next_name: usize,
+    parent_binding: Option<(OsString, Identity)>,
+}
+
+impl<'a> ArchiveFrame<'a> {
+    fn directory(&self) -> &Directory {
+        self.owned_directory.as_ref().unwrap_or(self.directory)
+    }
+}
+
+fn sorted_archive_names(directory: &Directory) -> Result<Vec<OsString>> {
+    let mut names = directory
+        .entry_names()
+        .map_err(|error| EvidenceError(format!("cannot list archive input: {error}")))?;
+    names.sort_by(|left, right| left.as_encoded_bytes().cmp(right.as_encoded_bytes()));
+    Ok(names)
+}
+
+fn append_open_directory_to_tar_iterative(
+    directory: &Directory,
+    archive_directory: &Path,
+    output: &mut DeterministicGzip,
+    entry_count: &mut usize,
+    payload_bytes: &mut usize,
+    snapshot_files: &mut BTreeMap<String, String>,
+) -> Result<()> {
+    let mut path_bytes = 0usize;
+    let mut stack = vec![ArchiveFrame {
+        directory,
+        owned_directory: None,
+        archive_directory: archive_directory.to_path_buf(),
+        names: sorted_archive_names(directory)?,
+        next_name: 0,
+        parent_binding: None,
+    }];
+    while !stack.is_empty() {
+        let completed = {
+            let frame = stack.last().expect("nonempty archive traversal stack");
+            frame.next_name == frame.names.len()
+        };
+        if completed {
+            let frame = stack.pop().expect("nonempty archive traversal stack");
+            require_unchanged_catalog(frame.directory(), &frame.names, &frame.archive_directory)?;
+            if let Some((name, identity)) = frame.parent_binding {
+                let parent = stack
+                    .last()
+                    .ok_or_else(|| EvidenceError("archive traversal lost its parent".into()))?;
+                require_named_directory_identity(
+                    parent.directory(),
+                    &name,
+                    identity,
+                    &frame.archive_directory,
+                )?;
+            }
+            continue;
+        }
+        let (name, archive_path) = {
+            let frame = stack.last_mut().expect("nonempty archive traversal stack");
+            let name = frame.names[frame.next_name].clone();
+            frame.next_name += 1;
+            let archive_path = frame.archive_directory.join(&name);
+            (name, archive_path)
+        };
+        *entry_count = entry_count
+            .checked_add(1)
+            .ok_or_else(|| EvidenceError("archive entry count overflowed".into()))?;
+        require(
+            *entry_count <= MAX_ARCHIVE_ENTRIES,
+            "archive input exceeds the 65536 entry limit",
+        )?;
+        let archive_name = archive_path
+            .to_str()
+            .ok_or_else(|| EvidenceError("archive input path is not UTF-8".into()))?
+            .replace('\\', "/");
+        path_bytes = path_bytes
+            .checked_add(archive_name.len())
+            .ok_or_else(|| EvidenceError("archive path budget overflowed".into()))?;
+        require(
+            path_bytes <= MAX_ARCHIVE_PATH_BYTES,
+            format!("archive paths exceed the {MAX_ARCHIVE_PATH_BYTES} byte limit"),
+        )?;
+        let child = stack
+            .last()
+            .expect("nonempty archive traversal stack")
+            .directory()
+            .open_child(&name);
+        match child {
+            Ok(DirectoryChild::Directory(child)) => {
+                require(
+                    stack.len() <= MAX_ARCHIVE_DEPTH,
+                    format!("archive input exceeds the {MAX_ARCHIVE_DEPTH} depth limit"),
+                )?;
+                let identity = child
+                    .identity()
+                    .map_err(|error| EvidenceError(error.to_string()))?;
+                append_tar_entry(output, &format!("{archive_name}/"), 0o755, b'5', &[])?;
+                let names = sorted_archive_names(&child)?;
+                stack.push(ArchiveFrame {
+                    directory,
+                    owned_directory: Some(child),
+                    archive_directory: archive_path,
+                    names,
+                    next_name: 0,
+                    parent_binding: Some((name, identity)),
+                });
+            }
+            Ok(DirectoryChild::Regular(file)) => {
+                let identity = regular_file_identity(&file)
+                    .map_err(|error| EvidenceError(error.to_string()))?;
+                let remaining_payload = MAX_ARCHIVE_PAYLOAD_BYTES
+                    .checked_sub(*payload_bytes)
+                    .ok_or_else(|| EvidenceError("archive payload budget underflowed".into()))?;
+                let bytes = read_opened_regular_file(
+                    file,
+                    &archive_path,
+                    remaining_payload.min(MAX_EVIDENCE_FILE_BYTES),
+                )?;
+                *payload_bytes = payload_bytes
+                    .checked_add(bytes.len())
+                    .ok_or_else(|| EvidenceError("archive payload size overflowed".into()))?;
+                require(
+                    *payload_bytes <= MAX_ARCHIVE_PAYLOAD_BYTES,
+                    "archive input exceeds the 1 GiB aggregate byte limit",
+                )?;
+                require_named_file_identity(
+                    stack
+                        .last()
+                        .expect("nonempty archive traversal stack")
+                        .directory(),
+                    &name,
+                    identity,
+                    &archive_path,
+                )?;
+                append_tar_entry(output, &archive_name, 0o644, b'0', &bytes)?;
+                if let Some(relative) = archive_name.strip_prefix("proofs/generated/") {
+                    if !relative.contains('/') && RETAINED_JSON.contains(&relative) {
+                        require(
+                            snapshot_files
+                                .insert(archive_name, sha256_hex(&bytes))
+                                .is_none(),
+                            "archive snapshot contains a duplicate retained file",
+                        )?;
+                    }
+                }
+            }
+            Err(error) => {
+                return Err(EvidenceError(format!(
+                    "archive input has unsupported entry {}: {error}",
+                    archive_path.display()
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn rehash_build_inputs(source_root: &Path, core_root: &Path, build: &Value) -> Result<()> {
@@ -2522,15 +3126,7 @@ pub fn build_release(
     require_current_schema(&capture, "capture.v1", "capture")?;
     rehash_build_inputs(&source_root, &core_root, &build)?;
     let generated = package_root.join("generated");
-    let mut top_json = fs::read_dir(&generated)
-        .map_err(|error| EvidenceError(error.to_string()))?
-        .filter_map(|entry| entry.ok())
-        .filter(|entry| {
-            entry.path().is_file() && entry.path().extension().is_some_and(|ext| ext == "json")
-        })
-        .map(|entry| entry.file_name().to_string_lossy().into_owned())
-        .collect::<Vec<_>>();
-    top_json.sort();
+    let top_json = direct_regular_names_with_extension(&generated, "json")?;
     require(
         top_json == RETAINED_JSON,
         format!("retained top-level JSON mismatch: got {top_json:?}"),
@@ -2550,28 +3146,32 @@ pub fn build_release(
         !contains_object_field(&command_result, "kernel_fuel"),
         "external checker evidence must not contain a fast-kernel fuel report",
     )?;
-    fs::create_dir_all(assets_root).map_err(|error| EvidenceError(error.to_string()))?;
+    let assets_directory = open_absolute_directory(assets_root, true)
+        .map_err(|error| EvidenceError(error.to_string()))?;
     require(
-        fs::read_dir(assets_root)
+        assets_directory
+            .entry_names()
             .map_err(|error| EvidenceError(error.to_string()))?
-            .next()
-            .is_none(),
+            .is_empty(),
         format!(
             "release assets directory is not empty: {}",
             assets_root.display()
         ),
     )?;
     let archive = assets_root.join(ARCHIVE_NAME);
-    write_deterministic_generated_archive(&generated, &archive)?;
+    let archive_snapshot = write_deterministic_generated_archive(&generated, &archive)?;
     let generated_files = RETAINED_JSON
         .into_iter()
         .map(|name| {
+            let archive_path = format!("proofs/generated/{name}");
+            let sha256 = archive_snapshot.get(&archive_path).ok_or_else(|| {
+                EvidenceError(format!(
+                    "retained file is absent from archive snapshot: {name}"
+                ))
+            })?;
             Ok(Value::object([
-                ("path", Value::string(format!("proofs/generated/{name}"))),
-                (
-                    "sha256",
-                    Value::string(sha256_hex(&read_bytes(&generated.join(name))?)),
-                ),
+                ("path", Value::string(archive_path)),
+                ("sha256", Value::string(sha256)),
             ]))
         })
         .collect::<Result<Vec<_>>>()?;
@@ -2592,7 +3192,8 @@ pub fn build_release(
     )
     .unwrap();
     let checksum = assets_root.join(CHECKSUM_NAME);
-    fs::write(&checksum, checksum_text).map_err(|error| EvidenceError(error.to_string()))?;
+    write_regular_file_atomic_no_follow(&checksum, checksum_text.as_bytes())
+        .map_err(|error| EvidenceError(error.to_string()))?;
     let command = direct_command(required_string(&preflight, "runner_policy_sha256")?);
     let external = Value::object([
         (
@@ -2674,9 +3275,14 @@ pub fn build_release(
         ),
         (
             "package_lock_sha256",
-            Value::string(sha256_bytes(&read_bytes(
-                &generated.join("package-lock.json"),
-            )?)),
+            Value::string(format!(
+                "sha256:{}",
+                archive_snapshot
+                    .get("proofs/generated/package-lock.json")
+                    .ok_or_else(|| {
+                        EvidenceError("package lock is absent from archive snapshot".into())
+                    })?
+            )),
         ),
         ("rust_target", required_value(&build, "rust_target")?),
         ("rust_toolchain", required_value(&build, "rust_toolchain")?),
@@ -2733,6 +3339,40 @@ pub fn build_release(
         ("status", Value::string("passed")),
     ])
     .canonical())
+}
+
+fn direct_regular_names_with_extension(directory: &Path, extension: &str) -> Result<Vec<String>> {
+    let directory = open_absolute_directory(directory, false)
+        .map_err(|error| EvidenceError(error.to_string()))?;
+    let mut names = directory
+        .entry_names()
+        .map_err(|error| EvidenceError(error.to_string()))?;
+    names.sort_by(|left, right| left.as_encoded_bytes().cmp(right.as_encoded_bytes()));
+    let mut matches = Vec::new();
+    for name in &names {
+        if Path::new(&name).extension().and_then(OsStr::to_str) != Some(extension) {
+            continue;
+        }
+        match directory.open_child(name) {
+            Ok(DirectoryChild::Regular(_)) => matches.push(
+                name.clone()
+                    .into_string()
+                    .map_err(|_| EvidenceError("generated file name is not UTF-8".into()))?,
+            ),
+            Ok(DirectoryChild::Directory(_)) => {
+                return Err(EvidenceError(
+                    "generated JSON entry is not a regular file".into(),
+                ));
+            }
+            Err(error) => {
+                return Err(EvidenceError(format!(
+                    "cannot inspect generated JSON entry: {error}"
+                )));
+            }
+        }
+    }
+    require_unchanged_catalog(&directory, &names, Path::new("generated"))?;
+    Ok(matches)
 }
 
 /// Read a scalar field from a duplicate-free JSON document for Shell orchestration.
@@ -2835,6 +3475,29 @@ pub fn contract() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_command_enforces_output_and_deadline_limits() {
+        let mut success = Command::new("/usr/bin/printf");
+        success.arg("ok");
+        let (status, stdout, stderr) =
+            run_bounded_command(&mut success, Duration::from_secs(5), 16, 16).unwrap();
+        assert!(status.success());
+        assert_eq!(stdout, b"ok");
+        assert!(stderr.is_empty());
+
+        let mut flood = Command::new("/usr/bin/yes");
+        let error =
+            run_bounded_command(&mut flood, Duration::from_secs(5), 1_024, 1_024).unwrap_err();
+        assert!(error.to_string().contains("byte limit"), "{error}");
+
+        let mut hang = Command::new("/bin/sleep");
+        hang.arg("1");
+        let error = run_bounded_command(&mut hang, Duration::from_millis(10), 16, 16).unwrap_err();
+        assert!(error.to_string().contains("deadline"), "{error}");
+    }
+    use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp(label: &str) -> PathBuf {
@@ -2975,7 +3638,7 @@ mod tests {
     }
 
     #[test]
-    fn archive_matches_frozen_python_gnu_tar_gzip_bytes() {
+    fn archive_is_deterministic_and_binds_only_retained_file_hashes() {
         let root = temp("archive");
         let generated = root.join("proofs/generated");
         let result = generated.join(
@@ -2986,14 +3649,119 @@ mod tests {
         fs::write(&result, "{\"status\":\"checked\"}\n").unwrap();
         let first = root.join("first.tar.gz");
         let second = root.join("second.tar.gz");
-        write_deterministic_generated_archive(&generated, &first).unwrap();
-        write_deterministic_generated_archive(&generated, &second).unwrap();
+        let first_snapshot = write_deterministic_generated_archive(&generated, &first).unwrap();
+        fs::write(generated.join("package-lock.json"), "{\"a\":2}\n").unwrap();
+        let second_snapshot = write_deterministic_generated_archive(&generated, &second).unwrap();
+        assert_eq!(
+            first_snapshot["proofs/generated/package-lock.json"],
+            sha256_hex(b"{\"a\":1}\n")
+        );
+        assert_eq!(
+            second_snapshot["proofs/generated/package-lock.json"],
+            sha256_hex(b"{\"a\":2}\n")
+        );
         let first_bytes = fs::read(&first).unwrap();
-        assert_eq!(first_bytes, fs::read(&second).unwrap());
+        assert_ne!(first_bytes, fs::read(&second).unwrap());
         assert_eq!(
             sha256_hex(&first_bytes),
-            "409a42cd7707b80f4f8cc17353c9dd6a733ed33c37ed56df2c0c17efb5552047"
+            "3e7c6aeaa189acd48dc03ac105cf3f96d874d3c96998848b6a0add854d31ee4d"
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn deterministic_gzip_stored_blocks_round_trip_without_a_child_process() {
+        let payload = (0u8..=255).cycle().take(70_000).collect::<Vec<_>>();
+        let mut gzip = DeterministicGzip::new();
+        gzip.write_tar_bytes(&payload).unwrap();
+        let encoded = gzip.finish().unwrap();
+
+        assert_eq!(&encoded[..10], &[0x1f, 0x8b, 0x08, 0, 0, 0, 0, 0, 0, 255]);
+        let mut cursor = 10usize;
+        let mut decoded = Vec::new();
+        loop {
+            let header = encoded[cursor];
+            cursor += 1;
+            assert!(header == 0 || header == 1);
+            let length = u16::from_le_bytes([encoded[cursor], encoded[cursor + 1]]);
+            let inverse = u16::from_le_bytes([encoded[cursor + 2], encoded[cursor + 3]]);
+            cursor += 4;
+            assert_eq!(length, !inverse);
+            let end = cursor + usize::from(length);
+            decoded.extend_from_slice(&encoded[cursor..end]);
+            cursor = end;
+            if header == 1 {
+                break;
+            }
+        }
+        let expected_crc = payload.iter().fold(u32::MAX, |crc, byte| {
+            GZIP_CRC32_TABLE[((crc ^ u32::from(*byte)) & 0xff) as usize] ^ (crc >> 8)
+        });
+        assert_eq!(
+            u32::from_le_bytes(encoded[cursor..cursor + 4].try_into().unwrap()),
+            !expected_crc
+        );
+        cursor += 4;
+        assert_eq!(
+            u32::from_le_bytes(encoded[cursor..cursor + 4].try_into().unwrap()),
+            payload.len() as u32
+        );
+        cursor += 4;
+        assert_eq!(cursor, encoded.len());
+        assert_eq!(decoded, payload);
+    }
+
+    #[test]
+    fn archive_rejects_depth_and_payload_before_publication() {
+        let root = temp("archive-bounds");
+        let generated = root.join("proofs/generated");
+        fs::create_dir_all(&generated).unwrap();
+        let archive = root.join("bounded.tar.gz");
+
+        let oversized = generated.join("oversized.bin");
+        let file = fs::File::create(&oversized).unwrap();
+        file.set_len((MAX_ARCHIVE_PAYLOAD_BYTES + 1) as u64)
+            .unwrap();
+        let error = write_deterministic_generated_archive(&generated, &archive).unwrap_err();
+        assert!(
+            error.to_string().contains("evidence input exceeds"),
+            "{error}"
+        );
+        assert!(!archive.exists());
+        fs::remove_file(&oversized).unwrap();
+
+        let mut current = generated.clone();
+        for _ in 0..=MAX_ARCHIVE_DEPTH {
+            current.push("d");
+            fs::create_dir(&current).unwrap();
+        }
+        let error = write_deterministic_generated_archive(&generated, &archive).unwrap_err();
+        assert!(error.to_string().contains("depth limit"), "{error}");
+        assert!(!archive.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn evidence_inputs_and_publication_reject_symlink_components_and_oversize_files() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp("filesystem-boundary");
+        let real = root.join("real");
+        fs::create_dir(&real).unwrap();
+        fs::write(real.join("input.json"), b"{}\n").unwrap();
+        symlink(&real, root.join("linked")).unwrap();
+        assert!(Value::parse_file(&root.join("linked/input.json")).is_err());
+
+        let huge = root.join("huge.json");
+        let file = std::fs::File::create(&huge).unwrap();
+        file.set_len(MAX_EVIDENCE_FILE_BYTES as u64 + 1).unwrap();
+        assert!(Value::parse_file(&huge).is_err());
+
+        let published = root.join("published.json");
+        symlink(real.join("input.json"), &published).unwrap();
+        assert!(write_json(&published, &Value::object([("ok", Value::Bool(true))])).is_err());
+        assert_eq!(fs::read(real.join("input.json")).unwrap(), b"{}\n");
         fs::remove_dir_all(root).unwrap();
     }
 }

@@ -1,6 +1,6 @@
 //! Source-free package artifact extraction loading for CLR-05 commands.
 
-use std::{fs, io, path::Path};
+use std::{io, path::Path};
 
 use npa_api::{
     build_package_audit_snapshot_source_free, extract_package_artifacts_source_free,
@@ -20,8 +20,10 @@ use crate::args::{PackageCheckGeneratedOptions, PackageCommonOptions, PackageTim
 use crate::diagnostic::{
     CommandArtifact, CommandDiagnostic, CommandResult, CommandStatus, DiagnosticKind,
 };
-use crate::fs::{join_package_path, render_package_path};
-use crate::generated_artifact_writer::read_regular_file_no_follow;
+use crate::fs::render_package_path;
+use crate::generated_artifact_writer::{
+    read_package_generated_artifact_no_follow, read_package_regular_file_no_follow,
+};
 use crate::package::{load_package_root, LoadedPackageRoot};
 use crate::package_axiom_report::run_package_axiom_report_check_with_snapshot;
 use crate::package_export_summary::run_package_export_summary_check_with_snapshot;
@@ -748,9 +750,13 @@ fn read_package_lock(
     loaded: &LoadedPackageRoot,
 ) -> Result<(String, PackageLockManifest), Box<CommandDiagnostic>> {
     let lock_path = PackagePath::new(PACKAGE_LOCK_PATH);
-    let full_lock_path = join_package_path(&loaded.root, &lock_path, "package_lock.path")?;
-    let lock_source = match fs::read_to_string(&full_lock_path) {
-        Ok(source) => source,
+    let lock_source = match read_package_regular_file_no_follow(&loaded.root, &lock_path) {
+        Ok(bytes) => String::from_utf8(bytes).map_err(|_| {
+            Box::new(
+                CommandDiagnostic::error(DiagnosticKind::ArtifactIo, "package_lock_missing")
+                    .with_path(PACKAGE_LOCK_PATH),
+            )
+        })?,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             return Err(Box::new(
                 CommandDiagnostic::error(DiagnosticKind::PackageLock, "package_lock_missing")
@@ -815,8 +821,8 @@ fn read_certificate_bytes(
     manifest_field_path: impl Into<String>,
     module: Option<&Name>,
 ) -> Result<Vec<u8>, Box<CommandDiagnostic>> {
-    let full_path = join_package_path(&loaded.root, package_path, manifest_field_path)?;
-    fs::read(full_path).map_err(|_| {
+    let _ = manifest_field_path.into();
+    read_package_regular_file_no_follow(&loaded.root, package_path).map_err(|_| {
         let mut diagnostic =
             CommandDiagnostic::error(DiagnosticKind::ArtifactIo, "certificate_missing")
                 .with_path(render_package_path(package_path));
@@ -893,34 +899,13 @@ fn read_checked_theorem_premise_report(
                 .with_path(PACKAGE_THEOREM_PREMISE_REPORT_PATH),
         )
     };
-    let generated = loaded.root.join("generated");
-    let parent = match fs::symlink_metadata(&generated) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return Err(failure("theorem_premise_report_missing"));
-        }
-        Err(_) => return Err(failure("generated_artifact_read_failed")),
-    };
-    let parent_type = parent.file_type();
-    if !parent_type.is_dir() || parent_type.is_symlink() {
-        return Err(failure("generated_artifact_read_failed"));
-    }
-
-    let target = generated.join("theorem-premise-report.json");
-    let metadata = match fs::symlink_metadata(&target) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return Err(failure("theorem_premise_report_missing"));
-        }
-        Err(_) => return Err(failure("generated_artifact_read_failed")),
-    };
-    let file_type = metadata.file_type();
-    if !file_type.is_file() || file_type.is_symlink() {
-        return Err(failure("generated_artifact_read_failed"));
-    }
-    let bytes = read_regular_file_no_follow(&target)
-        .map_err(|_| failure("generated_artifact_read_failed"))?;
-    String::from_utf8(bytes).map_err(|_| failure("generated_artifact_read_failed"))
+    crate::theorem_premise_report_storage::read_report(&loaded.root).map_err(|error| {
+        failure(if error.kind() == io::ErrorKind::NotFound {
+            "theorem_premise_report_missing"
+        } else {
+            "generated_artifact_read_failed"
+        })
+    })
 }
 
 fn read_generated_artifact(
@@ -930,14 +915,21 @@ fn read_generated_artifact(
     missing_reason: &str,
 ) -> Result<String, Box<CommandDiagnostic>> {
     let package_path = PackagePath::new(package_path);
-    let full_path = join_package_path(&loaded.root, &package_path, "generated_artifact.path")?;
-    fs::read_to_string(full_path).map_err(|error| {
-        let reason = if error.kind() == io::ErrorKind::NotFound {
-            missing_reason
-        } else {
-            "generated_artifact_read_failed"
-        };
-        Box::new(CommandDiagnostic::error(kind, reason).with_path(package_path.as_str()))
+    let bytes = read_package_generated_artifact_no_follow(&loaded.root, &package_path).map_err(
+        |error| {
+            let reason = if error.kind() == io::ErrorKind::NotFound {
+                missing_reason
+            } else {
+                "generated_artifact_read_failed"
+            };
+            Box::new(CommandDiagnostic::error(kind, reason).with_path(package_path.as_str()))
+        },
+    )?;
+    String::from_utf8(bytes).map_err(|_| {
+        Box::new(
+            CommandDiagnostic::error(kind, "generated_artifact_read_failed")
+                .with_path(package_path.as_str()),
+        )
     })
 }
 

@@ -1,14 +1,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::resolver::{
-    find_unique_verified_import_by_module, verified_import_identity, VerifiedImportIdentity,
-    VerifiedImportLookupError,
+    find_unique_verified_import_by_module, verified_import_identity, FrontendImportView,
+    VerifiedImportIdentity, VerifiedImportLookupError,
 };
 use crate::{
-    DefinitionReducibility, HumanAxiomDecl, HumanBinder, HumanBinderInfo, HumanBinderKind,
-    HumanClassDecl, HumanClassFieldDecl, HumanCompileOptions, HumanDecl, HumanDeclValue,
-    HumanDiagnostic, HumanDiagnosticKind, HumanDiagnosticPayload, HumanDiagnosticPhase,
-    HumanEquationDecl, HumanEquationRow, HumanExpr, HumanFrontendState,
+    DefinitionReducibility, HumanAuthoringImport, HumanAxiomDecl, HumanBinder, HumanBinderInfo,
+    HumanBinderKind, HumanClassDecl, HumanClassFieldDecl, HumanCompileOptions, HumanDecl,
+    HumanDeclValue, HumanDiagnostic, HumanDiagnosticKind, HumanDiagnosticPayload,
+    HumanDiagnosticPhase, HumanEquationDecl, HumanEquationRow, HumanExpr, HumanFrontendState,
     HumanGeneratedDeclarationKind, HumanGeneratedDeclarationMetadata, HumanImportedSourceInterface,
     HumanInductiveDecl, HumanInstanceDecl, HumanItem, HumanModule, HumanName,
     HumanNotationAssociativity, HumanNotationHead, HumanNotationKind, HumanOpenScope,
@@ -174,10 +174,59 @@ pub fn resolve_human_module_with_source_interfaces(
     imported_source_interfaces: &[HumanImportedSourceInterface],
     options: &HumanCompileOptions,
 ) -> HumanResult<ResolvedHumanModule> {
-    HumanResolver::new(module_name, verified_imports, options)
+    resolve_human_module_with_import_views(
+        module_name,
+        module,
+        verified_imports,
+        imported_source_interfaces,
+        options,
+    )
+}
+
+fn resolve_human_module_with_import_views<T: FrontendImportView>(
+    module_name: npa_cert::ModuleName,
+    module: HumanModule,
+    imports: &[T],
+    imported_source_interfaces: &[HumanImportedSourceInterface],
+    options: &HumanCompileOptions,
+) -> HumanResult<ResolvedHumanModule> {
+    HumanResolver::new(module_name, imports, options)
         .with_imported_source_interfaces(imported_source_interfaces)
         .resolve_module(module)
         .map_err(|diagnostic| diagnostic.with_default_phase(HumanDiagnosticPhase::Resolver))
+}
+
+/// Resolve Human source against opaque command-local authoring imports.
+pub fn resolve_human_module_with_authoring_imports(
+    module_name: npa_cert::ModuleName,
+    module: HumanModule,
+    authoring_imports: &[HumanAuthoringImport<'_>],
+    options: &HumanCompileOptions,
+) -> HumanResult<ResolvedHumanModule> {
+    resolve_human_module_with_authoring_imports_and_source_interfaces(
+        module_name,
+        module,
+        authoring_imports,
+        &[],
+        options,
+    )
+}
+
+/// Resolve Human source and imported metadata through the authoring-only lane.
+pub fn resolve_human_module_with_authoring_imports_and_source_interfaces(
+    module_name: npa_cert::ModuleName,
+    module: HumanModule,
+    authoring_imports: &[HumanAuthoringImport<'_>],
+    imported_source_interfaces: &[HumanImportedSourceInterface],
+    options: &HumanCompileOptions,
+) -> HumanResult<ResolvedHumanModule> {
+    resolve_human_module_with_import_views(
+        module_name,
+        module,
+        authoring_imports,
+        imported_source_interfaces,
+        options,
+    )
 }
 
 /// Fill a resolved source interface with the hashes authenticated by an import certificate.
@@ -190,8 +239,8 @@ pub fn bind_human_source_interface_to_verified_import(
         .map_err(|diagnostic| diagnostic.with_default_phase(HumanDiagnosticPhase::Resolver))
 }
 
-struct HumanResolver<'a> {
-    verified_imports: &'a [VerifiedImport],
+struct HumanResolver<'a, T: FrontendImportView> {
+    verified_imports: &'a [T],
     imported_source_interfaces: &'a [HumanImportedSourceInterface],
     max_notation_candidates: usize,
     enable_equation_compiler: bool,
@@ -209,10 +258,10 @@ struct HumanResolver<'a> {
     temporary_globals: Vec<HumanGlobalScopeEntry>,
 }
 
-impl<'a> HumanResolver<'a> {
+impl<'a, T: FrontendImportView> HumanResolver<'a, T> {
     fn new(
         module_name: npa_cert::ModuleName,
-        verified_imports: &'a [VerifiedImport],
+        verified_imports: &'a [T],
         options: &HumanCompileOptions,
     ) -> Self {
         Self {
@@ -307,7 +356,7 @@ impl<'a> HumanResolver<'a> {
 
     fn reconciled_imported_source_interface(
         &self,
-        import: &VerifiedImport,
+        import: &T,
         span: Span,
     ) -> HumanResult<HumanImportedSourceInterface> {
         let source_interface = self
@@ -318,22 +367,22 @@ impl<'a> HumanResolver<'a> {
             reconcile_source_interface_with_verified_import(source_interface, import, span)?;
 
         Ok(HumanImportedSourceInterface {
-            module: import.module.clone(),
-            export_hash: import.export_hash,
-            certificate_hash: import.certificate_hash,
+            module: import.module().clone(),
+            export_hash: import.export_hash(),
+            certificate_hash: import.certificate_hash(),
             source_interface,
         })
     }
 
     fn matching_imported_source_interface(
         &self,
-        import: &VerifiedImport,
+        import: &T,
         span: Span,
     ) -> HumanResult<Option<&HumanImportedSourceInterface>> {
         let mut matches = self.imported_source_interfaces.iter().filter(|interface| {
-            interface.module == import.module
-                && interface.export_hash == import.export_hash
-                && interface.certificate_hash == import.certificate_hash
+            interface.module == *import.module()
+                && interface.export_hash == import.export_hash()
+                && interface.certificate_hash == import.certificate_hash()
         });
         let Some(first) = matches.next() else {
             return Ok(None);
@@ -345,7 +394,7 @@ impl<'a> HumanResolver<'a> {
                 span,
                 format!(
                     "import {} has multiple Human source interfaces",
-                    import.module.as_dotted()
+                    import.module().as_dotted()
                 ),
             ));
         }
@@ -712,21 +761,6 @@ impl<'a> HumanResolver<'a> {
                 self.resolve_binders(binders, &mut nested)?;
                 self.resolve_expr(body, &mut nested)?;
             }
-            HumanExpr::Let {
-                name,
-                ty,
-                value,
-                body,
-                ..
-            } => {
-                if let Some(ty) = ty {
-                    self.resolve_expr(ty, locals)?;
-                }
-                self.resolve_expr(value, locals)?;
-                let mut nested = locals.clone();
-                nested.push(name.clone());
-                self.resolve_expr(body, &mut nested)?;
-            }
             HumanExpr::Annot { expr, ty, .. } => {
                 self.resolve_expr(expr, locals)?;
                 self.resolve_expr(ty, locals)?;
@@ -903,15 +937,6 @@ impl<'a> HumanResolver<'a> {
                 self.ensure_binders_have_no_holes(binders)?;
                 self.ensure_expr_has_no_holes(body)
             }
-            HumanExpr::Let {
-                ty, value, body, ..
-            } => {
-                if let Some(ty) = ty {
-                    self.ensure_expr_has_no_holes(ty)?;
-                }
-                self.ensure_expr_has_no_holes(value)?;
-                self.ensure_expr_has_no_holes(body)
-            }
             HumanExpr::Annot { expr, ty, .. } => {
                 self.ensure_expr_has_no_holes(expr)?;
                 self.ensure_expr_has_no_holes(ty)
@@ -996,29 +1021,6 @@ impl<'a> HumanResolver<'a> {
                 Ok(format!(
                     "pi({})->{}",
                     binders.join(","),
-                    self.canonical_expr(body, &nested)?
-                ))
-            }
-            HumanExpr::Let {
-                name,
-                ty,
-                value,
-                body,
-                ..
-            } => {
-                let ty = ty
-                    .as_deref()
-                    .map(|ty| self.canonical_expr(ty, locals))
-                    .transpose()?
-                    .unwrap_or_else(|| "_".to_owned());
-                let value = self.canonical_expr(value, locals)?;
-                let mut nested = locals.clone();
-                nested.push(name.clone());
-                Ok(format!(
-                    "let({},{},{}):{}",
-                    binder_info_sort_key(HumanBinderInfo::Explicit),
-                    ty,
-                    value,
                     self.canonical_expr(body, &nested)?
                 ))
             }
@@ -1496,8 +1498,8 @@ impl<'a> HumanResolver<'a> {
         Ok(())
     }
 
-    fn add_imported_globals(&mut self, import: &VerifiedImport) {
-        for export in &import.exports {
+    fn add_imported_globals(&mut self, import: &T) {
+        for export in import.exports() {
             self.global_scope.imported.push(HumanGlobalScopeEntry {
                 name: HumanName::new(export.name.0.clone(), Span::empty(crate::FileId(0))),
                 reference: human_import_global_ref(import, export),
@@ -2630,10 +2632,12 @@ fn human_binder_group_end(binders: &[HumanBinder], start: usize) -> usize {
     end
 }
 
-fn fallback_imported_source_interface(import: &VerifiedImport) -> HumanImportedSourceInterface {
-    let mut source_interface = HumanSourceInterface::new(import.module.clone());
+fn fallback_imported_source_interface(
+    import: &impl FrontendImportView,
+) -> HumanImportedSourceInterface {
+    let mut source_interface = HumanSourceInterface::new(import.module().clone());
     source_interface.declarations = import
-        .exports
+        .exports()
         .iter()
         .map(|export| HumanSourceDeclarationMetadata {
             kind: HumanSourceDeclarationKind::Imported,
@@ -2655,33 +2659,33 @@ fn fallback_imported_source_interface(import: &VerifiedImport) -> HumanImportedS
         .collect();
 
     HumanImportedSourceInterface {
-        module: import.module.clone(),
-        export_hash: import.export_hash,
-        certificate_hash: import.certificate_hash,
+        module: import.module().clone(),
+        export_hash: import.export_hash(),
+        certificate_hash: import.certificate_hash(),
         source_interface,
     }
 }
 
 fn reconcile_source_interface_with_verified_import(
     mut source_interface: HumanSourceInterface,
-    import: &VerifiedImport,
+    import: &impl FrontendImportView,
     span: Span,
 ) -> HumanResult<HumanSourceInterface> {
-    if source_interface.module != import.module {
+    if source_interface.module != *import.module() {
         return Err(HumanDiagnostic::error(
             HumanDiagnosticKind::ImportResolutionError,
             span,
             format!(
                 "Human source interface module {} does not match verified import {}",
                 source_interface.module.as_dotted(),
-                import.module.as_dotted()
+                import.module().as_dotted()
             ),
         ));
     }
 
     for decl in &mut source_interface.declarations {
         let name = name_from_human(&decl.name);
-        if let Some(export) = import.exports.iter().find(|export| export.name == name) {
+        if let Some(export) = import.exports().iter().find(|export| export.name == name) {
             if decl
                 .decl_interface_hash
                 .is_some_and(|hash| hash != export.decl_interface_hash)
@@ -2703,7 +2707,7 @@ fn reconcile_source_interface_with_verified_import(
 
     for generated in &mut source_interface.generated_declarations {
         let name = name_from_human(&generated.name);
-        if let Some(export) = import.exports.iter().find(|export| export.name == name) {
+        if let Some(export) = import.exports().iter().find(|export| export.name == name) {
             if generated
                 .decl_interface_hash
                 .is_some_and(|hash| hash != export.decl_interface_hash)
@@ -2723,7 +2727,7 @@ fn reconcile_source_interface_with_verified_import(
 
     for class in &mut source_interface.typeclass_classes {
         let name = name_from_human(&class.name);
-        if let Some(export) = import.exports.iter().find(|export| export.name == name) {
+        if let Some(export) = import.exports().iter().find(|export| export.name == name) {
             if class
                 .decl_interface_hash
                 .is_some_and(|hash| hash != export.decl_interface_hash)
@@ -2741,7 +2745,7 @@ fn reconcile_source_interface_with_verified_import(
         }
         for field in &mut class.fields {
             let name = name_from_human(&field.projection);
-            if let Some(export) = import.exports.iter().find(|export| export.name == name) {
+            if let Some(export) = import.exports().iter().find(|export| export.name == name) {
                 if field
                     .decl_interface_hash
                     .is_some_and(|hash| hash != export.decl_interface_hash)
@@ -2762,7 +2766,7 @@ fn reconcile_source_interface_with_verified_import(
 
     for instance in &mut source_interface.typeclass_instances {
         let name = name_from_human(&instance.name);
-        if let Some(export) = import.exports.iter().find(|export| export.name == name) {
+        if let Some(export) = import.exports().iter().find(|export| export.name == name) {
             if instance
                 .decl_interface_hash
                 .is_some_and(|hash| hash != export.decl_interface_hash)
@@ -2838,7 +2842,7 @@ fn builtin_candidate(name: &npa_cert::Name) -> Option<HumanNameCandidate> {
 }
 
 fn human_import_global_ref(
-    import: &VerifiedImport,
+    import: &impl FrontendImportView,
     export: &crate::VerifiedExport,
 ) -> HumanGlobalRef {
     if human_import_export_uses_builtin_eq_rec(import, export) {
@@ -2846,7 +2850,7 @@ fn human_import_global_ref(
     }
 
     HumanGlobalRef::Imported {
-        module: import.module.clone(),
+        module: import.module().clone(),
         name: export.name.clone(),
         decl_interface_hash: export.decl_interface_hash,
     }
@@ -2862,12 +2866,12 @@ fn human_builtin_eq_rec_ref() -> HumanGlobalRef {
 }
 
 fn human_import_export_uses_builtin_eq_rec(
-    import: &VerifiedImport,
+    import: &impl FrontendImportView,
     export: &crate::VerifiedExport,
 ) -> bool {
     export.name.as_dotted() == "Eq.rec"
         && import
-            .kernel_decls
+            .kernel_declarations()
             .iter()
             .any(|decl| matches!(decl, npa_kernel::Decl::Inductive { name, .. } if name == "Eq"))
 }

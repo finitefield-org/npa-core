@@ -48,7 +48,7 @@ impl LocalTransparencyBudget {
 }
 
 pub(crate) fn local_transparency_dependencies(
-    version: CertificateFormatVersion,
+    _version: CertificateFormatVersion,
     current_decl_index: usize,
     root: &DeclPayload,
     declarations: &[DeclCert],
@@ -82,35 +82,33 @@ pub(crate) fn local_transparency_dependencies(
         .collect::<BTreeMap<_, _>>();
 
     let mut opaque_definition_indices = BTreeSet::new();
-    if version == CertificateFormatVersion::V0_3_0 {
-        let mut pending = BTreeMap::new();
-        for (global_ref, depth) in &direct_refs {
-            queue_local_reference(global_ref, *depth, current_decl_index, &mut pending);
+    let mut pending = BTreeMap::new();
+    for (global_ref, depth) in &direct_refs {
+        queue_local_reference(global_ref, *depth, current_decl_index, &mut pending);
+    }
+    let mut visited = BTreeSet::new();
+    while let Some((decl_index, reference_depth)) =
+        pending.iter().next().map(|(index, depth)| (*index, *depth))
+    {
+        pending.remove(&decl_index);
+        if !visited.insert(decl_index) {
+            continue;
         }
-        let mut visited = BTreeSet::new();
-        while let Some((decl_index, reference_depth)) =
-            pending.iter().next().map(|(index, depth)| (*index, *depth))
-        {
-            pending.remove(&decl_index);
-            if !visited.insert(decl_index) {
-                continue;
-            }
-            let Some(declaration) = declarations.get(decl_index) else {
-                continue;
-            };
-            if is_opaque_definition(&declaration.decl) {
-                opaque_definition_indices.insert(decl_index);
-            }
-            let refs = scan_term_roots(
-                referenced_term_ids(&declaration.decl, version),
-                reference_depth.saturating_add(1),
-                term_table,
-                budget,
-                &mut root_expanded_nodes,
-            )?;
-            for (global_ref, depth) in refs {
-                queue_local_reference(&global_ref, depth, current_decl_index, &mut pending);
-            }
+        let Some(declaration) = declarations.get(decl_index) else {
+            continue;
+        };
+        if is_opaque_definition(&declaration.decl) {
+            opaque_definition_indices.insert(decl_index);
+        }
+        let refs = scan_term_roots(
+            referenced_term_ids(&declaration.decl),
+            reference_depth.saturating_add(1),
+            term_table,
+            budget,
+            &mut root_expanded_nodes,
+        )?;
+        for (global_ref, depth) in refs {
+            queue_local_reference(&global_ref, depth, current_decl_index, &mut pending);
         }
     }
 
@@ -263,7 +261,7 @@ pub fn dependency_selective_fingerprint_canonical_bytes(
     encode_dependency_entries_with_format_to(
         &mut out,
         &dependencies,
-        CertificateFormatVersion::V0_3_0,
+        CertificateFormatVersion::V0_4_0,
     );
     out
 }
@@ -383,7 +381,7 @@ fn root_term_ids(decl: &DeclPayload) -> Vec<TermId> {
     }
 }
 
-fn referenced_term_ids(decl: &DeclPayload, version: CertificateFormatVersion) -> Vec<TermId> {
+fn referenced_term_ids(decl: &DeclPayload) -> Vec<TermId> {
     match decl {
         DeclPayload::Def {
             ty,
@@ -398,11 +396,8 @@ fn referenced_term_ids(decl: &DeclPayload, version: CertificateFormatVersion) ->
             ..
         } => {
             let mut roots = vec![*ty];
-            if *reducibility == CertReducibility::Reducible
-                || version == CertificateFormatVersion::V0_3_0
-            {
-                roots.push(*value);
-            }
+            let _ = reducibility;
+            roots.push(*value);
             roots
         }
         DeclPayload::Theorem { ty, .. } | DeclPayload::TheoremConstrained { ty, .. } => vec![*ty],
@@ -440,11 +435,6 @@ fn scan_term_roots(
             }
             TermNode::Lam { ty, body } | TermNode::Pi { ty, body } => {
                 pending.push((*body, depth.saturating_add(1)));
-                pending.push((*ty, depth.saturating_add(1)));
-            }
-            TermNode::Let { ty, value, body } => {
-                pending.push((*body, depth.saturating_add(1)));
-                pending.push((*value, depth.saturating_add(1)));
                 pending.push((*ty, depth.saturating_add(1)));
             }
         }
@@ -510,7 +500,7 @@ mod tests {
         let (terms, declarations, root) = linear_reducible_chain(4_096);
         let compute = || {
             local_transparency_dependencies(
-                CertificateFormatVersion::V0_3_0,
+                CertificateFormatVersion::V0_4_0,
                 declarations.len(),
                 &root,
                 &declarations,
@@ -532,7 +522,7 @@ mod tests {
         let length = MAX_STRUCTURAL_DEPTH + 2;
         let (terms, declarations, root) = linear_reducible_chain(length);
         let err = local_transparency_dependencies(
-            CertificateFormatVersion::V0_3_0,
+            CertificateFormatVersion::V0_4_0,
             declarations.len(),
             &root,
             &declarations,

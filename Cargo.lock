@@ -3,6 +3,12 @@
 version = 4
 
 [[package]]
+name = "bitflags"
+version = "2.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b588b76d00fde79687d7646a9b5bdf3cc0f655e0bbd080335a95d7e96f3587da"
+
+[[package]]
 name = "block-buffer"
 version = "0.10.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -53,6 +59,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
 
 [[package]]
+name = "errno"
+version = "0.3.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
+dependencies = [
+ "libc",
+ "windows-sys",
+]
+
+[[package]]
 name = "generic-array"
 version = "0.14.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -85,6 +101,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 
 [[package]]
+name = "linux-raw-sys"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
+
+[[package]]
 name = "memchr"
 version = "2.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -92,7 +114,7 @@ checksum = "6b947ae49db0d222b1dbc6b113ce7248a3fc3a6ca21b696717bfc000ba4484d8"
 
 [[package]]
 name = "npa-api"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "libc",
  "npa-cert",
@@ -106,7 +128,7 @@ dependencies = [
 
 [[package]]
 name = "npa-cert"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "libc",
  "npa-kernel",
@@ -115,17 +137,18 @@ dependencies = [
 
 [[package]]
 name = "npa-checker-ref"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "libc",
  "npa-cert",
  "npa-kernel",
+ "rustix",
  "sha2",
 ]
 
 [[package]]
 name = "npa-cli"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "libc",
  "npa-api",
@@ -140,7 +163,7 @@ dependencies = [
 
 [[package]]
 name = "npa-frontend"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "npa-cert",
  "npa-kernel",
@@ -149,12 +172,13 @@ dependencies = [
 
 [[package]]
 name = "npa-kernel"
-version = "0.3.0"
+version = "0.4.0"
 
 [[package]]
 name = "npa-package"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
+ "libc",
  "npa-cert",
  "sha2",
  "toml",
@@ -162,7 +186,7 @@ dependencies = [
 
 [[package]]
 name = "npa-tactic"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "npa-cert",
  "npa-frontend",
@@ -186,6 +210,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "41f2619966050689382d2b44f664f4bc593e129785a36d6ee376ddf37259b924"
 dependencies = [
  "proc-macro2",
+]
+
+[[package]]
+name = "rustix"
+version = "1.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b6fe4565b9518b83ef4f91bb47ce29620ca828bd32cb7e408f0062e9930ba190"
+dependencies = [
+ "bitflags",
+ "errno",
+ "libc",
+ "linux-raw-sys",
+ "windows-sys",
 ]
 
 [[package]]
@@ -306,6 +343,21 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
+
+[[package]]
+name = "windows-link"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f0805222e57f7521d6a62e36fa9163bc891acd422f971defe97d64e70d0a4fe5"
+
+[[package]]
+name = "windows-sys"
+version = "0.61.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ae137229bcbd6cdf0f7b80a31df61766145077ddf49416a728b02cb3921ff3fc"
+dependencies = [
+ "windows-link",
+]
 
 [[package]]
 name = "winnow"

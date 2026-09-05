@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use npa_kernel::{Decl, Env, Expr, Level, UniverseConstraint, UniverseConstraintRelation};
 
+use crate::local_authoring::CertificateImportView;
 use crate::*;
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -38,11 +39,6 @@ pub(crate) enum CanonTerm {
     },
     Pi {
         ty: Arc<CanonTerm>,
-        body: Arc<CanonTerm>,
-    },
-    Let {
-        ty: Arc<CanonTerm>,
-        value: Arc<CanonTerm>,
         body: Arc<CanonTerm>,
     },
 }
@@ -104,60 +100,85 @@ pub(crate) struct CanonMutualInductive {
     recursor: Option<(NameId, Vec<NameId>, CanonTerm, RecursorRulesSpec)>,
 }
 
-pub(crate) fn build_module_cert_impl(
+pub(crate) fn build_module_cert_observed_impl(
     module: CoreModule,
     imports: &[VerifiedModule],
+    observation: Option<&mut CertificatePayloadObservation>,
 ) -> Result<ModuleCert> {
     let imports = imports.iter().collect::<Vec<_>>();
-    build_module_cert_from_import_refs_with_preferred_imports_impl(
+    build_module_cert_from_import_refs_with_preferred_imports_observed_impl(
         module,
         &imports,
         &BTreeMap::new(),
+        observation,
     )
 }
 
-pub(crate) fn build_module_cert_from_import_refs_impl(
+pub(crate) fn build_module_cert_from_import_refs_observed_impl(
     module: CoreModule,
     imports: &[&VerifiedModule],
+    observation: Option<&mut CertificatePayloadObservation>,
 ) -> Result<ModuleCert> {
-    build_module_cert_from_import_refs_with_preferred_imports_impl(
+    build_module_cert_from_import_refs_with_preferred_imports_observed_impl(
         module,
         imports,
         &BTreeMap::new(),
+        observation,
     )
 }
 
-pub(crate) fn build_module_cert_from_import_refs_with_preferred_imports_impl(
+pub(crate) fn build_module_cert_from_import_refs_with_preferred_imports_observed_impl(
     module: CoreModule,
     imports: &[&VerifiedModule],
     preferred_imports: &BTreeMap<Name, ImportEntry>,
+    observation: Option<&mut CertificatePayloadObservation>,
+) -> Result<ModuleCert> {
+    let imports = imports
+        .iter()
+        .map(|module| *module as &dyn CertificateImportView)
+        .collect::<Vec<_>>();
+    build_module_cert_from_context_refs_with_preferred_imports_observed_impl(
+        module,
+        &imports,
+        preferred_imports,
+        observation,
+    )
+}
+
+pub(crate) fn build_module_cert_from_context_refs_with_preferred_imports_impl(
+    module: CoreModule,
+    imports: &[&dyn CertificateImportView],
+    preferred_imports: &BTreeMap<Name, ImportEntry>,
+) -> Result<ModuleCert> {
+    build_module_cert_from_context_refs_with_preferred_imports_observed_impl(
+        module,
+        imports,
+        preferred_imports,
+        None,
+    )
+}
+
+fn build_module_cert_from_context_refs_with_preferred_imports_observed_impl(
+    module: CoreModule,
+    imports: &[&dyn CertificateImportView],
+    preferred_imports: &BTreeMap<Name, ImportEntry>,
+    observation: Option<&mut CertificatePayloadObservation>,
 ) -> Result<ModuleCert> {
     build_module_cert_from_import_refs_with_preferred_imports_for_version(
         module,
         imports,
         preferred_imports,
-        CertificateFormatVersion::V0_3_0,
-    )
-}
-
-pub(crate) fn build_module_cert_v0_2_compat_from_import_refs_with_preferred_imports_impl(
-    module: CoreModule,
-    imports: &[&VerifiedModule],
-    preferred_imports: &BTreeMap<Name, ImportEntry>,
-) -> Result<ModuleCert> {
-    build_module_cert_from_import_refs_with_preferred_imports_for_version(
-        module,
-        imports,
-        preferred_imports,
-        CertificateFormatVersion::V0_2_0,
+        CertificateFormatVersion::V0_4_0,
+        observation,
     )
 }
 
 fn build_module_cert_from_import_refs_with_preferred_imports_for_version(
     module: CoreModule,
-    imports: &[&VerifiedModule],
+    imports: &[&dyn CertificateImportView],
     preferred_imports: &BTreeMap<Name, ImportEntry>,
     version: CertificateFormatVersion,
+    observation: Option<&mut CertificatePayloadObservation>,
 ) -> Result<ModuleCert> {
     let mut module = module;
     module.declarations = canonical_declaration_order(module.declarations)?;
@@ -165,15 +186,15 @@ fn build_module_cert_from_import_refs_with_preferred_imports_for_version(
     let mut imports = imports.to_vec();
     imports.sort_by_key(|module| {
         (
-            module.module.clone(),
-            module.export_hash,
-            Some(module.certificate_hash),
+            module.module().clone(),
+            module.export_hash(),
+            Some(module.certificate_hash()),
         )
     });
     imports.dedup_by(|lhs, rhs| {
-        lhs.module == rhs.module
-            && lhs.export_hash == rhs.export_hash
-            && lhs.certificate_hash == rhs.certificate_hash
+        lhs.module() == rhs.module()
+            && lhs.export_hash() == rhs.export_hash()
+            && lhs.certificate_hash() == rhs.certificate_hash()
     });
 
     let local_names: Vec<Name> = module
@@ -229,7 +250,7 @@ fn build_module_cert_from_import_refs_with_preferred_imports_for_version(
     let mut names = BTreeSet::new();
     collect_name(&mut names, &module.name);
     for import in &imports {
-        collect_name(&mut names, &import.module);
+        collect_name(&mut names, import.module());
     }
     for decl in &module.declarations {
         collect_names_from_decl(&mut names, decl);
@@ -253,9 +274,9 @@ fn build_module_cert_from_import_refs_with_preferred_imports_for_version(
     let imports_entries: Vec<_> = imports
         .iter()
         .map(|module| ImportEntry {
-            module: module.module.clone(),
-            export_hash: module.export_hash,
-            certificate_hash: Some(module.certificate_hash),
+            module: module.module().clone(),
+            export_hash: module.export_hash(),
+            certificate_hash: Some(module.certificate_hash()),
         })
         .collect();
     let imported_decls = imported_decl_map(
@@ -321,12 +342,10 @@ fn build_module_cert_from_import_refs_with_preferred_imports_for_version(
     let mut interface_hashes: Vec<Hash> = Vec::new();
     let mut local_transparency_budget = LocalTransparencyBudget::default();
     for (decl_index, canon_decl) in canon_decls.iter().enumerate() {
-        let local_transparency = (version == CertificateFormatVersion::V0_3_0).then_some(
-            CanonLocalTransparencyContext {
-                previous_declarations: &declarations,
-                budget: &mut local_transparency_budget,
-            },
-        );
+        let local_transparency = Some(CanonLocalTransparencyContext {
+            previous_declarations: &declarations,
+            budget: &mut local_transparency_budget,
+        });
         let finalized = finalize_canon_decl(
             decl_index,
             canon_decl,
@@ -375,20 +394,10 @@ fn build_module_cert_from_import_refs_with_preferred_imports_for_version(
     let axiom_report_hash =
         hash_with_domain(b"NPA-AXIOM-REPORT-0.1", &encode_axiom_report(&axiom_report));
 
-    let (format, core_spec) = match version {
-        CertificateFormatVersion::V0_3_0 => (FORMAT, CORE_SPEC),
-        CertificateFormatVersion::V0_2_0 => (COMPAT_FORMAT, COMPAT_CORE_SPEC),
-        CertificateFormatVersion::V0_1_2 | CertificateFormatVersion::V0_1 => {
-            return Err(CertError::UnsupportedFormat {
-                format: FORMAT.to_owned(),
-                core_spec: CORE_SPEC.to_owned(),
-            });
-        }
-    };
-    let mut cert = ModuleCert {
+    let mut parts = ModuleCertParts {
         header: CertHeader {
-            format: format.to_owned(),
-            core_spec: core_spec.to_owned(),
+            format: FORMAT.to_owned(),
+            core_spec: CORE_SPEC.to_owned(),
             module: module.name,
         },
         imports: imports_entries,
@@ -404,12 +413,12 @@ fn build_module_cert_from_import_refs_with_preferred_imports_for_version(
             certificate_hash: [0; 32],
         },
     };
-    audit_emitted_reference_origins(&cert, &reference_bindings)?;
-    cert.hashes.certificate_hash = hash_with_domain(
+    audit_emitted_reference_origins(&parts, &reference_bindings)?;
+    parts.hashes.certificate_hash = hash_with_domain(
         version.module_certificate_domain(),
-        &encode_module_cert_without_certificate_hash_for_header(&cert)?,
+        &encode_module_cert_parts_without_certificate_hash_for_header(&parts)?,
     );
-    Ok(cert)
+    Ok(ModuleCert::from_parts_observed(parts, observation))
 }
 
 fn canonicalize_decl(decl: Decl, decl_index: usize, resolver: &Resolver<'_>) -> Result<CanonDecl> {
@@ -713,7 +722,7 @@ pub(crate) fn canonical_producer_checked_decl_hashes(
     let resolved = canonical_producer_checked_decl_for_version(
         decl,
         lookup_env,
-        CertificateFormatVersion::V0_3_0,
+        CertificateFormatVersion::V0_4_0,
         &[],
     )?;
     Ok((resolved.interface, resolved.hashes))
@@ -822,7 +831,7 @@ pub(crate) fn canonical_producer_checked_decl_for_version(
         },
     )?;
     let mut dependencies = finalized.dependencies.clone();
-    if version == CertificateFormatVersion::V0_3_0 {
+    if version == CertificateFormatVersion::V0_4_0 {
         let opaque_targets = local_implementation_dependencies
             .iter()
             .map(|dependency| match dependency.global_ref() {
@@ -1265,18 +1274,18 @@ impl Resolver<'_> {
 }
 
 fn audit_emitted_reference_origins(
-    cert: &ModuleCert,
+    parts: &ModuleCertParts,
     bindings: &BTreeMap<Name, ResolvedReferenceBinding>,
 ) -> Result<()> {
-    for node in &cert.term_table {
+    for node in &parts.term_table {
         if let TermNode::Const { global_ref, .. } = node {
-            audit_global_ref_origin(cert, bindings, global_ref)?;
+            audit_global_ref_origin(parts, bindings, global_ref)?;
         }
     }
-    for declaration in &cert.declarations {
+    for declaration in &parts.declarations {
         for dependency in &declaration.dependencies {
             let (name, expected_hash) =
-                audit_global_ref_origin(cert, bindings, dependency.global_ref())?;
+                audit_global_ref_origin(parts, bindings, dependency.global_ref())?;
             if dependency.decl_interface_hash() != expected_hash {
                 return Err(reference_origin_mismatch(
                     name,
@@ -1285,10 +1294,10 @@ fn audit_emitted_reference_origins(
                 ));
             }
         }
-        audit_axiom_ref_origins(cert, bindings, &declaration.axiom_dependencies)?;
+        audit_axiom_ref_origins(parts, bindings, &declaration.axiom_dependencies)?;
     }
-    for export in &cert.export_block {
-        let name = cert
+    for export in &parts.export_block {
+        let name = parts
             .name_table
             .get(export.name)
             .ok_or(CertError::DecodeError)?;
@@ -1312,7 +1321,7 @@ fn audit_emitted_reference_origins(
                 ))
             }
         };
-        let expected_hash = cert
+        let expected_hash = parts
             .declarations
             .get(owner_decl_index)
             .ok_or(CertError::DecodeError)?
@@ -1325,20 +1334,20 @@ fn audit_emitted_reference_origins(
                 "export interface hash",
             ));
         }
-        audit_axiom_ref_origins(cert, bindings, &export.axiom_dependencies)?;
+        audit_axiom_ref_origins(parts, bindings, &export.axiom_dependencies)?;
     }
-    audit_axiom_ref_origins(cert, bindings, &cert.axiom_report.module_axioms)?;
+    audit_axiom_ref_origins(parts, bindings, &parts.axiom_report.module_axioms)?;
     Ok(())
 }
 
 fn audit_axiom_ref_origins(
-    cert: &ModuleCert,
+    parts: &ModuleCertParts,
     bindings: &BTreeMap<Name, ResolvedReferenceBinding>,
     axioms: &[AxiomRef],
 ) -> Result<()> {
     for axiom in axioms {
-        let (name, expected_hash) = audit_axiom_ref_origin(cert, bindings, &axiom.global_ref)?;
-        let reported_name = cert
+        let (name, expected_hash) = audit_axiom_ref_origin(parts, bindings, &axiom.global_ref)?;
+        let reported_name = parts
             .name_table
             .get(axiom.name)
             .ok_or(CertError::DecodeError)?;
@@ -1361,7 +1370,7 @@ fn audit_axiom_ref_origins(
 }
 
 fn audit_axiom_ref_origin(
-    cert: &ModuleCert,
+    parts: &ModuleCertParts,
     bindings: &BTreeMap<Name, ResolvedReferenceBinding>,
     global_ref: &GlobalRef,
 ) -> Result<(Name, Hash)> {
@@ -1371,10 +1380,11 @@ fn audit_axiom_ref_origin(
             name,
             decl_interface_hash,
         } => {
-            cert.imports
+            parts
+                .imports
                 .get(*import_index)
                 .ok_or(CertError::DecodeError)?;
-            let name = cert
+            let name = parts
                 .name_table
                 .get(*name)
                 .cloned()
@@ -1385,7 +1395,7 @@ fn audit_axiom_ref_origin(
             name,
             decl_interface_hash,
         } => {
-            let name = cert
+            let name = parts
                 .name_table
                 .get(*name)
                 .cloned()
@@ -1400,23 +1410,23 @@ fn audit_axiom_ref_origin(
             Ok((name, *decl_interface_hash))
         }
         GlobalRef::Local { .. } | GlobalRef::LocalGenerated { .. } => {
-            audit_global_ref_origin(cert, bindings, global_ref)
+            audit_global_ref_origin(parts, bindings, global_ref)
         }
     }
 }
 
 fn audit_global_ref_origin(
-    cert: &ModuleCert,
+    parts: &ModuleCertParts,
     bindings: &BTreeMap<Name, ResolvedReferenceBinding>,
     global_ref: &GlobalRef,
 ) -> Result<(Name, Hash)> {
     match global_ref {
         GlobalRef::Local { decl_index } => {
-            let declaration = cert
+            let declaration = parts
                 .declarations
                 .get(*decl_index)
                 .ok_or(CertError::DecodeError)?;
-            let name = cert
+            let name = parts
                 .name_table
                 .get(decl_payload_name_id(&declaration.decl))
                 .cloned()
@@ -1435,7 +1445,7 @@ fn audit_global_ref_origin(
             Ok((name, declaration.hashes.decl_interface_hash))
         }
         GlobalRef::LocalGenerated { decl_index, name } => {
-            let name = cert
+            let name = parts
                 .name_table
                 .get(*name)
                 .cloned()
@@ -1452,7 +1462,7 @@ fn audit_global_ref_origin(
                     "local generated declaration with mismatched owner",
                 ));
             }
-            let hash = cert
+            let hash = parts
                 .declarations
                 .get(*decl_index)
                 .ok_or(CertError::DecodeError)?
@@ -1465,7 +1475,7 @@ fn audit_global_ref_origin(
             name,
             decl_interface_hash,
         } => {
-            let name = cert
+            let name = parts
                 .name_table
                 .get(*name)
                 .cloned()
@@ -1494,7 +1504,7 @@ fn audit_global_ref_origin(
             name,
             decl_interface_hash,
         } => {
-            let name = cert
+            let name = parts
                 .name_table
                 .get(*name)
                 .cloned()
@@ -1575,43 +1585,102 @@ fn canonicalize_expr(expr: &Expr, resolver: &Resolver<'_>) -> Result<CanonTerm> 
             ty: canonicalize_expr_rc(ty, resolver)?,
             body: canonicalize_expr_rc(body, resolver)?,
         },
-        Expr::Let {
-            ty, value, body, ..
-        } => CanonTerm::Let {
-            ty: canonicalize_expr_rc(ty, resolver)?,
-            value: canonicalize_expr_rc(value, resolver)?,
-            body: canonicalize_expr_rc(body, resolver)?,
-        },
     })
 }
 
 fn canonicalize_expr_rc(expr: &Arc<Expr>, resolver: &Resolver<'_>) -> Result<Arc<CanonTerm>> {
-    let key = Arc::as_ptr(expr) as usize;
-    if let Some((_, canon)) = resolver.canon_term_memo.borrow().get(&key) {
+    let root_key = Arc::as_ptr(expr) as usize;
+    if let Some((_, canon)) = resolver.canon_term_memo.borrow().get(&root_key) {
         return Ok(Arc::clone(canon));
     }
-    let canon = Arc::new(canonicalize_expr(expr, resolver)?);
+
+    let mut pending = vec![(Arc::clone(expr), false)];
+    while let Some((expr, exiting)) = pending.pop() {
+        let key = Arc::as_ptr(&expr) as usize;
+        if resolver.canon_term_memo.borrow().contains_key(&key) {
+            continue;
+        }
+        if !exiting {
+            pending.push((Arc::clone(&expr), true));
+            match expr.as_ref() {
+                Expr::Sort(_) | Expr::BVar(_) | Expr::Const { .. } => {}
+                Expr::App(fun, arg)
+                | Expr::Lam {
+                    ty: fun, body: arg, ..
+                }
+                | Expr::Pi {
+                    ty: fun, body: arg, ..
+                } => {
+                    pending.push((Arc::clone(arg), false));
+                    pending.push((Arc::clone(fun), false));
+                }
+            }
+            continue;
+        }
+        let canon = Arc::new(canonicalize_expr(&expr, resolver)?);
+        resolver
+            .canon_term_memo
+            .borrow_mut()
+            .insert(key, (expr, canon));
+    }
+
     resolver
         .canon_term_memo
-        .borrow_mut()
-        .insert(key, (Arc::clone(expr), Arc::clone(&canon)));
-    Ok(canon)
+        .borrow()
+        .get(&root_key)
+        .map(|(_, canon)| Arc::clone(canon))
+        .ok_or(CertError::DecodeError)
 }
 
 fn canonicalize_level(level: &Level, resolver: &Resolver<'_>) -> Result<CanonLevel> {
-    Ok(match npa_kernel::level::normalize_level(level.clone()) {
-        Level::Zero => CanonLevel::Zero,
-        Level::Succ(inner) => CanonLevel::Succ(Box::new(canonicalize_level(&inner, resolver)?)),
-        Level::Max(lhs, rhs) => CanonLevel::Max(
-            Box::new(canonicalize_level(&lhs, resolver)?),
-            Box::new(canonicalize_level(&rhs, resolver)?),
-        ),
-        Level::IMax(lhs, rhs) => CanonLevel::IMax(
-            Box::new(canonicalize_level(&lhs, resolver)?),
-            Box::new(canonicalize_level(&rhs, resolver)?),
-        ),
-        Level::Param(name) => CanonLevel::Param(resolver.name_id(&Name::from_dotted(name))?),
-    })
+    enum Frame {
+        Visit(Level),
+        Succ,
+        Max,
+        IMax,
+    }
+
+    let mut pending = vec![Frame::Visit(npa_kernel::level::normalize_level(
+        level.clone(),
+    ))];
+    let mut values = Vec::<CanonLevel>::new();
+    while let Some(frame) = pending.pop() {
+        match frame {
+            Frame::Visit(Level::Zero) => values.push(CanonLevel::Zero),
+            Frame::Visit(Level::Param(name)) => values.push(CanonLevel::Param(
+                resolver.name_id(&Name::from_dotted(name))?,
+            )),
+            Frame::Visit(Level::Succ(inner)) => {
+                pending.push(Frame::Succ);
+                pending.push(Frame::Visit(*inner));
+            }
+            Frame::Visit(Level::Max(lhs, rhs)) => {
+                pending.push(Frame::Max);
+                pending.push(Frame::Visit(*rhs));
+                pending.push(Frame::Visit(*lhs));
+            }
+            Frame::Visit(Level::IMax(lhs, rhs)) => {
+                pending.push(Frame::IMax);
+                pending.push(Frame::Visit(*rhs));
+                pending.push(Frame::Visit(*lhs));
+            }
+            Frame::Succ => {
+                let inner = values.pop().ok_or(CertError::DecodeError)?;
+                values.push(CanonLevel::Succ(Box::new(inner)));
+            }
+            Frame::Max => {
+                let rhs = values.pop().ok_or(CertError::DecodeError)?;
+                let lhs = values.pop().ok_or(CertError::DecodeError)?;
+                values.push(CanonLevel::Max(Box::new(lhs), Box::new(rhs)));
+            }
+            Frame::IMax => {
+                let rhs = values.pop().ok_or(CertError::DecodeError)?;
+                let lhs = values.pop().ok_or(CertError::DecodeError)?;
+                values.push(CanonLevel::IMax(Box::new(lhs), Box::new(rhs)));
+            }
+        }
+    }
+    values.pop().ok_or(CertError::DecodeError)
 }
 
 fn canonicalize_universe_constraints(
@@ -1681,11 +1750,6 @@ fn collect_dependencies(term: &CanonTerm, deps: &mut BTreeSet<DependencyEntry>) 
         }
         CanonTerm::Lam { ty, body } | CanonTerm::Pi { ty, body } => {
             collect_dependencies(ty, deps);
-            collect_dependencies(body, deps);
-        }
-        CanonTerm::Let { ty, value, body } => {
-            collect_dependencies(ty, deps);
-            collect_dependencies(value, deps);
             collect_dependencies(body, deps);
         }
     }
@@ -1985,67 +2049,60 @@ impl<'n> CanonNodeCollector<'n> {
     }
 
     fn collect_term(&mut self, term: &CanonTerm) -> Result<()> {
-        let (height, key) =
-            canon_term_height_and_key(term, self.names, &mut self.term_memo, &mut self.level_memo)?;
-        let hash = canon_term_hash_from_key(&key);
-        // A seen hash implies every subterm (and its levels) has already
-        // been collected, matching the old structural-set invariant.
-        if !self.seen_terms.insert(hash) {
-            return Ok(());
-        }
-        self.terms.push((height, key, hash, term.clone()));
-        match term {
-            CanonTerm::Sort(level) => self.collect_level(level)?,
-            CanonTerm::BVar(_) => {}
-            CanonTerm::Const { levels: ls, .. } => {
-                for level in ls {
-                    self.collect_level(level)?;
+        let mut pending = vec![term];
+        while let Some(term) = pending.pop() {
+            let (height, key) = canon_term_height_and_key(
+                term,
+                self.names,
+                &mut self.term_memo,
+                &mut self.level_memo,
+            )?;
+            let hash = canon_term_hash_from_key(&key);
+            // A seen hash implies every subterm (and its levels) has already
+            // been collected, matching the old structural-set invariant.
+            if !self.seen_terms.insert(hash) {
+                continue;
+            }
+            self.terms.push((height, key, hash, term.clone()));
+            match term {
+                CanonTerm::Sort(level) => self.collect_level(level)?,
+                CanonTerm::BVar(_) => {}
+                CanonTerm::Const { levels, .. } => {
+                    for level in levels {
+                        self.collect_level(level)?;
+                    }
                 }
-            }
-            CanonTerm::App(fun, arg) => {
-                self.collect_term_rc(fun)?;
-                self.collect_term_rc(arg)?;
-            }
-            CanonTerm::Lam { ty, body } | CanonTerm::Pi { ty, body } => {
-                self.collect_term_rc(ty)?;
-                self.collect_term_rc(body)?;
-            }
-            CanonTerm::Let { ty, value, body } => {
-                self.collect_term_rc(ty)?;
-                self.collect_term_rc(value)?;
-                self.collect_term_rc(body)?;
+                CanonTerm::App(fun, arg) => {
+                    pending.push(arg);
+                    pending.push(fun);
+                }
+                CanonTerm::Lam { ty, body } | CanonTerm::Pi { ty, body } => {
+                    pending.push(body);
+                    pending.push(ty);
+                }
             }
         }
         Ok(())
     }
 
-    fn collect_term_rc(&mut self, term: &Arc<CanonTerm>) -> Result<()> {
-        // The parent's key computation just memoized this child's hash, so
-        // shared subtrees skip both rehashing and re-collection here.
-        let ptr = Arc::as_ptr(term) as usize;
-        if let Some(&(_, _, hash)) = self.term_memo.get(&ptr) {
-            if self.seen_terms.contains(&hash) {
-                return Ok(());
-            }
-        }
-        self.collect_term(term)
-    }
-
     fn collect_level(&mut self, level: &CanonLevel) -> Result<()> {
-        let hash = canon_level_hash(level, self.names, &mut self.level_memo)?;
-        // A seen hash implies every sub-level has already been collected.
-        if !self.seen_levels.insert(hash) {
-            return Ok(());
-        }
-        let key = canon_level_key(level, self.names, &mut self.level_memo)?;
-        self.levels
-            .push((level_height(level), key, hash, level.clone()));
-        match level {
-            CanonLevel::Zero | CanonLevel::Param(_) => {}
-            CanonLevel::Succ(inner) => self.collect_level(inner)?,
-            CanonLevel::Max(lhs, rhs) | CanonLevel::IMax(lhs, rhs) => {
-                self.collect_level(lhs)?;
-                self.collect_level(rhs)?;
+        let mut pending = vec![level];
+        while let Some(level) = pending.pop() {
+            let hash = canon_level_hash(level, self.names, &mut self.level_memo)?;
+            // A seen hash implies every sub-level has already been collected.
+            if !self.seen_levels.insert(hash) {
+                continue;
+            }
+            let key = canon_level_key(level, self.names, &mut self.level_memo)?;
+            self.levels
+                .push((level_height(level), key, hash, level.clone()));
+            match level {
+                CanonLevel::Zero | CanonLevel::Param(_) => {}
+                CanonLevel::Succ(inner) => pending.push(inner),
+                CanonLevel::Max(lhs, rhs) | CanonLevel::IMax(lhs, rhs) => {
+                    pending.push(rhs);
+                    pending.push(lhs);
+                }
             }
         }
         Ok(())
@@ -2135,11 +2192,6 @@ impl<'n> CanonNodeCollector<'n> {
                     },
                     CanonTerm::Pi { ty, body } => TermNode::Pi {
                         ty: term_id_rc(ty, &mut term_memo, &mut level_memo)?,
-                        body: term_id_rc(body, &mut term_memo, &mut level_memo)?,
-                    },
-                    CanonTerm::Let { ty, value, body } => TermNode::Let {
-                        ty: term_id_rc(ty, &mut term_memo, &mut level_memo)?,
-                        value: term_id_rc(value, &mut term_memo, &mut level_memo)?,
                         body: term_id_rc(body, &mut term_memo, &mut level_memo)?,
                     },
                 })
@@ -2558,66 +2610,73 @@ fn collect_const_names_from_decl(names: &mut BTreeSet<Name>, decl: &Decl) {
 }
 
 fn collect_const_names_from_expr(names: &mut BTreeSet<Name>, expr: &Expr) {
-    match expr {
-        Expr::Sort(_) | Expr::BVar(_) => {}
-        Expr::Const { name, .. } => {
-            collect_name(names, &Name::from_dotted(name));
+    let mut pending = vec![expr];
+    let mut seen = HashSet::new();
+    while let Some(expr) = pending.pop() {
+        if !seen.insert(std::ptr::from_ref(expr) as usize) {
+            continue;
         }
-        Expr::App(fun, arg) => {
-            collect_const_names_from_expr(names, fun);
-            collect_const_names_from_expr(names, arg);
-        }
-        Expr::Lam { ty, body, .. } | Expr::Pi { ty, body, .. } => {
-            collect_const_names_from_expr(names, ty);
-            collect_const_names_from_expr(names, body);
-        }
-        Expr::Let {
-            ty, value, body, ..
-        } => {
-            collect_const_names_from_expr(names, ty);
-            collect_const_names_from_expr(names, value);
-            collect_const_names_from_expr(names, body);
+        match expr {
+            Expr::Sort(_) | Expr::BVar(_) => {}
+            Expr::Const { name, .. } => {
+                collect_name(names, &Name::from_dotted(name));
+            }
+            Expr::App(fun, arg)
+            | Expr::Lam {
+                ty: fun, body: arg, ..
+            }
+            | Expr::Pi {
+                ty: fun, body: arg, ..
+            } => {
+                pending.push(arg);
+                pending.push(fun);
+            }
         }
     }
 }
 
 fn collect_names_from_expr(names: &mut BTreeSet<Name>, expr: &Expr) {
-    match expr {
-        Expr::Sort(level) => collect_names_from_level(names, level),
-        Expr::BVar(_) => {}
-        Expr::Const { name, levels } => {
-            collect_name(names, &Name::from_dotted(name));
-            for level in levels {
-                collect_names_from_level(names, level);
+    let mut pending = vec![expr];
+    let mut seen = HashSet::new();
+    while let Some(expr) = pending.pop() {
+        if !seen.insert(std::ptr::from_ref(expr) as usize) {
+            continue;
+        }
+        match expr {
+            Expr::Sort(level) => collect_names_from_level(names, level),
+            Expr::BVar(_) => {}
+            Expr::Const { name, levels } => {
+                collect_name(names, &Name::from_dotted(name));
+                for level in levels {
+                    collect_names_from_level(names, level);
+                }
             }
-        }
-        Expr::App(fun, arg) => {
-            collect_names_from_expr(names, fun);
-            collect_names_from_expr(names, arg);
-        }
-        Expr::Lam { ty, body, .. } | Expr::Pi { ty, body, .. } => {
-            collect_names_from_expr(names, ty);
-            collect_names_from_expr(names, body);
-        }
-        Expr::Let {
-            ty, value, body, ..
-        } => {
-            collect_names_from_expr(names, ty);
-            collect_names_from_expr(names, value);
-            collect_names_from_expr(names, body);
+            Expr::App(fun, arg)
+            | Expr::Lam {
+                ty: fun, body: arg, ..
+            }
+            | Expr::Pi {
+                ty: fun, body: arg, ..
+            } => {
+                pending.push(arg);
+                pending.push(fun);
+            }
         }
     }
 }
 
 fn collect_names_from_level(names: &mut BTreeSet<Name>, level: &Level) {
-    match level {
-        Level::Zero => {}
-        Level::Succ(inner) => collect_names_from_level(names, inner),
-        Level::Max(lhs, rhs) | Level::IMax(lhs, rhs) => {
-            collect_names_from_level(names, lhs);
-            collect_names_from_level(names, rhs);
+    let mut pending = vec![level];
+    while let Some(level) = pending.pop() {
+        match level {
+            Level::Zero => {}
+            Level::Succ(inner) => pending.push(inner),
+            Level::Max(lhs, rhs) | Level::IMax(lhs, rhs) => {
+                pending.push(rhs);
+                pending.push(lhs);
+            }
+            Level::Param(name) => collect_name(names, &Name::from_dotted(name)),
         }
-        Level::Param(name) => collect_name(names, &Name::from_dotted(name)),
     }
 }
 
@@ -2640,19 +2699,19 @@ fn ensure_canonical_names(names: &[Name]) -> Result<()> {
 }
 
 fn imported_decl_map(
-    imports: &[&VerifiedModule],
+    imports: &[&dyn CertificateImportView],
     name_index: &BTreeMap<Name, usize>,
     referenced_names: &BTreeSet<Name>,
     preferred_imports: &BTreeMap<Name, ImportEntry>,
 ) -> Result<BTreeMap<Name, ImportedDeclInfo>> {
     let mut map = BTreeMap::new();
     for (import_index, import) in imports.iter().enumerate() {
-        for entry in &import.export_block {
+        for entry in import.export_block() {
             let name = import
-                .name_table
+                .name_table()
                 .get(entry.name)
                 .ok_or(CertError::DecodeError)?;
-            if import_export_uses_builtin_eq_rec(import, entry)? {
+            if import_export_uses_builtin_eq_rec(*import, entry)? {
                 continue;
             }
             if !referenced_names.contains(name) || !name_index.contains_key(name) {
@@ -2660,14 +2719,14 @@ fn imported_decl_map(
             }
             if preferred_imports
                 .get(name)
-                .is_some_and(|preferred| !verified_module_matches_import_entry(import, preferred))
+                .is_some_and(|preferred| !import_view_matches_import_entry(*import, preferred))
             {
                 continue;
             }
             let axiom_dependencies = entry
                 .axiom_dependencies
                 .iter()
-                .map(|axiom| remap_imported_axiom_ref(imports, import, axiom, name_index))
+                .map(|axiom| remap_imported_axiom_ref(imports, *import, axiom, name_index))
                 .collect::<Result<Vec<_>>>()?;
             let old = map.insert(
                 name.clone(),
@@ -2686,12 +2745,15 @@ fn imported_decl_map(
     Ok(map)
 }
 
-fn verified_module_matches_import_entry(module: &VerifiedModule, entry: &ImportEntry) -> bool {
-    module.module == entry.module
-        && module.export_hash == entry.export_hash
+fn import_view_matches_import_entry(
+    module: &dyn CertificateImportView,
+    entry: &ImportEntry,
+) -> bool {
+    module.module() == &entry.module
+        && module.export_hash() == entry.export_hash
         && entry
             .certificate_hash
-            .is_none_or(|hash| module.certificate_hash == hash)
+            .is_none_or(|hash| module.certificate_hash() == hash)
 }
 
 fn producer_imported_decl_map(
@@ -2732,13 +2794,13 @@ fn producer_imported_decl_map(
 }
 
 fn remap_imported_axiom_ref(
-    imports: &[&VerifiedModule],
-    import: &VerifiedModule,
+    imports: &[&dyn CertificateImportView],
+    import: &dyn CertificateImportView,
     axiom: &AxiomRef,
     name_index: &BTreeMap<Name, usize>,
 ) -> Result<AxiomRef> {
     let axiom_name = import
-        .name_table
+        .name_table()
         .get(axiom.name)
         .ok_or(CertError::DecodeError)?;
     let name = *name_index.get(axiom_name).ok_or(CertError::DecodeError)?;
@@ -2819,7 +2881,7 @@ fn remap_producer_imported_axiom_ref(
 
 fn referenced_imported_export_names(
     declarations: &[Decl],
-    imports: &[&VerifiedModule],
+    imports: &[&dyn CertificateImportView],
     local_public_names: &[Name],
 ) -> Result<BTreeSet<Name>> {
     let mut referenced_names = BTreeSet::new();
@@ -2837,13 +2899,13 @@ fn referenced_imported_export_names(
 
     let mut imported_exports = BTreeSet::new();
     for import in imports {
-        for entry in &import.export_block {
-            if import_export_uses_builtin_eq_rec(import, entry)? {
+        for entry in import.export_block() {
+            if import_export_uses_builtin_eq_rec(*import, entry)? {
                 continue;
             }
             imported_exports.insert(
                 import
-                    .name_table
+                    .name_table()
                     .get(entry.name)
                     .cloned()
                     .ok_or(CertError::DecodeError)?,
@@ -2867,7 +2929,7 @@ fn producer_referenced_imported_export_names(
 
 fn referenced_builtin_names(
     declarations: &[Decl],
-    imports: &[&VerifiedModule],
+    imports: &[&dyn CertificateImportView],
     local_public_names: &[Name],
 ) -> Result<BTreeSet<Name>> {
     let mut referenced_names = BTreeSet::new();
@@ -2885,13 +2947,13 @@ fn referenced_builtin_names(
 
     let mut imported_exports = BTreeSet::new();
     for import in imports {
-        for entry in &import.export_block {
-            if import_export_uses_builtin_eq_rec(import, entry)? {
+        for entry in import.export_block() {
+            if import_export_uses_builtin_eq_rec(*import, entry)? {
                 continue;
             }
             imported_exports.insert(
                 import
-                    .name_table
+                    .name_table()
                     .get(entry.name)
                     .cloned()
                     .ok_or(CertError::DecodeError)?,
@@ -2905,16 +2967,19 @@ fn referenced_builtin_names(
     Ok(referenced_names)
 }
 
-fn import_export_uses_builtin_eq_rec(import: &VerifiedModule, entry: &ExportEntry) -> Result<bool> {
-    let Some(entry_name) = import.name_table.get(entry.name) else {
+fn import_export_uses_builtin_eq_rec(
+    import: &dyn CertificateImportView,
+    entry: &ExportEntry,
+) -> Result<bool> {
+    let Some(entry_name) = import.name_table().get(entry.name) else {
         return Err(CertError::DecodeError);
     };
     if entry_name.as_dotted() != "Eq.rec" {
         return Ok(false);
     }
 
-    for candidate in &import.export_block {
-        let Some(candidate_name) = import.name_table.get(candidate.name) else {
+    for candidate in import.export_block() {
+        let Some(candidate_name) = import.name_table().get(candidate.name) else {
             return Err(CertError::DecodeError);
         };
         if candidate.kind == ExportKind::Inductive && candidate_name.as_dotted() == "Eq" {
@@ -2926,13 +2991,13 @@ fn import_export_uses_builtin_eq_rec(import: &VerifiedModule, entry: &ExportEntr
 
 fn collect_imported_axiom_names_for_referenced_exports(
     names: &mut BTreeSet<Name>,
-    imports: &[&VerifiedModule],
+    imports: &[&dyn CertificateImportView],
     referenced_names: &BTreeSet<Name>,
 ) -> Result<()> {
     for import in imports {
-        for entry in &import.export_block {
+        for entry in import.export_block() {
             let entry_name = import
-                .name_table
+                .name_table()
                 .get(entry.name)
                 .ok_or(CertError::DecodeError)?;
             if !referenced_names.contains(entry_name) {
@@ -2940,7 +3005,7 @@ fn collect_imported_axiom_names_for_referenced_exports(
             }
             for axiom in &entry.axiom_dependencies {
                 let axiom_name = import
-                    .name_table
+                    .name_table()
                     .get(axiom.name)
                     .ok_or(CertError::DecodeError)?;
                 collect_name(names, axiom_name);
@@ -2977,7 +3042,7 @@ fn producer_collect_imported_axiom_names_for_referenced_exports(
 }
 
 fn import_index_exporting_axiom(
-    imports: &[&VerifiedModule],
+    imports: &[&dyn CertificateImportView],
     axiom_name: &Name,
     decl_interface_hash: Hash,
 ) -> Result<usize> {
@@ -2986,13 +3051,13 @@ fn import_index_exporting_axiom(
         .enumerate()
         .find_map(|(import_index, import)| {
             import
-                .export_block
+                .export_block()
                 .iter()
                 .any(|entry| {
                     entry.kind == ExportKind::Axiom
                         && entry.decl_interface_hash == decl_interface_hash
                         && import
-                            .name_table
+                            .name_table()
                             .get(entry.name)
                             .is_some_and(|name| name == axiom_name)
                 })
@@ -3041,6 +3106,30 @@ pub(crate) fn union_axioms(axioms: impl IntoIterator<Item = AxiomRef>) -> Vec<Ax
 #[cfg(test)]
 mod reference_binding_tests {
     use super::*;
+
+    #[test]
+    fn raw_name_collection_is_stack_safe_and_memoizes_shared_dags() {
+        let mut expr = Arc::new(Expr::konst("Fixture.leaf", Vec::new()));
+        for _ in 0..8_192 {
+            expr = Arc::new(Expr::App(Arc::clone(&expr), Arc::clone(&expr)));
+        }
+        let mut names = BTreeSet::new();
+        collect_names_from_expr(&mut names, &expr);
+        assert_eq!(names, BTreeSet::from([Name::from_dotted("Fixture.leaf")]));
+        names.clear();
+        collect_const_names_from_expr(&mut names, &expr);
+        assert_eq!(names, BTreeSet::from([Name::from_dotted("Fixture.leaf")]));
+        std::mem::forget(expr);
+
+        let mut level = Level::param("u");
+        for _ in 0..8_192 {
+            level = Level::succ(level);
+        }
+        names.clear();
+        collect_names_from_level(&mut names, &level);
+        assert_eq!(names, BTreeSet::from([Name::from_dotted("u")]));
+        std::mem::forget(level);
+    }
 
     #[test]
     fn reference_binding_table_records_each_origin_before_emission() {

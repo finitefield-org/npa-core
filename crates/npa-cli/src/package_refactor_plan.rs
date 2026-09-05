@@ -3,7 +3,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
-    fs, io,
+    io,
     path::Path,
 };
 
@@ -18,7 +18,9 @@ use npa_package::{
 
 use crate::args::{PackageRefactorPlanOptions, PackageRefactorPlanScope};
 use crate::diagnostic::{CommandDiagnostic, CommandResult, DiagnosticKind};
-use crate::fs::join_package_path;
+use crate::generated_artifact_writer::{
+    open_package_regular_file_no_follow, read_package_regular_file_no_follow,
+};
 use crate::package::{load_package_root, LoadedPackageRoot};
 use crate::package_artifacts::{PACKAGE_LOCK_PATH, PACKAGE_THEOREM_INDEX_PATH};
 
@@ -1379,11 +1381,11 @@ fn local_module_metric_seed(
 }
 
 fn certificate_size_metric(root: &Path, entry: &PackageLockEntry) -> (Option<u64>, f64, bool) {
-    let full_path = match join_package_path(root, &entry.certificate, "package_lock.certificate") {
-        Ok(path) => path,
+    let file = match open_package_regular_file_no_follow(root, &entry.certificate) {
+        Ok(file) => file,
         Err(_) => return (None, 0.0, false),
     };
-    match fs::metadata(full_path) {
+    match file.metadata() {
         Ok(metadata) if metadata.is_file() => {
             let bytes = metadata.len();
             let bucket = (bytes / CERTIFICATE_SIZE_BUCKET_BYTES).min(CERTIFICATE_SIZE_WEIGHT_CAP);
@@ -1422,18 +1424,21 @@ fn lock_entries_by_module(lock: &PackageLockManifest) -> BTreeMap<Name, &Package
 
 fn read_package_lock(loaded: &LoadedPackageRoot) -> Result<PackageLockManifest, CommandResult> {
     let lock_path = PackagePath::new(PACKAGE_LOCK_PATH);
-    let full_lock_path = match join_package_path(&loaded.root, &lock_path, "package_lock.path") {
-        Ok(path) => path,
-        Err(diagnostic) => {
-            return Err(CommandResult::failed(
-                COMMAND,
-                loaded.root_display.clone(),
-                vec![*diagnostic],
-            ));
-        }
-    };
-    let lock_source = match fs::read_to_string(&full_lock_path) {
-        Ok(source) => source,
+    let lock_source = match read_package_regular_file_no_follow(&loaded.root, &lock_path) {
+        Ok(bytes) => match String::from_utf8(bytes) {
+            Ok(source) => source,
+            Err(_) => {
+                return Err(CommandResult::failed(
+                    COMMAND,
+                    loaded.root_display.clone(),
+                    vec![CommandDiagnostic::error(
+                        DiagnosticKind::ArtifactIo,
+                        "package_lock_missing",
+                    )
+                    .with_path(PACKAGE_LOCK_PATH)],
+                ));
+            }
+        },
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             return Err(CommandResult::failed(
                 COMMAND,
@@ -1468,19 +1473,14 @@ fn read_optional_theorem_index(
     loaded: &LoadedPackageRoot,
 ) -> Result<Option<PackageTheoremIndex>, CommandResult> {
     let index_path = PackagePath::new(PACKAGE_THEOREM_INDEX_PATH);
-    let full_index_path =
-        match join_package_path(&loaded.root, &index_path, "generated.theorem_index.path") {
-            Ok(path) => path,
-            Err(diagnostic) => {
-                return Err(CommandResult::failed(
-                    COMMAND,
-                    loaded.root_display.clone(),
-                    vec![*diagnostic],
-                ));
-            }
-        };
-    let index_source = match fs::read_to_string(&full_index_path) {
-        Ok(source) => source,
+    let index_source = match read_package_regular_file_no_follow(&loaded.root, &index_path) {
+        Ok(bytes) => String::from_utf8(bytes).map_err(|_| {
+            CommandResult::failed(
+                COMMAND,
+                loaded.root_display.clone(),
+                vec![refactor_plan_theorem_index_invalid_diagnostic(None)],
+            )
+        })?,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(_) => {
             return Err(CommandResult::failed(

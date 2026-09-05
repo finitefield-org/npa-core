@@ -66,7 +66,7 @@ pub fn parse_package_hash(
     }
 
     let mut digest = [0_u8; 32];
-    for (index, chunk) in hex.as_bytes().chunks_exact(2).enumerate() {
+    for (index, chunk) in hex.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         digest[index] = hex_nibble(chunk[0]) << 4 | hex_nibble(chunk[1]);
     }
     Ok(PackageHash::new(digest))

@@ -4,21 +4,24 @@ use npa_api::PerformanceDeclarationMeasurement;
 use npa_cert::Name;
 use npa_cli::args::{
     KernelFuelReportMode, PackageAuditCacheMode, PackageBuildCheckCacheMode, PackageBuildSelection,
-    PackageChecker, PackageLockInputMode, PackageTimingMode, PackageVerifierMemoMode,
+    PackageChecker, PackageLockInputMode, PackageSourceStructureSelection, PackageTimingMode,
+    PackageVerifierMemoMode,
 };
 use npa_cli::diagnostic::{CommandExitCode, DiagnosticKind};
 use npa_cli::package_api::v1::{
     audit_artifact_ledger_all, audit_artifact_ledger_modules, build_certs_check, build_certs_write,
+    check_source_structure_all, check_source_structure_modules, check_source_structure_paths,
     common_options, external_checker_options, refresh_artifacts_check, refresh_artifacts_write,
-    theorem_premise_report, verify_certs_full, verify_changed_certificates,
+    theorem_premise_report, verify_certs_base, verify_certs_full, verify_certs_modules,
+    verify_changed_certificates,
 };
 use npa_cli::package_build::run_package_build_certs;
 use npa_cli::package_verify::run_package_verify_certs;
 use npa_kernel::KernelWorkCounters;
 
 #[test]
-fn v0_8_public_break_shapes_are_complete_and_current() {
-    assert_eq!(env!("CARGO_PKG_VERSION"), "0.8.0");
+fn v0_9_public_break_shapes_are_complete_and_current() {
+    assert_eq!(env!("CARGO_PKG_VERSION"), "0.9.0");
 
     let counters = KernelWorkCounters {
         fuel: Default::default(),
@@ -97,6 +100,26 @@ fn package_api_v1_artifact_ledger_constructors_preserve_selection() {
 }
 
 #[test]
+fn package_api_v1_source_structure_constructors_preserve_closed_selection() {
+    let all = check_source_structure_all(common_options("all", true));
+    assert_eq!(all.selection, PackageSourceStructureSelection::All);
+
+    let names = vec![Name::from_dotted("Proofs.Example")];
+    let modules = check_source_structure_modules(common_options("modules", false), names.clone());
+    assert_eq!(
+        modules.selection,
+        PackageSourceStructureSelection::Modules(names)
+    );
+
+    let paths = vec![npa_package::PackagePath::new("Proofs/Example/source.npa")];
+    let direct = check_source_structure_paths(common_options("paths", false), paths.clone());
+    assert_eq!(
+        direct.selection,
+        PackageSourceStructureSelection::Paths(paths)
+    );
+}
+
+#[test]
 fn package_api_v1_theorem_premise_report_constructor_preserves_modes() {
     let request = theorem_premise_report(common_options("proofs", true), true)
         .with_timings(PackageTimingMode::Summary);
@@ -132,6 +155,109 @@ fn package_api_v1_verification_constructors_preserve_semantic_defaults() {
 }
 
 #[test]
+fn package_api_v1_verification_selector_constructors_and_builders_are_closed() {
+    let names = vec![Name::from_dotted("Proofs.A"), Name::from_dotted("Proofs.B")];
+    let modules = verify_certs_modules(
+        common_options("modules", true),
+        PackageChecker::Reference,
+        names.clone(),
+    );
+    assert!(!modules.changed);
+    assert_eq!(modules.modules, names);
+    assert_eq!(modules.base, None);
+
+    let base = verify_certs_base(
+        common_options("base", false),
+        PackageChecker::Fast,
+        "origin/main",
+    );
+    assert!(!base.changed);
+    assert!(base.modules.is_empty());
+    assert_eq!(base.base.as_deref(), Some("origin/main"));
+
+    let replaced =
+        verify_changed_certificates(common_options("replace", false), PackageChecker::Reference)
+            .with_modules(vec![Name::from_dotted("Proofs.C")])
+            .with_base("HEAD^");
+    assert!(!replaced.changed);
+    assert!(replaced.modules.is_empty());
+    assert_eq!(replaced.base.as_deref(), Some("HEAD^"));
+
+    let replaced = replaced.with_modules(vec![Name::from_dotted("Proofs.D")]);
+    assert!(!replaced.changed);
+    assert_eq!(replaced.modules, vec![Name::from_dotted("Proofs.D")]);
+    assert_eq!(replaced.base, None);
+}
+
+#[test]
+fn package_api_v1_verification_selector_validation_precedes_package_io() {
+    let missing_root = std::env::temp_dir().join(format!(
+        "npa-cli-verify-selector-validation-missing-{}",
+        std::process::id()
+    ));
+    let common = || common_options(&missing_root, true);
+    let cases = [
+        (
+            "empty modules",
+            verify_certs_modules(common(), PackageChecker::Reference, Vec::new()),
+            "verify_module_selection_empty",
+            "--module",
+        ),
+        (
+            "duplicate modules",
+            verify_certs_modules(
+                common(),
+                PackageChecker::Reference,
+                vec![Name::from_dotted("Proofs.A"), Name::from_dotted("Proofs.A")],
+            ),
+            "verify_module_duplicate",
+            "--module",
+        ),
+        (
+            "module cache",
+            verify_certs_modules(
+                common(),
+                PackageChecker::Reference,
+                vec![Name::from_dotted("Proofs.A")],
+            )
+            .with_audit_cache(PackageAuditCacheMode::ReadThrough),
+            "unsupported_flag",
+            "--audit-cache",
+        ),
+        (
+            "base reconstructed",
+            verify_certs_base(common(), PackageChecker::Reference, "HEAD^")
+                .with_package_lock_mode(PackageLockInputMode::ReconstructedInMemory),
+            "unsupported_flag",
+            "--package-lock",
+        ),
+        (
+            "base memo",
+            verify_certs_base(common(), PackageChecker::Reference, "HEAD^")
+                .with_verifier_memo(PackageVerifierMemoMode::Disk),
+            "unsupported_flag",
+            "--verifier-memo",
+        ),
+    ];
+
+    for (label, options, reason, field) in cases {
+        let result = run_package_verify_certs(options);
+        assert_eq!(
+            result.exit_code(),
+            CommandExitCode::UsageOrInternal,
+            "{label}"
+        );
+        assert_eq!(result.diagnostics[0].reason_code, reason, "{label}");
+        assert_eq!(
+            result.diagnostics[0].field.as_deref(),
+            Some(field),
+            "{label}"
+        );
+    }
+    assert!(!missing_root.exists());
+}
+
+#[test]
 fn package_api_v1_build_constructors_encode_check_write_and_refresh_modes() {
     for (options, expected_check, expected_refresh) in [
         (
@@ -158,6 +284,7 @@ fn package_api_v1_build_constructors_encode_check_write_and_refresh_modes() {
         assert_eq!(options.check, expected_check);
         assert_eq!(options.update_manifest_hashes, expected_refresh);
         assert_eq!(options.build_check_cache, PackageBuildCheckCacheMode::Off);
+        assert_eq!(options.build_check_cache_root, None);
         assert_eq!(options.kernel_fuel_report, KernelFuelReportMode::Failure);
         assert_eq!(options.timings, PackageTimingMode::Off);
     }
@@ -214,12 +341,37 @@ fn package_api_v1_verification_builders_are_pure_setters() {
 #[test]
 fn package_api_v1_build_builder_is_a_pure_setter() {
     let base = build_certs_check(common_options("proofs", true));
-    let mut expected = base.clone();
-    expected.build_check_cache = PackageBuildCheckCacheMode::ReadThrough;
+    for (mode, spelling, uses_local_store) in [
+        (PackageBuildCheckCacheMode::Off, "off", false),
+        (
+            PackageBuildCheckCacheMode::ReadThrough,
+            "read-through",
+            true,
+        ),
+        (PackageBuildCheckCacheMode::LocalHit, "local-hit", true),
+    ] {
+        let mut expected = base.clone();
+        expected.build_check_cache = mode;
+        let request = base.clone().with_build_check_cache(mode);
+        assert_eq!(request, expected);
+        assert_eq!(request.build_check_cache.as_str(), spelling);
+        assert_eq!(
+            request.build_check_cache.uses_local_store(),
+            uses_local_store
+        );
+    }
 
+    let local_hit = base
+        .clone()
+        .with_modules(vec![Name::from_dotted("Proofs.A")])
+        .with_build_check_cache(PackageBuildCheckCacheMode::LocalHit);
     assert_eq!(
-        base.with_build_check_cache(PackageBuildCheckCacheMode::ReadThrough),
-        expected
+        local_hit.selection,
+        PackageBuildSelection::Modules(vec![Name::from_dotted("Proofs.A")])
+    );
+    assert_eq!(
+        local_hit.build_check_cache,
+        PackageBuildCheckCacheMode::LocalHit
     );
 
     let base = build_certs_check(common_options("proofs", true));
@@ -234,6 +386,18 @@ fn package_api_v1_build_builder_is_a_pure_setter() {
     let mut expected = base.clone();
     expected.timings = PackageTimingMode::Detailed;
     assert_eq!(base.with_timings(PackageTimingMode::Detailed), expected);
+}
+
+#[test]
+fn package_api_v1_build_cache_root() {
+    let base = build_certs_check(common_options("proofs", true));
+    assert_eq!(base.build_check_cache_root, None);
+
+    let root = PathBuf::from("target/isolated-build-check-cache");
+    let mut expected = base.clone();
+    expected.build_check_cache_root = Some(root.clone());
+
+    assert_eq!(base.with_build_check_cache_root(root), expected);
 }
 
 #[test]
@@ -662,4 +826,34 @@ fn package_api_v1_invalid_build_requests_fail_before_package_io() {
             "{label}"
         );
     }
+}
+
+#[test]
+fn package_build_check_cache_mode_api_keeps_selection_validation_projection() {
+    let missing_root = std::env::temp_dir().join(format!(
+        "npa-cli-local-hit-api-validation-missing-{}",
+        std::process::id()
+    ));
+    let common = || common_options(&missing_root, true);
+    let cases = [
+        build_certs_check(common()).with_build_check_cache(PackageBuildCheckCacheMode::LocalHit),
+        build_certs_write(common())
+            .with_modules(vec![npa_cert::Name::from_dotted("Proofs.A")])
+            .with_build_check_cache(PackageBuildCheckCacheMode::LocalHit),
+        refresh_artifacts_check(common())
+            .with_modules(vec![npa_cert::Name::from_dotted("Proofs.A")])
+            .with_build_check_cache(PackageBuildCheckCacheMode::LocalHit),
+    ];
+
+    for request in cases {
+        let result = run_package_build_certs(request);
+        assert_eq!(result.exit_code(), CommandExitCode::UsageOrInternal);
+        assert_eq!(result.diagnostics.len(), 1);
+        let diagnostic = &result.diagnostics[0];
+        assert_eq!(diagnostic.kind, DiagnosticKind::Usage);
+        assert_eq!(diagnostic.reason_code, "package_build_selection_invalid");
+        assert_eq!(diagnostic.field.as_deref(), Some("--build-check-cache"));
+        assert_eq!(diagnostic.actual_value.as_deref(), Some("local-hit"));
+    }
+    assert!(!missing_root.exists());
 }

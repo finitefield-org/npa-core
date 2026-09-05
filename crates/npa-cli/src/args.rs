@@ -40,6 +40,8 @@ impl CliCommand {
 pub enum PackageCommand {
     /// `npa package check`.
     Check(PackageCommonOptions),
+    /// `npa package check-source-structure`.
+    CheckSourceStructure(PackageCheckSourceStructureOptions),
     /// `npa package check-interface-proposals`.
     CheckInterfaceProposals(PackageCheckInterfaceProposalsOptions),
     /// `npa package check-interface-proposal-surface`.
@@ -103,6 +105,7 @@ impl PackageCommand {
     pub fn command_name(&self) -> &'static str {
         match self {
             Self::Check(_) => "package check",
+            Self::CheckSourceStructure(_) => "package check-source-structure",
             Self::CheckInterfaceProposals(_) => "package check-interface-proposals",
             Self::CheckInterfaceProposalSurface(_) => "package check-interface-proposal-surface",
             Self::InventoryInterface(_) => "package inventory-interface",
@@ -146,6 +149,7 @@ impl PackageCommand {
     pub fn common_options(&self) -> &PackageCommonOptions {
         match self {
             Self::Check(options) | Self::CheckHashes(options) => options,
+            Self::CheckSourceStructure(options) => &options.common,
             Self::CheckInterfaceProposals(options) => &options.common,
             Self::CheckInterfaceProposalSurface(options) => &options.common,
             Self::InventoryInterface(options) => &options.common,
@@ -271,6 +275,28 @@ impl Default for PackageCommonOptions {
     }
 }
 
+/// Source selection for the dependency-free Human lexical-structure check.
+#[non_exhaustive]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PackageSourceStructureSelection {
+    /// Check every local source registered by the package manifest.
+    All,
+    /// Check the registered sources for explicit local modules.
+    Modules(Vec<Name>),
+    /// Check explicit validated package-relative source paths without loading a manifest.
+    Paths(Vec<npa_package::PackagePath>),
+}
+
+/// Options for `package check-source-structure`.
+#[non_exhaustive]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PackageCheckSourceStructureOptions {
+    /// Common package command options.
+    pub common: PackageCommonOptions,
+    /// Local sources selected for structural validation.
+    pub selection: PackageSourceStructureSelection,
+}
+
 /// Options for the non-mutating package artifact-ledger audit.
 #[non_exhaustive]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -326,6 +352,10 @@ pub struct PackageBuildCertsOptions {
     pub check: bool,
     /// Local build-check cache mode for check mode.
     pub build_check_cache: PackageBuildCheckCacheMode,
+    /// Optional complete build-check cache root for programmatic tools, tests, and benchmarks.
+    ///
+    /// Ordinary CLI parsing always initializes this to `None`; no CLI flag exposes it.
+    pub build_check_cache_root: Option<PathBuf>,
     /// Refresh local module hash pins in npa-package.toml after rebuilding certificates.
     pub update_manifest_hashes: bool,
     /// Local-module build selection.
@@ -352,10 +382,12 @@ pub enum PackageBuildSelection {
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PackageBuildCheckCacheMode {
-    /// Do not read or write package build-check cache entries.
+    /// Do not read or write either package build-check cache store.
     Off,
-    /// Read cache entries for diagnostics, but still run live build comparison.
+    /// Check everything live while reading/warming untrusted diagnostic and support entries.
     ReadThrough,
+    /// Reuse eligible support contexts only for targeted, local-only authoring feedback.
+    LocalHit,
 }
 
 impl PackageBuildCheckCacheMode {
@@ -364,6 +396,7 @@ impl PackageBuildCheckCacheMode {
         match self {
             Self::Off => "off",
             Self::ReadThrough => "read-through",
+            Self::LocalHit => "local-hit",
         }
     }
 
@@ -371,7 +404,7 @@ impl PackageBuildCheckCacheMode {
     pub fn uses_local_store(self) -> bool {
         match self {
             Self::Off => false,
-            Self::ReadThrough => true,
+            Self::ReadThrough | Self::LocalHit => true,
         }
     }
 }
@@ -653,6 +686,9 @@ pub struct PackageReconcilePromotionOriginRegistryOptions {
     pub out: Option<PathBuf>,
     /// Optional target-relative lifecycle change request.
     pub request: Option<PathBuf>,
+    /// Use the one-time, externally verified v0.8 checkpoint path for a v0.3
+    /// previous target that the current strict decoder intentionally rejects.
+    pub legacy_previous_v0_8_checkpoint: bool,
     /// Whether the validated transition may be written.
     pub apply: bool,
     /// Target-relative recovery journal path.
@@ -727,6 +763,12 @@ pub struct PackageVerifyCertsOptions {
     pub checker: PackageChecker,
     /// Verify only package modules whose certificate files are changed in Git.
     pub changed: bool,
+    /// Explicit local seed modules to verify, together with their source-free import closure.
+    pub modules: Vec<Name>,
+    /// Git ref used to select committed package changes relative to its merge base with `HEAD`.
+    pub base: Option<String>,
+    /// Whether the programmatic module selector was requested, including with an empty vector.
+    pub(crate) modules_requested: bool,
     /// Local package audit cache mode.
     pub audit_cache: PackageAuditCacheMode,
     /// Local verifier memo mode.
@@ -894,6 +936,7 @@ pub(crate) enum PackageBuildOptionsValidationError {
     BuildCheckCacheWithRefresh,
     BuildCheckCacheWithoutCheck,
     TargetedBuildCheckCache,
+    LocalHitRequiresTargetedCheck,
     TargetedWriteRequiresRefresh,
     EmptyModuleSelection,
     DuplicateModuleSelection,
@@ -911,8 +954,19 @@ pub(crate) fn validate_package_build_certs_options(
             return Err(PackageBuildOptionsValidationError::DuplicateModuleSelection);
         }
     }
+    if options.build_check_cache == PackageBuildCheckCacheMode::LocalHit
+        && (matches!(options.selection, PackageBuildSelection::Full)
+            || !options.check
+            || options.update_manifest_hashes)
+    {
+        return Err(PackageBuildOptionsValidationError::LocalHitRequiresTargetedCheck);
+    }
     if !matches!(options.selection, PackageBuildSelection::Full)
         && options.build_check_cache.uses_local_store()
+        && !((options.build_check_cache == PackageBuildCheckCacheMode::ReadThrough
+            || options.build_check_cache == PackageBuildCheckCacheMode::LocalHit)
+            && options.check
+            && !options.update_manifest_hashes)
     {
         return Err(PackageBuildOptionsValidationError::TargetedBuildCheckCache);
     }
@@ -952,6 +1006,12 @@ impl PackageExternalCheckerOptionsState {
 struct PackageVerifyOptionsValidationInput {
     checker: PackageChecker,
     changed: bool,
+    modules_requested: bool,
+    modules_empty: bool,
+    modules_duplicate: bool,
+    modules_invalid: bool,
+    base_present: bool,
+    base_empty: bool,
     audit_cache: PackageAuditCacheMode,
     verifier_memo: PackageVerifierMemoMode,
     jobs: usize,
@@ -962,9 +1022,21 @@ struct PackageVerifyOptionsValidationInput {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PackageVerifyOptionsValidationError {
     JobsZero,
+    SelectorConflict,
+    ModuleDuplicate,
+    ModuleSelectionEmpty,
+    ModuleInvalid,
+    BaseEmpty,
     ChangedWithExternalChecker,
     ChangedWithAuditCache,
     ChangedWithVerifierMemo,
+    ModulesWithExternalChecker,
+    ModulesWithAuditCache,
+    ModulesWithVerifierMemo,
+    BaseWithExternalChecker,
+    BaseWithAuditCache,
+    BaseWithVerifierMemo,
+    BaseWithReconstructedLock,
     ExternalCheckerWithParallelJobs,
     ExternalCheckerWithAuditCache,
     ExternalCheckerWithVerifierMemo,
@@ -975,12 +1047,50 @@ pub(crate) enum PackageVerifyOptionsValidationError {
     UnexpectedExternalCheckerOptions,
 }
 
+/// One validated certificate-verification selection mode.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PackageVerifySelection<'a> {
+    /// Verify the complete package.
+    Full,
+    /// Select certificate paths changed in the working tree relative to `HEAD`.
+    WorkingTreeChanged,
+    /// Verify explicit local seed modules.
+    Modules(&'a [Name]),
+    /// Select committed changes relative to the merge base of this ref and `HEAD`.
+    CommittedBase(&'a str),
+}
+
+pub(crate) fn package_verify_selection(
+    options: &PackageVerifyCertsOptions,
+) -> Result<PackageVerifySelection<'_>, PackageVerifyOptionsValidationError> {
+    validate_package_verify_certs_options(options)?;
+    Ok(if options.changed {
+        PackageVerifySelection::WorkingTreeChanged
+    } else if options.modules_requested || !options.modules.is_empty() {
+        PackageVerifySelection::Modules(&options.modules)
+    } else if let Some(base) = options.base.as_deref() {
+        PackageVerifySelection::CommittedBase(base)
+    } else {
+        PackageVerifySelection::Full
+    })
+}
+
 pub(crate) fn validate_package_verify_certs_options(
     options: &PackageVerifyCertsOptions,
 ) -> Result<(), PackageVerifyOptionsValidationError> {
+    let mut seen_modules = BTreeSet::new();
     validate_package_verify_options(PackageVerifyOptionsValidationInput {
         checker: options.checker,
         changed: options.changed,
+        modules_requested: options.modules_requested || !options.modules.is_empty(),
+        modules_empty: options.modules.is_empty(),
+        modules_duplicate: options
+            .modules
+            .iter()
+            .any(|module| !seen_modules.insert(module.clone())),
+        modules_invalid: options.modules.iter().any(|module| !module.is_canonical()),
+        base_present: options.base.is_some(),
+        base_empty: options.base.as_ref().is_some_and(String::is_empty),
         audit_cache: options.audit_cache,
         verifier_memo: options.verifier_memo,
         jobs: options.jobs,
@@ -999,6 +1109,24 @@ fn validate_package_verify_options(
     if !package_verify_jobs_are_valid(options.jobs) {
         return Err(PackageVerifyOptionsValidationError::JobsZero);
     }
+    let selector_count = usize::from(options.changed)
+        + usize::from(options.modules_requested)
+        + usize::from(options.base_present);
+    if selector_count > 1 {
+        return Err(PackageVerifyOptionsValidationError::SelectorConflict);
+    }
+    if options.modules_duplicate {
+        return Err(PackageVerifyOptionsValidationError::ModuleDuplicate);
+    }
+    if options.modules_requested && options.modules_empty {
+        return Err(PackageVerifyOptionsValidationError::ModuleSelectionEmpty);
+    }
+    if options.modules_invalid {
+        return Err(PackageVerifyOptionsValidationError::ModuleInvalid);
+    }
+    if options.base_empty {
+        return Err(PackageVerifyOptionsValidationError::BaseEmpty);
+    }
     if options.changed && options.checker == PackageChecker::External {
         return Err(PackageVerifyOptionsValidationError::ChangedWithExternalChecker);
     }
@@ -1007,6 +1135,29 @@ fn validate_package_verify_options(
     }
     if options.changed && options.verifier_memo.uses_local_store() {
         return Err(PackageVerifyOptionsValidationError::ChangedWithVerifierMemo);
+    }
+    if options.modules_requested && options.checker == PackageChecker::External {
+        return Err(PackageVerifyOptionsValidationError::ModulesWithExternalChecker);
+    }
+    if options.modules_requested && options.audit_cache.uses_local_store() {
+        return Err(PackageVerifyOptionsValidationError::ModulesWithAuditCache);
+    }
+    if options.modules_requested && options.verifier_memo.uses_local_store() {
+        return Err(PackageVerifyOptionsValidationError::ModulesWithVerifierMemo);
+    }
+    if options.base_present && options.checker == PackageChecker::External {
+        return Err(PackageVerifyOptionsValidationError::BaseWithExternalChecker);
+    }
+    if options.base_present && options.audit_cache.uses_local_store() {
+        return Err(PackageVerifyOptionsValidationError::BaseWithAuditCache);
+    }
+    if options.base_present && options.verifier_memo.uses_local_store() {
+        return Err(PackageVerifyOptionsValidationError::BaseWithVerifierMemo);
+    }
+    if options.base_present
+        && options.package_lock_mode == PackageLockInputMode::ReconstructedInMemory
+    {
+        return Err(PackageVerifyOptionsValidationError::BaseWithReconstructedLock);
     }
     if options.checker == PackageChecker::External && options.jobs > 1 {
         return Err(PackageVerifyOptionsValidationError::ExternalCheckerWithParallelJobs);
@@ -1057,6 +1208,8 @@ pub enum HelpTopic {
     Package,
     /// `npa package check --help`.
     PackageCheck,
+    /// `npa package check-source-structure --help`.
+    PackageCheckSourceStructure,
     /// `npa package check-interface-proposals --help`.
     PackageCheckInterfaceProposals,
     /// `npa package check-interface-proposal-surface --help`.
@@ -1198,6 +1351,14 @@ pub enum UsageReason {
     UnsupportedFlag,
     /// Flag value has the wrong deterministic shape.
     InvalidFlagValue,
+    /// More than one certificate-verification selector was supplied.
+    VerifySelectorConflict,
+    /// Module and path source-structure selectors were combined.
+    SourceStructureSelectorConflict,
+    /// An explicit certificate-verification module was repeated.
+    VerifyModuleDuplicate,
+    /// Programmatic explicit-module selection contained no modules.
+    VerifyModuleSelectionEmpty,
     /// Module name is not a canonical dotted NPA name.
     InvalidModuleName,
     /// Checker mode is outside CLR-04 scope.
@@ -1225,6 +1386,10 @@ impl UsageReason {
             Self::MissingRequiredFlag => "missing_required_flag",
             Self::UnsupportedFlag => "unsupported_flag",
             Self::InvalidFlagValue => "invalid_flag_value",
+            Self::VerifySelectorConflict => "verify_selector_conflict",
+            Self::SourceStructureSelectorConflict => "source_structure_selector_conflict",
+            Self::VerifyModuleDuplicate => "verify_module_duplicate",
+            Self::VerifyModuleSelectionEmpty => "verify_module_selection_empty",
             Self::InvalidModuleName => "invalid_module_name",
             Self::UnsupportedChecker => "unsupported_checker",
             Self::UnsupportedAuditCacheMode => "unsupported_audit_cache_mode",
@@ -1262,6 +1427,7 @@ fn parse_package_args(args: &[String]) -> Result<CliAction, CliUsageError> {
     match args[0].as_str() {
         "--help" | "-h" => Ok(CliAction::Help(HelpTopic::Package)),
         "check" => parse_package_check_args(&args[1..]),
+        "check-source-structure" => parse_package_check_source_structure_args(&args[1..]),
         "check-interface-proposals" => parse_package_check_interface_proposals_args(&args[1..]),
         "check-interface-proposal-surface" => {
             parse_package_check_interface_proposal_surface_args(&args[1..])
@@ -1354,6 +1520,98 @@ fn parse_package_check_args(args: &[String]) -> Result<CliAction, CliUsageError>
     Ok(CliAction::Run(CliCommand::Package(PackageCommand::Check(
         common,
     ))))
+}
+
+fn parse_package_check_source_structure_args(args: &[String]) -> Result<CliAction, CliUsageError> {
+    const COMMAND: &str = "package check-source-structure";
+    if contains_help(args) {
+        return Ok(CliAction::Help(HelpTopic::PackageCheckSourceStructure));
+    }
+
+    let mut common_tokens = Vec::new();
+    let mut module_values = Vec::new();
+    let mut path_values = Vec::new();
+    let mut index = 0usize;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--root" => {
+                // Keep the value adjacent so removing selectors cannot repair a
+                // missing root value by borrowing a later positional argument.
+                common_tokens.extend(args[index..].iter().take(2).cloned());
+                index += 2;
+            }
+            "--module" => {
+                module_values.push(flag_value(args, index, "--module", COMMAND)?.to_owned());
+                index += 2;
+            }
+            token if token.starts_with("--module=") => {
+                module_values.push(flag_equals_value(token, "--module", COMMAND)?.to_owned());
+                index += 1;
+            }
+            "--path" => {
+                path_values.push(flag_value(args, index, "--path", COMMAND)?.to_owned());
+                index += 2;
+            }
+            token if token.starts_with("--path=") => {
+                path_values.push(flag_equals_value(token, "--path", COMMAND)?.to_owned());
+                index += 1;
+            }
+            token => {
+                common_tokens.push(token.to_owned());
+                index += 1;
+            }
+        }
+    }
+
+    if !module_values.is_empty() && !path_values.is_empty() {
+        return Err(
+            CliUsageError::new(UsageReason::SourceStructureSelectorConflict).with_command(COMMAND),
+        );
+    }
+
+    let common = parse_common_options(&common_tokens, COMMAND, &["--module", "--path"])?;
+    let selection = if !module_values.is_empty() {
+        let mut seen = BTreeSet::new();
+        let mut modules = Vec::new();
+        for value in module_values {
+            let module = Name::from_dotted(&value);
+            if npa_package::validate_canonical_module_name(&module, "--module").is_err() {
+                return Err(CliUsageError::new(UsageReason::InvalidModuleName)
+                    .with_command(COMMAND)
+                    .with_flag("--module")
+                    .with_value(value));
+            }
+            if seen.insert(module.clone()) {
+                modules.push(module);
+            }
+        }
+        PackageSourceStructureSelection::Modules(modules)
+    } else if !path_values.is_empty() {
+        let mut seen = BTreeSet::new();
+        let mut paths = Vec::new();
+        for value in path_values {
+            let path = npa_package::PackagePath::new(&value);
+            if npa_package::validate_package_path(&path, "--path").is_err() {
+                return Err(CliUsageError::new(UsageReason::InvalidFlagValue)
+                    .with_command(COMMAND)
+                    .with_flag("--path")
+                    .with_value(value));
+            }
+            if seen.insert(path.clone()) {
+                paths.push(path);
+            }
+        }
+        PackageSourceStructureSelection::Paths(paths)
+    } else {
+        PackageSourceStructureSelection::All
+    };
+
+    Ok(CliAction::Run(CliCommand::Package(
+        PackageCommand::CheckSourceStructure(PackageCheckSourceStructureOptions {
+            common,
+            selection,
+        }),
+    )))
 }
 
 fn parse_package_check_interface_proposals_args(
@@ -1977,6 +2235,16 @@ fn parse_package_build_certs_args(args: &[String]) -> Result<CliAction, CliUsage
                 build_check_cache = Some(PackageBuildCheckCacheMode::ReadThrough);
                 index += 1;
             }
+            "--build-check-cache=local-hit" => {
+                if build_check_cache.is_some() {
+                    return Err(
+                        flag_error("--build-check-cache", UsageReason::DuplicateFlag)
+                            .with_command("package build-certs"),
+                    );
+                }
+                build_check_cache = Some(PackageBuildCheckCacheMode::LocalHit);
+                index += 1;
+            }
             token if token.starts_with("--build-check-cache=") => {
                 if build_check_cache.is_some() {
                     return Err(
@@ -2134,6 +2402,7 @@ fn parse_package_build_certs_args(args: &[String]) -> Result<CliAction, CliUsage
         common,
         check,
         build_check_cache,
+        build_check_cache_root: None,
         update_manifest_hashes,
         selection,
         kernel_fuel_report: kernel_fuel_report.unwrap_or(KernelFuelReportMode::Failure),
@@ -2160,6 +2429,12 @@ fn package_build_validation_cli_error(
                 .with_value(options.build_check_cache.as_str())
         }
         PackageBuildOptionsValidationError::TargetedBuildCheckCache => {
+            CliUsageError::new(UsageReason::UnsupportedFlag)
+                .with_command("package build-certs")
+                .with_flag("--build-check-cache")
+                .with_value(options.build_check_cache.as_str())
+        }
+        PackageBuildOptionsValidationError::LocalHitRequiresTargetedCheck => {
             CliUsageError::new(UsageReason::UnsupportedFlag)
                 .with_command("package build-certs")
                 .with_flag("--build-check-cache")
@@ -3486,6 +3761,7 @@ fn parse_package_reconcile_promotion_origin_registry_args(
     let mut out = None;
     let mut request = None;
     let mut recover = None;
+    let mut legacy_previous_v0_8_checkpoint = false;
     let mut apply = false;
     let mut dry_run = false;
     let mut index = 0;
@@ -3497,6 +3773,14 @@ fn parse_package_reconcile_promotion_origin_registry_args(
             "--out" => Some(("--out", &mut out)),
             "--request" => Some(("--request", &mut request)),
             "--recover" => Some(("--recover", &mut recover)),
+            "--legacy-previous-v0-8-checkpoint" if !legacy_previous_v0_8_checkpoint => {
+                legacy_previous_v0_8_checkpoint = true;
+                index += 1;
+                continue;
+            }
+            "--legacy-previous-v0-8-checkpoint" => {
+                return Err(flag_error(token, UsageReason::DuplicateFlag).with_command(COMMAND));
+            }
             "--apply" if !apply => {
                 apply = true;
                 index += 1;
@@ -3566,6 +3850,7 @@ fn parse_package_reconcile_promotion_origin_registry_args(
             || audit.is_some()
             || out.is_some()
             || request.is_some()
+            || legacy_previous_v0_8_checkpoint
             || apply
             || dry_run
         {
@@ -3599,6 +3884,7 @@ fn parse_package_reconcile_promotion_origin_registry_args(
                 audit,
                 out,
                 request,
+                legacy_previous_v0_8_checkpoint,
                 apply,
                 recover,
             },
@@ -4028,6 +4314,8 @@ fn parse_package_verify_certs_args(args: &[String]) -> Result<CliAction, CliUsag
     let mut checker = None::<PackageChecker>;
     let mut package_lock_mode = None::<PackageLockInputMode>;
     let mut changed = false;
+    let mut module_values = Vec::<String>::new();
+    let mut base = None::<String>;
     let mut audit_cache = None::<PackageAuditCacheMode>;
     let mut verifier_memo = None::<PackageVerifierMemoMode>;
     let mut jobs = None::<usize>;
@@ -4044,6 +4332,32 @@ fn parse_package_verify_certs_args(args: &[String]) -> Result<CliAction, CliUsag
                         .with_command("package verify-certs"));
                 }
                 changed = true;
+                index += 1;
+            }
+            "--module" => {
+                module_values
+                    .push(flag_value(args, index, "--module", "package verify-certs")?.to_owned());
+                index += 2;
+            }
+            token if token.starts_with("--module=") => {
+                module_values
+                    .push(flag_equals_value(token, "--module", "package verify-certs")?.to_owned());
+                index += 1;
+            }
+            "--base" => {
+                if base.is_some() {
+                    return Err(flag_error("--base", UsageReason::DuplicateFlag)
+                        .with_command("package verify-certs"));
+                }
+                base = Some(flag_value(args, index, "--base", "package verify-certs")?.to_owned());
+                index += 2;
+            }
+            token if token.starts_with("--base=") => {
+                if base.is_some() {
+                    return Err(flag_error("--base", UsageReason::DuplicateFlag)
+                        .with_command("package verify-certs"));
+                }
+                base = Some(flag_equals_value(token, "--base", "package verify-certs")?.to_owned());
                 index += 1;
             }
             "--checker" => {
@@ -4339,6 +4653,8 @@ fn parse_package_verify_certs_args(args: &[String]) -> Result<CliAction, CliUsag
             "--checker",
             "--package-lock",
             "--changed",
+            "--module",
+            "--base",
             "--runner-policy",
             "--runner-policy-hash",
             "--checker-registry",
@@ -4354,9 +4670,26 @@ fn parse_package_verify_certs_args(args: &[String]) -> Result<CliAction, CliUsag
     let verifier_memo = verifier_memo.unwrap_or(PackageVerifierMemoMode::Off);
     let jobs = jobs.unwrap_or(1);
     let timings = timings.unwrap_or(PackageTimingMode::Off);
+    let modules_requested = !module_values.is_empty();
+    let mut seen_modules = BTreeSet::new();
+    let mut modules = Vec::with_capacity(module_values.len());
+    let mut modules_duplicate = false;
+    let mut modules_invalid = false;
+    for value in module_values {
+        let module = Name::from_dotted(&value);
+        modules_invalid |= !module.is_canonical();
+        modules_duplicate |= !seen_modules.insert(module.clone());
+        modules.push(module);
+    }
     let validation = PackageVerifyOptionsValidationInput {
         checker,
         changed,
+        modules_requested,
+        modules_empty: modules.is_empty(),
+        modules_duplicate,
+        modules_invalid,
+        base_present: base.is_some(),
+        base_empty: base.as_ref().is_some_and(String::is_empty),
         audit_cache,
         verifier_memo,
         jobs,
@@ -4390,6 +4723,9 @@ fn parse_package_verify_certs_args(args: &[String]) -> Result<CliAction, CliUsag
             common,
             checker,
             changed,
+            modules,
+            base,
+            modules_requested,
             audit_cache,
             verifier_memo,
             jobs,
@@ -4420,6 +4756,37 @@ fn package_verify_validation_cli_error(
                 .with_flag("--jobs")
                 .with_value(options.jobs.to_string())
         }
+        PackageVerifyOptionsValidationError::SelectorConflict => {
+            let flag = if options.base_present {
+                "--base"
+            } else if options.modules_requested {
+                "--module"
+            } else {
+                "--changed"
+            };
+            CliUsageError::new(UsageReason::VerifySelectorConflict)
+                .with_command("package verify-certs")
+                .with_flag(flag)
+                .with_value("conflicting selector")
+        }
+        PackageVerifyOptionsValidationError::ModuleDuplicate => {
+            CliUsageError::new(UsageReason::VerifyModuleDuplicate)
+                .with_command("package verify-certs")
+                .with_flag("--module")
+        }
+        PackageVerifyOptionsValidationError::ModuleSelectionEmpty => {
+            CliUsageError::new(UsageReason::VerifyModuleSelectionEmpty)
+                .with_command("package verify-certs")
+                .with_flag("--module")
+        }
+        PackageVerifyOptionsValidationError::ModuleInvalid => {
+            CliUsageError::new(UsageReason::InvalidModuleName)
+                .with_command("package verify-certs")
+                .with_flag("--module")
+        }
+        PackageVerifyOptionsValidationError::BaseEmpty => {
+            flag_error("--base", UsageReason::MissingFlagValue).with_command("package verify-certs")
+        }
         PackageVerifyOptionsValidationError::ChangedWithExternalChecker => {
             unsupported("--changed", options.checker.as_str().to_owned())
         }
@@ -4429,6 +4796,28 @@ fn package_verify_validation_cli_error(
         PackageVerifyOptionsValidationError::ChangedWithVerifierMemo => {
             unsupported("--verifier-memo", options.verifier_memo.as_str().to_owned())
         }
+        PackageVerifyOptionsValidationError::ModulesWithExternalChecker => {
+            unsupported("--module", options.checker.as_str().to_owned())
+        }
+        PackageVerifyOptionsValidationError::ModulesWithAuditCache => {
+            unsupported("--audit-cache", options.audit_cache.as_str().to_owned())
+        }
+        PackageVerifyOptionsValidationError::ModulesWithVerifierMemo => {
+            unsupported("--verifier-memo", options.verifier_memo.as_str().to_owned())
+        }
+        PackageVerifyOptionsValidationError::BaseWithExternalChecker => {
+            unsupported("--base", options.checker.as_str().to_owned())
+        }
+        PackageVerifyOptionsValidationError::BaseWithAuditCache => {
+            unsupported("--audit-cache", options.audit_cache.as_str().to_owned())
+        }
+        PackageVerifyOptionsValidationError::BaseWithVerifierMemo => {
+            unsupported("--verifier-memo", options.verifier_memo.as_str().to_owned())
+        }
+        PackageVerifyOptionsValidationError::BaseWithReconstructedLock => unsupported(
+            "--package-lock",
+            options.package_lock_mode.as_str().to_owned(),
+        ),
         PackageVerifyOptionsValidationError::ExternalCheckerWithParallelJobs => {
             unsupported("--jobs", options.jobs.to_string())
         }
@@ -4601,6 +4990,7 @@ fn parse_build_check_cache_mode(value: &str) -> Result<PackageBuildCheckCacheMod
     match value {
         "off" => Ok(PackageBuildCheckCacheMode::Off),
         "read-through" => Ok(PackageBuildCheckCacheMode::ReadThrough),
+        "local-hit" => Ok(PackageBuildCheckCacheMode::LocalHit),
         other => Err(
             CliUsageError::new(UsageReason::UnsupportedBuildCheckCacheMode)
                 .with_command("package build-certs")
@@ -4826,6 +5216,7 @@ fn is_unsupported_clr04_flag(flag: &str) -> bool {
             | "--declaration"
             | "--top"
             | "--include-source-metrics"
+            | "--path"
     ) || flag.starts_with("--changed=")
         || flag.starts_with("--all=")
         || flag.starts_with("--registry=")
@@ -4854,6 +5245,7 @@ fn is_unsupported_clr04_flag(flag: &str) -> bool {
         || flag.starts_with("--declaration=")
         || flag.starts_with("--top=")
         || flag.starts_with("--include-source-metrics=")
+        || flag.starts_with("--path=")
 }
 
 /// Render deterministic help text.
@@ -4863,10 +5255,13 @@ pub fn render_help(topic: HelpTopic) -> &'static str {
             "Usage: npa <command> [options]\n\nCommands:\n  package    Package manifest and certificate commands\n  version    Print npa CLI version\n\nOptions:\n  --help\n  --version"
         }
         HelpTopic::Package => {
-            "Usage: npa package <command> [options]\n\nCommands:\n  check\n  check-interface-proposals\n  check-interface-proposal-surface\n  inventory-interface\n  build-certs\n  axiom-report\n  index\n  theorem-premise-report\n  export-summary\n  export-candidate-metadata\n  prepare-l2-review-input\n  aggregate-l2-acceptance\n  validate-l2-acceptance\n  validate-l2-namespace-transport\n  prepare-promotion\n  materialize-promotion\n  validate-promotion-materialization\n  validate-promotion-origin-registry\n  reconcile-promotion-origin-registry\n  register-equivalent-promotion-origin\n  verify-certs\n  check-hashes\n  audit-artifact-ledger\n  lock\n  publish-plan\n  check-generated\n  high-trust\n  gate-plan\n  refactor-plan\n\nCommon options:\n  --root PATH    Package root, default: .\n  --json         Emit deterministic JSON diagnostics\n  --help         Show help"
+            "Usage: npa package <command> [options]\n\nCommands:\n  check\n  check-source-structure\n  check-interface-proposals\n  check-interface-proposal-surface\n  inventory-interface\n  build-certs\n  axiom-report\n  index\n  theorem-premise-report\n  export-summary\n  export-candidate-metadata\n  prepare-l2-review-input\n  aggregate-l2-acceptance\n  validate-l2-acceptance\n  validate-l2-namespace-transport\n  prepare-promotion\n  materialize-promotion\n  validate-promotion-materialization\n  validate-promotion-origin-registry\n  reconcile-promotion-origin-registry\n  register-equivalent-promotion-origin\n  verify-certs\n  check-hashes\n  audit-artifact-ledger\n  lock\n  publish-plan\n  check-generated\n  high-trust\n  gate-plan\n  refactor-plan\n\nCommon options:\n  --root PATH    Package root, default: .\n  --json         Emit deterministic JSON diagnostics\n  --help         Show help"
         }
         HelpTopic::PackageCheck => {
             "Usage: npa package check [--root PATH] [--json]\n\nValidate npa-package.toml metadata without reading source or certificate artifacts."
+        }
+        HelpTopic::PackageCheckSourceStructure => {
+            "Usage: npa package check-source-structure [--root PATH] [--json] [--module MODULE]... [--path PATH]...\n\nRun a read-only, dependency-free Human Surface lexer and balanced-delimiter preflight. With no selector, check every manifest module. Repeated --module checks registered module sources; repeated --path checks package-relative files without loading npa-package.toml. --module and --path are mutually exclusive. This command does not parse, elaborate, type-check, read certificates, write files, or produce proof evidence."
         }
         HelpTopic::PackageCheckInterfaceProposals => {
             "Usage: npa package check-interface-proposals --root PATH [--proposal-root PATH] [--previous-proposal-root PATH] --json\n\nValidate network-free interface-proposal curation metadata and locally detectable per-record continuity. The caller must supply the immediately preceding validated snapshot when using --previous-proposal-root. This command is curation validation only: it is not proof verification or catalog admission, invokes no Git or network, and writes no files."
@@ -4878,7 +5273,7 @@ pub fn render_help(topic: HelpTopic) -> &'static str {
             "Usage: npa package inventory-interface --ecosystem lean4-mathlib4 --root PATH --repository ID --revision SHA --license ID [--license-note TEXT] --path PATH... --declaration NAME... --json\n\nInventory selected Lean 4/mathlib4 source paths with a caller-supplied immutable pin. The adapter is token-level, read-only, network-free, emits npa.mathlib.interface_inventory.v1, never invokes Git, and never writes proposals or proof evidence."
         }
         HelpTopic::PackageBuildCerts => {
-            "Usage: npa package build-certs [--root PATH] [--json] [--check] [--build-check-cache off|read-through] [--update-manifest-hashes] [--module MODULE]... [--changed] [--kernel-fuel-report off|failure|detailed] [--timings off|summary|detailed]\n\nRebuild package certificates. Kernel fuel reporting defaults to failure and timing telemetry defaults to off; the two selections are independent and neither changes proof acceptance. Build-check caching requires --check; for example: --check --build-check-cache read-through. --module and --changed select targeted authoring builds and are mutually exclusive. Targeted ordinary builds require --check; targeted writes require --update-manifest-hashes and rebuild the dependency-safe local dependent closure. Full build-certs --check and source-free verification remain required release gates. --update-manifest-hashes refreshes local module hash pins and declared metadata before rebuilding generated/package-lock.json."
+            "Usage: npa package build-certs [--root PATH] [--json] [--check] [--build-check-cache off|read-through|local-hit] [--update-manifest-hashes] [--module MODULE]... [--changed] [--kernel-fuel-report off|failure|detailed] [--timings off|summary|detailed]\n\nRebuild package certificates. Kernel fuel reporting defaults to failure and timing telemetry defaults to off; the two selections are independent and neither changes proof acceptance. Build-check cache modes are closed: off performs no cache-only work; read-through is available for full or targeted --check, always builds targets and checks support live, and may warm diagnostic result and eligible support stores; local-hit is available only for targeted --check with --module or --changed, may reuse exact eligible support contexts, and always builds every reached target fresh. Both non-off modes may write only their automatically placed external local stores; local-hit warms only cache-free live miss subtrees allowed by the publication rule. Store unavailability falls back to live work with a bounded diagnostic. All cache entries and hits are untrusted authoring metadata, and local-hit results are local-only with build_evidence=false and proof_evidence=false. This build-certs --build-check-cache local-hit mode is separate from verify-certs --audit-cache local-hit; the commands use different stores and neither cache is proof evidence. Non-off modes require --check; refresh, write, completion, and release workflows use cache off. --module and --changed select targeted authoring builds and are mutually exclusive. Targeted ordinary builds require --check; targeted writes require --update-manifest-hashes and rebuild the dependency-safe local dependent closure. Full build-certs --check with cache off and ordinary source-free verification remain required release gates. --update-manifest-hashes refreshes local module hash pins and declared metadata before rebuilding generated/package-lock.json."
         }
         HelpTopic::PackageAxiomReport => {
             "Usage: npa package axiom-report [--root PATH] [--json] [--check] [--timings off|summary|detailed]\n\nGenerate or check generated/axiom-report.json from source-free package certificate artifacts. Timing telemetry is informational and is not proof evidence."
@@ -4920,13 +5315,13 @@ pub fn render_help(topic: HelpTopic) -> &'static str {
             "Usage: npa package validate-promotion-origin-registry [--root PATH] [--source-root PATH]... [--previous-registry PATH] [--json]\n\nValidate the canonical target registry, current target identities, optional source identities, and an optional append-only transition."
         }
         HelpTopic::PackageReconcilePromotionOriginRegistry => {
-            "Usage: npa package reconcile-promotion-origin-registry --root PATH --previous-target-root PATH --audit PATH --out PATH [--request PATH] [--dry-run|--apply] [--json]\n       npa package reconcile-promotion-origin-registry --root PATH --recover PATH [--json]\n\nValidate and deterministically migrate or advance the promotion-origin registry to any strictly newer catalog version. Dry-run is the default."
+            "Usage: npa package reconcile-promotion-origin-registry --root PATH --previous-target-root PATH --audit PATH --out PATH [--request PATH] [--legacy-previous-v0-8-checkpoint] [--dry-run|--apply] [--json]\n       npa package reconcile-promotion-origin-registry --root PATH --recover PATH [--json]\n\nValidate and deterministically migrate or advance the promotion-origin registry to any strictly newer catalog version. Dry-run is the default. The legacy checkpoint flag is a one-time migration path for an externally verified v0.3 previous target and never decodes or accepts that target with the current checker."
         }
         HelpTopic::PackageRegisterEquivalentPromotionOrigin => {
             "Usage: npa package register-equivalent-promotion-origin --root PATH --target-root PATH --promotion-id HASH [--dry-run|--apply] [--json]\n\nValidate and optionally append one artifact-identical source package origin to an existing promotion route. Dry-run is the default."
         }
         HelpTopic::PackageVerifyCerts => {
-            "Usage: npa package verify-certs [--root PATH] [--json] [--changed] [--checker reference|fast|external] [--package-lock checked|reconstructed] [--audit-cache off|read-through|local-hit] [--verifier-memo off|read-through|disk] [--jobs N] [--timings off|summary|detailed] [--runner-policy PATH --runner-policy-hash HASH --checker-registry PATH]\n\nVerify certificates through the source-free package verifier. The default checker is reference, the package-lock input defaults to checked, the default audit cache mode is off, the default verifier memo mode is off, the default jobs value is 1, and timings default to off. Reconstructed is unavailable with the external checker. --changed verifies only package modules whose certificate files are changed in Git, plus source-free imports needed by the verifier. read-through audit cache and verifier memo modes still run live verification; local-hit and disk verifier memo hits are local-only acceleration and are not proof evidence; timing telemetry is informational and is not proof evidence; external mode requires explicit runner policy and checker registry inputs and does not support audit-cache, verifier-memo, or changed-certificate acceleration."
+            "Usage: npa package verify-certs [--root PATH] [--json] [--changed | --module MODULE ... | --base REF] [--checker reference|fast|external] [--package-lock checked|reconstructed] [--audit-cache off|read-through|local-hit] [--verifier-memo off|read-through|disk] [--jobs N] [--timings off|summary|detailed] [--runner-policy PATH --runner-policy-hash HASH --checker-registry PATH]\n\nVerify certificates through the source-free package verifier. The default checker is reference, the package-lock input defaults to checked, the default audit cache mode is off, the default verifier memo mode is off, the default jobs value is 1, and timings default to off. Reconstructed is unavailable with the external checker and with --base. --changed verifies only package modules whose certificate files are changed in Git. --module verifies explicit local seed modules. --base selects committed package changes relative to the merge base with HEAD and escalates package-wide semantic changes to full verification. Every partial selector adds source-free imports needed by the verifier and requires audit cache and verifier memo to be off; external mode does not support partial selection. read-through audit cache and verifier memo modes still run live verification; local-hit and disk verifier memo hits are local-only acceleration and are not proof evidence; timing telemetry and selector metadata are informational and are not proof evidence."
         }
         HelpTopic::PackageCheckHashes => {
             "Usage: npa package check-hashes [--root PATH] [--json]\n\nCheck checked-in package artifact hashes."

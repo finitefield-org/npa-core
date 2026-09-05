@@ -1,6 +1,7 @@
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet},
+    sync::Arc,
 };
 
 use npa_kernel::{is_canonical_name_component, Decl, Reducibility, UniverseConstraintRelation};
@@ -167,6 +168,256 @@ pub struct ImportKey {
 /// In-memory registry of modules already verified during this trust session.
 #[derive(Clone, Debug, Default)]
 pub struct VerifierSession {
+    index: Arc<SessionIndex>,
+}
+
+/// Operation-local observations for immutable certificate payload ownership.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CertificatePayloadObservation {
+    /// Newly allocated immutable certificate payloads.
+    pub payloads_frozen: u64,
+    /// Logical retained bytes of newly allocated certificate payloads.
+    pub payload_unique_bytes: u64,
+    /// Explicit verifier-session snapshot clones.
+    pub session_snapshot_clones: u64,
+    /// Copy-on-write session-index copies that actually occurred.
+    pub session_index_cow_copies: u64,
+    /// Session entries copied by actual copy-on-write events.
+    pub session_index_cow_entries: u64,
+    /// Whether any observation arithmetic saturated.
+    pub overflowed: bool,
+}
+
+impl CertificatePayloadObservation {
+    fn add(field: &mut u64, value: u64, overflowed: &mut bool) {
+        let (sum, overflow) = field.overflowing_add(value);
+        *field = if overflow { u64::MAX } else { sum };
+        *overflowed |= overflow;
+    }
+
+    pub(crate) fn observe_payload_frozen(&mut self, logical_bytes: u64) {
+        Self::add(&mut self.payloads_frozen, 1, &mut self.overflowed);
+        Self::add(
+            &mut self.payload_unique_bytes,
+            logical_bytes,
+            &mut self.overflowed,
+        );
+    }
+
+    fn observe_session_snapshot(&mut self) {
+        Self::add(&mut self.session_snapshot_clones, 1, &mut self.overflowed);
+    }
+
+    fn observe_session_cow(&mut self, entries: usize) {
+        Self::add(&mut self.session_index_cow_copies, 1, &mut self.overflowed);
+        Self::add(
+            &mut self.session_index_cow_entries,
+            u64::try_from(entries).unwrap_or(u64::MAX),
+            &mut self.overflowed,
+        );
+    }
+
+    /// Merge another operation-local observation using saturating arithmetic.
+    pub fn merge(&mut self, other: Self) {
+        Self::add(
+            &mut self.payloads_frozen,
+            other.payloads_frozen,
+            &mut self.overflowed,
+        );
+        Self::add(
+            &mut self.payload_unique_bytes,
+            other.payload_unique_bytes,
+            &mut self.overflowed,
+        );
+        Self::add(
+            &mut self.session_snapshot_clones,
+            other.session_snapshot_clones,
+            &mut self.overflowed,
+        );
+        Self::add(
+            &mut self.session_index_cow_copies,
+            other.session_index_cow_copies,
+            &mut self.overflowed,
+        );
+        Self::add(
+            &mut self.session_index_cow_entries,
+            other.session_index_cow_entries,
+            &mut self.overflowed,
+        );
+        self.overflowed |= other.overflowed;
+    }
+}
+
+/// Operation-local observations for certificate term-DAG materialization.
+///
+/// These counters describe physical acceleration work only. They are not
+/// certificate evidence and never participate in verifier lane selection.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CertificateTermMaterializationObservation {
+    /// Successful handoffs of one materialized root expression.
+    pub root_requests: u64,
+    /// Selected certificate term nodes materialized into a stored `Arc`.
+    pub unique_nodes_materialized: u64,
+    /// Child edges belonging to successfully materialized compound nodes.
+    pub selected_edges: u64,
+    /// Stored child `Arc` values cloned into materialized parent nodes.
+    pub reused_child_arcs: u64,
+    /// Materialized roots handed to owned kernel declaration fields.
+    pub owned_root_handoffs: u64,
+    /// Root handoffs that cloned an owned leaf payload.
+    pub leaf_root_clones: u64,
+    /// Root handoffs that shallow-cloned a compound expression.
+    pub compound_root_clones: u64,
+    /// Reserved option-table slots initialized by ready materializers.
+    pub materialization_slots: u64,
+    /// Deterministic logical bytes committed by admitted materializers.
+    pub materialization_charged_bytes: u64,
+    /// Materialization attempts rejected by a logical or reservation capacity stop.
+    pub materialization_capacity_stops: u64,
+    /// Authoritative recursive conversions selected after a speculative stop.
+    pub materialization_legacy_fallbacks: u64,
+    /// Whether any counter arithmetic saturated.
+    pub overflowed: bool,
+}
+
+impl CertificateTermMaterializationObservation {
+    fn add(field: &mut u64, value: u64, overflowed: &mut bool) {
+        if value == 0 {
+            return;
+        }
+        let (sum, overflow) = field.overflowing_add(value);
+        *field = if overflow { u64::MAX } else { sum };
+        *overflowed |= overflow;
+    }
+
+    pub(crate) fn observe_root_request(&mut self, leaf: bool) {
+        Self::add(&mut self.root_requests, 1, &mut self.overflowed);
+        Self::add(&mut self.owned_root_handoffs, 1, &mut self.overflowed);
+        if leaf {
+            Self::add(&mut self.leaf_root_clones, 1, &mut self.overflowed);
+        } else {
+            Self::add(&mut self.compound_root_clones, 1, &mut self.overflowed);
+        }
+    }
+
+    pub(crate) fn observe_unique_nodes(&mut self, value: u64) {
+        Self::add(
+            &mut self.unique_nodes_materialized,
+            value,
+            &mut self.overflowed,
+        );
+    }
+
+    pub(crate) fn observe_selected_edges(&mut self, value: u64) {
+        Self::add(&mut self.selected_edges, value, &mut self.overflowed);
+    }
+
+    pub(crate) fn observe_reused_child_arcs(&mut self, value: u64) {
+        Self::add(&mut self.reused_child_arcs, value, &mut self.overflowed);
+    }
+
+    pub(crate) fn observe_slots(&mut self, value: u64) {
+        Self::add(&mut self.materialization_slots, value, &mut self.overflowed);
+    }
+
+    pub(crate) fn observe_charged_bytes(&mut self, value: u64) {
+        Self::add(
+            &mut self.materialization_charged_bytes,
+            value,
+            &mut self.overflowed,
+        );
+    }
+
+    pub(crate) fn observe_capacity_stop(&mut self) {
+        Self::add(
+            &mut self.materialization_capacity_stops,
+            1,
+            &mut self.overflowed,
+        );
+    }
+
+    pub(crate) fn observe_legacy_fallback(&mut self) {
+        Self::add(
+            &mut self.materialization_legacy_fallbacks,
+            1,
+            &mut self.overflowed,
+        );
+    }
+
+    pub(crate) fn observe_overflow(&mut self) {
+        self.overflowed = true;
+    }
+
+    /// Merge another operation-local observation with saturating arithmetic.
+    pub fn merge(&mut self, other: Self) {
+        macro_rules! merge_field {
+            ($field:ident) => {
+                Self::add(&mut self.$field, other.$field, &mut self.overflowed)
+            };
+        }
+        merge_field!(root_requests);
+        merge_field!(unique_nodes_materialized);
+        merge_field!(selected_edges);
+        merge_field!(reused_child_arcs);
+        merge_field!(owned_root_handoffs);
+        merge_field!(leaf_root_clones);
+        merge_field!(compound_root_clones);
+        merge_field!(materialization_slots);
+        merge_field!(materialization_charged_bytes);
+        merge_field!(materialization_capacity_stops);
+        merge_field!(materialization_legacy_fallbacks);
+        self.overflowed |= other.overflowed;
+    }
+}
+
+/// Additive operation-local observation sinks for certificate verification.
+///
+/// All fields are private so new diagnostic sinks can be added without
+/// changing existing verifier signatures. An empty bundle has no semantic or
+/// allocation effect.
+pub struct CertificateVerificationObservationSinks<'a> {
+    pub(crate) kernel: Option<&'a mut npa_kernel::KernelWorkCounters>,
+    pub(crate) term: Option<&'a mut CertificateTermMaterializationObservation>,
+    pub(crate) payload: Option<&'a mut CertificatePayloadObservation>,
+}
+
+impl<'a> CertificateVerificationObservationSinks<'a> {
+    /// Create an empty observation bundle.
+    pub fn new() -> Self {
+        Self {
+            kernel: None,
+            term: None,
+            payload: None,
+        }
+    }
+
+    /// Install the deterministic kernel-work sink.
+    pub fn with_kernel(mut self, sink: &'a mut npa_kernel::KernelWorkCounters) -> Self {
+        self.kernel = Some(sink);
+        self
+    }
+
+    /// Install the certificate term-materialization sink.
+    pub fn with_term(mut self, sink: &'a mut CertificateTermMaterializationObservation) -> Self {
+        self.term = Some(sink);
+        self
+    }
+
+    /// Install the immutable certificate-payload ownership sink.
+    pub fn with_payload(mut self, sink: &'a mut CertificatePayloadObservation) -> Self {
+        self.payload = Some(sink);
+        self
+    }
+}
+
+impl Default for CertificateVerificationObservationSinks<'_> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct SessionIndex {
     checked: BTreeMap<ImportKey, SessionEntry>,
 }
 
@@ -180,6 +431,25 @@ impl VerifierSession {
     /// Create an empty verifier session.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Create an immutable snapshot of the current verified-import index.
+    ///
+    /// This operation clones only an `Arc`. A later registration uses
+    /// copy-on-write and cannot mutate the returned snapshot.
+    pub fn snapshot(&self) -> Self {
+        self.snapshot_observed(None)
+    }
+
+    /// Create a session snapshot and optionally record the handle clone.
+    pub fn snapshot_observed(
+        &self,
+        observation: Option<&mut CertificatePayloadObservation>,
+    ) -> Self {
+        if let Some(observation) = observation {
+            observation.observe_session_snapshot();
+        }
+        self.clone()
     }
 
     /// Register an already verified module as a normal-trust import for later verification.
@@ -197,17 +467,45 @@ impl VerifierSession {
     /// that verified modules in independent workers and need to merge those
     /// `VerifiedModule` values back into one deterministic session.
     pub fn register_verified_module_with_trust(&mut self, module: VerifiedModule, mode: TrustMode) {
-        self.insert_verified(module, mode);
+        self.register_verified_module_with_trust_observed(module, mode, None);
+    }
+
+    /// Register a verified module and optionally observe an actual session-index copy.
+    pub fn register_verified_module_with_trust_observed(
+        &mut self,
+        module: VerifiedModule,
+        mode: TrustMode,
+        observation: Option<&mut CertificatePayloadObservation>,
+    ) {
+        self.insert_verified_observed(module, mode, observation);
     }
 
     pub(crate) fn insert_verified(&mut self, module: VerifiedModule, mode: TrustMode) {
+        self.insert_verified_observed(module, mode, None);
+    }
+
+    fn insert_verified_observed(
+        &mut self,
+        module: VerifiedModule,
+        mode: TrustMode,
+        observation: Option<&mut CertificatePayloadObservation>,
+    ) {
         let key = ImportKey {
-            module: module.module.clone(),
-            export_hash: module.export_hash,
-            certificate_hash: Some(module.certificate_hash),
+            module: module.module().clone(),
+            export_hash: module.export_hash(),
+            certificate_hash: Some(module.certificate_hash()),
         };
         let entry = SessionEntry { module, mode };
-        match self.checked.get_mut(&key) {
+        if Arc::get_mut(&mut self.index).is_none() {
+            if let Some(observation) = observation {
+                observation.observe_session_cow(self.index.checked.len());
+            }
+            self.index = Arc::new((*self.index).clone());
+        }
+        let checked = &mut Arc::get_mut(&mut self.index)
+            .expect("session index must be unique after copy-on-write")
+            .checked;
+        match checked.get_mut(&key) {
             Some(existing) if existing.mode == TrustMode::HighTrust => {
                 if mode == TrustMode::HighTrust {
                     *existing = entry;
@@ -215,7 +513,7 @@ impl VerifierSession {
             }
             Some(existing) => *existing = entry,
             None => {
-                self.checked.insert(key, entry);
+                checked.insert(key, entry);
             }
         }
     }
@@ -225,22 +523,23 @@ impl VerifierSession {
         entry: &ImportEntry,
         mode: TrustMode,
     ) -> Result<&VerifiedModule> {
-        let module_export_matches = self.checked.values().any(|checked| {
-            checked.module.module == entry.module && checked.module.export_hash == entry.export_hash
+        let module_export_matches = self.index.checked.values().any(|checked| {
+            checked.module.module() == &entry.module
+                && checked.module.export_hash() == entry.export_hash
         });
-        let high_trust_module_export_matches = self.checked.values().any(|checked| {
+        let high_trust_module_export_matches = self.index.checked.values().any(|checked| {
             checked.mode == TrustMode::HighTrust
-                && checked.module.module == entry.module
-                && checked.module.export_hash == entry.export_hash
+                && checked.module.module() == &entry.module
+                && checked.module.export_hash() == entry.export_hash
         });
 
-        let found = self.checked.values().find(|checked| {
+        let found = self.index.checked.values().find(|checked| {
             (mode == TrustMode::Normal || checked.mode == TrustMode::HighTrust)
-                && checked.module.module == entry.module
-                && checked.module.export_hash == entry.export_hash
+                && checked.module.module() == &entry.module
+                && checked.module.export_hash() == entry.export_hash
                 && match (mode, entry.certificate_hash) {
                     (TrustMode::Normal, None) => true,
-                    (_, Some(hash)) => checked.module.certificate_hash == hash,
+                    (_, Some(hash)) => checked.module.certificate_hash() == hash,
                     (TrustMode::HighTrust, None) => false,
                 }
         });
@@ -267,102 +566,167 @@ impl VerifierSession {
     }
 }
 
-/// Verified module payload that can be imported by later certificate verification.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct VerifiedModule {
-    /// Exact certificate format accepted from the verified input header.
-    pub(crate) certificate_format: String,
-    /// Exact core specification accepted from the verified input header.
-    pub(crate) core_spec: String,
-    /// Module name from the verified certificate.
-    pub(crate) module: Name,
-    /// Canonical import list from the verified certificate.
-    pub(crate) imports: Vec<ImportEntry>,
-    /// Canonical name table from the verified certificate.
-    pub(crate) name_table: Vec<Name>,
-    /// Canonical level table from the verified certificate.
-    pub(crate) level_table: Vec<LevelNode>,
-    /// Canonical term table from the verified certificate.
-    pub(crate) term_table: Vec<TermNode>,
-    /// Verified declaration certificates.
-    pub(crate) declarations: Vec<DeclCert>,
-    /// Module export hash used by downstream imports.
-    pub(crate) export_hash: Hash,
-    /// Full certificate hash used by high-trust imports.
-    pub(crate) certificate_hash: Hash,
-    /// Public export interface derived from declarations.
-    pub(crate) export_block: ExportBlock,
-    /// Axiom report recomputed during verification.
-    pub(crate) axiom_report: AxiomReport,
+#[derive(Clone)]
+pub(crate) struct VerifiedModuleParts {
+    /// Immutable syntactic certificate accepted by live verification.
+    pub(crate) certificate: ModuleCert,
     /// Unique structural cost summary for this verified import closure.
     pub(crate) structural_closure: crate::structural::StructuralClosureSummary,
+    pub(crate) logical_retained_bytes_v1: u64,
+}
+
+impl PartialEq for VerifiedModuleParts {
+    fn eq(&self, other: &Self) -> bool {
+        self.certificate == other.certificate && self.structural_closure == other.structural_closure
+    }
+}
+
+impl Eq for VerifiedModuleParts {}
+
+impl std::fmt::Debug for VerifiedModuleParts {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("VerifiedModule")
+            .field("certificate_format", &self.certificate.header().format)
+            .field("core_spec", &self.certificate.header().core_spec)
+            .field("module", &self.certificate.header().module)
+            .field("imports", &self.certificate.imports())
+            .field("name_table", &self.certificate.name_table())
+            .field("level_table", &self.certificate.level_table())
+            .field("term_table", &self.certificate.term_table())
+            .field("declarations", &self.certificate.declarations())
+            .field("export_hash", &self.certificate.hashes().export_hash)
+            .field(
+                "certificate_hash",
+                &self.certificate.hashes().certificate_hash,
+            )
+            .field("export_block", &self.certificate.export_block())
+            .field("axiom_report", &self.certificate.axiom_report())
+            .field("structural_closure", &self.structural_closure)
+            .finish()
+    }
+}
+
+/// Verified module payload that can be imported by later certificate verification.
+#[derive(Clone)]
+pub struct VerifiedModule {
+    payload: Arc<VerifiedModuleParts>,
+}
+
+impl PartialEq for VerifiedModule {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.payload, &other.payload) || self.payload == other.payload
+    }
+}
+
+impl Eq for VerifiedModule {}
+
+impl std::fmt::Debug for VerifiedModule {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.payload.fmt(formatter)
+    }
 }
 
 impl VerifiedModule {
+    pub(crate) fn from_parts(parts: VerifiedModuleParts) -> Self {
+        Self {
+            payload: Arc::new(parts),
+        }
+    }
+
     /// Return the exact certificate format accepted from the input header.
     pub fn certificate_format(&self) -> &str {
-        &self.certificate_format
+        &self.payload.certificate.header().format
     }
 
     /// Return the exact core specification accepted from the input header.
     pub fn core_spec(&self) -> &str {
-        &self.core_spec
+        &self.payload.certificate.header().core_spec
     }
 
     /// Return the verified module name.
     pub fn module(&self) -> &Name {
-        &self.module
+        &self.payload.certificate.header().module
     }
 
     /// Return the canonical import list from the verified certificate.
     pub fn imports(&self) -> &[ImportEntry] {
-        &self.imports
+        self.payload.certificate.imports()
     }
 
     /// Return the canonical name table from the verified certificate.
     pub fn name_table(&self) -> &[Name] {
-        &self.name_table
+        self.payload.certificate.name_table()
     }
 
     /// Return the canonical level table from the verified certificate.
     pub fn level_table(&self) -> &[LevelNode] {
-        &self.level_table
+        self.payload.certificate.level_table()
     }
 
     /// Return the canonical term table from the verified certificate.
     pub fn term_table(&self) -> &[TermNode] {
-        &self.term_table
+        self.payload.certificate.term_table()
     }
 
     /// Return the verified declaration certificates.
     pub fn declarations(&self) -> &[DeclCert] {
-        &self.declarations
+        self.payload.certificate.declarations()
     }
 
     /// Return the module export hash used by downstream imports.
     pub fn export_hash(&self) -> Hash {
-        self.export_hash
+        self.payload.certificate.hashes().export_hash
     }
 
     /// Return the full certificate hash used by high-trust imports.
     pub fn certificate_hash(&self) -> Hash {
-        self.certificate_hash
+        self.payload.certificate.hashes().certificate_hash
     }
 
     /// Return the public export interface derived from declarations.
     pub fn export_block(&self) -> &[ExportEntry] {
-        &self.export_block
+        self.payload.certificate.export_block()
     }
 
     /// Return the axiom report recomputed during verification.
     pub fn axiom_report(&self) -> &AxiomReport {
-        &self.axiom_report
+        self.payload.certificate.axiom_report()
+    }
+
+    /// Return the target-independent v1 logical retained-size charge for the
+    /// complete verified certificate and structural closure.
+    pub fn logical_retained_bytes_v1(&self) -> u64 {
+        self.payload.logical_retained_bytes_v1
+    }
+
+    pub(crate) fn structural_closure(&self) -> &crate::structural::StructuralClosureSummary {
+        &self.payload.structural_closure
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mutate_certificate_parts_for_test(
+        &mut self,
+        mutate: impl FnOnce(&mut ModuleCertParts),
+    ) {
+        let payload = Arc::make_mut(&mut self.payload);
+        payload.certificate.mutate_parts_for_test(mutate);
+        payload.logical_retained_bytes_v1 =
+            crate::logical_charge::verified_module_logical_retained_bytes_v1(
+                payload.certificate.logical_retained_bytes_v1(),
+                &payload.structural_closure,
+            );
     }
 }
 
-/// Syntactic module certificate as represented after canonical binary decoding.
+/// Owned construction form for a syntactic module certificate.
+///
+/// Certificate decoders and builders use this type while assembling a value,
+/// then hand it to [`ModuleCert::from_parts`].  Keeping the mutable construction
+/// form separate from the runtime certificate lets the latter use immutable
+/// shared ownership without exposing a mutable shared payload.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ModuleCert {
+pub struct ModuleCertParts {
     /// Certificate format, core spec, and module identity.
     pub header: CertHeader,
     /// Canonical import list.
@@ -381,6 +745,483 @@ pub struct ModuleCert {
     pub axiom_report: AxiomReport,
     /// Export, axiom-report, and full-certificate hashes.
     pub hashes: ModuleHashes,
+}
+
+#[derive(Clone)]
+struct ModuleCertPayload {
+    parts: ModuleCertParts,
+    logical_retained_bytes_v1: u64,
+}
+
+impl PartialEq for ModuleCertPayload {
+    fn eq(&self, other: &Self) -> bool {
+        self.parts == other.parts
+    }
+}
+
+impl Eq for ModuleCertPayload {}
+
+impl std::fmt::Debug for ModuleCertPayload {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ModuleCert")
+            .field("header", &self.parts.header)
+            .field("imports", &self.parts.imports)
+            .field("name_table", &self.parts.name_table)
+            .field("level_table", &self.parts.level_table)
+            .field("term_table", &self.parts.term_table)
+            .field("declarations", &self.parts.declarations)
+            .field("export_block", &self.parts.export_block)
+            .field("axiom_report", &self.parts.axiom_report)
+            .field("hashes", &self.parts.hashes)
+            .finish()
+    }
+}
+
+/// Syntactic module certificate as represented after canonical binary decoding.
+#[derive(Clone)]
+pub struct ModuleCert {
+    payload: Arc<ModuleCertPayload>,
+}
+
+impl PartialEq for ModuleCert {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.payload, &other.payload) || self.payload == other.payload
+    }
+}
+
+impl Eq for ModuleCert {}
+
+impl std::fmt::Debug for ModuleCert {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.payload.fmt(formatter)
+    }
+}
+
+impl ModuleCert {
+    /// Freeze an owned construction payload into a certificate value.
+    pub fn from_parts(parts: ModuleCertParts) -> Self {
+        Self::from_parts_observed(parts, None)
+    }
+
+    /// Freeze an owned construction payload and optionally observe its logical allocation.
+    pub fn from_parts_observed(
+        parts: ModuleCertParts,
+        observation: Option<&mut CertificatePayloadObservation>,
+    ) -> Self {
+        let logical_retained_bytes_v1 =
+            crate::logical_charge::module_cert_logical_retained_bytes_v1(&parts);
+        let certificate = Self {
+            payload: Arc::new(ModuleCertPayload {
+                parts,
+                logical_retained_bytes_v1,
+            }),
+        };
+        if let Some(observation) = observation {
+            observation.observe_payload_frozen(logical_retained_bytes_v1);
+        }
+        certificate
+    }
+
+    /// Consume this certificate and return its owned construction payload.
+    pub fn into_parts(self) -> ModuleCertParts {
+        match Arc::try_unwrap(self.payload) {
+            Ok(payload) => payload.parts,
+            Err(payload) => payload.parts.clone(),
+        }
+    }
+
+    pub(crate) fn parts(&self) -> &ModuleCertParts {
+        &self.payload.parts
+    }
+
+    /// Mutate an owned construction payload in crate-local tests, then refreeze
+    /// it so cached logical accounting is recomputed from the resulting value.
+    #[cfg(test)]
+    pub(crate) fn mutate_parts_for_test(&mut self, mutate: impl FnOnce(&mut ModuleCertParts)) {
+        let mut parts = self.clone().into_parts();
+        mutate(&mut parts);
+        *self = Self::from_parts(parts);
+    }
+
+    /// Return the certificate header.
+    pub fn header(&self) -> &CertHeader {
+        &self.payload.parts.header
+    }
+
+    /// Return the canonical import list.
+    pub fn imports(&self) -> &[ImportEntry] {
+        &self.payload.parts.imports
+    }
+
+    /// Return the canonical name table.
+    pub fn name_table(&self) -> &[Name] {
+        &self.payload.parts.name_table
+    }
+
+    /// Return the canonical level table.
+    pub fn level_table(&self) -> &[LevelNode] {
+        &self.payload.parts.level_table
+    }
+
+    /// Return the canonical term table.
+    pub fn term_table(&self) -> &[TermNode] {
+        &self.payload.parts.term_table
+    }
+
+    /// Return the declaration certificates.
+    pub fn declarations(&self) -> &[DeclCert] {
+        &self.payload.parts.declarations
+    }
+
+    /// Return the public export block.
+    pub fn export_block(&self) -> &[ExportEntry] {
+        &self.payload.parts.export_block
+    }
+
+    /// Return the module axiom report.
+    pub fn axiom_report(&self) -> &AxiomReport {
+        &self.payload.parts.axiom_report
+    }
+
+    /// Return the committed certificate hashes.
+    pub fn hashes(&self) -> &ModuleHashes {
+        &self.payload.parts.hashes
+    }
+
+    /// Return the target-independent v1 logical retained-size charge.
+    ///
+    /// This value is cache-accounting metadata only; it is not encoded into a
+    /// certificate and does not participate in equality or hashing.
+    pub fn logical_retained_bytes_v1(&self) -> u64 {
+        self.payload.logical_retained_bytes_v1
+    }
+}
+
+/// Maximum number of per-declaration rows returned by retained-certificate
+/// detailed measurement projection.
+pub const RETAINED_CERTIFICATE_MEASUREMENT_DETAIL_LIMIT: usize = 2_048;
+
+/// Detail requested from a retained decoded-certificate measurement summary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CertificateMeasurementDetail {
+    /// Return only aggregate declaration counts.
+    Summary,
+    /// Return aggregate counts and a bounded declaration prefix.
+    Detailed,
+}
+
+/// One bounded declaration row projected from a retained decoded certificate.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CertificateDeclarationMeasurementSummary {
+    /// Zero-based declaration index in certificate order.
+    pub declaration_index: u64,
+    /// Resolved dotted declaration name, or the stable index fallback.
+    pub declaration: String,
+    /// Number of distinct term-table nodes reachable from this declaration.
+    ///
+    /// This is `u64::MAX` when the operation-wide detailed-projection work budget was exhausted;
+    /// [`CertificateMeasurementSummary::overflowed`] is also set in that case.
+    pub term_nodes: u64,
+}
+
+/// Bounded measurement projection for a retained decoded certificate.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CertificateMeasurementSummary {
+    /// Total declaration count, including rows omitted from detailed output.
+    pub declaration_count: u64,
+    /// Bounded declaration rows in certificate order.
+    pub declarations: Vec<CertificateDeclarationMeasurementSummary>,
+    /// Whether integer conversion saturated or the bounded detailed reachability projection was
+    /// truncated.
+    pub overflowed: bool,
+}
+
+/// Move-only capability for a decoded certificate retained by an artifact owner.
+///
+/// The capability intentionally exposes neither `Clone` nor a raw certificate
+/// reference. This keeps prepared-artifact accounting aligned with physical
+/// ownership while still allowing verification and bounded projections inside
+/// this crate.
+#[derive(Debug)]
+pub struct RetainedDecodedModuleCert {
+    module: ModuleCert,
+}
+
+impl RetainedDecodedModuleCert {
+    /// Move a decoded certificate into an opaque retained capability.
+    pub fn from_decoded(module: ModuleCert) -> Self {
+        Self { module }
+    }
+
+    /// Return the decoded certificate header.
+    pub fn header(&self) -> &CertHeader {
+        self.module.header()
+    }
+
+    /// Return the committed decoded certificate hashes.
+    pub fn hashes(&self) -> &ModuleHashes {
+        self.module.hashes()
+    }
+
+    /// Return the decoded certificate axiom report.
+    pub fn axiom_report(&self) -> &AxiomReport {
+        self.module.axiom_report()
+    }
+
+    /// Return the target-independent logical retained-size charge.
+    pub fn logical_retained_bytes_v1(&self) -> u64 {
+        self.module.logical_retained_bytes_v1()
+    }
+
+    /// Project bounded measurement metadata without exposing certificate tables.
+    pub fn measurement_summary(
+        &self,
+        detail: CertificateMeasurementDetail,
+    ) -> CertificateMeasurementSummary {
+        retained_certificate_measurement_summary(&self.module, detail)
+    }
+
+    /// Borrow the private decoded value for verifier implementations inside this crate.
+    pub(crate) fn module(&self) -> &ModuleCert {
+        &self.module
+    }
+}
+
+fn retained_certificate_measurement_summary(
+    certificate: &ModuleCert,
+    detail: CertificateMeasurementDetail,
+) -> CertificateMeasurementSummary {
+    let (declaration_count, mut overflowed) = match u64::try_from(certificate.declarations().len())
+    {
+        Ok(count) => (count, false),
+        Err(_) => (u64::MAX, true),
+    };
+    if detail == CertificateMeasurementDetail::Summary {
+        return CertificateMeasurementSummary {
+            declaration_count,
+            declarations: Vec::new(),
+            overflowed,
+        };
+    }
+    let mut reachability = RetainedTermReachability::new(
+        certificate.term_table(),
+        crate::MAX_CERTIFICATE_EXPANDED_NODES,
+    );
+    let mut declarations = Vec::with_capacity(
+        certificate
+            .declarations()
+            .len()
+            .min(RETAINED_CERTIFICATE_MEASUREMENT_DETAIL_LIMIT),
+    );
+    for (index, declaration) in certificate
+        .declarations()
+        .iter()
+        .take(RETAINED_CERTIFICATE_MEASUREMENT_DETAIL_LIMIT)
+        .enumerate()
+    {
+        let term_nodes = match reachability.count(declaration) {
+            Some(count) => count,
+            None => {
+                overflowed = true;
+                u64::MAX
+            }
+        };
+        declarations.push(CertificateDeclarationMeasurementSummary {
+            declaration_index: u64::try_from(index).unwrap_or(u64::MAX),
+            declaration: retained_declaration_name(certificate.name_table(), declaration, index),
+            term_nodes,
+        });
+    }
+    CertificateMeasurementSummary {
+        declaration_count,
+        declarations,
+        overflowed,
+    }
+}
+
+fn retained_declaration_name(
+    names: &[Name],
+    declaration: &DeclCert,
+    declaration_index: usize,
+) -> String {
+    let name = match &declaration.decl {
+        DeclPayload::Axiom { name, .. }
+        | DeclPayload::AxiomConstrained { name, .. }
+        | DeclPayload::Def { name, .. }
+        | DeclPayload::DefConstrained { name, .. }
+        | DeclPayload::Theorem { name, .. }
+        | DeclPayload::TheoremConstrained { name, .. }
+        | DeclPayload::Inductive { name, .. }
+        | DeclPayload::InductiveConstrained { name, .. }
+        | DeclPayload::MutualInductiveBlock { name, .. } => *name,
+    };
+    names
+        .get(name)
+        .map(Name::as_dotted)
+        .unwrap_or_else(|| format!("declaration[{declaration_index}]"))
+}
+
+struct RetainedTermReachability<'a> {
+    terms: &'a [TermNode],
+    seen_generation: Vec<u32>,
+    generation: u32,
+    pending: Vec<TermId>,
+    remaining_work: usize,
+    root_set_counts: BTreeMap<Vec<TermId>, u64>,
+}
+
+impl<'a> RetainedTermReachability<'a> {
+    fn new(terms: &'a [TermNode], work_budget: usize) -> Self {
+        Self {
+            terms,
+            seen_generation: vec![0; terms.len()],
+            generation: 0,
+            pending: Vec::new(),
+            remaining_work: work_budget,
+            root_set_counts: BTreeMap::new(),
+        }
+    }
+
+    fn count(&mut self, declaration: &DeclCert) -> Option<u64> {
+        let roots = retained_declaration_term_roots(&declaration.decl);
+        if let Some(count) = self.root_set_counts.get(&roots).copied() {
+            return Some(count);
+        }
+        if self.remaining_work == 0 {
+            return None;
+        }
+        self.generation = self.generation.checked_add(1)?;
+        self.pending.clear();
+        self.pending.extend(roots.iter().copied());
+        let mut count = 0_u64;
+        while let Some(term_id) = self.pending.pop() {
+            self.remaining_work = self.remaining_work.checked_sub(1)?;
+            let Some(generation) = self.seen_generation.get_mut(term_id) else {
+                continue;
+            };
+            if *generation == self.generation {
+                continue;
+            }
+            *generation = self.generation;
+            count = count.checked_add(1)?;
+            let Some(node) = self.terms.get(term_id) else {
+                continue;
+            };
+            match node {
+                TermNode::App(function, argument) => {
+                    self.pending.push(*function);
+                    self.pending.push(*argument);
+                }
+                TermNode::Lam { ty, body } | TermNode::Pi { ty, body } => {
+                    self.pending.push(*ty);
+                    self.pending.push(*body);
+                }
+                TermNode::Sort(_) | TermNode::BVar(_) | TermNode::Const { .. } => {}
+            }
+        }
+        self.root_set_counts.insert(roots, count);
+        Some(count)
+    }
+}
+
+fn retained_declaration_term_roots(declaration: &DeclPayload) -> Vec<TermId> {
+    match declaration {
+        DeclPayload::Axiom { ty, .. } | DeclPayload::AxiomConstrained { ty, .. } => vec![*ty],
+        DeclPayload::Def { ty, value, .. } | DeclPayload::DefConstrained { ty, value, .. } => {
+            vec![*ty, *value]
+        }
+        DeclPayload::Theorem { ty, proof, .. }
+        | DeclPayload::TheoremConstrained { ty, proof, .. } => vec![*ty, *proof],
+        DeclPayload::Inductive {
+            params,
+            indices,
+            constructors,
+            recursor,
+            ..
+        }
+        | DeclPayload::InductiveConstrained {
+            params,
+            indices,
+            constructors,
+            recursor,
+            ..
+        } => params
+            .iter()
+            .chain(indices)
+            .map(|binder| binder.ty)
+            .chain(constructors.iter().map(|constructor| constructor.ty))
+            .chain(recursor.iter().map(|recursor| recursor.ty))
+            .collect(),
+        DeclPayload::MutualInductiveBlock { inductives, .. } => inductives
+            .iter()
+            .flat_map(|inductive| {
+                inductive
+                    .params
+                    .iter()
+                    .chain(&inductive.indices)
+                    .map(|binder| binder.ty)
+                    .chain(
+                        inductive
+                            .constructors
+                            .iter()
+                            .map(|constructor| constructor.ty),
+                    )
+                    .chain(inductive.recursor.iter().map(|recursor| recursor.ty))
+            })
+            .collect(),
+    }
+}
+
+#[cfg(test)]
+mod retained_measurement_tests {
+    use super::*;
+
+    fn axiom(root: TermId) -> DeclCert {
+        DeclCert {
+            decl: DeclPayload::Axiom {
+                name: 0,
+                universe_params: Vec::new(),
+                ty: root,
+            },
+            dependencies: Vec::new(),
+            axiom_dependencies: Vec::new(),
+            hashes: DeclHashes {
+                decl_interface_hash: [0; 32],
+                decl_certificate_hash: [0; 32],
+            },
+        }
+    }
+
+    fn shared_chain(length: usize) -> Vec<TermNode> {
+        let mut terms = vec![TermNode::BVar(0)];
+        for index in 1..length {
+            terms.push(TermNode::App(index - 1, index - 1));
+        }
+        terms
+    }
+
+    #[test]
+    fn retained_measurement_reuses_identical_root_sets_after_budget_is_spent() {
+        let terms = shared_chain(100);
+        let declaration = axiom(99);
+        let mut reachability = RetainedTermReachability::new(&terms, 199);
+
+        assert_eq!(reachability.count(&declaration), Some(100));
+        assert_eq!(reachability.remaining_work, 0);
+        assert_eq!(reachability.count(&declaration), Some(100));
+    }
+
+    #[test]
+    fn retained_measurement_stops_before_repeating_unbounded_dag_work() {
+        let terms = shared_chain(100);
+        let declaration = axiom(99);
+        let mut reachability = RetainedTermReachability::new(&terms, 64);
+
+        assert_eq!(reachability.count(&declaration), None);
+        assert_eq!(reachability.remaining_work, 0);
+        assert_eq!(reachability.count(&declaration), None);
+    }
 }
 
 /// Certificate header identifying the certificate and core specification versions.
@@ -458,15 +1299,6 @@ pub enum TermNode {
     Pi {
         /// Binder type.
         ty: TermId,
-        /// Body under one additional binder.
-        body: TermId,
-    },
-    /// Let binding.
-    Let {
-        /// Bound value type.
-        ty: TermId,
-        /// Bound value.
-        value: TermId,
         /// Body under one additional binder.
         body: TermId,
     },
@@ -1427,5 +2259,213 @@ pub type Result<T> = std::result::Result<T, CertError>;
 impl From<npa_kernel::Error> for CertError {
     fn from(value: npa_kernel::Error) -> Self {
         Self::Kernel(value)
+    }
+}
+
+#[cfg(test)]
+mod shared_payload_tests {
+    use super::*;
+
+    fn certificate(module: &str) -> ModuleCert {
+        ModuleCert::from_parts(ModuleCertParts {
+            header: CertHeader {
+                format: "NPA-CERT-0.4.0".to_owned(),
+                core_spec: "NPA-Core-0.4.0".to_owned(),
+                module: Name::from_dotted(module),
+            },
+            imports: Vec::new(),
+            name_table: Vec::new(),
+            level_table: Vec::new(),
+            term_table: Vec::new(),
+            declarations: Vec::new(),
+            export_block: Vec::new(),
+            axiom_report: AxiomReport {
+                per_declaration: Vec::new(),
+                module_axioms: Vec::new(),
+                core_features: Vec::new(),
+            },
+            hashes: ModuleHashes {
+                export_hash: [1; 32],
+                axiom_report_hash: [2; 32],
+                certificate_hash: [3; 32],
+            },
+        })
+    }
+
+    fn verified(module: &str, seed: u8) -> VerifiedModule {
+        let certificate = ModuleCert::from_parts(ModuleCertParts {
+            header: CertHeader {
+                format: "NPA-CERT-0.4.0".to_owned(),
+                core_spec: "NPA-Core-0.4.0".to_owned(),
+                module: Name::from_dotted(module),
+            },
+            imports: Vec::new(),
+            name_table: Vec::new(),
+            level_table: Vec::new(),
+            term_table: Vec::new(),
+            declarations: Vec::new(),
+            export_block: Vec::new(),
+            axiom_report: AxiomReport {
+                per_declaration: Vec::new(),
+                module_axioms: Vec::new(),
+                core_features: Vec::new(),
+            },
+            hashes: ModuleHashes {
+                export_hash: [seed; 32],
+                axiom_report_hash: [0; 32],
+                certificate_hash: [seed.wrapping_add(1); 32],
+            },
+        });
+        let structural_closure = crate::structural::StructuralClosureSummary::default();
+        let logical_retained_bytes_v1 =
+            crate::logical_charge::verified_module_logical_retained_bytes_v1(
+                certificate.logical_retained_bytes_v1(),
+                &structural_closure,
+            );
+        VerifiedModule::from_parts(VerifiedModuleParts {
+            certificate,
+            structural_closure,
+            logical_retained_bytes_v1,
+        })
+    }
+
+    #[test]
+    fn verifier_session_snapshot_is_cow_isolated() {
+        let first = verified("Shared.First", 1);
+        let second = verified("Shared.Second", 2);
+        let mut session = VerifierSession::new();
+        session.register_verified_module(first);
+
+        let mut observation = CertificatePayloadObservation::default();
+        let snapshot = session.snapshot_observed(Some(&mut observation));
+        session.register_verified_module_with_trust_observed(
+            second.clone(),
+            TrustMode::Normal,
+            Some(&mut observation),
+        );
+
+        let import = ImportEntry {
+            module: second.module().clone(),
+            export_hash: second.export_hash(),
+            certificate_hash: None,
+        };
+        assert!(session.find_import(&import, TrustMode::Normal).is_ok());
+        assert!(matches!(
+            snapshot.find_import(&import, TrustMode::Normal),
+            Err(CertError::ImportHashMismatch { .. })
+        ));
+        assert_eq!(observation.session_snapshot_clones, 1);
+        assert_eq!(observation.session_index_cow_copies, 1);
+        assert_eq!(observation.session_index_cow_entries, 1);
+        assert!(!observation.overflowed);
+    }
+
+    #[test]
+    fn certificate_payload_observation_merge_saturates() {
+        let mut observation = CertificatePayloadObservation {
+            payloads_frozen: u64::MAX,
+            ..CertificatePayloadObservation::default()
+        };
+        observation.merge(CertificatePayloadObservation {
+            payloads_frozen: 1,
+            session_index_cow_entries: 9,
+            ..CertificatePayloadObservation::default()
+        });
+        assert_eq!(observation.payloads_frozen, u64::MAX);
+        assert_eq!(observation.session_index_cow_entries, 9);
+        assert!(observation.overflowed);
+    }
+
+    #[test]
+    fn module_cert_clone_and_verified_module_clone_share_immutable_payloads() {
+        let certificate = certificate("Shared.Certificate");
+        assert_eq!(Arc::strong_count(&certificate.payload), 1);
+        let certificate_clone = certificate.clone();
+        assert_eq!(Arc::strong_count(&certificate.payload), 2);
+        assert!(Arc::ptr_eq(
+            &certificate.payload,
+            &certificate_clone.payload
+        ));
+
+        let module = verified("Shared.Module", 7);
+        assert_eq!(Arc::strong_count(&module.payload), 1);
+        let module_clone = module.clone();
+        assert_eq!(Arc::strong_count(&module.payload), 2);
+        assert!(Arc::ptr_eq(&module.payload, &module_clone.payload));
+    }
+
+    #[test]
+    fn module_cert_equality_and_verified_module_equality_ignore_cached_charge() {
+        let certificate = certificate("Shared.Equality");
+        let mut certificate_with_other_charge = certificate.clone();
+        Arc::make_mut(&mut certificate_with_other_charge.payload).logical_retained_bytes_v1 =
+            certificate.logical_retained_bytes_v1().saturating_add(1);
+        assert_eq!(certificate, certificate_with_other_charge);
+
+        let module = verified("Shared.Equality.Module", 9);
+        let mut module_with_other_charge = module.clone();
+        Arc::make_mut(&mut module_with_other_charge.payload).logical_retained_bytes_v1 = 1;
+        assert_eq!(module, module_with_other_charge);
+    }
+
+    #[test]
+    fn module_cert_debug_and_verified_module_debug_are_logical_and_deterministic() {
+        let certificate_value = certificate("Shared.Debug.Certificate");
+        let separately_frozen = certificate("Shared.Debug.Certificate");
+        let certificate_debug = format!("{certificate_value:?}");
+        assert_eq!(certificate_debug, format!("{separately_frozen:?}"));
+        assert!(certificate_debug.starts_with("ModuleCert {"));
+        assert!(certificate_debug.contains("header:"));
+
+        let module = verified("Shared.Debug.Module", 13);
+        let separately_verified = verified("Shared.Debug.Module", 13);
+        let module_debug = format!("{module:?}");
+        assert_eq!(module_debug, format!("{separately_verified:?}"));
+        assert!(module_debug.starts_with("VerifiedModule {"));
+        assert!(module_debug.contains("certificate_format:"));
+        assert!(module_debug.contains("structural_closure:"));
+
+        for forbidden in [
+            "ModuleCertParts",
+            "VerifiedModuleParts",
+            "logical_retained_bytes_v1",
+            "strong_count",
+            "capacity",
+            "0x",
+        ] {
+            assert!(!certificate_debug.contains(forbidden));
+            assert!(!module_debug.contains(forbidden));
+        }
+    }
+
+    #[test]
+    fn test_only_verified_module_mutation_refreezes_all_cached_charges() {
+        let mut module = verified("Shared.Mutation", 17);
+        let untouched_clone = module.clone();
+        let old_charge = module.logical_retained_bytes_v1();
+
+        module.mutate_certificate_parts_for_test(|parts| {
+            parts
+                .name_table
+                .push(Name::from_dotted("Shared.Mutation.AddedName"));
+        });
+
+        let expected_charge = crate::logical_charge::verified_module_logical_retained_bytes_v1(
+            module.payload.certificate.logical_retained_bytes_v1(),
+            &module.payload.structural_closure,
+        );
+        assert_eq!(module.logical_retained_bytes_v1(), expected_charge);
+        assert!(module.logical_retained_bytes_v1() > old_charge);
+        assert!(untouched_clone.name_table().is_empty());
+        assert_eq!(untouched_clone.logical_retained_bytes_v1(), old_charge);
+    }
+
+    #[test]
+    fn public_shared_payload_handles_are_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+
+        assert_send_sync::<ModuleCert>();
+        assert_send_sync::<VerifiedModule>();
+        assert_send_sync::<VerifierSession>();
     }
 }

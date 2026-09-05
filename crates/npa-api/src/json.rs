@@ -42,6 +42,10 @@ impl<'src> JsonDocument<'src> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct JsonParseLimits {
     pub max_depth: usize,
+    pub max_values: usize,
+    pub max_container_items: usize,
+    pub max_decoded_string_bytes: usize,
+    pub max_number_bytes: usize,
 }
 
 impl JsonParseLimits {
@@ -54,6 +58,26 @@ impl JsonParseLimits {
             } else {
                 self.max_depth
             },
+            max_values: self.max_values,
+            max_container_items: self.max_container_items,
+            max_decoded_string_bytes: self.max_decoded_string_bytes,
+            max_number_bytes: self.max_number_bytes,
+        }
+    }
+
+    pub const fn bounded(
+        max_depth: usize,
+        max_values: usize,
+        max_container_items: usize,
+        max_decoded_string_bytes: usize,
+        max_number_bytes: usize,
+    ) -> Self {
+        Self {
+            max_depth,
+            max_values,
+            max_container_items,
+            max_decoded_string_bytes,
+            max_number_bytes,
         }
     }
 }
@@ -62,6 +86,10 @@ impl Default for JsonParseLimits {
     fn default() -> Self {
         Self {
             max_depth: Self::MAX_DEPTH,
+            max_values: usize::MAX,
+            max_container_items: usize::MAX,
+            max_decoded_string_bytes: usize::MAX,
+            max_number_bytes: usize::MAX,
         }
     }
 }
@@ -187,6 +215,10 @@ pub enum JsonParseErrorKind {
     InvalidUnicodeEscape,
     ControlCharacterInString,
     NestingDepthExceeded { max_depth: usize },
+    ValuesExceeded { max_values: usize },
+    ContainerItemsExceeded { max_items: usize },
+    DecodedStringBytesExceeded { max_bytes: usize },
+    NumberBytesExceeded { max_bytes: usize },
 }
 
 struct Parser<'src> {
@@ -194,6 +226,9 @@ struct Parser<'src> {
     bytes: &'src [u8],
     offset: usize,
     limits: JsonParseLimits,
+    values: usize,
+    container_items: usize,
+    decoded_string_bytes: usize,
 }
 
 impl<'src> Parser<'src> {
@@ -203,6 +238,9 @@ impl<'src> Parser<'src> {
             bytes: source.as_bytes(),
             offset: 0,
             limits,
+            values: 0,
+            container_items: 0,
+            decoded_string_bytes: 0,
         }
     }
 
@@ -217,6 +255,16 @@ impl<'src> Parser<'src> {
     }
 
     fn parse_value(&mut self, depth: usize) -> Result<JsonValue<'src>, JsonParseError> {
+        self.values = self.values.checked_add(1).ok_or_else(|| {
+            self.error(JsonParseErrorKind::ValuesExceeded {
+                max_values: self.limits.max_values,
+            })
+        })?;
+        if self.values > self.limits.max_values {
+            return Err(self.error(JsonParseErrorKind::ValuesExceeded {
+                max_values: self.limits.max_values,
+            }));
+        }
         if depth > self.limits.max_depth {
             return Err(self.error(JsonParseErrorKind::NestingDepthExceeded {
                 max_depth: self.limits.max_depth,
@@ -287,6 +335,7 @@ impl<'src> Parser<'src> {
         }
 
         loop {
+            self.charge_container_item()?;
             elements.push(self.parse_value(depth + 1)?);
             self.skip_ws();
             if self.try_consume(b']') {
@@ -317,6 +366,7 @@ impl<'src> Parser<'src> {
         }
 
         loop {
+            self.charge_container_item()?;
             self.skip_ws();
             let (key, key_span) = self.parse_string_token()?;
             self.skip_ws();
@@ -359,6 +409,11 @@ impl<'src> Parser<'src> {
             self.consume_digits()?;
         }
 
+        if self.offset - start > self.limits.max_number_bytes {
+            return Err(self.error(JsonParseErrorKind::NumberBytesExceeded {
+                max_bytes: self.limits.max_number_bytes,
+            }));
+        }
         Ok(JsonValue {
             raw: &self.source[start..self.offset],
             span: JsonSpan::new(start, self.offset),
@@ -426,7 +481,7 @@ impl<'src> Parser<'src> {
                         return Err(self.error(JsonParseErrorKind::UnexpectedEof));
                     };
                     self.offset += ch.len_utf8();
-                    value.push(ch);
+                    self.push_decoded_character(&mut value, ch)?;
                 }
             }
         }
@@ -438,14 +493,14 @@ impl<'src> Parser<'src> {
         };
         self.offset += 1;
         match byte {
-            b'"' => out.push('"'),
-            b'\\' => out.push('\\'),
-            b'/' => out.push('/'),
-            b'b' => out.push('\u{0008}'),
-            b'f' => out.push('\u{000c}'),
-            b'n' => out.push('\n'),
-            b'r' => out.push('\r'),
-            b't' => out.push('\t'),
+            b'"' => self.push_decoded_character(out, '"')?,
+            b'\\' => self.push_decoded_character(out, '\\')?,
+            b'/' => self.push_decoded_character(out, '/')?,
+            b'b' => self.push_decoded_character(out, '\u{0008}')?,
+            b'f' => self.push_decoded_character(out, '\u{000c}')?,
+            b'n' => self.push_decoded_character(out, '\n')?,
+            b'r' => self.push_decoded_character(out, '\r')?,
+            b't' => self.push_decoded_character(out, '\t')?,
             b'u' => {
                 let unit = self.parse_hex_u16()?;
                 self.push_unicode_escape(unit, out)?;
@@ -471,7 +526,7 @@ impl<'src> Parser<'src> {
             let Some(ch) = char::from_u32(scalar) else {
                 return Err(self.error(JsonParseErrorKind::InvalidUnicodeEscape));
             };
-            out.push(ch);
+            self.push_decoded_character(out, ch)?;
             return Ok(());
         }
 
@@ -482,7 +537,43 @@ impl<'src> Parser<'src> {
         let Some(ch) = char::from_u32(u32::from(unit)) else {
             return Err(self.error(JsonParseErrorKind::InvalidUnicodeEscape));
         };
-        out.push(ch);
+        self.push_decoded_character(out, ch)?;
+        Ok(())
+    }
+
+    fn charge_container_item(&mut self) -> Result<(), JsonParseError> {
+        self.container_items = self.container_items.checked_add(1).ok_or_else(|| {
+            self.error(JsonParseErrorKind::ContainerItemsExceeded {
+                max_items: self.limits.max_container_items,
+            })
+        })?;
+        if self.container_items > self.limits.max_container_items {
+            return Err(self.error(JsonParseErrorKind::ContainerItemsExceeded {
+                max_items: self.limits.max_container_items,
+            }));
+        }
+        Ok(())
+    }
+
+    fn push_decoded_character(
+        &mut self,
+        output: &mut String,
+        character: char,
+    ) -> Result<(), JsonParseError> {
+        self.decoded_string_bytes = self
+            .decoded_string_bytes
+            .checked_add(character.len_utf8())
+            .ok_or_else(|| {
+                self.error(JsonParseErrorKind::DecodedStringBytesExceeded {
+                    max_bytes: self.limits.max_decoded_string_bytes,
+                })
+            })?;
+        if self.decoded_string_bytes > self.limits.max_decoded_string_bytes {
+            return Err(self.error(JsonParseErrorKind::DecodedStringBytesExceeded {
+                max_bytes: self.limits.max_decoded_string_bytes,
+            }));
+        }
+        output.push(character);
         Ok(())
     }
 
@@ -568,5 +659,117 @@ fn hex_value(byte: u8) -> Option<u8> {
         b'a'..=b'f' => Some(byte - b'a' + 10),
         b'A'..=b'F' => Some(byte - b'A' + 10),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn document_parser_accepts_one_root_and_rejects_trailing_root() {
+        assert!(JsonDocument::parse(r#"{"a":1}"#).is_ok());
+        assert!(matches!(
+            JsonDocument::parse(r#"{"a":1} {"b":2}"#),
+            Err(JsonParseError {
+                kind: JsonParseErrorKind::TrailingCharacters,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn bounded_parser_rejects_values_items_strings_and_numbers_before_next_item() {
+        let limits = JsonParseLimits::bounded(8, 3, 2, 5, 3);
+        assert!(JsonDocument::parse_with_limits(r#"{"a":"four"}"#, limits).is_ok());
+        assert!(matches!(
+            JsonDocument::parse_with_limits("[0,1,2]", limits),
+            Err(JsonParseError {
+                kind: JsonParseErrorKind::ContainerItemsExceeded { max_items: 2 },
+                ..
+            })
+        ));
+        assert!(matches!(
+            JsonDocument::parse_with_limits(r#""123456""#, limits),
+            Err(JsonParseError {
+                kind: JsonParseErrorKind::DecodedStringBytesExceeded { max_bytes: 5 },
+                ..
+            })
+        ));
+        assert!(matches!(
+            JsonDocument::parse_with_limits("1234", limits),
+            Err(JsonParseError {
+                kind: JsonParseErrorKind::NumberBytesExceeded { max_bytes: 3 },
+                ..
+            })
+        ));
+        let value_limit = JsonParseLimits::bounded(8, 2, 8, 8, 8);
+        assert!(matches!(
+            JsonDocument::parse_with_limits("[[0]]", value_limit),
+            Err(JsonParseError {
+                kind: JsonParseErrorKind::ValuesExceeded { max_values: 2 },
+                ..
+            })
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_parser_rejects_near_limit_structure_under_low_address_space() {
+        const CHILD_MODE: &str = "NPA_TEST_JSON_LOW_ADDRESS_SPACE";
+
+        if std::env::var_os(CHILD_MODE).is_some() {
+            let mut current = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_AS, &mut current) }, 0);
+            let requested = 192 * 1024 * 1024;
+            let low_limit_active = requested <= current.rlim_max
+                && unsafe {
+                    libc::setrlimit(
+                        libc::RLIMIT_AS,
+                        &libc::rlimit {
+                            rlim_cur: requested,
+                            rlim_max: current.rlim_max,
+                        },
+                    )
+                } == 0;
+            #[cfg(target_os = "linux")]
+            assert!(
+                low_limit_active,
+                "Linux must enforce the low-address-space gate"
+            );
+            #[cfg(not(target_os = "linux"))]
+            let _ = low_limit_active;
+
+            // This source is only about 128 KiB, but an unbounded parser would
+            // attempt to retain 65,537 nodes and vector slots. The closed
+            // parser rejects before pushing the first over-limit item, so the
+            // subprocess remains well below its independent address-space
+            // ceiling and returns a controlled error.
+            let source = format!(
+                "[{}]",
+                std::iter::repeat_n("0", 65_537)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
+            let limits = JsonParseLimits::bounded(64, 65_536, 65_536, 1024, 128);
+            let error = JsonDocument::parse_with_limits(&source, limits).unwrap_err();
+            assert!(matches!(
+                error.kind,
+                JsonParseErrorKind::ContainerItemsExceeded { max_items: 65_536 }
+                    | JsonParseErrorKind::ValuesExceeded { max_values: 65_536 }
+            ));
+            return;
+        }
+
+        let test_name = std::thread::current().name().unwrap().to_owned();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &test_name, "--nocapture"])
+            .env(CHILD_MODE, "1")
+            .status()
+            .unwrap();
+        assert!(status.success());
     }
 }

@@ -180,6 +180,109 @@ fn package_build_certs_frontend_failure_refresh_write_is_atomic() {
 }
 
 #[test]
+fn package_build_certs_targeted_refresh_write_preflight_is_atomic() {
+    let package = build_local_import_fixture("targeted-preflight-write-atomic");
+    fs::write(
+        package.artifact_path("Fixture/A/source.npa"),
+        "def malformed : Type := {\n",
+    )
+    .unwrap();
+    fs::write(
+        package.artifact_path("Fixture/B/certificate.npcert"),
+        b"not a certificate",
+    )
+    .unwrap();
+    let before = package_snapshot(&package);
+
+    let result = run_package_build_certs(
+        refresh_artifacts_write(common_options(package.path(), true))
+            .with_modules(vec![Name::from_dotted("Fixture.A")]),
+    );
+
+    assert_eq!(result.exit_code(), CommandExitCode::PackageFailure);
+    assert_eq!(result.diagnostics.len(), 3);
+    assert_eq!(result.diagnostics[0].reason_code, "package_build_selection");
+    assert_eq!(
+        result.diagnostics[1].reason_code,
+        "package_build_refresh_schedule"
+    );
+    assert_eq!(result.diagnostics[2].reason_code, "build_failed");
+    assert_eq!(result.diagnostics[2].field.as_deref(), Some("parser"));
+    assert_eq!(
+        result.diagnostics[2]
+            .source
+            .as_ref()
+            .and_then(|source| source.declaration()),
+        None
+    );
+    assert_eq!(package_snapshot(&package), before);
+}
+
+#[test]
+fn package_build_certs_targeted_refresh_defers_priority_metadata_until_selected_sources_pass() {
+    let package = build_local_import_fixture("targeted-priority-metadata-deferred");
+    install_metadata_target_for_module(
+        &package,
+        "Fixture.A",
+        "Fixture/A/certificate.npcert",
+        "Fixture/A/meta.json",
+        Some("{"),
+    );
+    let source_b_path = package.artifact_path("Fixture/B/source.npa");
+    let valid_source_b = fs::read_to_string(&source_b_path).unwrap();
+    fs::write(
+        &source_b_path,
+        "import Fixture.A\n\ndef selected_bad : Type := Prop Prop\n",
+    )
+    .unwrap();
+    let before_frontend_failure = package_snapshot(&package);
+    let options = || {
+        refresh_artifacts_write(common_options(package.path(), true)).with_modules(vec![
+            Name::from_dotted("Fixture.A"),
+            Name::from_dotted("Fixture.B"),
+        ])
+    };
+
+    let frontend_failure = run_package_build_certs(options());
+
+    assert_eq!(
+        frontend_failure.exit_code(),
+        CommandExitCode::PackageFailure
+    );
+    assert_eq!(frontend_failure.diagnostics.len(), 3);
+    assert_eq!(frontend_failure.diagnostics[2].reason_code, "build_failed");
+    assert_eq!(
+        frontend_failure.diagnostics[2].module.as_deref(),
+        Some("Fixture.B")
+    );
+    assert_eq!(
+        package_snapshot(&package),
+        before_frontend_failure,
+        "deferred metadata and selected frontend failures must stage no writes"
+    );
+
+    fs::write(&source_b_path, valid_source_b).unwrap();
+    let before_metadata_failure = package_snapshot(&package);
+    let metadata_failure = run_package_build_certs(options());
+
+    assert_eq!(
+        metadata_failure.exit_code(),
+        CommandExitCode::PackageFailure
+    );
+    assert_eq!(metadata_failure.diagnostics.len(), 3);
+    assert_ne!(metadata_failure.diagnostics[2].reason_code, "build_failed");
+    assert_eq!(
+        metadata_failure.diagnostics[2].module.as_deref(),
+        Some("Fixture.A")
+    );
+    assert_eq!(
+        metadata_failure.diagnostics[2].path.as_deref(),
+        Some("Fixture/A/meta.json")
+    );
+    assert_eq!(package_snapshot(&package), before_metadata_failure);
+}
+
+#[test]
 fn package_build_certs_write_repairs_local_certificate_and_package_lock() {
     let package = build_module_fixture("write-repair", "Proofs.Ai.Basic", false);
     let certificate_path = package.artifact_path("Proofs/Ai/Basic/certificate.npcert");
@@ -217,7 +320,7 @@ fn package_build_certs_write_cli_succeeds_json() {
     assert!(output.stderr.is_empty());
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
-        "{\"schema\":\"npa.package.command_result.v0.4\",\"command\":\"package build-certs\",\"root\":\"<absolute-root>\",\"status\":\"passed\",\"diagnostics\":[],\"artifacts\":[]}\n"
+        "{\"schema\":\"npa.package.command_result.v0.5\",\"command\":\"package build-certs\",\"root\":\"<absolute-root>\",\"status\":\"passed\",\"diagnostics\":[],\"artifacts\":[]}\n"
     );
 }
 
@@ -348,7 +451,7 @@ fn package_build_certs_selection_targeted_refresh_rebuilds_dependents() {
     );
 
     assert_eq!(result.exit_code(), CommandExitCode::Success);
-    assert_eq!(result.diagnostics.len(), 2);
+    assert_eq!(result.diagnostics.len(), 3);
     assert_eq!(result.diagnostics[0].reason_code, "package_build_selection");
     assert!(result.diagnostics[0]
         .actual_value
@@ -357,9 +460,17 @@ fn package_build_certs_selection_targeted_refresh_rebuilds_dependents() {
         .contains("seeds=1,rebuild=2"));
     assert_eq!(
         result.diagnostics[1].reason_code,
+        "package_build_refresh_schedule"
+    );
+    assert_eq!(
+        result.diagnostics[1].actual_value.as_deref(),
+        Some("priority_rebuild=1,priority_support_local=0,priority_external_roots=0,declared_external=0,deferred_rebuild=1,deferred_support_local=0,snapshot_unrelated_local=0")
+    );
+    assert_eq!(
+        result.diagnostics[2].reason_code,
         "package_build_refresh_plan"
     );
-    assert!(result.diagnostics[1]
+    assert!(result.diagnostics[2]
         .actual_value
         .as_deref()
         .unwrap()
@@ -383,7 +494,7 @@ fn package_build_certs_selection_targeted_leaf_refresh_preserves_unselected_modu
     );
 
     assert_eq!(result.exit_code(), CommandExitCode::Success);
-    assert_eq!(result.diagnostics.len(), 2);
+    assert_eq!(result.diagnostics.len(), 3);
     assert!(result.diagnostics[0]
         .actual_value
         .as_deref()
@@ -391,6 +502,14 @@ fn package_build_certs_selection_targeted_leaf_refresh_preserves_unselected_modu
         .contains("seeds=1,rebuild=1,support_local=1"));
     assert_eq!(
         result.diagnostics[1].reason_code,
+        "package_build_refresh_schedule"
+    );
+    assert_eq!(
+        result.diagnostics[1].actual_value.as_deref(),
+        Some("priority_rebuild=1,priority_support_local=1,priority_external_roots=0,declared_external=0,deferred_rebuild=0,deferred_support_local=0,snapshot_unrelated_local=0")
+    );
+    assert_eq!(
+        result.diagnostics[2].reason_code,
         "package_build_refresh_plan"
     );
     assert_eq!(fs::read(support_path).unwrap(), support_before);
@@ -444,12 +563,16 @@ fn package_build_certs_targeted_refresh_rebinds_export_stable_dependent() {
         "{:?}",
         targeted_result.diagnostics
     );
-    assert_eq!(targeted_result.diagnostics.len(), 2);
+    assert_eq!(targeted_result.diagnostics.len(), 3);
     assert_eq!(
         targeted_result.diagnostics[1].reason_code,
+        "package_build_refresh_schedule"
+    );
+    assert_eq!(
+        targeted_result.diagnostics[2].reason_code,
         "package_build_refresh_plan"
     );
-    let plan = targeted_result.diagnostics[1]
+    let plan = targeted_result.diagnostics[2]
         .actual_value
         .as_deref()
         .unwrap();
@@ -507,7 +630,7 @@ fn package_build_certs_targeted_refresh_propagates_rebind_through_diamond() {
         "{:?}",
         targeted_result.diagnostics
     );
-    let plan = targeted_result.diagnostics[1]
+    let plan = targeted_result.diagnostics[2]
         .actual_value
         .as_deref()
         .unwrap();
@@ -516,12 +639,12 @@ fn package_build_certs_targeted_refresh_propagates_rebind_through_diamond() {
     let new_d_bytes = fs::read(targeted.artifact_path("Fixture/D/certificate.npcert")).unwrap();
     let new_d = npa_cert::decode_module_cert(&new_d_bytes).unwrap();
     let old_imports = old_d
-        .imports
+        .imports()
         .iter()
         .map(|import| (import.module.clone(), import.certificate_hash))
         .collect::<BTreeMap<_, _>>();
     let new_imports = new_d
-        .imports
+        .imports()
         .iter()
         .map(|import| (import.module.clone(), import.certificate_hash))
         .collect::<BTreeMap<_, _>>();
@@ -562,7 +685,7 @@ fn package_build_certs_targeted_refresh_live_verifies_unchanged_dependent() {
     );
 
     assert_eq!(result.exit_code(), CommandExitCode::Success);
-    let plan = result.diagnostics[1].actual_value.as_deref().unwrap();
+    let plan = result.diagnostics[2].actual_value.as_deref().unwrap();
     assert!(plan.contains("seeds=1,candidates=2,source_rebuild=1,certificate_rebind=0,unchanged=1"));
     assert!(plan.contains("source_scans=2,source_interfaces=1,fallbacks=none"));
     assert_refresh_package_verifies_with_reference_checker(&package);
@@ -583,7 +706,7 @@ fn package_build_certs_targeted_refresh_rebuilds_stale_nonseed_source() {
     );
 
     assert_eq!(result.exit_code(), CommandExitCode::Success);
-    let plan = result.diagnostics[1].actual_value.as_deref().unwrap();
+    let plan = result.diagnostics[2].actual_value.as_deref().unwrap();
     assert!(plan.contains("source_rebuild=2,certificate_rebind=0,unchanged=0"));
     assert!(plan.contains("fallbacks=source_hash:1"));
     assert_refresh_package_is_hash_clean(&package);
@@ -609,7 +732,7 @@ fn package_build_certs_targeted_refresh_rebuilds_on_import_export_change() {
         "{:?}",
         result.diagnostics
     );
-    let plan = result.diagnostics[1].actual_value.as_deref().unwrap();
+    let plan = result.diagnostics[2].actual_value.as_deref().unwrap();
     assert!(plan.contains("source_rebuild=2,certificate_rebind=0,unchanged=0"));
     assert!(plan.contains("fallbacks=import_export_changed:1"));
     assert_refresh_package_is_hash_clean(&package);
@@ -632,18 +755,22 @@ fn package_build_certs_targeted_refresh_check_reports_rebind_plan_without_writes
     );
 
     assert_eq!(result.exit_code(), CommandExitCode::PackageFailure);
-    assert_eq!(result.diagnostics.len(), 3);
+    assert_eq!(result.diagnostics.len(), 4);
     assert_eq!(result.diagnostics[0].reason_code, "package_build_selection");
     assert_eq!(
         result.diagnostics[1].reason_code,
+        "package_build_refresh_schedule"
+    );
+    assert_eq!(
+        result.diagnostics[2].reason_code,
         "package_build_refresh_plan"
     );
-    assert!(result.diagnostics[1]
+    assert!(result.diagnostics[2]
         .actual_value
         .as_deref()
         .unwrap()
         .contains("source_rebuild=1,certificate_rebind=1,unchanged=0"));
-    assert_eq!(result.diagnostics[2].reason_code, "manifest_hashes_stale");
+    assert_eq!(result.diagnostics[3].reason_code, "manifest_hashes_stale");
     assert_eq!(package_snapshot(&package), before);
 }
 
@@ -806,10 +933,14 @@ fn package_build_certs_targeted_refresh_metadata_uses_direct_imports() {
     );
 
     assert_eq!(write.exit_code(), CommandExitCode::Success);
-    assert_eq!(write.diagnostics.len(), 2);
+    assert_eq!(write.diagnostics.len(), 3);
     assert_eq!(write.diagnostics[0].reason_code, "package_build_selection");
     assert_eq!(
         write.diagnostics[1].reason_code,
+        "package_build_refresh_schedule"
+    );
+    assert_eq!(
+        write.diagnostics[2].reason_code,
         "package_build_refresh_plan"
     );
     assert_transitive_certificate_and_direct_metadata(&package);
@@ -1662,7 +1793,7 @@ fn assert_transitive_certificate_and_direct_metadata(package: &TestPackage) {
     let certificate = fs::read(package.artifact_path("Fixture/C/certificate.npcert")).unwrap();
     let certificate = npa_cert::decode_module_cert(&certificate).unwrap();
     let certificate_imports = certificate
-        .imports
+        .imports()
         .iter()
         .map(|import| import.module.clone())
         .collect::<std::collections::BTreeSet<_>>();
@@ -1772,8 +1903,8 @@ fn compile_fixture_module(
     let verified = output.verified_module;
     let source_interface = HumanImportedSourceInterface {
         module,
-        export_hash: output.certificate.hashes.export_hash,
-        certificate_hash: Some(output.certificate.hashes.certificate_hash),
+        export_hash: output.certificate.hashes().export_hash,
+        certificate_hash: Some(output.certificate.hashes().certificate_hash),
         source_interface: output.source_interface,
     };
     (bytes, verified, source_interface)
@@ -1803,8 +1934,8 @@ fn compile_fixture_module_with_available(
     let bytes = npa_cert::encode_module_cert(&output.certificate).unwrap();
     let source_interface = HumanImportedSourceInterface {
         module,
-        export_hash: output.certificate.hashes.export_hash,
-        certificate_hash: Some(output.certificate.hashes.certificate_hash),
+        export_hash: output.certificate.hashes().export_hash,
+        certificate_hash: Some(output.certificate.hashes().certificate_hash),
         source_interface: output.source_interface,
     };
     (bytes, output.verified_module, source_interface)
@@ -1826,9 +1957,9 @@ fn generated_manifest_module(
         imports,
         source_hash: package_file_hash(source_bytes),
         certificate_file_hash: package_file_hash(certificate_bytes),
-        export_hash: PackageHash::from(cert.hashes.export_hash),
-        axiom_report_hash: PackageHash::from(cert.hashes.axiom_report_hash),
-        certificate_hash: PackageHash::from(cert.hashes.certificate_hash),
+        export_hash: PackageHash::from(cert.hashes().export_hash),
+        axiom_report_hash: PackageHash::from(cert.hashes().axiom_report_hash),
+        certificate_hash: PackageHash::from(cert.hashes().certificate_hash),
     }
 }
 
@@ -1993,4 +2124,10 @@ fn repo_root() -> PathBuf {
         .join("../..")
         .components()
         .collect()
+}
+
+#[test]
+fn package_build_changed_batching_preserves_selection_plan() {
+    package_build_certs_selection_targeted_leaf_refresh_preserves_unselected_module();
+    package_build_certs_selection_targeted_refresh_rebuilds_dependents();
 }

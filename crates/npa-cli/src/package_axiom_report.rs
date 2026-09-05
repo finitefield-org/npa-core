@@ -1,7 +1,5 @@
 //! Implementation of `npa package axiom-report`.
 
-use std::{fs, io};
-
 use npa_api::{project_package_axiom_report_from_extraction, PackageArtifactReferenceSummaryMode};
 use npa_package::{
     format_package_hash, package_axiom_report_incremental_projection_plan, package_file_hash,
@@ -12,11 +10,12 @@ use npa_package::{
 
 use crate::args::{PackageAxiomReportOptions, PackageCommonOptions};
 use crate::diagnostic::{CommandArtifact, CommandDiagnostic, CommandResult, DiagnosticKind};
-use crate::fs::join_package_path;
+use crate::generated_artifact_writer::write_package_generated_artifact_under_lock;
 use crate::package_artifacts::{
     load_package_artifact_extraction_with_timings, LoadedPackageArtifactExtraction,
     LoadedPackageAuditSnapshot, PackageGeneratedArtifactReadMode, PACKAGE_AXIOM_REPORT_PATH,
 };
+use crate::package_promotion_transaction::TargetLock;
 use crate::timing::{
     PackageTimingCollector, TIMING_ARTIFACT_COMPARE_MS, TIMING_JSON_WRITE_MS, TIMING_PROJECTION_MS,
 };
@@ -266,6 +265,16 @@ fn run_package_axiom_report_write(
     options: PackageCommonOptions,
     timings: &mut PackageTimingCollector,
 ) -> CommandResult {
+    let mutation_lock = match TargetLock::acquire(&options.root) {
+        Ok(lock) => lock,
+        Err(_) => {
+            return CommandResult::failed(
+                COMMAND,
+                crate::fs::render_package_root(&options.root),
+                vec![write_failed_diagnostic()],
+            );
+        }
+    };
     let (loaded, report, report_json) =
         match generate_axiom_report(&options, PackageGeneratedArtifactReadMode::none(), timings) {
             Ok(generated) => generated,
@@ -276,7 +285,7 @@ fn run_package_axiom_report_write(
         return CommandResult::failed(COMMAND, loaded.root_display, policy_violations);
     }
     let write_result = timings.time_phase(TIMING_JSON_WRITE_MS, || {
-        write_axiom_report(&options, report_json.as_bytes())
+        write_axiom_report(&options, report_json.as_bytes(), &mutation_lock)
     });
     if let Err(diagnostic) = write_result {
         return CommandResult::failed(COMMAND, loaded.root_display, vec![*diagnostic]);
@@ -393,19 +402,16 @@ fn record_incremental_reuse_json(timings: &mut PackageTimingCollector, checked_j
 fn write_axiom_report(
     options: &PackageCommonOptions,
     report_json: &[u8],
+    mutation_lock: &TargetLock,
 ) -> Result<(), Box<CommandDiagnostic>> {
     let package_path = PackagePath::new(PACKAGE_AXIOM_REPORT_PATH);
-    let full_path = join_package_path(&options.root, &package_path, "generated.axiom_report.path")?;
-    match fs::read(&full_path) {
-        Ok(existing) if existing == report_json => return Ok(()),
-        Ok(_) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(_) => return Err(Box::new(write_failed_diagnostic())),
-    }
-    if let Some(parent) = full_path.parent() {
-        fs::create_dir_all(parent).map_err(|_| Box::new(write_failed_diagnostic()))?;
-    }
-    fs::write(full_path, report_json).map_err(|_| Box::new(write_failed_diagnostic()))
+    write_package_generated_artifact_under_lock(
+        &options.root,
+        &package_path,
+        report_json,
+        mutation_lock,
+    )
+    .map_err(|_| Box::new(write_failed_diagnostic()))
 }
 
 fn passed_result(root_display: String) -> CommandResult {

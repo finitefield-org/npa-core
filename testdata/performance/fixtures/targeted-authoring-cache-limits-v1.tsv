@@ -1,0 +1,8 @@
+# schema=npa.performance.targeted_authoring_cache_limit_measurements.v1
+# measured_snapshot=7cda5b22f
+# source/certificate measurements include only local module paths declared by each npa-package.toml
+# declared_interface_records is the per-module sum of inductives, definitions, theorems, and axioms
+fixture	package_root	local_modules	max_direct_imports	max_declared_interface_records	max_module_name_bytes	max_manifest_string_bytes	manifest_bytes	max_source_bytes	total_source_bytes	max_certificate_bytes	total_certificate_bytes	measured_tool_identity_bytes
+compact-npa-std	npa-core/testdata/package/npa-std	2	0	1	13	71	1904	240	478	655	1106	49135064
+proof-package	npa-core/testdata/package/proofs	6	3	28	41	71	8058	24995	46545	20831	50668	49135064
+large-targeted-iut	npa-project-iut/proofs	992	356	2594	139	175	6307803	4941574	42421598	3156164	45723791	49135064

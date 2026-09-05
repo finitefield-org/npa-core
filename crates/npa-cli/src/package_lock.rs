@@ -1,9 +1,5 @@
 //! Implementation of `npa package lock`.
 
-use std::fs;
-use std::io;
-use std::path::{Path, PathBuf};
-
 use npa_package::{
     build_package_lock_from_package_root, format_package_hash, package_file_hash,
     parse_package_lock_json, PackagePath,
@@ -11,9 +7,12 @@ use npa_package::{
 
 use crate::args::{PackageCommonOptions, PackageLockCommand};
 use crate::diagnostic::{CommandDiagnostic, CommandResult, DiagnosticKind};
-use crate::fs::join_package_path;
+use crate::generated_artifact_writer::{
+    read_package_generated_artifact_no_follow, write_package_generated_artifact_under_lock,
+};
 use crate::package::{load_package_root, LoadedPackageRoot};
 use crate::package_artifacts::PACKAGE_LOCK_PATH;
+use crate::package_promotion_transaction::TargetLock;
 
 const COMMAND_CHECK: &str = "package lock check";
 const COMMAND_WRITE: &str = "package lock write";
@@ -47,6 +46,20 @@ pub fn run_package_lock_check(options: PackageCommonOptions) -> CommandResult {
 
 /// Run `package lock write`.
 pub fn run_package_lock_write(options: PackageCommonOptions) -> CommandResult {
+    let mutation_lock = match TargetLock::acquire(&options.root) {
+        Ok(lock) => lock,
+        Err(_) => {
+            return CommandResult::failed(
+                COMMAND_WRITE,
+                crate::fs::render_package_root(&options.root),
+                vec![CommandDiagnostic::error(
+                    DiagnosticKind::ArtifactIo,
+                    "package_lock_concurrent_update",
+                )
+                .with_path(PACKAGE_LOCK_PATH)],
+            )
+        }
+    };
     let loaded = match load_package_root(&options.root, COMMAND_WRITE) {
         Ok(loaded) => loaded,
         Err(result) => return result,
@@ -57,7 +70,9 @@ pub fn run_package_lock_write(options: PackageCommonOptions) -> CommandResult {
         Err(result) => return result,
     };
 
-    if let Some(diagnostic) = write_package_lock(&loaded, regenerated_lock_json.as_bytes()) {
+    if let Some(diagnostic) =
+        write_package_lock(&loaded, regenerated_lock_json.as_bytes(), &mutation_lock)
+    {
         return CommandResult::failed(COMMAND_WRITE, loaded.root_display, vec![diagnostic]);
     }
 
@@ -97,13 +112,12 @@ fn check_package_lock(
     regenerated_lock_json: &str,
 ) -> Option<CommandDiagnostic> {
     let lock_path = PackagePath::new(PACKAGE_LOCK_PATH);
-    let full_lock_path = match join_package_path(&loaded.root, &lock_path, "package_lock.path") {
-        Ok(path) => path,
-        Err(diagnostic) => return Some(*diagnostic),
-    };
-    let lock_source = match fs::read_to_string(&full_lock_path) {
-        Ok(source) => source,
-        Err(_) => {
+    let lock_source = match read_package_generated_artifact_no_follow(&loaded.root, &lock_path)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+    {
+        Some(source) => source,
+        None => {
             return Some(
                 CommandDiagnostic::error(DiagnosticKind::PackageLock, "package_lock_missing")
                     .with_path(PACKAGE_LOCK_PATH),
@@ -128,67 +142,15 @@ fn check_package_lock(
     None
 }
 
-fn write_package_lock(loaded: &LoadedPackageRoot, bytes: &[u8]) -> Option<CommandDiagnostic> {
-    let lock_path = PackagePath::new(PACKAGE_LOCK_PATH);
-    let pending = match prepare_pending_write(&loaded.root, &lock_path, bytes) {
-        Ok(Some(write)) => write,
-        Ok(None) => return None,
-        Err(diagnostic) => return Some(*diagnostic),
-    };
-    commit_pending_write(pending)
-}
-
-struct PendingWrite {
-    path: PackagePath,
-    full_path: PathBuf,
-    temp_path: PathBuf,
-}
-
-fn prepare_pending_write(
-    root: &Path,
-    package_path: &PackagePath,
+fn write_package_lock(
+    loaded: &LoadedPackageRoot,
     bytes: &[u8],
-) -> Result<Option<PendingWrite>, Box<CommandDiagnostic>> {
-    let full_path = join_package_path(root, package_path, "package_lock.path")?;
-    match fs::read(&full_path) {
-        Ok(existing) if existing == bytes => return Ok(None),
-        Ok(_) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(_) => return Err(Box::new(write_artifact_diagnostic(package_path))),
-    }
-
-    if let Some(parent) = full_path.parent() {
-        if fs::create_dir_all(parent).is_err() {
-            return Err(Box::new(write_artifact_diagnostic(package_path)));
-        }
-    }
-
-    let temp_path = temporary_write_path(&full_path);
-    if fs::write(&temp_path, bytes).is_err() {
-        return Err(Box::new(write_artifact_diagnostic(package_path)));
-    }
-
-    Ok(Some(PendingWrite {
-        path: package_path.clone(),
-        full_path,
-        temp_path,
-    }))
-}
-
-fn commit_pending_write(write: PendingWrite) -> Option<CommandDiagnostic> {
-    if fs::rename(&write.temp_path, &write.full_path).is_err() {
-        let _ = fs::remove_file(&write.temp_path);
-        return Some(write_artifact_diagnostic(&write.path));
-    }
-    None
-}
-
-fn temporary_write_path(path: &Path) -> PathBuf {
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("package-lock.json");
-    path.with_file_name(format!(".{file_name}.npa-package-lock.tmp"))
+    mutation_lock: &TargetLock,
+) -> Option<CommandDiagnostic> {
+    let lock_path = PackagePath::new(PACKAGE_LOCK_PATH);
+    write_package_generated_artifact_under_lock(&loaded.root, &lock_path, bytes, mutation_lock)
+        .err()
+        .map(|_| write_artifact_diagnostic(&lock_path))
 }
 
 fn write_artifact_diagnostic(path: &PackagePath) -> CommandDiagnostic {

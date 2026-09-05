@@ -456,35 +456,10 @@ let public_axiom_ref section offset declarations axiom =
         (fun public_ref ->
           Ok { axiom with Ext_cert.axiom_global_ref = public_ref })
 
-let declaration_constraints payload =
-  match payload with
-  | Ext_cert.AxiomDecl { decl_universe_constraints; _ }
-  | Ext_cert.DefDecl { decl_universe_constraints; _ }
-  | Ext_cert.TheoremDecl { decl_universe_constraints; _ }
-  | Ext_cert.InductiveDecl { decl_universe_constraints; _ }
-  | Ext_cert.MutualInductiveBlockDecl { decl_universe_constraints; _ } ->
-      decl_universe_constraints
-
-let rec export_owner_constraints (declarations : Ext_cert.declaration list)
-    (export : Ext_cert.export_entry) =
-  match declarations with
-  | [] -> []
-  | declaration :: rest ->
-      if
-        declaration.Ext_cert.hashes.Ext_cert.decl_interface_hash
-        = export.Ext_cert.export_decl_interface_hash
-      then declaration_constraints declaration.Ext_cert.payload
-      else export_owner_constraints rest export
-
-let public_export_of_export version declarations export =
-  let owner_constraints = export_owner_constraints declarations export in
-  if version = Ext_cert.Legacy && owner_constraints <> [] then
-    Ext_bytes.error Ext_bytes.Export_block export.Ext_cert.export_offset
-      Ext_bytes.Constrained_export_requires_format_upgrade
-  else
-    bind
-      (public_term Ext_bytes.Export_block export.Ext_cert.export_offset declarations
-         export.Ext_cert.export_ty)
+let public_export_of_export declarations export =
+  bind
+    (public_term Ext_bytes.Export_block export.Ext_cert.export_offset declarations
+       export.Ext_cert.export_ty)
     (fun public_ty ->
       bind
         (map_option_result
@@ -576,8 +551,7 @@ let public_environment_of_decoded decoded =
   in
   bind
     (map_result
-       (public_export_of_export decoded.Ext_cert.header.Ext_cert.version
-          decoded.Ext_cert.declaration_table)
+       (public_export_of_export decoded.Ext_cert.declaration_table)
        decoded.Ext_cert.export_block)
     (fun public_exports ->
       bind

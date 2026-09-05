@@ -7,7 +7,9 @@
 
 use std::{
     collections::BTreeMap,
-    fs, io,
+    ffi::OsString,
+    io,
+    io::{Read, Write},
     path::{Path, PathBuf},
     sync::atomic::{AtomicUsize, Ordering},
 };
@@ -45,12 +47,16 @@ use npa_package::{
 
 use crate::args::{PackageCommonOptions, PackagePublishPlanOptions};
 use crate::diagnostic::{CommandDiagnostic, CommandResult, DiagnosticKind};
-use crate::fs::join_package_path;
+use crate::fs::no_follow_directory::open_absolute_directory;
+use crate::generated_artifact_writer::{
+    read_package_generated_artifact_no_follow, write_package_generated_artifact_under_lock,
+};
 use crate::package_artifacts::{
     load_package_audit_snapshot, load_package_audit_snapshot_with_timings,
     LoadedPackageAuditSnapshot, PackageGeneratedArtifactReadMode, PACKAGE_AXIOM_REPORT_PATH,
     PACKAGE_LOCK_PATH, PACKAGE_THEOREM_INDEX_PATH,
 };
+use crate::package_promotion_transaction::TargetLock;
 use crate::timing::{
     PackageTimingCollector, TIMING_ARTIFACT_COMPARE_MS, TIMING_CACHE_LOOKUP_MS, TIMING_CHECKER_MS,
     TIMING_JSON_WRITE_MS, TIMING_PROJECTION_MS,
@@ -59,6 +65,7 @@ use crate::timing::{
 /// Stable command name reserved for the later `npa package publish-plan` command.
 pub const COMMAND: &str = "package publish-plan";
 static NEXT_REFERENCE_SUMMARY_CACHE_WRITE_TEMP: AtomicUsize = AtomicUsize::new(0);
+const MAX_REFERENCE_SUMMARY_CACHE_ENTRY_BYTES: u64 = 2 * 1024 * 1024;
 
 /// Source-free publish inputs loaded and freshness-checked for CLR-06.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -424,6 +431,16 @@ fn run_package_publish_plan_write(
     options: PackageCommonOptions,
     timings: &mut PackageTimingCollector,
 ) -> CommandResult {
+    let mutation_lock = match TargetLock::acquire(&options.root) {
+        Ok(lock) => lock,
+        Err(_) => {
+            return CommandResult::failed(
+                COMMAND,
+                crate::fs::render_package_root(&options.root),
+                vec![write_failed_diagnostic()],
+            );
+        }
+    };
     let (inputs, _plan, generated_json) = match generate_package_publish_plan(&options, timings) {
         Ok(generated) => generated,
         Err(result) => return result,
@@ -438,7 +455,7 @@ fn run_package_publish_plan_write(
         );
     }
     let write_result = timings.time_phase(TIMING_JSON_WRITE_MS, || {
-        write_publish_plan(&options, generated_json.as_bytes())
+        write_publish_plan(&options, generated_json.as_bytes(), &mutation_lock)
     });
     if let Err(diagnostic) = write_result {
         return CommandResult::failed(COMMAND, inputs.root_display, vec![*diagnostic]);
@@ -895,22 +912,29 @@ fn reference_summary_cache_dir() -> PathBuf {
         .join(PACKAGE_REFERENCE_SUMMARY_CACHE_LAYOUT_DIR)
 }
 
-fn reference_summary_cache_entry_path(cache_dir: &Path, cache_key: &str) -> PathBuf {
-    cache_dir.join(format!("{cache_key}.json"))
-}
-
 fn read_reference_summary_cache_lookup(
     cache_dir: &Path,
     cache_key: &str,
     expected: &PackageReferenceSummaryCacheEntry,
 ) -> PackageReferenceSummaryCacheLookup {
-    let path = reference_summary_cache_entry_path(cache_dir, cache_key);
-    let source = match fs::read_to_string(path) {
-        Ok(source) => source,
+    let directory = match open_absolute_directory(cache_dir, false) {
+        Ok(directory) => directory,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             return PackageReferenceSummaryCacheLookup::Missing;
         }
         Err(_) => return PackageReferenceSummaryCacheLookup::Stale,
+    };
+    let filename = OsString::from(format!("{cache_key}.json"));
+    let mut file = match directory.open_regular_file(&filename) {
+        Ok(Some(file)) => file,
+        Ok(None) => return PackageReferenceSummaryCacheLookup::Missing,
+        Err(_) => return PackageReferenceSummaryCacheLookup::Stale,
+    };
+    let Ok(metadata) = file.metadata() else {
+        return PackageReferenceSummaryCacheLookup::Stale;
+    };
+    let Ok(source) = read_bounded_reference_summary(&mut file, metadata.len()) else {
+        return PackageReferenceSummaryCacheLookup::Stale;
     };
     if source == package_reference_summary_cache_entry_json(expected) {
         return PackageReferenceSummaryCacheLookup::Hit(Box::new(expected.clone()));
@@ -926,37 +950,58 @@ fn read_reference_summary_cache_lookup(
     }
 }
 
+fn read_bounded_reference_summary(
+    mut reader: impl Read,
+    declared_length: u64,
+) -> io::Result<String> {
+    if declared_length > MAX_REFERENCE_SUMMARY_CACHE_ENTRY_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "reference summary cache entry exceeds its byte limit",
+        ));
+    }
+    let mut source = String::new();
+    reader
+        .by_ref()
+        .take(MAX_REFERENCE_SUMMARY_CACHE_ENTRY_BYTES + 1)
+        .read_to_string(&mut source)?;
+    if source.len() as u64 > MAX_REFERENCE_SUMMARY_CACHE_ENTRY_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "reference summary cache entry grew beyond its byte limit",
+        ));
+    }
+    Ok(source)
+}
+
 fn write_reference_summary_cache_entry(
     cache_dir: &Path,
     entry: &PackageReferenceSummaryCacheEntry,
 ) -> bool {
-    if fs::create_dir_all(cache_dir).is_err() {
+    let Ok(directory) = open_absolute_directory(cache_dir, true) else {
         return false;
-    }
-    let path = reference_summary_cache_entry_path(cache_dir, &entry.cache_key);
+    };
+    let filename = OsString::from(format!("{}.json", entry.cache_key));
     let temp_index = NEXT_REFERENCE_SUMMARY_CACHE_WRITE_TEMP.fetch_add(1, Ordering::SeqCst);
-    let temp_path = cache_dir.join(format!(
+    let temporary = OsString::from(format!(
         "{}.{}.{}.tmp",
         entry.cache_key,
         std::process::id(),
         temp_index
     ));
-    if fs::write(
-        &temp_path,
-        package_reference_summary_cache_entry_json(entry),
-    )
-    .is_err()
-    {
-        let _ = fs::remove_file(&temp_path);
+    let Ok(mut file) = directory.create_new_regular_file(&temporary) else {
         return false;
-    }
-    match fs::rename(&temp_path, path) {
-        Ok(()) => true,
-        Err(_) => {
-            let _ = fs::remove_file(&temp_path);
-            false
-        }
-    }
+    };
+    let result = (|| {
+        file.write_all(package_reference_summary_cache_entry_json(entry).as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        directory.publish_file_no_replace(&temporary, &filename)
+    })();
+    // A failed create-only cache publication preserves its unique staging file.
+    // Identity inspection cannot make a later unlink conditional, and cache
+    // residue is safer than deleting an independently replaced entry.
+    result.is_ok()
 }
 
 fn reference_summary_cache_entry_for_key(
@@ -1706,16 +1751,28 @@ fn read_checked_publish_plan(
     options: &PackageCommonOptions,
 ) -> Result<String, Box<CommandDiagnostic>> {
     let package_path = PackagePath::new(PACKAGE_PUBLISH_PLAN_PATH);
-    let full_path = join_package_path(&options.root, &package_path, "publish_plan.path")?;
-    fs::read_to_string(full_path).map_err(|error| {
-        let reason = if error.kind() == io::ErrorKind::NotFound {
-            "publish_plan_missing"
-        } else {
-            "generated_artifact_read_failed"
-        };
+    String::from_utf8(
+        read_package_generated_artifact_no_follow(&options.root, &package_path).map_err(
+            |error| {
+                let reason = if error.kind() == io::ErrorKind::NotFound {
+                    "publish_plan_missing"
+                } else {
+                    "generated_artifact_read_failed"
+                };
+                Box::new(
+                    CommandDiagnostic::error(DiagnosticKind::GeneratedArtifact, reason)
+                        .with_path(PACKAGE_PUBLISH_PLAN_PATH),
+                )
+            },
+        )?,
+    )
+    .map_err(|_| {
         Box::new(
-            CommandDiagnostic::error(DiagnosticKind::GeneratedArtifact, reason)
-                .with_path(PACKAGE_PUBLISH_PLAN_PATH),
+            CommandDiagnostic::error(
+                DiagnosticKind::GeneratedArtifact,
+                "generated_artifact_read_failed",
+            )
+            .with_path(PACKAGE_PUBLISH_PLAN_PATH),
         )
     })
 }
@@ -1723,35 +1780,16 @@ fn read_checked_publish_plan(
 fn write_publish_plan(
     options: &PackageCommonOptions,
     publish_plan_json: &[u8],
+    mutation_lock: &TargetLock,
 ) -> Result<(), Box<CommandDiagnostic>> {
     let package_path = PackagePath::new(PACKAGE_PUBLISH_PLAN_PATH);
-    let full_path = join_package_path(&options.root, &package_path, "publish_plan.path")?;
-    match fs::read(&full_path) {
-        Ok(existing) if existing == publish_plan_json => return Ok(()),
-        Ok(_) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(_) => return Err(Box::new(write_failed_diagnostic())),
-    }
-    if let Some(parent) = full_path.parent() {
-        fs::create_dir_all(parent).map_err(|_| Box::new(write_failed_diagnostic()))?;
-    }
-    let temp_path = temporary_write_path(&full_path);
-    if fs::write(&temp_path, publish_plan_json).is_err() {
-        return Err(Box::new(write_failed_diagnostic()));
-    }
-    if fs::rename(&temp_path, &full_path).is_err() {
-        let _ = fs::remove_file(&temp_path);
-        return Err(Box::new(write_failed_diagnostic()));
-    }
-    Ok(())
-}
-
-fn temporary_write_path(path: &Path) -> std::path::PathBuf {
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("publish-plan.json");
-    path.with_file_name(format!(".{file_name}.npa-publish-plan.tmp"))
+    write_package_generated_artifact_under_lock(
+        &options.root,
+        &package_path,
+        publish_plan_json,
+        mutation_lock,
+    )
+    .map_err(|_| Box::new(write_failed_diagnostic()))
 }
 
 fn passed_result(root_display: String) -> CommandResult {
@@ -1944,4 +1982,25 @@ fn certificate_file_references(lock: &PackageLockManifest) -> Vec<PackageArtifac
             file_hash: entry.certificate_file_hash,
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reference_summary_cache_reader_rejects_declared_and_observed_overflow() {
+        assert!(read_bounded_reference_summary(
+            b"small".as_slice(),
+            MAX_REFERENCE_SUMMARY_CACHE_ENTRY_BYTES + 1,
+        )
+        .is_err());
+
+        let oversized = vec![b'x'; MAX_REFERENCE_SUMMARY_CACHE_ENTRY_BYTES as usize + 1];
+        assert!(read_bounded_reference_summary(oversized.as_slice(), 0).is_err());
+        assert_eq!(
+            read_bounded_reference_summary(b"small".as_slice(), 5).unwrap(),
+            "small"
+        );
+    }
 }

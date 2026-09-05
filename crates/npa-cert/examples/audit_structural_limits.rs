@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    env, fs,
+    env,
     io::{self, BufRead, BufReader, Read, Write},
     process::{self, Command, Stdio},
 };
@@ -12,6 +12,13 @@ use npa_cert::{
     MAX_DECLARATIONS, MAX_EXPORTS, MAX_IMPORTS, MAX_LEVEL_TABLE_NODES, MAX_NAME_TABLE_ENTRIES,
     MAX_NESTED_VECTOR_ENTRIES, MAX_ROOT_EXPANDED_NODES, MAX_STRUCTURAL_DEPTH, MAX_TERM_TABLE_NODES,
 };
+
+#[path = "../../npa-api/examples/support/closed_private_tree.rs"]
+mod closed_private_tree;
+
+use closed_private_tree::InvocationReadRoot;
+
+const MAX_DEPENDENCY_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
 
 #[derive(Clone)]
 struct Maximum {
@@ -181,10 +188,15 @@ fn parse_hash(value: &str, field: &str, line: usize) -> Result<Hash, String> {
 
 fn load_committed_dependencies(
     records: &mut Vec<AuditRecord>,
+    inputs: &InvocationReadRoot,
     manifest_path: &str,
 ) -> Result<(), String> {
-    let manifest = fs::read_to_string(manifest_path)
-        .map_err(|error| format!("failed to read dependency manifest {manifest_path}: {error}"))?;
+    let manifest = String::from_utf8(inputs.read(
+        std::path::Path::new(manifest_path),
+        MAX_DEPENDENCY_MANIFEST_BYTES,
+        "dependency manifest",
+    )?)
+    .map_err(|_| format!("dependency manifest {manifest_path} is not UTF-8"))?;
     let mut lines = manifest.lines();
     let expected_header =
         "module\texport_hash\tcertificate_hash\tsource_repository\tsource_commit\tsource_path\tfixture_path";
@@ -227,7 +239,12 @@ fn load_committed_dependencies(
             .ok_or_else(|| format!("dependency manifest {manifest_path} has no parent directory"))?
             .join(fields[6]);
         let fixture_display = fixture_path.to_string_lossy();
-        let bytes = fs::read(&fixture_path)
+        let bytes = inputs
+            .read(
+                &fixture_path,
+                u64::try_from(MAX_CERTIFICATE_BYTES).map_err(|error| error.to_string())?,
+                "dependency certificate",
+            )
             .map_err(|error| format!("failed to read {fixture_display}: {error}"))?;
         verify_module_cert_hashes(&bytes).map_err(|error| {
             format!("failed to validate hashes for {fixture_display}: {error:?}")
@@ -496,12 +513,23 @@ fn main() {
     } else {
         arguments
     };
-    let mut records = Vec::new();
-    for path in paths {
-        let bytes = fs::read(&path).unwrap_or_else(|error| {
-            eprintln!("failed to read {path}: {error}");
+    let inputs =
+        InvocationReadRoot::current("structural audit transaction").unwrap_or_else(|error| {
+            eprintln!("failed to retain structural audit input root: {error}");
             process::exit(1);
         });
+    let mut records = Vec::new();
+    for path in paths {
+        let bytes = inputs
+            .read(
+                std::path::Path::new(&path),
+                u64::try_from(MAX_CERTIFICATE_BYTES).expect("certificate limit fits u64"),
+                "certificate audit input",
+            )
+            .unwrap_or_else(|error| {
+                eprintln!("failed to read {path}: {error}");
+                process::exit(1);
+            });
         let audit = audit_certificate_structural_limits(&bytes).unwrap_or_else(|error| {
             eprintln!("failed to audit {path}: {error:?}");
             process::exit(1);
@@ -513,15 +541,23 @@ fn main() {
         });
     }
     if let Some(manifest_path) = dependency_manifest {
-        load_committed_dependencies(&mut records, &manifest_path).unwrap_or_else(|error| {
-            eprintln!("failed to load committed certificate dependencies: {error}");
-            process::exit(1);
-        });
+        load_committed_dependencies(&mut records, &inputs, &manifest_path).unwrap_or_else(
+            |error| {
+                eprintln!("failed to load committed certificate dependencies: {error}");
+                process::exit(1);
+            },
+        );
         load_head_history_dependencies(&mut records).unwrap_or_else(|error| {
             eprintln!("failed to load HEAD certificate history: {error}");
             process::exit(1);
         });
     }
+    inputs
+        .verify("structural audit transaction")
+        .unwrap_or_else(|error| {
+            eprintln!("structural audit input tree changed during the audit: {error}");
+            process::exit(1);
+        });
     let mut exact = BTreeMap::<FullIdentity, Vec<usize>>::new();
     let mut exports = BTreeMap::<ExportIdentity, Vec<usize>>::new();
     for (index, record) in records.iter().enumerate() {
@@ -606,6 +642,89 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct CurrentDirectoryGuard(std::path::PathBuf);
+
+    impl CurrentDirectoryGuard {
+        fn change_to(path: &std::path::Path) -> Self {
+            let original = std::env::current_dir().unwrap();
+            std::env::set_current_dir(path).unwrap();
+            Self(original)
+        }
+    }
+
+    impl Drop for CurrentDirectoryGuard {
+        fn drop(&mut self) {
+            std::env::set_current_dir(&self.0).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn structural_audit_input_reader_rejects_links_oversized_and_root_replacement() {
+        use std::os::unix::fs::symlink;
+
+        let current = std::env::current_dir().unwrap().canonicalize().unwrap();
+        let root = current.join(format!(
+            "npa-structural-audit-reader-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("real")).unwrap();
+        std::fs::write(root.join("real/certificate.npcert"), b"cert").unwrap();
+        let maximum = u64::try_from(MAX_CERTIFICATE_BYTES).unwrap();
+        let inputs = InvocationReadRoot::current("test audit transaction").unwrap();
+        let relative_root = root.strip_prefix(&current).unwrap();
+        assert_eq!(
+            inputs
+                .read(
+                    &relative_root.join("real/certificate.npcert"),
+                    maximum,
+                    "test certificate",
+                )
+                .unwrap(),
+            b"cert"
+        );
+        symlink(root.join("real"), root.join("linked")).unwrap();
+        assert!(inputs
+            .read(
+                &relative_root.join("linked/certificate.npcert"),
+                maximum,
+                "linked certificate",
+            )
+            .is_err());
+        let oversized = std::fs::File::create(root.join("real/oversized.npcert")).unwrap();
+        oversized.set_len(maximum + 1).unwrap();
+        assert!(inputs
+            .read(
+                &relative_root.join("real/oversized.npcert"),
+                maximum,
+                "oversized certificate",
+            )
+            .is_err());
+        assert!(inputs
+            .read(
+                std::path::Path::new("../escape.npcert"),
+                maximum,
+                "escaping certificate",
+            )
+            .is_err());
+        let relocated = root.with_extension("relocated");
+        std::fs::rename(&root, &relocated).unwrap();
+        std::fs::create_dir_all(root.join("real")).unwrap();
+        std::fs::write(root.join("real/certificate.npcert"), b"replacement").unwrap();
+        assert!(inputs.verify("test audit transaction").is_err());
+        assert_eq!(
+            std::fs::read(relocated.join("real/certificate.npcert")).unwrap(),
+            b"cert"
+        );
+        assert_eq!(
+            std::fs::read(root.join("real/certificate.npcert")).unwrap(),
+            b"replacement"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(relocated).unwrap();
+    }
 
     fn record(module: &str, export: u8, certificate: u8, root: bool) -> AuditRecord {
         AuditRecord {
@@ -722,24 +841,26 @@ mod tests {
     }
 
     #[test]
-    fn committed_dependency_manifest_loads_exact_validated_identities() {
-        let manifest = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/certificate-structural-history/dependencies.tsv"
-        );
+    fn retired_committed_dependency_manifest_is_not_current_input() {
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .unwrap()
+            .join("testdata/certificate-structural-history/dependencies.tsv");
         let mut records = Vec::new();
-        load_committed_dependencies(&mut records, manifest).unwrap();
+        let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .unwrap();
+        let _current = CurrentDirectoryGuard::change_to(&workspace);
+        let inputs = InvocationReadRoot::current("committed dependency test").unwrap();
+        let manifest = manifest.strip_prefix(&workspace).unwrap();
+        let error = load_committed_dependencies(&mut records, &inputs, manifest.to_str().unwrap())
+            .expect_err("retired certificate history must not decode as current input");
 
-        assert_eq!(records.len(), 6);
-        assert!(records.iter().all(|record| !record.root));
-        assert!(records.iter().any(|record| {
-            record.audit.module == Name::from_dotted("Mathlib.Algebra.Group.Basic")
-                && record.audit.certificate_hash
-                    == [
-                        0xae, 0x0e, 0x5a, 0xc3, 0x6b, 0x7f, 0x4c, 0x27, 0x29, 0xfb, 0x4f, 0x20,
-                        0x26, 0x27, 0xaf, 0xd5, 0x75, 0x76, 0x39, 0x27, 0xdb, 0x61, 0xe8, 0x8f,
-                        0x33, 0x0b, 0x7a, 0x24, 0x5c, 0x18, 0x57, 0x56,
-                    ]
-        }));
+        assert!(records.is_empty());
+        assert!(error.contains(
+            "UnsupportedFormat { format: \"NPA-CERT-0.1\", core_spec: \"NPA-Core-0.1\" }"
+        ));
     }
 }

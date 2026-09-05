@@ -468,18 +468,6 @@ pub fn render_kernel_core_expr(expr: &Expr) -> String {
             render_kernel_core_expr(ty),
             render_kernel_core_expr(body)
         ),
-        Expr::Let {
-            binder,
-            ty,
-            value,
-            body,
-        } => format!(
-            "Let({}, {}, {}, {})",
-            binder,
-            render_kernel_core_expr(ty),
-            render_kernel_core_expr(value),
-            render_kernel_core_expr(body)
-        ),
     }
 }
 
@@ -584,12 +572,6 @@ impl<'ctx> MachineExprRenderer<'ctx> {
             Expr::Pi { binder, ty, body } => {
                 self.render_binder_expr("forall", ",", binder, ty, body)?
             }
-            Expr::Let {
-                binder,
-                ty,
-                value,
-                body,
-            } => self.render_let_expr(binder, ty, value, body)?,
         };
 
         if rendered.precedence < required_prec {
@@ -647,26 +629,6 @@ impl<'ctx> MachineExprRenderer<'ctx> {
         };
         Ok(RenderedExpr {
             source,
-            precedence: PREC_BINDER,
-        })
-    }
-
-    fn render_let_expr(
-        &mut self,
-        debug_name: &str,
-        ty: &Expr,
-        value: &Expr,
-        body: &Expr,
-    ) -> Result<RenderedExpr, MachineExprRendererError> {
-        let binder_name = self.fresh_binder_name(debug_name)?;
-        let ty = self.render_annotation_type(ty)?;
-        let value = self.render_expr(value, PREC_APP)?.source;
-        self.binder_stack.push(binder_name.clone());
-        let body = self.render_expr(body, 0)?.source;
-        self.binder_stack.pop();
-
-        Ok(RenderedExpr {
-            source: format!("let {binder_name} : {ty} := {value} in {body}"),
             precedence: PREC_BINDER,
         })
     }
@@ -829,11 +791,6 @@ enum OwnerAwareExpr {
         ty: Box<OwnerAwareExpr>,
         body: Box<OwnerAwareExpr>,
     },
-    Let {
-        ty: Box<OwnerAwareExpr>,
-        value: Box<OwnerAwareExpr>,
-        body: Box<OwnerAwareExpr>,
-    },
 }
 
 fn owner_aware_expr(
@@ -861,13 +818,6 @@ fn owner_aware_expr(
         },
         Expr::Pi { ty, body, .. } => OwnerAwareExpr::Pi {
             ty: Box::new(owner_aware_expr(ty, context)?),
-            body: Box::new(owner_aware_expr(body, context)?),
-        },
-        Expr::Let {
-            ty, value, body, ..
-        } => OwnerAwareExpr::Let {
-            ty: Box::new(owner_aware_expr(ty, context)?),
-            value: Box::new(owner_aware_expr(value, context)?),
             body: Box::new(owner_aware_expr(body, context)?),
         },
     })
@@ -1780,13 +1730,6 @@ fn collect_constants(
             collect_constants(ty, context, out)?;
             collect_constants(body, context, out)?;
         }
-        Expr::Let {
-            ty, value, body, ..
-        } => {
-            collect_constants(ty, context, out)?;
-            collect_constants(value, context, out)?;
-            collect_constants(body, context, out)?;
-        }
     }
     Ok(())
 }
@@ -1803,13 +1746,6 @@ fn collect_constant_names(expr: &Expr, out: &mut BTreeSet<Name>) {
         }
         Expr::Lam { ty, body, .. } | Expr::Pi { ty, body, .. } => {
             collect_constant_names(ty, out);
-            collect_constant_names(body, out);
-        }
-        Expr::Let {
-            ty, value, body, ..
-        } => {
-            collect_constant_names(ty, out);
-            collect_constant_names(value, out);
             collect_constant_names(body, out);
         }
     }
@@ -1855,13 +1791,6 @@ fn collect_free_locals(
             collect_free_locals(ty, base_context_len, binder_depth, out)?;
             collect_free_locals(body, base_context_len, binder_depth + 1, out)?;
         }
-        Expr::Let {
-            ty, value, body, ..
-        } => {
-            collect_free_locals(ty, base_context_len, binder_depth, out)?;
-            collect_free_locals(value, base_context_len, binder_depth, out)?;
-            collect_free_locals(body, base_context_len, binder_depth + 1, out)?;
-        }
     }
     Ok(())
 }
@@ -1884,13 +1813,6 @@ fn count_expr_nodes(expr: &Expr, size: &mut u32) -> Result<(), MachineExprRender
         }
         Expr::Lam { ty, body, .. } | Expr::Pi { ty, body, .. } => {
             count_expr_nodes(ty, size)?;
-            count_expr_nodes(body, size)?;
-        }
-        Expr::Let {
-            ty, value, body, ..
-        } => {
-            count_expr_nodes(ty, size)?;
-            count_expr_nodes(value, size)?;
             count_expr_nodes(body, size)?;
         }
     }
@@ -1969,7 +1891,6 @@ mod tests {
         MachineLocalDecl {
             name: name.to_owned(),
             ty,
-            value: None,
         }
     }
 

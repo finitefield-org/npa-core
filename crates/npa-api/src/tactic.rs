@@ -1549,16 +1549,16 @@ pub struct RepairChainReport {
     pub final_diagnostic_hash: Option<Hash>,
 }
 
-pub const FAILURE_MEMORY_SCHEMA: &str = "npa.failure_memory.v1";
-pub const FAILURE_MEMORY_KEY_HASH_DOMAIN: &str = "npa.failure-memory.key-hash.v1";
+pub const FAILURE_MEMORY_SCHEMA: &str = "npa.failure_memory.v2";
+pub const FAILURE_MEMORY_KEY_HASH_DOMAIN: &str = "npa.failure-memory.key-hash.v2";
 pub const FAILURE_MEMORY_CANDIDATE_SHAPE_HASH_DOMAIN: &str =
     "npa.failure-memory.candidate-shape-hash.v1";
-pub const MINIMAL_FAILING_ARTIFACT_SCHEMA: &str = "npa.minimal_failing_artifact.v2";
+pub const MINIMAL_FAILING_ARTIFACT_SCHEMA: &str = "npa.minimal_failing_artifact.v3";
 pub const MINIMAL_FAILING_ARTIFACT_HASH_DOMAIN: &str =
-    "npa.machine-api.minimal-failing-artifact.hash.v2";
-pub const FOCUSED_REPLAY_FAILURE_ARTIFACT_SCHEMA: &str = "npa.focused_replay_failure_artifact.v2";
+    "npa.machine-api.minimal-failing-artifact.hash.v3";
+pub const FOCUSED_REPLAY_FAILURE_ARTIFACT_SCHEMA: &str = "npa.focused_replay_failure_artifact.v3";
 pub const FOCUSED_REPLAY_FAILURE_ARTIFACT_HASH_DOMAIN: &str =
-    "npa.machine-api.focused-replay-failure-artifact.hash.v2";
+    "npa.machine-api.focused-replay-failure-artifact.hash.v3";
 pub const FOCUSED_REPLAY_FAILURE_EXCLUDED_FIELDS: &[&str] = &[
     "raw_prompts",
     "model_completions",
@@ -1567,8 +1567,8 @@ pub const FOCUSED_REPLAY_FAILURE_EXCLUDED_FIELDS: &[&str] = &[
     "theorem_graph_scores",
     "unrelated_filesystem_paths",
 ];
-pub const HARD_NEGATIVE_EXPORT_SCHEMA: &str = "npa.hard_negative_export.v1";
-pub const HARD_NEGATIVE_EXPORT_HASH_DOMAIN: &str = "npa.machine-api.hard-negative-export.hash.v1";
+pub const HARD_NEGATIVE_EXPORT_SCHEMA: &str = "npa.hard_negative_export.v2";
+pub const HARD_NEGATIVE_EXPORT_HASH_DOMAIN: &str = "npa.machine-api.hard-negative-export.hash.v2";
 pub const REPAIR_EFFECTIVENESS_BENCHMARK_SCHEMA: &str = "npa.repair_effectiveness_benchmark.v1";
 pub const DIAGNOSTIC_PROFILE_BENCHMARK_SCHEMA: &str = "npa.diagnostic_profile_benchmark.v1";
 pub const PERFORMANCE_ISOLATION_GUARDRAIL_SCHEMA: &str = "npa.performance_isolation_guardrail.v1";
@@ -2079,7 +2079,6 @@ pub struct MinimalFailingArtifactCheckedCurrentDecl {
 pub struct MinimalFailingArtifactLocal {
     pub name: String,
     pub type_hash: Hash,
-    pub value_hash: Option<Hash>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2867,7 +2866,7 @@ pub fn validate_minimal_failing_artifact_identity(
             artifact.owner_certificate_format.as_str(),
             artifact.owner_core_spec.as_str(),
         ),
-        ("NPA-CERT-0.2.0", "NPA-Core-0.2.0") | ("NPA-CERT-0.3.0", "NPA-Core-0.3.0")
+        ("NPA-CERT-0.4.0", "NPA-Core-0.4.0")
     );
     if !supported_owner
         || artifact.checked_current_decls.iter().any(|decl| {
@@ -3227,7 +3226,6 @@ pub fn minimal_failing_artifact_canonical_bytes(
     for local in &artifact.local_context {
         repair_encode_string(&mut out, &local.name);
         out.extend_from_slice(&local.type_hash);
-        minimal_failing_encode_optional_hash(&mut out, local.value_hash);
     }
     out.extend_from_slice(&artifact.context_hash);
     out.extend_from_slice(&artifact.target_hash);
@@ -3542,7 +3540,6 @@ fn minimal_failing_artifact_local_context(
         .map(|local| MinimalFailingArtifactLocal {
             name: local.name.clone(),
             type_hash: core_expr_hash(&local.ty),
-            value_hash: local.value.as_ref().map(core_expr_hash),
         })
         .collect()
 }
@@ -5275,7 +5272,7 @@ fn machine_session_owner_pair_is_consistent(session: &MachineProofSession) -> bo
             session.owner_certificate_format.as_str(),
             session.owner_core_spec.as_str(),
         ),
-        ("NPA-CERT-0.2.0", "NPA-Core-0.2.0") | ("NPA-CERT-0.3.0", "NPA-Core-0.3.0")
+        ("NPA-CERT-0.4.0", "NPA-Core-0.4.0")
     );
     if !supported {
         return false;
@@ -5285,7 +5282,7 @@ fn machine_session_owner_pair_is_consistent(session: &MachineProofSession) -> bo
         .checked_current_decls()
         .first()
         .map(|decl| (decl.owner_certificate_format(), decl.owner_core_spec()))
-        .unwrap_or(("NPA-CERT-0.3.0", "NPA-Core-0.3.0"));
+        .unwrap_or(("NPA-CERT-0.4.0", "NPA-Core-0.4.0"));
     session.owner_certificate_format == expected.0
         && session.owner_core_spec == expected.1
         && session
@@ -9867,7 +9864,7 @@ mod tests {
     fn minimal_session_json(theorem_type: &str) -> String {
         format!(
             r#"{{
-              "protocol_version":"npa.machine-api.v1",
+              "protocol_version":"npa.machine-api.v2",
               "root":{{
                 "module":"Scratch",
                 "theorem_name":"Scratch.t",
@@ -10796,7 +10793,6 @@ mod tests {
             .push(MinimalFailingArtifactLocal {
                 name: "h".to_owned(),
                 type_hash: [3; 32],
-                value_hash: None,
             });
         assert_ne!(
             focused_replay_failure_artifact_hash(&changed_local_context).unwrap(),
@@ -11997,7 +11993,7 @@ mod tests {
             .join(",");
         format!(
             r#"{{
-              "protocol_version":"npa.machine-api.v1",
+              "protocol_version":"npa.machine-api.v2",
               "root":{{
                 "module":"Scratch",
                 "theorem_name":"Scratch.t",

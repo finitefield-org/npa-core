@@ -171,11 +171,11 @@ pub fn inductive_generated_artifact_hashes_v1(
         },
         &[],
     )?;
-    let term_hashes = (0..cert.term_table.len())
+    let term_hashes = (0..cert.term_table().len())
         .map(|term| crate::term_hash(&cert, term))
         .collect::<Result<Vec<_>>>()?;
 
-    for decl in &cert.declarations {
+    for decl in cert.declarations() {
         let recursor = match &decl.decl {
             DeclPayload::Inductive { recursor, .. }
             | DeclPayload::InductiveConstrained { recursor, .. } => recursor.as_ref(),
@@ -186,7 +186,7 @@ pub fn inductive_generated_artifact_hashes_v1(
                 recursor_signature_hash: Some(crate::generated_recursor_signature_hash(
                     Some(recursor),
                     &term_hashes,
-                    &cert.name_table,
+                    cert.name_table(),
                 )?),
                 iota_rules_hash: Some(crate::generated_computation_rule_hash(Some(recursor))),
             });
@@ -722,21 +722,6 @@ fn remap_bvars(
                 remap_bvars(body, source_ctx_len + 1, target_ctx_len + 1, &body_map)?,
             ))
         }
-        Expr::Let {
-            binder,
-            ty,
-            value,
-            body,
-        } => {
-            let mut body_map = source_to_target.to_vec();
-            body_map.push(target_ctx_len);
-            Ok(Expr::let_in(
-                binder.clone(),
-                remap_bvars(ty, source_ctx_len, target_ctx_len, source_to_target)?,
-                remap_bvars(value, source_ctx_len, target_ctx_len, source_to_target)?,
-                remap_bvars(body, source_ctx_len + 1, target_ctx_len + 1, &body_map)?,
-            ))
-        }
     }
 }
 
@@ -816,7 +801,7 @@ fn recursive_occurrences_strictly_positive(
                     ctx_len + 1,
                 )
         }
-        Expr::Lam { .. } | Expr::Let { .. } => !contains_const(domain, inductive_name),
+        Expr::Lam { .. } => !contains_const(domain, inductive_name),
     }
 }
 
@@ -857,7 +842,7 @@ fn mutual_recursive_occurrences_strictly_positive(
             !contains_any_const(ty, block.inductives.iter().map(|data| data.name.as_str()))
                 && mutual_recursive_occurrences_strictly_positive(block, body, ctx_len + 1)
         }
-        Expr::Lam { .. } | Expr::Let { .. } => !contains_any_const(
+        Expr::Lam { .. } => !contains_any_const(
             domain,
             block.inductives.iter().map(|data| data.name.as_str()),
         ),
@@ -967,13 +952,6 @@ fn contains_const(expr: &Expr, needle: &str) -> bool {
         Expr::App(fun, arg) => contains_const(fun, needle) || contains_const(arg, needle),
         Expr::Lam { ty, body, .. } | Expr::Pi { ty, body, .. } => {
             contains_const(ty, needle) || contains_const(body, needle)
-        }
-        Expr::Let {
-            ty, value, body, ..
-        } => {
-            contains_const(ty, needle)
-                || contains_const(value, needle)
-                || contains_const(body, needle)
         }
     }
 }

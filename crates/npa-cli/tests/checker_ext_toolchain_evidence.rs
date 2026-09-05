@@ -328,3 +328,9 @@ fn prepare_inputs_rejects_stale_v0_2_checker_metadata() {
         .contains("checker --version line 1 mismatch"));
     fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn snapshot_external_input_differential() {
+    capture_rejects_historical_fixture_labels_and_fast_kernel_attribution();
+    prepare_inputs_emits_v0_8_identity_and_executable_checker();
+}

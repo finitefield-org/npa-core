@@ -28,12 +28,12 @@ use crate::{
 };
 
 /// Canonical theorem-premise report schema.
-pub const PACKAGE_THEOREM_PREMISE_REPORT_SCHEMA: &str = "npa.package.theorem_premise_report.v0.1";
+pub const PACKAGE_THEOREM_PREMISE_REPORT_SCHEMA: &str = "npa.package.theorem_premise_report.v0.2";
 /// Fixed package-relative theorem-premise report path.
 pub const PACKAGE_THEOREM_PREMISE_REPORT_PATH: &str = "generated/theorem-premise-report.json";
 /// Certificate-structural theorem-premise analysis profile.
 pub const PACKAGE_THEOREM_PREMISE_REPORT_PROFILE: &str =
-    "npa.package.theorem_premise_report.v0.1.certificate_structural";
+    "npa.package.theorem_premise_report.v0.2.certificate_structural";
 /// Fixed package-level representation of the version 1 analysis limits.
 pub const PACKAGE_THEOREM_PREMISE_ANALYSIS_LIMITS_V1: PackageTheoremPremiseAnalysisLimits =
     PackageTheoremPremiseAnalysisLimits {
@@ -168,8 +168,6 @@ pub enum PackageTheoremPremiseUseSite {
     TermBody,
     /// The premise occurs in a nested dependent type.
     DependentType,
-    /// The premise occurs in a let-bound value.
-    LetValue,
 }
 
 impl PackageTheoremPremiseUseSite {
@@ -181,7 +179,6 @@ impl PackageTheoremPremiseUseSite {
             Self::ApplicationArgument => "application_argument",
             Self::TermBody => "term_body",
             Self::DependentType => "dependent_type",
-            Self::LetValue => "let_value",
         }
     }
 
@@ -192,7 +189,6 @@ impl PackageTheoremPremiseUseSite {
             "application_argument" => Ok(Self::ApplicationArgument),
             "term_body" => Ok(Self::TermBody),
             "dependent_type" => Ok(Self::DependentType),
-            "let_value" => Ok(Self::LetValue),
             _ => Err(invalid_enum(path, "use_sites", value)),
         }
     }

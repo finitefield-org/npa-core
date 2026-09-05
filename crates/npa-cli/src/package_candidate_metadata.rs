@@ -1,6 +1,6 @@
 //! Implementation of `npa package export-candidate-metadata`.
 
-use std::{fs, io, path::Path};
+use std::{io, path::Path};
 
 use npa_package::{
     format_package_hash, package_file_hash, parse_package_theorem_index_json, PackagePath,
@@ -9,8 +9,9 @@ use npa_package::{
 
 use crate::args::PackageCandidateMetadataOptions;
 use crate::diagnostic::{CommandArtifact, CommandDiagnostic, CommandResult, DiagnosticKind};
-use crate::fs::{
-    join_package_path, render_package_path, render_package_root, validate_package_output_path,
+use crate::fs::{render_package_path, render_package_root, validate_package_output_path};
+use crate::generated_artifact_writer::{
+    read_package_regular_file_no_follow, write_package_regular_artifact_atomic,
 };
 use crate::package::PACKAGE_MANIFEST_PATH;
 use crate::package_artifacts::{PACKAGE_LOCK_PATH, PACKAGE_THEOREM_INDEX_PATH};
@@ -195,8 +196,7 @@ fn candidate_snapshot_hash(
 
 fn read_package_file(root: &Path, relative: &str) -> Result<Vec<u8>, Box<CommandDiagnostic>> {
     let path = PackagePath::new(relative);
-    let full_path = join_package_path(root, &path, relative)?;
-    fs::read(full_path).map_err(|error| {
+    read_package_regular_file_no_follow(root, &path).map_err(|error| {
         if error.kind() == io::ErrorKind::NotFound {
             if let Some(diagnostic) = missing_prerequisite_diagnostic(relative) {
                 return Box::new(diagnostic);
@@ -251,33 +251,7 @@ fn write_output(
     target: &PackagePath,
     contents: &[u8],
 ) -> Result<(), Box<CommandDiagnostic>> {
-    let full_path = join_package_path(root, target, "/out")?;
-    match fs::read(&full_path) {
-        Ok(existing) if existing == contents => return Ok(()),
-        Ok(_) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(_) => {
-            return Err(Box::new(
-                CommandDiagnostic::error(
-                    DiagnosticKind::GeneratedArtifact,
-                    "generated_artifact_read_failed",
-                )
-                .with_path(render_package_path(target)),
-            ));
-        }
-    }
-    if let Some(parent) = full_path.parent() {
-        fs::create_dir_all(parent).map_err(|_| {
-            Box::new(
-                CommandDiagnostic::error(
-                    DiagnosticKind::GeneratedArtifact,
-                    "generated_artifact_write_failed",
-                )
-                .with_path(render_package_path(target)),
-            )
-        })?;
-    }
-    fs::write(full_path, contents).map_err(|_| {
+    write_package_regular_artifact_atomic(root, target, contents).map_err(|_| {
         Box::new(
             CommandDiagnostic::error(
                 DiagnosticKind::GeneratedArtifact,

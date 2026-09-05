@@ -267,7 +267,9 @@ fn parse_basic_string_at(value: &str, mut index: usize) -> Result<(String, usize
 
 fn skip_ws(value: &str, mut index: usize) -> usize {
     while index < value.len() {
-        let ch = value[index..].chars().next().expect("index is in bounds");
+        let Some(ch) = value[index..].chars().next() else {
+            break;
+        };
         if ch.is_whitespace() {
             index += ch.len_utf8();
         } else {

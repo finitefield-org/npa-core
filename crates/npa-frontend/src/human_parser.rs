@@ -3,17 +3,111 @@ use std::collections::BTreeMap;
 use crate::{
     DefinitionReducibility, FileId, HumanAxiomDecl, HumanBinder, HumanBinderInfo, HumanClassDecl,
     HumanClassFieldDecl, HumanConstructorDecl, HumanDecl, HumanDeclValue, HumanDefinitionDecl,
-    HumanDiagnostic, HumanDiagnosticKind, HumanDiagnosticPhase, HumanEquationDecl,
-    HumanEquationRow, HumanExpr, HumanImplicitMode, HumanImportedSourceInterface,
-    HumanInductiveDecl, HumanInstanceDecl, HumanInstanceFieldDecl, HumanItem, HumanLevel,
-    HumanModule, HumanName, HumanNotationAssociativity, HumanNotationDecl, HumanNotationHead,
-    HumanNotationKind, HumanPattern, HumanProofBlock, HumanResult, HumanRewriteDirection,
-    HumanRewriteRuleSyntax, HumanSourceNotationMetadata, HumanTacticScript, HumanTacticSyntax,
-    HumanTerminationAnnotation, HumanUniverseParam, Span,
+    HumanDelimiterDiagnostic, HumanDelimiterDiagnosticKind, HumanDiagnostic, HumanDiagnosticKind,
+    HumanDiagnosticPayload, HumanDiagnosticPhase, HumanEquationDecl, HumanEquationRow, HumanExpr,
+    HumanImplicitMode, HumanImportedSourceInterface, HumanInductiveDecl, HumanInstanceDecl,
+    HumanInstanceFieldDecl, HumanItem, HumanLevel, HumanModule, HumanName,
+    HumanNotationAssociativity, HumanNotationDecl, HumanNotationHead, HumanNotationKind,
+    HumanPattern, HumanProofBlock, HumanResult, HumanRewriteDirection, HumanRewriteRuleSyntax,
+    HumanSourceNotationMetadata, HumanTacticScript, HumanTacticSyntax, HumanTerminationAnnotation,
+    HumanUniverseParam, Span,
 };
 
 pub fn parse_human_module(file_id: FileId, source: &str) -> HumanResult<HumanModule> {
     parse_human_module_with_source_interfaces(file_id, source, &[])
+}
+
+/// Validate context-free Human Surface lexical structure.
+///
+/// This deliberately stops before parsing, removed-syntax policy, or
+/// imported-notation resolution. It reuses the ordinary Human lexer mechanics
+/// and checks only properly nested `()`, `[]`, and `{}` token pairs.
+pub fn validate_human_source_lexical_structure(file_id: FileId, source: &str) -> HumanResult<()> {
+    let tokens = lex_human_with_removed_let_policy(file_id, source, false)
+        .map_err(|diagnostic| diagnostic.with_default_phase(HumanDiagnosticPhase::Parser))?;
+    let mut delimiters = Vec::<(&'static str, &'static str, Span)>::new();
+
+    for token in tokens {
+        match token.kind {
+            TokenKind::LParen => delimiters.push(("(", ")", token.span)),
+            TokenKind::LBracket => delimiters.push(("[", "]", token.span)),
+            TokenKind::LBrace => delimiters.push(("{", "}", token.span)),
+            TokenKind::RParen => {
+                close_human_delimiter(&mut delimiters, ")", token.span)?;
+            }
+            TokenKind::RBracket => {
+                close_human_delimiter(&mut delimiters, "]", token.span)?;
+            }
+            TokenKind::RBrace => {
+                close_human_delimiter(&mut delimiters, "}", token.span)?;
+            }
+            TokenKind::Eof => {
+                if let Some((open, expected, open_span)) = delimiters.last().copied() {
+                    return Err(HumanDiagnostic::parse(
+                        token.span,
+                        format!(
+                            "unclosed delimiter '{open}' at byte {}; expected '{expected}' before end of input",
+                            open_span.start.0
+                        ),
+                    )
+                    .with_payload(HumanDiagnosticPayload::default().with_delimiter(
+                        HumanDelimiterDiagnostic {
+                            kind: HumanDelimiterDiagnosticKind::Unclosed,
+                            opening_span: Some(open_span),
+                            expected_closing: Some(expected.to_owned()),
+                            actual_closing: None,
+                        },
+                    ))
+                    .with_phase(HumanDiagnosticPhase::Parser));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Ok(())
+}
+
+fn close_human_delimiter(
+    delimiters: &mut Vec<(&'static str, &'static str, Span)>,
+    close: &'static str,
+    close_span: Span,
+) -> HumanResult<()> {
+    let Some((open, expected, open_span)) = delimiters.last().copied() else {
+        return Err(HumanDiagnostic::parse(
+            close_span,
+            format!("unexpected closing delimiter '{close}'"),
+        )
+        .with_payload(
+            HumanDiagnosticPayload::default().with_delimiter(HumanDelimiterDiagnostic {
+                kind: HumanDelimiterDiagnosticKind::UnexpectedClosing,
+                opening_span: None,
+                expected_closing: None,
+                actual_closing: Some(close.to_owned()),
+            }),
+        )
+        .with_phase(HumanDiagnosticPhase::Parser));
+    };
+    if expected != close {
+        return Err(HumanDiagnostic::parse(
+            close_span,
+            format!(
+                "mismatched closing delimiter '{close}'; '{open}' at byte {} expects '{expected}'",
+                open_span.start.0
+            ),
+        )
+        .with_payload(
+            HumanDiagnosticPayload::default().with_delimiter(HumanDelimiterDiagnostic {
+                kind: HumanDelimiterDiagnosticKind::MismatchedClosing,
+                opening_span: Some(open_span),
+                expected_closing: Some(expected.to_owned()),
+                actual_closing: Some(close.to_owned()),
+            }),
+        )
+        .with_phase(HumanDiagnosticPhase::Parser));
+    }
+    delimiters.pop();
+    Ok(())
 }
 
 /// One top-level Human Surface import module-name span.
@@ -165,8 +259,6 @@ enum TokenKind {
     Induction,
     Fun,
     Forall,
-    Let,
-    In,
     Prop,
     Type,
     Sort,
@@ -193,6 +285,14 @@ enum TokenKind {
 }
 
 fn lex_human(file_id: FileId, source: &str) -> HumanResult<Vec<Token>> {
+    lex_human_with_removed_let_policy(file_id, source, true)
+}
+
+fn lex_human_with_removed_let_policy(
+    file_id: FileId,
+    source: &str,
+    reject_removed_let: bool,
+) -> HumanResult<Vec<Token>> {
     let mut tokens = Vec::new();
     let mut chars = source.char_indices().peekable();
 
@@ -286,7 +386,14 @@ fn lex_human(file_id: FileId, source: &str) -> HumanResult<Vec<Token>> {
             },
             '?' => lex_named_hole(file_id, source, start, &mut chars),
             '0'..='9' => lex_number(file_id, source, start, offset, ch, &mut chars)?,
-            ch if is_ident_start(ch) => lex_ident(file_id, source, start, offset, &mut chars),
+            ch if is_ident_start(ch) => lex_ident(
+                file_id,
+                source,
+                start,
+                offset,
+                &mut chars,
+                reject_removed_let,
+            )?,
             ch if is_operator_char(ch) => {
                 lex_operator(file_id, source, start, offset, ch, &mut chars)
             }
@@ -389,7 +496,8 @@ fn lex_ident(
     start: u32,
     first_offset: usize,
     chars: &mut std::iter::Peekable<std::str::CharIndices<'_>>,
-) -> Token {
+    reject_removed_let: bool,
+) -> HumanResult<Token> {
     let mut end = first_offset;
 
     while let Some((offset, ch)) = chars.peek().copied() {
@@ -426,6 +534,11 @@ fn lex_ident(
     }
 
     let text = &source[start as usize..end];
+    if reject_removed_let && text == "let" {
+        return Err(HumanDiagnostic::removed_term_let(Span::new(
+            file_id, start, end as u32,
+        )));
+    }
     let kind = match text {
         "import" => TokenKind::Import,
         "open" => TokenKind::Open,
@@ -456,8 +569,6 @@ fn lex_ident(
         "induction" => TokenKind::Induction,
         "fun" => TokenKind::Fun,
         "forall" => TokenKind::Forall,
-        "let" => TokenKind::Let,
-        "in" => TokenKind::In,
         "Prop" => TokenKind::Prop,
         "Type" => TokenKind::Type,
         "Sort" => TokenKind::Sort,
@@ -467,10 +578,10 @@ fn lex_ident(
         _ => TokenKind::Ident(text.to_owned()),
     };
 
-    Token {
+    Ok(Token {
         kind,
         span: Span::new(file_id, start, end as u32),
-    }
+    })
 }
 
 fn lex_named_hole(
@@ -582,8 +693,6 @@ fn reserved_name_component_spelling(kind: &TokenKind) -> Option<&'static str> {
         TokenKind::Induction => "induction",
         TokenKind::Fun => "fun",
         TokenKind::Forall => "forall",
-        TokenKind::Let => "let",
-        TokenKind::In => "in",
         TokenKind::Prop => "Prop",
         TokenKind::Type => "Type",
         TokenKind::Sort => "Sort",
@@ -1847,7 +1956,6 @@ impl<'a> Parser<'a> {
         match self.peek_kind() {
             TokenKind::Fun => self.parse_lam(),
             TokenKind::Forall => self.parse_pi(),
-            TokenKind::Let => self.parse_let(),
             _ => self.parse_arrow(),
         }
     }
@@ -1909,30 +2017,6 @@ impl<'a> Parser<'a> {
 
         Ok(HumanExpr::Pi {
             binders,
-            body: Box::new(body),
-            span,
-        })
-    }
-
-    fn parse_let(&mut self) -> HumanResult<HumanExpr> {
-        let start = self.expect_let()?;
-        let name = self.parse_name()?;
-        let ty = if matches!(self.peek_kind(), TokenKind::Colon) {
-            self.expect_colon()?;
-            Some(Box::new(self.parse_term()?))
-        } else {
-            None
-        };
-        self.expect_colon_eq()?;
-        let value = self.parse_term()?;
-        self.expect_in()?;
-        let body = self.parse_term()?;
-        let span = start.join(body.span());
-
-        Ok(HumanExpr::Let {
-            name,
-            ty,
-            value: Box::new(value),
             body: Box::new(body),
             span,
         })
@@ -2616,10 +2700,6 @@ impl<'a> Parser<'a> {
         self.expect_simple(|kind| matches!(kind, TokenKind::Forall), "expected forall")
     }
 
-    fn expect_let(&mut self) -> HumanResult<Span> {
-        self.expect_simple(|kind| matches!(kind, TokenKind::Let), "expected let")
-    }
-
     fn expect_where(&mut self) -> HumanResult<Span> {
         self.expect_simple(|kind| matches!(kind, TokenKind::Where), "expected where")
     }
@@ -2695,10 +2775,6 @@ impl<'a> Parser<'a> {
         self.expect_simple(|kind| matches!(kind, TokenKind::Sort), "expected Sort")
     }
 
-    fn expect_in(&mut self) -> HumanResult<Span> {
-        self.expect_simple(|kind| matches!(kind, TokenKind::In), "expected in")
-    }
-
     fn expect_simple(
         &mut self,
         matches_expected: impl FnOnce(&TokenKind) -> bool,
@@ -2736,6 +2812,229 @@ mod tests {
     }
 
     #[test]
+    fn validates_balanced_human_lexical_structure_without_parsing() {
+        for source in [
+            "",
+            "([{}])",
+            "\"unbalanced ([{ text\"",
+            "-- unbalanced ([{ text\n",
+            "notation:65 lhs \" ⊗ \" rhs => lhs",
+        ] {
+            validate_human_source_lexical_structure(FileId(4), source)
+                .expect("lexically balanced source should pass structural validation");
+        }
+        validate_human_source_lexical_structure(FileId(4), "def")
+            .expect("structural validation should not require a complete declaration");
+        assert!(parse_human_module(FileId(4), "def").is_err());
+
+        let removed_let = "def sample : Nat := let n : Nat := Nat.zero in n";
+        validate_human_source_lexical_structure(FileId(4), removed_let)
+            .expect("structural validation must not enforce removed-syntax policy");
+        assert_eq!(
+            parse_human_module(FileId(4), removed_let)
+                .expect_err("ordinary parsing must still reject removed term-level let")
+                .kind,
+            HumanDiagnosticKind::RemovedTermLet
+        );
+    }
+
+    #[test]
+    fn lexical_structure_reports_unexpected_closing_delimiter() {
+        for close in [")", "]", "}"] {
+            let diagnostic = validate_human_source_lexical_structure(FileId(5), close)
+                .expect_err("unexpected closer should fail");
+
+            assert_eq!(diagnostic.kind, HumanDiagnosticKind::ParseError);
+            assert_eq!(diagnostic.primary_span, Span::new(FileId(5), 0, 1));
+            assert_eq!(
+                diagnostic.message,
+                format!("unexpected closing delimiter '{close}'")
+            );
+            assert_eq!(
+                diagnostic
+                    .payload
+                    .as_ref()
+                    .and_then(|payload| payload.phase),
+                Some(HumanDiagnosticPhase::Parser)
+            );
+            let delimiter = diagnostic
+                .payload
+                .as_ref()
+                .and_then(|payload| payload.delimiter.as_ref())
+                .expect("unexpected closer should carry structured context");
+            assert_eq!(
+                delimiter.kind,
+                HumanDelimiterDiagnosticKind::UnexpectedClosing
+            );
+            assert_eq!(delimiter.opening_span, None);
+            assert_eq!(delimiter.expected_closing, None);
+            assert_eq!(delimiter.actual_closing.as_deref(), Some(close));
+        }
+    }
+
+    #[test]
+    fn lexical_structure_reports_first_mismatched_closing_delimiter() {
+        let diagnostic = validate_human_source_lexical_structure(FileId(6), "([)]")
+            .expect_err("crossed delimiters should fail at the first mismatch");
+
+        assert_eq!(diagnostic.kind, HumanDiagnosticKind::ParseError);
+        assert_eq!(diagnostic.primary_span, Span::new(FileId(6), 2, 3));
+        assert_eq!(
+            diagnostic.message,
+            "mismatched closing delimiter ')'; '[' at byte 1 expects ']'"
+        );
+        let delimiter = diagnostic
+            .payload
+            .as_ref()
+            .and_then(|payload| payload.delimiter.as_ref())
+            .expect("mismatch should carry structured context");
+        assert_eq!(
+            delimiter.kind,
+            HumanDelimiterDiagnosticKind::MismatchedClosing
+        );
+        assert_eq!(delimiter.opening_span, Some(Span::new(FileId(6), 1, 2)));
+        assert_eq!(delimiter.expected_closing.as_deref(), Some("]"));
+        assert_eq!(delimiter.actual_closing.as_deref(), Some(")"));
+    }
+
+    #[test]
+    fn lexical_structure_reports_innermost_unclosed_delimiter_at_eof() {
+        let diagnostic = validate_human_source_lexical_structure(FileId(7), "\"α\"({")
+            .expect_err("unclosed delimiter should fail at EOF");
+
+        assert_eq!(diagnostic.kind, HumanDiagnosticKind::ParseError);
+        assert_eq!(diagnostic.primary_span, Span::new(FileId(7), 6, 6));
+        assert_eq!(
+            diagnostic.message,
+            "unclosed delimiter '{' at byte 5; expected '}' before end of input"
+        );
+        let delimiter = diagnostic
+            .payload
+            .as_ref()
+            .and_then(|payload| payload.delimiter.as_ref())
+            .expect("unclosed delimiter should carry structured context");
+        assert_eq!(delimiter.kind, HumanDelimiterDiagnosticKind::Unclosed);
+        assert_eq!(delimiter.opening_span, Some(Span::new(FileId(7), 5, 6)));
+        assert_eq!(delimiter.expected_closing.as_deref(), Some("}"));
+        assert_eq!(delimiter.actual_closing, None);
+    }
+
+    #[test]
+    fn lexical_structure_reports_expected_closer_for_each_unclosed_delimiter() {
+        for (open, close) in [("(", ")"), ("[", "]"), ("{", "}")] {
+            let source = format!("\"α\"{open}");
+            let eof = source.len() as u32;
+            let diagnostic = validate_human_source_lexical_structure(FileId(9), &source)
+                .expect_err("unclosed delimiter should fail");
+
+            assert_eq!(diagnostic.primary_span, Span::new(FileId(9), eof, eof));
+            assert_eq!(
+                diagnostic.message,
+                format!(
+                    "unclosed delimiter '{open}' at byte 4; expected '{close}' before end of input"
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn lexical_structure_preserves_lexer_diagnostics() {
+        let diagnostic = validate_human_source_lexical_structure(FileId(8), "\"unterminated")
+            .expect_err("lexer failure should be preserved");
+
+        assert_eq!(diagnostic.kind, HumanDiagnosticKind::ParseError);
+        assert_eq!(diagnostic.primary_span, Span::new(FileId(8), 0, 13));
+        assert_eq!(diagnostic.message, "unterminated string literal");
+        assert_eq!(
+            diagnostic
+                .payload
+                .as_ref()
+                .and_then(|payload| payload.phase),
+            Some(HumanDiagnosticPhase::Parser)
+        );
+        assert!(
+            diagnostic
+                .payload
+                .as_ref()
+                .and_then(|payload| payload.delimiter.as_ref())
+                .is_none(),
+            "ordinary lexer failures must not claim delimiter context"
+        );
+    }
+
+    #[test]
+    fn removed_let_tombstone_consumes_the_shared_source_fixture_matrix() {
+        let matrix = include_str!("../../../testdata/certificate-v0.4/fixture-matrix.tsv");
+        let rows = matrix
+            .lines()
+            .skip(1)
+            .map(|line| {
+                let fields = line.split('\t').collect::<Vec<_>>();
+                assert_eq!(fields.len(), 10, "malformed fixture row: {line}");
+                fields
+            })
+            .filter(|fields| fields[1].starts_with("source_"))
+            .collect::<Vec<_>>();
+        assert_eq!(rows.len(), 11);
+
+        for fields in rows {
+            let source = match fields[0] {
+                "source_typed_let" => "def Test.x : Nat := let x : Nat := Nat.zero in x",
+                "source_unannotated_let" => "def Test.x : Nat := let x := Nat.zero in x",
+                "source_nested_let" => {
+                    "def Test.x : Nat := let x : Nat := Nat.zero in let y : Nat := x in y"
+                }
+                "source_declaration_name_let" => "def let : Nat := Nat.zero",
+                "source_binder_name_let" => "def Test.bad (let : Nat) : Nat := Nat.zero",
+                "source_letter_identifier" => "letter",
+                "source_comment_let" => "-- let",
+                "source_string_let" => "\"let\"",
+                "source_in_declaration_name" => "def in : Nat := Nat.zero",
+                "source_in_binder_name" => "def Test.in (in : Nat) : Nat := in",
+                "source_in_reference" => "in",
+                case_id => panic!("unmapped source fixture: {case_id}"),
+            };
+            match fields[6] {
+                "accepted" => {
+                    lex_human(FileId(10), source)
+                        .unwrap_or_else(|error| panic!("{}: {error:?}", fields[0]));
+                }
+                "removed_term_let" => {
+                    let start = source.find("let").expect("negative fixture contains let") as u32;
+                    let diagnostic = lex_human(FileId(11), source)
+                        .expect_err("the complete retired identifier should be rejected");
+                    assert_eq!(
+                        diagnostic.kind,
+                        HumanDiagnosticKind::RemovedTermLet,
+                        "{}",
+                        fields[0]
+                    );
+                    assert_eq!(
+                        diagnostic.primary_span,
+                        Span::new(FileId(11), start, start + 3),
+                        "{}",
+                        fields[0]
+                    );
+                    assert!(
+                        diagnostic
+                            .payload
+                            .as_ref()
+                            .and_then(|payload| payload.phase)
+                            .is_none(),
+                        "the lexer tombstone must not manufacture a parser phase: {}",
+                        fields[0]
+                    );
+                    for replacement in ["substitute", "`fun`", "`have`", "module-level declaration"]
+                    {
+                        assert!(diagnostic.message.contains(replacement));
+                    }
+                }
+                result => panic!("unmapped source result for {}: {result}", fields[0]),
+            }
+        }
+    }
+
+    #[test]
     fn parses_empty_human_module() {
         let module = parse_human_module(FileId(2), " \n\t ").expect("empty module should parse");
 
@@ -2758,6 +3057,55 @@ end Demo",
         assert!(matches!(module.items[1], HumanItem::Open { .. }));
         assert!(matches!(module.items[2], HumanItem::NamespaceStart { .. }));
         assert!(matches!(module.items[3], HumanItem::NamespaceEnd { .. }));
+    }
+
+    #[test]
+    fn parses_in_as_an_identifier_in_human_surface_positions() {
+        let module = parse_module(
+            "import in.in\nopen in\nnamespace in\ndef in.{in} (in : Sort in) : in := in\nend in",
+        );
+
+        let HumanItem::Import { module: import, .. } = &module.items[0] else {
+            panic!("expected import item")
+        };
+        assert_eq!(import.as_dotted(), "in.in");
+        assert!(matches!(
+            &module.items[1],
+            HumanItem::Open { namespace, .. } if namespace.as_dotted() == "in"
+        ));
+        assert!(matches!(
+            &module.items[2],
+            HumanItem::NamespaceStart { name, .. } if name.as_dotted() == "in"
+        ));
+        let HumanItem::Def(definition) = &module.items[3] else {
+            panic!("expected definition")
+        };
+        let declaration = &definition.declaration;
+        assert_eq!(declaration.name.as_dotted(), "in");
+        assert_eq!(declaration.universe_params[0].name, "in");
+        assert!(matches!(
+            &declaration.binders[0].kind,
+            HumanBinderKind::Named(name) if name.as_dotted() == "in"
+        ));
+        assert!(matches!(
+            declaration.binders[0].ty.as_deref(),
+            Some(HumanExpr::Sort {
+                level: HumanLevel::Param { name, .. },
+                ..
+            }) if name == "in"
+        ));
+        assert!(matches!(
+            &declaration.ty,
+            HumanExpr::Ident { name, .. } if name.as_dotted() == "in"
+        ));
+        assert!(matches!(
+            &declaration.value,
+            HumanDeclValue::Term(HumanExpr::Ident { name, .. }) if name.as_dotted() == "in"
+        ));
+        assert!(matches!(
+            &module.items[4],
+            HumanItem::NamespaceEnd { name: Some(name), .. } if name.as_dotted() == "in"
+        ));
     }
 
     #[test]
@@ -3270,14 +3618,14 @@ infixr:70 \" :: \" => List.cons",
     }
 
     #[test]
-    fn parses_fun_forall_let_annotation_application_and_parens() {
-        let term = parse_term("fun x => let y : (Nat) := x in (y : Nat)");
+    fn parses_fun_forall_annotation_application_and_parens() {
+        let term = parse_term("fun x => (x : Nat)");
         let HumanExpr::Lam { binders, body, .. } = term else {
             panic!("expected lambda");
         };
 
         assert_eq!(binders.len(), 1);
-        assert!(matches!(body.as_ref(), HumanExpr::Let { .. }));
+        assert!(matches!(body.as_ref(), HumanExpr::Annot { .. }));
 
         let forall = parse_term("forall (x y : Nat), Eq Nat x y");
         let HumanExpr::Pi { binders, body, .. } = forall else {
@@ -3285,6 +3633,46 @@ infixr:70 \" :: \" => List.cons",
         };
         assert_eq!(binders.len(), 2);
         assert!(matches!(body.as_ref(), HumanExpr::App { .. }));
+    }
+
+    #[test]
+    fn rejects_removed_term_let_with_exact_span_for_typed_and_untyped_forms() {
+        for source in [
+            "let n := Nat.zero in n",
+            "let n : Nat := Nat.zero in n",
+            "def Test.value : Nat := let n : Nat := Nat.zero in n",
+            "def let : Nat := Nat.zero",
+        ] {
+            let start = source.find("let").expect("fixture contains retired lexeme") as u32;
+            let diagnostic = parse_human_module(FileId(7), source)
+                .expect_err("every complete `let` lexeme should be rejected");
+            assert_eq!(diagnostic.kind, HumanDiagnosticKind::RemovedTermLet);
+            assert_eq!(
+                diagnostic.primary_span,
+                Span::new(FileId(7), start, start + 3)
+            );
+            assert_eq!(
+                diagnostic
+                    .payload
+                    .as_ref()
+                    .and_then(|payload| payload.phase),
+                Some(HumanDiagnosticPhase::Parser)
+            );
+        }
+    }
+
+    #[test]
+    fn rejection_only_human_fixture_reports_removed_term_let() {
+        let source = include_str!("../../../testdata/removed-term-let/human.npa");
+        let start = source.find("let").expect("fixture contains retired lexeme") as u32;
+        let diagnostic = parse_human_module(FileId(12), source)
+            .expect_err("rejection-only fixture must not become accepted source");
+
+        assert_eq!(diagnostic.kind, HumanDiagnosticKind::RemovedTermLet);
+        assert_eq!(
+            diagnostic.primary_span,
+            Span::new(FileId(12), start, start + 3)
+        );
     }
 
     #[test]

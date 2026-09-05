@@ -258,10 +258,10 @@ impl fmt::Display for SubgoalClusterError {
 impl std::error::Error for SubgoalClusterError {}
 
 pub const LEMMA_GENERALIZATION_INPUT_PROFILE: &str =
-    "npa.library-growth.lemma-generalization-input.v1";
-pub const LEMMA_GENERALIZED_STATEMENT_PROFILE: &str = "npa.library-growth.generalized-statement.v1";
+    "npa.library-growth.lemma-generalization-input.v2";
+pub const LEMMA_GENERALIZED_STATEMENT_PROFILE: &str = "npa.library-growth.generalized-statement.v2";
 pub const STATEMENT_NORMALIZATION_REPORT_PROFILE: &str =
-    "npa.library-growth.statement-normalization-report.v1";
+    "npa.library-growth.statement-normalization-report.v2";
 pub const LIBRARY_REUSE_SCORE_INPUT_PROFILE: &str = "npa.library-growth.reuse-score-input.v1";
 pub const LIBRARY_REUSE_SCORE_REPORT_PROFILE: &str = "npa.library-growth.reuse-score-report.v1";
 pub const LIBRARY_GROWTH_BUDGET_PROFILE: &str = "npa.library-growth.budget.pg012.v1";
@@ -307,7 +307,6 @@ impl LemmaGeneralizationBinderKind {
 pub struct LemmaGeneralizationLocal {
     pub local_id: String,
     pub type_hash: Hash,
-    pub value_hash: Option<Hash>,
     pub depends_on_local_ids: Vec<String>,
     pub occurrence_count: u64,
     pub binder_kind: LemmaGeneralizationBinderKind,
@@ -450,7 +449,6 @@ pub struct LemmaGeneralizationInput {
 pub struct StatementNormalizationBinder {
     pub local_id: String,
     pub type_hash: Hash,
-    pub value_hash: Option<Hash>,
     pub binder_kind: LemmaGeneralizationBinderKind,
 }
 
@@ -2498,7 +2496,7 @@ pub fn lemma_generalization_input_hash(
         None => out.push(0x00),
     }
     Ok(hash_with_domain(
-        "npa.library-growth.lemma-generalization-input.hash.v1",
+        "npa.library-growth.lemma-generalization-input.hash.v2",
         &out,
     ))
 }
@@ -2579,7 +2577,7 @@ pub fn statement_normalization_report_hash(report: &StatementNormalizationReport
     encode_typecheck_witness(&mut out, &report.typecheck_witness);
     encode_bool(&mut out, report.proof_task_allowed);
     hash_with_domain(
-        "npa.library-growth.statement-normalization-report.hash.v1",
+        "npa.library-growth.statement-normalization-report.hash.v2",
         &out,
     )
 }
@@ -5858,7 +5856,6 @@ fn statement_normalization_binder_order(
         .map(|local| StatementNormalizationBinder {
             local_id: local.local_id.clone(),
             type_hash: local.type_hash,
-            value_hash: local.value_hash,
             binder_kind: local.binder_kind,
         })
         .collect())
@@ -6110,7 +6107,7 @@ fn generalized_statement_hash_from_parts(
     for import in parts.import_needs {
         encode_import_need(&mut out, import);
     }
-    hash_with_domain("npa.library-growth.generalized-statement.hash.v1", &out)
+    hash_with_domain("npa.library-growth.generalized-statement.hash.v2", &out)
 }
 
 fn validate_report_binder_dependency_order(
@@ -6330,7 +6327,6 @@ fn statement_premise_from_input(
 fn encode_local(out: &mut Vec<u8>, local: &LemmaGeneralizationLocal) {
     encode_string(out, &local.local_id);
     encode_hash(out, &local.type_hash);
-    encode_option_hash(out, local.value_hash.as_ref());
     let mut dependencies = local.depends_on_local_ids.clone();
     dependencies.sort();
     dependencies.dedup();
@@ -6359,7 +6355,6 @@ fn encode_premise(out: &mut Vec<u8>, premise: &LemmaGeneralizationPremise) {
 fn encode_binder(out: &mut Vec<u8>, binder: &StatementNormalizationBinder) {
     encode_string(out, &binder.local_id);
     encode_hash(out, &binder.type_hash);
-    encode_option_hash(out, binder.value_hash.as_ref());
     encode_string(out, binder.binder_kind.as_str());
 }
 
@@ -6793,7 +6788,6 @@ mod tests {
                 LemmaGeneralizationLocal {
                     local_id: "x".to_owned(),
                     type_hash: test_hash(0xc4),
-                    value_hash: None,
                     depends_on_local_ids: vec!["A".to_owned()],
                     occurrence_count: 1,
                     binder_kind: LemmaGeneralizationBinderKind::RegularLocal,
@@ -6801,7 +6795,6 @@ mod tests {
                 LemmaGeneralizationLocal {
                     local_id: "M".to_owned(),
                     type_hash: test_hash(0xc3),
-                    value_hash: None,
                     depends_on_local_ids: vec!["A".to_owned()],
                     occurrence_count: 1,
                     binder_kind: LemmaGeneralizationBinderKind::Structure,
@@ -6809,7 +6802,6 @@ mod tests {
                 LemmaGeneralizationLocal {
                     local_id: "n".to_owned(),
                     type_hash: test_hash(0xc2),
-                    value_hash: None,
                     depends_on_local_ids: vec![],
                     occurrence_count: 1,
                     binder_kind: LemmaGeneralizationBinderKind::IndexLocal,
@@ -6817,7 +6809,6 @@ mod tests {
                 LemmaGeneralizationLocal {
                     local_id: "A".to_owned(),
                     type_hash: test_hash(0xc1),
-                    value_hash: None,
                     depends_on_local_ids: vec![],
                     occurrence_count: 1,
                     binder_kind: LemmaGeneralizationBinderKind::Carrier,

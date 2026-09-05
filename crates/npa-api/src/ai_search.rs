@@ -6049,8 +6049,7 @@ fn ai_search_builtin_intro_candidate(goal: &MachineGoalView) -> Option<MachineTa
 }
 
 fn ai_search_local_exact_prefilter(goal: &MachineGoalView, local: &MachineLocalView) -> bool {
-    local.value.is_none()
-        && local.ty.core_hash == goal.target.core_hash
+    local.ty.core_hash == goal.target.core_hash
         && ai_search_machine_name_is_unique(goal, &local.machine_name)
 }
 
@@ -6061,7 +6060,6 @@ fn ai_search_induction_nat_prefilter(
 ) -> bool {
     ai_search_goal_allows_tactic(goal, MachineApiTacticKind::InductionNat)
         && ai_search_machine_name_is_unique(goal, &local.machine_name)
-        && local.value.is_none()
         && context_index + 1 == goal.context.len()
         && goal.target.free_locals.contains(&local.local_id)
 }
@@ -7378,7 +7376,6 @@ mod tests {
             machine_name: format!("x{index}"),
             display_name: format!("x{index}"),
             ty: expr_view(70 + index as u8, 1, 0, None),
-            value: None,
             depends_on: Vec::new(),
             binder_index: index,
         }

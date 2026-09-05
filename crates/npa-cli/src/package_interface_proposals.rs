@@ -12,13 +12,13 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::OsStr,
-    fs::{self, OpenOptions},
+    fs,
     io::{self, Read},
     path::{Component, Path, PathBuf},
 };
 
 #[cfg(unix)]
-use std::os::unix::{ffi::OsStrExt, fs::OpenOptionsExt};
+use std::os::unix::ffi::OsStrExt;
 
 use npa_cert::Name;
 use npa_frontend::{
@@ -43,6 +43,9 @@ use crate::diagnostic::{
     CommandDiagnostic, CommandResult, DiagnosticKind, InterfaceProposalCheckDiagnostic,
     InterfaceProposalCheckOutput, InterfaceProposalCheckRow, InterfaceProposalCheckSnapshot,
     InterfaceProposalStatusCounts,
+};
+use crate::fs::no_follow_directory::{
+    open_absolute_directory, regular_file_identity, Directory, DirectoryChild, Identity,
 };
 use crate::package::load_package_root;
 
@@ -993,15 +996,6 @@ fn collect_human_universe_params(expr: &HumanExpr, params: &mut Vec<String>) {
                     collect_human_universe_params(ty, params);
                 }
             }
-            collect_human_universe_params(body, params);
-        }
-        HumanExpr::Let {
-            ty, value, body, ..
-        } => {
-            if let Some(ty) = ty {
-                collect_human_universe_params(ty, params);
-            }
-            collect_human_universe_params(value, params);
             collect_human_universe_params(body, params);
         }
         HumanExpr::Annot { expr, ty, .. } => {
@@ -2591,49 +2585,98 @@ pub fn discover_interface_proposal_set(
 fn discover_resolved_interface_proposal_set(
     proposal_root: &Path,
 ) -> Result<InterfaceProposalDiscovery, InterfaceProposalError> {
-    let module_root = proposal_root.join(CANONICAL_MODULE_ROOT);
     let module_relative = PathBuf::from(CANONICAL_MODULE_ROOT);
-    let module_metadata = match fs::symlink_metadata(&module_root) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return Ok(build_discovery(Vec::new(), 0));
-        }
-        Err(error) => {
-            return Err(proposal_root_io_error(
-                &module_relative,
-                error,
-                InterfaceProposalErrorReason::ReadFailed,
-            ));
-        }
-    };
-    if module_metadata.file_type().is_symlink() {
-        return Err(discovery_error(
-            InterfaceProposalErrorReason::SymlinkEntry,
-            CANONICAL_MODULE_ROOT.to_owned(),
-            None,
-            Some("real non-symlink directory"),
-            Some("symlink"),
-        ));
-    }
-    if !module_metadata.is_dir() {
-        return Err(discovery_error(
-            InterfaceProposalErrorReason::NonRegularEntry,
-            CANONICAL_MODULE_ROOT.to_owned(),
-            None,
-            Some("directory"),
-            Some("non-directory"),
-        ));
-    }
+    let proposal_directory = open_absolute_directory(proposal_root, false).map_err(|error| {
+        proposal_root_io_error(
+            Path::new("proposal-root"),
+            error,
+            InterfaceProposalErrorReason::ProposalRootNotDirectory,
+        )
+    })?;
+    let proposal_identity = proposal_directory.identity().map_err(|error| {
+        proposal_root_io_error(
+            Path::new("proposal-root"),
+            error,
+            InterfaceProposalErrorReason::ReadFailed,
+        )
+    })?;
+    let (module_directory, module_identity) =
+        match proposal_directory.open_child(OsStr::new(CANONICAL_MODULE_ROOT)) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(build_discovery(Vec::new(), 0));
+            }
+            Err(error) if is_symbolic_link_error(&error) => {
+                return Err(discovery_error(
+                    InterfaceProposalErrorReason::SymlinkEntry,
+                    CANONICAL_MODULE_ROOT.to_owned(),
+                    None,
+                    Some("real non-symlink directory"),
+                    Some("symlink"),
+                ));
+            }
+            Err(error) => {
+                return Err(proposal_root_io_error(
+                    &module_relative,
+                    error,
+                    InterfaceProposalErrorReason::ReadFailed,
+                ));
+            }
+            Ok(DirectoryChild::Regular(_)) => {
+                return Err(discovery_error(
+                    InterfaceProposalErrorReason::NonRegularEntry,
+                    CANONICAL_MODULE_ROOT.to_owned(),
+                    None,
+                    Some("directory"),
+                    Some("non-directory"),
+                ));
+            }
+            Ok(DirectoryChild::Directory(directory)) => {
+                let identity = directory.identity().map_err(|error| {
+                    proposal_root_io_error(
+                        &module_relative,
+                        error,
+                        InterfaceProposalErrorReason::ReadFailed,
+                    )
+                })?;
+                (directory, identity)
+            }
+        };
 
     let mut files = Vec::new();
     let mut total_file_bytes = 0usize;
     scan_module_tree(
-        &module_root,
+        &module_directory,
         &module_relative,
-        proposal_root,
         &mut files,
         &mut total_file_bytes,
     )?;
+    require_named_directory_identity(
+        &proposal_directory,
+        OsStr::new(CANONICAL_MODULE_ROOT),
+        module_identity,
+        &module_relative,
+    )?;
+    let reopened_proposal = open_absolute_directory(proposal_root, false).map_err(|error| {
+        proposal_root_io_error(
+            Path::new("proposal-root"),
+            error,
+            InterfaceProposalErrorReason::ReadFailed,
+        )
+    })?;
+    if reopened_proposal.identity().map_err(|error| {
+        proposal_root_io_error(
+            Path::new("proposal-root"),
+            error,
+            InterfaceProposalErrorReason::ReadFailed,
+        )
+    })? != proposal_identity
+    {
+        return Err(proposal_root_io_error(
+            Path::new("proposal-root"),
+            io::Error::other("proposal root identity changed during discovery"),
+            InterfaceProposalErrorReason::ReadFailed,
+        ));
+    }
     files.sort_by(|left, right| {
         left.relative_path
             .as_bytes()
@@ -2700,82 +2743,66 @@ fn build_discovery(
 }
 
 fn scan_module_tree(
-    directory: &Path,
+    directory: &Directory,
     relative_directory: &Path,
-    proposal_root: &Path,
     files: &mut Vec<InterfaceProposalDiscoveredFile>,
     total_file_bytes: &mut usize,
 ) -> Result<(), InterfaceProposalError> {
-    let mut entries = fs::read_dir(directory)
-        .map_err(|error| {
-            proposal_root_io_error(
-                relative_directory,
-                error,
-                InterfaceProposalErrorReason::ReadFailed,
-            )
-        })?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| {
-            proposal_root_io_error(
-                relative_directory,
-                error,
-                InterfaceProposalErrorReason::ReadFailed,
-            )
-        })?;
-    entries.sort_by(|left, right| {
-        raw_os_bytes(&left.file_name()).cmp(&raw_os_bytes(&right.file_name()))
-    });
+    let mut entries = directory.entry_names().map_err(|error| {
+        proposal_root_io_error(
+            relative_directory,
+            error,
+            InterfaceProposalErrorReason::ReadFailed,
+        )
+    })?;
+    entries.sort_by_key(|left| raw_os_bytes(left));
 
-    for entry in entries {
-        let name = entry.file_name();
-        let relative_path = relative_directory.join(&name);
+    for name in &entries {
+        let relative_path = relative_directory.join(name);
         let display_path = validate_discovered_relative_path(&relative_path)?;
-        let full_path = proposal_root.join(&relative_path);
-        if full_path.strip_prefix(proposal_root).is_err() {
-            return Err(discovery_error(
-                InterfaceProposalErrorReason::PathEscape,
-                display_path,
-                None,
-                Some("path confined beneath proposal root"),
-                Some("escaped path"),
-            ));
-        }
-        let metadata = fs::symlink_metadata(&full_path).map_err(|error| {
-            proposal_root_io_error(
-                &relative_path,
-                error,
-                InterfaceProposalErrorReason::ReadFailed,
-            )
-        })?;
-        let file_type = metadata.file_type();
-        if file_type.is_symlink() {
-            return Err(discovery_error(
-                InterfaceProposalErrorReason::SymlinkEntry,
-                display_path,
-                None,
-                Some("real non-symlink entry"),
-                Some("symlink"),
-            ));
-        }
-        if file_type.is_dir() {
-            scan_module_tree(
-                &full_path,
-                &relative_path,
-                proposal_root,
-                files,
-                total_file_bytes,
-            )?;
-            continue;
-        }
-        if !file_type.is_file() {
-            return Err(discovery_error(
-                InterfaceProposalErrorReason::NonRegularEntry,
-                display_path,
-                None,
-                Some("regular file or directory"),
-                Some("non-regular entry"),
-            ));
-        }
+        let child = match directory.open_child(name) {
+            Ok(child) => child,
+            Err(error) if is_symbolic_link_error(&error) => {
+                return Err(discovery_error(
+                    InterfaceProposalErrorReason::SymlinkEntry,
+                    display_path,
+                    None,
+                    Some("real non-symlink entry"),
+                    Some("symlink"),
+                ));
+            }
+            Err(error) if error.kind() == io::ErrorKind::InvalidData => {
+                return Err(discovery_error(
+                    InterfaceProposalErrorReason::NonRegularEntry,
+                    display_path,
+                    None,
+                    Some("regular file or directory"),
+                    Some("non-regular entry"),
+                ));
+            }
+            Err(error) => {
+                return Err(proposal_root_io_error(
+                    &relative_path,
+                    error,
+                    InterfaceProposalErrorReason::ReadFailed,
+                ));
+            }
+        };
+        let mut file = match child {
+            DirectoryChild::Directory(child_directory) => {
+                let child_identity = child_directory.identity().map_err(|error| {
+                    proposal_root_io_error(
+                        &relative_path,
+                        error,
+                        InterfaceProposalErrorReason::ReadFailed,
+                    )
+                })?;
+                scan_module_tree(&child_directory, &relative_path, files, total_file_bytes)?;
+                require_named_directory_identity(directory, name, child_identity, &relative_path)?;
+                continue;
+            }
+            DirectoryChild::Regular(file) => file,
+        };
         if relative_path.extension().and_then(OsStr::to_str) != Some("toml") {
             return Err(discovery_error(
                 InterfaceProposalErrorReason::NoncanonicalExtension,
@@ -2796,7 +2823,23 @@ fn scan_module_tree(
                 Some(&actual),
             ));
         }
-        let metadata_bytes = metadata.len();
+        let identity = regular_file_identity(&file).map_err(|error| {
+            proposal_root_io_error(
+                &relative_path,
+                error,
+                InterfaceProposalErrorReason::ReadFailed,
+            )
+        })?;
+        let metadata_bytes = file
+            .metadata()
+            .map_err(|error| {
+                proposal_root_io_error(
+                    &relative_path,
+                    error,
+                    InterfaceProposalErrorReason::ReadFailed,
+                )
+            })?
+            .len();
         if metadata_bytes > MAX_PROPOSAL_FILE_BYTES as u64 {
             return Err(resource_error(
                 InterfaceProposalErrorReason::ProposalFileBytesExceeded,
@@ -2823,13 +2866,47 @@ fn scan_module_tree(
                 metadata_total as u64,
             ));
         }
-        let bytes = read_regular_file_no_follow(&full_path).map_err(|error| {
+        let mut bytes = Vec::with_capacity(metadata_bytes as usize);
+        std::io::Read::by_ref(&mut file)
+            .take(MAX_PROPOSAL_FILE_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|error| {
+                proposal_root_io_error(
+                    &relative_path,
+                    error,
+                    InterfaceProposalErrorReason::ReadFailed,
+                )
+            })?;
+        let reopened = directory
+            .open_regular_file(name)
+            .map_err(|error| {
+                proposal_root_io_error(
+                    &relative_path,
+                    error,
+                    InterfaceProposalErrorReason::ReadFailed,
+                )
+            })?
+            .ok_or_else(|| {
+                proposal_root_io_error(
+                    &relative_path,
+                    io::Error::other("proposal file disappeared during discovery"),
+                    InterfaceProposalErrorReason::ReadFailed,
+                )
+            })?;
+        if regular_file_identity(&reopened).map_err(|error| {
             proposal_root_io_error(
                 &relative_path,
                 error,
                 InterfaceProposalErrorReason::ReadFailed,
             )
-        })?;
+        })? != identity
+        {
+            return Err(proposal_root_io_error(
+                &relative_path,
+                io::Error::other("proposal file identity changed during discovery"),
+                InterfaceProposalErrorReason::ReadFailed,
+            ));
+        }
         if bytes.len() > MAX_PROPOSAL_FILE_BYTES {
             return Err(resource_error(
                 InterfaceProposalErrorReason::ProposalFileBytesExceeded,
@@ -2870,7 +2947,64 @@ fn scan_module_tree(
             bytes,
         });
     }
+    let mut entries_after = directory.entry_names().map_err(|error| {
+        proposal_root_io_error(
+            relative_directory,
+            error,
+            InterfaceProposalErrorReason::ReadFailed,
+        )
+    })?;
+    entries_after.sort_by_key(|left| raw_os_bytes(left));
+    if entries_after != entries {
+        return Err(proposal_root_io_error(
+            relative_directory,
+            io::Error::other("proposal directory catalog changed during discovery"),
+            InterfaceProposalErrorReason::ReadFailed,
+        ));
+    }
     Ok(())
+}
+
+fn require_named_directory_identity(
+    parent: &Directory,
+    name: &OsStr,
+    expected: Identity,
+    relative_path: &Path,
+) -> Result<(), InterfaceProposalError> {
+    let actual = match parent.open_child(name) {
+        Ok(DirectoryChild::Directory(directory)) => directory.identity(),
+        Ok(DirectoryChild::Regular(_)) => Err(io::Error::other(
+            "proposal directory was replaced by a regular file",
+        )),
+        Err(error) => Err(error),
+    }
+    .map_err(|error| {
+        proposal_root_io_error(
+            relative_path,
+            error,
+            InterfaceProposalErrorReason::ReadFailed,
+        )
+    })?;
+    if actual != expected {
+        return Err(proposal_root_io_error(
+            relative_path,
+            io::Error::other("proposal directory identity changed during discovery"),
+            InterfaceProposalErrorReason::ReadFailed,
+        ));
+    }
+    Ok(())
+}
+
+fn is_symbolic_link_error(error: &io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        error.raw_os_error() == Some(libc::ELOOP)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = error;
+        false
+    }
 }
 
 fn proposal_set_hash(files: &[InterfaceProposalDiscoveredFile]) -> PackageHash {
@@ -3056,26 +3190,6 @@ fn raw_os_bytes(value: &OsStr) -> Vec<u8> {
     {
         value.to_string_lossy().as_bytes().to_vec()
     }
-}
-
-fn read_regular_file_no_follow(path: &Path) -> io::Result<Vec<u8>> {
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    options.custom_flags(libc::O_NOFOLLOW);
-    let file = options.open(path)?;
-    let metadata = file.metadata()?;
-    if !metadata.is_file() || metadata.file_type().is_symlink() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "proposal entry is not a regular file",
-        ));
-    }
-    let capacity = metadata.len().min(MAX_PROPOSAL_FILE_BYTES as u64 + 1) as usize;
-    let mut bytes = Vec::with_capacity(capacity);
-    file.take(MAX_PROPOSAL_FILE_BYTES as u64 + 1)
-        .read_to_end(&mut bytes)?;
-    Ok(bytes)
 }
 
 fn discovery_error(

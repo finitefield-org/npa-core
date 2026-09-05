@@ -2,8 +2,9 @@
 
 use crate::args::{
     KernelFuelReportMode, PackageArtifactLedgerAuditOptions, PackageAuditCacheMode,
-    PackageBuildCertsOptions, PackageBuildCheckCacheMode, PackageBuildSelection, PackageChecker,
-    PackageCommonOptions, PackageExternalCheckerOptions, PackageLockInputMode,
+    PackageBuildCertsOptions, PackageBuildCheckCacheMode, PackageBuildSelection,
+    PackageCheckSourceStructureOptions, PackageChecker, PackageCommonOptions,
+    PackageExternalCheckerOptions, PackageLockInputMode, PackageSourceStructureSelection,
     PackageTheoremPremiseReportOptions, PackageTimingMode, PackageVerifierMemoMode,
     PackageVerifyCertsOptions,
 };
@@ -15,7 +16,8 @@ pub mod v1 {
     use super::{
         KernelFuelReportMode, PackageArtifactLedgerAuditOptions, PackageAuditCacheMode,
         PackageBuildCertsOptions, PackageBuildCheckCacheMode, PackageBuildSelection,
-        PackageChecker, PackageCommonOptions, PackageExternalCheckerOptions, PackageLockInputMode,
+        PackageCheckSourceStructureOptions, PackageChecker, PackageCommonOptions,
+        PackageExternalCheckerOptions, PackageLockInputMode, PackageSourceStructureSelection,
         PackageTheoremPremiseReportOptions, PackageTimingMode, PackageVerifierMemoMode,
         PackageVerifyCertsOptions,
     };
@@ -46,6 +48,38 @@ pub mod v1 {
         PackageArtifactLedgerAuditOptions { common, modules }
     }
 
+    /// Construct a source-structure check for every manifest module.
+    pub fn check_source_structure_all(
+        common: PackageCommonOptions,
+    ) -> PackageCheckSourceStructureOptions {
+        PackageCheckSourceStructureOptions {
+            common,
+            selection: PackageSourceStructureSelection::All,
+        }
+    }
+
+    /// Construct a source-structure check for explicit registered modules.
+    pub fn check_source_structure_modules(
+        common: PackageCommonOptions,
+        modules: Vec<npa_cert::Name>,
+    ) -> PackageCheckSourceStructureOptions {
+        PackageCheckSourceStructureOptions {
+            common,
+            selection: PackageSourceStructureSelection::Modules(modules),
+        }
+    }
+
+    /// Construct a manifest-free source-structure check for package-relative paths.
+    pub fn check_source_structure_paths(
+        common: PackageCommonOptions,
+        paths: Vec<npa_package::PackagePath>,
+    ) -> PackageCheckSourceStructureOptions {
+        PackageCheckSourceStructureOptions {
+            common,
+            selection: PackageSourceStructureSelection::Paths(paths),
+        }
+    }
+
     /// Construct the policy and registry inputs required by the external checker.
     pub fn external_checker_options(
         runner_policy: impl Into<PathBuf>,
@@ -73,6 +107,42 @@ pub mod v1 {
         checker: PackageChecker,
     ) -> PackageVerifyCertsOptions {
         verify_certs(common, checker, true)
+    }
+
+    /// Construct a request that verifies explicit local seed modules and their imports.
+    pub fn verify_certs_modules(
+        common: PackageCommonOptions,
+        checker: PackageChecker,
+        modules: Vec<npa_cert::Name>,
+    ) -> PackageVerifyCertsOptions {
+        verify_certs(common, checker, false).with_modules(modules)
+    }
+
+    /// Construct a request that selects committed changes relative to a Git base ref.
+    pub fn verify_certs_base(
+        common: PackageCommonOptions,
+        checker: PackageChecker,
+        base: impl Into<String>,
+    ) -> PackageVerifyCertsOptions {
+        verify_certs(common, checker, false).with_base(base)
+    }
+
+    /// Alias for [`verify_certs_modules`] using selection-oriented naming.
+    pub fn verify_modules(
+        common: PackageCommonOptions,
+        checker: PackageChecker,
+        modules: Vec<npa_cert::Name>,
+    ) -> PackageVerifyCertsOptions {
+        verify_certs_modules(common, checker, modules)
+    }
+
+    /// Alias for [`verify_certs_base`] using committed-range naming.
+    pub fn verify_committed_base(
+        common: PackageCommonOptions,
+        checker: PackageChecker,
+        base: impl Into<String>,
+    ) -> PackageVerifyCertsOptions {
+        verify_certs_base(common, checker, base)
     }
 
     /// Construct a read-only ordinary certificate-build check request.
@@ -116,6 +186,9 @@ pub mod v1 {
             common,
             checker,
             changed,
+            modules: Vec::new(),
+            base: None,
+            modules_requested: false,
             audit_cache: PackageAuditCacheMode::Off,
             verifier_memo: PackageVerifierMemoMode::Off,
             jobs: 1,
@@ -134,6 +207,7 @@ pub mod v1 {
             common,
             check,
             build_check_cache: PackageBuildCheckCacheMode::Off,
+            build_check_cache_root: None,
             update_manifest_hashes,
             selection: PackageBuildSelection::Full,
             kernel_fuel_report: KernelFuelReportMode::Failure,
@@ -143,6 +217,26 @@ pub mod v1 {
 }
 
 impl PackageVerifyCertsOptions {
+    /// Replace the current selector with explicit local seed modules.
+    #[must_use]
+    pub fn with_modules(mut self, modules: Vec<npa_cert::Name>) -> Self {
+        self.changed = false;
+        self.modules = modules;
+        self.base = None;
+        self.modules_requested = true;
+        self
+    }
+
+    /// Replace the current selector with a committed Git base ref.
+    #[must_use]
+    pub fn with_base(mut self, base: impl Into<String>) -> Self {
+        self.changed = false;
+        self.modules.clear();
+        self.modules_requested = false;
+        self.base = Some(base.into());
+        self
+    }
+
     /// Set the local package audit-cache mode without changing any other option.
     #[must_use]
     pub fn with_audit_cache(mut self, mode: PackageAuditCacheMode) -> Self {
@@ -188,9 +282,27 @@ impl PackageVerifyCertsOptions {
 
 impl PackageBuildCertsOptions {
     /// Set the build-check cache mode without changing any other option.
+    ///
+    /// `Off` performs no cache-only work. `ReadThrough` is accepted by full or targeted checks,
+    /// performs every build and support check live, and may warm untrusted diagnostic and support
+    /// stores. `LocalHit` is accepted only by targeted checks, may reuse eligible support
+    /// contexts, builds every reached target fresh, and always produces local-only authoring
+    /// feedback. Both non-off modes write only safety-resolved external local stores;
+    /// local-hit warms only eligible cache-free live miss subtrees. Neither mode is proof
+    /// evidence.
     #[must_use]
     pub fn with_build_check_cache(mut self, mode: PackageBuildCheckCacheMode) -> Self {
         self.build_check_cache = mode;
+        self
+    }
+
+    /// Set the complete build-check cache root used by programmatic tools and tests.
+    ///
+    /// This does not expose an ordinary CLI flag. The cache-anchor resolver validates the
+    /// supplied root before use.
+    #[must_use]
+    pub fn with_build_check_cache_root(mut self, root: std::path::PathBuf) -> Self {
+        self.build_check_cache_root = Some(root);
         self
     }
 

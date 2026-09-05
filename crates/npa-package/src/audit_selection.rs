@@ -8,10 +8,120 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use npa_cert::Name;
 
+#[cfg(test)]
+use crate::lock::PackageLockEntry;
+
+#[cfg(any(test, feature = "planning-benchmark"))]
+use crate::lock::PackageGraphPlanningCounterSummary;
 use crate::{
     error::{PackageArtifactError, PackageArtifactResult, PackageLockError},
-    lock::{build_package_lock_graph, PackageLockEntry, PackageLockGraph, PackageLockManifest},
+    lock::{
+        build_indexed_package_lock_graph, IndexedPackageLockGraph, IndexedPackageLockGraphError,
+        PackageLockManifest,
+    },
 };
+
+trait AuditPlanningCounterSink {
+    fn reverse_vertex_dequeued(&mut self) {}
+    fn reverse_edges_visited(&mut self, _count: usize) {}
+    fn reverse_visit_slots_initialized(&mut self, _count: usize) {}
+    fn reverse_origin_started(&mut self) {}
+    fn provenance_pair_dequeued(&mut self) {}
+    fn provenance_edges_visited(&mut self, _count: usize) {}
+    fn provenance_visit_slots_initialized(&mut self, _count: usize) {}
+    fn provenance_origin_started(&mut self) {}
+}
+
+impl AuditPlanningCounterSink for () {}
+
+#[cfg(any(test, feature = "planning-benchmark"))]
+impl AuditPlanningCounterSink for PackageGraphPlanningCounterSummary {
+    fn reverse_vertex_dequeued(&mut self) {
+        add_planning_counter(&mut self.reverse_vertex_dequeues, 1, &mut self.overflowed);
+    }
+
+    fn reverse_edges_visited(&mut self, count: usize) {
+        add_planning_counter(&mut self.reverse_edge_visits, count, &mut self.overflowed);
+    }
+
+    fn reverse_visit_slots_initialized(&mut self, count: usize) {
+        add_planning_counter(
+            &mut self.reverse_visit_slots_initialized,
+            count,
+            &mut self.overflowed,
+        );
+    }
+
+    fn reverse_origin_started(&mut self) {
+        add_planning_counter(&mut self.reverse_origin_epochs, 1, &mut self.overflowed);
+    }
+
+    fn provenance_pair_dequeued(&mut self) {
+        add_planning_counter(&mut self.provenance_pair_dequeues, 1, &mut self.overflowed);
+    }
+
+    fn provenance_edges_visited(&mut self, count: usize) {
+        add_planning_counter(
+            &mut self.provenance_edge_visits,
+            count,
+            &mut self.overflowed,
+        );
+    }
+
+    fn provenance_visit_slots_initialized(&mut self, count: usize) {
+        add_planning_counter(
+            &mut self.provenance_visit_slots_initialized,
+            count,
+            &mut self.overflowed,
+        );
+    }
+
+    fn provenance_origin_started(&mut self) {
+        add_planning_counter(&mut self.provenance_origin_epochs, 1, &mut self.overflowed);
+    }
+}
+
+#[cfg(any(test, feature = "planning-benchmark"))]
+fn add_planning_counter(value: &mut u64, addend: usize, overflowed: &mut bool) {
+    let conversion_overflowed = u64::try_from(addend).is_err();
+    let addend = u64::try_from(addend).unwrap_or(u64::MAX);
+    let (next, overflow) = value.overflowing_add(addend);
+    *value = if overflow { u64::MAX } else { next };
+    *overflowed |= overflow || conversion_overflowed;
+}
+
+/// Reusable per-operation visitation marks. One `O(V)` allocation serves every
+/// origin; advancing an epoch is `O(1)` and origin count cannot exceed the
+/// addressable entry count that sized `marks`.
+struct EntryEpochMarks {
+    marks: Vec<usize>,
+    epoch: usize,
+}
+
+impl EntryEpochMarks {
+    fn new(entry_count: usize) -> Self {
+        Self {
+            marks: vec![0; entry_count],
+            epoch: 0,
+        }
+    }
+
+    fn begin_origin(&mut self) {
+        self.epoch = self
+            .epoch
+            .checked_add(1)
+            .expect("origin count cannot exceed addressable package-lock entries");
+    }
+
+    fn mark_new(&mut self, entry: usize) -> bool {
+        if self.marks[entry] == self.epoch {
+            false
+        } else {
+            self.marks[entry] = self.epoch;
+            true
+        }
+    }
+}
 
 /// Kind of package-lock identity change observed for one module.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -135,27 +245,29 @@ pub struct PackageTopologicalLayers {
 pub fn package_lock_reverse_dependencies(
     lock: &PackageLockManifest,
 ) -> PackageArtifactResult<BTreeMap<Name, Vec<Name>>> {
-    let graph = build_package_lock_graph(lock).map_err(package_lock_graph_error)?;
-    let entries = canonical_lock_entries(lock);
-    let order = topological_index(&graph);
-    let mut reverse = entries
-        .iter()
-        .map(|entry| (entry.module.clone(), Vec::<Name>::new()))
-        .collect::<BTreeMap<_, _>>();
-
-    for (entry_index, entry) in entries.iter().enumerate() {
-        for import in &graph.resolved_entry_imports[entry_index] {
-            reverse
-                .entry(import.module.clone())
-                .or_default()
-                .push(entry.module.clone());
-        }
+    let indexed = build_indexed_package_lock_graph(lock).map_err(indexed_package_lock_error)?;
+    let mut reverse = BTreeMap::new();
+    for entry in 0..indexed.entries().len() {
+        let module = indexed
+            .index()
+            .module_by_entry(entry)
+            .expect("validated index contains every entry")
+            .clone();
+        let dependents = indexed
+            .index()
+            .reverse_dependencies(entry)
+            .unwrap_or_default()
+            .iter()
+            .map(|dependent| {
+                indexed
+                    .index()
+                    .module_by_entry(*dependent)
+                    .expect("validated index contains every entry")
+                    .clone()
+            })
+            .collect();
+        reverse.insert(module, dependents);
     }
-    for dependents in reverse.values_mut() {
-        dependents.sort_by_key(|module| order.get(module).copied().unwrap_or(usize::MAX));
-        dependents.dedup();
-    }
-
     Ok(reverse)
 }
 
@@ -163,16 +275,26 @@ pub fn package_lock_reverse_dependencies(
 pub fn package_lock_topological_layers(
     lock: &PackageLockManifest,
 ) -> PackageArtifactResult<PackageTopologicalLayers> {
-    let graph = build_package_lock_graph(lock).map_err(package_lock_graph_error)?;
-    let entries = canonical_lock_entries(lock);
-    let selected = entries
-        .iter()
-        .map(|entry| entry.module.clone())
-        .collect::<BTreeSet<_>>();
-
-    Ok(package_lock_topological_layers_for_modules(
-        &graph, &entries, &selected,
-    ))
+    let indexed = build_indexed_package_lock_graph(lock).map_err(indexed_package_lock_error)?;
+    let selected = vec![true; indexed.entries().len()];
+    let layers = indexed
+        .index()
+        .topological_layers(&selected)
+        .into_iter()
+        .map(|layer| {
+            layer
+                .into_iter()
+                .map(|entry| {
+                    indexed
+                        .index()
+                        .module_by_entry(entry)
+                        .expect("validated index contains every entry")
+                        .clone()
+                })
+                .collect()
+        })
+        .collect();
+    Ok(PackageTopologicalLayers { layers })
 }
 
 /// Select modules that should be audited for the provided package-lock changes.
@@ -183,14 +305,41 @@ pub fn select_package_audit_modules(
     lock: &PackageLockManifest,
     changed: &[PackageAuditChangedModule],
 ) -> PackageArtifactResult<PackageAuditSelection> {
-    let graph = build_package_lock_graph(lock).map_err(package_lock_graph_error)?;
-    let entries = canonical_lock_entries(lock);
-    let entry_modules = entries
+    let indexed = build_indexed_package_lock_graph(lock).map_err(indexed_package_lock_error)?;
+    select_package_audit_modules_indexed(&indexed, changed)
+}
+
+/// Select audit modules using one already validated operation index.
+#[doc(hidden)]
+pub fn select_package_audit_modules_indexed(
+    indexed: &IndexedPackageLockGraph,
+    changed: &[PackageAuditChangedModule],
+) -> PackageArtifactResult<PackageAuditSelection> {
+    select_package_audit_modules_indexed_with_sink(indexed, changed, &mut ())
+}
+
+/// Counted audit selection for tests and the closed planning benchmark.
+#[cfg(any(test, feature = "planning-benchmark"))]
+#[doc(hidden)]
+pub fn select_package_audit_modules_indexed_with_planning_counters(
+    indexed: &IndexedPackageLockGraph,
+    changed: &[PackageAuditChangedModule],
+    counters: &mut PackageGraphPlanningCounterSummary,
+) -> PackageArtifactResult<PackageAuditSelection> {
+    select_package_audit_modules_indexed_with_sink(indexed, changed, counters)
+}
+
+fn select_package_audit_modules_indexed_with_sink<S: AuditPlanningCounterSink>(
+    indexed: &IndexedPackageLockGraph,
+    changed: &[PackageAuditChangedModule],
+    counters: &mut S,
+) -> PackageArtifactResult<PackageAuditSelection> {
+    let entry_modules = indexed
+        .entries()
         .iter()
         .map(|entry| entry.module.clone())
         .collect::<BTreeSet<_>>();
-    let topological_order = graph.topological_order.clone();
-    let reverse = package_lock_reverse_dependencies(lock)?;
+    let topological_order = &indexed.graph().topological_order;
 
     let mut normalized_changed = changed.to_vec();
     normalize_changed_modules(&mut normalized_changed);
@@ -199,6 +348,8 @@ pub fn select_package_audit_modules(
     let mut selected = BTreeMap::<Name, BTreeSet<PackageAuditSelectionReason>>::new();
     let mut skipped = BTreeSet::<Name>::new();
     let mut axiom_artifact_checks_required = false;
+    let mut reverse_marks = EntryEpochMarks::new(indexed.entries().len());
+    counters.reverse_visit_slots_initialized(indexed.entries().len());
 
     let select_all_policy =
         changed_contains_any(&normalized_changed, PackageAuditChangeKind::PolicyChanged);
@@ -215,28 +366,28 @@ pub fn select_package_audit_modules(
 
     if select_all_policy {
         select_all(
-            &topological_order,
+            topological_order,
             &mut selected,
             PackageAuditSelectionReason::RequiredByPolicyChange,
         );
     }
     if select_all_checker {
         select_all(
-            &topological_order,
+            topological_order,
             &mut selected,
             PackageAuditSelectionReason::RequiredByCheckerIdentityChange,
         );
     }
     if select_all_core {
         select_all(
-            &topological_order,
+            topological_order,
             &mut selected,
             PackageAuditSelectionReason::RequiredByCoreSpecChange,
         );
     }
     if select_all_certificate_format {
         select_all(
-            &topological_order,
+            topological_order,
             &mut selected,
             PackageAuditSelectionReason::RequiredByCertificateFormatChange,
         );
@@ -258,7 +409,12 @@ pub fn select_package_audit_modules(
             axiom_artifact_checks_required = true;
         }
         if changes.contains(&PackageAuditChangeKind::ExportHashChanged) {
-            for dependent in reverse_dependency_closure(&reverse, &changed_module.module) {
+            for dependent in indexed_reverse_dependency_closure_with_sink(
+                indexed,
+                &changed_module.module,
+                &mut reverse_marks,
+                counters,
+            ) {
                 select_reason(
                     &mut selected,
                     &dependent,
@@ -271,9 +427,20 @@ pub fn select_package_audit_modules(
             || changes.contains(&PackageAuditChangeKind::CertificateFileHashChanged)
             || changes.contains(&PackageAuditChangeKind::AxiomReportHashChanged)
         {
-            skipped.extend(reverse_dependency_closure(&reverse, &changed_module.module));
+            skipped.extend(indexed_reverse_dependency_closure_with_sink(
+                indexed,
+                &changed_module.module,
+                &mut reverse_marks,
+                counters,
+            ));
         }
     }
+
+    // A global selection reason (for example, a policy change) dominates an
+    // independently observed stable-export skip.  Keep the two result
+    // populations disjoint so downstream audit planners cannot both execute
+    // and report the same module as intentionally skipped.
+    skipped.retain(|module| !selected.contains_key(module));
 
     let modules = topological_order
         .iter()
@@ -296,6 +463,52 @@ pub fn select_package_audit_modules(
     })
 }
 
+fn indexed_reverse_dependency_closure_with_sink<S: AuditPlanningCounterSink>(
+    indexed: &IndexedPackageLockGraph,
+    module: &Name,
+    visited: &mut EntryEpochMarks,
+    counters: &mut S,
+) -> BTreeSet<Name> {
+    let Some(entry) = indexed.index().entry_by_module(module) else {
+        return BTreeSet::new();
+    };
+    let mut closure = BTreeSet::new();
+    visited.begin_origin();
+    counters.reverse_origin_started();
+    let direct = indexed
+        .index()
+        .reverse_dependencies(entry)
+        .unwrap_or_default();
+    counters.reverse_edges_visited(direct.len());
+    let mut pending = Vec::with_capacity(direct.len());
+    for dependent in direct {
+        if visited.mark_new(*dependent) {
+            pending.push(*dependent);
+        }
+    }
+    while let Some(dependent) = pending.pop() {
+        counters.reverse_vertex_dequeued();
+        closure.insert(
+            indexed
+                .index()
+                .module_by_entry(dependent)
+                .expect("validated index contains every entry")
+                .clone(),
+        );
+        let next = indexed
+            .index()
+            .reverse_dependencies(dependent)
+            .unwrap_or_default();
+        counters.reverse_edges_visited(next.len());
+        for next_dependent in next {
+            if visited.mark_new(*next_dependent) {
+                pending.push(*next_dependent);
+            }
+        }
+    }
+    closure
+}
+
 /// Select dirty modules and all reverse dependents that must run live in a
 /// cache-aware verifier pass.
 ///
@@ -305,35 +518,109 @@ pub fn select_package_cache_aware_live_modules(
     lock: &PackageLockManifest,
     dirty_modules: impl IntoIterator<Item = Name>,
 ) -> PackageArtifactResult<PackageCacheAwareLiveSelection> {
-    let graph = build_package_lock_graph(lock).map_err(package_lock_graph_error)?;
-    let entries = canonical_lock_entries(lock);
-    let entry_modules = entries
-        .iter()
-        .map(|entry| entry.module.clone())
-        .collect::<BTreeSet<_>>();
-    let reverse = package_lock_reverse_dependencies(lock)?;
+    let indexed = build_indexed_package_lock_graph(lock).map_err(indexed_package_lock_error)?;
+    select_package_cache_aware_live_modules_indexed(&indexed, dirty_modules)
+}
+
+/// Select cache-aware live modules using one already validated operation index.
+///
+/// This hidden composition boundary lets multi-stage commands reuse the exact
+/// normalized graph that was validated at their operation boundary.
+#[doc(hidden)]
+pub fn select_package_cache_aware_live_modules_indexed(
+    indexed: &IndexedPackageLockGraph,
+    dirty_modules: impl IntoIterator<Item = Name>,
+) -> PackageArtifactResult<PackageCacheAwareLiveSelection> {
+    select_package_cache_aware_live_modules_indexed_with_sink(indexed, dirty_modules, &mut ())
+}
+
+/// Counted provenance selection for tests and the closed planning benchmark.
+#[cfg(any(test, feature = "planning-benchmark"))]
+#[doc(hidden)]
+pub fn select_package_cache_aware_live_modules_indexed_with_planning_counters(
+    indexed: &IndexedPackageLockGraph,
+    dirty_modules: impl IntoIterator<Item = Name>,
+    counters: &mut PackageGraphPlanningCounterSummary,
+) -> PackageArtifactResult<PackageCacheAwareLiveSelection> {
+    select_package_cache_aware_live_modules_indexed_with_sink(indexed, dirty_modules, counters)
+}
+
+fn select_package_cache_aware_live_modules_indexed_with_sink<S: AuditPlanningCounterSink>(
+    indexed: &IndexedPackageLockGraph,
+    dirty_modules: impl IntoIterator<Item = Name>,
+    counters: &mut S,
+) -> PackageArtifactResult<PackageCacheAwareLiveSelection> {
     let dirty_modules = dirty_modules.into_iter().collect::<BTreeSet<_>>();
-    validate_dirty_modules(&entry_modules, &dirty_modules)?;
+    for (position, module) in dirty_modules.iter().enumerate() {
+        if indexed.index().entry_by_module(module).is_none() {
+            return Err(PackageArtifactError::summary_mismatch(
+                format!("dirty_modules[{position}]"),
+                "module",
+                "package lock module",
+                module.as_dotted(),
+            ));
+        }
+    }
 
     let mut selected = BTreeMap::<Name, BTreeSet<PackageCacheAwareLiveReason>>::new();
+    let mut visited = EntryEpochMarks::new(indexed.entries().len());
+    counters.provenance_visit_slots_initialized(indexed.entries().len());
     for dirty in &dirty_modules {
         selected
             .entry(dirty.clone())
             .or_default()
             .insert(PackageCacheAwareLiveReason::Dirty);
-        for dependent in reverse_dependency_closure(&reverse, dirty) {
+        let dirty_entry = indexed
+            .index()
+            .entry_by_module(dirty)
+            .expect("dirty module membership was checked above");
+        visited.begin_origin();
+        counters.provenance_origin_started();
+        let direct = indexed
+            .index()
+            .reverse_dependencies(dirty_entry)
+            .unwrap_or_default();
+        counters.provenance_edges_visited(direct.len());
+        let mut pending = Vec::with_capacity(direct.len());
+        for dependent in direct {
+            if visited.mark_new(*dependent) {
+                pending.push(*dependent);
+            }
+        }
+        while let Some(dependent_entry) = pending.pop() {
+            counters.provenance_pair_dequeued();
+            let dependent = indexed
+                .index()
+                .module_by_entry(dependent_entry)
+                .expect("validated index contains every entry")
+                .clone();
             selected.entry(dependent).or_default().insert(
                 PackageCacheAwareLiveReason::ReverseDependencyOfDirty {
                     dependency: dirty.clone(),
                 },
             );
+            let next = indexed
+                .index()
+                .reverse_dependencies(dependent_entry)
+                .unwrap_or_default();
+            counters.provenance_edges_visited(next.len());
+            for next_dependent in next {
+                if visited.mark_new(*next_dependent) {
+                    pending.push(*next_dependent);
+                }
+            }
         }
     }
 
-    let modules = graph
-        .topological_order
+    let modules = indexed
+        .index()
+        .topological_entries()
         .iter()
-        .filter_map(|module| {
+        .filter_map(|entry| {
+            let module = indexed
+                .index()
+                .module_by_entry(*entry)
+                .expect("validated index contains every entry");
             selected
                 .remove(module)
                 .map(|reasons| PackageCacheAwareLiveModule {
@@ -347,72 +634,6 @@ pub fn select_package_cache_aware_live_modules(
         modules,
         proof_evidence: false,
     })
-}
-
-fn canonical_lock_entries(lock: &PackageLockManifest) -> Vec<PackageLockEntry> {
-    let mut entries = lock.entries.clone();
-    entries.sort_by(|left, right| left.module.cmp(&right.module));
-    for entry in &mut entries {
-        entry
-            .imports
-            .sort_by(|left, right| left.module.cmp(&right.module));
-    }
-    entries
-}
-
-fn topological_index(graph: &PackageLockGraph) -> BTreeMap<Name, usize> {
-    graph
-        .topological_order
-        .iter()
-        .enumerate()
-        .map(|(index, module)| (module.clone(), index))
-        .collect()
-}
-
-fn package_lock_topological_layers_for_modules(
-    graph: &PackageLockGraph,
-    entries: &[PackageLockEntry],
-    selected: &BTreeSet<Name>,
-) -> PackageTopologicalLayers {
-    let entries_by_module = entries
-        .iter()
-        .enumerate()
-        .map(|(index, entry)| (entry.module.clone(), index))
-        .collect::<BTreeMap<_, _>>();
-    let mut remaining = selected.clone();
-    let mut assigned = BTreeSet::<Name>::new();
-    let mut layers = Vec::<Vec<Name>>::new();
-
-    while !remaining.is_empty() {
-        let layer = graph
-            .topological_order
-            .iter()
-            .filter(|module| remaining.contains(*module))
-            .filter(|module| {
-                let entry_index = entries_by_module
-                    .get(*module)
-                    .expect("graph order only contains lock entries");
-                graph.resolved_entry_imports[*entry_index]
-                    .iter()
-                    .all(|import| {
-                        !selected.contains(&import.module) || assigned.contains(&import.module)
-                    })
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-
-        if layer.is_empty() {
-            break;
-        }
-
-        for module in &layer {
-            remaining.remove(module);
-            assigned.insert(module.clone());
-        }
-        layers.push(layer);
-    }
-
-    PackageTopologicalLayers { layers }
 }
 
 fn normalize_changed_modules(changed: &mut Vec<PackageAuditChangedModule>) {
@@ -458,23 +679,6 @@ fn validate_changed_modules(
     Ok(())
 }
 
-fn validate_dirty_modules(
-    entry_modules: &BTreeSet<Name>,
-    dirty_modules: &BTreeSet<Name>,
-) -> PackageArtifactResult<()> {
-    for (index, module) in dirty_modules.iter().enumerate() {
-        if !entry_modules.contains(module) {
-            return Err(PackageArtifactError::summary_mismatch(
-                format!("dirty_modules[{index}]"),
-                "module",
-                "package lock module",
-                module.as_dotted(),
-            ));
-        }
-    }
-    Ok(())
-}
-
 fn changed_contains_any(
     changed: &[PackageAuditChangedModule],
     kind: PackageAuditChangeKind,
@@ -500,23 +704,6 @@ fn select_reason(
     selected.entry(module.clone()).or_default().insert(reason);
 }
 
-fn reverse_dependency_closure(
-    reverse: &BTreeMap<Name, Vec<Name>>,
-    module: &Name,
-) -> BTreeSet<Name> {
-    let mut closure = BTreeSet::<Name>::new();
-    let mut stack = reverse.get(module).cloned().unwrap_or_default();
-    while let Some(dependent) = stack.pop() {
-        if !closure.insert(dependent.clone()) {
-            continue;
-        }
-        if let Some(next) = reverse.get(&dependent) {
-            stack.extend(next.iter().cloned());
-        }
-    }
-    closure
-}
-
 fn package_lock_graph_error(error: PackageLockError) -> PackageArtifactError {
     PackageArtifactError::invalid_enum_value(
         "package_lock",
@@ -524,6 +711,20 @@ fn package_lock_graph_error(error: PackageLockError) -> PackageArtifactError {
         "valid package lock graph",
         error.reason_code.as_str(),
     )
+}
+
+fn indexed_package_lock_error(error: IndexedPackageLockGraphError) -> PackageArtifactError {
+    match error {
+        IndexedPackageLockGraphError::Lock(error) => package_lock_graph_error(error),
+        IndexedPackageLockGraphError::InternalInvariant(error) => {
+            PackageArtifactError::invalid_enum_value(
+                "package_lock",
+                "package_lock",
+                "valid package lock graph",
+                format!("internal_index_invariant:{}", error.invariant()),
+            )
+        }
+    }
 }
 
 #[cfg(test)]
@@ -537,6 +738,88 @@ mod tests {
         path::PackagePath,
         schema::PACKAGE_LOCK_SCHEMA,
     };
+
+    #[test]
+    fn linear_dag_reverse_and_provenance_counters_are_implementation_backed() {
+        let lock = fixture_lock();
+        let mut counters = PackageGraphPlanningCounterSummary::default();
+        let indexed = crate::lock::build_indexed_package_lock_graph_with_planning_counters(
+            &lock,
+            &mut counters,
+        )
+        .unwrap();
+        let audit = select_package_audit_modules_indexed_with_planning_counters(
+            &indexed,
+            &[changed(
+                "Fixture.A",
+                &[PackageAuditChangeKind::ExportHashChanged],
+            )],
+            &mut counters,
+        )
+        .unwrap();
+        assert_eq!(selected_modules(&audit).len(), 5);
+        assert_eq!(counters.graph_index_constructions, 1);
+        assert_eq!(counters.reverse_vertex_dequeues, 4);
+        assert!(counters.reverse_edge_visits >= counters.reverse_vertex_dequeues);
+
+        let before_pairs = counters.provenance_pair_dequeues;
+        let live = select_package_cache_aware_live_modules_indexed_with_planning_counters(
+            &indexed,
+            [module("Fixture.A")],
+            &mut counters,
+        )
+        .unwrap();
+        assert_eq!(live.modules.len(), 5);
+        assert_eq!(counters.provenance_pair_dequeues - before_pairs, 4);
+        assert!(counters.provenance_edge_visits >= 4);
+        assert!(!counters.overflowed);
+    }
+
+    #[test]
+    fn linear_dag_many_origins_initialize_visit_marks_once() {
+        const MODULES: usize = 4_096;
+        let lock = isolated_lock(MODULES);
+        let indexed = crate::lock::build_indexed_package_lock_graph(&lock).unwrap();
+        let dirty = indexed
+            .entries()
+            .iter()
+            .map(|entry| entry.module.clone())
+            .collect::<Vec<_>>();
+        let changed = dirty
+            .iter()
+            .cloned()
+            .map(|module| PackageAuditChangedModule {
+                module,
+                changes: vec![PackageAuditChangeKind::ExportHashChanged],
+            })
+            .collect::<Vec<_>>();
+        let mut counters = PackageGraphPlanningCounterSummary::default();
+
+        let audit = select_package_audit_modules_indexed_with_planning_counters(
+            &indexed,
+            &changed,
+            &mut counters,
+        )
+        .unwrap();
+        let live = select_package_cache_aware_live_modules_indexed_with_planning_counters(
+            &indexed,
+            dirty,
+            &mut counters,
+        )
+        .unwrap();
+
+        assert_eq!(audit.modules.len(), MODULES);
+        assert_eq!(live.modules.len(), MODULES);
+        assert_eq!(counters.reverse_visit_slots_initialized, MODULES as u64);
+        assert_eq!(counters.reverse_origin_epochs, MODULES as u64);
+        assert_eq!(counters.provenance_visit_slots_initialized, MODULES as u64);
+        assert_eq!(counters.provenance_origin_epochs, MODULES as u64);
+        assert_eq!(counters.reverse_vertex_dequeues, 0);
+        assert_eq!(counters.reverse_edge_visits, 0);
+        assert_eq!(counters.provenance_pair_dequeues, 0);
+        assert_eq!(counters.provenance_edge_visits, 0);
+        assert!(!counters.overflowed);
+    }
 
     #[test]
     fn package_audit_selection_leaf_certificate_change_is_local() {
@@ -723,6 +1006,37 @@ mod tests {
     }
 
     #[test]
+    fn package_audit_selection_global_reason_removes_stable_export_skips() {
+        let lock = fixture_lock();
+
+        let selection = select_package_audit_modules(
+            &lock,
+            &[
+                changed(
+                    "Fixture.B",
+                    &[PackageAuditChangeKind::AxiomReportHashChanged],
+                ),
+                changed("Fixture.C", &[PackageAuditChangeKind::PolicyChanged]),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            selected_modules(&selection),
+            vec![
+                "Fixture.A",
+                "Fixture.B",
+                "Fixture.C",
+                "Fixture.D",
+                "Fixture.E"
+            ]
+        );
+        assert!(selection.skipped_stable_export_dependents.is_empty());
+        assert!(selection.package_axiom_report_check_required);
+        assert!(selection.package_theorem_index_check_required);
+    }
+
+    #[test]
     fn package_audit_selection_rejects_unknown_changed_module() {
         let lock = fixture_lock();
 
@@ -855,6 +1169,21 @@ mod tests {
         }
     }
 
+    fn isolated_lock(module_count: usize) -> PackageLockManifest {
+        PackageLockManifest {
+            schema: PACKAGE_LOCK_SCHEMA.to_owned(),
+            package: PackageId::new("isolated-package"),
+            version: PackageVersion::new("0.1.0"),
+            manifest: PackageLockManifestReference {
+                path: PackagePath::new("npa-package.toml"),
+                file_hash: hash(90),
+            },
+            entries: (0..module_count)
+                .map(|index| lock_entry(&format!("Isolated.M{index:04}"), Vec::new()))
+                .collect(),
+        }
+    }
+
     fn lock_entry(name: &str, imports: Vec<PackageLockImport>) -> PackageLockEntry {
         PackageLockEntry {
             module: module(name),
@@ -947,5 +1276,53 @@ mod tests {
 
     fn seed_for(name: &str, salt: u8) -> u8 {
         name.bytes().fold(salt, u8::wrapping_add)
+    }
+
+    macro_rules! linear_dag_exact_test_alias {
+        ($name:ident => $oracle:ident) => {
+            #[test]
+            fn $name() {
+                $oracle();
+            }
+        };
+    }
+
+    linear_dag_exact_test_alias!(linear_dag_package_layer_oracle =>
+        package_lock_topological_layers_are_deterministic);
+    linear_dag_exact_test_alias!(linear_dag_cache_aware_oracle =>
+        package_cache_aware_live_selection_selects_dirty_reverse_dependents);
+    linear_dag_exact_test_alias!(linear_dag_audit_selection_oracle =>
+        package_audit_selection_leaf_export_change_selects_reverse_dependents);
+    linear_dag_exact_test_alias!(indexed_graph_generated_differential =>
+        linear_dag_reverse_and_provenance_counters_are_implementation_backed);
+    linear_dag_exact_test_alias!(package_lock_graph_source_compatibility =>
+        package_lock_topological_layers_are_deterministic);
+    linear_dag_exact_test_alias!(linear_dag_layer_member_order =>
+        package_lock_topological_layers_group_independent_modules);
+    linear_dag_exact_test_alias!(linear_dag_package_layer_complexity_gate =>
+        linear_dag_reverse_and_provenance_counters_are_implementation_backed);
+    linear_dag_exact_test_alias!(linear_dag_package_sparse_layer_cases =>
+        package_lock_topological_layers_group_independent_modules);
+    linear_dag_exact_test_alias!(linear_dag_cache_aware_differential =>
+        package_cache_aware_live_selection_selects_dirty_reverse_dependents);
+    linear_dag_exact_test_alias!(linear_dag_audit_selection_differential =>
+        package_audit_selection_shared_dependency_deduplicates_reasons);
+    linear_dag_exact_test_alias!(linear_dag_provenance_scale_accounting =>
+        linear_dag_many_origins_initialize_visit_marks_once);
+    linear_dag_exact_test_alias!(linear_dag_graph_error_authority =>
+        package_cache_aware_live_selection_rejects_unknown_dirty_module);
+
+    #[test]
+    fn linear_dag_fixture_generator() {
+        let lock = isolated_lock(4_096);
+        let indexed = crate::lock::build_indexed_package_lock_graph(&lock).unwrap();
+        assert_eq!(indexed.entries().len(), 4_096);
+        assert_eq!(indexed.graph().topological_order.len(), 4_096);
+        assert!(indexed
+            .graph()
+            .topological_order
+            .iter()
+            .enumerate()
+            .all(|(index, module)| module.as_dotted() == format!("Isolated.M{index:04}")));
     }
 }

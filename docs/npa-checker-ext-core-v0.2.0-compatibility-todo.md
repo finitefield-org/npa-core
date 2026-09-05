@@ -2,6 +2,12 @@
 
 Audit date: 2026-07-11
 
+> Historical record. The v0.2 compatibility lane and its
+> `test/conformance-manifest.tsv` inventory have been retired. Current checker
+> acceptance is the strict v0.4 matrix in
+> `../testdata/certificate-v0.4/fixture-matrix.tsv`; the commands and claims
+> below describe the 2026-07-11 implementation only.
+
 Normative baseline:
 
 - `core-spec-v0.2.0.md`
@@ -49,7 +55,7 @@ high-trust evidence.
 
 | Tasks | Status | Primary evidence |
 | --- | --- | --- |
-| EXT-COMPAT-01–04 | Complete | `test/conformance-manifest.tsv`, canonical re-encoding/hash suites, generated fixtures |
+| EXT-COMPAT-01–04 | Complete | retired v0.2 manifest; current successor: `../testdata/certificate-v0.4/fixture-matrix.tsv` |
 | EXT-COMPAT-05–08 | Complete | abstract checker capability, indexed/mutual/nested fixtures, recursor/positivity suites |
 | EXT-COMPAT-09–11 | Complete | policy-checked DAG session, real CLI, raw parser, deterministic resource and trace gates |
 | EXT-COMPAT-12 | Complete | `scripts/differential.sh` and the real OCaml external-package test |

@@ -1,0 +1,2 @@
+def RemovedLet.machine : Nat :=
+  let value : Nat := Nat.zero in value

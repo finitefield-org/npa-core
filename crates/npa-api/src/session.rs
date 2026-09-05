@@ -73,7 +73,7 @@ fn checked_current_owner_pair(current: &MachineCheckedCurrentDeclContext) -> (St
                 entry.owner_core_spec.clone(),
             )
         })
-        .unwrap_or_else(|| ("NPA-CERT-0.3.0".to_owned(), "NPA-Core-0.3.0".to_owned()))
+        .unwrap_or_else(|| ("NPA-CERT-0.4.0".to_owned(), "NPA-Core-0.4.0".to_owned()))
 }
 
 const ROOT_FIELDS: &[FieldSpec] = &[
@@ -685,7 +685,7 @@ fn parse_checked_current_decl_item(
         path,
     )?;
     if required_string(&object, "encoding")
-        != "npa.machine-api.checked-current-decl-package.canonical.v6.hex"
+        != "npa.machine-api.checked-current-decl-package.canonical.v7.hex"
     {
         return Err(grammar_error(
             MachineApiErrorKind::InvalidCheckedCurrentDecl,
@@ -1131,6 +1131,7 @@ fn high_trust_policy_for_imports(
         let cert = decode_module_cert(&input.certificate_bytes).map_err(|err| {
             format!("certificate decode failed before high-trust verify: {err:?}")
         })?;
+        let cert = cert.into_parts();
         allowlisted_axioms.extend(cert.name_table.into_iter().filter(Name::is_canonical));
     }
     Ok(AxiomPolicy {
@@ -1836,7 +1837,7 @@ struct SessionRootHashInput<'a> {
 
 fn session_root_hash(input: SessionRootHashInput<'_>) -> Hash {
     let mut out = Vec::new();
-    encode_string(&mut out, "npa.machine-api.session-root.v2");
+    encode_string(&mut out, "npa.machine-api.session-root.v3");
     encode_string(&mut out, input.protocol_version.as_str());
     encode_string(&mut out, input.owner_certificate_format);
     encode_string(&mut out, input.owner_core_spec);
@@ -1888,7 +1889,7 @@ fn encode_direct_imports_to(out: &mut Vec<u8>, imports: &MachineImportCertificat
 }
 
 fn encode_checked_current_to(out: &mut Vec<u8>, current: &MachineCheckedCurrentDeclContext) {
-    encode_string(out, "npa.machine-api.session-checked-current.v1");
+    encode_string(out, "npa.machine-api.session-checked-current.v2");
     encode_list_len(out, current.decl_index_table().len());
     for entry in current.decl_index_table() {
         out.extend(&entry.package_bytes);
@@ -2392,7 +2393,7 @@ fn decode_hex_bytes(
         ));
     }
     let mut out = Vec::with_capacity(bytes.len() / 2);
-    for chunk in bytes.chunks_exact(2) {
+    for chunk in bytes.as_chunks::<2>().0 {
         let high = lowercase_hex_value(chunk[0])
             .ok_or_else(|| grammar_error(error_kind, path.clone(), field, JsonValueKind::String))?;
         let low = lowercase_hex_value(chunk[1])
@@ -2465,16 +2466,16 @@ fn has_strict_module_prefix(module: &Name, name: &Name) -> bool {
 
 fn kernel_check_profile_hash(profile: KernelCheckProfileId) -> Hash {
     let mut out = Vec::new();
-    encode_string(&mut out, "core-spec-v0.1");
-    encode_string(&mut out, "npa-kernel.core.v0.1");
-    encode_string(&mut out, "beta-delta-iota-zeta.v0.1");
+    encode_string(&mut out, "core-spec-v0.2");
+    encode_string(&mut out, "npa-kernel.core.v0.2");
+    encode_string(&mut out, "beta-delta-iota.v0.1");
     encode_string(&mut out, "levels-imax-v0.1");
     let builtin_profile_id = match profile {
         KernelCheckProfileId::BuiltinNone => "builtin-none-v0.1",
         KernelCheckProfileId::BuiltinNatEqRec => "builtin-nat-eq-rec-v0.1",
     };
     encode_string(&mut out, builtin_profile_id);
-    hash_with_domain("npa.machine-tactic.kernel-check-profile.v1", &out)
+    hash_with_domain("npa.machine-tactic.kernel-check-profile.v2", &out)
 }
 
 fn hash_with_domain(domain: &str, payload: &[u8]) -> Hash {
@@ -2592,7 +2593,7 @@ mod tests {
     fn minimal_session_json_with_options(theorem_type: &str, options: &str) -> String {
         format!(
             r#"{{
-              "protocol_version":"npa.machine-api.v1",
+              "protocol_version":"npa.machine-api.v2",
               "root":{{
                 "module":"Scratch",
                 "theorem_name":"Scratch.t",
@@ -2686,8 +2687,8 @@ mod tests {
             .session;
 
         assert_eq!(first.session_root_hash, second.session_root_hash);
-        assert_eq!(first.owner_certificate_format, "NPA-CERT-0.3.0");
-        assert_eq!(first.owner_core_spec, "NPA-Core-0.3.0");
+        assert_eq!(first.owner_certificate_format, "NPA-CERT-0.4.0");
+        assert_eq!(first.owner_core_spec, "NPA-Core-0.4.0");
         assert_ne!(first.session_id, second.session_id);
         assert_eq!(
             first.initial_snapshot.state_fingerprint,
@@ -2703,30 +2704,30 @@ mod tests {
         assert_eq!(first.snapshots.len(), 1);
 
         let tactic_options = machine_tactic_options(&first.options.tactic_options).unwrap();
-        let v0_3_env = MachineTacticEnv::new_with_kernel_profile_and_owner_pair(
+        let v0_4_env = MachineTacticEnv::new_with_kernel_profile_and_owner_pair(
             machine_tactic_kernel_profile(first.options.kernel_check_profile),
             Vec::new(),
             Vec::new(),
             tactic_options.clone(),
-            "NPA-CERT-0.3.0",
-            "NPA-Core-0.3.0",
+            "NPA-CERT-0.4.0",
+            "NPA-Core-0.4.0",
         )
         .unwrap();
-        let v0_3_root = session_root_hash(SessionRootHashInput {
+        let v0_4_root = session_root_hash(SessionRootHashInput {
             protocol_version: first.protocol_version,
-            owner_certificate_format: "NPA-CERT-0.3.0",
-            owner_core_spec: "NPA-Core-0.3.0",
+            owner_certificate_format: "NPA-CERT-0.4.0",
+            owner_core_spec: "NPA-Core-0.4.0",
             root: &first.root,
             imports: &first.import_certificate_context,
             current: &first.checked_current_decls,
             options: &first.options,
             machine_tactic_options: &tactic_options,
-            resolved_eq_family: v0_3_env.eq_family.as_ref(),
-            resolved_nat_family: v0_3_env.nat_family.as_ref(),
+            resolved_eq_family: v0_4_env.eq_family.as_ref(),
+            resolved_nat_family: v0_4_env.nat_family.as_ref(),
             callable_table: &first.machine_surface_callable_interface_table,
-            simp_registry_fingerprint: npa_tactic::simp_registry_hash(&v0_3_env.simp_registry),
+            simp_registry_fingerprint: npa_tactic::simp_registry_hash(&v0_4_env.simp_registry),
         });
-        assert_eq!(first.session_root_hash, v0_3_root);
+        assert_eq!(first.session_root_hash, v0_4_root);
     }
 
     #[test]
@@ -2783,7 +2784,7 @@ mod tests {
         encode_checked_current_to(&mut actual, &current_context);
 
         let mut expected = Vec::new();
-        encode_string(&mut expected, "npa.machine-api.session-checked-current.v1");
+        encode_string(&mut expected, "npa.machine-api.session-checked-current.v2");
         encode_list_len(&mut expected, 1);
         expected.extend(&current_bytes);
 
@@ -2860,7 +2861,7 @@ mod tests {
         let current_hex = hex_bytes(&current_bytes);
         let body = format!(
             r#"{{
-              "protocol_version":"npa.machine-api.v1",
+              "protocol_version":"npa.machine-api.v2",
               "root":{{
                 "module":"Scratch",
                 "theorem_name":"Scratch.t",
@@ -2871,7 +2872,7 @@ mod tests {
               "import_closure":[],
               "imports":[],
               "checked_current_decls":[{{
-                "encoding":"npa.machine-api.checked-current-decl-package.canonical.v6.hex",
+                "encoding":"npa.machine-api.checked-current-decl-package.canonical.v7.hex",
                 "bytes":"{current_hex}"
               }}],
               "options":{{
@@ -2917,7 +2918,7 @@ mod tests {
     #[test]
     fn rejects_checked_current_wire_shape_with_request_phase() {
         let body = r#"{
-          "protocol_version":"npa.machine-api.v1",
+          "protocol_version":"npa.machine-api.v2",
           "root":{
             "module":"Scratch",
             "theorem_name":"Scratch.t",
@@ -3006,7 +3007,7 @@ mod tests {
     ) -> String {
         format!(
             r#"{{
-              "protocol_version":"npa.machine-api.v1",
+              "protocol_version":"npa.machine-api.v2",
               "root":{{
                 "module":"Scratch",
                 "theorem_name":"Scratch.t",

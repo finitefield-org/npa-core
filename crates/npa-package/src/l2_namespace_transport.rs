@@ -119,6 +119,8 @@ const ATTESTATION_THEOREM_PAIR_FIELDS: &[&str] = &[
     "target_theorem",
     "target_statement_hash",
 ];
+const L2_PROJECTION_MAX_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
+const L2_PROJECTION_MAX_EXPANDED_NODES: usize = npa_cert::MAX_CERTIFICATE_EXPANDED_NODES;
 
 /// Current strict namespace transport policy.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -160,6 +162,21 @@ impl L2NamespaceTransportPolicy {
         validate_policy(self)?;
         Ok(format!("{}\n", policy_json(self)))
     }
+}
+
+/// Return whether `name` lies strictly below a canonical dotted namespace prefix.
+///
+/// Policy prefixes use a trailing `.` (for example `Mathlib.`). Matching is component-aware, so
+/// `Mathlib.` accepts `Mathlib.Algebra` but never `MathlibExtra` or the namespace root itself.
+pub fn l2_namespace_prefix_matches(name: &Name, prefix: &str) -> bool {
+    let Some(base) = prefix.strip_suffix('.') else {
+        return false;
+    };
+    if base.is_empty() {
+        return false;
+    }
+    let base = Name::from_dotted(base);
+    base.is_canonical() && name.0.len() > base.0.len() && name.0.starts_with(&base.0)
 }
 
 /// A package identity in a transport request.
@@ -791,6 +808,28 @@ fn validate_policy(p: &L2NamespaceTransportPolicy) -> PackageArtifactResult<()> 
             "mismatch",
         ));
     }
+    for (field, prefixes) in [
+        ("allowed_source_prefixes", &p.allowed_source_prefixes),
+        ("allowed_target_prefixes", &p.allowed_target_prefixes),
+    ] {
+        if !prefixes.windows(2).all(|pair| pair[0] < pair[1]) {
+            return Err(PackageArtifactError::non_canonical(
+                field,
+                "sorted unique namespace prefixes",
+            ));
+        }
+        for prefix in prefixes {
+            let probe = Name::from_dotted(format!("{prefix}member"));
+            if !l2_namespace_prefix_matches(&probe, prefix) {
+                return Err(PackageArtifactError::invalid_enum_value(
+                    field,
+                    "namespace_prefix",
+                    "canonical dotted namespace ending in '.'",
+                    prefix,
+                ));
+            }
+        }
+    }
     Ok(())
 }
 fn validate_request(r: &L2NamespaceTransportRequest) -> PackageArtifactResult<()> {
@@ -911,13 +950,14 @@ pub fn l2_transport_module_declaration_names(
         cert,
         request,
         map_source,
+        remaining_nodes: L2_PROJECTION_MAX_EXPANDED_NODES,
     };
-    cert.export_block
+    cert.export_block()
         .iter()
         .map(|entry| {
             context
                 .name(entry.name)
-                .map(|name| context.mapped(&cert.header.module, &name).1)
+                .map(|name| context.mapped(&cert.header().module, &name).1)
         })
         .collect()
 }
@@ -929,35 +969,44 @@ fn l2_transport_module_projection_internal(
     declaration_names: Option<&BTreeSet<Name>>,
     include_import_inventory: bool,
 ) -> PackageArtifactResult<Vec<u8>> {
+    npa_cert::validate_decoded_module_cert_structural_limits(cert).map_err(|_| {
+        PackageArtifactError::invalid_enum_value(
+            "certificate",
+            "structure",
+            "bounded acyclic canonical table references",
+            "invalid",
+        )
+    })?;
     let mapping = if map_source {
         request
             .module_mappings
             .iter()
-            .find(|m| m.source.module == cert.header.module)
+            .find(|m| m.source.module == cert.header().module)
     } else {
         request
             .module_mappings
             .iter()
-            .find(|m| m.target.module == cert.header.module)
+            .find(|m| m.target.module == cert.header().module)
     }
     .ok_or_else(|| {
         PackageArtifactError::invalid_enum_value(
             "module",
             "mapping",
             "mapped module",
-            cert.header.module.as_dotted(),
+            cert.header().module.as_dotted(),
         )
     })?;
-    let c = Projection {
+    let mut c = Projection {
         cert,
         request,
         map_source,
+        remaining_nodes: L2_PROJECTION_MAX_EXPANDED_NODES,
     };
     let mut out = Vec::new();
-    put_str(&mut out, "NPA-L2-TRANSPORT-PROJECTION-v1");
-    put_name(&mut out, &mapping.target.module);
+    projection_put_str(&mut out, "NPA-L2-TRANSPORT-PROJECTION-v2")?;
+    projection_put_name(&mut out, &mapping.target.module)?;
     let mut imports = cert
-        .imports
+        .imports()
         .iter()
         .map(|i| {
             if map_source {
@@ -975,58 +1024,62 @@ fn l2_transport_module_projection_internal(
         imports.clear();
     }
     imports.sort();
-    put_u64(&mut out, imports.len() as u64);
+    projection_put_u64(&mut out, imports.len() as u64)?;
     for i in imports {
-        put_name(&mut out, &i);
+        projection_put_name(&mut out, &i)?;
     }
-    let mut decls = cert
-        .declarations
-        .iter()
-        .enumerate()
-        .map(|(i, d)| {
-            let mut b = Vec::new();
-            c.decl(&mut b, &d.decl)?;
-            let mut dependencies = Vec::new();
-            for dependency in &d.dependencies {
-                let mut identity = Vec::new();
-                c.global(&mut identity, dependency.global_ref())?;
-                dependencies.push(identity);
-            }
-            dependencies.sort();
-            put_u64(&mut b, dependencies.len() as u64);
-            for identity in dependencies {
-                put_bytes(&mut b, &identity);
-            }
-            let mut axioms = Vec::new();
-            for axiom in &d.axiom_dependencies {
-                let mut identity = Vec::new();
-                c.global(&mut identity, &axiom.global_ref)?;
-                axioms.push(identity);
-            }
-            axioms.sort();
-            put_u64(&mut b, axioms.len() as u64);
-            for identity in axioms {
-                put_bytes(&mut b, &identity);
-            }
-            let name = c.decl_name(i)?;
-            Ok((name, b))
-        })
-        .collect::<PackageArtifactResult<Vec<_>>>()?;
+    let mut decls = Vec::with_capacity(cert.declarations().len());
+    let mut retained_decl_bytes = 0usize;
+    for (index, declaration) in cert.declarations().iter().enumerate() {
+        let mut bytes = Vec::new();
+        c.decl(&mut bytes, &declaration.decl)?;
+        let mut dependencies = Vec::with_capacity(declaration.dependencies.len());
+        let mut dependency_bytes = 0usize;
+        for dependency in &declaration.dependencies {
+            let mut identity = Vec::new();
+            c.global(&mut identity, dependency.global_ref())?;
+            dependency_bytes =
+                projection_checked_total(dependency_bytes, identity.len(), "dependencies")?;
+            dependencies.push(identity);
+        }
+        dependencies.sort();
+        projection_put_u64(&mut bytes, dependencies.len() as u64)?;
+        for identity in dependencies {
+            projection_put_bytes(&mut bytes, &identity)?;
+        }
+        let mut axioms = Vec::with_capacity(declaration.axiom_dependencies.len());
+        let mut axiom_bytes = 0usize;
+        for axiom in &declaration.axiom_dependencies {
+            let mut identity = Vec::new();
+            c.global(&mut identity, &axiom.global_ref)?;
+            axiom_bytes =
+                projection_checked_total(axiom_bytes, identity.len(), "axiom_dependencies")?;
+            axioms.push(identity);
+        }
+        axioms.sort();
+        projection_put_u64(&mut bytes, axioms.len() as u64)?;
+        for identity in axioms {
+            projection_put_bytes(&mut bytes, &identity)?;
+        }
+        retained_decl_bytes =
+            projection_checked_total(retained_decl_bytes, bytes.len(), "declarations")?;
+        decls.push((c.decl_name(index)?, bytes));
+    }
     if let Some(names) = declaration_names {
         decls.retain(|(name, _)| names.contains(name));
     }
     decls.sort_by(|a, b| a.0.cmp(&b.0));
-    put_u64(&mut out, decls.len() as u64);
+    projection_put_u64(&mut out, decls.len() as u64)?;
     for (n, b) in decls {
-        put_name(&mut out, &n);
-        put_bytes(&mut out, &b);
+        projection_put_name(&mut out, &n)?;
+        projection_put_bytes(&mut out, &b)?;
     }
     Ok(out)
 }
 
-/// Hash an equal normalized closure projection with the v1 domain separator.
+/// Hash an equal normalized closure projection with the v2 domain separator.
 pub fn l2_transport_normalized_closure_hash(bytes: &[u8]) -> PackageHash {
-    let mut v = b"NPA-L2-TRANSPORT-CLOSURE-v1\0".to_vec();
+    let mut v = b"NPA-L2-TRANSPORT-CLOSURE-v2\0".to_vec();
     v.extend_from_slice(bytes);
     package_file_hash(&v)
 }
@@ -1052,16 +1105,16 @@ pub fn l2_transport_derived_mapping_hash(
                     mapping.source.module.as_dotted(),
                 )
             })?;
-        if cert.header.module != mapping.source.module {
+        if cert.header().module != mapping.source.module {
             return Err(PackageArtifactError::invalid_enum_value(
                 "module_mappings.source.module",
                 "module",
                 mapping.source.module.as_dotted(),
-                cert.header.module.as_dotted(),
+                cert.header().module.as_dotted(),
             ));
         }
-        for export in &cert.export_block {
-            let source_name = cert.name_table.get(export.name).cloned().ok_or_else(|| {
+        for export in cert.export_block() {
+            let source_name = cert.name_table().get(export.name).cloned().ok_or_else(|| {
                 PackageArtifactError::invalid_enum_value(
                     "export_block.name",
                     "name",
@@ -1113,10 +1166,11 @@ struct Projection<'a> {
     cert: &'a ModuleCert,
     request: &'a L2NamespaceTransportRequest,
     map_source: bool,
+    remaining_nodes: usize,
 }
 impl Projection<'_> {
     fn name(&self, id: NameId) -> PackageArtifactResult<Name> {
-        self.cert.name_table.get(id).cloned().ok_or_else(|| {
+        self.cert.name_table().get(id).cloned().ok_or_else(|| {
             PackageArtifactError::invalid_enum_value("name_table", "id", "valid", id.to_string())
         })
     }
@@ -1124,7 +1178,7 @@ impl Projection<'_> {
         self.name(decl_name_id(
             &self
                 .cert
-                .declarations
+                .declarations()
                 .get(i)
                 .ok_or_else(|| {
                     PackageArtifactError::invalid_enum_value(
@@ -1148,7 +1202,7 @@ impl Projection<'_> {
     }
     fn decl_name(&self, i: usize) -> PackageArtifactResult<Name> {
         let n = self.raw_decl_name(i)?;
-        Ok(self.mapped(&self.cert.header.module, &n).1)
+        Ok(self.mapped(&self.cert.header().module, &n).1)
     }
     fn global(&self, o: &mut Vec<u8>, g: &GlobalRef) -> PackageArtifactResult<()> {
         let (m, n) = match g {
@@ -1157,7 +1211,7 @@ impl Projection<'_> {
                 import_index, name, ..
             } => (
                 self.cert
-                    .imports
+                    .imports()
                     .get(*import_index)
                     .ok_or_else(|| {
                         PackageArtifactError::invalid_enum_value(
@@ -1172,89 +1226,118 @@ impl Projection<'_> {
                 self.name(*name)?,
             ),
             GlobalRef::Local { decl_index } => (
-                self.cert.header.module.clone(),
+                self.cert.header().module.clone(),
                 self.raw_decl_name(*decl_index)?,
             ),
             GlobalRef::LocalGenerated { name, .. } => {
-                (self.cert.header.module.clone(), self.name(*name)?)
+                (self.cert.header().module.clone(), self.name(*name)?)
             }
         };
         let (m, n) = self.mapped(&m, &n);
-        put_name(o, &m);
-        put_name(o, &n);
+        projection_put_name(o, &m)?;
+        projection_put_name(o, &n)?;
         Ok(())
     }
-    fn level(&self, o: &mut Vec<u8>, id: LevelId) -> PackageArtifactResult<()> {
-        match self.cert.level_table.get(id).ok_or_else(|| {
-            PackageArtifactError::invalid_enum_value("level_table", "id", "valid", id.to_string())
-        })? {
-            LevelNode::Zero => o.push(0),
-            LevelNode::Succ(a) => {
-                o.push(1);
-                self.level(o, *a)?
-            }
-            LevelNode::Max(a, b) => {
-                o.push(2);
-                self.level(o, *a)?;
-                self.level(o, *b)?
-            }
-            LevelNode::IMax(a, b) => {
-                o.push(3);
-                self.level(o, *a)?;
-                self.level(o, *b)?
-            }
-            LevelNode::Param(n) => {
-                o.push(4);
-                put_name(o, &self.name(*n)?);
-            }
-        }
-        Ok(())
-    }
-    fn term(&self, o: &mut Vec<u8>, id: TermId) -> PackageArtifactResult<()> {
-        match self.cert.term_table.get(id).ok_or_else(|| {
-            PackageArtifactError::invalid_enum_value("term_table", "id", "valid", id.to_string())
-        })? {
-            TermNode::Sort(l) => {
-                o.push(0);
-                self.level(o, *l)?
-            }
-            TermNode::BVar(i) => {
-                o.push(1);
-                put_u64(o, *i as u64)
-            }
-            TermNode::Const { global_ref, levels } => {
-                o.push(2);
-                self.global(o, global_ref)?;
-                put_u64(o, levels.len() as u64);
-                for l in levels {
-                    self.level(o, *l)?
+    fn level(&mut self, o: &mut Vec<u8>, id: LevelId) -> PackageArtifactResult<()> {
+        let mut pending = vec![id];
+        while let Some(id) = pending.pop() {
+            self.charge_node("level_table")?;
+            match self.cert.level_table().get(id).ok_or_else(|| {
+                PackageArtifactError::invalid_enum_value(
+                    "level_table",
+                    "id",
+                    "valid",
+                    id.to_string(),
+                )
+            })? {
+                LevelNode::Zero => projection_push(o, 0)?,
+                LevelNode::Succ(inner) => {
+                    projection_push(o, 1)?;
+                    pending.push(*inner);
+                }
+                LevelNode::Max(lhs, rhs) => {
+                    projection_push(o, 2)?;
+                    pending.push(*rhs);
+                    pending.push(*lhs);
+                }
+                LevelNode::IMax(lhs, rhs) => {
+                    projection_push(o, 3)?;
+                    pending.push(*rhs);
+                    pending.push(*lhs);
+                }
+                LevelNode::Param(name) => {
+                    projection_push(o, 4)?;
+                    projection_put_name(o, &self.name(*name)?)?;
                 }
             }
-            TermNode::App(a, b) => {
-                o.push(3);
-                self.term(o, *a)?;
-                self.term(o, *b)?
-            }
-            TermNode::Lam { ty, body } => {
-                o.push(4);
-                self.term(o, *ty)?;
-                self.term(o, *body)?
-            }
-            TermNode::Pi { ty, body } => {
-                o.push(5);
-                self.term(o, *ty)?;
-                self.term(o, *body)?
-            }
-            TermNode::Let { ty, value, body } => {
-                o.push(6);
-                self.term(o, *ty)?;
-                self.term(o, *value)?;
-                self.term(o, *body)?
+        }
+        Ok(())
+    }
+    fn term(&mut self, o: &mut Vec<u8>, id: TermId) -> PackageArtifactResult<()> {
+        enum Action {
+            Term(TermId),
+            Level(LevelId),
+        }
+        let mut pending = vec![Action::Term(id)];
+        while let Some(action) = pending.pop() {
+            match action {
+                Action::Level(level) => self.level(o, level)?,
+                Action::Term(id) => {
+                    self.charge_node("term_table")?;
+                    match self.cert.term_table().get(id).ok_or_else(|| {
+                        PackageArtifactError::invalid_enum_value(
+                            "term_table",
+                            "id",
+                            "valid",
+                            id.to_string(),
+                        )
+                    })? {
+                        TermNode::Sort(level) => {
+                            projection_push(o, 0)?;
+                            pending.push(Action::Level(*level));
+                        }
+                        TermNode::BVar(index) => {
+                            projection_push(o, 1)?;
+                            projection_put_u64(o, *index as u64)?;
+                        }
+                        TermNode::Const { global_ref, levels } => {
+                            projection_push(o, 2)?;
+                            self.global(o, global_ref)?;
+                            projection_put_u64(o, levels.len() as u64)?;
+                            for level in levels.iter().rev() {
+                                pending.push(Action::Level(*level));
+                            }
+                        }
+                        TermNode::App(function, argument) => {
+                            projection_push(o, 3)?;
+                            pending.push(Action::Term(*argument));
+                            pending.push(Action::Term(*function));
+                        }
+                        TermNode::Lam { ty, body } => {
+                            projection_push(o, 4)?;
+                            pending.push(Action::Term(*body));
+                            pending.push(Action::Term(*ty));
+                        }
+                        TermNode::Pi { ty, body } => {
+                            projection_push(o, 5)?;
+                            pending.push(Action::Term(*body));
+                            pending.push(Action::Term(*ty));
+                        }
+                    }
+                }
             }
         }
         Ok(())
     }
-    fn decl(&self, o: &mut Vec<u8>, d: &DeclPayload) -> PackageArtifactResult<()> {
+
+    fn charge_node(&mut self, path: &str) -> PackageArtifactResult<()> {
+        self.remaining_nodes = self
+            .remaining_nodes
+            .checked_sub(1)
+            .ok_or_else(|| projection_limit_error(path, L2_PROJECTION_MAX_EXPANDED_NODES + 1))?;
+        Ok(())
+    }
+    fn decl(&mut self, o: &mut Vec<u8>, d: &DeclPayload) -> PackageArtifactResult<()> {
         match d {
             DeclPayload::Axiom {
                 name,
@@ -1278,7 +1361,7 @@ impl Projection<'_> {
                 reducibility,
             } => {
                 self.basic_decl(o, 2, *name, universe_params, *ty, Some(*value))?;
-                o.push(reducibility_tag(*reducibility));
+                projection_push(o, reducibility_tag(*reducibility))?;
             }
             DeclPayload::DefConstrained {
                 name,
@@ -1290,7 +1373,7 @@ impl Projection<'_> {
             } => {
                 self.basic_decl(o, 3, *name, universe_params, *ty, Some(*value))?;
                 self.constraints(o, universe_constraints)?;
-                o.push(reducibility_tag(*reducibility));
+                projection_push(o, reducibility_tag(*reducibility))?;
             }
             DeclPayload::Theorem {
                 name,
@@ -1300,7 +1383,7 @@ impl Projection<'_> {
                 opacity,
             } => {
                 self.basic_decl(o, 4, *name, universe_params, *ty, Some(*proof))?;
-                o.push(opacity_tag(*opacity));
+                projection_push(o, opacity_tag(*opacity))?;
             }
             DeclPayload::TheoremConstrained {
                 name,
@@ -1312,7 +1395,7 @@ impl Projection<'_> {
             } => {
                 self.basic_decl(o, 5, *name, universe_params, *ty, Some(*proof))?;
                 self.constraints(o, universe_constraints)?;
-                o.push(opacity_tag(*opacity));
+                projection_push(o, opacity_tag(*opacity))?;
             }
             DeclPayload::Inductive {
                 name,
@@ -1323,7 +1406,7 @@ impl Projection<'_> {
                 constructors,
                 recursor,
             } => {
-                o.push(6);
+                projection_push(o, 6)?;
                 self.names(o, universe_params)?;
                 self.inductive(o, *name, params, indices, *sort, constructors, recursor)?;
             }
@@ -1337,7 +1420,7 @@ impl Projection<'_> {
                 constructors,
                 recursor,
             } => {
-                o.push(7);
+                projection_push(o, 7)?;
                 self.names(o, universe_params)?;
                 self.constraints(o, universe_constraints)?;
                 self.inductive(o, *name, params, indices, *sort, constructors, recursor)?;
@@ -1348,12 +1431,12 @@ impl Projection<'_> {
                 universe_constraints,
                 inductives,
             } => {
-                o.push(8);
+                projection_push(o, 8)?;
                 let raw = self.name(*name)?;
-                put_name(o, &self.mapped(&self.cert.header.module, &raw).1);
+                projection_put_name(o, &self.mapped(&self.cert.header().module, &raw).1)?;
                 self.names(o, universe_params)?;
                 self.constraints(o, universe_constraints)?;
-                put_u64(o, inductives.len() as u64);
+                projection_put_u64(o, inductives.len() as u64)?;
                 for inductive in inductives {
                     self.mutual_inductive(o, inductive)?;
                 }
@@ -1363,7 +1446,7 @@ impl Projection<'_> {
     }
 
     fn basic_decl(
-        &self,
+        &mut self,
         out: &mut Vec<u8>,
         tag: u8,
         name: NameId,
@@ -1371,9 +1454,9 @@ impl Projection<'_> {
         ty: TermId,
         body: Option<TermId>,
     ) -> PackageArtifactResult<()> {
-        out.push(tag);
+        projection_push(out, tag)?;
         let raw = self.name(name)?;
-        put_name(out, &self.mapped(&self.cert.header.module, &raw).1);
+        projection_put_name(out, &self.mapped(&self.cert.header().module, &raw).1)?;
         self.names(out, universe_params)?;
         self.term(out, ty)?;
         if let Some(body) = body {
@@ -1383,30 +1466,30 @@ impl Projection<'_> {
     }
 
     fn names(&self, out: &mut Vec<u8>, names: &[NameId]) -> PackageArtifactResult<()> {
-        put_u64(out, names.len() as u64);
+        projection_put_u64(out, names.len() as u64)?;
         for name in names {
-            put_name(out, &self.name(*name)?);
+            projection_put_name(out, &self.name(*name)?)?;
         }
         Ok(())
     }
 
     fn constraints(
-        &self,
+        &mut self,
         out: &mut Vec<u8>,
         constraints: &[UniverseConstraintSpec],
     ) -> PackageArtifactResult<()> {
-        put_u64(out, constraints.len() as u64);
+        projection_put_u64(out, constraints.len() as u64)?;
         for constraint in constraints {
             self.level(out, constraint.lhs)?;
             let relation = format!("{:?}", constraint.relation);
-            put_str(out, &relation);
+            projection_put_str(out, &relation)?;
             self.level(out, constraint.rhs)?;
         }
         Ok(())
     }
 
-    fn binders(&self, out: &mut Vec<u8>, binders: &[BinderType]) -> PackageArtifactResult<()> {
-        put_u64(out, binders.len() as u64);
+    fn binders(&mut self, out: &mut Vec<u8>, binders: &[BinderType]) -> PackageArtifactResult<()> {
+        projection_put_u64(out, binders.len() as u64)?;
         for binder in binders {
             self.term(out, binder.ty)?;
         }
@@ -1414,34 +1497,34 @@ impl Projection<'_> {
     }
 
     fn constructors(
-        &self,
+        &mut self,
         out: &mut Vec<u8>,
         constructors: &[ConstructorSpec],
     ) -> PackageArtifactResult<()> {
-        put_u64(out, constructors.len() as u64);
+        projection_put_u64(out, constructors.len() as u64)?;
         for constructor in constructors {
             let raw = self.name(constructor.name)?;
-            put_name(out, &self.mapped(&self.cert.header.module, &raw).1);
+            projection_put_name(out, &self.mapped(&self.cert.header().module, &raw).1)?;
             self.term(out, constructor.ty)?;
         }
         Ok(())
     }
 
     fn recursor(
-        &self,
+        &mut self,
         out: &mut Vec<u8>,
         recursor: &Option<RecursorSpec>,
     ) -> PackageArtifactResult<()> {
         match recursor {
-            None => out.push(0),
+            None => projection_push(out, 0)?,
             Some(recursor) => {
-                out.push(1);
+                projection_push(out, 1)?;
                 let raw = self.name(recursor.name)?;
-                put_name(out, &self.mapped(&self.cert.header.module, &raw).1);
+                projection_put_name(out, &self.mapped(&self.cert.header().module, &raw).1)?;
                 self.names(out, &recursor.universe_params)?;
                 self.term(out, recursor.ty)?;
-                put_u64(out, recursor.rules.minor_start as u64);
-                put_u64(out, recursor.rules.major_index as u64);
+                projection_put_u64(out, recursor.rules.minor_start as u64)?;
+                projection_put_u64(out, recursor.rules.major_index as u64)?;
             }
         }
         Ok(())
@@ -1451,7 +1534,7 @@ impl Projection<'_> {
     // explicit prevents an index-bearing intermediate representation from entering the hash.
     #[allow(clippy::too_many_arguments)]
     fn inductive(
-        &self,
+        &mut self,
         out: &mut Vec<u8>,
         name: NameId,
         params: &[BinderType],
@@ -1461,7 +1544,7 @@ impl Projection<'_> {
         recursor: &Option<RecursorSpec>,
     ) -> PackageArtifactResult<()> {
         let raw = self.name(name)?;
-        put_name(out, &self.mapped(&self.cert.header.module, &raw).1);
+        projection_put_name(out, &self.mapped(&self.cert.header().module, &raw).1)?;
         self.binders(out, params)?;
         self.binders(out, indices)?;
         self.level(out, sort)?;
@@ -1470,7 +1553,7 @@ impl Projection<'_> {
     }
 
     fn mutual_inductive(
-        &self,
+        &mut self,
         out: &mut Vec<u8>,
         inductive: &MutualInductiveSpec,
     ) -> PackageArtifactResult<()> {
@@ -1511,6 +1594,92 @@ fn decl_name_id(d: &DeclPayload) -> NameId {
         | DeclPayload::MutualInductiveBlock { name, .. } => *name,
     }
 }
+
+fn projection_limit_error(path: impl Into<String>, observed: usize) -> PackageArtifactError {
+    PackageArtifactError::invalid_enum_value(
+        path,
+        "projection_resource",
+        format!("at most {L2_PROJECTION_MAX_OUTPUT_BYTES} output bytes and bounded DAG work"),
+        observed.to_string(),
+    )
+}
+
+fn projection_checked_total(
+    total: usize,
+    additional: usize,
+    path: &str,
+) -> PackageArtifactResult<usize> {
+    let observed = total
+        .checked_add(additional)
+        .ok_or_else(|| projection_limit_error(path, usize::MAX))?;
+    if observed > L2_PROJECTION_MAX_OUTPUT_BYTES {
+        return Err(projection_limit_error(path, observed));
+    }
+    Ok(observed)
+}
+
+fn projection_reserve(
+    out: &mut Vec<u8>,
+    additional: usize,
+    path: &str,
+) -> PackageArtifactResult<()> {
+    let observed = projection_checked_total(out.len(), additional, path)?;
+    out.try_reserve_exact(additional)
+        .map_err(|_| projection_limit_error(path, observed))?;
+    Ok(())
+}
+
+fn projection_push(out: &mut Vec<u8>, value: u8) -> PackageArtifactResult<()> {
+    projection_reserve(out, 1, "projection")?;
+    out.push(value);
+    Ok(())
+}
+
+fn projection_put_u64(out: &mut Vec<u8>, value: u64) -> PackageArtifactResult<()> {
+    projection_reserve(out, std::mem::size_of::<u64>(), "projection")?;
+    out.extend_from_slice(&value.to_le_bytes());
+    Ok(())
+}
+
+fn projection_put_bytes(out: &mut Vec<u8>, value: &[u8]) -> PackageArtifactResult<()> {
+    let additional = std::mem::size_of::<u64>()
+        .checked_add(value.len())
+        .ok_or_else(|| projection_limit_error("projection", usize::MAX))?;
+    projection_reserve(out, additional, "projection")?;
+    out.extend_from_slice(&(value.len() as u64).to_le_bytes());
+    out.extend_from_slice(value);
+    Ok(())
+}
+
+fn projection_put_str(out: &mut Vec<u8>, value: &str) -> PackageArtifactResult<()> {
+    projection_put_bytes(out, value.as_bytes())
+}
+
+fn projection_put_name(out: &mut Vec<u8>, value: &Name) -> PackageArtifactResult<()> {
+    let dotted_len = value
+        .0
+        .iter()
+        .enumerate()
+        .try_fold(0usize, |length, (index, component)| {
+            length
+                .checked_add(usize::from(index != 0))
+                .and_then(|length| length.checked_add(component.len()))
+        })
+        .ok_or_else(|| projection_limit_error("projection.name", usize::MAX))?;
+    let additional = std::mem::size_of::<u64>()
+        .checked_add(dotted_len)
+        .ok_or_else(|| projection_limit_error("projection.name", usize::MAX))?;
+    projection_reserve(out, additional, "projection.name")?;
+    out.extend_from_slice(&(dotted_len as u64).to_le_bytes());
+    for (index, component) in value.0.iter().enumerate() {
+        if index != 0 {
+            out.push(b'.');
+        }
+        out.extend_from_slice(component.as_bytes());
+    }
+    Ok(())
+}
+
 fn put_u64(o: &mut Vec<u8>, v: u64) {
     o.extend_from_slice(&v.to_le_bytes())
 }
@@ -1965,6 +2134,115 @@ mod tests {
         PackageHash::from([seed; 32])
     }
 
+    fn projection_request(module: &str) -> L2NamespaceTransportRequest {
+        L2NamespaceTransportRequest {
+            schema: L2_NAMESPACE_TRANSPORT_REQUEST_SCHEMA.to_owned(),
+            source: L2TransportPackageIdentity {
+                package: PackageId::new("npa-proof-corpus"),
+                version: PackageVersion::new("0.1.0"),
+            },
+            target: L2TransportPackageIdentity {
+                package: PackageId::new("npa-mathlib"),
+                version: PackageVersion::new("0.2.0"),
+            },
+            module_mappings: vec![L2TransportModuleMapping {
+                role: L2TransportModuleRole::Selected,
+                source: L2TransportEndpoint {
+                    origin: PackageArtifactOrigin::Local,
+                    package: PackageId::new("npa-proof-corpus"),
+                    version: PackageVersion::new("0.1.0"),
+                    module: Name::from_dotted(module),
+                },
+                target: L2TransportEndpoint {
+                    origin: PackageArtifactOrigin::Local,
+                    package: PackageId::new("npa-mathlib"),
+                    version: PackageVersion::new("0.2.0"),
+                    module: Name::from_dotted("Mathlib.Deep"),
+                },
+                declaration_mapping: "same-name-except-explicit".to_owned(),
+                renames: Vec::new(),
+            }],
+            proof_evidence: false,
+        }
+    }
+
+    fn syntactic_projection_certificate(term_table: Vec<TermNode>, root: TermId) -> ModuleCert {
+        ModuleCert::from_parts(npa_cert::ModuleCertParts {
+            header: npa_cert::CertHeader {
+                format: "NPA-CERT-0.3.0".to_owned(),
+                core_spec: "NPA-Core-0.3.0".to_owned(),
+                module: Name::from_dotted("Proofs.Ai.Deep"),
+            },
+            imports: Vec::new(),
+            name_table: vec![Name::from_dotted("deep")],
+            level_table: vec![LevelNode::Zero],
+            term_table,
+            declarations: vec![npa_cert::DeclCert {
+                decl: DeclPayload::Axiom {
+                    name: 0,
+                    universe_params: Vec::new(),
+                    ty: root,
+                },
+                dependencies: Vec::new(),
+                axiom_dependencies: Vec::new(),
+                hashes: npa_cert::DeclHashes {
+                    decl_interface_hash: [0; 32],
+                    decl_certificate_hash: [0; 32],
+                },
+            }],
+            export_block: Vec::new(),
+            axiom_report: npa_cert::AxiomReport {
+                per_declaration: Vec::new(),
+                module_axioms: Vec::new(),
+                core_features: Vec::new(),
+            },
+            hashes: npa_cert::ModuleHashes {
+                export_hash: [0; 32],
+                axiom_report_hash: [0; 32],
+                certificate_hash: [0; 32],
+            },
+        })
+    }
+
+    #[test]
+    fn projection_rejects_cyclic_raw_table_before_expansion() {
+        let certificate = syntactic_projection_certificate(vec![TermNode::App(0, 0)], 0);
+        let request = projection_request("Proofs.Ai.Deep");
+
+        assert!(l2_transport_module_projection(&certificate, &request, true).is_err());
+    }
+
+    #[test]
+    fn projection_handles_maximal_structural_depth_iteratively() {
+        let mut terms = vec![TermNode::BVar(0)];
+        for index in 1..npa_cert::MAX_STRUCTURAL_DEPTH {
+            terms.push(TermNode::Lam {
+                ty: 0,
+                body: index - 1,
+            });
+        }
+        let root = terms.len() - 1;
+        let certificate = syntactic_projection_certificate(terms, root);
+        let request = projection_request("Proofs.Ai.Deep");
+
+        let projection = l2_transport_module_projection(&certificate, &request, true).unwrap();
+        assert!(projection.len() < L2_PROJECTION_MAX_OUTPUT_BYTES);
+    }
+
+    #[test]
+    fn projection_rejects_doubling_dag_and_output_limit_without_large_allocation() {
+        let mut terms = vec![TermNode::BVar(0)];
+        for index in 1..32 {
+            terms.push(TermNode::App(index - 1, index - 1));
+        }
+        let root = terms.len() - 1;
+        let certificate = syntactic_projection_certificate(terms, root);
+        let request = projection_request("Proofs.Ai.Deep");
+
+        assert!(l2_transport_module_projection(&certificate, &request, true).is_err());
+        assert!(projection_checked_total(L2_PROJECTION_MAX_OUTPUT_BYTES, 1, "test").is_err());
+    }
+
     #[test]
     fn transport_policy_and_request_round_trip_canonically() {
         let policy = L2NamespaceTransportPolicy {
@@ -1989,6 +2267,18 @@ mod tests {
             parse_l2_namespace_transport_policy_json(&policy_json).unwrap(),
             policy
         );
+        assert!(l2_namespace_prefix_matches(
+            &Name::from_dotted("Mathlib.Algebra"),
+            "Mathlib."
+        ));
+        assert!(!l2_namespace_prefix_matches(
+            &Name::from_dotted("MathlibExtra.Algebra"),
+            "Mathlib."
+        ));
+        assert!(!l2_namespace_prefix_matches(
+            &Name::from_dotted("Mathlib.Algebra"),
+            "Math"
+        ));
 
         let request = L2NamespaceTransportRequest {
             schema: L2_NAMESPACE_TRANSPORT_REQUEST_SCHEMA.to_owned(),
@@ -2112,20 +2402,21 @@ mod tests {
 
     #[test]
     fn declaration_inventory_includes_and_renames_generated_exports() {
-        let certificate = std::fs::read(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(
-            "../../testdata/package/npa-mathlib/vendor/npa-std/Std/Nat/Basic/certificate.npcert",
-        ))
-        .unwrap();
+        let certificate =
+            std::fs::read(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(
+                "../../checkers/npa-checker-ext/test/fixtures/conformance/indexed-v0.4.npcert",
+            ))
+            .unwrap();
         let cert = npa_cert::verify_module_cert_hashes(&certificate).unwrap();
         let source_declarations = cert
-            .declarations
+            .declarations()
             .iter()
-            .map(|declaration| cert.name_table[decl_name_id(&declaration.decl)].clone())
+            .map(|declaration| cert.name_table()[decl_name_id(&declaration.decl)].clone())
             .collect::<BTreeSet<_>>();
         let generated = cert
-            .export_block
+            .export_block()
             .iter()
-            .map(|entry| cert.name_table[entry.name].clone())
+            .map(|entry| cert.name_table()[entry.name].clone())
             .find(|name| !source_declarations.contains(name))
             .expect("fixture must contain a generated export");
         let renamed = Name::from_dotted("renamed_generated_export");
@@ -2145,7 +2436,7 @@ mod tests {
                     origin: PackageArtifactOrigin::External,
                     package: PackageId::new("npa-std"),
                     version: PackageVersion::new("0.1.0"),
-                    module: cert.header.module.clone(),
+                    module: cert.header().module.clone(),
                 },
                 target: L2TransportEndpoint {
                     origin: PackageArtifactOrigin::Local,
@@ -2162,10 +2453,10 @@ mod tests {
             proof_evidence: false,
         };
         let names = l2_transport_module_declaration_names(&cert, &request, true).unwrap();
-        assert_eq!(names.len(), cert.export_block.len());
+        assert_eq!(names.len(), cert.export_block().len());
         assert!(names.contains(&renamed));
 
-        let certificates = BTreeMap::from([(cert.header.module.clone(), cert.clone())]);
+        let certificates = BTreeMap::from([(cert.header().module.clone(), cert.clone())]);
         let mapped_hash = l2_transport_derived_mapping_hash(&request, &certificates).unwrap();
         let mut changed = request.clone();
         changed.module_mappings[0].renames[0].target =

@@ -4,16 +4,22 @@ use std::path::{Path, PathBuf};
 
 use npa_cert::Name;
 use npa_package::{
-    build_package_lock_from_artifacts,
+    build_indexed_package_lock_graph,
+    build_package_lock_and_snapshot_owned_artifacts as build_owned_snapshot_api,
+    build_package_lock_and_snapshot_owned_artifacts_with_payload_observation,
+    build_package_lock_from_artifacts as build_package_lock_from_artifacts_api,
     build_package_lock_from_artifacts_allowing_local_hash_updates,
     build_package_lock_from_package_root,
     build_package_lock_from_package_root_allowing_local_hash_updates, build_package_lock_graph,
-    package_file_hash, parse_manifest_str, parse_package_hash, parse_package_lock_json,
-    validate_manifest, validate_observed_package_lock_against_manifest_graph,
-    validate_package_lock_against_manifest_graph, PackageHash, PackageId, PackageLockArtifact,
+    format_package_hash, package_file_hash, parse_manifest_str, parse_package_hash,
+    parse_package_lock_json, validate_manifest,
+    validate_observed_package_lock_against_manifest_graph,
+    validate_package_lock_against_manifest_graph, OwnedPackageLockArtifact,
+    PackageArtifactPreparationObservation, PackageHash, PackageId, PackageLockArtifact,
     PackageLockEntry, PackageLockEntryOrigin, PackageLockError, PackageLockErrorKind,
     PackageLockErrorReason, PackageLockImport, PackageLockManifest, PackageLockManifestReference,
-    PackagePath, PackageVersion, ValidatedPackageManifest, PACKAGE_LOCK_SCHEMA,
+    PackagePath, PackageVersion, PreparedArtifactObservationMode, PreparedArtifactRetentionPolicy,
+    PreparedPackageArtifactView, ValidatedPackageManifest, PACKAGE_LOCK_SCHEMA,
 };
 
 const ZERO_HASH: &str = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
@@ -346,7 +352,7 @@ fn build_proof_lock_from_artifacts(
     validated: &ValidatedPackageManifest,
     artifacts: &BTreeMap<PackagePath, Vec<u8>>,
 ) -> Result<PackageLockManifest, PackageLockError> {
-    build_package_lock_from_artifacts(
+    build_package_lock_from_artifacts_api(
         validated,
         PackagePath::new("npa-package.toml"),
         &proof_manifest_bytes(),
@@ -367,26 +373,34 @@ fn build_proof_lock_from_artifacts_allowing_local_hash_updates(
 }
 
 fn tampered_certificate_hash(bytes: &[u8]) -> Vec<u8> {
-    let mut cert = npa_cert::decode_module_cert(bytes).expect("certificate decodes before tamper");
-    cert.hashes.certificate_hash[0] ^= 0x01;
+    let cert = npa_cert::decode_module_cert(bytes).expect("certificate decodes before tamper");
+    let mut parts = cert.into_parts();
+    parts.hashes.certificate_hash[0] ^= 0x01;
+    let cert = npa_cert::ModuleCert::from_parts(parts);
     npa_cert::encode_module_cert(&cert).expect("tampered certificate re-encodes")
 }
 
 fn tampered_export_hash(bytes: &[u8]) -> Vec<u8> {
-    let mut cert = npa_cert::decode_module_cert(bytes).expect("certificate decodes before tamper");
-    cert.hashes.export_hash[0] ^= 0x01;
+    let cert = npa_cert::decode_module_cert(bytes).expect("certificate decodes before tamper");
+    let mut parts = cert.into_parts();
+    parts.hashes.export_hash[0] ^= 0x01;
+    let cert = npa_cert::ModuleCert::from_parts(parts);
     npa_cert::encode_module_cert(&cert).expect("tampered certificate re-encodes")
 }
 
 fn tampered_axiom_report_hash(bytes: &[u8]) -> Vec<u8> {
-    let mut cert = npa_cert::decode_module_cert(bytes).expect("certificate decodes before tamper");
-    cert.hashes.axiom_report_hash[0] ^= 0x01;
+    let cert = npa_cert::decode_module_cert(bytes).expect("certificate decodes before tamper");
+    let mut parts = cert.into_parts();
+    parts.hashes.axiom_report_hash[0] ^= 0x01;
+    let cert = npa_cert::ModuleCert::from_parts(parts);
     npa_cert::encode_module_cert(&cert).expect("tampered certificate re-encodes")
 }
 
 fn tampered_module_name(bytes: &[u8], module: &str) -> Vec<u8> {
-    let mut cert = npa_cert::decode_module_cert(bytes).expect("certificate decodes before tamper");
-    cert.header.module = Name::from_dotted(module);
+    let cert = npa_cert::decode_module_cert(bytes).expect("certificate decodes before tamper");
+    let mut parts = cert.into_parts();
+    parts.header.module = Name::from_dotted(module);
+    let cert = npa_cert::ModuleCert::from_parts(parts);
     npa_cert::encode_module_cert(&cert).expect("tampered certificate re-encodes")
 }
 
@@ -394,8 +408,10 @@ fn tampered_certificate_imports(
     bytes: &[u8],
     edit: impl FnOnce(&mut Vec<npa_cert::ImportEntry>),
 ) -> Vec<u8> {
-    let mut cert = npa_cert::decode_module_cert(bytes).expect("certificate decodes before tamper");
-    edit(&mut cert.imports);
+    let cert = npa_cert::decode_module_cert(bytes).expect("certificate decodes before tamper");
+    let mut parts = cert.into_parts();
+    edit(&mut parts.imports);
+    let cert = npa_cert::ModuleCert::from_parts(parts);
     npa_cert::encode_module_cert(&cert).expect("tampered certificate re-encodes")
 }
 
@@ -772,6 +788,532 @@ fn package_lock_builder_builds_source_free_lock_from_certificate_bytes() {
 
     let canonical = lock.canonical_json().unwrap();
     assert_eq!(parse_package_lock_json(&canonical).unwrap(), lock);
+}
+
+#[test]
+fn indexed_lock_graph_closure_and_layers_match_dependency_order() {
+    let validated = validated_proof_manifest();
+    let artifacts = proof_certificate_artifacts(&validated);
+    let lock = build_proof_lock_from_artifacts(&validated, &artifacts).unwrap();
+    let indexed = build_indexed_package_lock_graph(&lock).unwrap();
+    assert_eq!(indexed.lock(), &lock);
+    assert_eq!(indexed.entries(), lock.entries.as_slice());
+    assert_eq!(
+        indexed.graph().topological_order,
+        lock_topological_modules(&indexed)
+    );
+
+    let root = indexed
+        .graph()
+        .topological_order
+        .last()
+        .expect("nonempty fixture")
+        .clone();
+    let membership = indexed
+        .index()
+        .dependency_closure(&BTreeSet::from([root.clone()]))
+        .unwrap();
+    let root_entry = indexed.index().entry_by_module(&root).unwrap();
+    assert!(membership[root_entry]);
+    let layers = indexed.index().topological_layers(&membership);
+    assert!(!layers.is_empty());
+    let mut seen = BTreeSet::new();
+    for layer in layers {
+        for entry in layer {
+            for dependency in indexed.index().dependencies(entry).unwrap() {
+                assert!(seen.contains(dependency));
+            }
+            seen.insert(entry);
+        }
+    }
+    assert_eq!(
+        seen.len(),
+        membership.iter().filter(|selected| **selected).count()
+    );
+}
+
+fn lock_topological_modules(indexed: &npa_package::IndexedPackageLockGraph) -> Vec<Name> {
+    indexed
+        .index()
+        .topological_entries()
+        .iter()
+        .map(|entry| indexed.index().module_by_entry(*entry).unwrap().clone())
+        .collect()
+}
+
+fn owned_artifacts(artifacts: &BTreeMap<PackagePath, Vec<u8>>) -> Vec<OwnedPackageLockArtifact> {
+    artifacts
+        .iter()
+        .map(|(path, bytes)| OwnedPackageLockArtifact::from_vec(path.clone(), bytes.clone()))
+        .collect()
+}
+
+fn build_owned_snapshot(
+    validated: &ValidatedPackageManifest,
+    artifacts: &BTreeMap<PackagePath, Vec<u8>>,
+    retention_policy: PreparedArtifactRetentionPolicy,
+    observation_mode: PreparedArtifactObservationMode,
+    preparation: Option<&mut PackageArtifactPreparationObservation>,
+) -> Result<npa_package::PackageLockArtifactSnapshots, PackageLockError> {
+    build_owned_snapshot_api(
+        validated,
+        PackagePath::new("npa-package.toml"),
+        &proof_manifest_bytes(),
+        owned_artifacts(artifacts),
+        retention_policy,
+        observation_mode,
+        preparation,
+    )
+}
+
+fn assert_snapshot_work_oracles() {
+    let validated = validated_proof_manifest();
+    let artifacts = proof_certificate_artifacts(&validated);
+    let expected_count = u64::try_from(artifacts.len()).unwrap();
+    let mut success = PackageArtifactPreparationObservation::default();
+    build_owned_snapshot(
+        &validated,
+        &artifacts,
+        PreparedArtifactRetentionPolicy::RawOnly,
+        PreparedArtifactObservationMode::Off,
+        Some(&mut success),
+    )
+    .unwrap();
+    assert_eq!(
+        success,
+        PackageArtifactPreparationObservation {
+            artifact_file_hashes: expected_count,
+            artifact_full_decodes: expected_count,
+            overflowed: false,
+        }
+    );
+
+    let mut malformed_manifest = proof_manifest();
+    let malformed_path = malformed_manifest.modules[0].certificate.clone();
+    let malformed_bytes = b"not a certificate".to_vec();
+    malformed_manifest.modules[0].expected_certificate_file_hash =
+        package_file_hash(&malformed_bytes);
+    let malformed_validated = validate_manifest(malformed_manifest).unwrap();
+    let mut malformed_artifacts = proof_certificate_artifacts(&malformed_validated);
+    malformed_artifacts.insert(malformed_path, malformed_bytes);
+    let mut failed = PackageArtifactPreparationObservation::default();
+    let error = build_owned_snapshot(
+        &malformed_validated,
+        &malformed_artifacts,
+        PreparedArtifactRetentionPolicy::RawOnly,
+        PreparedArtifactObservationMode::Off,
+        Some(&mut failed),
+    )
+    .unwrap_err();
+    assert_lock_error_kind_reason(
+        &error,
+        PackageLockErrorKind::CertificateDecode,
+        PackageLockErrorReason::CertificateDecodeFailed,
+    );
+    assert_eq!(error.path, "modules[0].certificate");
+    assert_eq!(failed.artifact_file_hashes, 1);
+    assert_eq!(failed.artifact_full_decodes, 1);
+    assert!(!failed.overflowed);
+}
+
+#[test]
+fn owned_lock_builder_matches_borrowed_lock_and_reuses_decoded_artifacts() {
+    let validated = validated_proof_manifest();
+    let artifacts = proof_certificate_artifacts(&validated);
+    let expected = build_proof_lock_from_artifacts(&validated, &artifacts).unwrap();
+    let owned = artifacts
+        .into_iter()
+        .map(|(path, bytes)| OwnedPackageLockArtifact::from_vec(path, bytes))
+        .collect::<Vec<_>>();
+    let expected_count = owned.len() as u64;
+    let mut preparation = PackageArtifactPreparationObservation::default();
+    let mut payloads = npa_cert::CertificatePayloadObservation::default();
+    let result = build_package_lock_and_snapshot_owned_artifacts_with_payload_observation(
+        &validated,
+        PackagePath::new("npa-package.toml"),
+        &proof_manifest_bytes(),
+        owned,
+        PreparedArtifactRetentionPolicy::FastCandidateV1,
+        PreparedArtifactObservationMode::Aggregate,
+        Some(&mut preparation),
+        Some(&mut payloads),
+    )
+    .unwrap();
+    let (actual, prepared) = result.into_parts();
+    assert_eq!(actual, expected);
+    assert_eq!(preparation.artifact_file_hashes, expected_count);
+    assert_eq!(preparation.artifact_full_decodes, expected_count);
+    assert_eq!(payloads.payloads_frozen, expected_count);
+    assert_eq!(
+        prepared.retention_observation().unwrap().admissions,
+        expected_count
+    );
+    for entry in &actual.entries {
+        assert!(matches!(
+            prepared.get(&entry.certificate),
+            Some(PreparedPackageArtifactView::Prepared(_))
+        ));
+    }
+}
+
+#[test]
+fn snapshot_lock_error_oracle() {
+    let validated = validated_proof_manifest();
+    let artifacts = proof_certificate_artifacts(&validated);
+    let first_path = validated.manifest().modules[0].certificate.clone();
+
+    // Complete map validation precedes every hash/decode attempt, even when
+    // the duplicated payload itself is malformed and later artifacts are absent.
+    let duplicate = vec![
+        OwnedPackageLockArtifact::from_vec(first_path.clone(), b"bad-a".to_vec()),
+        OwnedPackageLockArtifact::from_vec(first_path.clone(), b"bad-b".to_vec()),
+    ];
+    let mut duplicate_work = PackageArtifactPreparationObservation::default();
+    let duplicate_error = build_owned_snapshot_api(
+        &validated,
+        PackagePath::new("npa-package.toml"),
+        &proof_manifest_bytes(),
+        duplicate,
+        PreparedArtifactRetentionPolicy::FastCandidateV1,
+        PreparedArtifactObservationMode::Aggregate,
+        Some(&mut duplicate_work),
+    )
+    .unwrap_err();
+    assert_lock_error(
+        &duplicate_error,
+        PackageLockErrorKind::Duplicate,
+        PackageLockErrorReason::DuplicateCertificatePath,
+        "artifacts",
+        Some("certificate"),
+    );
+    assert_eq!(
+        duplicate_error.actual_value.as_deref(),
+        Some(first_path.as_str())
+    );
+    assert_eq!(
+        duplicate_work,
+        PackageArtifactPreparationObservation::default()
+    );
+
+    // The first local entry's file-hash mismatch precedes malformed later
+    // local/external inputs and preserves expected/actual orientation.
+    let mut multi_fault = artifacts;
+    let first_bytes = b"first local is malformed".to_vec();
+    multi_fault.insert(first_path.clone(), first_bytes.clone());
+    if let Some(import) = validated
+        .manifest()
+        .imports
+        .as_deref()
+        .unwrap_or(&[])
+        .first()
+    {
+        multi_fault.insert(
+            import.certificate.clone(),
+            b"later external is malformed".to_vec(),
+        );
+    }
+    let mut work = PackageArtifactPreparationObservation::default();
+    let error = build_owned_snapshot(
+        &validated,
+        &multi_fault,
+        PreparedArtifactRetentionPolicy::FastCandidateV1,
+        PreparedArtifactObservationMode::Aggregate,
+        Some(&mut work),
+    )
+    .unwrap_err();
+    assert_lock_error(
+        &error,
+        PackageLockErrorKind::CertificateIdentity,
+        PackageLockErrorReason::CertificateFileHashMismatch,
+        "modules[0].expected_certificate_file_hash",
+        Some("expected_certificate_file_hash"),
+    );
+    let expected_hash =
+        format_package_hash(&validated.manifest().modules[0].expected_certificate_file_hash);
+    let actual_hash = format_package_hash(&package_file_hash(&first_bytes));
+    assert_eq!(
+        error.expected_value.as_deref(),
+        Some(expected_hash.as_str())
+    );
+    assert_eq!(error.actual_value.as_deref(), Some(actual_hash.as_str()));
+    assert_eq!(work.artifact_file_hashes, 1);
+    assert_eq!(work.artifact_full_decodes, 0);
+}
+
+#[test]
+fn snapshot_lock_hash_work_oracle() {
+    assert_snapshot_work_oracles();
+}
+
+#[test]
+fn snapshot_lock_decode_work_oracle() {
+    assert_snapshot_work_oracles();
+}
+
+#[test]
+fn local_lock_entry() {
+    let validated = validated_proof_manifest();
+    let artifacts = proof_certificate_artifacts(&validated);
+    let lock = build_proof_lock_from_artifacts(&validated, &artifacts).unwrap();
+
+    for module in &validated.manifest().modules {
+        let entry = lock
+            .entries
+            .iter()
+            .find(|entry| entry.module == module.module)
+            .expect("local lock entry");
+        assert_eq!(entry.origin, PackageLockEntryOrigin::Local);
+        assert_eq!(entry.certificate, module.certificate);
+        assert_eq!(
+            entry.certificate_file_hash,
+            module.expected_certificate_file_hash
+        );
+        assert_eq!(entry.export_hash, module.expected_export_hash);
+        assert_eq!(entry.axiom_report_hash, module.expected_axiom_report_hash);
+        assert_eq!(entry.certificate_hash, module.expected_certificate_hash);
+        assert_eq!(entry.package, None);
+        assert_eq!(entry.version, None);
+    }
+}
+
+#[test]
+fn external_lock_entry() {
+    let validated = validated_proof_manifest();
+    let artifacts = proof_certificate_artifacts(&validated);
+    let lock = build_proof_lock_from_artifacts(&validated, &artifacts).unwrap();
+
+    for import in validated.manifest().imports.as_deref().unwrap_or(&[]) {
+        let entry = lock
+            .entries
+            .iter()
+            .find(|entry| entry.module == import.module)
+            .expect("external lock entry");
+        assert_eq!(entry.origin, PackageLockEntryOrigin::External);
+        assert_eq!(entry.certificate, import.certificate);
+        assert_eq!(entry.export_hash, import.export_hash);
+        assert_eq!(entry.certificate_hash, import.certificate_hash);
+        assert_eq!(entry.package.as_ref(), Some(&import.package));
+        assert_eq!(entry.version.as_ref(), Some(&import.version));
+    }
+}
+
+#[test]
+fn build_package_lock_from_artifacts() {
+    let validated = validated_proof_manifest();
+    let artifacts = proof_certificate_artifacts(&validated);
+    let lock = build_proof_lock_from_artifacts(&validated, &artifacts).unwrap();
+    assert_eq!(
+        lock.entries.len(),
+        validated.manifest().modules.len()
+            + validated.manifest().imports.as_deref().unwrap_or(&[]).len()
+    );
+    assert_eq!(
+        lock.manifest.file_hash,
+        package_file_hash(&proof_manifest_bytes())
+    );
+    validate_package_lock_against_manifest_graph(&validated, &lock).unwrap();
+}
+
+#[test]
+fn owned_artifact_map_precedence() {
+    let validated = validated_proof_manifest();
+    let path = validated.manifest().modules[0].certificate.clone();
+    let duplicate = vec![
+        OwnedPackageLockArtifact::from_vec(path.clone(), b"invalid-first".to_vec()),
+        OwnedPackageLockArtifact::from_vec(path.clone(), b"invalid-second".to_vec()),
+    ];
+    let mut preparation = PackageArtifactPreparationObservation::default();
+    let error = build_owned_snapshot_api(
+        &validated,
+        PackagePath::new("npa-package.toml"),
+        &proof_manifest_bytes(),
+        duplicate,
+        PreparedArtifactRetentionPolicy::FastCandidateV1,
+        PreparedArtifactObservationMode::Aggregate,
+        Some(&mut preparation),
+    )
+    .unwrap_err();
+    assert_lock_error_kind_reason(
+        &error,
+        PackageLockErrorKind::Duplicate,
+        PackageLockErrorReason::DuplicateCertificatePath,
+    );
+    assert_eq!(error.path, "artifacts");
+    assert_eq!(error.actual_value.as_deref(), Some(path.as_str()));
+    assert_eq!(
+        preparation,
+        PackageArtifactPreparationObservation::default()
+    );
+}
+
+#[test]
+fn owned_local_lock_derivation() {
+    let validated = validated_proof_manifest();
+    let artifacts = proof_certificate_artifacts(&validated);
+    let (lock, prepared) = build_owned_snapshot(
+        &validated,
+        &artifacts,
+        PreparedArtifactRetentionPolicy::FastCandidateV1,
+        PreparedArtifactObservationMode::Aggregate,
+        None,
+    )
+    .unwrap()
+    .into_parts();
+
+    for module in &validated.manifest().modules {
+        let entry = lock
+            .entries
+            .iter()
+            .find(|entry| entry.module == module.module)
+            .unwrap();
+        let Some(PreparedPackageArtifactView::Prepared(snapshot)) =
+            prepared.get(&module.certificate)
+        else {
+            panic!("local derivation should produce one prepared slot");
+        };
+        assert_eq!(snapshot.file_hash(), entry.certificate_file_hash);
+        assert_eq!(snapshot.decoded_header().unwrap().module, module.module);
+    }
+}
+
+#[test]
+fn owned_external_lock_derivation() {
+    let validated = validated_proof_manifest();
+    let artifacts = proof_certificate_artifacts(&validated);
+    let (lock, prepared) = build_owned_snapshot(
+        &validated,
+        &artifacts,
+        PreparedArtifactRetentionPolicy::FastCandidateV1,
+        PreparedArtifactObservationMode::Aggregate,
+        None,
+    )
+    .unwrap()
+    .into_parts();
+
+    for import in validated.manifest().imports.as_deref().unwrap_or(&[]) {
+        let entry = lock
+            .entries
+            .iter()
+            .find(|entry| entry.module == import.module)
+            .unwrap();
+        let Some(PreparedPackageArtifactView::Prepared(snapshot)) =
+            prepared.get(&import.certificate)
+        else {
+            panic!("external derivation should produce one prepared slot");
+        };
+        assert_eq!(snapshot.file_hash(), entry.certificate_file_hash);
+        assert_eq!(snapshot.decoded_header().unwrap().module, import.module);
+    }
+}
+
+#[test]
+fn package_lock_artifact_snapshots() {
+    let validated = validated_proof_manifest();
+    let artifacts = proof_certificate_artifacts(&validated);
+    let snapshots = build_owned_snapshot(
+        &validated,
+        &artifacts,
+        PreparedArtifactRetentionPolicy::FastCandidateV1,
+        PreparedArtifactObservationMode::Aggregate,
+        None,
+    )
+    .unwrap();
+    let (lock, prepared) = snapshots.into_parts();
+    assert_eq!(lock.entries.len(), artifacts.len());
+    assert_eq!(prepared.retained_decoded_entries(), artifacts.len());
+    assert!(lock
+        .entries
+        .iter()
+        .all(|entry| prepared.get(&entry.certificate).is_some()));
+}
+
+#[test]
+fn owned_lock_finalization() {
+    let validated = validated_proof_manifest();
+    let artifacts = proof_certificate_artifacts(&validated);
+    let expected = build_proof_lock_from_artifacts(&validated, &artifacts).unwrap();
+    let (actual, _) = build_owned_snapshot(
+        &validated,
+        &artifacts,
+        PreparedArtifactRetentionPolicy::RawOnly,
+        PreparedArtifactObservationMode::Off,
+        None,
+    )
+    .unwrap()
+    .into_parts();
+    assert_eq!(actual, expected);
+    assert!(actual
+        .entries
+        .windows(2)
+        .all(|entries| entries[0].module <= entries[1].module));
+    validate_package_lock_against_manifest_graph(&validated, &actual).unwrap();
+}
+
+#[test]
+fn build_package_lock_and_snapshot_owned_artifacts() {
+    let validated = validated_proof_manifest();
+    let artifacts = proof_certificate_artifacts(&validated);
+    let mut preparation = PackageArtifactPreparationObservation::default();
+    let (lock, prepared) = build_owned_snapshot(
+        &validated,
+        &artifacts,
+        PreparedArtifactRetentionPolicy::RawOnly,
+        PreparedArtifactObservationMode::Off,
+        Some(&mut preparation),
+    )
+    .unwrap()
+    .into_parts();
+    assert_eq!(preparation.artifact_file_hashes, artifacts.len() as u64);
+    assert_eq!(preparation.artifact_full_decodes, artifacts.len() as u64);
+    assert_eq!(prepared.retention_observation(), None);
+    assert_eq!(prepared.retained_decoded_entries(), 0);
+    for entry in &lock.entries {
+        assert!(matches!(
+            prepared.get(&entry.certificate),
+            Some(PreparedPackageArtifactView::Hashed(_))
+        ));
+    }
+}
+
+#[test]
+fn artifact_preparation_hash_attempts() {
+    assert_snapshot_work_oracles();
+}
+
+#[test]
+fn artifact_preparation_full_decode_attempts() {
+    assert_snapshot_work_oracles();
+}
+
+#[test]
+fn owned_builder_differential() {
+    let validated = validated_proof_manifest();
+    let artifacts = proof_certificate_artifacts(&validated);
+    let borrowed = build_proof_lock_from_artifacts(&validated, &artifacts).unwrap();
+    let (owned, _) = build_owned_snapshot(
+        &validated,
+        &artifacts,
+        PreparedArtifactRetentionPolicy::FastCandidateV1,
+        PreparedArtifactObservationMode::Aggregate,
+        None,
+    )
+    .unwrap()
+    .into_parts();
+    assert_eq!(owned, borrowed);
+
+    let mut invalid = artifacts;
+    let first = validated.manifest().modules[0].certificate.clone();
+    invalid.insert(first, b"differential invalid certificate".to_vec());
+    let borrowed_error = build_proof_lock_from_artifacts(&validated, &invalid).unwrap_err();
+    let owned_error = build_owned_snapshot(
+        &validated,
+        &invalid,
+        PreparedArtifactRetentionPolicy::FastCandidateV1,
+        PreparedArtifactObservationMode::Aggregate,
+        None,
+    )
+    .unwrap_err();
+    assert_eq!(owned_error, borrowed_error);
 }
 
 #[test]

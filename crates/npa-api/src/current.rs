@@ -344,13 +344,11 @@ pub fn project_checked_current_decl_context_with_kernel_profile(
             .remove(&source_index)
             .expect("prefix check guarantees decoded package exists");
         ensure_name_has_module_prefix(root_module, &decoded.signature.name)?;
-        if !matches!(
-            (
-                decoded.owner_certificate_format.as_str(),
-                decoded.owner_core_spec.as_str(),
-            ),
-            ("NPA-CERT-0.2.0", "NPA-Core-0.2.0") | ("NPA-CERT-0.3.0", "NPA-Core-0.3.0")
-        ) {
+        if (
+            decoded.owner_certificate_format.as_str(),
+            decoded.owner_core_spec.as_str(),
+        ) != ("NPA-CERT-0.4.0", "NPA-Core-0.4.0")
+        {
             return Err(CheckedCurrentDeclProjectionError::UnsupportedOwnerPair { source_index });
         }
         if checked_current_decls.first().is_some_and(|first| {
@@ -385,7 +383,6 @@ pub fn project_checked_current_decl_context_with_kernel_profile(
             &decoded.core_package,
             &decl_index_table,
             &generated_decl_table,
-            decoded.owner_certificate_format == "NPA-CERT-0.3.0",
         )?;
         if recomputed_report != decoded.dependency_report {
             return Err(
@@ -519,7 +516,7 @@ fn decode_checked_current_decl_package(
     bytes: &[u8],
 ) -> Result<DecodedCheckedCurrentDeclPackage, CheckedCurrentDeclProjectionError> {
     let mut decoder = PackageDecoder::new(bytes);
-    decoder.tag("npa.machine-api.checked-current-decl-package.v6")?;
+    decoder.tag("npa.machine-api.checked-current-decl-package.v7")?;
     let source_index = decoder.u64()?;
     let signature_start = decoder.offset();
     let signature = decoder.checked_decl_signature()?;
@@ -925,12 +922,6 @@ impl CoreDeclPackage {
                     self.expr_from_term(root_module, source_index, prior_decls, generated, *ty)?,
                     self.expr_from_term(root_module, source_index, prior_decls, generated, *body)?,
                 ),
-                TermNode::Let { ty, value, body } => Expr::let_in(
-                    "_",
-                    self.expr_from_term(root_module, source_index, prior_decls, generated, *ty)?,
-                    self.expr_from_term(root_module, source_index, prior_decls, generated, *value)?,
-                    self.expr_from_term(root_module, source_index, prior_decls, generated, *body)?,
-                ),
             },
         )
     }
@@ -1096,7 +1087,7 @@ impl<'a> PackageDecoder<'a> {
     fn checked_decl_signature(
         &mut self,
     ) -> Result<MachineCheckedDeclSignature, CheckedCurrentDeclProjectionError> {
-        self.tag("npa.machine-tactic.checked-decl-signature.v1")?;
+        self.tag("npa.machine-tactic.checked-decl-signature.v2")?;
         let name = self.name()?;
         let param_len = self.bounded_len()?;
         let universe_params = (0..param_len)
@@ -1113,12 +1104,12 @@ impl<'a> PackageDecoder<'a> {
     }
 
     fn core_decl_package(&mut self) -> Result<CoreDeclPackage, CheckedCurrentDeclProjectionError> {
-        self.tag("npa.machine-api.current-core-decl-package.v1")?;
+        self.tag("npa.machine-api.current-core-decl-package.v2")?;
         self.tag("npa.machine-api.current-core-decl-package.name-table.v1")?;
         let name_table = self.name_table()?;
         self.tag("npa.machine-api.current-core-decl-package.level-table.v1")?;
         let level_table = self.level_table()?;
-        self.tag("npa.machine-api.current-core-decl-package.term-table.v1")?;
+        self.tag("npa.machine-api.current-core-decl-package.term-table.v2")?;
         let term_table = self.term_table()?;
         self.tag("npa.machine-api.current-core-decl-package.root-decl.v1")?;
         let root_decl = self.decl_payload()?;
@@ -1274,11 +1265,6 @@ impl<'a> PackageDecoder<'a> {
                     },
                     0x05 => TermNode::Pi {
                         ty: self.usize()?,
-                        body: self.usize()?,
-                    },
-                    0x06 => TermNode::Let {
-                        ty: self.usize()?,
-                        value: self.usize()?,
                         body: self.usize()?,
                     },
                     _ => {
@@ -1551,7 +1537,6 @@ impl<'a> PackageDecoder<'a> {
             0x03 => Expr::app(self.core_expr()?, self.core_expr()?),
             0x04 => Expr::lam("_", self.core_expr()?, self.core_expr()?),
             0x05 => Expr::pi("_", self.core_expr()?, self.core_expr()?),
-            0x06 => Expr::let_in("_", self.core_expr()?, self.core_expr()?, self.core_expr()?),
             _ => {
                 return Err(CheckedCurrentDeclProjectionError::DecodeFailed {
                     reason: "unknown core expr tag",
@@ -1938,12 +1923,6 @@ fn term_height(
         TermNode::Lam { ty, body } | TermNode::Pi { ty, body } => {
             term_height(*ty, package, visiting)?.max(term_height(*body, package, visiting)?) + 1
         }
-        TermNode::Let { ty, value, body } => {
-            term_height(*ty, package, visiting)?
-                .max(term_height(*value, package, visiting)?)
-                .max(term_height(*body, package, visiting)?)
-                + 1
-        }
     };
     visiting.remove(&index);
     Ok(height)
@@ -2065,12 +2044,6 @@ fn term_canonical_key(
         TermNode::Pi { ty, body } => {
             out.push(0x05);
             out.extend(term_canonical_hash(*ty, package, visiting)?);
-            out.extend(term_canonical_hash(*body, package, visiting)?);
-        }
-        TermNode::Let { ty, value, body } => {
-            out.push(0x06);
-            out.extend(term_canonical_hash(*ty, package, visiting)?);
-            out.extend(term_canonical_hash(*value, package, visiting)?);
             out.extend(term_canonical_hash(*body, package, visiting)?);
         }
     }
@@ -2356,11 +2329,6 @@ fn collect_term_refs(
             collect_term_refs(*ty, levels, terms, names, level_refs, term_refs)?;
             collect_term_refs(*body, levels, terms, names, level_refs, term_refs)?;
         }
-        TermNode::Let { ty, value, body } => {
-            collect_term_refs(*ty, levels, terms, names, level_refs, term_refs)?;
-            collect_term_refs(*value, levels, terms, names, level_refs, term_refs)?;
-            collect_term_refs(*body, levels, terms, names, level_refs, term_refs)?;
-        }
     }
     Ok(())
 }
@@ -2458,7 +2426,7 @@ fn sort_dedup_axiom_refs(entries: &mut Vec<MachineAxiomRefWire>) {
 
 fn encode_checked_current_decl_package(package: &DecodedCheckedCurrentDeclPackage) -> Vec<u8> {
     let mut out = Vec::new();
-    encode_string(&mut out, "npa.machine-api.checked-current-decl-package.v6");
+    encode_string(&mut out, "npa.machine-api.checked-current-decl-package.v7");
     encode_uvar(&mut out, package.source_index);
     out.extend(encode_checked_decl_signature(&package.signature));
     encode_core_decl_package_to(&mut out, &package.core_package);
@@ -2473,7 +2441,7 @@ fn encode_checked_current_decl_package(package: &DecodedCheckedCurrentDeclPackag
 
 fn encode_checked_decl_signature(signature: &MachineCheckedDeclSignature) -> Vec<u8> {
     let mut out = Vec::new();
-    encode_string(&mut out, "npa.machine-tactic.checked-decl-signature.v1");
+    encode_string(&mut out, "npa.machine-tactic.checked-decl-signature.v2");
     encode_name(&mut out, &signature.name);
     encode_uvar(&mut out, signature.universe_params.len() as u64);
     for param in &signature.universe_params {
@@ -2485,7 +2453,7 @@ fn encode_checked_decl_signature(signature: &MachineCheckedDeclSignature) -> Vec
 }
 
 fn encode_core_decl_package_to(out: &mut Vec<u8>, package: &CoreDeclPackage) {
-    encode_string(out, "npa.machine-api.current-core-decl-package.v1");
+    encode_string(out, "npa.machine-api.current-core-decl-package.v2");
     encode_string(
         out,
         "npa.machine-api.current-core-decl-package.name-table.v1",
@@ -2498,7 +2466,7 @@ fn encode_core_decl_package_to(out: &mut Vec<u8>, package: &CoreDeclPackage) {
     encode_level_table_to(out, &package.level_table);
     encode_string(
         out,
-        "npa.machine-api.current-core-decl-package.term-table.v1",
+        "npa.machine-api.current-core-decl-package.term-table.v2",
     );
     encode_term_table_to(out, &package.term_table);
     encode_string(
@@ -2935,12 +2903,6 @@ fn encode_term_node_to(out: &mut Vec<u8>, term: &TermNode) {
             encode_uvar(out, *ty as u64);
             encode_uvar(out, *body as u64);
         }
-        TermNode::Let { ty, value, body } => {
-            out.push(0x06);
-            encode_uvar(out, *ty as u64);
-            encode_uvar(out, *value as u64);
-            encode_uvar(out, *body as u64);
-        }
     }
 }
 
@@ -3036,7 +2998,6 @@ fn derive_dependency_report(
     package: &CoreDeclPackage,
     prior_decls: &[CurrentDeclIndexEntry],
     generated: &[CurrentGeneratedDeclEntry],
-    include_local_implementations: bool,
 ) -> Result<CurrentDeclDependencyReport, CheckedCurrentDeclProjectionError> {
     let mut direct_dependency_entries = Vec::new();
     for global_ref in root_decl_global_refs(package)? {
@@ -3054,15 +3015,13 @@ fn derive_dependency_report(
         )?);
     }
     sort_dedup_dependency_entries(&mut direct_dependency_entries);
-    if include_local_implementations {
-        append_reached_local_implementations(
-            source_index,
-            prior_decls,
-            generated,
-            &mut direct_dependency_entries,
-        )?;
-        sort_dedup_dependency_entries(&mut direct_dependency_entries);
-    }
+    append_reached_local_implementations(
+        source_index,
+        prior_decls,
+        generated,
+        &mut direct_dependency_entries,
+    )?;
+    sort_dedup_dependency_entries(&mut direct_dependency_entries);
 
     let mut axiom_dependencies = Vec::new();
     for entry in &direct_dependency_entries {
@@ -3301,13 +3260,6 @@ fn collect_expr_constant_names(expr: &Expr, names: &mut BTreeSet<String>) {
             collect_expr_constant_names(ty, names);
             collect_expr_constant_names(body, names);
         }
-        Expr::Let {
-            ty, value, body, ..
-        } => {
-            collect_expr_constant_names(ty, names);
-            collect_expr_constant_names(value, names);
-            collect_expr_constant_names(body, names);
-        }
     }
 }
 
@@ -3388,11 +3340,6 @@ fn collect_global_refs_from_term(
         }
         TermNode::Lam { ty, body } | TermNode::Pi { ty, body } => {
             collect_global_refs_from_term(package, *ty, refs)?;
-            collect_global_refs_from_term(package, *body, refs)?;
-        }
-        TermNode::Let { ty, value, body } => {
-            collect_global_refs_from_term(package, *ty, refs)?;
-            collect_global_refs_from_term(package, *value, refs)?;
             collect_global_refs_from_term(package, *body, refs)?;
         }
     }
@@ -3756,6 +3703,7 @@ pub(crate) fn encode_checked_current_decl_package_for_test(
     };
     let cert = npa_cert::build_module_cert(module, &[])
         .expect("test current declaration should build as a standalone certificate");
+    let cert = cert.into_parts();
     let root_decl = cert
         .declarations
         .into_iter()
@@ -3780,7 +3728,6 @@ pub(crate) fn encode_checked_current_decl_package_for_test(
         &core_package,
         &[],
         &[],
-        checked.owner_certificate_format() == "NPA-CERT-0.3.0",
     )
     .expect("test current declaration dependency report should be derivable");
     let decoded = DecodedCheckedCurrentDeclPackage {
@@ -3920,11 +3867,6 @@ fn remap_term_node_for_test(
         },
         TermNode::Pi { ty, body } => TermNode::Pi {
             ty: remap_index_for_test(term_map, *ty),
-            body: remap_index_for_test(term_map, *body),
-        },
-        TermNode::Let { ty, value, body } => TermNode::Let {
-            ty: remap_index_for_test(term_map, *ty),
-            value: remap_index_for_test(term_map, *value),
             body: remap_index_for_test(term_map, *body),
         },
     }
@@ -4456,7 +4398,6 @@ mod tests {
             &core_package,
             prior_decls,
             generated,
-            checked.owner_certificate_format() == "NPA-CERT-0.3.0",
         )
         .unwrap();
         let decoded = DecodedCheckedCurrentDeclPackage {
@@ -4488,8 +4429,8 @@ mod tests {
         let cert_bytes = encode_module_cert(&cert).unwrap();
         let key = VerifiedImportKey::new(
             Name::from_dotted("A"),
-            cert.hashes.export_hash,
-            cert.hashes.certificate_hash,
+            cert.hashes().export_hash,
+            cert.hashes().certificate_hash,
         );
         let mut allowlisted_axioms = BTreeSet::new();
         allowlisted_axioms.insert(Name::from_dotted("A.T"));
@@ -4514,12 +4455,12 @@ mod tests {
             imported_export_by_name_hash(
                 direct[0],
                 &Name::from_dotted("A.T"),
-                &cert.declarations[0].hashes.decl_interface_hash,
+                &cert.declarations()[0].hashes.decl_interface_hash,
             )
             .unwrap()
             .decl_interface_hash
         };
-        (context, imported_hash, cert.hashes.export_hash)
+        (context, imported_hash, cert.hashes().export_hash)
     }
 
     fn imported_eq_rec_alias_context() -> MachineImportCertificateContext {
@@ -4539,8 +4480,8 @@ mod tests {
         let cert_bytes = encode_module_cert(&cert).unwrap();
         let key = VerifiedImportKey::new(
             Name::from_dotted("A"),
-            cert.hashes.export_hash,
-            cert.hashes.certificate_hash,
+            cert.hashes().export_hash,
+            cert.hashes().certificate_hash,
         );
         let mut allowlisted_axioms = BTreeSet::new();
         allowlisted_axioms.insert(Name::from_dotted("Eq.rec"));
@@ -4769,8 +4710,8 @@ mod tests {
                 direct_dependency_entries: Vec::new(),
                 axiom_dependencies: Vec::new(),
             },
-            owner_certificate_format: "NPA-CERT-0.2.0".to_owned(),
-            owner_core_spec: "NPA-Core-0.2.0".to_owned(),
+            owner_certificate_format: "NPA-CERT-0.4.0".to_owned(),
+            owner_core_spec: "NPA-Core-0.4.0".to_owned(),
             dependency_selective_fingerprint: [0; 32],
             prior_chain_fingerprint: [0; 32],
             checked_env_fingerprint: [0; 32],
@@ -4901,7 +4842,7 @@ mod tests {
     }
 
     #[test]
-    fn opaque_current_chain_uses_v0_3_and_local_implementation_dependency() {
+    fn opaque_current_chain_uses_v0_4_and_local_implementation_dependency() {
         let imports = empty_import_context();
         let mut opaque_package = id_core_package("M.id");
         match &mut opaque_package.root_decl {
@@ -4927,7 +4868,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             prior_context.decl_index_table()[0].owner_certificate_format,
-            "NPA-CERT-0.3.0"
+            "NPA-CERT-0.4.0"
         );
 
         let alias_bytes = package_bytes(
@@ -4985,11 +4926,11 @@ mod tests {
                     },
                 ],
             ),
-            Err(CheckedCurrentDeclProjectionError::OwnerPairMismatch { source_index: 1 })
+            Err(CheckedCurrentDeclProjectionError::UnsupportedOwnerPair { source_index: 1 })
         ));
 
         let mut stale_v5 = opaque_bytes.clone();
-        let tag = b"npa.machine-api.checked-current-decl-package.v6";
+        let tag = b"npa.machine-api.checked-current-decl-package.v7";
         let offset = stale_v5
             .windows(tag.len())
             .position(|window| window == tag)

@@ -1,7 +1,5 @@
 //! Implementation of `npa package index`.
 
-use std::{fs, io};
-
 use npa_api::{project_package_theorem_index_from_extraction, PackageArtifactReferenceSummaryMode};
 use npa_package::{
     format_package_hash, package_file_hash, package_theorem_index_incremental_projection_plan,
@@ -11,11 +9,12 @@ use npa_package::{
 
 use crate::args::{PackageCommonOptions, PackageIndexOptions};
 use crate::diagnostic::{CommandArtifact, CommandDiagnostic, CommandResult, DiagnosticKind};
-use crate::fs::join_package_path;
+use crate::generated_artifact_writer::write_package_generated_artifact_under_lock;
 use crate::package_artifacts::{
     load_package_artifact_extraction_with_timings, LoadedPackageArtifactExtraction,
     LoadedPackageAuditSnapshot, PackageGeneratedArtifactReadMode, PACKAGE_THEOREM_INDEX_PATH,
 };
+use crate::package_promotion_transaction::TargetLock;
 use crate::timing::{
     PackageTimingCollector, TIMING_ARTIFACT_COMPARE_MS, TIMING_JSON_WRITE_MS, TIMING_PROJECTION_MS,
 };
@@ -229,13 +228,23 @@ fn run_package_index_write(
     options: PackageCommonOptions,
     timings: &mut PackageTimingCollector,
 ) -> CommandResult {
+    let mutation_lock = match TargetLock::acquire(&options.root) {
+        Ok(lock) => lock,
+        Err(_) => {
+            return CommandResult::failed(
+                COMMAND,
+                crate::fs::render_package_root(&options.root),
+                vec![write_failed_diagnostic()],
+            );
+        }
+    };
     let (loaded, _index, index_json) =
         match generate_theorem_index(&options, PackageGeneratedArtifactReadMode::none(), timings) {
             Ok(generated) => generated,
             Err(result) => return result,
         };
     let write_result = timings.time_phase(TIMING_JSON_WRITE_MS, || {
-        write_theorem_index(&options, index_json.as_bytes())
+        write_theorem_index(&options, index_json.as_bytes(), &mutation_lock)
     });
     if let Err(diagnostic) = write_result {
         return CommandResult::failed(COMMAND, loaded.root_display, vec![*diagnostic]);
@@ -344,20 +353,16 @@ fn record_incremental_reuse_json(timings: &mut PackageTimingCollector, checked_j
 fn write_theorem_index(
     options: &PackageCommonOptions,
     index_json: &[u8],
+    mutation_lock: &TargetLock,
 ) -> Result<(), Box<CommandDiagnostic>> {
     let package_path = PackagePath::new(PACKAGE_THEOREM_INDEX_PATH);
-    let full_path =
-        join_package_path(&options.root, &package_path, "generated.theorem_index.path")?;
-    match fs::read(&full_path) {
-        Ok(existing) if existing == index_json => return Ok(()),
-        Ok(_) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(_) => return Err(Box::new(write_failed_diagnostic())),
-    }
-    if let Some(parent) = full_path.parent() {
-        fs::create_dir_all(parent).map_err(|_| Box::new(write_failed_diagnostic()))?;
-    }
-    fs::write(full_path, index_json).map_err(|_| Box::new(write_failed_diagnostic()))
+    write_package_generated_artifact_under_lock(
+        &options.root,
+        &package_path,
+        index_json,
+        mutation_lock,
+    )
+    .map_err(|_| Box::new(write_failed_diagnostic()))
 }
 
 fn passed_result(root_display: String) -> CommandResult {

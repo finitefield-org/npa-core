@@ -74,6 +74,9 @@ let root_dir () =
   try Sys.getenv "NPA_CHECKER_EXT_ROOT"
   with Not_found -> Filename.concat (Sys.getcwd ()) "checkers/npa-checker-ext"
 
+let conformance_fixture_path name =
+  Filename.concat (root_dir ()) ("test/fixtures/conformance/" ^ name)
+
 let boundary_input length =
   let bytes = Bytes.create length in
   for index = 0 to length - 1 do
@@ -91,7 +94,7 @@ let vector_input source label length =
   | "boundary", _ -> boundary_input length
   | "rust-sha2", "build-identity-domain" ->
       Bytes.of_string
-        "npa-checker-ext\000checker-build\000vendored-sha256-source:v1\000NPA-CERT-0.1\000NPA-Core-0.1"
+        "npa-checker-ext\000checker-build\000vendored-sha256-source:v1\000NPA-CERT-0.4.0\000NPA-Core-0.4.0"
   | "rust-sha2", "level-zero-domain" -> Bytes.of_string "npa.hash.domain\000level\000zero"
   | "rust-sha2", "term-sort-zero-domain" ->
       Bytes.of_string "npa.hash.domain\000term\000sort\000zero"
@@ -165,10 +168,10 @@ let run_cli_tests () =
   let zero_hash = "sha256:" ^ String.make 64 '0' in
   let version = Ext_cli.run [ "--version" ] in
   let expected_version =
-    "npa-checker-ext 0.3.0\n"
+    "npa-checker-ext 0.4.0\n"
     ^ "checker_build_hash " ^ Ext_result.checker_build_hash ^ "\n"
-    ^ "certificate_format NPA-CERT-0.3.0\n"
-    ^ "core_spec NPA-Core-0.3.0\n"
+    ^ "certificate_format NPA-CERT-0.4.0\n"
+    ^ "core_spec NPA-Core-0.4.0\n"
     ^ "implementation_profile ocaml-clean-room\n"
     ^ "project_directory checkers/npa-checker-ext/\n"
     ^ "feature_policy_contract m0-05:first-release-empty-core-feature-set\n"
@@ -442,9 +445,6 @@ let encode_term_lam ty body = one_byte 0x04 ^ encode_uvar_int ty ^ encode_uvar_i
 
 let encode_term_pi ty body = one_byte 0x05 ^ encode_uvar_int ty ^ encode_uvar_int body
 
-let encode_term_let ty value body =
-  one_byte 0x06 ^ encode_uvar_int ty ^ encode_uvar_int value ^ encode_uvar_int body
-
 let encode_global_builtin name_id hash = one_byte 0x03 ^ encode_uvar_int name_id ^ hash
 
 let encode_global_imported import_index name_id hash =
@@ -490,6 +490,14 @@ let encode_level_table entries = encode_uvar_int (List.length entries) ^ String.
 let encode_term_table entries = encode_uvar_int (List.length entries) ^ String.concat "" entries
 
 let encode_dependency_entries entries =
+  encode_uvar_int (List.length entries)
+  ^ String.concat ""
+      (List.map
+         (fun (global_ref, decl_interface_hash) ->
+           one_byte 0x00 ^ global_ref ^ decl_interface_hash)
+         entries)
+
+let encode_interface_dependency_entries entries =
   encode_uvar_int (List.length entries)
   ^ String.concat ""
       (List.map
@@ -581,7 +589,8 @@ let encode_export_kind tag = one_byte tag
 
 let encode_export_entry_prefix name_id kind_tag universe_params ty body =
   encode_uvar_int name_id ^ encode_export_kind kind_tag ^ encode_usize_vec universe_params
-  ^ encode_uvar_int ty ^ encode_option_usize body ^ hash_bytes 0x31 ^ encode_option_hash None
+  ^ encode_universe_constraints [] ^ encode_uvar_int ty ^ encode_option_usize body
+  ^ hash_bytes 0x31 ^ encode_option_hash None
   ^ encode_option None ^ encode_option None ^ hash_bytes 0x32
 
 let encode_export_entry name_id kind_tag universe_params ty body axiom_dependencies =
@@ -607,8 +616,8 @@ let encode_core_features features =
 
 let encode_hashes = hash_bytes 0xa1 ^ hash_bytes 0xa2 ^ hash_bytes 0xa3
 
-let encode_header ?(format = Ext_cert.expected_format)
-    ?(core_spec = Ext_cert.expected_core_spec) module_components =
+let encode_header ?(format = Ext_cert.current_format)
+    ?(core_spec = Ext_cert.current_core_spec) module_components =
   encode_string format ^ encode_string core_spec ^ encode_name module_components
 
 let read_binary_file path =
@@ -618,36 +627,260 @@ let read_binary_file path =
   close_in channel;
   contents
 
-type golden_hash_fixture = {
-  golden_byte_len : int;
-  golden_export_hash : string;
-  golden_axiom_report_hash : string;
-  golden_certificate_hash : string;
+type fixture_matrix_row = {
+  case_id : string;
+  case_class : string;
+  template : string;
+  format : string;
+  core_spec : string;
+  mutation : string;
+  producer_result : string;
+  rust_result : string;
+  ocaml_result : string;
+  boundary : string;
 }
 
-let golden_hash_fixture label =
+let fixture_matrix_rows () =
   let path =
-    Filename.concat (root_dir ()) "test/golden/legacy_certificate_hashes.tsv"
+    Filename.concat (root_dir ()) "../../testdata/certificate-v0.4/fixture-matrix.tsv"
   in
-  let contents = read_binary_file path in
-  let rec loop lines =
-    match lines with
-    | [] -> failwith ("missing golden hash fixture " ^ label)
-    | line :: rest ->
-        if line = "" || contains line "label\t" then loop rest
-        else (
-          match split_tabs line with
-          | [ current; byte_len; export_hash; axiom_report_hash; certificate_hash ]
-            when current = label ->
-              {
-                golden_byte_len = int_of_string byte_len;
-                golden_export_hash = export_hash;
-                golden_axiom_report_hash = axiom_report_hash;
-                golden_certificate_hash = certificate_hash;
-              }
-          | _ -> loop rest)
+  match String.split_on_char '\n' (read_binary_file path) with
+  | [] -> failwith "empty v0.4 fixture matrix"
+  | header :: lines ->
+      assert_equal "v0.4 fixture matrix header"
+        "case_id\tclass\ttemplate\tformat\tcore_spec\tmutation\tproducer_fast_or_frontend_result\trust_ref_result\tocaml_result\thash_or_boundary"
+        header;
+      List.filter_map
+        (fun line ->
+          if line = "" then None
+          else
+            match split_tabs line with
+            | [
+             case_id;
+             case_class;
+             template;
+             format;
+             core_spec;
+             mutation;
+             producer_result;
+             rust_result;
+             ocaml_result;
+             boundary;
+            ] ->
+                Some
+                  {
+                    case_id;
+                    case_class;
+                    template;
+                    format;
+                    core_spec;
+                    mutation;
+                    producer_result;
+                    rust_result;
+                    ocaml_result;
+                    boundary;
+                  }
+            | _ -> failwith ("malformed v0.4 fixture matrix row: " ^ line))
+        lines
+
+let fixture_rows case_class =
+  List.filter
+    (fun row -> row.case_class = case_class)
+    (fixture_matrix_rows ())
+
+let string_after_prefix label prefix value =
+  let prefix_length = String.length prefix in
+  if
+    String.length value < prefix_length
+    || String.sub value 0 prefix_length <> prefix
+  then failwith (label ^ ": expected prefix " ^ prefix ^ " in " ^ value)
+  else String.sub value prefix_length (String.length value - prefix_length)
+
+let bytes_of_hex label hex =
+  if String.length hex mod 2 <> 0 then failwith (label ^ ": odd hex length");
+  String.init (String.length hex / 2) (fun index ->
+      let pair = String.sub hex (index * 2) 2 in
+      try Char.chr (int_of_string ("0x" ^ pair))
+      with Failure _ -> failwith (label ^ ": invalid hex " ^ pair))
+
+let run_fixture_matrix_tests () =
+  let rows = fixture_matrix_rows () in
+  assert_int_equal "v0.4 fixture matrix row count" 72 (List.length rows);
+  let seen = Hashtbl.create 72 in
+  let class_counts = Hashtbl.create 11 in
+  let allowed_ocaml_results =
+    [
+      "checked";
+      "format_mismatch";
+      "core_spec_mismatch";
+      "unknown_tag:0x06";
+      "certificate_hash_mismatch";
+      "decl_certificate_hash_mismatch";
+      "not_applicable";
+    ]
   in
-  loop (String.split_on_char '\n' contents)
+  List.iter
+    (fun row ->
+      if Hashtbl.mem seen row.case_id then
+        failwith ("duplicate v0.4 fixture case " ^ row.case_id);
+      Hashtbl.add seen row.case_id ();
+      Hashtbl.replace class_counts row.case_class
+        (1 + Option.value ~default:0 (Hashtbl.find_opt class_counts row.case_class));
+      if not (List.mem row.ocaml_result allowed_ocaml_results) then
+        failwith
+          (row.case_id ^ ": unreviewed OCaml result " ^ row.ocaml_result);
+      let normalized =
+        String.lowercase_ascii
+          (String.concat "\t"
+             [
+               row.case_id;
+               row.case_class;
+               row.template;
+               row.format;
+               row.core_spec;
+               row.mutation;
+               row.producer_result;
+               row.rust_result;
+               row.ocaml_result;
+               row.boundary;
+             ])
+      in
+      List.iter
+        (fun marker ->
+          if contains normalized marker then
+            failwith (row.case_id ^ ": forbidden matrix marker " ^ marker))
+        [ "todo"; "skip"; "ignore"; "expected-failure" ];
+      if contains row.case_class "source_" then
+        assert_equal (row.case_id ^ " OCaml source disposition")
+          "not_applicable" row.ocaml_result
+      else
+        assert_bool (row.case_id ^ " has an OCaml certificate disposition")
+          (row.ocaml_result <> "not_applicable"))
+    rows;
+  List.iter
+    (fun (case_class, expected) ->
+      assert_int_equal (case_class ^ " fixture count") expected
+        (Option.value ~default:0 (Hashtbl.find_opt class_counts case_class)))
+    [
+      ("closure_rejection", 3);
+      ("hash", 10);
+      ("hash_rejection", 3);
+      ("header", 28);
+      ("positive_semantics", 3);
+      ("positive_structure", 2);
+      ("positive_term", 6);
+      ("retired_tag", 6);
+      ("source_positive", 6);
+      ("source_rejection", 5);
+    ];
+
+  let header_rows = fixture_rows "header" in
+  List.iter
+    (fun row ->
+      let bytes =
+        encode_header ~format:row.format ~core_spec:row.core_spec
+          [ "Header"; "Matrix" ]
+      in
+      match row.ocaml_result with
+      | "checked" ->
+          let header, next =
+            assert_ok row.case_id
+              (Ext_cert.read_header (Ext_bytes.of_string bytes))
+          in
+          assert_equal (row.case_id ^ " format") Ext_cert.current_format
+            header.Ext_cert.format;
+          assert_equal (row.case_id ^ " core spec") Ext_cert.current_core_spec
+            header.Ext_cert.core_spec;
+          assert_equal (row.case_id ^ " module") "Header.Matrix"
+            (Ext_name.to_string header.Ext_cert.module_name);
+          assert_int_equal (row.case_id ^ " header offset")
+            (String.length bytes) (Ext_bytes.offset next)
+      | expected ->
+          let expected_reason, expected_section, expected_offset =
+            if row.format <> Ext_cert.current_format then
+              ( Ext_bytes.Format_mismatch,
+                Ext_bytes.Header_format,
+                String.length (encode_string row.format) )
+            else
+              ( Ext_bytes.Core_spec_mismatch,
+                Ext_bytes.Header_core_spec,
+                String.length
+                  (encode_string row.format ^ encode_string row.core_spec) )
+          in
+          assert_equal (row.case_id ^ " matrix outcome")
+            (Ext_bytes.reason_code expected_reason) expected;
+          assert_decode_error row.case_id "certificate_decode_error"
+            expected_reason expected_section expected_offset
+            (Ext_cert.read_header (Ext_bytes.of_string bytes)))
+    header_rows;
+
+  List.iter
+    (fun row ->
+      let node =
+        match row.case_id with
+        | "term_sort" -> encode_term_sort 0
+        | "term_bvar" -> encode_term_bvar 0
+        | "term_const" -> encode_term_const (encode_global_local 0) []
+        | "term_app" -> encode_term_app 0 1
+        | "term_lam" -> encode_term_lam 0 1
+        | "term_pi" -> encode_term_pi 0 1
+        | _ -> failwith ("unmapped positive term row " ^ row.case_id)
+      in
+      let expected =
+        bytes_of_hex row.case_id
+          (string_after_prefix row.case_id "assert_node_hex:" row.mutation)
+      in
+      assert_equal (row.case_id ^ " exact node bytes") expected node;
+      assert_equal (row.case_id ^ " OCaml outcome") "checked"
+        row.ocaml_result)
+    (fixture_rows "positive_term");
+
+  let levels, _ =
+    assert_ok "retired tag level fixture"
+      (Ext_level.read_table []
+         (Ext_bytes.of_string
+            (encode_uvar_int 1 ^ encode_level_zero)))
+  in
+  List.iter
+    (fun row ->
+      let separator =
+        try String.index row.mutation ':'
+        with Not_found -> failwith (row.case_id ^ ": missing mutation payload")
+      in
+      let fragment =
+        bytes_of_hex row.case_id
+          (String.sub row.mutation (separator + 1)
+             (String.length row.mutation - separator - 1))
+      in
+      let table, expected_offset =
+        if row.case_id = "retired_06_unused" then
+          (encode_uvar_int 2 ^ encode_term_sort 0 ^ fragment, 3)
+        else (encode_uvar_int 1 ^ fragment, 1)
+      in
+      assert_equal (row.case_id ^ " OCaml outcome") "unknown_tag:0x06"
+        row.ocaml_result;
+      assert_decode_error row.case_id "certificate_decode_error"
+        (Ext_bytes.Unknown_tag 0x06) Ext_bytes.Term_table expected_offset
+        (Ext_term.read_table [] levels (Ext_bytes.of_string table)))
+    (fixture_rows "retired_tag");
+
+  let assert_case_ids case_class expected_ids =
+    let actual =
+      List.map (fun row -> row.case_id) (fixture_rows case_class)
+      |> List.sort String.compare
+    in
+    assert_bool (case_class ^ " case mapping")
+      (actual = List.sort String.compare expected_ids)
+  in
+  assert_case_ids "positive_semantics"
+    [ "reduction_beta"; "reduction_delta"; "reduction_iota" ];
+  assert_case_ids "positive_structure" [ "deep_binders"; "shared_dag" ];
+  assert_case_ids "closure_rejection"
+    [ "import_old_pair"; "import_mixed_old_format"; "import_mixed_old_core" ];
+  assert_case_ids "hash_rejection"
+    [ "hash_header_only_upgrade"; "hash_old_decl_domain"; "hash_old_module_domain" ];
+  assert_int_equal "hash boundary mapping" 10
+    (List.length (fixture_rows "hash"))
 
 let hex_of_raw_hash hash = Ext_sha256.to_hex (Bytes.of_string hash)
 
@@ -664,47 +897,11 @@ let decode_module_bytes label bytes =
        ^ string_of_int error.Ext_bytes.offset)
 
 let assert_header label expected_module header =
-  assert_equal (label ^ " format") Ext_cert.expected_format header.Ext_cert.format;
-  assert_equal (label ^ " core spec") Ext_cert.expected_core_spec header.Ext_cert.core_spec;
+  assert_equal (label ^ " format") Ext_cert.current_format header.Ext_cert.format;
+  assert_equal (label ^ " core spec") Ext_cert.current_core_spec header.Ext_cert.core_spec;
   assert_equal (label ^ " module") expected_module (Ext_name.to_string header.Ext_cert.module_name)
 
 let run_decoder_header_tests () =
-  let golden_path =
-    Filename.concat (root_dir ()) "../../testdata/package/npa-mathlib/vendor/npa-std/Std/Nat/Basic/certificate.npcert"
-  in
-  let golden = read_binary_file golden_path in
-  (match Ext_cert.read_header (Ext_bytes.of_string golden) with
-  | Error error ->
-      failwith ("golden header: unexpected decode error " ^ Ext_bytes.reason_code error.Ext_bytes.reason)
-  | Ok (header, next) ->
-      assert_equal "golden header format" Ext_cert.expected_format header.Ext_cert.format;
-      assert_equal "golden header core spec" Ext_cert.expected_core_spec header.Ext_cert.core_spec;
-      assert_bool "golden header module is structured"
-        (String.length (Ext_name.to_string header.Ext_cert.module_name) > 0);
-      assert_bool "golden header advances reader" (Ext_bytes.offset next > 0));
-
-  let assert_versioned_header label relative_path expected_format expected_core
-      expected_version =
-    let bytes = read_binary_file (Filename.concat (root_dir ()) relative_path) in
-    match Ext_cert.read_header (Ext_bytes.of_string bytes) with
-    | Error error ->
-        failwith
-          (label ^ ": unexpected decode error "
-          ^ Ext_bytes.reason_code error.Ext_bytes.reason)
-    | Ok (header, _) ->
-        assert_equal (label ^ " format") expected_format header.Ext_cert.format;
-        assert_equal (label ^ " core spec") expected_core
-          header.Ext_cert.core_spec;
-        assert_bool (label ^ " version")
-          (header.Ext_cert.version = expected_version)
-  in
-  assert_versioned_header "compatibility header"
-    "../../testdata/certificates/security/mutual-inductive-constructor-universe-bound-v0.2.npcert"
-    Ext_cert.compatibility_format Ext_cert.compatibility_core_spec Ext_cert.Compatibility;
-  assert_versioned_header "previous header"
-    "../../testdata/package/npa-mathlib-downstream/vendor/npa-mathlib/Mathlib/Logic/Basic/certificate.npcert"
-    Ext_cert.previous_format Ext_cert.previous_core_spec Ext_cert.Previous;
-
   let valid_header = encode_header [ "Std"; "Nat" ] in
   (match Ext_cert.read_header (Ext_bytes.of_string valid_header) with
   | Error error ->
@@ -718,7 +915,7 @@ let run_decoder_header_tests () =
     Ext_bytes.Header_format (String.length (encode_string "BAD-CERT"))
     (Ext_cert.read_header (Ext_bytes.of_string bad_format));
 
-  let core_prefix = encode_string Ext_cert.expected_format ^ encode_string "NPA-Core-X" in
+  let core_prefix = encode_string Ext_cert.current_format ^ encode_string "NPA-Core-X" in
   let bad_core = core_prefix ^ encode_name [ "Std"; "Nat" ] in
   assert_decode_error "core spec mismatch" "certificate_decode_error"
     Ext_bytes.Core_spec_mismatch Ext_bytes.Header_core_spec (String.length core_prefix)
@@ -726,7 +923,7 @@ let run_decoder_header_tests () =
 
   let mixed_pair_prefix =
     encode_string Ext_cert.current_format
-    ^ encode_string Ext_cert.previous_core_spec
+    ^ encode_string "NPA-Core-0.3.0"
   in
   let mixed_pair = mixed_pair_prefix ^ encode_name [ "Std"; "Nat" ] in
   assert_decode_error "mixed header pair" "certificate_decode_error"
@@ -734,13 +931,21 @@ let run_decoder_header_tests () =
     (String.length mixed_pair_prefix)
     (Ext_cert.read_header (Ext_bytes.of_string mixed_pair));
 
+  let truncated_old_core =
+    encode_string "NPA-CERT-0.3.0" ^ encode_uvar_int 4 ^ "x"
+  in
+  assert_decode_error "old format still decodes bounded core" "certificate_decode_error"
+    Ext_bytes.Unexpected_eof Ext_bytes.Header_core_spec
+    (String.length truncated_old_core)
+    (Ext_cert.read_header (Ext_bytes.of_string truncated_old_core));
+
   let invalid_utf8 = encode_raw_string (string_of_codes [ 0xff ]) in
   assert_decode_error "invalid utf8 header" "noncanonical_encoding" Ext_bytes.Invalid_utf8
     Ext_bytes.Header_format 1
     (Ext_cert.read_header (Ext_bytes.of_string invalid_utf8));
 
   let empty_module_prefix =
-    encode_string Ext_cert.expected_format ^ encode_string Ext_cert.expected_core_spec
+    encode_string Ext_cert.current_format ^ encode_string Ext_cert.current_core_spec
   in
   let empty_module = empty_module_prefix ^ encode_uvar_int 0 in
   assert_decode_error "empty module name" "noncanonical_encoding" Ext_bytes.Empty_name
@@ -822,10 +1027,9 @@ let run_decoder_tables_tests () =
 
   let builtin_nat = encode_global_builtin 1 (hash_bytes 0x42) in
   let valid_term_table =
-    encode_uvar_int 7 ^ encode_term_sort 0 ^ encode_term_bvar 0
+    encode_uvar_int 6 ^ encode_term_sort 0 ^ encode_term_bvar 0
     ^ encode_term_const builtin_nat [ 0; 1 ]
     ^ encode_term_app 2 1 ^ encode_term_lam 0 3 ^ encode_term_pi 0 4
-    ^ encode_term_let 0 1 5
   in
   let terms =
     match Ext_term.read_table names levels (Ext_bytes.of_string valid_term_table) with
@@ -836,7 +1040,7 @@ let run_decoder_tables_tests () =
     | Ok (terms, next) ->
         assert_int_equal "valid term table offset" (String.length valid_term_table)
           (Ext_bytes.offset next);
-        assert_int_equal "valid term table length" 7 (List.length terms);
+        assert_int_equal "valid term table length" 6 (List.length terms);
         terms
   in
   (match List.map term_value terms with
@@ -848,7 +1052,6 @@ let run_decoder_tables_tests () =
    Ext_term.App (_, _);
    Ext_term.Lam (_, _);
    Ext_term.Pi (_, _);
-   Ext_term.Let (_, _, _);
   ] ->
       assert_equal "valid term const builtin name" "Nat" (Ext_name.to_string name);
       assert_int_equal "valid term const hash length" 32 (String.length decl_interface_hash)
@@ -1007,7 +1210,7 @@ let assert_decoded_minimal label decoded expected_feature_count =
 
 let run_decoder_declarations_tests () =
   let golden_path =
-    Filename.concat (root_dir ()) "../../testdata/package/npa-mathlib/vendor/npa-std/Std/Nat/Basic/certificate.npcert"
+    conformance_fixture_path "indexed-v0.4.npcert"
   in
   let golden = read_binary_file golden_path in
   (match Ext_cert.read_module (Ext_bytes.of_string golden) with
@@ -1080,7 +1283,7 @@ let run_decoder_declarations_tests () =
          variant_payloads)
   in
   (match
-     Ext_cert.read_declarations Ext_cert.Compatibility 0 variant_names simple_level_table simple_term_table
+     Ext_cert.read_declarations Ext_cert.Current 0 variant_names simple_level_table simple_term_table
        (Ext_bytes.of_string variant_declarations)
    with
   | Error error ->
@@ -1102,16 +1305,16 @@ let run_decoder_declarations_tests () =
   assert_decode_error "duplicate declaration name" "noncanonical_encoding"
     Ext_bytes.Duplicate_declaration Ext_bytes.Declarations
     (String.length (encode_uvar_int 2 ^ minimal_axiom_decl))
-    (Ext_cert.read_declarations Ext_cert.Compatibility 0 [ make_name [ "A" ] ] simple_level_table simple_term_table
+    (Ext_cert.read_declarations Ext_cert.Current 0 [ make_name [ "A" ] ] simple_level_table simple_term_table
        (Ext_bytes.of_string duplicate_declarations));
 
   let dangling_term_export =
     encode_uvar_int 1 ^ encode_uvar_int 0 ^ encode_export_kind 0x00 ^ encode_usize_vec []
-    ^ encode_uvar_int 1
+    ^ encode_universe_constraints [] ^ encode_uvar_int 1
   in
   assert_decode_error "export dangling term" "certificate_decode_error"
-    Ext_bytes.Dangling_reference Ext_bytes.Export_block 4
-    (Ext_cert.read_export_block Ext_cert.Legacy 0
+    Ext_bytes.Dangling_reference Ext_bytes.Export_block 5
+    (Ext_cert.read_export_block Ext_cert.Current 0
        (Array.of_list [ make_name [ "A" ] ])
        (Array.of_list simple_level_table)
        (Array.of_list simple_term_table) 1
@@ -1126,7 +1329,7 @@ let run_decoder_declarations_tests () =
   in
   assert_decode_error "export dangling declaration" "certificate_decode_error"
     Ext_bytes.Dangling_reference Ext_bytes.Export_block dangling_decl_offset
-    (Ext_cert.read_export_block Ext_cert.Legacy 0
+    (Ext_cert.read_export_block Ext_cert.Current 0
        (Array.of_list [ make_name [ "A" ] ])
        (Array.of_list simple_level_table)
        (Array.of_list simple_term_table) 1
@@ -1134,7 +1337,7 @@ let run_decoder_declarations_tests () =
 
 let run_decoder_reachability_tests () =
   let golden_path =
-    Filename.concat (root_dir ()) "../../testdata/package/npa-mathlib/vendor/npa-std/Std/Nat/Basic/certificate.npcert"
+    conformance_fixture_path "indexed-v0.4.npcert"
   in
   let golden = read_binary_file golden_path in
   (match Ext_cert.read_module (Ext_bytes.of_string golden) with
@@ -1209,7 +1412,7 @@ let run_decoder_reachability_tests () =
   in
   let malformed_certificate_hash =
     Ext_canonical.hash_with_domain
-      (Ext_canonical.module_certificate_domain Ext_cert.Legacy)
+      (Ext_canonical.module_certificate_domain Ext_cert.Current)
       malformed_without_certificate_hash
   in
   let malformed_later_section =
@@ -1231,8 +1434,8 @@ let run_decoder_reachability_tests () =
     =
     {
       Ext_cli.empty_context with
-      input_certificate_format = Some Ext_cert.expected_format;
-      input_core_spec = Some Ext_cert.expected_core_spec;
+      input_certificate_format = Some Ext_cert.current_format;
+      input_core_spec = Some Ext_cert.current_core_spec;
     });
 
   let unused_level_prefix =
@@ -1302,9 +1505,9 @@ let run_decoder_reachability_tests () =
       input_core_spec = Some core_spec;
     } ->
       assert_equal "trailing bytes diagnostic certificate format"
-        Ext_cert.expected_format format;
+        Ext_cert.current_format format;
       assert_equal "trailing bytes diagnostic core spec"
-        Ext_cert.expected_core_spec core_spec
+        Ext_cert.current_core_spec core_spec
   | _ ->
       failwith
         "trailing bytes diagnostic context must preserve only the input pair")
@@ -1312,7 +1515,8 @@ let run_decoder_reachability_tests () =
 let encode_export_entry_full name_id kind_tag universe_params ty body type_hash body_hash
     reducibility opacity decl_interface_hash axiom_dependencies =
   encode_uvar_int name_id ^ encode_export_kind kind_tag ^ encode_usize_vec universe_params
-  ^ encode_uvar_int ty ^ encode_option_usize body ^ type_hash ^ encode_option_hash body_hash
+  ^ encode_universe_constraints [] ^ encode_uvar_int ty ^ encode_option_usize body
+  ^ type_hash ^ encode_option_hash body_hash
   ^ encode_option reducibility ^ encode_option opacity ^ decl_interface_hash
   ^ encode_axiom_refs axiom_dependencies
 
@@ -1841,10 +2045,9 @@ let run_hash_level_term_tests () =
 
   let imported_ref = encode_global_imported 0 1 (hash_bytes 0x55) in
   let term_bytes =
-    encode_uvar_int 8 ^ encode_term_sort 0 ^ encode_term_sort 1 ^ encode_term_bvar 0
+    encode_uvar_int 7 ^ encode_term_sort 0 ^ encode_term_sort 1 ^ encode_term_bvar 0
     ^ encode_term_const imported_ref [ 0; 1 ]
     ^ encode_term_app 3 2 ^ encode_term_lam 0 4 ^ encode_term_pi 0 5
-    ^ encode_term_let 0 2 6
   in
   let term_table = decode_term_table "hash term table" names level_table term_bytes in
   let term_hashes =
@@ -1857,7 +2060,6 @@ let run_hash_level_term_tests () =
         "aa45ed6b3051ec6dd79b578d048c64711404e1434d39082d8874ad1777db8ea9";
         "8079e8d16fa1f32538052afd5379b3107399c2964d6e43aad7082ad938b8c670";
         "37adbeb21882f9c57f6c6f952715b9e75e8a30e53ab88269d20ec40976b3300e";
-        "9dde1d65cb02d6d632083bd28394894abb0c42b55285190f4e1d4b648433ac46";
       ]
       (Ext_canonical.term_hashes name_table level_table level_hashes term_table)
   in
@@ -1939,10 +2141,10 @@ let run_hash_level_term_tests () =
     in
     assert_export_term_hashes label decoded
   in
-  assert_golden_export_terms "nat"
-    (Filename.concat (root_dir ()) "../../testdata/package/npa-mathlib/vendor/npa-std/Std/Nat/Basic/certificate.npcert");
-  assert_golden_export_terms "eq"
-    (Filename.concat (root_dir ()) "../../testdata/package/npa-mathlib/vendor/npa-std/Std/Logic/Eq/certificate.npcert")
+  assert_golden_export_terms "indexed"
+    (conformance_fixture_path "indexed-v0.4.npcert");
+  assert_golden_export_terms "mutual"
+    (conformance_fixture_path "mutual-v0.4.npcert")
 
 let run_hash_declarations_tests () =
   let assert_golden_declarations label path =
@@ -1951,10 +2153,10 @@ let run_hash_declarations_tests () =
     in
     assert_declaration_hash_verifies label decoded
   in
-  assert_golden_declarations "nat"
-    (Filename.concat (root_dir ()) "../../testdata/package/npa-mathlib/vendor/npa-std/Std/Nat/Basic/certificate.npcert");
-  assert_golden_declarations "eq"
-    (Filename.concat (root_dir ()) "../../testdata/package/npa-mathlib/vendor/npa-std/Std/Logic/Eq/certificate.npcert");
+  assert_golden_declarations "indexed"
+    (conformance_fixture_path "indexed-v0.4.npcert");
+  assert_golden_declarations "mutual"
+    (conformance_fixture_path "mutual-v0.4.npcert");
 
   let simple_theorem_decl =
     encode_decl_cert (encode_theorem_decl_payload 0x02 0 [] 0 1) [] []
@@ -2058,12 +2260,8 @@ let run_hash_declarations_tests () =
 let run_hash_module_tests () =
   let golden_paths =
     [
-      ( "nat",
-        Filename.concat (root_dir ()) "../../testdata/package/npa-mathlib/vendor/npa-std/Std/Nat/Basic/certificate.npcert"
-      );
-      ( "eq",
-        Filename.concat (root_dir ()) "../../testdata/package/npa-mathlib/vendor/npa-std/Std/Logic/Eq/certificate.npcert"
-      );
+      ("indexed", conformance_fixture_path "indexed-v0.4.npcert");
+      ("mutual", conformance_fixture_path "mutual-v0.4.npcert");
     ]
   in
   let decoded_golden label path =
@@ -2076,7 +2274,9 @@ let run_hash_module_tests () =
       assert_module_hash_verifies (label ^ " valid module hashes") bytes decoded)
     golden_paths;
 
-  let bytes, decoded = decoded_golden "nat mutation corpus" (List.assoc "nat" golden_paths) in
+  let bytes, decoded =
+    decoded_golden "indexed mutation corpus" (List.assoc "indexed" golden_paths)
+  in
   let hashes = decoded.Ext_cert.hashes in
   let assert_mutated_hash label expected_kind offset =
     let mutated = mutate_byte bytes offset in
@@ -2125,22 +2325,23 @@ let run_hash_module_tests () =
 
 let run_import_store_tests () =
   let nat_path =
-    Filename.concat (root_dir ()) "../../testdata/package/npa-mathlib/vendor/npa-std/Std/Nat/Basic/certificate.npcert"
+    conformance_fixture_path "indexed-v0.4.npcert"
   in
-  let nat_dir = Filename.dirname nat_path in
+  let nat_bytes = read_binary_file nat_path in
   let nat_store =
-    assert_import_store_ok "nat import dir" (Ext_import_store.load_import_dir nat_dir)
+    assert_import_store_ok "indexed import bytes"
+      (Ext_import_store.from_source_free_certificates [ nat_bytes ])
   in
-  assert_int_equal "nat import store entry count" 1
+  assert_int_equal "indexed import store entry count" 1
     (List.length (Ext_import_store.entries nat_store));
   let nat_module =
     match Ext_import_store.entries nat_store with
     | [ entry ] -> entry
-    | _ -> failwith "expected one nat import entry"
+    | _ -> failwith "expected one indexed import entry"
   in
-  assert_equal "nat import module name" "Std.Nat.Basic"
+  assert_equal "indexed import module name" "Conformance.Indexed"
     (Ext_name.to_string nat_module.Ext_import_store.import_entry.Ext_import.module_name);
-  assert_bool "nat import exposes public exports"
+  assert_bool "indexed import exposes public exports"
     (List.length
        nat_module.Ext_import_store.public_environment.Ext_import_store.public_exports
     > 0);
@@ -2192,7 +2393,6 @@ let run_import_store_tests () =
     "import_hash_mismatch" "import_certificate_hash_mismatch" 29 nat_store
     wrong_certificate_request;
 
-  let nat_bytes = read_binary_file nat_path in
   assert_import_store_load_error "bounded certificate read enforces aggregate remainder"
     "certificate_decode_error:resource_limit"
     (Ext_import_store.read_binary_file_with_limit nat_path
@@ -2309,16 +2509,17 @@ let load_single_import_entry label path =
 
 let run_import_normal_tests () =
   let nat_path =
-    Filename.concat (root_dir ()) "../../testdata/package/npa-mathlib/vendor/npa-std/Std/Nat/Basic/certificate.npcert"
+    conformance_fixture_path "indexed-v0.4.npcert"
   in
   let nat_store =
-    assert_import_store_ok "normal nat import dir"
-      (Ext_import_store.load_import_dir (Filename.dirname nat_path))
+    assert_import_store_ok "normal indexed import"
+      (Ext_import_store.from_source_free_certificates
+         [ read_binary_file nat_path ])
   in
   let nat_module =
     match Ext_import_store.entries nat_store with
     | [ entry ] -> entry
-    | _ -> failwith "expected one nat import entry"
+    | _ -> failwith "expected one indexed import entry"
   in
   let nat_request =
     decoded_import_request "normal import request"
@@ -2329,8 +2530,8 @@ let run_import_normal_tests () =
     assert_import_environment_ok "normal import environment resolves" nat_store
       nat_request
   in
-  let nat_import = single_resolved_import "normal nat import" nat_environment in
-  assert_equal "normal import resolved module" "Std.Nat.Basic"
+  let nat_import = single_resolved_import "normal indexed import" nat_environment in
+  assert_equal "normal import resolved module" "Conformance.Indexed"
     (Ext_name.to_string nat_import.Ext_import_store.resolved_module_name);
   assert_equal "normal import resolved export hash"
     nat_module.Ext_import_store.import_entry.Ext_import.export_hash
@@ -2514,10 +2715,10 @@ let run_import_normal_tests () =
 
 let run_import_high_trust_tests () =
   let nat_path =
-    Filename.concat (root_dir ()) "../../testdata/package/npa-mathlib/vendor/npa-std/Std/Nat/Basic/certificate.npcert"
+    conformance_fixture_path "indexed-v0.4.npcert"
   in
-  let nat_module = load_single_import_entry "high-trust nat fixture" nat_path in
-  assert_bool "source-free nat fixture starts unchecked"
+  let nat_module = load_single_import_entry "high-trust indexed fixture" nat_path in
+  assert_bool "source-free indexed fixture starts unchecked"
     (not nat_module.Ext_import_store.checked_by_ext_checker);
   let nat_request_without_hash =
     decoded_import_request "high-trust missing certificate hash request"
@@ -2529,7 +2730,7 @@ let run_import_high_trust_tests () =
     "import_not_found" "missing_import_certificate_hash" [ nat_module ]
     nat_request_without_hash;
   let nat_request_with_hash =
-    decoded_import_request "high-trust nat request"
+    decoded_import_request "high-trust indexed request"
       nat_module.Ext_import_store.import_entry.Ext_import.module_name
       nat_module.Ext_import_store.import_entry.Ext_import.export_hash
       nat_module.Ext_import_store.import_entry.Ext_import.certificate_hash
@@ -2612,10 +2813,10 @@ let decoded_axiom_report_fixture ?(module_name = make_name [ "AxiomReportFixture
   {
     Ext_cert.header =
       {
-        format = Ext_cert.expected_format;
-        core_spec = Ext_cert.expected_core_spec;
+        format = Ext_cert.current_format;
+        core_spec = Ext_cert.current_core_spec;
         module_name;
-        version = Ext_cert.Legacy;
+        version = Ext_cert.Current;
       };
     imports = [];
     name_table = located_names names;
@@ -3607,11 +3808,11 @@ let assert_duplicate_universe_param_error label result =
 
 let run_type_env_tests () =
   let nat_path =
-    Filename.concat (root_dir ()) "../../testdata/package/npa-mathlib/vendor/npa-std/Std/Nat/Basic/certificate.npcert"
+    conformance_fixture_path "indexed-v0.4.npcert"
   in
-  let nat_module = load_single_import_entry "type-env nat fixture" nat_path in
+  let nat_module = load_single_import_entry "type-env indexed fixture" nat_path in
   let nat_request =
-    decoded_import_request "type-env nat import request"
+    decoded_import_request "type-env indexed import request"
       nat_module.Ext_import_store.import_entry.Ext_import.module_name
       nat_module.Ext_import_store.import_entry.Ext_import.export_hash None
   in
@@ -3930,12 +4131,6 @@ let run_type_core_tests () =
   assert_typecheck_ok "type-core reducible definition unfolds in expected type"
     (Ext_typecheck.check alias_env Ext_typecheck.empty_context nat_zero alias_ref);
 
-  let let_term = Ext_term.Let (nat, nat_zero, Ext_term.BVar 0) in
-  assert_infers_term "type-core let inference" nat
-    (Ext_typecheck.infer Ext_env.empty Ext_typecheck.empty_context let_term);
-  assert_typecheck_ok "type-core let checks value and body"
-    (Ext_typecheck.check Ext_env.empty Ext_typecheck.empty_context let_term nat);
-
   assert_typecheck_rejects "type-core rejects ill-typed application" "type_mismatch"
     "expected_function"
     (Ext_typecheck.infer Ext_env.empty Ext_typecheck.empty_context
@@ -3954,10 +4149,7 @@ let run_type_core_tests () =
     "expected_sort"
     (Ext_typecheck.infer Ext_env.empty Ext_typecheck.empty_context
        (Ext_term.Pi (nat_zero, nat)));
-  assert_typecheck_rejects "type-core rejects bad let value" "type_mismatch"
-    "type_mismatch"
-    (Ext_typecheck.infer Ext_env.empty Ext_typecheck.empty_context
-       (Ext_term.Let (nat, Ext_term.Sort Ext_level.Zero, Ext_term.BVar 0)))
+  ()
 
 let run_type_declarations_tests () =
   let nat = Ext_env.nat in
@@ -4714,13 +4906,13 @@ let run_inductive_universe_tests () =
     "universe_inconsistency" "constructor_universe_bound_violation"
     (Ext_typecheck.check_declarations [ malicious_mutual_decl ]);
 
-  let legacy_export_offset = 919 in
+  let constrained_export_offset = 919 in
   let constrained_export =
     {
       Ext_cert.export_name = make_name [ "Audit"; "Provider" ];
       export_kind = Ext_cert.Export_axiom;
       export_universe_params = [ u_name ];
-      export_universe_constraints = [];
+      export_universe_constraints = [ le Ext_env.level_type0 u_level ];
       export_ty = Ext_term.Sort u_level;
       export_body = None;
       export_type_hash = hash_bytes 0x77;
@@ -4729,10 +4921,10 @@ let run_inductive_universe_tests () =
       export_opacity = None;
       export_decl_interface_hash = provider_hash;
       export_axiom_dependencies = [];
-      export_offset = legacy_export_offset;
+      export_offset = constrained_export_offset;
     }
   in
-  let constrained_legacy_module =
+  let constrained_current_module =
     {
       (decoded_axiom_report_fixture
          [ make_name [ "Audit"; "Provider" ]; u_name ] [ provider_decl ])
@@ -4740,24 +4932,15 @@ let run_inductive_universe_tests () =
       Ext_cert.export_block = [ constrained_export ];
     }
   in
-  assert_decode_error
-    "inductive-universe legacy exports cannot erase constraints"
-    "unsupported_schema_version"
-    Ext_bytes.Constrained_export_requires_format_upgrade Ext_bytes.Export_block
-    legacy_export_offset
-    (Ext_import_store.public_environment_of_decoded constrained_legacy_module);
-
-  let fixture_path =
-    Filename.concat (root_dir ())
-      "../../testdata/certificates/security/inductive-constructor-universe-bound-v0.1.npcert"
+  let constrained_public_environment =
+    assert_ok "inductive-universe current exports preserve constraints"
+      (Ext_import_store.public_environment_of_decoded constrained_current_module)
   in
-  let fixture =
-    decode_module_bytes "inductive-universe frozen fixture"
-      (read_binary_file fixture_path)
-  in
-  assert_typecheck_rejects "inductive-universe rejects frozen exploit fixture"
-    "universe_inconsistency" "constructor_universe_bound_violation"
-    (Ext_typecheck.check_declarations fixture.Ext_cert.declaration_table)
+  match constrained_public_environment.Ext_import_store.public_exports with
+  | [ export ] ->
+      assert_int_equal "inductive-universe exported constraint count" 1
+        (List.length export.Ext_import_store.public_universe_constraints)
+  | _ -> failwith "inductive-universe expected one constrained public export"
 
 let run_positivity_tests () =
   let positive_name = make_name [ "Positive" ] in
@@ -5586,7 +5769,7 @@ let run_recursor_tests () =
   let nested_bytes =
     read_binary_file
       (Filename.concat (root_dir ())
-         "test/fixtures/conformance/nested-v0.2.npcert")
+         "test/fixtures/conformance/nested-v0.4.npcert")
   in
   let nested_decoded = decode_module_bytes "nested recursor fixture" nested_bytes in
   let nested_env =
@@ -5648,20 +5831,14 @@ let run_subst_tests () =
       ( Ext_term.BVar 1,
         Ext_term.Pi
           ( Ext_term.App (Ext_term.BVar 2, Ext_term.BVar 0),
-            Ext_term.Let
-              ( Ext_term.BVar 3,
-                Ext_term.BVar 1,
-                Ext_term.App (Ext_term.BVar 4, Ext_term.BVar 0) ) ) )
+            Ext_term.App (Ext_term.BVar 3, Ext_term.BVar 0) ) )
   in
   let shifted_nested =
     Ext_term.Lam
       ( Ext_term.BVar 2,
         Ext_term.Pi
           ( Ext_term.App (Ext_term.BVar 3, Ext_term.BVar 0),
-            Ext_term.Let
-              ( Ext_term.BVar 4,
-                Ext_term.BVar 1,
-                Ext_term.App (Ext_term.BVar 5, Ext_term.BVar 0) ) ) )
+            Ext_term.App (Ext_term.BVar 4, Ext_term.BVar 0) ) )
   in
   assert_term_result "subst shifts nested binders by Rust reference rules"
     shifted_nested (shift nested 1 0);
@@ -5700,19 +5877,6 @@ let run_subst_tests () =
           ( Ext_term.BVar 0,
             Ext_term.App (Ext_term.BVar 0, Ext_term.BVar 1) ))
        0 replacement);
-  assert_term_result "subst let preserves body binder boundary"
-    (Ext_term.Let
-       ( replacement,
-         replacement,
-         Ext_term.App
-           ( Ext_term.App (Ext_term.BVar 1, Ext_term.BVar 3),
-             Ext_term.BVar 0 ) ))
-    (substitute
-       (Ext_term.Let
-          ( Ext_term.BVar 0,
-            Ext_term.BVar 0,
-            Ext_term.App (Ext_term.BVar 1, Ext_term.BVar 0) ))
-       0 replacement);
   assert_term_result "subst instantiate removes the top binder"
     (Ext_term.App (Ext_term.BVar 1, Ext_term.BVar 1))
     (instantiate
@@ -5721,7 +5885,8 @@ let run_subst_tests () =
 
   assert_typecheck_ok "subst preserves well-scoped beta body after instantiate"
     (Ext_typecheck.check Ext_env.empty Ext_typecheck.empty_context
-       (Ext_term.Let (Ext_env.nat, Ext_env.nat_zero, Ext_term.BVar 0))
+       (Ext_term.App
+          (Ext_term.Lam (Ext_env.nat, Ext_term.BVar 0), Ext_env.nat_zero))
        Ext_env.nat);
   assert_typecheck_rejects "subst rejects negative bvar before reduction"
     "type_mismatch" "invalid_bvar"
@@ -5747,8 +5912,6 @@ let run_reduce_tests () =
   in
   let beta_term = Ext_term.App (Ext_term.Lam (nat, Ext_term.BVar 0), nat_zero) in
   assert_term_result "reduce beta lambda application" nat_zero (whnf beta_term);
-  assert_term_result "reduce zeta let value" nat_zero
-    (whnf (Ext_term.Let (nat, nat_zero, Ext_term.BVar 0)));
 
   let alias_decl =
     declaration_fixture Ext_cert.Definition
@@ -5859,12 +6022,10 @@ let run_defeq_tests () =
   let nat = Ext_env.nat in
   let nat_zero = Ext_env.nat_zero in
   let beta_term = Ext_term.App (Ext_term.Lam (nat, Ext_term.BVar 0), nat_zero) in
-  let zeta_term = Ext_term.Let (nat, nat_zero, Ext_term.BVar 0) in
   let defeq ?(env = Ext_env.empty) ?(context = Ext_typecheck.empty_context) lhs rhs =
     Ext_typecheck.is_defeq env context lhs rhs
   in
   assert_defeq "defeq beta equals contractum" true (defeq beta_term nat_zero);
-  assert_defeq "defeq zeta equals body instantiation" true (defeq zeta_term nat_zero);
 
   let alias_decl =
     declaration_fixture Ext_cert.Definition
@@ -5892,85 +6053,6 @@ let run_defeq_tests () =
   assert_defeq "defeq normalizes const levels" true
     (defeq (Ext_env.builtin_const "Eq" [ normalized_level ])
        (Ext_env.builtin_const "Eq" [ Ext_env.level_type0 ]));
-
-  let eq_path =
-    Filename.concat (root_dir ())
-      "../../testdata/package/proofs/vendor/npa-std/Std/Logic/Eq/certificate.npcert"
-  in
-  let eq_module = load_single_import_entry "defeq Eq import fixture" eq_path in
-  let eq_request =
-    decoded_import_request "defeq Eq import request"
-      eq_module.Ext_import_store.import_entry.Ext_import.module_name
-      eq_module.Ext_import_store.import_entry.Ext_import.export_hash None
-  in
-  let eq_import_environment =
-    assert_import_environment_ok "defeq Eq import environment" [ eq_module ]
-      eq_request
-  in
-  let eq_env = Ext_env.of_imports eq_import_environment in
-  let eq_import =
-    single_resolved_import "defeq Eq resolved import" eq_import_environment
-  in
-  let imported_eq_const dotted levels =
-    let imported_name = make_name (Ext_env.split_dotted dotted) in
-    let exports =
-      eq_import.Ext_import_store.resolved_public_environment.public_exports
-    in
-    let export =
-      match
-        List.find_opt
-          (fun (export : Ext_import_store.public_export) ->
-            Ext_name.equal export.Ext_import_store.public_export_name
-              imported_name)
-          exports
-      with
-      | Some export -> export
-      | None ->
-          failwith
-            ("missing imported Eq export " ^ dotted ^ " among "
-            ^ String.concat ","
-                (List.map
-                   (fun (export : Ext_import_store.public_export) ->
-                     Ext_name.to_string
-                       export.Ext_import_store.public_export_name)
-                   exports))
-    in
-    Ext_term.Const
-      ( Ext_term.Imported
-          {
-            import_index = 0;
-            name = imported_name;
-            decl_interface_hash =
-              export.Ext_import_store.public_decl_interface_hash;
-          },
-        levels )
-  in
-  assert_defeq "defeq authenticates imported Eq as builtin" true
-    (defeq ~env:eq_env
-       (imported_eq_const "Eq" [ Ext_level.Zero ])
-       (Ext_env.builtin_const "Eq" [ Ext_level.Zero ]));
-  assert_defeq "defeq authenticates imported Eq.refl as builtin" true
-    (defeq ~env:eq_env
-       (imported_eq_const "Eq.refl" [ Ext_level.Zero ])
-       (Ext_env.builtin_const "Eq.refl" [ Ext_level.Zero ]));
-  let wrong_eq_import =
-    {
-      eq_import with
-      Ext_import_store.resolved_module_name =
-        make_name [ "Not"; "Std"; "Logic"; "Eq" ];
-    }
-  in
-  let wrong_eq_env =
-    Ext_env.of_imports
-      {
-        Ext_import_store.resolved_imports = [ wrong_eq_import ];
-        structural_closure = [];
-      }
-  in
-  assert_defeq "defeq does not bridge an Eq-shaped untrusted module" false
-    (defeq ~env:wrong_eq_env
-       (imported_eq_const "Eq" [ Ext_level.Zero ])
-       (Ext_env.builtin_const "Eq" [ Ext_level.Zero ]));
 
   let fn_ty = Ext_term.Pi (nat, nat) in
   let fn_context = Ext_typecheck.push_assumption Ext_typecheck.empty_context fn_ty in
@@ -6032,7 +6114,7 @@ let run_hash_encoder_tests () =
   in
   let expected_axiom_iface =
     one_byte 0x00 ^ encode_name [ "A" ] ^ encode_uvar_int 0 ^ sort_hash
-    ^ encode_dependency_entries []
+    ^ encode_interface_dependency_entries []
   in
   assert_canonical_bytes "axiom declaration interface payload" expected_axiom_iface
     (Ext_canonical.declaration_interface_payload axiom_decoded.Ext_cert.name_table
@@ -6076,7 +6158,8 @@ let run_hash_encoder_tests () =
   in
   let expected_theorem_iface =
     one_byte 0x02 ^ encode_name [ "A" ] ^ encode_uvar_int 0 ^ theorem_sort_hash
-    ^ encode_opacity_opaque ^ encode_dependency_entries [] ^ encode_axiom_refs []
+    ^ encode_opacity_opaque ^ encode_interface_dependency_entries []
+    ^ encode_axiom_refs []
   in
   assert_canonical_bytes "theorem declaration interface payload" expected_theorem_iface
     (Ext_canonical.declaration_interface_payload theorem_decoded.Ext_cert.name_table
@@ -6124,7 +6207,7 @@ let run_hash_encoder_tests () =
   let import_decoded = decode_module_bytes "import hash fixture" import_module in
   assert_canonical_bytes "import dependency payload"
     (encode_dependency_entries [ (imported_ref, hash_bytes 0x55) ])
-    (Ext_canonical.encode_dependency_entries Ext_cert.Compatibility Ext_bytes.Declarations 0
+    (Ext_canonical.encode_dependency_entries Ext_cert.Current Ext_bytes.Declarations 0
        import_decoded.Ext_cert.name_table (first_declaration import_decoded).Ext_cert.dependencies);
   assert_canonical_bytes "import export payload" (encode_export_block [ import_export ])
     (Ext_canonical.encode_export_block import_decoded);
@@ -6149,34 +6232,11 @@ let run_hash_encoder_tests () =
   assert_canonical_bytes "inductive export payload" (encode_export_block [ inductive_export ])
     (Ext_canonical.encode_export_block inductive_decoded);
 
-  let assert_golden_module label path =
+  let assert_current_reencoding label path =
     let bytes = read_binary_file path in
-    let fixture = golden_hash_fixture label in
-    assert_int_equal (label ^ " golden byte length") fixture.golden_byte_len
-      (String.length bytes);
-    let decoded = decode_module_bytes (label ^ " golden") bytes in
-    assert_equal (label ^ " stored export hash") fixture.golden_export_hash
-      (hex_of_raw_hash decoded.Ext_cert.hashes.Ext_cert.export_hash);
-    assert_equal (label ^ " stored axiom report hash") fixture.golden_axiom_report_hash
-      (hex_of_raw_hash decoded.Ext_cert.hashes.Ext_cert.axiom_report_hash);
-    assert_equal (label ^ " stored certificate hash") fixture.golden_certificate_hash
-      (hex_of_raw_hash decoded.Ext_cert.hashes.Ext_cert.certificate_hash);
-    assert_declaration_hashes label decoded;
-    assert_canonical_hash (label ^ " encoded export hash") fixture.golden_export_hash
-      (Ext_canonical.export_hash decoded);
-    assert_canonical_hash (label ^ " encoded axiom report hash")
-      fixture.golden_axiom_report_hash (Ext_canonical.axiom_report_hash decoded)
-  in
-  assert_golden_module "nat"
-    (Filename.concat (root_dir ()) "../../testdata/package/npa-mathlib/vendor/npa-std/Std/Nat/Basic/certificate.npcert");
-  assert_golden_module "eq"
-    (Filename.concat (root_dir ()) "../../testdata/package/npa-mathlib/vendor/npa-std/Std/Logic/Eq/certificate.npcert");
-
-  let assert_versioned_reencoding label relative_path expected_version =
-    let bytes = read_binary_file (Filename.concat (root_dir ()) relative_path) in
     let decoded = decode_module_bytes label bytes in
     assert_bool (label ^ " version")
-      (decoded.Ext_cert.header.Ext_cert.version = expected_version);
+      (decoded.Ext_cert.header.Ext_cert.version = Ext_cert.Current);
     assert_canonical_bytes (label ^ " full certificate re-encoding") bytes
       (Ext_canonical.encode_module_bytes decoded);
     assert_declaration_hashes label decoded;
@@ -6192,23 +6252,18 @@ let run_hash_encoder_tests () =
           (label ^ ": unexpected hash decode error "
           ^ Ext_bytes.reason_code error.Ext_bytes.reason))
   in
-  assert_versioned_reencoding "previous certificate"
-    "../../testdata/package/npa-mathlib-downstream/vendor/npa-mathlib/Mathlib/Logic/Basic/certificate.npcert"
-    Ext_cert.Previous;
-  assert_versioned_reencoding "compatibility certificate"
-    "../../testdata/package/npa-mathlib-downstream/Downstream/MathlibBasic/certificate.npcert"
-    Ext_cert.Compatibility
+  assert_current_reencoding "indexed v0.4 certificate"
+    (conformance_fixture_path "indexed-v0.4.npcert");
+  assert_current_reencoding "mutual v0.4 certificate"
+    (conformance_fixture_path "mutual-v0.4.npcert")
 
 let run_checker_pipeline_tests () =
   let import_bytes =
-    read_binary_file
-      (Filename.concat (root_dir ())
-         "../../testdata/package/npa-mathlib-downstream/vendor/npa-mathlib/Mathlib/Logic/Basic/certificate.npcert")
+    read_binary_file (conformance_fixture_path "mutual-v0.4.npcert")
   in
   let leaf_bytes =
     read_binary_file
-      (Filename.concat (root_dir ())
-         "../../testdata/package/npa-mathlib-downstream/Downstream/MathlibBasic/certificate.npcert")
+      (conformance_fixture_path "imported-mutual-iota-v0.4.npcert")
   in
   let store =
     match Ext_import_store.from_source_free_certificates [ import_bytes ] with
@@ -6218,14 +6273,23 @@ let run_checker_pipeline_tests () =
   match Ext_checker.check_normal store Ext_axiom.default_policy leaf_bytes with
   | Error _ -> failwith "checker pipeline unexpectedly rejected current leaf"
   | Ok checked ->
-      assert_equal "checker pipeline module" "Downstream.MathlibBasic"
+      assert_equal "checker pipeline module" "Conformance.ImportedMutualIota"
         (Ext_name.to_string (Ext_checker.module_name checked));
       assert_int_equal "checker pipeline declaration count" 1
         (Ext_checker.declarations_checked checked);
       let import_dir =
-        Filename.concat (root_dir ())
-          "../../testdata/package/npa-mathlib-downstream/vendor"
+        Filename.temp_file "npa-checker-ext-pipeline" ".imports"
       in
+      Sys.remove import_dir;
+      Unix.mkdir import_dir 0o700;
+      let import_dir = Unix.realpath import_dir in
+      let import_path = Filename.concat import_dir "provider.npcert" in
+      let write_import bytes =
+        let channel = open_out_bin import_path in
+        output_string channel bytes;
+        close_out channel
+      in
+      write_import import_bytes;
       (match
          Ext_session.check_high_trust import_dir Ext_axiom.default_policy
            leaf_bytes
@@ -6234,7 +6298,7 @@ let run_checker_pipeline_tests () =
       | Ok session ->
           assert_int_equal "checker high-trust import count" 1
             (List.length session.Ext_session.checked_imports);
-          assert_equal "checker high-trust leaf" "Downstream.MathlibBasic"
+          assert_equal "checker high-trust leaf" "Conformance.ImportedMutualIota"
             (Ext_name.to_string
                (Ext_checker.module_name session.Ext_session.leaf)));
       let policy_path =
@@ -6244,8 +6308,7 @@ let run_checker_pipeline_tests () =
         Ext_cli.run
           [
             "--cert";
-            Filename.concat (root_dir ())
-              "../../testdata/package/npa-mathlib-downstream/Downstream/MathlibBasic/certificate.npcert";
+            conformance_fixture_path "imported-mutual-iota-v0.4.npcert";
             "--import-dir";
             import_dir;
             "--policy";
@@ -6266,11 +6329,11 @@ let run_checker_pipeline_tests () =
         assert_contains (label ^ " checker id")
           "\"checker_id\": \"npa-checker-ext\"" json;
         assert_contains (label ^ " checker version")
-          "\"checker_version\": \"0.3.0\"" json;
+          "\"checker_version\": \"0.4.0\"" json;
         assert_contains (label ^ " capability format")
-          "\"certificate_format\": \"NPA-CERT-0.3.0\"" json;
+          "\"certificate_format\": \"NPA-CERT-0.4.0\"" json;
         assert_contains (label ^ " capability core")
-          "\"core_spec\": \"NPA-Core-0.3.0\"" json;
+          "\"core_spec\": \"NPA-Core-0.4.0\"" json;
         assert_contains (label ^ " checker build hash")
           ("\"checker_build_hash\": \"" ^ Ext_result.checker_build_hash ^ "\"")
           json
@@ -6279,17 +6342,16 @@ let run_checker_pipeline_tests () =
       assert_contains "checker executable-shaped CLI checked"
         "\"status\": \"checked\"" cli.stdout;
       assert_contains "checker executable-shaped CLI module"
-        "\"module\": \"Downstream.MathlibBasic\"" cli.stdout;
-      assert_contains "checker compatibility input format"
-        "\"input_certificate_format\": \"NPA-CERT-0.2.0\"" cli.stdout;
-      assert_contains "checker compatibility input core"
-        "\"input_core_spec\": \"NPA-Core-0.2.0\"" cli.stdout;
+        "\"module\": \"Conformance.ImportedMutualIota\"" cli.stdout;
+      assert_contains "checker current input format"
+        "\"input_certificate_format\": \"NPA-CERT-0.4.0\"" cli.stdout;
+      assert_contains "checker current input core"
+        "\"input_core_spec\": \"NPA-Core-0.4.0\"" cli.stdout;
       let policy_hash_mismatch =
         Ext_cli.run
           [
             "--cert";
-            Filename.concat (root_dir ())
-              "../../testdata/package/npa-mathlib-downstream/Downstream/MathlibBasic/certificate.npcert";
+            conformance_fixture_path "imported-mutual-iota-v0.4.npcert";
             "--import-dir";
             import_dir;
             "--policy";
@@ -6313,7 +6375,7 @@ let run_checker_pipeline_tests () =
       let boundary_file name =
         read_binary_file (Filename.concat boundary_dir name)
       in
-      let check_v0_3_fixture name expected_module =
+      let check_v0_4_fixture name expected_module =
         let bytes = boundary_file name in
         let decoded = decode_module_bytes name bytes in
         assert_bool (name ^ " current version")
@@ -6327,24 +6389,24 @@ let run_checker_pipeline_tests () =
         | Ok checked ->
             assert_equal (name ^ " module") expected_module
               (Ext_name.to_string (Ext_checker.module_name checked));
-            assert_equal (name ^ " input format") "NPA-CERT-0.3.0"
+            assert_equal (name ^ " input format") "NPA-CERT-0.4.0"
               (Ext_checker.input_certificate_format checked);
-            assert_equal (name ^ " input core") "NPA-Core-0.3.0"
+            assert_equal (name ^ " input core") "NPA-Core-0.4.0"
               (Ext_checker.input_core_spec checked);
             let raw = Ext_cli.checked_result checked in
             assert_contains (name ^ " raw capability format")
-              "\"certificate_format\": \"NPA-CERT-0.3.0\"" raw;
+              "\"certificate_format\": \"NPA-CERT-0.4.0\"" raw;
             assert_contains (name ^ " raw input format")
-              "\"input_certificate_format\": \"NPA-CERT-0.3.0\"" raw
-        | Error _ -> failwith (name ^ ": expected successful v0.3 check")
+              "\"input_certificate_format\": \"NPA-CERT-0.4.0\"" raw
+        | Error _ -> failwith (name ^ ": expected successful v0.4 check")
       in
-      check_v0_3_fixture "opaque-direct-v0.3.npcert"
+      check_v0_4_fixture "opaque-direct-v0.4.npcert"
         "Conformance.OpaqueDirect";
-      check_v0_3_fixture "opaque-alias-chain-v0.3.npcert"
+      check_v0_4_fixture "opaque-alias-chain-v0.4.npcert"
         "Conformance.OpaqueAliasChain";
       (match
          Ext_checker.check_high_trust [] Ext_axiom.default_policy
-           (boundary_file "invalid-target-v0.3.npcert")
+           (boundary_file "invalid-target-v0.4.npcert")
        with
       | Error (Ext_checker.Axiom_report_error error) ->
           assert_equal "invalid target kind" "dependency_hash_mismatch"
@@ -6353,10 +6415,10 @@ let run_checker_pipeline_tests () =
             (Ext_axiom.error_reason_code error);
           assert_bool "invalid target section"
             (error.Ext_axiom.section = Ext_bytes.Declarations)
-      | _ -> failwith "invalid v0.3 implementation target must be rejected");
+      | _ -> failwith "invalid v0.4 implementation target must be rejected");
       (match
          Ext_checker.check_high_trust [] Ext_axiom.default_policy
-           (boundary_file "stale-implementation-hash-v0.3.npcert")
+           (boundary_file "stale-implementation-hash-v0.4.npcert")
        with
       | Error (Ext_checker.Axiom_report_error error) ->
           assert_equal "stale implementation hash kind"
@@ -6365,36 +6427,21 @@ let run_checker_pipeline_tests () =
             "certificate_hash_mismatch" (Ext_axiom.error_reason_code error);
           assert_bool "stale implementation hash section"
             (error.Ext_axiom.section = Ext_bytes.Declarations)
-      | _ -> failwith "stale v0.3 implementation hash must be rejected");
+      | _ -> failwith "stale v0.4 implementation hash must be rejected");
       (match
          Ext_checker.check_high_trust [] Ext_axiom.default_policy
-           (boundary_file "legacy-empty-v0.1.npcert")
-       with
-      | Ok checked ->
-          assert_equal "compact legacy module" "Conformance.LegacyEmpty"
-            (Ext_name.to_string (Ext_checker.module_name checked));
-          assert_equal "compact legacy input format" "NPA-CERT-0.1"
-            (Ext_checker.input_certificate_format checked);
-          let raw = Ext_cli.checked_result checked in
-          assert_contains "compact legacy raw capability"
-            "\"certificate_format\": \"NPA-CERT-0.3.0\"" raw;
-          assert_contains "compact legacy raw input"
-            "\"input_certificate_format\": \"NPA-CERT-0.1\"" raw
-      | Error _ -> failwith "compact legacy fixture must remain accepted");
-      (match
-         Ext_checker.check_high_trust [] Ext_axiom.default_policy
-           (boundary_file "forbidden-axiom-v0.3.npcert")
+           (boundary_file "forbidden-axiom-v0.4.npcert")
        with
       | Error (Ext_checker.Axiom_policy_error _) -> ()
-      | _ -> failwith "v0.3 forbidden axiom fixture must reach policy denial");
+      | _ -> failwith "v0.4 forbidden axiom fixture must reach policy denial");
       let bad_provider =
-        boundary_file "unchecked-provider-bad-v0.2.npcert"
+        boundary_file "unchecked-provider-bad-v0.4.npcert"
       in
       let unpinned_leaf =
-        boundary_file "unchecked-consumer-unpinned-v0.2.npcert"
+        boundary_file "unchecked-consumer-unpinned-v0.4.npcert"
       in
       let pinned_leaf =
-        boundary_file "unchecked-consumer-pinned-v0.2.npcert"
+        boundary_file "unchecked-consumer-pinned-v0.4.npcert"
       in
       (match
          Ext_checker.check_normal [] Ext_axiom.default_policy bad_provider
@@ -6418,8 +6465,9 @@ let run_checker_pipeline_tests () =
             (Ext_name.to_string (Ext_checker.module_name checked))
       | Error _ ->
           failwith "normal mode must retain unchecked-import semantics");
+      write_import bad_provider;
       (match
-         Ext_session.check_high_trust boundary_dir Ext_axiom.default_policy
+         Ext_session.check_high_trust import_dir Ext_axiom.default_policy
            pinned_leaf
        with
       | Error (Ext_session.Check_error (Ext_checker.Type_error _)) -> ()
@@ -6435,7 +6483,7 @@ let run_checker_pipeline_tests () =
       in
       (match
          Ext_checker.check_high_trust [] permissive_policy
-           (boundary_file "forbidden-axiom-v0.2.npcert")
+           (boundary_file "forbidden-axiom-v0.4.npcert")
        with
       | Error (Ext_checker.Axiom_policy_error _) -> ()
       | _ ->
@@ -6445,13 +6493,13 @@ let run_checker_pipeline_tests () =
       let decoded_fixture name =
         decode_module_bytes name (boundary_file name)
       in
-      let indexed = decoded_fixture "indexed-v0.2.npcert" in
-      let mutual = decoded_fixture "mutual-v0.2.npcert" in
-      let nested = decoded_fixture "nested-v0.2.npcert" in
+      let indexed = decoded_fixture "indexed-v0.4.npcert" in
+      let mutual = decoded_fixture "mutual-v0.4.npcert" in
+      let nested = decoded_fixture "nested-v0.4.npcert" in
       let checked_mutual =
         match
           Ext_checker.check_high_trust [] Ext_axiom.default_policy
-            (boundary_file "mutual-v0.2.npcert")
+            (boundary_file "mutual-v0.4.npcert")
         with
         | Ok checked -> checked
         | Error _ -> failwith "mutual cache provider must check"
@@ -6460,7 +6508,7 @@ let run_checker_pipeline_tests () =
         match
           Ext_checker.check_high_trust [ checked_mutual ]
             Ext_axiom.default_policy
-            (boundary_file "imported-mutual-iota-v0.2.npcert")
+            (boundary_file "imported-mutual-iota-v0.4.npcert")
         with
         | Ok checked -> checked
         | Error _ -> failwith "mutual cache consumer must check"
@@ -6567,7 +6615,9 @@ let run_checker_pipeline_tests () =
             { reason = Ext_session.Missing_certificate_hash; offset = 17 }) ->
           ()
       | _ ->
-          failwith "high-trust plan must reject missing certificate hashes")
+          failwith "high-trust plan must reject missing certificate hashes");
+      Sys.remove import_path;
+      Unix.rmdir import_dir
 
 let should_run selected name = selected = [] || List.mem name selected
 
@@ -6591,6 +6641,7 @@ let () =
                "decoder-reachability";
                "decoder-tables";
                "feature-policy";
+               "fixture-matrix";
                "hash-declarations";
                "hash-encoder";
                "hash-level-term";
@@ -6626,6 +6677,7 @@ let () =
   if should_run selected "decoder-declarations" then run_decoder_declarations_tests ();
   if should_run selected "decoder-reachability" then run_decoder_reachability_tests ();
   if should_run selected "feature-policy" then run_feature_policy_tests ();
+  if should_run selected "fixture-matrix" then run_fixture_matrix_tests ();
   if should_run selected "hash-level-term" then run_hash_level_term_tests ();
   if should_run selected "hash-declarations" then run_hash_declarations_tests ();
   if should_run selected "hash-module" then run_hash_module_tests ();

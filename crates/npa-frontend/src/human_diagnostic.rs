@@ -40,7 +40,6 @@ pub struct HumanKernelWorkSnapshot {
     pub beta_steps: u64,
     pub delta_steps: u64,
     pub iota_steps: u64,
-    pub zeta_steps: u64,
     pub physical_reductions: u64,
     pub overflowed: bool,
 }
@@ -198,7 +197,6 @@ impl HumanKernelWorkSnapshot {
             beta_steps: work.beta_steps,
             delta_steps: work.delta_steps,
             iota_steps: work.iota_steps,
-            zeta_steps: work.zeta_steps,
             physical_reductions: work.physical_reductions,
             overflowed: work.overflowed,
         }
@@ -257,6 +255,7 @@ pub enum HumanDiagnosticSeverity {
 pub enum HumanDiagnosticKind {
     NotImplemented,
     ParseError,
+    RemovedTermLet,
     OpaqueModifierNotFollowedByDef,
     DuplicateOpaqueModifier,
     UnsupportedOpaqueEquationDefinition,
@@ -317,6 +316,42 @@ pub enum HumanDiagnosticPhase {
     CertificateHandoff,
 }
 
+/// Stable delimiter failure classification for lexical source preflight.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum HumanDelimiterDiagnosticKind {
+    /// A closing delimiter appeared with no currently open delimiter.
+    UnexpectedClosing,
+    /// A closing delimiter did not match the innermost open delimiter.
+    MismatchedClosing,
+    /// Input ended while a delimiter was still open.
+    Unclosed,
+}
+
+impl HumanDelimiterDiagnosticKind {
+    /// Stable machine-readable spelling.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::UnexpectedClosing => "unexpected_closing_delimiter",
+            Self::MismatchedClosing => "mismatched_closing_delimiter",
+            Self::Unclosed => "unclosed_delimiter",
+        }
+    }
+}
+
+/// Structured delimiter context attached to a lexical source diagnostic.
+#[non_exhaustive]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HumanDelimiterDiagnostic {
+    /// Stable failure classification.
+    pub kind: HumanDelimiterDiagnosticKind,
+    /// Opening-delimiter span when one exists for this failure.
+    pub opening_span: Option<Span>,
+    /// Expected closing delimiter when one is known.
+    pub expected_closing: Option<String>,
+    /// Encountered closing delimiter, absent for an end-of-input failure.
+    pub actual_closing: Option<String>,
+}
+
 impl HumanDiagnosticPhase {
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -346,6 +381,8 @@ pub struct HumanDiagnosticPayload {
     pub conversion: Option<HumanDiagnosticConversionContext>,
     pub universe_mismatch: Option<HumanUniverseMismatchContext>,
     pub kernel_fuel: Option<HumanKernelFuelDiagnostic>,
+    /// Structured context for lexical delimiter failures.
+    pub delimiter: Option<HumanDelimiterDiagnostic>,
 }
 
 impl HumanDiagnosticPayload {
@@ -376,6 +413,12 @@ impl HumanDiagnosticPayload {
     #[must_use]
     pub fn with_kernel_fuel(mut self, kernel_fuel: HumanKernelFuelDiagnostic) -> Self {
         self.kernel_fuel = Some(kernel_fuel);
+        self
+    }
+
+    #[must_use]
+    pub fn with_delimiter(mut self, delimiter: HumanDelimiterDiagnostic) -> Self {
+        self.delimiter = Some(delimiter);
         self
     }
 }
@@ -509,7 +552,6 @@ pub struct HumanHoleGoal {
 pub struct HumanHoleGoalLocal {
     pub name: String,
     pub ty: String,
-    pub value: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -564,6 +606,14 @@ impl HumanDiagnostic {
 
     pub fn parse(primary_span: Span, message: impl Into<String>) -> Self {
         Self::error(HumanDiagnosticKind::ParseError, primary_span, message)
+    }
+
+    pub fn removed_term_let(primary_span: Span) -> Self {
+        Self::error(
+            HumanDiagnosticKind::RemovedTermLet,
+            primary_span,
+            "term-level `let` has been removed; substitute the value directly, apply an explicitly typed `fun`, use `have` for a local proof, or introduce a named module-level declaration",
+        )
     }
 
     pub fn opaque_modifier_not_followed_by_def(
@@ -698,6 +748,9 @@ fn merge_human_diagnostic_payload(
     if next.kernel_fuel.is_none() {
         next.kernel_fuel = existing.kernel_fuel;
     }
+    if next.delimiter.is_none() {
+        next.delimiter = existing.delimiter;
+    }
     next
 }
 
@@ -733,12 +786,7 @@ fn render_human_diagnostic_message(
         if !goal.context.is_empty() {
             lines.push("context:".to_owned());
             for local in &goal.context {
-                match &local.value {
-                    Some(value) => {
-                        lines.push(format!("  {} : {} := {}", local.name, local.ty, value))
-                    }
-                    None => lines.push(format!("  {} : {}", local.name, local.ty)),
-                }
+                lines.push(format!("  {} : {}", local.name, local.ty));
             }
         }
         if let Some(target) = &goal.target {
@@ -753,6 +801,7 @@ fn human_diagnostic_kind_label(kind: &HumanDiagnosticKind) -> &'static str {
     match kind {
         HumanDiagnosticKind::NotImplemented => "not implemented",
         HumanDiagnosticKind::ParseError => "parse error",
+        HumanDiagnosticKind::RemovedTermLet => "removed term let",
         HumanDiagnosticKind::OpaqueModifierNotFollowedByDef => {
             "opaque modifier not followed by def"
         }

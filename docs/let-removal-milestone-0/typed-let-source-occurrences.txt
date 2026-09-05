@@ -1,0 +1,12 @@
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/testdata/package/npa-mathlib-seed/Proofs/Ai/Reduction/source.npa:17:  fun n => let x : Nat := n in x
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/testdata/package/npa-mathlib-seed/Proofs/Ai/Reduction/source.npa:21:  fun n => let z : Nat := Nat.zero in z
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/testdata/package/npa-mathlib/Mathlib/Core/Reduction/source.npa:17:  fun n => let x : Nat := n in x
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/testdata/package/npa-mathlib/Mathlib/Core/Reduction/source.npa:21:  fun n => let z : Nat := Nat.zero in z
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-corpus/fixtures/npa-mathlib-seed/Proofs/Ai/Reduction/source.npa:17:  fun n => let x : Nat := n in x
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-corpus/fixtures/npa-mathlib-seed/Proofs/Ai/Reduction/source.npa:21:  fun n => let z : Nat := Nat.zero in z
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-corpus/fixtures/npa-mathlib/Mathlib/Core/Reduction/source.npa:17:  fun n => let x : Nat := n in x
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-corpus/fixtures/npa-mathlib/Mathlib/Core/Reduction/source.npa:21:  fun n => let z : Nat := Nat.zero in z
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-corpus/proofs/Proofs/Ai/Reduction/source.npa:17:  fun n => let x : Nat := n in x
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-corpus/proofs/Proofs/Ai/Reduction/source.npa:21:  fun n => let z : Nat := Nat.zero in z
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-mathlib/Mathlib/Core/Reduction/source.npa:17:  fun n => let x : Nat := n in x
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-mathlib/Mathlib/Core/Reduction/source.npa:21:  fun n => let z : Nat := Nat.zero in z

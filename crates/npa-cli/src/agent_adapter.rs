@@ -1,5 +1,6 @@
 //! Local-process adapter binaries for `agentctl` typed verifier calls.
 
+use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::io::{self, Read};
 use std::path::Path;
@@ -11,6 +12,10 @@ use npa_package::{format_package_hash, package_file_hash};
 const REQUEST_SCHEMA_ID: &str = "npa-client.local-process-request.v1";
 const RESPONSE_SCHEMA_ID: &str = "npa-client.local-process-response.v1";
 const ZERO_HASH: &str = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+// Matches the accepted local-process verifier profile's request-body budget.
+const MAX_REQUEST_BYTES: u64 = 1024 * 1024;
+const MAX_NPA_MANIFEST_BYTES: u64 = 1024 * 1024;
+const DISABLED_IDENTITY_BINDING_MESSAGE: &str = "local-process adapter identity binding is disabled: the caller must hash and execute the same retained executable and provide a build identity derived from the closed source/toolchain inputs";
 
 /// Adapter executable selected by the binary entrypoint.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -46,11 +51,13 @@ pub fn is_agent_adapter_invocation(args: &[String]) -> bool {
 /// Run an adapter entrypoint from the real process environment.
 pub fn run_agent_adapter_process(executable: AgentAdapterExecutable) -> ExitCode {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
-    let mut input = String::new();
-    if let Err(error) = io::stdin().read_to_string(&mut input) {
-        eprintln!("failed to read local-process request stdin: {error}");
-        return ExitCode::from(2);
-    }
+    let input = match read_request_input(io::stdin()) {
+        Ok(input) => input,
+        Err(error) => {
+            eprintln!("failed to read local-process request stdin: {error}");
+            return ExitCode::from(2);
+        }
+    };
     let output = run_agent_adapter(executable, &args, &input);
     if !output.stdout.is_empty() {
         print!("{}", output.stdout);
@@ -61,11 +68,40 @@ pub fn run_agent_adapter_process(executable: AgentAdapterExecutable) -> ExitCode
     ExitCode::from(output.exit_code)
 }
 
+fn read_request_input(mut reader: impl Read) -> io::Result<String> {
+    let mut bytes = Vec::new();
+    reader
+        .by_ref()
+        .take(MAX_REQUEST_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_REQUEST_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "local-process request exceeds its byte limit",
+        ));
+    }
+    String::from_utf8(bytes).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "local-process request is not UTF-8",
+        )
+    })
+}
+
 /// Run an adapter request using explicit argv and stdin.
 pub fn run_agent_adapter(
     executable: AgentAdapterExecutable,
     args: &[String],
     input: &str,
+) -> AgentAdapterOutput {
+    run_agent_adapter_with_binding(executable, args, input, None)
+}
+
+fn run_agent_adapter_with_binding(
+    executable: AgentAdapterExecutable,
+    args: &[String],
+    input: &str,
+    test_binding: Option<(&str, &str)>,
 ) -> AgentAdapterOutput {
     let operation = match parse_operation_arg(args) {
         Ok(operation) => operation,
@@ -111,7 +147,7 @@ pub fn run_agent_adapter(
             stderr: String::new(),
         };
     }
-    if let Err(message) = validate_envelope(&envelope) {
+    if let Err(message) = validate_envelope(&envelope, test_binding) {
         return AgentAdapterOutput {
             exit_code: 2,
             stdout: invalid_request_response(operation, &envelope.request_hash, &message),
@@ -180,6 +216,18 @@ impl AgentOperation {
             Self::IndependentChecker => "independent_checker",
         }
     }
+
+    const fn endpoint_path(self) -> &'static str {
+        match self {
+            Self::SnapshotGet => "/v1/npa/snapshots/get",
+            Self::FocusedReplay => "/v1/npa/replay",
+            Self::ModuleBuild => "/v1/npa/module/build",
+            Self::CertificateBuild => "/v1/npa/certificate/build",
+            Self::CertificateVerify => "/v1/npa/certificate/verify",
+            Self::SourceFreeVerification => "/v1/npa/source-free/verify",
+            Self::IndependentChecker => "/v1/npa/checker/independent",
+        }
+    }
 }
 
 impl AgentAdapterExecutable {
@@ -203,6 +251,7 @@ struct RequestEnvelope {
     operation: AgentOperation,
     request_hash: String,
     npa_root: String,
+    workspace_root: String,
     expected_npa_build_hash: String,
     expected_verifier_binary_hash: String,
     payload: RequestPayload,
@@ -257,10 +306,31 @@ fn parse_operation_arg(args: &[String]) -> Result<AgentOperation, String> {
 }
 
 fn parse_request_envelope(source: &str) -> Result<RequestEnvelope, String> {
-    let document = JsonDocument::parse_with_limits(source, JsonParseLimits { max_depth: 64 })
-        .map_err(|error| format!("malformed request JSON at byte {}", error.offset))?;
+    let document = JsonDocument::parse_with_limits(
+        source,
+        JsonParseLimits {
+            max_depth: 32,
+            ..JsonParseLimits::default()
+        },
+    )
+    .map_err(|error| format!("malformed request JSON at byte {}", error.offset))?;
     let root =
         object_members(document.root()).ok_or_else(|| "request must be an object".to_owned())?;
+    require_exact_fields(
+        root,
+        &[
+            "schema_id",
+            "operation",
+            "endpoint_path",
+            "request_hash",
+            "npa_root",
+            "workspace_root",
+            "expected_npa_build_hash",
+            "expected_verifier_binary_hash",
+            "payload",
+        ],
+        "request",
+    )?;
     let schema_id = required_string(root, "schema_id")?;
     if schema_id != REQUEST_SCHEMA_ID {
         return Err("unsupported request schema_id".to_owned());
@@ -268,30 +338,52 @@ fn parse_request_envelope(source: &str) -> Result<RequestEnvelope, String> {
     let operation_raw = required_string(root, "operation")?;
     let operation = AgentOperation::parse(operation_raw)
         .ok_or_else(|| "unsupported request operation".to_owned())?;
+    if required_string(root, "endpoint_path")? != operation.endpoint_path() {
+        return Err("endpoint_path does not match request operation".to_owned());
+    }
     let request_hash = required_hash(root, "request_hash")?.to_owned();
     let npa_root = required_string(root, "npa_root")?.to_owned();
-    let _workspace_root = required_string(root, "workspace_root")?;
+    let workspace_root = required_string(root, "workspace_root")?.to_owned();
     let expected_npa_build_hash = required_hash(root, "expected_npa_build_hash")?.to_owned();
     let expected_verifier_binary_hash =
         required_hash(root, "expected_verifier_binary_hash")?.to_owned();
-    let payload = parse_payload(required_value(root, "payload")?)?;
+    let payload = parse_payload(operation, required_value(root, "payload")?)?;
 
     Ok(RequestEnvelope {
         operation,
         request_hash,
         npa_root,
+        workspace_root,
         expected_npa_build_hash,
         expected_verifier_binary_hash,
         payload,
     })
 }
 
-fn validate_envelope(envelope: &RequestEnvelope) -> Result<(), String> {
-    if !Path::new(&envelope.npa_root).join("Cargo.toml").is_file() {
-        return Err("npa_root must contain Cargo.toml".to_owned());
+fn validate_envelope(
+    envelope: &RequestEnvelope,
+    test_binding: Option<(&str, &str)>,
+) -> Result<(), String> {
+    let Some((bound_npa_build_hash, bound_verifier_binary_hash)) = test_binding else {
+        return Err(DISABLED_IDENTITY_BINDING_MESSAGE.to_owned());
+    };
+    let npa_root = Path::new(&envelope.npa_root);
+    if !npa_root.is_absolute() {
+        return Err("npa_root must be absolute".to_owned());
     }
-    let _ = &envelope.expected_npa_build_hash;
-    let _ = &envelope.expected_verifier_binary_hash;
+    if !Path::new(&envelope.workspace_root).is_absolute() {
+        return Err("workspace_root must be absolute".to_owned());
+    }
+    crate::fs::read_bounded_regular_file(&npa_root.join("Cargo.toml"), MAX_NPA_MANIFEST_BYTES)
+        .map_err(|_| "npa_root must contain a bounded regular Cargo.toml".to_owned())?;
+    if envelope.expected_npa_build_hash != bound_npa_build_hash {
+        return Err("expected_npa_build_hash does not match adapter build attestation".to_owned());
+    }
+    if envelope.expected_verifier_binary_hash != bound_verifier_binary_hash {
+        return Err(
+            "expected_verifier_binary_hash does not match adapter verifier attestation".to_owned(),
+        );
+    }
     let _ = &envelope.payload.environment_hash;
     let _ = &envelope.payload.policy_hash;
     let _ = &envelope.payload.supply_chain_pin_set_hash;
@@ -313,12 +405,12 @@ fn operation_result_fields(
                     operation,
                     &envelope.request_hash,
                     "state_fingerprint",
-                    payload,
+                    envelope,
                 ),
             ),
             (
                 "export_hash",
-                derived_hash(operation, &envelope.request_hash, "export_hash", payload),
+                derived_hash(operation, &envelope.request_hash, "export_hash", envelope),
             ),
         ],
         AgentOperation::FocusedReplay => vec![
@@ -335,7 +427,7 @@ fn operation_result_fields(
                     operation,
                     &envelope.request_hash,
                     "replay_trace_hash",
-                    payload,
+                    envelope,
                 ),
             ),
         ],
@@ -346,12 +438,12 @@ fn operation_result_fields(
                     operation,
                     &envelope.request_hash,
                     "module_artifact_hash",
-                    payload,
+                    envelope,
                 ),
             ),
             (
                 "export_hash",
-                derived_hash(operation, &envelope.request_hash, "export_hash", payload),
+                derived_hash(operation, &envelope.request_hash, "export_hash", envelope),
             ),
         ],
         AgentOperation::CertificateBuild => vec![
@@ -361,7 +453,7 @@ fn operation_result_fields(
                     operation,
                     &envelope.request_hash,
                     "certificate_hash",
-                    payload,
+                    envelope,
                 ),
             ),
             (
@@ -370,7 +462,7 @@ fn operation_result_fields(
                     operation,
                     &envelope.request_hash,
                     "certificate_artifact_hash",
-                    payload,
+                    envelope,
                 ),
             ),
             (
@@ -379,14 +471,14 @@ fn operation_result_fields(
                     operation,
                     &envelope.request_hash,
                     "axiom_report_hash",
-                    payload,
+                    envelope,
                 ),
             ),
         ],
         AgentOperation::CertificateVerify => vec![
             (
                 "result_hash",
-                derived_hash(operation, &envelope.request_hash, "result_hash", payload),
+                derived_hash(operation, &envelope.request_hash, "result_hash", envelope),
             ),
             (
                 "certificate_hash",
@@ -435,7 +527,7 @@ fn derived_hash(
     operation: AgentOperation,
     request_hash: &str,
     field: &str,
-    payload: &RequestPayload,
+    envelope: &RequestEnvelope,
 ) -> String {
     let mut body = String::new();
     body.push_str("schema:npa.agent-local-process-adapter.v1\n");
@@ -448,17 +540,127 @@ fn derived_hash(
     body.push_str("field:");
     body.push_str(field);
     body.push('\n');
+    body.push_str("expected_npa_build_hash:");
+    body.push_str(&envelope.expected_npa_build_hash);
+    body.push('\n');
+    body.push_str("expected_verifier_binary_hash:");
+    body.push_str(&envelope.expected_verifier_binary_hash);
+    body.push('\n');
     body.push_str("payload:");
-    body.push_str(&payload.raw);
+    body.push_str(&envelope.payload.raw);
     body.push('\n');
     format_package_hash(&package_file_hash(body.as_bytes()))
 }
 
-fn parse_payload(value: &JsonValue<'_>) -> Result<RequestPayload, String> {
+fn parse_payload(
+    operation: AgentOperation,
+    value: &JsonValue<'_>,
+) -> Result<RequestPayload, String> {
     let payload = object_members(value).ok_or_else(|| "payload must be an object".to_owned())?;
+    let expected_fields: &[&str] = match operation {
+        AgentOperation::SnapshotGet => &["context", "project_id", "task_id"],
+        AgentOperation::FocusedReplay => &[
+            "context",
+            "candidate_hash",
+            "replay_artifact_hash",
+            "max_steps",
+        ],
+        AgentOperation::ModuleBuild => &[
+            "context",
+            "module_name",
+            "source_artifact_hash",
+            "options_hash",
+            "base_export_hash",
+        ],
+        AgentOperation::CertificateBuild => &[
+            "context",
+            "candidate_hash",
+            "module_artifact_hash",
+            "export_hash",
+        ],
+        AgentOperation::CertificateVerify => &[
+            "context",
+            "certificate_hash",
+            "export_hash",
+            "axiom_report_hash",
+        ],
+        AgentOperation::SourceFreeVerification => &[
+            "context",
+            "statement_hash",
+            "certificate_hash",
+            "export_hash",
+        ],
+        AgentOperation::IndependentChecker => &[
+            "context",
+            "checker_profile",
+            "certificate_hash",
+            "export_hash",
+            "axiom_report_hash",
+        ],
+    };
+    require_exact_fields(payload, expected_fields, "payload")?;
     let context_value = required_value(payload, "context")?;
     let context =
         object_members(context_value).ok_or_else(|| "context must be an object".to_owned())?;
+    require_exact_fields(
+        context,
+        &[
+            "request_id",
+            "workspace_id",
+            "snapshot_hash",
+            "environment_hash",
+            "policy_hash",
+            "supply_chain_pin_set_hash",
+            "sandbox_profile_hash",
+            "timeout_ms",
+        ],
+        "context",
+    )?;
+    require_safe_text(context, "request_id")?;
+    let workspace_id = require_safe_text(context, "workspace_id")?;
+    if !is_safe_workspace_id(workspace_id) {
+        return Err("workspace_id must be a safe relative isolated workspace".to_owned());
+    }
+    required_positive_u64(context, "timeout_ms")?;
+
+    match operation {
+        AgentOperation::SnapshotGet => {
+            require_safe_text(payload, "project_id")?;
+            require_safe_text(payload, "task_id")?;
+        }
+        AgentOperation::FocusedReplay => {
+            required_hash(payload, "candidate_hash")?;
+            required_hash(payload, "replay_artifact_hash")?;
+            required_positive_u64(payload, "max_steps")?;
+        }
+        AgentOperation::ModuleBuild => {
+            require_safe_text(payload, "module_name")?;
+            required_hash(payload, "source_artifact_hash")?;
+            required_hash(payload, "options_hash")?;
+            required_hash(payload, "base_export_hash")?;
+        }
+        AgentOperation::CertificateBuild => {
+            required_hash(payload, "candidate_hash")?;
+            required_hash(payload, "module_artifact_hash")?;
+            required_hash(payload, "export_hash")?;
+        }
+        AgentOperation::CertificateVerify => {
+            required_hash(payload, "certificate_hash")?;
+            required_hash(payload, "export_hash")?;
+            required_hash(payload, "axiom_report_hash")?;
+        }
+        AgentOperation::SourceFreeVerification => {
+            required_hash(payload, "statement_hash")?;
+            required_hash(payload, "certificate_hash")?;
+            required_hash(payload, "export_hash")?;
+        }
+        AgentOperation::IndependentChecker => {
+            require_safe_text(payload, "checker_profile")?;
+            required_hash(payload, "certificate_hash")?;
+            required_hash(payload, "export_hash")?;
+            required_hash(payload, "axiom_report_hash")?;
+        }
+    }
     Ok(RequestPayload {
         raw: value.raw_slice().to_owned(),
         snapshot_hash: required_hash(context, "snapshot_hash")?.to_owned(),
@@ -471,6 +673,72 @@ fn parse_payload(value: &JsonValue<'_>) -> Result<RequestPayload, String> {
         export_hash: optional_hash(payload, "export_hash")?,
         axiom_report_hash: optional_hash(payload, "axiom_report_hash")?,
     })
+}
+
+fn require_exact_fields(
+    object: &[JsonMember<'_>],
+    expected: &[&str],
+    label: &str,
+) -> Result<(), String> {
+    let expected = expected.iter().copied().collect::<BTreeSet<_>>();
+    let mut actual = BTreeSet::new();
+    for member in object {
+        if !actual.insert(member.key()) {
+            return Err(format!("duplicate {label} field {}", member.key()));
+        }
+    }
+    if actual != expected {
+        let missing = expected.difference(&actual).copied().collect::<Vec<_>>();
+        let unknown = actual.difference(&expected).copied().collect::<Vec<_>>();
+        return Err(format!(
+            "{label} fields do not match the closed schema (missing: {}; unknown: {})",
+            missing.join(","),
+            unknown.join(",")
+        ));
+    }
+    Ok(())
+}
+
+fn require_safe_text<'src>(
+    object: &'src [JsonMember<'src>],
+    field: &str,
+) -> Result<&'src str, String> {
+    let value = required_string(object, field)?;
+    if value.trim().is_empty()
+        || value.chars().any(|character| {
+            character.is_control()
+                || matches!(
+                    character,
+                    ';' | '&' | '|' | '$' | '`' | '<' | '>' | '"' | '\''
+                )
+        })
+    {
+        Err(format!("{field} contains unsafe text"))
+    } else {
+        Ok(value)
+    }
+}
+
+fn is_safe_workspace_id(value: &str) -> bool {
+    !value.starts_with('/')
+        && !value.contains('\\')
+        && value
+            .split('/')
+            .all(|component| !component.is_empty() && component != "." && component != "..")
+}
+
+fn required_positive_u64(object: &[JsonMember<'_>], field: &str) -> Result<u64, String> {
+    let raw = required_value(object, field)?
+        .number_raw()
+        .ok_or_else(|| format!("{field} must be an integer"))?;
+    let value = raw
+        .parse::<u64>()
+        .map_err(|_| format!("{field} must be an unsigned integer"))?;
+    if value == 0 {
+        Err(format!("{field} must be positive"))
+    } else {
+        Ok(value)
+    }
 }
 
 fn object_members<'src>(value: &'src JsonValue<'src>) -> Option<&'src [JsonMember<'src>]> {
@@ -638,11 +906,73 @@ mod tests {
     }
 
     fn request(operation: &str) -> String {
+        let operation_kind = AgentOperation::parse(operation).expect("test operation is valid");
+        let operation_fields = match operation_kind {
+            AgentOperation::SnapshotGet => r#",
+    "project_id": "project",
+    "task_id": "task""#
+                .to_owned(),
+            AgentOperation::FocusedReplay => format!(
+                r#",
+    "candidate_hash": "{}",
+    "replay_artifact_hash": "{}",
+    "max_steps": 1000"#,
+                hash(9),
+                hash(10)
+            ),
+            AgentOperation::ModuleBuild => format!(
+                r#",
+    "module_name": "Fixture.Module",
+    "source_artifact_hash": "{}",
+    "options_hash": "{}",
+    "base_export_hash": "{}""#,
+                hash(9),
+                hash(10),
+                hash(11)
+            ),
+            AgentOperation::CertificateBuild => format!(
+                r#",
+    "candidate_hash": "{}",
+    "module_artifact_hash": "{}",
+    "export_hash": "{}""#,
+                hash(9),
+                hash(10),
+                hash(11)
+            ),
+            AgentOperation::CertificateVerify => format!(
+                r#",
+    "certificate_hash": "{}",
+    "export_hash": "{}",
+    "axiom_report_hash": "{}""#,
+                hash(10),
+                hash(11),
+                hash(12)
+            ),
+            AgentOperation::SourceFreeVerification => format!(
+                r#",
+    "statement_hash": "{}",
+    "certificate_hash": "{}",
+    "export_hash": "{}""#,
+                hash(9),
+                hash(10),
+                hash(11)
+            ),
+            AgentOperation::IndependentChecker => format!(
+                r#",
+    "checker_profile": "npa-reference-checker/v1",
+    "certificate_hash": "{}",
+    "export_hash": "{}",
+    "axiom_report_hash": "{}""#,
+                hash(10),
+                hash(11),
+                hash(12)
+            ),
+        };
         format!(
             r#"{{
   "schema_id": "npa-client.local-process-request.v1",
   "operation": "{operation}",
-  "endpoint_path": "/v1/npa/test",
+  "endpoint_path": "{endpoint_path}",
   "request_hash": "{request_hash}",
   "npa_root": "{npa_root}",
   "workspace_root": "{workspace_root}",
@@ -658,15 +988,11 @@ mod tests {
       "supply_chain_pin_set_hash": "{pin_hash}",
       "sandbox_profile_hash": "{sandbox_hash}",
       "timeout_ms": 30000
-    }},
-    "replay_artifact_hash": "{replay_hash}",
-    "certificate_hash": "{certificate_hash}",
-    "export_hash": "{export_hash}",
-    "axiom_report_hash": "{axiom_hash}",
-    "checker_profile": "npa-reference-checker/v1"
+    }}{operation_fields}
   }}
 }}"#,
             request_hash = hash(1),
+            endpoint_path = operation_kind.endpoint_path(),
             npa_root = env!("CARGO_MANIFEST_DIR").replace('\\', "\\\\"),
             workspace_root = std::env::temp_dir().display(),
             build_hash = hash(2),
@@ -676,10 +1002,6 @@ mod tests {
             policy_hash = hash(6),
             pin_hash = hash(7),
             sandbox_hash = hash(8),
-            replay_hash = hash(9),
-            certificate_hash = hash(10),
-            export_hash = hash(11),
-            axiom_hash = hash(12),
         )
     }
 
@@ -691,11 +1013,26 @@ mod tests {
         ]
     }
 
+    fn run_bound(
+        executable: AgentAdapterExecutable,
+        operation: &str,
+        source: &str,
+    ) -> AgentAdapterOutput {
+        let build_hash = hash(2);
+        let verifier_hash = hash(3);
+        run_agent_adapter_with_binding(
+            executable,
+            &args(operation),
+            source,
+            Some((&build_hash, &verifier_hash)),
+        )
+    }
+
     #[test]
     fn adapter_echoes_required_consistency_fields() {
-        let output = run_agent_adapter(
+        let output = run_bound(
             AgentAdapterExecutable::Cert,
-            &args("certificate_verify"),
+            "certificate_verify",
             &request("certificate_verify"),
         );
 
@@ -715,9 +1052,9 @@ mod tests {
 
     #[test]
     fn adapter_rejects_operation_for_wrong_binary() {
-        let output = run_agent_adapter(
+        let output = run_bound(
             AgentAdapterExecutable::Replay,
-            &args("module_build"),
+            "module_build",
             &request("module_build"),
         );
 
@@ -732,7 +1069,7 @@ mod tests {
             (AgentAdapterExecutable::Cert, "source_free_verification"),
             (AgentAdapterExecutable::Checker, "independent_checker"),
         ] {
-            let output = run_agent_adapter(executable, &args(operation), &request(operation));
+            let output = run_bound(executable, operation, &request(operation));
 
             assert_eq!(output.exit_code, 1, "{operation}");
             assert!(output.stderr.is_empty(), "{operation}");
@@ -746,5 +1083,161 @@ mod tests {
             assert!(!output.stdout.contains(r#""status":"ok""#), "{operation}");
             assert!(!output.stdout.contains(r#""result":"#), "{operation}");
         }
+    }
+
+    #[test]
+    fn process_reader_rejects_oversized_and_non_utf8_requests() {
+        let oversized = vec![b'x'; usize::try_from(MAX_REQUEST_BYTES).unwrap() + 1];
+        let error = read_request_input(oversized.as_slice()).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("byte limit"));
+
+        let error = read_request_input([0xff].as_slice()).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("UTF-8"));
+    }
+
+    #[test]
+    fn adapter_rejects_disabled_and_mismatched_identity_attestations() {
+        let source = request("certificate_verify");
+        let build_hash = hash(2);
+        let verifier_hash = hash(3);
+        let wrong_hash = hash(9);
+        let disabled = run_agent_adapter(
+            AgentAdapterExecutable::Cert,
+            &args("certificate_verify"),
+            &source,
+        );
+        assert_eq!(disabled.exit_code, 2);
+        assert!(disabled.stdout.contains(r#""status":"invalid_request""#));
+        assert_eq!(
+            disabled.stdout,
+            invalid_request_response(
+                AgentOperation::CertificateVerify,
+                &hash(1),
+                DISABLED_IDENTITY_BINDING_MESSAGE,
+            )
+        );
+        for npa_root in ["/definitely/missing/npa", "relative/npa", "/"] {
+            let altered = source.replacen(
+                &format!(
+                    r#""npa_root": "{}""#,
+                    env!("CARGO_MANIFEST_DIR").replace('\\', "\\\\")
+                ),
+                &format!(r#""npa_root": "{npa_root}""#),
+                1,
+            );
+            let output = run_agent_adapter(
+                AgentAdapterExecutable::Cert,
+                &args("certificate_verify"),
+                &altered,
+            );
+            assert_eq!(output.exit_code, 2, "{npa_root}");
+            assert_eq!(output.stdout, disabled.stdout, "{npa_root}");
+        }
+
+        for (build, verifier, message) in [
+            (
+                wrong_hash.as_str(),
+                verifier_hash.as_str(),
+                "expected_npa_build_hash does not match adapter build attestation",
+            ),
+            (
+                build_hash.as_str(),
+                wrong_hash.as_str(),
+                "expected_verifier_binary_hash does not match adapter verifier attestation",
+            ),
+        ] {
+            let output = run_agent_adapter_with_binding(
+                AgentAdapterExecutable::Cert,
+                &args("certificate_verify"),
+                &source,
+                Some((build, verifier)),
+            );
+            assert_eq!(output.exit_code, 2, "{build}/{verifier}");
+            assert_eq!(
+                output.stdout,
+                invalid_request_response(AgentOperation::CertificateVerify, &hash(1), message,)
+            );
+        }
+    }
+
+    #[test]
+    fn adapter_request_parser_rejects_open_or_ambiguous_shapes() {
+        let canonical = request("certificate_verify");
+
+        let endpoint_mismatch = canonical.replace(
+            AgentOperation::CertificateVerify.endpoint_path(),
+            AgentOperation::CertificateBuild.endpoint_path(),
+        );
+        let output = run_agent_adapter(
+            AgentAdapterExecutable::Cert,
+            &args("certificate_verify"),
+            &endpoint_mismatch,
+        );
+        assert_eq!(output.exit_code, 2);
+        assert!(output.stdout.contains(r#""status":"invalid_request""#));
+
+        let duplicate = canonical.replacen(
+            r#""schema_id": "npa-client.local-process-request.v1","#,
+            r#""schema_id": "npa-client.local-process-request.v1",
+  "schema_id": "npa-client.local-process-request.v1","#,
+            1,
+        );
+        let output = run_agent_adapter(
+            AgentAdapterExecutable::Cert,
+            &args("certificate_verify"),
+            &duplicate,
+        );
+        assert_eq!(output.exit_code, 2);
+
+        let unknown_payload = canonical.replacen(
+            r#""certificate_hash": "#,
+            r#""unknown": true, "certificate_hash": "#,
+            1,
+        );
+        let output = run_agent_adapter(
+            AgentAdapterExecutable::Cert,
+            &args("certificate_verify"),
+            &unknown_payload,
+        );
+        assert_eq!(output.exit_code, 2);
+
+        let duplicate_context = canonical.replacen(
+            r#""request_id": "run:test","#,
+            r#""request_id": "run:test",
+      "request_id": "second","#,
+            1,
+        );
+        let output = run_agent_adapter(
+            AgentAdapterExecutable::Cert,
+            &args("certificate_verify"),
+            &duplicate_context,
+        );
+        assert_eq!(output.exit_code, 2);
+
+        let unsafe_workspace = canonical.replacen(
+            r#""workspace_id": "workspace""#,
+            r#""workspace_id": "../escape""#,
+            1,
+        );
+        let output = run_agent_adapter(
+            AgentAdapterExecutable::Cert,
+            &args("certificate_verify"),
+            &unsafe_workspace,
+        );
+        assert_eq!(output.exit_code, 2);
+
+        let unsafe_text = canonical.replacen(
+            r#""request_id": "run:test""#,
+            r#""request_id": "run;escape""#,
+            1,
+        );
+        let output = run_agent_adapter(
+            AgentAdapterExecutable::Cert,
+            &args("certificate_verify"),
+            &unsafe_text,
+        );
+        assert_eq!(output.exit_code, 2);
     }
 }

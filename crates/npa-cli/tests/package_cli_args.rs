@@ -1,11 +1,12 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use npa_cert::Name;
 use npa_cli::args::{
     parse_cli_args, render_help, CliAction, CliCommand, HelpTopic, KernelFuelReportMode,
     PackageAuditCacheMode, PackageBuildCheckCacheMode, PackageBuildSelection, PackageChecker,
     PackageCommand, PackageLockCommand, PackageLockInputMode, PackageRefactorPlanScope,
-    PackageTimingMode, PackageVerifierMemoMode, UsageReason,
+    PackageSourceStructureSelection, PackageTimingMode, PackageVerifierMemoMode, UsageReason,
 };
 use npa_cli::diagnostic::{CommandStatus, DiagnosticKind};
 use npa_cli::package::run_package_command;
@@ -541,6 +542,7 @@ fn package_cli_args_parses_build_certs_check_mode() {
     assert!(options.common.json);
     assert!(options.check);
     assert_eq!(options.build_check_cache, PackageBuildCheckCacheMode::Off);
+    assert_eq!(options.build_check_cache_root, None);
     assert!(!options.update_manifest_hashes);
     assert_eq!(options.kernel_fuel_report, KernelFuelReportMode::Failure);
     assert_eq!(options.timings, PackageTimingMode::Off);
@@ -699,6 +701,7 @@ fn package_cli_args_parses_build_certs_build_check_cache_read_through() {
         options.build_check_cache,
         PackageBuildCheckCacheMode::ReadThrough
     );
+    assert_eq!(options.build_check_cache_root, None);
     assert!(!options.update_manifest_hashes);
 
     let action = parse(&[
@@ -711,7 +714,62 @@ fn package_cli_args_parses_build_certs_build_check_cache_read_through() {
         panic!("expected package build-certs command");
     };
     assert_eq!(options.build_check_cache, PackageBuildCheckCacheMode::Off);
+    assert_eq!(options.build_check_cache_root, None);
     assert!(!options.update_manifest_hashes);
+}
+
+#[test]
+fn package_cli_args_accepts_targeted_build_check_cache_read_through() {
+    let action = parse(&[
+        "package",
+        "build-certs",
+        "--check",
+        "--module",
+        "Proofs.A",
+        "--build-check-cache",
+        "read-through",
+    ]);
+    let CliAction::Run(CliCommand::Package(PackageCommand::BuildCerts(options))) = action else {
+        panic!("expected package build-certs command");
+    };
+    assert_eq!(
+        options.selection,
+        PackageBuildSelection::Modules(vec![npa_cert::Name::from_dotted("Proofs.A")])
+    );
+    assert_eq!(
+        options.build_check_cache,
+        PackageBuildCheckCacheMode::ReadThrough
+    );
+
+    let action = parse(&[
+        "package",
+        "build-certs",
+        "--check",
+        "--changed",
+        "--build-check-cache=read-through",
+    ]);
+    let CliAction::Run(CliCommand::Package(PackageCommand::BuildCerts(options))) = action else {
+        panic!("expected package build-certs command");
+    };
+    assert_eq!(options.selection, PackageBuildSelection::Changed);
+    assert_eq!(
+        options.build_check_cache,
+        PackageBuildCheckCacheMode::ReadThrough
+    );
+}
+
+#[test]
+fn package_cli_args_do_not_expose_build_check_cache_root() {
+    let error = parse_error(&[
+        "package",
+        "build-certs",
+        "--check",
+        "--build-check-cache-root",
+        "target/cache",
+    ]);
+    assert_eq!(error.reason, UsageReason::UnknownFlag);
+    assert_eq!(error.command.as_deref(), Some("package build-certs"));
+    assert_eq!(error.flag.as_deref(), Some("--build-check-cache-root"));
 }
 
 #[test]
@@ -806,6 +864,123 @@ fn package_build_certs_selection_rejects_invalid_combinations() {
 }
 
 #[test]
+fn targeted_authoring_differential_command_mode_matrix_accepts_only_authorized_cache_modes() {
+    let accepted = [
+        (
+            vec!["package", "build-certs", "--check"],
+            PackageBuildSelection::Full,
+            PackageBuildCheckCacheMode::Off,
+        ),
+        (
+            vec![
+                "package",
+                "build-certs",
+                "--check",
+                "--build-check-cache=read-through",
+            ],
+            PackageBuildSelection::Full,
+            PackageBuildCheckCacheMode::ReadThrough,
+        ),
+        (
+            vec![
+                "package",
+                "build-certs",
+                "--check",
+                "--module=Proofs.A",
+                "--build-check-cache=off",
+            ],
+            PackageBuildSelection::Modules(vec![Name::from_dotted("Proofs.A")]),
+            PackageBuildCheckCacheMode::Off,
+        ),
+        (
+            vec![
+                "package",
+                "build-certs",
+                "--check",
+                "--module=Proofs.A",
+                "--build-check-cache=read-through",
+            ],
+            PackageBuildSelection::Modules(vec![Name::from_dotted("Proofs.A")]),
+            PackageBuildCheckCacheMode::ReadThrough,
+        ),
+        (
+            vec![
+                "package",
+                "build-certs",
+                "--check",
+                "--module=Proofs.A",
+                "--build-check-cache=local-hit",
+            ],
+            PackageBuildSelection::Modules(vec![Name::from_dotted("Proofs.A")]),
+            PackageBuildCheckCacheMode::LocalHit,
+        ),
+        (
+            vec![
+                "package",
+                "build-certs",
+                "--check",
+                "--module",
+                "Proofs.A",
+                "--build-check-cache",
+                "local-hit",
+            ],
+            PackageBuildSelection::Modules(vec![Name::from_dotted("Proofs.A")]),
+            PackageBuildCheckCacheMode::LocalHit,
+        ),
+    ];
+    for (args, expected_selection, expected_mode) in accepted {
+        let action = parse(&args);
+        let CliAction::Run(CliCommand::Package(PackageCommand::BuildCerts(options))) = action
+        else {
+            panic!("expected package build-certs command for {args:?}");
+        };
+        assert_eq!(options.selection, expected_selection, "{args:?}");
+        assert_eq!(options.build_check_cache, expected_mode, "{args:?}");
+    }
+
+    let rejected = [
+        vec![
+            "package",
+            "build-certs",
+            "--check",
+            "--build-check-cache=local-hit",
+        ],
+        vec!["package", "build-certs", "--build-check-cache=read-through"],
+        vec![
+            "package",
+            "build-certs",
+            "--module=Proofs.A",
+            "--build-check-cache=local-hit",
+        ],
+        vec![
+            "package",
+            "build-certs",
+            "--check",
+            "--module=Proofs.A",
+            "--update-manifest-hashes",
+            "--build-check-cache=read-through",
+        ],
+        vec![
+            "package",
+            "build-certs",
+            "--check",
+            "--module=Proofs.A",
+            "--update-manifest-hashes",
+            "--build-check-cache=local-hit",
+        ],
+    ];
+    for args in rejected {
+        let error = parse_error(&args);
+        assert_eq!(error.reason, UsageReason::UnsupportedFlag, "{args:?}");
+        assert_eq!(
+            error.flag.as_deref(),
+            Some("--build-check-cache"),
+            "{args:?}"
+        );
+    }
+}
+
+#[test]
 fn package_cli_args_rejects_build_certs_build_check_cache_duplicate_unknown_and_write_mode() {
     let duplicate = parse_error(&[
         "package",
@@ -822,11 +997,11 @@ fn package_cli_args_rejects_build_certs_build_check_cache_duplicate_unknown_and_
         "package",
         "build-certs",
         "--check",
-        "--build-check-cache=local-hit",
+        "--build-check-cache=future",
     ]);
     assert_eq!(unknown.reason, UsageReason::UnsupportedBuildCheckCacheMode);
     assert_eq!(unknown.flag.as_deref(), Some("--build-check-cache"));
-    assert_eq!(unknown.value.as_deref(), Some("local-hit"));
+    assert_eq!(unknown.value.as_deref(), Some("future"));
 
     let write_mode = parse_error(&[
         "package",
@@ -837,6 +1012,32 @@ fn package_cli_args_rejects_build_certs_build_check_cache_duplicate_unknown_and_
     assert_eq!(write_mode.reason, UsageReason::UnsupportedFlag);
     assert_eq!(write_mode.flag.as_deref(), Some("--build-check-cache"));
     assert_eq!(write_mode.value.as_deref(), Some("read-through"));
+
+    let targeted_write = parse_error(&[
+        "package",
+        "build-certs",
+        "--module",
+        "Proofs.A",
+        "--build-check-cache",
+        "read-through",
+    ]);
+    assert_eq!(targeted_write.reason, UsageReason::UnsupportedFlag);
+    assert_eq!(targeted_write.flag.as_deref(), Some("--build-check-cache"));
+
+    let targeted_refresh = parse_error(&[
+        "package",
+        "build-certs",
+        "--module",
+        "Proofs.A",
+        "--update-manifest-hashes",
+        "--build-check-cache",
+        "read-through",
+    ]);
+    assert_eq!(targeted_refresh.reason, UsageReason::UnsupportedFlag);
+    assert_eq!(
+        targeted_refresh.flag.as_deref(),
+        Some("--build-check-cache")
+    );
 }
 
 #[test]
@@ -1385,6 +1586,225 @@ fn package_cli_args_parses_verify_certs_changed_certificate_selection() {
 }
 
 #[test]
+fn package_cli_args_parses_closed_verify_certs_module_and_base_selectors() {
+    let modules = parse(&[
+        "package",
+        "verify-certs",
+        "--module",
+        "Proofs.Ai.Basic",
+        "--module=Proofs.Ai.EqReasoning",
+    ]);
+    let CliAction::Run(CliCommand::Package(PackageCommand::VerifyCerts(options))) = modules else {
+        panic!("expected package verify-certs command");
+    };
+    assert!(!options.changed);
+    assert_eq!(
+        options
+            .modules
+            .iter()
+            .map(Name::as_dotted)
+            .collect::<Vec<_>>(),
+        vec!["Proofs.Ai.Basic", "Proofs.Ai.EqReasoning"]
+    );
+    assert!(options.base.is_none());
+
+    let base = parse(&["package", "verify-certs", "--base=-topic"]);
+    let CliAction::Run(CliCommand::Package(PackageCommand::VerifyCerts(options))) = base else {
+        panic!("expected package verify-certs command");
+    };
+    assert_eq!(options.base.as_deref(), Some("-topic"));
+    assert!(options.modules.is_empty());
+
+    let conflict = parse_error(&[
+        "package",
+        "verify-certs",
+        "--changed",
+        "--module",
+        "Proofs.Ai.Basic",
+    ]);
+    assert_eq!(conflict.reason, UsageReason::VerifySelectorConflict);
+    assert_eq!(conflict.flag.as_deref(), Some("--module"));
+
+    let duplicate = parse_error(&[
+        "package",
+        "verify-certs",
+        "--module",
+        "Proofs.Ai.Basic",
+        "--module=Proofs.Ai.Basic",
+    ]);
+    assert_eq!(duplicate.reason, UsageReason::VerifyModuleDuplicate);
+
+    let reconstructed = parse_error(&[
+        "package",
+        "verify-certs",
+        "--base",
+        "origin/main",
+        "--package-lock=reconstructed",
+    ]);
+    assert_eq!(reconstructed.reason, UsageReason::UnsupportedFlag);
+    assert_eq!(reconstructed.flag.as_deref(), Some("--package-lock"));
+}
+
+#[test]
+fn package_cli_args_verify_certs_selector_matrix_is_exhaustive() {
+    for accepted in [
+        vec![
+            "package",
+            "verify-certs",
+            "--checker=reference",
+            "--module=Proofs.A",
+            "--package-lock=checked",
+        ],
+        vec![
+            "package",
+            "verify-certs",
+            "--checker=fast",
+            "--module=Proofs.A",
+            "--package-lock=reconstructed",
+        ],
+        vec![
+            "package",
+            "verify-certs",
+            "--checker=reference",
+            "--base=HEAD^",
+            "--package-lock=checked",
+        ],
+        vec![
+            "package",
+            "verify-certs",
+            "--checker=fast",
+            "--base=HEAD^",
+            "--package-lock=checked",
+        ],
+    ] {
+        let _ = parse(&accepted);
+    }
+
+    let cases = [
+        (
+            vec!["package", "verify-certs", "--changed", "--base=HEAD^"],
+            UsageReason::VerifySelectorConflict,
+            "--base",
+        ),
+        (
+            vec![
+                "package",
+                "verify-certs",
+                "--module=Proofs.A",
+                "--base=HEAD^",
+            ],
+            UsageReason::VerifySelectorConflict,
+            "--base",
+        ),
+        (
+            vec![
+                "package",
+                "verify-certs",
+                "--changed",
+                "--module=Proofs.A",
+                "--base=HEAD^",
+            ],
+            UsageReason::VerifySelectorConflict,
+            "--base",
+        ),
+        (
+            vec!["package", "verify-certs", "--module=Proofs..A"],
+            UsageReason::InvalidModuleName,
+            "--module",
+        ),
+        (
+            vec![
+                "package",
+                "verify-certs",
+                "--module=Proofs.A",
+                "--checker=external",
+            ],
+            UsageReason::UnsupportedFlag,
+            "--module",
+        ),
+        (
+            vec![
+                "package",
+                "verify-certs",
+                "--module=Proofs.A",
+                "--audit-cache=read-through",
+            ],
+            UsageReason::UnsupportedFlag,
+            "--audit-cache",
+        ),
+        (
+            vec![
+                "package",
+                "verify-certs",
+                "--module=Proofs.A",
+                "--verifier-memo=disk",
+            ],
+            UsageReason::UnsupportedFlag,
+            "--verifier-memo",
+        ),
+        (
+            vec![
+                "package",
+                "verify-certs",
+                "--base=HEAD^",
+                "--checker=external",
+            ],
+            UsageReason::UnsupportedFlag,
+            "--base",
+        ),
+        (
+            vec![
+                "package",
+                "verify-certs",
+                "--base=HEAD^",
+                "--audit-cache=local-hit",
+            ],
+            UsageReason::UnsupportedFlag,
+            "--audit-cache",
+        ),
+        (
+            vec![
+                "package",
+                "verify-certs",
+                "--base=HEAD^",
+                "--verifier-memo=read-through",
+            ],
+            UsageReason::UnsupportedFlag,
+            "--verifier-memo",
+        ),
+    ];
+    for (args, reason, flag) in cases {
+        let error = parse_error(&args);
+        assert_eq!(error.reason, reason, "{args:?}");
+        assert_eq!(error.flag.as_deref(), Some(flag), "{args:?}");
+    }
+
+    for (args, flag) in [
+        (
+            vec!["package", "verify-certs", "--changed", "--changed"],
+            "--changed",
+        ),
+        (
+            vec!["package", "verify-certs", "--base=HEAD", "--base=HEAD^"],
+            "--base",
+        ),
+    ] {
+        let error = parse_error(&args);
+        assert_eq!(error.reason, UsageReason::DuplicateFlag, "{args:?}");
+        assert_eq!(error.flag.as_deref(), Some(flag), "{args:?}");
+    }
+
+    for (args, flag) in [
+        (vec!["package", "verify-certs", "--module="], "--module"),
+        (vec!["package", "verify-certs", "--base="], "--base"),
+    ] {
+        let error = parse_error(&args);
+        assert_eq!(error.reason, UsageReason::MissingFlagValue, "{args:?}");
+        assert_eq!(error.flag.as_deref(), Some(flag), "{args:?}");
+    }
+}
+
+#[test]
 fn package_timings_cli_args_parse_for_verify_certs() {
     let action = parse(&[
         "package",
@@ -1885,6 +2305,10 @@ fn package_cli_args_parses_help_topics() {
         CliAction::Help(HelpTopic::PackageCheck)
     );
     assert_eq!(
+        parse(&["package", "check-source-structure", "--help"]),
+        CliAction::Help(HelpTopic::PackageCheckSourceStructure)
+    );
+    assert_eq!(
         parse(&["package", "build-certs", "--help"]),
         CliAction::Help(HelpTopic::PackageBuildCerts)
     );
@@ -1927,14 +2351,24 @@ fn package_cli_args_parses_help_topics() {
 }
 
 #[test]
-fn package_build_certs_help_documents_update_manifest_hashes() {
+fn cli_help_publishes_build_certs_cache_modes_and_evidence_boundary() {
     let help = render_help(HelpTopic::PackageBuildCerts);
 
     assert!(help.contains("[--update-manifest-hashes]"));
     assert!(help.contains("refreshes local module hash pins"));
     assert!(help.contains("[--module MODULE]... [--changed]"));
     assert!(help.contains("required release gates"));
-    assert!(help.contains("--check --build-check-cache read-through"));
+    assert!(help.contains("--build-check-cache off|read-through|local-hit"));
+    assert!(help.contains("read-through is available for full or targeted --check"));
+    assert!(help.contains("local-hit is available only for targeted --check"));
+    assert!(help.contains("always builds every reached target fresh"));
+    assert!(help.contains("only their automatically placed external local stores"));
+    assert!(help.contains("local-hit warms only cache-free live miss subtrees"));
+    assert!(help.contains("build_evidence=false and proof_evidence=false"));
+    assert!(help.contains("build-certs --build-check-cache local-hit"));
+    assert!(help.contains("verify-certs --audit-cache local-hit"));
+    assert!(help.contains("different stores"));
+    assert!(help.contains("completion, and release workflows use cache off"));
 }
 
 #[test]
@@ -1954,8 +2388,9 @@ fn package_export_help_documents_package_root_relative_output() {
 fn package_verify_certs_help_documents_changed_and_package_lock_selection() {
     let help = render_help(HelpTopic::PackageVerifyCerts);
 
-    assert!(help.contains("[--changed]"));
+    assert!(help.contains("[--changed | --module MODULE ... | --base REF]"));
     assert!(help.contains("certificate files are changed in Git"));
+    assert!(help.contains("committed package changes relative to the merge base"));
     assert!(help.contains("[--package-lock checked|reconstructed]"));
     assert!(help.contains("package-lock input defaults to checked"));
     assert!(help.contains("Reconstructed is unavailable with the external checker"));
@@ -2008,7 +2443,7 @@ fn package_cli_args_binary_reports_json_usage_error_when_requested() {
     assert_eq!(output.status.code(), Some(2));
     assert!(output.stderr.is_empty());
     let stdout = String::from_utf8(output.stdout).unwrap();
-    assert!(stdout.contains("\"schema\":\"npa.package.command_result.v0.4\""));
+    assert!(stdout.contains("\"schema\":\"npa.package.command_result.v0.5\""));
     assert!(stdout.contains("\"kind\":\"Usage\""));
     assert!(stdout.contains("\"reason_code\":\"unknown_flag\""));
     assert!(stdout.contains("\"field\":\"--mystery\""));
@@ -2075,6 +2510,149 @@ fn package_cli_args_parses_artifact_ledger_modules_and_deduplicates() {
             .collect::<Vec<_>>(),
         vec!["Example.Second", "Example.First"]
     );
+}
+
+#[test]
+fn package_cli_args_parses_source_structure_selections() {
+    let action = parse(&[
+        "package",
+        "check-source-structure",
+        "--root=proofs",
+        "--json",
+        "--module",
+        "Example.Second",
+        "--module=Example.First",
+        "--module=Example.Second",
+    ]);
+    let CliAction::Run(CliCommand::Package(PackageCommand::CheckSourceStructure(options))) = action
+    else {
+        panic!("expected source-structure command");
+    };
+    assert_eq!(options.common.root, PathBuf::from("proofs"));
+    assert!(options.common.json);
+    let PackageSourceStructureSelection::Modules(modules) = options.selection else {
+        panic!("expected module selection");
+    };
+    assert_eq!(
+        modules
+            .iter()
+            .map(npa_cert::Name::as_dotted)
+            .collect::<Vec<_>>(),
+        vec!["Example.Second", "Example.First"]
+    );
+
+    let action = parse(&[
+        "package",
+        "check-source-structure",
+        "--path=Proofs/A/source.npa",
+        "--path",
+        "Proofs/B/source.npa",
+    ]);
+    let CliAction::Run(CliCommand::Package(PackageCommand::CheckSourceStructure(options))) = action
+    else {
+        panic!("expected source-structure command");
+    };
+    let PackageSourceStructureSelection::Paths(paths) = options.selection else {
+        panic!("expected path selection");
+    };
+    assert_eq!(
+        paths
+            .iter()
+            .map(npa_package::PackagePath::as_str)
+            .collect::<Vec<_>>(),
+        vec!["Proofs/A/source.npa", "Proofs/B/source.npa"]
+    );
+
+    let action = parse(&["package", "check-source-structure"]);
+    let CliAction::Run(CliCommand::Package(PackageCommand::CheckSourceStructure(options))) = action
+    else {
+        panic!("expected source-structure command");
+    };
+    assert_eq!(options.selection, PackageSourceStructureSelection::All);
+}
+
+#[test]
+fn package_cli_args_source_structure_preserves_root_value_adjacency() {
+    for selector in [
+        vec!["--path", "Proofs/A/source.npa"],
+        vec!["--path=Proofs/A/source.npa"],
+        vec!["--module", "Example.First"],
+        vec!["--module=Example.First"],
+    ] {
+        let mut args = vec!["package", "check-source-structure", "--root"];
+        args.extend(selector);
+        args.push("proofs");
+
+        let error = parse_error(&args);
+        assert_eq!(error.reason, UsageReason::MissingFlagValue);
+        assert_eq!(error.flag.as_deref(), Some("--root"));
+        assert_eq!(
+            error.command.as_deref(),
+            Some("package check-source-structure")
+        );
+    }
+
+    let action = parse(&[
+        "package",
+        "check-source-structure",
+        "--path=Proofs/A/source.npa",
+        "--root",
+        "proofs",
+        "--path=Proofs/B/source.npa",
+    ]);
+    let CliAction::Run(CliCommand::Package(PackageCommand::CheckSourceStructure(options))) = action
+    else {
+        panic!("expected source-structure command");
+    };
+    assert_eq!(options.common.root, PathBuf::from("proofs"));
+    assert_eq!(
+        options.selection,
+        PackageSourceStructureSelection::Paths(vec![
+            npa_package::PackagePath::new("Proofs/A/source.npa"),
+            npa_package::PackagePath::new("Proofs/B/source.npa"),
+        ])
+    );
+}
+
+#[test]
+fn package_cli_args_source_structure_help_and_errors_are_stable() {
+    assert_eq!(
+        parse(&["package", "check-source-structure", "--help"]),
+        CliAction::Help(HelpTopic::PackageCheckSourceStructure)
+    );
+    let help = render_help(HelpTopic::PackageCheckSourceStructure);
+    assert!(help.contains("[--module MODULE]... [--path PATH]..."));
+    assert!(help.contains("dependency-free"));
+    assert!(help.contains("does not parse, elaborate, type-check"));
+    assert!(help.contains("write files, or produce proof evidence"));
+
+    let conflict = parse_error(&[
+        "package",
+        "check-source-structure",
+        "--module=Example.First",
+        "--path=Proofs/A/source.npa",
+    ]);
+    assert_eq!(
+        conflict.reason,
+        UsageReason::SourceStructureSelectorConflict
+    );
+
+    let invalid_module = parse_error(&[
+        "package",
+        "check-source-structure",
+        "--module=not..canonical",
+    ]);
+    assert_eq!(invalid_module.reason, UsageReason::InvalidModuleName);
+
+    let invalid_path = parse_error(&["package", "check-source-structure", "--path=../outside.npa"]);
+    assert_eq!(invalid_path.reason, UsageReason::InvalidFlagValue);
+    assert_eq!(invalid_path.flag.as_deref(), Some("--path"));
+
+    for flag in ["--module", "--path"] {
+        let missing = parse_error(&["package", "check-source-structure", flag]);
+        assert_eq!(missing.reason, UsageReason::MissingFlagValue);
+        assert_eq!(missing.flag.as_deref(), Some(flag));
+    }
 }
 
 #[test]
@@ -2300,6 +2878,7 @@ fn package_promotion_registry_commands_parse() {
         "--previous-target-root=old-mathlib",
         "--audit=docs/promotion/reconcile.md",
         "--out=docs/promotion/reconcile.json",
+        "--legacy-previous-v0-8-checkpoint",
         "--apply",
         "--json",
     ]);
@@ -2309,7 +2888,7 @@ fn package_promotion_registry_commands_parse() {
     else {
         panic!("expected registry reconciliation");
     };
-    assert!(options.apply && options.common.json);
+    assert!(options.apply && options.common.json && options.legacy_previous_v0_8_checkpoint);
     assert_eq!(
         options.previous_target_root,
         Some(PathBuf::from("old-mathlib"))
@@ -2327,6 +2906,18 @@ fn package_promotion_registry_commands_parse() {
             PackageCommand::ReconcilePromotionOriginRegistry(_)
         ))
     ));
+
+    let recovery_with_legacy_checkpoint = parse_error(&[
+        "package",
+        "reconcile-promotion-origin-registry",
+        "--root=mathlib",
+        "--recover=target/registry-reconciliation/event.json",
+        "--legacy-previous-v0-8-checkpoint",
+    ]);
+    assert_eq!(
+        recovery_with_legacy_checkpoint.reason,
+        UsageReason::InvalidFlagValue
+    );
 
     let conflict = parse_error(&[
         "package",

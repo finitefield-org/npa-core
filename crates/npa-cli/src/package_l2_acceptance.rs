@@ -1,6 +1,6 @@
 //! Implementation of `npa package validate-l2-acceptance`.
 
-use std::{collections::BTreeSet, fs, path::Path};
+use std::{collections::BTreeSet, path::Path};
 
 use npa_package::{
     format_package_hash, package_file_hash, parse_l2_acceptance_json,
@@ -13,6 +13,7 @@ use npa_package::{
 use crate::{
     args::PackageL2AcceptanceOptions,
     diagnostic::{CommandDiagnostic, CommandResult, DiagnosticKind},
+    generated_artifact_writer::{read_package_regular_file_no_follow, read_regular_file_no_follow},
     package::load_package_root,
     package_artifacts::PACKAGE_THEOREM_INDEX_PATH,
     package_l2_acceptance_aggregate::validate_l2_acceptance_v2_current_with_context,
@@ -106,10 +107,15 @@ pub fn run_package_validate_l2_acceptance(options: PackageL2AcceptanceOptions) -
         }
     };
 
-    let theorem_index_path = options.common.root.join(PACKAGE_THEOREM_INDEX_PATH);
-    let theorem_index_source = match fs::read_to_string(&theorem_index_path) {
-        Ok(source) => source,
-        Err(_) => {
+    let theorem_index_source = match read_package_regular_file_no_follow(
+        &options.common.root,
+        &npa_package::PackagePath::new(PACKAGE_THEOREM_INDEX_PATH),
+    )
+    .ok()
+    .and_then(|bytes| String::from_utf8(bytes).ok())
+    {
+        Some(source) => source,
+        None => {
             return CommandResult::failed(
                 COMMAND,
                 root_display,
@@ -662,7 +668,7 @@ fn read_file(
     display: &str,
     reason: &'static str,
 ) -> Result<Vec<u8>, Box<CommandDiagnostic>> {
-    fs::read(path).map_err(|_| {
+    read_regular_file_no_follow(path).map_err(|_| {
         Box::new(CommandDiagnostic::error(DiagnosticKind::ArtifactIo, reason).with_path(display))
     })
 }

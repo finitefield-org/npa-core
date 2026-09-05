@@ -100,6 +100,7 @@ pub const INDEPENDENT_CHECKER_COMMAND_ERROR_SCHEMA: &str =
 pub const INDEPENDENT_CHECKER_API_ERROR_SCHEMA: &str = "npa.independent-checker.api_error.v1";
 pub const INDEPENDENT_CHECKER_AXIOM_POLICY_TOML_FORMAT: &str =
     "npa.independent-checker.axiom_policy.v1";
+const INDEPENDENT_CHECKER_MAX_IMPORT_LOCK_ENTRIES: usize = 4_096;
 
 pub const INDEPENDENT_CHECKER_FORBIDDEN_VERIFICATION_INPUT_FIELDS: &[&str] = &[
     "source",
@@ -17910,6 +17911,13 @@ fn parse_independent_checker_import_lock_manifest_value(
         )
         .into());
     };
+    if import_values.len() > INDEPENDENT_CHECKER_MAX_IMPORT_LOCK_ENTRIES {
+        return Err(IndependentCheckerRequestValidationError::value_failure(
+            format!("{root_path}.imports"),
+            format!("at_most_{INDEPENDENT_CHECKER_MAX_IMPORT_LOCK_ENTRIES}_entries"),
+            format!("count:{}", import_values.len()),
+        ));
+    }
 
     let mut imports = Vec::new();
     for (index, import_value) in import_values.iter().enumerate() {
@@ -21810,14 +21818,14 @@ fn independent_checker_certificate_artifact_facts(
 ) -> Result<IndependentCheckerCertificateArtifactFacts, ()> {
     let certificate = npa_cert::decode_module_cert(bytes).map_err(|_| ())?;
     let theorem_statement_hashes = certificate
-        .export_block
+        .export_block()
         .iter()
         .filter_map(|export| (export.kind == ExportKind::Theorem).then_some(export.type_hash))
         .collect();
     Ok(IndependentCheckerCertificateArtifactFacts {
-        module: certificate.header.module.as_dotted(),
-        certificate_hash: certificate.hashes.certificate_hash,
-        export_hash: certificate.hashes.export_hash,
+        module: certificate.header().module.as_dotted(),
+        certificate_hash: certificate.hashes().certificate_hash,
+        export_hash: certificate.hashes().export_hash,
         theorem_statement_hashes,
     })
 }
@@ -29595,12 +29603,17 @@ fn independent_checker_raw_certificate_header_module(
 fn independent_checker_requested_certificate_pair(
     certificate_bytes: &[u8],
 ) -> Option<IndependentCheckerCertificatePair> {
+    // This untrusted orchestration reader binds an external check result to
+    // the pair it actually received; it does not decode or accept certificate
+    // semantics. Historical pairs remain identifiable for negative/audit
+    // records while the Rust certificate decoders accept only v0.4.
     let mut decoder = IndependentCheckerRawCertificateHeaderDecoder::new(certificate_bytes);
     let certificate_format = decoder.string().ok()?;
     let core_spec = decoder.string().ok()?;
     let exact = matches!(
         (certificate_format.as_str(), core_spec.as_str()),
-        ("NPA-CERT-0.3.0", "NPA-Core-0.3.0")
+        ("NPA-CERT-0.4.0", "NPA-Core-0.4.0")
+            | ("NPA-CERT-0.3.0", "NPA-Core-0.3.0")
             | ("NPA-CERT-0.2.0", "NPA-Core-0.2.0")
             | ("NPA-CERT-0.1.2", "NPA-Core-0.1.2")
             | ("NPA-CERT-0.1", "NPA-Core-0.1")
@@ -33272,6 +33285,20 @@ mod tests {
             "imports.manifest.imports[0].certificate.kind"
         );
         assert_eq!(bad_kind.actual_value.as_deref(), Some("invalid_enum"));
+    }
+
+    #[test]
+    fn m2_import_lock_manifest_rejects_unbounded_entry_arrays() {
+        let entry = r#"{"module":"A","export_hash":"sha256:0000000000000000000000000000000000000000000000000000000000000000","certificate":{"kind":"path","path":"build/certs/a","file_hash":"sha256:0000000000000000000000000000000000000000000000000000000000000001","certificate_hash":"sha256:0000000000000000000000000000000000000000000000000000000000000002"}}"#;
+        let source = format!(
+            "{{\"schema\":\"npa.independent-checker.import_lock_manifest.v1\",\"imports\":[{}]}}",
+            std::iter::repeat_n(entry, INDEPENDENT_CHECKER_MAX_IMPORT_LOCK_ENTRIES + 1)
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let error = parse_independent_checker_import_lock_manifest(&source).unwrap_err();
+        assert_eq!(error.field.as_ref(), "imports.manifest.imports");
+        assert_eq!(error.actual_value.as_deref(), Some("count:4097"));
     }
 
     #[test]
@@ -38526,7 +38553,7 @@ mod tests {
         )
         .unwrap();
         let statement_core_hash = cert
-            .export_block
+            .export_block()
             .iter()
             .find(|export| export.kind == ExportKind::Theorem)
             .unwrap()
@@ -38535,8 +38562,8 @@ mod tests {
         M12RealCertificate {
             file_hash: independent_checker_file_hash(&bytes),
             bytes,
-            certificate_hash: cert.hashes.certificate_hash,
-            export_hash: cert.hashes.export_hash,
+            certificate_hash: cert.hashes().certificate_hash,
+            export_hash: cert.hashes().export_hash,
             statement_core_hash,
         }
     }

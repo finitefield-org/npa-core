@@ -6,13 +6,21 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs, io,
+    error::Error,
+    fmt,
+    fs::File,
+    io::{self, Read},
     path::Path,
 };
 
 use npa_cert::Name;
 
 use crate::{
+    artifact_snapshot::{
+        HashedPackageLockArtifact, OwnedPackageLockArtifact, PackageArtifactPreparationObservation,
+        PackageLockArtifactSnapshots, PreparedArtifactObservationMode,
+        PreparedArtifactRetentionPolicy, PreparedPackageArtifacts,
+    },
     error::{PackageLockError, PackageLockResult},
     graph::ResolvedModuleImport,
     hash::{format_package_hash, package_file_hash, parse_package_hash, PackageHash},
@@ -128,6 +136,12 @@ pub struct PackageLockArtifact<'a> {
     pub bytes: &'a [u8],
 }
 
+struct DerivedPackageLockEntry {
+    entry: PackageLockEntry,
+    file_hash: PackageHash,
+    decoded: npa_cert::ModuleCert,
+}
+
 /// Resolved package-lock import graph.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PackageLockGraph {
@@ -149,6 +163,357 @@ pub struct PackageLockResolvedImport {
     /// Imported module certificate hash.
     pub certificate_hash: PackageHash,
 }
+
+/// Operation counts collected only by tests and the explicit planning benchmark.
+#[cfg(any(test, feature = "planning-benchmark"))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PackageGraphPlanningCounterSummary {
+    /// Successful operation-scoped graph-index constructions.
+    pub graph_index_constructions: u64,
+    /// Internal invariant failures observed during index construction.
+    pub graph_index_invariant_failures: u64,
+    /// Reverse-adjacency list sorts; canonical construction requires zero.
+    pub reverse_list_sort_calls: u64,
+    /// Entries removed from forward dependency worklists.
+    pub forward_vertex_dequeues: u64,
+    /// Dependency edges visited by forward worklists.
+    pub forward_edge_visits: u64,
+    /// Entries removed from reverse dependency worklists.
+    pub reverse_vertex_dequeues: u64,
+    /// Reverse-dependency edges visited by reverse worklists.
+    pub reverse_edge_visits: u64,
+    /// Entry-mark slots allocated once for reverse-origin traversals.
+    pub reverse_visit_slots_initialized: u64,
+    /// Reverse-closure origins started with reusable epoch marks.
+    pub reverse_origin_epochs: u64,
+    /// Origin/entry pairs removed from provenance worklists.
+    pub provenance_pair_dequeues: u64,
+    /// Edges visited while propagating one provenance origin.
+    pub provenance_edge_visits: u64,
+    /// Entry-mark slots allocated once for provenance traversals.
+    pub provenance_visit_slots_initialized: u64,
+    /// Provenance origins started with reusable epoch marks.
+    pub provenance_origin_epochs: u64,
+    /// Selected entries assigned to a topological layer.
+    pub layer_assignments: u64,
+    /// Direct dependency edges inspected during layer assignment.
+    pub layer_dependency_edge_visits: u64,
+    /// Whether any counter saturated its `u64` representation.
+    pub overflowed: bool,
+}
+
+#[cfg(any(test, feature = "planning-benchmark"))]
+impl PackageGraphPlanningCounterSummary {
+    /// Merge lower planning work into this operation-owned summary.
+    pub fn merge(&mut self, other: Self) {
+        macro_rules! merge_field {
+            ($field:ident) => {
+                let (next, overflowed) = self.$field.overflowing_add(other.$field);
+                self.$field = if overflowed { u64::MAX } else { next };
+                self.overflowed |= overflowed;
+            };
+        }
+        merge_field!(graph_index_constructions);
+        merge_field!(graph_index_invariant_failures);
+        merge_field!(reverse_list_sort_calls);
+        merge_field!(forward_vertex_dequeues);
+        merge_field!(forward_edge_visits);
+        merge_field!(reverse_vertex_dequeues);
+        merge_field!(reverse_edge_visits);
+        merge_field!(reverse_visit_slots_initialized);
+        merge_field!(reverse_origin_epochs);
+        merge_field!(provenance_pair_dequeues);
+        merge_field!(provenance_edge_visits);
+        merge_field!(provenance_visit_slots_initialized);
+        merge_field!(provenance_origin_epochs);
+        merge_field!(layer_assignments);
+        merge_field!(layer_dependency_edge_visits);
+        self.overflowed |= other.overflowed;
+    }
+}
+
+trait PackageGraphPlanningCounterSink {
+    fn graph_index_constructed(&mut self) {}
+    fn graph_index_invariant_failed(&mut self) {}
+    fn forward_vertex_dequeued(&mut self) {}
+    fn forward_edges_visited(&mut self, _count: usize) {}
+    fn layer_assigned(&mut self) {}
+    fn layer_dependency_edges_visited(&mut self, _count: usize) {}
+}
+
+impl PackageGraphPlanningCounterSink for () {}
+
+#[cfg(any(test, feature = "planning-benchmark"))]
+impl PackageGraphPlanningCounterSummary {
+    fn increment(value: &mut u64, overflowed: &mut bool) {
+        let (next, overflow) = value.overflowing_add(1);
+        *value = if overflow { u64::MAX } else { next };
+        *overflowed |= overflow;
+    }
+
+    fn add_usize(value: &mut u64, addend: usize, overflowed: &mut bool) {
+        let addend = u64::try_from(addend).unwrap_or(u64::MAX);
+        let (next, overflow) = value.overflowing_add(addend);
+        *value = if overflow { u64::MAX } else { next };
+        *overflowed |= overflow || addend == u64::MAX;
+    }
+}
+
+#[cfg(any(test, feature = "planning-benchmark"))]
+impl PackageGraphPlanningCounterSink for PackageGraphPlanningCounterSummary {
+    fn graph_index_constructed(&mut self) {
+        Self::increment(&mut self.graph_index_constructions, &mut self.overflowed);
+    }
+
+    fn graph_index_invariant_failed(&mut self) {
+        Self::increment(
+            &mut self.graph_index_invariant_failures,
+            &mut self.overflowed,
+        );
+    }
+
+    fn forward_vertex_dequeued(&mut self) {
+        Self::increment(&mut self.forward_vertex_dequeues, &mut self.overflowed);
+    }
+
+    fn forward_edges_visited(&mut self, count: usize) {
+        Self::add_usize(&mut self.forward_edge_visits, count, &mut self.overflowed);
+    }
+
+    fn layer_assigned(&mut self) {
+        Self::increment(&mut self.layer_assignments, &mut self.overflowed);
+    }
+
+    fn layer_dependency_edges_visited(&mut self, count: usize) {
+        Self::add_usize(
+            &mut self.layer_dependency_edge_visits,
+            count,
+            &mut self.overflowed,
+        );
+    }
+}
+
+/// Operation-scoped adjacency and topological index for a validated lock graph.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PackageLockGraphIndex {
+    module_by_entry: Vec<Name>,
+    entry_by_module: BTreeMap<Name, usize>,
+    topological_entries: Vec<usize>,
+    topological_position_by_entry: Vec<usize>,
+    dependencies_by_entry: Vec<Vec<usize>>,
+    reverse_dependencies_by_entry: Vec<Vec<usize>>,
+}
+
+impl PackageLockGraphIndex {
+    /// Return the canonical module for an entry index.
+    pub fn module_by_entry(&self, entry: usize) -> Option<&Name> {
+        self.module_by_entry.get(entry)
+    }
+
+    /// Resolve a canonical module to its entry index.
+    pub fn entry_by_module(&self, module: &Name) -> Option<usize> {
+        self.entry_by_module.get(module).copied()
+    }
+
+    /// Return dependency-first entry indices.
+    pub fn topological_entries(&self) -> &[usize] {
+        &self.topological_entries
+    }
+
+    /// Return the topological position of an entry.
+    pub fn topological_position(&self, entry: usize) -> Option<usize> {
+        self.topological_position_by_entry.get(entry).copied()
+    }
+
+    /// Return direct dependency entry indices.
+    pub fn dependencies(&self, entry: usize) -> Option<&[usize]> {
+        self.dependencies_by_entry.get(entry).map(Vec::as_slice)
+    }
+
+    /// Return direct reverse-dependent entry indices.
+    pub fn reverse_dependencies(&self, entry: usize) -> Option<&[usize]> {
+        self.reverse_dependencies_by_entry
+            .get(entry)
+            .map(Vec::as_slice)
+    }
+
+    /// Compute dependency closure from sorted seed names with a linear worklist.
+    pub fn dependency_closure(
+        &self,
+        seeds: &BTreeSet<Name>,
+    ) -> Result<Vec<bool>, PackageLockIndexInvariantError> {
+        self.dependency_closure_with_sink(seeds, &mut ())
+    }
+
+    /// Counted dependency closure for tests and the closed planning benchmark.
+    #[cfg(any(test, feature = "planning-benchmark"))]
+    #[doc(hidden)]
+    pub fn dependency_closure_with_planning_counters(
+        &self,
+        seeds: &BTreeSet<Name>,
+        counters: &mut PackageGraphPlanningCounterSummary,
+    ) -> Result<Vec<bool>, PackageLockIndexInvariantError> {
+        self.dependency_closure_with_sink(seeds, counters)
+    }
+
+    fn dependency_closure_with_sink<S: PackageGraphPlanningCounterSink>(
+        &self,
+        seeds: &BTreeSet<Name>,
+        counters: &mut S,
+    ) -> Result<Vec<bool>, PackageLockIndexInvariantError> {
+        let mut selected = vec![false; self.module_by_entry.len()];
+        let mut pending = Vec::with_capacity(seeds.len());
+        for seed in seeds {
+            let entry = self.entry_by_module(seed).ok_or_else(|| {
+                PackageLockIndexInvariantError::new("selected_module_missing_from_index")
+            })?;
+            if !selected[entry] {
+                selected[entry] = true;
+                pending.push(entry);
+            }
+        }
+        while let Some(entry) = pending.pop() {
+            counters.forward_vertex_dequeued();
+            counters.forward_edges_visited(self.dependencies_by_entry[entry].len());
+            for dependency in &self.dependencies_by_entry[entry] {
+                if !selected[*dependency] {
+                    selected[*dependency] = true;
+                    pending.push(*dependency);
+                }
+            }
+        }
+        Ok(selected)
+    }
+
+    /// Assign selected entries to minimal topological layers in one pass.
+    pub fn topological_layers(&self, selected: &[bool]) -> Vec<Vec<usize>> {
+        self.topological_layers_with_sink(selected, &mut ())
+    }
+
+    /// Counted layer assignment for tests and the closed planning benchmark.
+    #[cfg(any(test, feature = "planning-benchmark"))]
+    #[doc(hidden)]
+    pub fn topological_layers_with_planning_counters(
+        &self,
+        selected: &[bool],
+        counters: &mut PackageGraphPlanningCounterSummary,
+    ) -> Vec<Vec<usize>> {
+        self.topological_layers_with_sink(selected, counters)
+    }
+
+    fn topological_layers_with_sink<S: PackageGraphPlanningCounterSink>(
+        &self,
+        selected: &[bool],
+        counters: &mut S,
+    ) -> Vec<Vec<usize>> {
+        let mut layer_by_entry = vec![0usize; self.module_by_entry.len()];
+        let mut layers = Vec::<Vec<usize>>::new();
+        for entry in &self.topological_entries {
+            if !selected.get(*entry).copied().unwrap_or(false) {
+                continue;
+            }
+            counters.layer_assigned();
+            counters.layer_dependency_edges_visited(self.dependencies_by_entry[*entry].len());
+            let layer = self.dependencies_by_entry[*entry]
+                .iter()
+                .filter(|dependency| selected.get(**dependency).copied().unwrap_or(false))
+                .map(|dependency| layer_by_entry[*dependency].saturating_add(1))
+                .max()
+                .unwrap_or(0);
+            if layers.len() <= layer {
+                layers.resize_with(layer + 1, Vec::new);
+            }
+            layers[layer].push(*entry);
+            layer_by_entry[*entry] = layer;
+        }
+        layers
+    }
+}
+
+/// Validated normalized lock, graph, and their operation-scoped index.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IndexedPackageLockGraph {
+    lock: PackageLockManifest,
+    graph: PackageLockGraph,
+    index: PackageLockGraphIndex,
+}
+
+impl IndexedPackageLockGraph {
+    /// Return the exact normalized lock used to build the index.
+    pub fn lock(&self) -> &PackageLockManifest {
+        &self.lock
+    }
+
+    /// Return normalized lock entries.
+    pub fn entries(&self) -> &[PackageLockEntry] {
+        &self.lock.entries
+    }
+
+    /// Return the source-compatible graph projection.
+    pub fn graph(&self) -> &PackageLockGraph {
+        &self.graph
+    }
+
+    /// Return the operation-scoped adjacency index.
+    pub fn index(&self) -> &PackageLockGraphIndex {
+        &self.index
+    }
+}
+
+/// Failure while constructing a validated indexed package-lock graph.
+#[derive(Debug)]
+pub enum IndexedPackageLockGraphError {
+    /// Existing public package-lock validation failure.
+    Lock(PackageLockError),
+    /// Same-call validated graph products violated an internal invariant.
+    InternalInvariant(PackageLockIndexInvariantError),
+}
+
+impl fmt::Display for IndexedPackageLockGraphError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Lock(error) => write!(formatter, "{error}"),
+            Self::InternalInvariant(error) => write!(formatter, "{error}"),
+        }
+    }
+}
+
+impl Error for IndexedPackageLockGraphError {}
+
+impl From<PackageLockError> for IndexedPackageLockGraphError {
+    fn from(error: PackageLockError) -> Self {
+        Self::Lock(error)
+    }
+}
+
+/// Non-serialized same-call index invariant failure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PackageLockIndexInvariantError {
+    invariant: &'static str,
+}
+
+impl PackageLockIndexInvariantError {
+    fn new(invariant: &'static str) -> Self {
+        Self { invariant }
+    }
+
+    /// Return the fixed internal invariant identifier.
+    pub fn invariant(&self) -> &'static str {
+        self.invariant
+    }
+}
+
+impl fmt::Display for PackageLockIndexInvariantError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "package lock index invariant failed: {}",
+            self.invariant
+        )
+    }
+}
+
+impl Error for PackageLockIndexInvariantError {}
 
 /// Build a package lock from a validated manifest and explicit certificate bytes.
 ///
@@ -188,6 +553,182 @@ pub fn build_package_lock_from_artifacts_allowing_local_hash_updates<'a>(
         artifacts,
         false,
     )
+}
+
+/// Build a canonical package lock and an operation-local owned artifact snapshot.
+///
+/// The input byte owners are consumed without copying their buffers. File hashes
+/// and complete certificate decodes performed while deriving the lock are reused
+/// by the returned artifact owner according to `retention_policy`.
+pub fn build_package_lock_and_snapshot_owned_artifacts(
+    validated: &ValidatedPackageManifest,
+    manifest_path: PackagePath,
+    manifest_bytes: &[u8],
+    artifacts: impl IntoIterator<Item = OwnedPackageLockArtifact>,
+    retention_policy: PreparedArtifactRetentionPolicy,
+    observation_mode: PreparedArtifactObservationMode,
+    preparation_observation: Option<&mut PackageArtifactPreparationObservation>,
+) -> PackageLockResult<PackageLockArtifactSnapshots> {
+    build_package_lock_and_snapshot_owned_artifacts_with_payload_observation(
+        validated,
+        manifest_path,
+        manifest_bytes,
+        artifacts,
+        retention_policy,
+        observation_mode,
+        preparation_observation,
+        None,
+    )
+}
+
+/// Build a lock and artifact snapshot while also observing decoded payload freezes.
+#[allow(clippy::too_many_arguments)]
+pub fn build_package_lock_and_snapshot_owned_artifacts_with_payload_observation(
+    validated: &ValidatedPackageManifest,
+    manifest_path: PackagePath,
+    manifest_bytes: &[u8],
+    artifacts: impl IntoIterator<Item = OwnedPackageLockArtifact>,
+    retention_policy: PreparedArtifactRetentionPolicy,
+    observation_mode: PreparedArtifactObservationMode,
+    preparation_observation: Option<&mut PackageArtifactPreparationObservation>,
+    payload_observation: Option<&mut npa_cert::CertificatePayloadObservation>,
+) -> PackageLockResult<PackageLockArtifactSnapshots> {
+    let (lock, prepared) = derive_package_lock_and_snapshot_owned_artifacts(
+        validated,
+        manifest_path,
+        manifest_bytes,
+        artifacts,
+        retention_policy,
+        observation_mode,
+        preparation_observation,
+        payload_observation,
+    )?;
+    validate_package_lock_against_manifest_graph_impl(validated, &lock, true)?;
+    Ok(PackageLockArtifactSnapshots::new(
+        normalized_package_lock(&lock),
+        prepared,
+    ))
+}
+
+/// Build a lock, prepared artifacts, and their single operation-scoped index.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn build_indexed_package_lock_and_snapshot_owned_artifacts_with_payload_observation(
+    validated: &ValidatedPackageManifest,
+    manifest_path: PackagePath,
+    manifest_bytes: &[u8],
+    artifacts: impl IntoIterator<Item = OwnedPackageLockArtifact>,
+    retention_policy: PreparedArtifactRetentionPolicy,
+    observation_mode: PreparedArtifactObservationMode,
+    preparation_observation: Option<&mut PackageArtifactPreparationObservation>,
+    payload_observation: Option<&mut npa_cert::CertificatePayloadObservation>,
+) -> Result<(IndexedPackageLockGraph, PreparedPackageArtifacts), IndexedPackageLockGraphError> {
+    let (lock, prepared) = derive_package_lock_and_snapshot_owned_artifacts(
+        validated,
+        manifest_path,
+        manifest_bytes,
+        artifacts,
+        retention_policy,
+        observation_mode,
+        preparation_observation,
+        payload_observation,
+    )?;
+    let indexed = validate_package_lock_against_manifest_indexed(validated, &lock)?;
+    Ok((indexed, prepared))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn derive_package_lock_and_snapshot_owned_artifacts(
+    validated: &ValidatedPackageManifest,
+    manifest_path: PackagePath,
+    manifest_bytes: &[u8],
+    artifacts: impl IntoIterator<Item = OwnedPackageLockArtifact>,
+    retention_policy: PreparedArtifactRetentionPolicy,
+    observation_mode: PreparedArtifactObservationMode,
+    mut preparation_observation: Option<&mut PackageArtifactPreparationObservation>,
+    mut payload_observation: Option<&mut npa_cert::CertificatePayloadObservation>,
+) -> PackageLockResult<(PackageLockManifest, PreparedPackageArtifacts)> {
+    validate_lock_path(&manifest_path, "manifest.path")?;
+    let manifest = validated.manifest();
+    let mut artifact_owners = owned_artifact_map(artifacts)?;
+    let mut entries = Vec::new();
+    let mut prepared = PreparedPackageArtifacts::new(observation_mode);
+
+    for (index, module) in manifest.modules.iter().enumerate() {
+        let certificate_path = format!("modules[{index}].certificate");
+        let derived = {
+            let artifact = owned_certificate_artifact(
+                &artifact_owners,
+                &module.certificate,
+                &certificate_path,
+            )?;
+            derive_local_lock_entry(
+                index,
+                module,
+                artifact.bytes(),
+                true,
+                preparation_observation.as_deref_mut(),
+                payload_observation.as_deref_mut(),
+            )?
+        };
+        let owner = artifact_owners
+            .remove(&module.certificate)
+            .expect("owned artifact was resolved immediately above");
+        let hashed = HashedPackageLockArtifact::from_lock_derivation(owner, derived.file_hash);
+        prepared.push_derived(
+            hashed,
+            npa_cert::RetainedDecodedModuleCert::from_decoded(derived.decoded),
+            retention_policy,
+        );
+        entries.push(derived.entry);
+    }
+
+    for (index, import) in manifest
+        .imports
+        .as_deref()
+        .unwrap_or(&[])
+        .iter()
+        .enumerate()
+    {
+        let certificate_path = format!("imports[{index}].certificate");
+        let derived = {
+            let artifact = owned_certificate_artifact(
+                &artifact_owners,
+                &import.certificate,
+                &certificate_path,
+            )?;
+            derive_external_lock_entry(
+                index,
+                import,
+                artifact.bytes(),
+                preparation_observation.as_deref_mut(),
+                payload_observation.as_deref_mut(),
+            )?
+        };
+        let owner = artifact_owners
+            .remove(&import.certificate)
+            .expect("owned artifact was resolved immediately above");
+        let hashed = HashedPackageLockArtifact::from_lock_derivation(owner, derived.file_hash);
+        prepared.push_derived(
+            hashed,
+            npa_cert::RetainedDecodedModuleCert::from_decoded(derived.decoded),
+            retention_policy,
+        );
+        entries.push(derived.entry);
+    }
+
+    let lock = PackageLockManifest {
+        schema: PACKAGE_LOCK_SCHEMA.to_owned(),
+        package: manifest.package.clone(),
+        version: manifest.version.clone(),
+        manifest: PackageLockManifestReference {
+            path: manifest_path,
+            file_hash: package_file_hash(manifest_bytes),
+        },
+        entries,
+    };
+    validate_package_lock_manifest(&lock)?;
+    Ok((lock, prepared))
 }
 
 fn build_package_lock_from_artifacts_impl<'a>(
@@ -276,14 +817,22 @@ fn build_package_lock_from_package_root_impl(
 ) -> PackageLockResult<PackageLockManifest> {
     let package_root = package_root.as_ref();
     validate_lock_path(&manifest_path, "manifest.path")?;
+    let reader = PackageRootReader::open(package_root).map_err(|error| {
+        PackageLockError::artifact_read_failed(
+            "manifest.path",
+            "manifest",
+            manifest_path.as_str(),
+            error.to_string(),
+        )
+    })?;
     let manifest_bytes =
-        read_package_artifact(package_root, &manifest_path, "manifest.path", "manifest")?;
+        read_package_artifact(&reader, &manifest_path, "manifest.path", "manifest")?;
     let mut certificate_buffers = Vec::<(PackagePath, Vec<u8>)>::new();
     let manifest = validated.manifest();
 
     for (index, module) in manifest.modules.iter().enumerate() {
         let path = format!("modules[{index}].certificate");
-        let bytes = read_certificate_artifact(package_root, &module.certificate, &path)?;
+        let bytes = read_certificate_artifact(&reader, &module.certificate, &path)?;
         certificate_buffers.push((module.certificate.clone(), bytes));
     }
 
@@ -295,7 +844,7 @@ fn build_package_lock_from_package_root_impl(
         .enumerate()
     {
         let path = format!("imports[{index}].certificate");
-        let bytes = read_certificate_artifact(package_root, &import.certificate, &path)?;
+        let bytes = read_certificate_artifact(&reader, &import.certificate, &path)?;
         certificate_buffers.push((import.certificate.clone(), bytes));
     }
 
@@ -322,6 +871,22 @@ pub fn validate_package_lock_against_manifest_graph(
     validate_package_lock_against_manifest_graph_impl(validated, lock, true)
 }
 
+/// Validate and normalize a manifest/lock pair for deterministic metadata comparison.
+///
+/// This boundary is intended for read-only comparison of an untrusted package
+/// snapshot. It checks the same package identity, local hash pins, imports, and
+/// graph invariants as ordinary package verification, but deliberately returns
+/// no reusable verifier graph or index.
+pub fn normalize_package_lock_against_manifest_for_comparison(
+    validated: &ValidatedPackageManifest,
+    lock: &PackageLockManifest,
+) -> PackageLockResult<PackageLockManifest> {
+    Ok(
+        validate_package_lock_against_manifest_graph_product(validated, lock, true)?
+            .normalized_lock,
+    )
+}
+
 /// Validate an observed package lock while allowing local manifest hash-pin drift.
 ///
 /// This audit-only boundary keeps package identity, lock shape, module/import
@@ -340,26 +905,190 @@ fn validate_package_lock_against_manifest_graph_impl(
     lock: &PackageLockManifest,
     check_local_hashes: bool,
 ) -> PackageLockResult<PackageLockGraph> {
-    let graph = build_package_lock_graph(lock)?;
-    let normalized = normalized_package_lock(lock);
-    validate_manifest_lock_entries(validated, &normalized)?;
-    validate_local_certificate_imports(validated, &normalized, check_local_hashes)?;
+    Ok(
+        validate_package_lock_against_manifest_graph_product(validated, lock, check_local_hashes)?
+            .graph,
+    )
+}
+
+struct NormalizedPackageLockGraphBuild {
+    normalized_lock: PackageLockManifest,
+    graph: PackageLockGraph,
+}
+
+fn validate_package_lock_against_manifest_graph_product(
+    validated: &ValidatedPackageManifest,
+    lock: &PackageLockManifest,
+    check_local_hashes: bool,
+) -> PackageLockResult<NormalizedPackageLockGraphBuild> {
+    let product = build_normalized_package_lock_graph(lock)?;
+    validate_manifest_lock_entries(validated, &product.normalized_lock)?;
+    validate_local_certificate_imports(validated, &product.normalized_lock, check_local_hashes)?;
     if check_local_hashes {
-        validate_local_manifest_hashes(validated, &normalized)?;
+        validate_local_manifest_hashes(validated, &product.normalized_lock)?;
     }
-    Ok(graph)
+    Ok(product)
 }
 
 /// Build a resolved package-lock graph and deterministic verification order.
 pub fn build_package_lock_graph(lock: &PackageLockManifest) -> PackageLockResult<PackageLockGraph> {
-    validate_package_lock_manifest(lock)?;
-    let normalized = normalized_package_lock(lock);
-    let resolved_entry_imports = resolve_lock_entry_imports(&normalized.entries)?;
-    let topological_order = lock_topological_order(&normalized.entries, &resolved_entry_imports)?;
+    Ok(build_normalized_package_lock_graph(lock)?.graph)
+}
 
-    Ok(PackageLockGraph {
-        resolved_entry_imports,
-        topological_order,
+fn build_normalized_package_lock_graph(
+    lock: &PackageLockManifest,
+) -> PackageLockResult<NormalizedPackageLockGraphBuild> {
+    validate_package_lock_manifest(lock)?;
+    let normalized_lock = normalized_package_lock(lock);
+    let resolved_entry_imports = resolve_lock_entry_imports(&normalized_lock.entries)?;
+    let topological_order =
+        lock_topological_order(&normalized_lock.entries, &resolved_entry_imports)?;
+
+    Ok(NormalizedPackageLockGraphBuild {
+        normalized_lock,
+        graph: PackageLockGraph {
+            resolved_entry_imports,
+            topological_order,
+        },
+    })
+}
+
+/// Build a normalized package-lock graph and one reusable operation-scoped index.
+pub fn build_indexed_package_lock_graph(
+    lock: &PackageLockManifest,
+) -> Result<IndexedPackageLockGraph, IndexedPackageLockGraphError> {
+    let product = build_normalized_package_lock_graph(lock)?;
+    build_indexed_package_lock_graph_from_validated(product.normalized_lock, product.graph)
+}
+
+/// Build the closed benchmark index while collecting actual index work.
+#[cfg(any(test, feature = "planning-benchmark"))]
+#[doc(hidden)]
+pub fn build_indexed_package_lock_graph_with_planning_counters(
+    lock: &PackageLockManifest,
+    counters: &mut PackageGraphPlanningCounterSummary,
+) -> Result<IndexedPackageLockGraph, IndexedPackageLockGraphError> {
+    let product = build_normalized_package_lock_graph(lock)?;
+    build_indexed_package_lock_graph_from_validated_with_sink(
+        product.normalized_lock,
+        product.graph,
+        counters,
+    )
+}
+
+/// Strictly validate a manifest/lock pair and return its reusable graph index.
+pub fn validate_package_lock_against_manifest_indexed(
+    validated: &ValidatedPackageManifest,
+    lock: &PackageLockManifest,
+) -> Result<IndexedPackageLockGraph, IndexedPackageLockGraphError> {
+    let product = validate_package_lock_against_manifest_graph_product(validated, lock, true)?;
+    build_indexed_package_lock_graph_from_validated(product.normalized_lock, product.graph)
+}
+
+/// Audit-validate a manifest/lock pair and return its reusable graph index.
+#[doc(hidden)]
+pub fn validate_observed_package_lock_against_manifest_indexed(
+    validated: &ValidatedPackageManifest,
+    lock: &PackageLockManifest,
+) -> Result<IndexedPackageLockGraph, IndexedPackageLockGraphError> {
+    let product = validate_package_lock_against_manifest_graph_product(validated, lock, false)?;
+    build_indexed_package_lock_graph_from_validated(product.normalized_lock, product.graph)
+}
+
+fn build_indexed_package_lock_graph_from_validated(
+    lock: PackageLockManifest,
+    graph: PackageLockGraph,
+) -> Result<IndexedPackageLockGraph, IndexedPackageLockGraphError> {
+    build_indexed_package_lock_graph_from_validated_with_sink(lock, graph, &mut ())
+}
+
+fn build_indexed_package_lock_graph_from_validated_with_sink<S: PackageGraphPlanningCounterSink>(
+    lock: PackageLockManifest,
+    graph: PackageLockGraph,
+    counters: &mut S,
+) -> Result<IndexedPackageLockGraph, IndexedPackageLockGraphError> {
+    counters.graph_index_constructed();
+    let entry_count = lock.entries.len();
+    if graph.resolved_entry_imports.len() != entry_count
+        || graph.topological_order.len() != entry_count
+    {
+        counters.graph_index_invariant_failed();
+        return Err(IndexedPackageLockGraphError::InternalInvariant(
+            PackageLockIndexInvariantError::new("graph_entry_count"),
+        ));
+    }
+    let module_by_entry = lock
+        .entries
+        .iter()
+        .map(|entry| entry.module.clone())
+        .collect::<Vec<_>>();
+    let entry_by_module = module_by_entry
+        .iter()
+        .cloned()
+        .enumerate()
+        .map(|(entry, module)| (module, entry))
+        .collect::<BTreeMap<_, _>>();
+    if entry_by_module.len() != entry_count {
+        counters.graph_index_invariant_failed();
+        return Err(IndexedPackageLockGraphError::InternalInvariant(
+            PackageLockIndexInvariantError::new("duplicate_module_index"),
+        ));
+    }
+    let mut topological_entries = Vec::with_capacity(entry_count);
+    let mut topological_position_by_entry = vec![usize::MAX; entry_count];
+    for (position, module) in graph.topological_order.iter().enumerate() {
+        let entry = entry_by_module.get(module).copied().ok_or_else(|| {
+            counters.graph_index_invariant_failed();
+            IndexedPackageLockGraphError::InternalInvariant(PackageLockIndexInvariantError::new(
+                "topological_module_missing",
+            ))
+        })?;
+        if topological_position_by_entry[entry] != usize::MAX {
+            counters.graph_index_invariant_failed();
+            return Err(IndexedPackageLockGraphError::InternalInvariant(
+                PackageLockIndexInvariantError::new("duplicate_topological_entry"),
+            ));
+        }
+        topological_position_by_entry[entry] = position;
+        topological_entries.push(entry);
+    }
+    let mut dependencies_by_entry = vec![Vec::new(); entry_count];
+    let mut reverse_dependencies_by_entry = vec![Vec::new(); entry_count];
+    let mut seen_dependency_epoch = vec![0usize; entry_count];
+    let mut epoch = 0usize;
+    for dependent in &topological_entries {
+        epoch = epoch.saturating_add(1);
+        let mut dependencies = Vec::with_capacity(graph.resolved_entry_imports[*dependent].len());
+        for import in &graph.resolved_entry_imports[*dependent] {
+            let dependency = import.entry_index;
+            if dependency >= entry_count
+                || module_by_entry.get(dependency) != Some(&import.module)
+                || topological_position_by_entry[dependency]
+                    >= topological_position_by_entry[*dependent]
+                || seen_dependency_epoch[dependency] == epoch
+            {
+                counters.graph_index_invariant_failed();
+                return Err(IndexedPackageLockGraphError::InternalInvariant(
+                    PackageLockIndexInvariantError::new("dependency_edge"),
+                ));
+            }
+            seen_dependency_epoch[dependency] = epoch;
+            dependencies.push(dependency);
+            reverse_dependencies_by_entry[dependency].push(*dependent);
+        }
+        dependencies_by_entry[*dependent] = dependencies;
+    }
+    Ok(IndexedPackageLockGraph {
+        lock,
+        graph,
+        index: PackageLockGraphIndex {
+            module_by_entry,
+            entry_by_module,
+            topological_entries,
+            topological_position_by_entry,
+            dependencies_by_entry,
+            reverse_dependencies_by_entry,
+        },
     })
 }
 
@@ -381,6 +1110,32 @@ fn artifact_byte_map<'a>(
     Ok(artifact_bytes)
 }
 
+fn owned_artifact_map(
+    artifacts: impl IntoIterator<Item = OwnedPackageLockArtifact>,
+) -> PackageLockResult<BTreeMap<PackagePath, OwnedPackageLockArtifact>> {
+    let mut artifact_owners = BTreeMap::new();
+    for artifact in artifacts {
+        let path = artifact.path().clone();
+        if artifact_owners.insert(path.clone(), artifact).is_some() {
+            return Err(PackageLockError::duplicate_certificate_path(
+                "artifacts",
+                path.as_str(),
+            ));
+        }
+    }
+    Ok(artifact_owners)
+}
+
+fn owned_certificate_artifact<'a>(
+    artifacts: &'a BTreeMap<PackagePath, OwnedPackageLockArtifact>,
+    path: &PackagePath,
+    error_path: &str,
+) -> PackageLockResult<&'a OwnedPackageLockArtifact> {
+    artifacts
+        .get(path)
+        .ok_or_else(|| PackageLockError::certificate_missing(error_path, path.as_str()))
+}
+
 fn certificate_artifact_bytes<'a>(
     artifacts: &BTreeMap<PackagePath, &'a [u8]>,
     path: &PackagePath,
@@ -393,11 +1148,11 @@ fn certificate_artifact_bytes<'a>(
 }
 
 fn read_certificate_artifact(
-    package_root: &Path,
+    package_root: &PackageRootReader,
     path: &PackagePath,
     error_path: &str,
 ) -> PackageLockResult<Vec<u8>> {
-    match fs::read(package_root.join(path.as_str())) {
+    match package_root.read(path) {
         Ok(bytes) => Ok(bytes),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Err(
             PackageLockError::certificate_missing(error_path, path.as_str()),
@@ -412,14 +1167,219 @@ fn read_certificate_artifact(
 }
 
 fn read_package_artifact(
-    package_root: &Path,
+    package_root: &PackageRootReader,
     path: &PackagePath,
     error_path: &str,
     field: &str,
 ) -> PackageLockResult<Vec<u8>> {
-    fs::read(package_root.join(path.as_str())).map_err(|error| {
+    package_root.read(path).map_err(|error| {
         PackageLockError::artifact_read_failed(error_path, field, path.as_str(), error.to_string())
     })
+}
+
+/// One retained package-root directory capability. All root-builder reads are
+/// resolved relative to this descriptor, so swapping the root path after the
+/// call starts cannot redirect later manifest or certificate reads.
+struct PackageRootReader {
+    root: File,
+}
+
+#[cfg(unix)]
+impl PackageRootReader {
+    fn open(path: &Path) -> io::Result<Self> {
+        use std::{
+            ffi::{CString, OsString},
+            os::{fd::FromRawFd, unix::ffi::OsStrExt},
+            path::Component,
+        };
+
+        let mut normalized = Vec::<OsString>::new();
+        let absolute = path.is_absolute();
+        let start = if absolute { "/" } else { "." };
+        for component in path.components() {
+            match component {
+                Component::RootDir | Component::CurDir => {}
+                Component::Normal(value) => normalized.push(value.to_owned()),
+                Component::ParentDir => {
+                    if !absolute
+                        && normalized
+                            .last()
+                            .is_none_or(|value| value.as_os_str() == std::ffi::OsStr::new(".."))
+                    {
+                        normalized.push(OsString::from(".."));
+                    } else if normalized.pop().is_none() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "package root escapes its retained starting directory",
+                        ));
+                    }
+                }
+                Component::Prefix(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "unsupported package-root prefix",
+                    ));
+                }
+            }
+        }
+        // macOS exposes `/var` and `/tmp` as fixed compatibility symlinks
+        // into `/private`. Rewrite only those operating-system aliases before
+        // the no-follow walk; every package-controlled component remains
+        // descriptor-relative and must not be a symbolic link.
+        if package_root_uses_macos_compatibility_alias(path, normalized.first()) {
+            normalized.insert(0, OsString::from("private"));
+        }
+        let root = CString::new(start).expect("filesystem start has no NUL");
+        // SAFETY: the constant pathname is NUL terminated; successful ownership
+        // is transferred to File exactly once.
+        let descriptor = unsafe {
+            libc::open(
+                root.as_ptr(),
+                libc::O_RDONLY | libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW,
+            )
+        };
+        if descriptor < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: descriptor is freshly owned.
+        let mut directory = unsafe { File::from_raw_fd(descriptor) };
+        for component in normalized {
+            let component = CString::new(component.as_bytes()).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "package root contains NUL")
+            })?;
+            use std::os::fd::{AsRawFd, FromRawFd as _};
+            // SAFETY: parent descriptor and component are live and valid.
+            let descriptor = unsafe {
+                libc::openat(
+                    directory.as_raw_fd(),
+                    component.as_ptr(),
+                    libc::O_RDONLY | libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW,
+                )
+            };
+            if descriptor < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: descriptor is freshly owned.
+            directory = unsafe { File::from_raw_fd(descriptor) };
+        }
+        Ok(Self { root: directory })
+    }
+
+    fn read(&self, path: &PackagePath) -> io::Result<Vec<u8>> {
+        self.read_bounded(path, npa_cert::MAX_CERTIFICATE_BYTES as u64)
+    }
+
+    fn read_bounded(&self, path: &PackagePath, limit: u64) -> io::Result<Vec<u8>> {
+        use std::os::fd::AsRawFd;
+        use std::{
+            ffi::CString,
+            os::{fd::FromRawFd, unix::ffi::OsStrExt},
+            path::Component,
+        };
+
+        validate_package_path(path, "package_file.path")
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid package path"))?;
+        let mut components = Path::new(path.as_str()).components().peekable();
+        let mut directory = self.root.try_clone()?;
+        while let Some(component) = components.next() {
+            let Component::Normal(component) = component else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "invalid package path component",
+                ));
+            };
+            let component = CString::new(component.as_bytes()).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "package path contains NUL")
+            })?;
+            if components.peek().is_some() {
+                // SAFETY: retained parent descriptor and component are valid.
+                let descriptor = unsafe {
+                    libc::openat(
+                        directory.as_raw_fd(),
+                        component.as_ptr(),
+                        libc::O_RDONLY | libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW,
+                    )
+                };
+                if descriptor < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                // SAFETY: descriptor is freshly owned.
+                directory = unsafe { File::from_raw_fd(descriptor) };
+            } else {
+                // O_NONBLOCK avoids blocking on a hostile FIFO before fstat.
+                // SAFETY: retained parent descriptor and component are valid.
+                let descriptor = unsafe {
+                    libc::openat(
+                        directory.as_raw_fd(),
+                        component.as_ptr(),
+                        libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+                    )
+                };
+                if descriptor < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                // SAFETY: descriptor is freshly owned.
+                let mut file = unsafe { File::from_raw_fd(descriptor) };
+                let metadata = file.metadata()?;
+                if !metadata.file_type().is_file() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "package artifact is not a regular file",
+                    ));
+                }
+                if metadata.len() > limit {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "package artifact exceeds its byte limit",
+                    ));
+                }
+                let mut bytes = Vec::new();
+                file.by_ref().take(limit + 1).read_to_end(&mut bytes)?;
+                if bytes.len() as u64 > limit {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "package artifact exceeds its byte limit",
+                    ));
+                }
+                return Ok(bytes);
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "package artifact path is empty",
+        ))
+    }
+}
+
+#[cfg(unix)]
+fn package_root_uses_macos_compatibility_alias(
+    path: &Path,
+    first: Option<&std::ffi::OsString>,
+) -> bool {
+    use std::ffi::OsStr;
+
+    cfg!(target_os = "macos")
+        && path.is_absolute()
+        && first.is_some_and(|component| {
+            component == OsStr::new("var") || component == OsStr::new("tmp")
+        })
+}
+
+#[cfg(not(unix))]
+impl PackageRootReader {
+    fn open(_path: &Path) -> io::Result<Self> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "package-root filesystem lock building requires Unix no-follow I/O",
+        ))
+    }
+
+    fn read(&self, _path: &PackagePath) -> io::Result<Vec<u8>> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "package-root filesystem lock building requires Unix no-follow I/O",
+        ))
+    }
 }
 
 fn local_lock_entry(
@@ -428,7 +1388,30 @@ fn local_lock_entry(
     certificate_bytes: &[u8],
     check_manifest_hashes: bool,
 ) -> PackageLockResult<PackageLockEntry> {
+    Ok(derive_local_lock_entry(
+        index,
+        module,
+        certificate_bytes,
+        check_manifest_hashes,
+        None,
+        None,
+    )?
+    .entry)
+}
+
+fn derive_local_lock_entry(
+    index: usize,
+    module: &PackageModule,
+    certificate_bytes: &[u8],
+    check_manifest_hashes: bool,
+    preparation_observation: Option<&mut PackageArtifactPreparationObservation>,
+    payload_observation: Option<&mut npa_cert::CertificatePayloadObservation>,
+) -> PackageLockResult<DerivedPackageLockEntry> {
+    let mut preparation_observation = preparation_observation;
     let base_path = format!("modules[{index}]");
+    if let Some(observation) = preparation_observation.as_deref_mut() {
+        observation.observe_file_hash();
+    }
     let certificate_file_hash = package_file_hash(certificate_bytes);
     if check_manifest_hashes {
         check_certificate_file_hash(
@@ -439,44 +1422,56 @@ fn local_lock_entry(
         )?;
     }
 
-    let cert = decode_lock_certificate(certificate_bytes, format!("{base_path}.certificate"))?;
+    if let Some(observation) = preparation_observation {
+        observation.observe_full_decode();
+    }
+    let cert = decode_lock_certificate_observed(
+        certificate_bytes,
+        format!("{base_path}.certificate"),
+        payload_observation,
+    )?;
     check_certificate_module(
         format!("{base_path}.certificate"),
         &module.module,
-        &cert.header.module,
+        &cert.header().module,
     )?;
     if check_manifest_hashes {
         check_export_hash(
             format!("{base_path}.expected_export_hash"),
             "expected_export_hash",
             module.expected_export_hash,
-            PackageHash::from(cert.hashes.export_hash),
+            PackageHash::from(cert.hashes().export_hash),
         )?;
         check_axiom_report_hash(
             format!("{base_path}.expected_axiom_report_hash"),
             "expected_axiom_report_hash",
             module.expected_axiom_report_hash,
-            PackageHash::from(cert.hashes.axiom_report_hash),
+            PackageHash::from(cert.hashes().axiom_report_hash),
         )?;
         check_certificate_hash(
             format!("{base_path}.expected_certificate_hash"),
             "expected_certificate_hash",
             module.expected_certificate_hash,
-            PackageHash::from(cert.hashes.certificate_hash),
+            PackageHash::from(cert.hashes().certificate_hash),
         )?;
     }
 
-    Ok(PackageLockEntry {
+    let entry = PackageLockEntry {
         module: module.module.clone(),
         origin: PackageLockEntryOrigin::Local,
         certificate: module.certificate.clone(),
         certificate_file_hash,
-        export_hash: PackageHash::from(cert.hashes.export_hash),
-        axiom_report_hash: PackageHash::from(cert.hashes.axiom_report_hash),
-        certificate_hash: PackageHash::from(cert.hashes.certificate_hash),
-        imports: lock_imports(&cert.imports, &format!("{base_path}.certificate.imports"))?,
+        export_hash: PackageHash::from(cert.hashes().export_hash),
+        axiom_report_hash: PackageHash::from(cert.hashes().axiom_report_hash),
+        certificate_hash: PackageHash::from(cert.hashes().certificate_hash),
+        imports: lock_imports(cert.imports(), &format!("{base_path}.certificate.imports"))?,
         package: None,
         version: None,
+    };
+    Ok(DerivedPackageLockEntry {
+        entry,
+        file_hash: certificate_file_hash,
+        decoded: cert,
     })
 }
 
@@ -485,46 +1480,73 @@ fn external_lock_entry(
     import: &PackageExternalImport,
     certificate_bytes: &[u8],
 ) -> PackageLockResult<PackageLockEntry> {
+    Ok(derive_external_lock_entry(index, import, certificate_bytes, None, None)?.entry)
+}
+
+fn derive_external_lock_entry(
+    index: usize,
+    import: &PackageExternalImport,
+    certificate_bytes: &[u8],
+    preparation_observation: Option<&mut PackageArtifactPreparationObservation>,
+    payload_observation: Option<&mut npa_cert::CertificatePayloadObservation>,
+) -> PackageLockResult<DerivedPackageLockEntry> {
+    let mut preparation_observation = preparation_observation;
     let base_path = format!("imports[{index}]");
+    if let Some(observation) = preparation_observation.as_deref_mut() {
+        observation.observe_file_hash();
+    }
     let certificate_file_hash = package_file_hash(certificate_bytes);
-    let cert = decode_lock_certificate(certificate_bytes, format!("{base_path}.certificate"))?;
+    if let Some(observation) = preparation_observation {
+        observation.observe_full_decode();
+    }
+    let cert = decode_lock_certificate_observed(
+        certificate_bytes,
+        format!("{base_path}.certificate"),
+        payload_observation,
+    )?;
     check_certificate_module(
         format!("{base_path}.certificate"),
         &import.module,
-        &cert.header.module,
+        &cert.header().module,
     )?;
     check_export_hash(
         format!("{base_path}.export_hash"),
         "export_hash",
         import.export_hash,
-        PackageHash::from(cert.hashes.export_hash),
+        PackageHash::from(cert.hashes().export_hash),
     )?;
     check_certificate_hash(
         format!("{base_path}.certificate_hash"),
         "certificate_hash",
         import.certificate_hash,
-        PackageHash::from(cert.hashes.certificate_hash),
+        PackageHash::from(cert.hashes().certificate_hash),
     )?;
 
-    Ok(PackageLockEntry {
+    let entry = PackageLockEntry {
         module: import.module.clone(),
         origin: PackageLockEntryOrigin::External,
         certificate: import.certificate.clone(),
         certificate_file_hash,
-        export_hash: PackageHash::from(cert.hashes.export_hash),
-        axiom_report_hash: PackageHash::from(cert.hashes.axiom_report_hash),
-        certificate_hash: PackageHash::from(cert.hashes.certificate_hash),
-        imports: lock_imports(&cert.imports, &format!("{base_path}.certificate.imports"))?,
+        export_hash: PackageHash::from(cert.hashes().export_hash),
+        axiom_report_hash: PackageHash::from(cert.hashes().axiom_report_hash),
+        certificate_hash: PackageHash::from(cert.hashes().certificate_hash),
+        imports: lock_imports(cert.imports(), &format!("{base_path}.certificate.imports"))?,
         package: Some(import.package.clone()),
         version: Some(import.version.clone()),
+    };
+    Ok(DerivedPackageLockEntry {
+        entry,
+        file_hash: certificate_file_hash,
+        decoded: cert,
     })
 }
 
-fn decode_lock_certificate(
+fn decode_lock_certificate_observed(
     certificate_bytes: &[u8],
     path: impl Into<String>,
+    observation: Option<&mut npa_cert::CertificatePayloadObservation>,
 ) -> PackageLockResult<npa_cert::ModuleCert> {
-    npa_cert::decode_module_cert(certificate_bytes)
+    npa_cert::decode_module_cert_observed(certificate_bytes, observation)
         .map_err(|error| PackageLockError::certificate_decode_failed(path, format!("{error:?}")))
 }
 
@@ -1536,5 +2558,49 @@ fn field_path(path: &str, field: &str) -> String {
         field.to_owned()
     } else {
         format!("{path}.{field}")
+    }
+}
+
+#[cfg(all(test, unix))]
+mod package_root_alias_tests {
+    use super::*;
+    use std::os::unix::fs::MetadataExt as _;
+    use std::{ffi::OsString, path::PathBuf};
+
+    #[test]
+    fn package_root_reader_accepts_parent_relative_roots() {
+        let current = std::env::current_dir().unwrap();
+        let current_name = current.file_name().unwrap();
+        let selected = PathBuf::from("..").join(current_name);
+        let reader = PackageRootReader::open(&selected).unwrap();
+        let reopened = reader.root.metadata().unwrap();
+        let retained = std::fs::metadata(".").unwrap();
+
+        assert_eq!(
+            (reopened.dev(), reopened.ino()),
+            (retained.dev(), retained.ino())
+        );
+    }
+
+    #[test]
+    fn macos_compatibility_alias_never_rewrites_relative_package_roots() {
+        let tmp = OsString::from("tmp");
+        let var = OsString::from("var");
+        assert!(!package_root_uses_macos_compatibility_alias(
+            Path::new("tmp/package"),
+            Some(&tmp)
+        ));
+        assert!(!package_root_uses_macos_compatibility_alias(
+            Path::new("var/package"),
+            Some(&var)
+        ));
+        assert_eq!(
+            package_root_uses_macos_compatibility_alias(Path::new("/tmp/package"), Some(&tmp)),
+            cfg!(target_os = "macos")
+        );
+        assert_eq!(
+            package_root_uses_macos_compatibility_alias(Path::new("/var/package"), Some(&var)),
+            cfg!(target_os = "macos")
+        );
     }
 }

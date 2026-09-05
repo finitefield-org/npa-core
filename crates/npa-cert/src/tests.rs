@@ -1,11 +1,34 @@
 use super::*;
 use npa_kernel::{
     eq, eq_inductive, eq_rec_type, eq_refl, eq_refl_type, nat, nat_inductive, nat_succ, nat_zero,
-    prop, type0, Binder, ConstructorDecl, Ctx, Decl, Env, Expr, InductiveDecl, Level,
-    MutualInductiveBlock, RecursorDecl, Reducibility, ResourceLimitKind, UniverseConstraint,
+    prop, type0, Binder, ConstructorDecl, Ctx, Decl, Env, Expr, InductiveDecl,
+    KernelExecutionOptions, KernelWorkCounterSink, KernelWorkCounters, Level, MutualInductiveBlock,
+    RecursorDecl, Reducibility, ResourceLimitKind, UniverseConstraint,
 };
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::process::Command;
+
+const V0_4_FIXTURE_MATRIX: &str =
+    include_str!("../../../testdata/certificate-v0.4/fixture-matrix.tsv");
+
+fn v0_4_fixture_matrix_rows() -> Vec<Vec<&'static str>> {
+    V0_4_FIXTURE_MATRIX
+        .lines()
+        .skip(1)
+        .map(|line| {
+            let fields = line.split('\t').collect::<Vec<_>>();
+            assert_eq!(fields.len(), 10, "malformed fixture matrix row: {line}");
+            fields
+        })
+        .collect()
+}
+
+fn v0_4_fixture_rows(class: &str) -> Vec<Vec<&'static str>> {
+    v0_4_fixture_matrix_rows()
+        .into_iter()
+        .filter(|fields| fields[1] == class)
+        .collect()
+}
 
 fn encode_module_cert_without_certificate_hash(cert: &ModuleCert) -> Vec<u8> {
     encode_module_cert_without_certificate_hash_for_header(cert).unwrap()
@@ -81,6 +104,911 @@ fn id_value_with_beta_redex() -> Expr {
 
 fn id_module(a: &str, x: &str) -> CoreModule {
     id_def_module_with_value(id_value(a, x))
+}
+
+#[test]
+fn canonical_level_key_goldens() {
+    let child_a = [0x11; 32];
+    let child_b = [0x22; 32];
+    let names = vec![Name::from_dotted("u")];
+    let cases = vec![
+        (LevelNode::Zero, vec![0x00]),
+        (LevelNode::Succ(0), [vec![0x01], child_a.to_vec()].concat()),
+        (
+            LevelNode::Max(0, 1),
+            [vec![0x02], child_a.to_vec(), child_b.to_vec()].concat(),
+        ),
+        (
+            LevelNode::IMax(1, 0),
+            [vec![0x03], child_b.to_vec(), child_a.to_vec()].concat(),
+        ),
+        (LevelNode::Param(0), vec![0x04, 0x01, 0x01, b'u']),
+    ];
+    for (node, expected) in cases {
+        let mut emitted = Vec::new();
+        encode_level_node_key_to(&mut emitted, &node, &[child_a, child_b], &names).unwrap();
+        assert_eq!(emitted, expected);
+        assert_eq!(
+            level_node_key(&node, &[child_a, child_b], &names).unwrap(),
+            expected
+        );
+    }
+}
+
+#[test]
+fn canonical_term_key_goldens() {
+    let child_a = [0x11; 32];
+    let child_b = [0x22; 32];
+    let child_c = [0x33; 32];
+    let level_a = [0x44; 32];
+    let level_b = [0x55; 32];
+    let local = GlobalRef::Local { decl_index: 7 };
+    let cases = vec![
+        (TermNode::Sort(1), [vec![0x00], level_b.to_vec()].concat()),
+        (TermNode::BVar(128), vec![0x01, 0x80, 0x01]),
+        (
+            TermNode::Const {
+                global_ref: local,
+                levels: vec![0, 1],
+            },
+            [
+                vec![0x02, 0x01, 0x07, 0x02],
+                level_a.to_vec(),
+                level_b.to_vec(),
+            ]
+            .concat(),
+        ),
+        (
+            TermNode::App(0, 1),
+            [vec![0x03], child_a.to_vec(), child_b.to_vec()].concat(),
+        ),
+        (
+            TermNode::Lam { ty: 1, body: 2 },
+            [vec![0x04], child_b.to_vec(), child_c.to_vec()].concat(),
+        ),
+        (
+            TermNode::Pi { ty: 2, body: 0 },
+            [vec![0x05], child_c.to_vec(), child_a.to_vec()].concat(),
+        ),
+    ];
+    for (node, expected) in cases {
+        let mut emitted = Vec::new();
+        encode_term_node_key_to(
+            &mut emitted,
+            &node,
+            &[child_a, child_b, child_c],
+            &[level_a, level_b],
+        )
+        .unwrap();
+        assert_eq!(emitted, expected);
+        assert_eq!(
+            term_node_key(&node, &[child_a, child_b, child_c], &[level_a, level_b]).unwrap(),
+            expected
+        );
+    }
+}
+
+fn assert_canonical_hash_boundary(cert: &ModuleCert) {
+    let encoding = encode_module_cert_full_with_boundary_for_header(cert).unwrap();
+    assert_eq!(encoding.version, CertificateFormatVersion::V0_4_0);
+    let expected_prefix = encode_module_cert_without_certificate_hash_for_header(cert).unwrap();
+    assert_eq!(
+        &encoding.bytes[..encoding.certificate_hash_input_end],
+        expected_prefix
+    );
+    assert_eq!(
+        &encoding.bytes[encoding.certificate_hash_input_end..],
+        cert.hashes().certificate_hash
+    );
+}
+
+#[test]
+fn canonical_boundary_v0_4() {
+    let cert = build_module_cert(id_module("A", "x"), &[]).unwrap();
+    assert_canonical_hash_boundary(&cert);
+}
+
+#[test]
+fn validation_reuse_byte_work_equation() {
+    for cert in [
+        build_module_cert(
+            CoreModule {
+                name: Name::from_dotted("Test.Cvr.Empty"),
+                declarations: Vec::new(),
+            },
+            &[],
+        )
+        .unwrap(),
+        build_module_cert(id_module("A", "x"), &[]).unwrap(),
+    ] {
+        let bytes = encode_module_cert(&cert).unwrap();
+        let mut counter = ValidationReuseWorkCounter::default();
+        let observed =
+            verify_module_cert_hashes_impl_with_validation_reuse_counter(&bytes, &mut counter)
+                .unwrap();
+        assert_eq!(observed, cert);
+        assert_eq!(counter.level_key_encodings, cert.level_table().len() as u64);
+        assert_eq!(counter.term_key_encodings, cert.term_table().len() as u64);
+        assert_eq!(counter.level_hash_passes, 1);
+        assert_eq!(counter.term_hash_passes, 1);
+        assert_eq!(counter.canonical_full_encodings, 1);
+        assert_eq!(counter.authoritative_prefix_uses, 1);
+        assert_eq!(counter.streamed_prehash_uses, 0);
+        assert_eq!(counter.lazy_built_materializations, 0);
+        assert!(counter.canonical_encoding_allocated_bytes >= bytes.len() as u64);
+    }
+}
+
+#[test]
+fn validation_reuse_built_work_equation() {
+    for cert in [
+        build_module_cert(
+            CoreModule {
+                name: Name::from_dotted("Test.Cvr.Empty"),
+                declarations: Vec::new(),
+            },
+            &[],
+        )
+        .unwrap(),
+        build_module_cert(id_module("A", "x"), &[]).unwrap(),
+    ] {
+        let mut counter = ValidationReuseWorkCounter::default();
+        verify_built_module_cert_hashes_impl_with_validation_reuse_counter(&cert, &mut counter)
+            .unwrap();
+        assert_eq!(counter.level_key_encodings, cert.level_table().len() as u64);
+        assert_eq!(counter.term_key_encodings, cert.term_table().len() as u64);
+        assert_eq!(counter.level_hash_passes, 1);
+        assert_eq!(counter.term_hash_passes, 1);
+        assert_eq!(counter.canonical_full_encodings, 0);
+        assert_eq!(counter.authoritative_prefix_uses, 0);
+        assert_eq!(counter.streamed_prehash_uses, 0);
+        assert_eq!(counter.lazy_built_materializations, 1);
+    }
+}
+
+#[test]
+fn validation_reuse_complete_table_differential() {
+    let cert = build_module_cert(const_module(), &[]).unwrap();
+    let expected_levels = compute_level_hashes(cert.level_table(), cert.name_table()).unwrap();
+    let expected_terms = compute_term_hashes(cert.term_table(), &expected_levels).unwrap();
+    let (level_hashes, term_hashes) = validation_reuse_verify_tables_for_test(&cert).unwrap();
+    assert_eq!(level_hashes, expected_levels);
+    assert_eq!(term_hashes, expected_terms);
+}
+
+#[test]
+fn validation_reuse_legacy_table_oracle() {
+    for bytes in validation_reuse_format_fixture_bytes() {
+        let cert = decode_module_cert(&bytes).unwrap();
+        assert_eq!(
+            validation_reuse_verify_tables_for_test(&cert),
+            validation_reuse_legacy_table_oracle_for_test(&cert),
+        );
+    }
+
+    let mut malformed = build_module_cert(id_module("A", "x"), &[]).unwrap();
+    malformed.mutate_parts_for_test(|parts| {
+        parts.term_table[0] = TermNode::App(0, 0);
+    });
+    assert_eq!(
+        validation_reuse_verify_tables_for_test(&malformed),
+        validation_reuse_legacy_table_oracle_for_test(&malformed),
+    );
+    assert!(matches!(
+        validation_reuse_legacy_table_oracle_for_test(&malformed),
+        Err(CertError::NonCanonicalEncoding {
+            object: "TermTable"
+        })
+    ));
+}
+
+#[test]
+fn validation_reuse_legacy_hash_oracle() {
+    for bytes in validation_reuse_format_fixture_bytes() {
+        let cert = decode_module_cert(&bytes).unwrap();
+        let mut counter = ValidationReuseWorkCounter::default();
+        assert_eq!(
+            verify_built_module_cert_hashes_impl_with_validation_reuse_counter(&cert, &mut counter,),
+            validation_reuse_legacy_hash_oracle_for_test(&cert),
+        );
+
+        let mut malformed = cert.clone();
+        malformed.mutate_parts_for_test(|parts| {
+            parts.hashes.certificate_hash[0] ^= 1;
+        });
+        let mut counter = ValidationReuseWorkCounter::default();
+        assert_eq!(
+            verify_built_module_cert_hashes_impl_with_validation_reuse_counter(
+                &malformed,
+                &mut counter,
+            ),
+            validation_reuse_legacy_hash_oracle_for_test(&malformed),
+        );
+        assert!(matches!(
+            validation_reuse_legacy_hash_oracle_for_test(&malformed),
+            Err(CertError::HashMismatch {
+                object: HashObject::ModuleCertificate,
+                ..
+            })
+        ));
+    }
+}
+
+#[test]
+fn validation_reuse_late_hash_error_keeps_payload_and_work_order() {
+    let mut cert = build_module_cert(id_module("A", "x"), &[]).unwrap();
+    cert.mutate_parts_for_test(|parts| parts.hashes.certificate_hash[0] ^= 0x01);
+    let bytes = encode_module_cert(&cert).unwrap();
+    let mut counter = ValidationReuseWorkCounter::default();
+    let error = verify_module_cert_hashes_impl_with_validation_reuse_counter(&bytes, &mut counter)
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        CertError::HashMismatch {
+            object: HashObject::ModuleCertificate,
+            expected,
+            actual,
+        } if expected == cert.hashes().certificate_hash && expected != actual
+    ));
+    assert_eq!(counter.canonical_full_encodings, 1);
+    assert_eq!(counter.authoritative_prefix_uses, 1);
+    assert_eq!(counter.lazy_built_materializations, 0);
+}
+
+#[test]
+fn validation_reuse_late_hash_mutation_reaches_module_hash_stage() {
+    let cert = build_module_cert(id_module("A", "x"), &[]).unwrap();
+    let mut bytes = encode_module_cert(&cert).unwrap();
+    let prefix_end = bytes.len() - 32;
+    bytes[prefix_end] ^= 0x01;
+    let mutated = decode_module_cert(&bytes).unwrap();
+    assert_eq!(encode_module_cert(&mutated).unwrap(), bytes);
+    let error = verify_module_certificate_hash_from_input_prefix_for_test(
+        &mutated,
+        CertificateFormatVersion::V0_4_0,
+        &bytes[..prefix_end],
+    )
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        CertError::HashMismatch {
+            object: HashObject::ModuleCertificate,
+            expected,
+            actual,
+        } if expected == mutated.hashes().certificate_hash && expected != actual
+    ));
+}
+
+#[test]
+fn validation_reuse_scoped_allocation_meter() {
+    use crate::validation_reuse_allocation_meter::{
+        reset_and_start, set_for_saturation_test, stop, Snapshot,
+    };
+
+    let inactive = vec![0_u8; 32];
+    std::hint::black_box(inactive);
+    reset_and_start();
+    let mut measured = Vec::with_capacity(16);
+    measured.resize(64, 1_u8);
+    std::hint::black_box(&measured);
+    let snapshot = stop();
+    assert!(snapshot.allocation_events >= 1);
+    assert!(snapshot.allocated_bytes >= 16);
+
+    let unchanged = vec![0_u8; 128];
+    std::hint::black_box(unchanged);
+    assert_eq!(stop(), snapshot);
+
+    let other = std::thread::spawn(|| {
+        reset_and_start();
+        let value = vec![0_u8; 8];
+        std::hint::black_box(value);
+        stop()
+    })
+    .join()
+    .unwrap();
+    assert!(other.allocation_events >= 1);
+    assert_eq!(stop(), snapshot);
+
+    set_for_saturation_test(Snapshot {
+        allocation_events: u64::MAX,
+        allocated_bytes: u64::MAX,
+    });
+    let saturated = vec![0_u8; 8];
+    std::hint::black_box(saturated);
+    assert_eq!(
+        stop(),
+        Snapshot {
+            allocation_events: u64::MAX,
+            allocated_bytes: u64::MAX,
+        }
+    );
+}
+
+fn validation_reuse_format_fixture_bytes() -> Vec<Vec<u8>> {
+    let current = build_module_cert(id_module("A", "x"), &[]).unwrap();
+    vec![encode_module_cert(&current).unwrap()]
+}
+
+#[test]
+fn validation_reuse_format_goldens() {
+    let actual = validation_reuse_format_fixture_bytes()
+        .into_iter()
+        .map(|bytes| {
+            let cert = decode_module_cert(&bytes).unwrap();
+            let full = encode_module_cert_full_with_boundary_for_header(&cert).unwrap();
+            (
+                cert.header().format.clone(),
+                bytes.len(),
+                full.certificate_hash_input_end,
+                hash_hex(hash_with_domain(b"", &bytes)),
+                hash_hex(hash_with_domain(
+                    b"",
+                    &bytes[..full.certificate_hash_input_end],
+                )),
+                hash_hex(cert.hashes().export_hash),
+                hash_hex(cert.hashes().axiom_report_hash),
+                hash_hex(cert.hashes().certificate_hash),
+            )
+        })
+        .collect::<Vec<_>>();
+    let expected = vec![(
+        FORMAT.to_owned(),
+        364,
+        332,
+        "c06e7ea9ecde9a349a04f9c66e96ee7c7b2bdff1b65a7d2293709f9d46740054".to_owned(),
+        "2359528c4b045bc2f97b36c61eb61b9732d4f73a5e562ee88ffa3456f5b74430".to_owned(),
+        "495c350b0f738421ad48ef76bd2b5c21ee1b34eeab717086b416d6868aa124e8".to_owned(),
+        "a1ef77782ab68d41aede3e412c79174432934c3cac66c319dd2d406cf514f40e".to_owned(),
+        "150843ddf2724fb226b81079d0168d2fcc633419a99aa78ef30945b0826ed08b".to_owned(),
+    )];
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn level_key_sink_differential() {
+    let cert = build_module_cert(const_module(), &[]).unwrap();
+    let mut child_hashes = Vec::new();
+    for level in cert.level_table() {
+        let expected = level_node_key(level, &child_hashes, cert.name_table());
+        let mut emitted = Vec::new();
+        let actual =
+            match encode_level_node_key_to(&mut emitted, level, &child_hashes, cert.name_table()) {
+                Ok(()) => Ok(emitted),
+                Err(error) => Err(error),
+            };
+        assert_eq!(actual, expected);
+        child_hashes.push(hash_with_domain(b"NPA-LEVEL-0.1", &actual.unwrap()));
+    }
+
+    let invalid = LevelNode::Param(usize::MAX);
+    let expected = level_node_key(&invalid, &child_hashes, cert.name_table());
+    let mut emitted = Vec::new();
+    let actual = encode_level_node_key_to(&mut emitted, &invalid, &child_hashes, cert.name_table())
+        .map(|()| emitted);
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn term_key_sink_differential() {
+    let child_hashes = [[0x11; 32], [0x22; 32], [0x33; 32]];
+    let level_hashes = [[0x44; 32], [0x55; 32], [0x66; 32]];
+    let nodes = [
+        TermNode::Sort(0),
+        TermNode::BVar(7),
+        TermNode::Const {
+            global_ref: GlobalRef::Local { decl_index: 3 },
+            levels: vec![0, 1, 2],
+        },
+        TermNode::App(0, 1),
+        TermNode::Lam { ty: 0, body: 1 },
+        TermNode::Pi { ty: 1, body: 2 },
+    ];
+    for term in nodes {
+        let expected = term_node_key(&term, &child_hashes, &level_hashes);
+        let mut emitted = Vec::new();
+        let actual = encode_term_node_key_to(&mut emitted, &term, &child_hashes, &level_hashes)
+            .map(|()| emitted);
+        assert_eq!(actual, expected);
+    }
+
+    let invalid = TermNode::Sort(usize::MAX);
+    let expected = term_node_key(&invalid, &child_hashes, &level_hashes);
+    let mut emitted = Vec::new();
+    let actual = encode_term_node_key_to(&mut emitted, &invalid, &child_hashes, &level_hashes)
+        .map(|()| emitted);
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn one_pass_level_table_processor() {
+    let cert = build_module_cert(const_module(), &[]).unwrap();
+    let expected = compute_level_hashes(cert.level_table(), cert.name_table()).unwrap();
+    let mut counter = ValidationReuseWorkCounter::default();
+    let (actual, _) =
+        validation_reuse_verify_tables_with_counter_for_test(&cert, &mut counter).unwrap();
+    assert_eq!(actual, expected);
+    assert_eq!(counter.level_key_encodings, cert.level_table().len() as u64);
+    assert_eq!(counter.level_hash_passes, 1);
+}
+
+#[test]
+fn one_pass_term_table_processor() {
+    let cert = build_module_cert(const_module(), &[]).unwrap();
+    let levels = compute_level_hashes(cert.level_table(), cert.name_table()).unwrap();
+    let expected = compute_term_hashes(cert.term_table(), &levels).unwrap();
+    let mut counter = ValidationReuseWorkCounter::default();
+    let (_, actual) =
+        validation_reuse_verify_tables_with_counter_for_test(&cert, &mut counter).unwrap();
+    assert_eq!(actual, expected);
+    assert_eq!(counter.term_key_encodings, cert.term_table().len() as u64);
+    assert_eq!(counter.term_hash_passes, 1);
+}
+
+#[test]
+fn validation_reuse_level_normalization_order() {
+    let mut non_normal = build_module_cert(
+        CoreModule {
+            name: Name::from_dotted("Test.CvrLevelOrder"),
+            declarations: vec![Decl::Axiom {
+                name: "Test.CvrLevelOrder.target".to_owned(),
+                universe_params: Vec::new(),
+                ty: Expr::sort(Level::succ(Level::zero())),
+            }],
+        },
+        &[],
+    )
+    .unwrap();
+    let succ = non_normal
+        .level_table()
+        .iter()
+        .position(|level| matches!(level, LevelNode::Succ(_)))
+        .unwrap();
+    non_normal.mutate_parts_for_test(|parts| {
+        parts.level_table[succ] = LevelNode::Max(0, 0);
+        parts.hashes.certificate_hash[0] ^= 1;
+    });
+    assert_eq!(
+        validation_reuse_verify_tables_for_test(&non_normal).unwrap_err(),
+        CertError::NonCanonicalEncoding {
+            object: "LevelTable"
+        }
+    );
+
+    let mut bad_reference = non_normal;
+    bad_reference.mutate_parts_for_test(|parts| {
+        parts.level_table[succ] = LevelNode::Max(succ, succ);
+    });
+    assert_eq!(
+        validation_reuse_verify_tables_for_test(&bad_reference).unwrap_err(),
+        CertError::NonCanonicalEncoding {
+            object: "LevelTable"
+        }
+    );
+}
+
+#[test]
+fn validation_reuse_term_reference_order() {
+    let cert = build_module_cert(const_module(), &[]).unwrap();
+    let mut cases = Vec::new();
+
+    let mut child = cert.clone();
+    let index = child
+        .term_table()
+        .iter()
+        .enumerate()
+        .find(|(_, term)| matches!(term, TermNode::Pi { .. } | TermNode::Lam { .. }))
+        .map(|(index, _)| index)
+        .unwrap();
+    child.mutate_parts_for_test(|parts| match &mut parts.term_table[index] {
+        TermNode::Pi { ty, .. } | TermNode::Lam { ty, .. } => *ty = index,
+        _ => unreachable!(),
+    });
+    cases.push(child);
+
+    let mut level = cert.clone();
+    let index = level
+        .term_table()
+        .iter()
+        .enumerate()
+        .find(|(_, term)| matches!(term, TermNode::Sort(_)))
+        .map(|(index, _)| index)
+        .unwrap();
+    level.mutate_parts_for_test(|parts| {
+        parts.term_table[index] = TermNode::Sort(usize::MAX);
+    });
+    cases.push(level);
+
+    let mut global = cert;
+    global.mutate_parts_for_test(|parts| {
+        parts.term_table[0] = TermNode::Const {
+            global_ref: GlobalRef::Local {
+                decl_index: usize::MAX,
+            },
+            levels: Vec::new(),
+        };
+    });
+    cases.push(global);
+
+    for malformed in cases {
+        assert_eq!(
+            validation_reuse_verify_tables_for_test(&malformed).unwrap_err(),
+            CertError::NonCanonicalEncoding {
+                object: "TermTable"
+            }
+        );
+    }
+}
+
+#[test]
+fn validation_reuse_reference_stage_differential() {
+    let mut cert = build_module_cert(const_module(), &[]).unwrap();
+    let index = cert
+        .term_table()
+        .iter()
+        .enumerate()
+        .find(|(_, term)| matches!(term, TermNode::Pi { .. }))
+        .map(|(index, _)| index)
+        .unwrap();
+    cert.mutate_parts_for_test(|parts| {
+        if let TermNode::Pi { body, .. } = &mut parts.term_table[index] {
+            *body = index;
+        }
+    });
+    let mut counter = ValidationReuseWorkCounter::default();
+    let error =
+        validation_reuse_verify_tables_with_counter_for_test(&cert, &mut counter).unwrap_err();
+    assert_eq!(
+        error,
+        CertError::NonCanonicalEncoding {
+            object: "TermTable"
+        }
+    );
+    assert_eq!(counter.term_key_encodings, 0);
+    assert_eq!(counter.term_hash_passes, 0);
+}
+
+#[test]
+fn validation_reuse_hash_pass_counts() {
+    validation_reuse_byte_work_equation();
+    validation_reuse_built_work_equation();
+}
+
+#[test]
+fn validation_reuse_typed_hash_differential() {
+    for bytes in validation_reuse_format_fixture_bytes() {
+        let mut cert = decode_module_cert(&bytes).unwrap();
+        cert.mutate_parts_for_test(|parts| parts.hashes.certificate_hash[0] ^= 1);
+        let mutated = encode_module_cert(&cert).unwrap();
+        let mut byte_counter = ValidationReuseWorkCounter::default();
+        let byte = verify_module_cert_hashes_impl_with_validation_reuse_counter(
+            &mutated,
+            &mut byte_counter,
+        )
+        .map(|_| ());
+        let mut built_counter = ValidationReuseWorkCounter::default();
+        let built = verify_built_module_cert_hashes_impl_with_validation_reuse_counter(
+            &cert,
+            &mut built_counter,
+        );
+        assert_eq!(byte, built);
+        assert_eq!(byte_counter.level_hash_passes, 1);
+        assert_eq!(built_counter.level_hash_passes, 1);
+    }
+}
+
+#[test]
+fn validation_reuse_all_byte_entry_paths() {
+    let cert = build_module_cert(id_module("A", "x"), &[]).unwrap();
+    let bytes = encode_module_cert(&cert).unwrap();
+    assert_eq!(verify_module_cert_hashes(&bytes).unwrap(), cert);
+    let policy = AxiomPolicy::normal();
+    let expected = verify_module_cert_with_import_refs(&bytes, &[], &policy).unwrap();
+    assert_eq!(
+        verify_decoded_module_cert_with_import_refs(&cert, &bytes, &[], &policy).unwrap(),
+        expected
+    );
+    let mut session = VerifierSession::new();
+    assert_eq!(
+        verify_module_cert(&bytes, &mut session, &policy).unwrap(),
+        expected
+    );
+    let mut session = VerifierSession::new();
+    assert_eq!(
+        verify_decoded_module_cert(&cert, &bytes, &mut session, &policy).unwrap(),
+        expected
+    );
+}
+
+fn validation_reuse_legacy_built_result(cert: &ModuleCert) -> Result<()> {
+    structural_preflight(cert)?;
+    validation_reuse_legacy_table_oracle_for_test(cert)?;
+    validation_reuse_legacy_hash_oracle_for_test(cert)
+}
+
+fn validation_reuse_new_built_result(cert: &ModuleCert) -> Result<()> {
+    let mut counter = ValidationReuseWorkCounter::default();
+    verify_built_module_cert_hashes_impl_with_validation_reuse_counter(cert, &mut counter)
+}
+
+#[test]
+fn validation_reuse_built_multifault_differential() {
+    for bytes in validation_reuse_format_fixture_bytes() {
+        let cert = decode_module_cert(&bytes).unwrap();
+
+        let mut table_then_late_hash = cert.clone();
+        table_then_late_hash.mutate_parts_for_test(|parts| {
+            parts.term_table.push(parts.term_table[0].clone());
+            parts.declarations[0].hashes.decl_interface_hash[0] ^= 1;
+            parts.hashes.export_hash[0] ^= 1;
+            parts.hashes.certificate_hash[0] ^= 1;
+        });
+        let expected = validation_reuse_legacy_built_result(&table_then_late_hash);
+        assert_eq!(
+            validation_reuse_new_built_result(&table_then_late_hash),
+            expected
+        );
+        assert!(matches!(
+            expected,
+            Err(CertError::NonCanonicalEncoding {
+                object: "TermTable"
+            })
+        ));
+
+        let mut declaration_then_export = cert.clone();
+        declaration_then_export.mutate_parts_for_test(|parts| {
+            parts.declarations[0].hashes.decl_interface_hash[0] ^= 1;
+            parts.hashes.export_hash[0] ^= 1;
+            parts.hashes.certificate_hash[0] ^= 1;
+        });
+        let expected = validation_reuse_legacy_built_result(&declaration_then_export);
+        assert_eq!(
+            validation_reuse_new_built_result(&declaration_then_export),
+            expected
+        );
+        assert!(
+            matches!(
+                &expected,
+                Err(CertError::HashMismatch {
+                    object: HashObject::DeclInterface,
+                    ..
+                })
+            ),
+            "observed declaration rejection: {expected:?}"
+        );
+
+        let mut export_then_certificate = cert;
+        export_then_certificate.mutate_parts_for_test(|parts| {
+            parts.hashes.export_hash[0] ^= 1;
+            parts.hashes.certificate_hash[0] ^= 1;
+        });
+        let expected = validation_reuse_legacy_built_result(&export_then_certificate);
+        assert_eq!(
+            validation_reuse_new_built_result(&export_then_certificate),
+            expected
+        );
+        assert!(matches!(
+            expected,
+            Err(CertError::HashMismatch {
+                object: HashObject::ExportBlock,
+                ..
+            })
+        ));
+    }
+
+    let tagged = v0_4_opaque_alias_cert_with_local_implementation_dependency();
+    assert_eq!(
+        validation_reuse_new_built_result(&tagged),
+        validation_reuse_legacy_built_result(&tagged)
+    );
+}
+
+#[test]
+fn validation_reuse_bounded_dag_differential() {
+    let mut valid = 0_usize;
+    let mut malformed = 0_usize;
+    for module in [id_module("A", "x"), const_module(), nat_module()] {
+        let cert = build_module_cert(module, &[]).unwrap();
+        let expected = validation_reuse_legacy_table_oracle_for_test(&cert);
+        assert_eq!(validation_reuse_verify_tables_for_test(&cert), expected);
+        valid += usize::from(expected.is_ok());
+
+        for index in 0..cert.level_table().len() {
+            for child in 0..=cert.level_table().len() {
+                let mut candidate = cert.clone();
+                candidate.mutate_parts_for_test(|parts| {
+                    parts.level_table[index] = LevelNode::Succ(child);
+                });
+                let expected = validation_reuse_legacy_table_oracle_for_test(&candidate);
+                assert_eq!(
+                    validation_reuse_verify_tables_for_test(&candidate),
+                    expected
+                );
+                valid += usize::from(expected.is_ok());
+                malformed += usize::from(expected.is_err());
+            }
+        }
+        for index in 0..cert.term_table().len() {
+            for child in 0..=cert.term_table().len() {
+                for replacement in [TermNode::Sort(child), TermNode::App(child, child)] {
+                    let mut candidate = cert.clone();
+                    candidate.mutate_parts_for_test(|parts| {
+                        parts.term_table[index] = replacement.clone();
+                    });
+                    let expected = validation_reuse_legacy_table_oracle_for_test(&candidate);
+                    assert_eq!(
+                        validation_reuse_verify_tables_for_test(&candidate),
+                        expected
+                    );
+                    valid += usize::from(expected.is_ok());
+                    malformed += usize::from(expected.is_err());
+                }
+            }
+        }
+    }
+    assert!(valid >= 3);
+    assert!(malformed >= 100);
+}
+
+#[test]
+fn validation_reuse_all_formats_byte_differential() {
+    for bytes in validation_reuse_format_fixture_bytes() {
+        let decoded = decode_module_cert(&bytes).unwrap();
+        assert_eq!(verify_module_cert_hashes(&bytes).unwrap(), decoded);
+        assert_eq!(encode_module_cert(&decoded).unwrap(), bytes);
+
+        let mut rejected = decoded.clone();
+        rejected.mutate_parts_for_test(|parts| parts.hashes.certificate_hash[0] ^= 1);
+        let rejected_bytes = encode_module_cert(&rejected).unwrap();
+        let mut counter = ValidationReuseWorkCounter::default();
+        let observed = verify_module_cert_hashes_impl_with_validation_reuse_counter(
+            &rejected_bytes,
+            &mut counter,
+        )
+        .map(|_| ());
+        assert_eq!(observed, validation_reuse_legacy_built_result(&rejected));
+        assert!(matches!(
+            observed,
+            Err(CertError::HashMismatch {
+                object: HashObject::ModuleCertificate,
+                ..
+            })
+        ));
+        assert_eq!(counter.level_hash_passes, 1);
+        assert_eq!(counter.term_hash_passes, 1);
+        assert_eq!(counter.canonical_full_encodings, 1);
+    }
+}
+
+#[test]
+fn validation_reuse_all_formats_built_differential() {
+    for bytes in validation_reuse_format_fixture_bytes() {
+        let cert = decode_module_cert(&bytes).unwrap();
+        let mut counter = ValidationReuseWorkCounter::default();
+        verify_built_module_cert_hashes_impl_with_validation_reuse_counter(&cert, &mut counter)
+            .unwrap();
+        assert_eq!(counter.canonical_full_encodings, 0);
+        assert_eq!(counter.lazy_built_materializations, 1);
+
+        let mut rejected = cert;
+        rejected.mutate_parts_for_test(|parts| {
+            parts.declarations[0].hashes.decl_certificate_hash[0] ^= 1;
+            parts.hashes.certificate_hash[0] ^= 1;
+        });
+        let mut counter = ValidationReuseWorkCounter::default();
+        let observed = verify_built_module_cert_hashes_impl_with_validation_reuse_counter(
+            &rejected,
+            &mut counter,
+        );
+        assert_eq!(observed, validation_reuse_legacy_built_result(&rejected));
+        assert!(matches!(
+            observed,
+            Err(CertError::HashMismatch {
+                object: HashObject::DeclCertificate,
+                ..
+            })
+        ));
+        assert_eq!(counter.canonical_full_encodings, 0);
+        assert_eq!(counter.lazy_built_materializations, 0);
+    }
+}
+
+#[test]
+fn validation_reuse_outer_error_order() {
+    let cert = build_module_cert(id_module("A", "x"), &[]).unwrap();
+    let bytes = encode_module_cert(&cert).unwrap();
+    let mut nonminimal_uvar = bytes.clone();
+    nonminimal_uvar[0] |= 0x80;
+    nonminimal_uvar.insert(1, 0x00);
+    let mut unsupported = bytes.clone();
+    let offset = unsupported
+        .windows(FORMAT.len())
+        .position(|window| window == FORMAT.as_bytes())
+        .unwrap();
+    unsupported[offset..offset + FORMAT.len()].copy_from_slice(b"NPA-CERT-9.9.9");
+    let mut structural = cert.clone();
+    let duplicate = structural.term_table()[0].clone();
+    structural.mutate_parts_for_test(|parts| parts.term_table.push(duplicate));
+    let structural_bytes = encode_module_cert(&structural).unwrap();
+    let over_limit = vec![0_u8; MAX_CERTIFICATE_BYTES + 1];
+    let cases = vec![
+        (bytes[..bytes.len() - 1].to_vec(), "truncated"),
+        ([bytes.as_slice(), &[0xff]].concat(), "trailing"),
+        (nonminimal_uvar, "nonminimal-uvar"),
+        (unsupported, "unsupported-format"),
+        (structural_bytes, "structural"),
+        (over_limit, "over-byte-limit"),
+    ];
+    for (malformed, label) in cases {
+        let mut counter = ValidationReuseWorkCounter::default();
+        let error =
+            verify_module_cert_hashes_impl_with_validation_reuse_counter(&malformed, &mut counter)
+                .unwrap_err();
+        match label {
+            "nonminimal-uvar" => assert!(matches!(
+                error,
+                CertError::NonCanonicalEncoding { object: "uvar" }
+            )),
+            "unsupported-format" => {
+                assert!(matches!(error, CertError::UnsupportedFormat { .. }))
+            }
+            "structural" => assert!(matches!(
+                error,
+                CertError::NonCanonicalEncoding {
+                    object: "TermTable"
+                }
+            )),
+            "over-byte-limit" => assert!(matches!(
+                error,
+                CertError::StructuralLimitExceeded {
+                    kind: StructuralLimitKind::CertificateBytes,
+                    ..
+                }
+            )),
+            "truncated" | "trailing" => assert!(matches!(error, CertError::DecodeError)),
+            _ => unreachable!(),
+        }
+        if label == "structural" {
+            assert_eq!(counter.level_hash_passes, 1);
+            assert_eq!(counter.level_key_encodings, cert.level_table().len() as u64);
+            assert!(counter.term_key_encodings > 0);
+            assert_eq!(counter.term_hash_passes, 0);
+            assert_eq!(counter.canonical_full_encodings, 1);
+        } else {
+            assert_eq!(counter.level_key_encodings, 0);
+            assert_eq!(counter.term_key_encodings, 0);
+            assert_eq!(counter.canonical_full_encodings, 0);
+        }
+    }
+}
+
+#[test]
+fn validation_reuse_error_precedence_baseline() {
+    validation_reuse_level_normalization_order();
+    validation_reuse_term_reference_order();
+    validation_reuse_typed_hash_differential();
+    validation_reuse_outer_error_order();
+}
+
+#[test]
+fn canonical_full_buffer_default_dispatch() {
+    let cert = build_module_cert(id_module("A", "x"), &[]).unwrap();
+    let bytes = encode_module_cert(&cert).unwrap();
+    let mut counter = ValidationReuseWorkCounter::default();
+    verify_module_cert_hashes_impl_with_validation_reuse_counter(&bytes, &mut counter).unwrap();
+    assert_eq!(counter.canonical_full_encodings, 1);
+    assert_eq!(counter.authoritative_prefix_uses, 1);
+    assert_eq!(counter.streamed_prehash_uses, 0);
+}
+
+#[test]
+fn reusable_vector_key_sink_default_dispatch() {
+    let cert = build_module_cert(const_module(), &[]).unwrap();
+    let mut counter = ValidationReuseWorkCounter::default();
+    validation_reuse_verify_tables_with_counter_for_test(&cert, &mut counter).unwrap();
+    assert_eq!(counter.level_key_encodings, cert.level_table().len() as u64);
+    assert_eq!(counter.term_key_encodings, cert.term_table().len() as u64);
+    assert!(counter.key_scratch_allocated_bytes > 0);
 }
 
 fn id_def_module_with_value(value: Expr) -> CoreModule {
@@ -166,34 +1094,6 @@ fn max_u_v_le_w() -> UniverseConstraint {
 
 fn succ_u_le_u() -> UniverseConstraint {
     UniverseConstraint::le(Level::succ(Level::param("u")), Level::param("u"))
-}
-
-fn legacy_bytes_from_current_cert(mut cert: ModuleCert) -> Vec<u8> {
-    cert.header.format = LEGACY_FORMAT.to_owned();
-    cert.header.core_spec = LEGACY_CORE_SPEC.to_owned();
-    cert.hashes.export_hash = hash_with_domain(
-        LEGACY_MODULE_EXPORT_DOMAIN,
-        &encode_export_block_legacy(&cert.export_block),
-    );
-    cert.hashes.certificate_hash = hash_with_domain(
-        LEGACY_MODULE_CERT_DOMAIN,
-        &encode_module_cert_without_certificate_hash_for_header(&cert).unwrap(),
-    );
-    encode_module_cert(&cert).unwrap()
-}
-
-fn previous_bytes_from_current_cert(mut cert: ModuleCert) -> Vec<u8> {
-    cert.header.format = PREVIOUS_FORMAT.to_owned();
-    cert.header.core_spec = PREVIOUS_CORE_SPEC.to_owned();
-    cert.hashes.export_hash = hash_with_domain(
-        PREVIOUS_MODULE_EXPORT_DOMAIN,
-        &encode_export_block_previous(&cert.export_block),
-    );
-    cert.hashes.certificate_hash = hash_with_domain(
-        PREVIOUS_MODULE_CERT_DOMAIN,
-        &encode_module_cert_without_certificate_hash_for_header(&cert).unwrap(),
-    );
-    encode_module_cert(&cert).unwrap()
 }
 
 fn opaque_alias_module() -> CoreModule {
@@ -368,19 +1268,19 @@ fn theorem_interface_only_module(hidden_value: Expr) -> CoreModule {
     }
 }
 
-fn build_v0_3_cert(module: CoreModule) -> ModuleCert {
+fn build_v0_4_cert(module: CoreModule) -> ModuleCert {
     build_module_cert(module, &[]).unwrap()
 }
 
-fn v0_3_opaque_alias_cert_with_interface_dependency() -> ModuleCert {
-    let mut cert = build_v0_3_cert(opaque_alias_module());
+fn v0_4_opaque_alias_cert_with_interface_dependency() -> ModuleCert {
+    let mut cert = build_v0_4_cert(opaque_alias_module());
     replace_first_local_dependency_with_interface(&mut cert);
     cert
 }
 
 fn first_local_dependency(cert: &ModuleCert) -> (usize, usize) {
     let consumer_index = cert
-        .declarations
+        .declarations()
         .iter()
         .position(|decl| {
             decl.dependencies
@@ -388,7 +1288,7 @@ fn first_local_dependency(cert: &ModuleCert) -> (usize, usize) {
                 .any(|dependency| matches!(dependency.global_ref(), GlobalRef::Local { .. }))
         })
         .unwrap();
-    let dependency_index = cert.declarations[consumer_index]
+    let dependency_index = cert.declarations()[consumer_index]
         .dependencies
         .iter()
         .position(|dependency| matches!(dependency.global_ref(), GlobalRef::Local { .. }))
@@ -398,66 +1298,75 @@ fn first_local_dependency(cert: &ModuleCert) -> (usize, usize) {
 
 fn replace_first_local_dependency_with_interface(cert: &mut ModuleCert) -> usize {
     let (consumer_index, dependency_index) = first_local_dependency(cert);
-    let dependency = &cert.declarations[consumer_index].dependencies[dependency_index];
+    let dependency = &cert.declarations()[consumer_index].dependencies[dependency_index];
     let interface = DependencyEntry::checked_interface(
         dependency.global_ref().clone(),
         dependency.decl_interface_hash(),
     )
     .unwrap();
-    cert.declarations[consumer_index].dependencies[dependency_index] = interface;
-    rehash_v0_3_dependency_change(cert, consumer_index);
+    cert.mutate_parts_for_test(|parts| {
+        parts.declarations[consumer_index].dependencies[dependency_index] = interface;
+    });
+    rehash_v0_4_dependency_change(cert, consumer_index);
     consumer_index
 }
 
 fn replace_first_local_dependency_with_implementation(cert: &mut ModuleCert) -> usize {
     let (consumer_index, dependency_index) = first_local_dependency(cert);
-    let global_ref = cert.declarations[consumer_index].dependencies[dependency_index]
+    let global_ref = cert.declarations()[consumer_index].dependencies[dependency_index]
         .global_ref()
         .clone();
     let implementation = DependencyEntry::checked_local_implementation(
         global_ref,
         consumer_index,
-        &cert.declarations,
+        cert.declarations(),
     )
     .unwrap();
-    cert.declarations[consumer_index].dependencies[dependency_index] = implementation;
-    rehash_v0_3_dependency_change(cert, consumer_index);
+    cert.mutate_parts_for_test(|parts| {
+        parts.declarations[consumer_index].dependencies[dependency_index] = implementation;
+    });
+    rehash_v0_4_dependency_change(cert, consumer_index);
     consumer_index
 }
 
-fn rehash_v0_3_dependency_change(cert: &mut ModuleCert, consumer_index: usize) {
-    let level_hashes = compute_level_hashes(&cert.level_table, &cert.name_table).unwrap();
-    let term_hashes = compute_term_hashes(&cert.term_table, &level_hashes).unwrap();
-    cert.declarations[consumer_index].hashes = compute_decl_hashes(
-        CertificateFormatVersion::V0_3_0,
-        &cert.declarations[consumer_index].decl,
-        &cert.declarations[consumer_index].dependencies,
-        &cert.declarations[consumer_index].axiom_dependencies,
+fn rehash_v0_4_dependency_change(cert: &mut ModuleCert, consumer_index: usize) {
+    let level_hashes = compute_level_hashes(cert.level_table(), cert.name_table()).unwrap();
+    let term_hashes = compute_term_hashes(cert.term_table(), &level_hashes).unwrap();
+    let declaration_hashes = compute_decl_hashes(
+        CertificateFormatVersion::V0_4_0,
+        &cert.declarations()[consumer_index].decl,
+        &cert.declarations()[consumer_index].dependencies,
+        &cert.declarations()[consumer_index].axiom_dependencies,
         DeclHashTables {
-            terms: &cert.term_table,
+            terms: cert.term_table(),
             level_hashes: &level_hashes,
             term_hashes: &term_hashes,
-            names: &cert.name_table,
+            names: cert.name_table(),
         },
     )
     .unwrap();
-    cert.export_block =
-        build_export_block(&cert.declarations, &cert.term_table, &term_hashes).unwrap();
-    cert.hashes.export_hash = hash_with_domain(
-        MODULE_EXPORT_DOMAIN,
-        &encode_export_block(&cert.export_block),
-    );
-    cert.hashes.certificate_hash = hash_with_domain(
+    cert.mutate_parts_for_test(|parts| {
+        parts.declarations[consumer_index].hashes = declaration_hashes;
+    });
+    let export_block =
+        build_export_block(cert.declarations(), cert.term_table(), &term_hashes).unwrap();
+    let export_hash = hash_with_domain(MODULE_EXPORT_DOMAIN, &encode_export_block(&export_block));
+    cert.mutate_parts_for_test(|parts| {
+        parts.export_block = export_block;
+        parts.hashes.export_hash = export_hash;
+    });
+    let certificate_hash = hash_with_domain(
         MODULE_CERT_DOMAIN,
         &encode_module_cert_without_certificate_hash_for_header(cert).unwrap(),
     );
+    cert.mutate_parts_for_test(|parts| parts.hashes.certificate_hash = certificate_hash);
 }
 
-fn v0_3_opaque_alias_cert_with_local_implementation_dependency() -> ModuleCert {
-    build_v0_3_cert(opaque_alias_module())
+fn v0_4_opaque_alias_cert_with_local_implementation_dependency() -> ModuleCert {
+    build_v0_4_cert(opaque_alias_module())
 }
 
-fn v0_3_dependency_bytes(entry: &DependencyEntry) -> Vec<u8> {
+fn v0_4_dependency_bytes(entry: &DependencyEntry) -> Vec<u8> {
     let mut bytes = vec![match entry.kind() {
         DependencyEntryKind::Interface => 0x00,
         DependencyEntryKind::LocalImplementation => 0x01,
@@ -472,7 +1381,7 @@ fn v0_3_dependency_bytes(entry: &DependencyEntry) -> Vec<u8> {
 
 fn decl_index_named(cert: &ModuleCert, expected: &str) -> usize {
     let expected = Name::from_dotted(expected);
-    cert.declarations
+    cert.declarations()
         .iter()
         .position(|declaration| {
             let name = match &declaration.decl {
@@ -486,13 +1395,13 @@ fn decl_index_named(cert: &ModuleCert, expected: &str) -> usize {
                 | DeclPayload::InductiveConstrained { name, .. }
                 | DeclPayload::MutualInductiveBlock { name, .. } => *name,
             };
-            cert.name_table[name] == expected
+            cert.name_table()[name] == expected
         })
         .unwrap()
 }
 
 fn local_implementation_targets(cert: &ModuleCert, decl_index: usize) -> BTreeSet<usize> {
-    cert.declarations[decl_index]
+    cert.declarations()[decl_index]
         .dependencies
         .iter()
         .filter_map(|dependency| {
@@ -513,14 +1422,16 @@ fn replace_first_local_dependency_with_raw_implementation(
     decl_certificate_hash: Hash,
 ) -> usize {
     let (consumer_index, dependency_index) = first_local_dependency(cert);
-    cert.declarations[consumer_index].dependencies[dependency_index] =
-        DependencyEntry::from_decoded_local_implementation(
-            global_ref,
-            decl_interface_hash,
-            decl_certificate_hash,
-        );
-    cert.declarations[consumer_index].dependencies.sort();
-    rehash_v0_3_dependency_change(cert, consumer_index);
+    cert.mutate_parts_for_test(|parts| {
+        parts.declarations[consumer_index].dependencies[dependency_index] =
+            DependencyEntry::from_decoded_local_implementation(
+                global_ref,
+                decl_interface_hash,
+                decl_certificate_hash,
+            );
+        parts.declarations[consumer_index].dependencies.sort();
+    });
+    rehash_v0_4_dependency_change(cert, consumer_index);
     consumer_index
 }
 
@@ -534,11 +1445,14 @@ fn assert_local_implementation_error(
         &AxiomPolicy::normal(),
     )
     .unwrap_err();
-    assert!(matches!(
-        err,
+    assert!(
+        matches!(
+            err,
         CertError::InvalidLocalImplementationDependency { reason, .. }
             if reason == expected_reason && reason.as_str() == expected_reason.as_str()
-    ));
+        ),
+        "unexpected error for {expected_reason:?}: {err:?}"
+    );
 }
 
 fn height_order_regression_constraints() -> Vec<UniverseConstraint> {
@@ -561,11 +1475,13 @@ fn universe_meta_param_certificate_bytes() -> Vec<u8> {
         &[],
     )
     .unwrap();
-    for name in &mut cert.name_table {
-        if name.as_dotted() == "w" {
-            *name = Name::from_dotted("z?meta");
+    cert.mutate_parts_for_test(|parts| {
+        for name in &mut parts.name_table {
+            if name.as_dotted() == "w" {
+                *name = Name::from_dotted("z?meta");
+            }
         }
-    }
+    });
     encode_module_cert(&cert).unwrap()
 }
 
@@ -580,7 +1496,7 @@ fn decode_with_import_offsets_preserves_import_order() {
     let (decoded, import_offsets) = decode_module_cert_with_import_offsets(&bytes).unwrap();
 
     assert_eq!(decoded, use_id_cert);
-    assert_eq!(import_offsets.len(), decoded.imports.len());
+    assert_eq!(import_offsets.len(), decoded.imports().len());
     assert_eq!(import_offsets.len(), 1);
     assert!(import_offsets[0] < bytes.len());
 }
@@ -620,7 +1536,7 @@ fn canonical_certificate_name_grammar_allows_ascii_prime() {
     )
     .unwrap();
     assert_eq!(
-        cert.name_table
+        cert.name_table()
             .iter()
             .map(Name::as_dotted)
             .collect::<Vec<_>>(),
@@ -754,13 +1670,13 @@ fn universe_constraints_change_certificate_hash_and_import_hash() {
         build_module_cert(constrained_axiom_module(vec![max_u_v_le_w()]), &[]).unwrap();
 
     assert_ne!(
-        empty.declarations[0].hashes.decl_interface_hash,
-        constrained.declarations[0].hashes.decl_interface_hash
+        empty.declarations()[0].hashes.decl_interface_hash,
+        constrained.declarations()[0].hashes.decl_interface_hash
     );
-    assert_ne!(empty.hashes.export_hash, constrained.hashes.export_hash);
+    assert_ne!(empty.hashes().export_hash, constrained.hashes().export_hash);
     assert_ne!(
-        empty.hashes.certificate_hash,
-        constrained.hashes.certificate_hash
+        empty.hashes().certificate_hash,
+        constrained.hashes().certificate_hash
     );
 }
 
@@ -768,50 +1684,34 @@ fn universe_constraints_change_certificate_hash_and_import_hash() {
 fn constrained_export_entries_encode_universe_constraints_in_current_format() {
     let cert = build_module_cert(constrained_axiom_module(vec![max_u_v_le_w()]), &[]).unwrap();
 
-    assert_eq!(cert.header.format, FORMAT);
-    assert_eq!(cert.header.core_spec, CORE_SPEC);
+    assert_eq!(cert.header().format, FORMAT);
+    assert_eq!(cert.header().core_spec, CORE_SPEC);
     assert_eq!(
-        cert.hashes.export_hash,
+        cert.hashes().export_hash,
         hash_with_domain(
             MODULE_EXPORT_DOMAIN,
-            &encode_export_block(&cert.export_block)
+            &encode_export_block(cert.export_block())
         )
     );
     assert_eq!(
-        cert.hashes.certificate_hash,
+        cert.hashes().certificate_hash,
         hash_with_domain(
             MODULE_CERT_DOMAIN,
             &encode_module_cert_without_certificate_hash(&cert)
         )
     );
-    assert_eq!(cert.export_block.len(), 1);
-    assert_eq!(cert.export_block[0].universe_constraints.len(), 1);
+    assert_eq!(cert.export_block().len(), 1);
+    assert_eq!(cert.export_block()[0].universe_constraints.len(), 1);
 
     let bytes = encode_module_cert(&cert).unwrap();
     let decoded = decode_module_cert(&bytes).unwrap();
     assert_eq!(
-        decoded.export_block[0].universe_constraints,
-        cert.export_block[0].universe_constraints
+        decoded.export_block()[0].universe_constraints,
+        cert.export_block()[0].universe_constraints
     );
 
     let mut session = VerifierSession::new();
     verify_module_cert(&bytes, &mut session, &AxiomPolicy::normal()).unwrap();
-}
-
-#[test]
-fn previous_constrained_public_exports_remain_readable() {
-    let cert =
-        build_module_cert_v0_2_compat(constrained_axiom_module(vec![max_u_v_le_w()]), &[]).unwrap();
-    let bytes = previous_bytes_from_current_cert(cert);
-    let decoded = decode_module_cert(&bytes).unwrap();
-
-    assert_eq!(decoded.header.format, PREVIOUS_FORMAT);
-    assert_eq!(decoded.header.core_spec, PREVIOUS_CORE_SPEC);
-    assert_eq!(decoded.export_block[0].universe_constraints.len(), 1);
-
-    let mut session = VerifierSession::new();
-    let verified = verify_module_cert(&bytes, &mut session, &AxiomPolicy::normal()).unwrap();
-    assert_eq!(verified.export_block()[0].universe_constraints.len(), 1);
 }
 
 #[test]
@@ -835,162 +1735,67 @@ fn imported_public_signature_reconstructs_exported_universe_constraints() {
     ));
 
     let mut stripped_export = verified.clone();
-    stripped_export.export_block[0].universe_constraints.clear();
+    stripped_export.mutate_certificate_parts_for_test(|parts| {
+        parts.export_block[0].universe_constraints.clear();
+    });
     let stripped_decls = verified_module_to_kernel_decls(&stripped_export).unwrap();
     assert!(matches!(&stripped_decls[0], Decl::Axiom { .. }));
 }
 
 #[test]
-fn legacy_unconstrained_public_exports_remain_readable() {
-    let cert = build_module_cert_v0_2_compat(constrained_axiom_module(vec![]), &[]).unwrap();
-    let bytes = legacy_bytes_from_current_cert(cert);
-    let decoded = decode_module_cert(&bytes).unwrap();
-
-    assert_eq!(decoded.header.format, LEGACY_FORMAT);
-    assert_eq!(decoded.header.core_spec, LEGACY_CORE_SPEC);
-    assert!(decoded.export_block[0].universe_constraints.is_empty());
-
-    let mut session = VerifierSession::new();
-    let verified = verify_module_cert(&bytes, &mut session, &AxiomPolicy::normal()).unwrap();
-    assert!(verified.export_block()[0].universe_constraints.is_empty());
-}
-
-#[test]
-fn binary_four_version_certificates_round_trip_without_rewriting_legacy_dependencies() {
-    let v0_3 = build_module_cert(opaque_alias_module(), &[]).unwrap();
-    let v0_2 = build_module_cert_v0_2_compat(opaque_alias_module(), &[]).unwrap();
-    let cases = [
-        (encode_module_cert(&v0_3).unwrap(), FORMAT, CORE_SPEC),
-        (
-            encode_module_cert(&v0_2).unwrap(),
-            COMPAT_FORMAT,
-            COMPAT_CORE_SPEC,
-        ),
-        (
-            previous_bytes_from_current_cert(v0_2.clone()),
-            PREVIOUS_FORMAT,
-            PREVIOUS_CORE_SPEC,
-        ),
-        (
-            legacy_bytes_from_current_cert(v0_2),
-            LEGACY_FORMAT,
-            LEGACY_CORE_SPEC,
-        ),
-    ];
-
-    for (bytes, expected_format, expected_core_spec) in cases {
-        let decoded = decode_module_cert(&bytes).unwrap();
-        assert_eq!(decoded.header.format, expected_format);
-        assert_eq!(decoded.header.core_spec, expected_core_spec);
-        assert_eq!(encode_module_cert(&decoded).unwrap(), bytes);
-    }
-}
-
-#[test]
-fn certificate_format_builders_emit_v0_3_by_default_and_v0_2_only_explicitly() {
-    let ordinary = build_module_cert(id_module("A", "x"), &[]).unwrap();
-    assert_eq!(ordinary.header.format, FORMAT);
-    assert_eq!(ordinary.header.core_spec, CORE_SPEC);
-
-    let compatibility = build_module_cert_v0_2_compat(id_module("A", "x"), &[]).unwrap();
-    assert_eq!(compatibility.header.format, COMPAT_FORMAT);
-    assert_eq!(compatibility.header.core_spec, COMPAT_CORE_SPEC);
-    verify_module_cert_hashes(&encode_module_cert(&ordinary).unwrap()).unwrap();
-    verify_module_cert_hashes(&encode_module_cert(&compatibility).unwrap()).unwrap();
-}
-
-#[test]
-fn hash_v0_3_plain_migration_changes_certificate_identities_only() {
-    let v0_2 = build_module_cert_v0_2_compat(id_module("A", "x"), &[]).unwrap();
-    let v0_3 = build_module_cert(id_module("A", "x"), &[]).unwrap();
-
-    assert_eq!(v0_2.export_block, v0_3.export_block);
-    assert_eq!(
-        encode_export_block(&v0_2.export_block),
-        encode_export_block(&v0_3.export_block)
-    );
-    assert_eq!(v0_2.hashes.export_hash, v0_3.hashes.export_hash);
-    assert_eq!(
-        v0_2.declarations[0].hashes.decl_interface_hash,
-        v0_3.declarations[0].hashes.decl_interface_hash
-    );
-    assert_ne!(
-        v0_2.declarations[0].hashes.decl_certificate_hash,
-        v0_3.declarations[0].hashes.decl_certificate_hash
-    );
-    assert_ne!(v0_2.hashes.certificate_hash, v0_3.hashes.certificate_hash);
-    let v0_3_payload = encode_module_cert_without_certificate_hash_for_header(&v0_3).unwrap();
-    assert_eq!(
-        v0_3.hashes.certificate_hash,
-        hash_with_domain(MODULE_CERT_DOMAIN, &v0_3_payload)
-    );
-    assert_ne!(
-        v0_3.hashes.certificate_hash,
-        hash_with_domain(COMPAT_MODULE_CERT_DOMAIN, &v0_3_payload)
-    );
-    verify_module_cert_hashes(&encode_module_cert(&v0_3).unwrap()).unwrap();
-
-    let v0_2_bytes = encode_module_cert(&v0_2).unwrap();
-    let v0_3_bytes = encode_module_cert(&v0_3).unwrap();
-    assert_ne!(v0_2_bytes, v0_3_bytes);
-    let mut header_only_upgrade = v0_2.clone();
-    header_only_upgrade.header.format = FORMAT.to_owned();
-    header_only_upgrade.header.core_spec = CORE_SPEC.to_owned();
-    let header_only_upgrade_bytes = encode_module_cert(&header_only_upgrade).unwrap();
-    assert!(verify_module_cert_hashes(&header_only_upgrade_bytes).is_err());
-}
-
-#[test]
-fn hash_v0_3_opaque_body_change_keeps_public_identity() {
-    let direct = build_v0_3_cert(id_def_module_with_value_and_reducibility(
+fn hash_v0_4_opaque_body_change_keeps_public_identity() {
+    let direct = build_v0_4_cert(id_def_module_with_value_and_reducibility(
         id_value("A", "x"),
         Reducibility::Opaque,
     ));
-    let beta = build_v0_3_cert(id_def_module_with_value_and_reducibility(
+    let beta = build_v0_4_cert(id_def_module_with_value_and_reducibility(
         id_value_with_beta_redex(),
         Reducibility::Opaque,
     ));
 
     assert_eq!(
-        direct.declarations[0].hashes.decl_interface_hash,
-        beta.declarations[0].hashes.decl_interface_hash
+        direct.declarations()[0].hashes.decl_interface_hash,
+        beta.declarations()[0].hashes.decl_interface_hash
     );
-    assert_eq!(direct.export_block, beta.export_block);
-    assert_eq!(direct.hashes.export_hash, beta.hashes.export_hash);
+    assert_eq!(direct.export_block(), beta.export_block());
+    assert_eq!(direct.hashes().export_hash, beta.hashes().export_hash);
     assert_ne!(
-        direct.declarations[0].hashes.decl_certificate_hash,
-        beta.declarations[0].hashes.decl_certificate_hash
+        direct.declarations()[0].hashes.decl_certificate_hash,
+        beta.declarations()[0].hashes.decl_certificate_hash
     );
-    assert_ne!(direct.hashes.certificate_hash, beta.hashes.certificate_hash);
+    assert_ne!(
+        direct.hashes().certificate_hash,
+        beta.hashes().certificate_hash
+    );
     verify_module_cert_hashes(&encode_module_cert(&direct).unwrap()).unwrap();
     verify_module_cert_hashes(&encode_module_cert(&beta).unwrap()).unwrap();
 }
 
 #[test]
-fn hash_v0_3_transitive_axiom_change_still_changes_public_identity() {
-    let p1 = build_v0_3_cert(theorem_using_axiom_module("p1"));
-    let p2 = build_v0_3_cert(theorem_using_axiom_module("p2"));
+fn hash_v0_4_transitive_axiom_change_still_changes_public_identity() {
+    let p1 = build_v0_4_cert(theorem_using_axiom_module("p1"));
+    let p2 = build_v0_4_cert(theorem_using_axiom_module("p2"));
 
     assert_ne!(
-        p1.axiom_report.per_declaration[3].transitive_axioms,
-        p2.axiom_report.per_declaration[3].transitive_axioms
+        p1.axiom_report().per_declaration[3].transitive_axioms,
+        p2.axiom_report().per_declaration[3].transitive_axioms
     );
     assert_ne!(
-        p1.declarations[3].hashes.decl_interface_hash,
-        p2.declarations[3].hashes.decl_interface_hash
+        p1.declarations()[3].hashes.decl_interface_hash,
+        p2.declarations()[3].hashes.decl_interface_hash
     );
-    assert_ne!(p1.export_block, p2.export_block);
-    assert_ne!(p1.hashes.export_hash, p2.hashes.export_hash);
+    assert_ne!(p1.export_block(), p2.export_block());
+    assert_ne!(p1.hashes().export_hash, p2.hashes().export_hash);
     verify_module_cert_hashes(&encode_module_cert(&p1).unwrap()).unwrap();
     verify_module_cert_hashes(&encode_module_cert(&p2).unwrap()).unwrap();
 }
 
 #[test]
-fn hash_v0_3_local_implementation_projects_to_legacy_public_interface_dependency() {
-    let interface = v0_3_opaque_alias_cert_with_interface_dependency();
-    let implementation = v0_3_opaque_alias_cert_with_local_implementation_dependency();
+fn hash_v0_4_local_implementation_projects_to_public_interface_dependency() {
+    let interface = v0_4_opaque_alias_cert_with_interface_dependency();
+    let implementation = v0_4_opaque_alias_cert_with_local_implementation_dependency();
     let consumer_index = implementation
-        .declarations
+        .declarations()
         .iter()
         .position(|declaration| {
             declaration
@@ -1001,38 +1806,38 @@ fn hash_v0_3_local_implementation_projects_to_legacy_public_interface_dependency
         .unwrap();
 
     assert_eq!(
-        interface.declarations[consumer_index]
+        interface.declarations()[consumer_index]
             .hashes
             .decl_interface_hash,
-        implementation.declarations[consumer_index]
+        implementation.declarations()[consumer_index]
             .hashes
             .decl_interface_hash
     );
-    assert_eq!(interface.export_block, implementation.export_block);
+    assert_eq!(interface.export_block(), implementation.export_block());
     assert_eq!(
-        interface.hashes.export_hash,
-        implementation.hashes.export_hash
+        interface.hashes().export_hash,
+        implementation.hashes().export_hash
     );
     assert_ne!(
-        interface.declarations[consumer_index]
+        interface.declarations()[consumer_index]
             .hashes
             .decl_certificate_hash,
-        implementation.declarations[consumer_index]
+        implementation.declarations()[consumer_index]
             .hashes
             .decl_certificate_hash
     );
     assert_ne!(
-        interface.hashes.certificate_hash,
-        implementation.hashes.certificate_hash
+        interface.hashes().certificate_hash,
+        implementation.hashes().certificate_hash
     );
     verify_module_cert_hashes(&encode_module_cert(&implementation).unwrap()).unwrap();
 }
 
 #[test]
-fn hash_v0_3_local_implementation_certificate_hash_is_committed_privately() {
-    let cert = v0_3_opaque_alias_cert_with_interface_dependency();
+fn hash_v0_4_local_implementation_certificate_hash_is_committed_privately() {
+    let cert = v0_4_opaque_alias_cert_with_interface_dependency();
     let consumer_index = cert
-        .declarations
+        .declarations()
         .iter()
         .position(|declaration| {
             declaration
@@ -1041,7 +1846,7 @@ fn hash_v0_3_local_implementation_certificate_hash_is_committed_privately() {
                 .any(|dependency| matches!(dependency.global_ref(), GlobalRef::Local { .. }))
         })
         .unwrap();
-    let global_ref = cert.declarations[consumer_index]
+    let global_ref = cert.declarations()[consumer_index]
         .dependencies
         .iter()
         .find(|dependency| matches!(dependency.global_ref(), GlobalRef::Local { .. }))
@@ -1051,10 +1856,10 @@ fn hash_v0_3_local_implementation_certificate_hash_is_committed_privately() {
     let original_dependency = DependencyEntry::checked_local_implementation(
         global_ref.clone(),
         consumer_index,
-        &cert.declarations,
+        cert.declarations(),
     )
     .unwrap();
-    let mut changed_targets = cert.declarations.clone();
+    let mut changed_targets = cert.declarations().to_vec();
     let GlobalRef::Local { decl_index } = global_ref else {
         unreachable!()
     };
@@ -1065,32 +1870,32 @@ fn hash_v0_3_local_implementation_certificate_hash_is_committed_privately() {
         &changed_targets,
     )
     .unwrap();
-    let consumer = &cert.declarations[consumer_index];
-    let level_hashes = compute_level_hashes(&cert.level_table, &cert.name_table).unwrap();
-    let term_hashes = compute_term_hashes(&cert.term_table, &level_hashes).unwrap();
+    let consumer = &cert.declarations()[consumer_index];
+    let level_hashes = compute_level_hashes(cert.level_table(), cert.name_table()).unwrap();
+    let term_hashes = compute_term_hashes(cert.term_table(), &level_hashes).unwrap();
     let original_hashes = compute_decl_hashes(
-        CertificateFormatVersion::V0_3_0,
+        CertificateFormatVersion::V0_4_0,
         &consumer.decl,
         &[original_dependency],
         &consumer.axiom_dependencies,
         DeclHashTables {
-            terms: &cert.term_table,
+            terms: cert.term_table(),
             level_hashes: &level_hashes,
             term_hashes: &term_hashes,
-            names: &cert.name_table,
+            names: cert.name_table(),
         },
     )
     .unwrap();
     let changed_hashes = compute_decl_hashes(
-        CertificateFormatVersion::V0_3_0,
+        CertificateFormatVersion::V0_4_0,
         &consumer.decl,
         &[changed_dependency],
         &consumer.axiom_dependencies,
         DeclHashTables {
-            terms: &cert.term_table,
+            terms: cert.term_table(),
             level_hashes: &level_hashes,
             term_hashes: &term_hashes,
-            names: &cert.name_table,
+            names: cert.name_table(),
         },
     )
     .unwrap();
@@ -1106,30 +1911,30 @@ fn hash_v0_3_local_implementation_certificate_hash_is_committed_privately() {
 }
 
 #[test]
-fn hash_v0_3_closure_only_local_implementation_is_absent_from_public_projection() {
+fn hash_v0_4_closure_only_local_implementation_is_absent_from_public_projection() {
     let mut module = opaque_alias_module();
     match &mut module.declarations[1] {
         Decl::Def { reducibility, .. } => *reducibility = Reducibility::Opaque,
         _ => panic!("expected definition"),
     }
-    let mut interface = build_v0_3_cert(module);
+    let mut interface = build_v0_4_cert(module);
     replace_first_local_dependency_with_interface(&mut interface);
     let mut implementation = interface.clone();
     let consumer_index = replace_first_local_dependency_with_implementation(&mut implementation);
-    let consumer = &implementation.declarations[consumer_index];
+    let consumer = &implementation.declarations()[consumer_index];
     let level_hashes =
-        compute_level_hashes(&implementation.level_table, &implementation.name_table).unwrap();
-    let term_hashes = compute_term_hashes(&implementation.term_table, &level_hashes).unwrap();
+        compute_level_hashes(implementation.level_table(), implementation.name_table()).unwrap();
+    let term_hashes = compute_term_hashes(implementation.term_table(), &level_hashes).unwrap();
     let without_closure_dependency = compute_decl_hashes(
-        CertificateFormatVersion::V0_3_0,
+        CertificateFormatVersion::V0_4_0,
         &consumer.decl,
         &[],
         &consumer.axiom_dependencies,
         DeclHashTables {
-            terms: &implementation.term_table,
+            terms: implementation.term_table(),
             level_hashes: &level_hashes,
             term_hashes: &term_hashes,
-            names: &implementation.name_table,
+            names: implementation.name_table(),
         },
     )
     .unwrap();
@@ -1139,18 +1944,18 @@ fn hash_v0_3_closure_only_local_implementation_is_absent_from_public_projection(
         without_closure_dependency.decl_interface_hash
     );
     assert_eq!(
-        interface.declarations[consumer_index]
+        interface.declarations()[consumer_index]
             .hashes
             .decl_interface_hash,
         consumer.hashes.decl_interface_hash
     );
-    assert_eq!(interface.export_block, implementation.export_block);
+    assert_eq!(interface.export_block(), implementation.export_block());
     assert_eq!(
-        interface.hashes.export_hash,
-        implementation.hashes.export_hash
+        interface.hashes().export_hash,
+        implementation.hashes().export_hash
     );
     assert_ne!(
-        interface.declarations[consumer_index]
+        interface.declarations()[consumer_index]
             .hashes
             .decl_certificate_hash,
         consumer.hashes.decl_certificate_hash
@@ -1159,13 +1964,13 @@ fn hash_v0_3_closure_only_local_implementation_is_absent_from_public_projection(
 }
 
 #[test]
-fn current_module_opaque_body_supports_v0_3_equality_and_keeps_stored_decl_opaque() {
-    let cert = build_v0_3_cert(opaque_nat_equality_module(nat_zero()));
+fn current_module_opaque_body_supports_v0_4_equality_and_keeps_stored_decl_opaque() {
+    let cert = build_v0_4_cert(opaque_nat_equality_module(nat_zero()));
     let hidden = decl_index_named(&cert, "hidden_nat");
     let theorem = decl_index_named(&cert, "hidden_nat_eq_zero");
 
     assert!(matches!(
-        cert.declarations[hidden].decl,
+        cert.declarations()[hidden].decl,
         DeclPayload::Def {
             reducibility: CertReducibility::Opaque,
             ..
@@ -1186,47 +1991,8 @@ fn current_module_opaque_body_supports_v0_3_equality_and_keeps_stored_decl_opaqu
 }
 
 #[test]
-fn current_module_opaque_body_is_immediately_opaque_in_v0_2_builder() {
-    assert!(matches!(
-        build_module_cert_v0_2_compat(opaque_nat_equality_module(nat_zero()), &[]),
-        Err(CertError::Kernel(npa_kernel::Error::TypeMismatch { .. }))
-    ));
-}
-
-#[test]
-fn current_module_compatibility_formats_keep_checked_opaque_body_hidden() {
-    for version in [
-        CertificateFormatVersion::V0_2_0,
-        CertificateFormatVersion::V0_1_2,
-        CertificateFormatVersion::V0_1,
-    ] {
-        let mut env = Env::new();
-        add_current_module_decl_to_env(
-            &mut env,
-            Decl::Def {
-                name: "compatibility_hidden".to_owned(),
-                universe_params: vec![],
-                ty: Expr::sort(Level::succ(Level::zero())),
-                value: Expr::sort(Level::zero()),
-                reducibility: Reducibility::Opaque,
-            },
-            version,
-        )
-        .unwrap();
-        assert!(!env
-            .is_defeq(
-                &Ctx::new(),
-                &[],
-                &Expr::konst("compatibility_hidden", vec![]),
-                &Expr::sort(Level::zero()),
-            )
-            .unwrap());
-    }
-}
-
-#[test]
 fn imported_opaque_body_is_not_available_to_conversion_or_export_projection() {
-    let imported_cert = build_v0_3_cert(CoreModule {
+    let imported_cert = build_v0_4_cert(CoreModule {
         name: Name::from_dotted("Test.OpaqueNatImport"),
         declarations: vec![Decl::Def {
             name: "hidden_nat".to_owned(),
@@ -1252,10 +2018,10 @@ fn imported_opaque_body_is_not_available_to_conversion_or_export_projection() {
         Err(CertError::Kernel(npa_kernel::Error::TypeMismatch { .. }))
     ));
 
-    match &mut imported.declarations[0].decl {
+    imported.mutate_certificate_parts_for_test(|parts| match &mut parts.declarations[0].decl {
         DeclPayload::Def { value, .. } => *value = usize::MAX,
         _ => panic!("expected opaque definition"),
-    }
+    });
     assert!(matches!(
         verified_module_to_kernel_decls(&imported).unwrap().as_slice(),
         [Decl::Axiom { name, .. }] if name == "hidden_nat"
@@ -1273,7 +2039,7 @@ fn current_module_failed_opaque_body_check_inserts_no_local_view() {
         reducibility: Reducibility::Opaque,
     };
     assert!(matches!(
-        add_current_module_decl_to_env(&mut env, bad, CertificateFormatVersion::V0_3_0),
+        add_current_module_decl_to_env(&mut env, bad, CertificateFormatVersion::V0_4_0),
         Err(CertError::Kernel(npa_kernel::Error::TypeMismatch { .. }))
     ));
     assert!(env.decl("bad_hidden").is_none());
@@ -1292,7 +2058,7 @@ fn current_module_opaque_view_obeys_conversion_fuel_exhaustion() {
             value: Expr::sort(Level::zero()),
             reducibility: Reducibility::Opaque,
         },
-        CertificateFormatVersion::V0_3_0,
+        CertificateFormatVersion::V0_4_0,
     )
     .unwrap();
     let mut reducible = Env::new();
@@ -1336,8 +2102,8 @@ fn opaque_body_check_consumes_same_kernel_work_as_reducible_body() {
             reducibility,
         }],
     };
-    let opaque = build_v0_3_cert(module("Test.OpaqueBodyWork", Reducibility::Opaque));
-    let reducible = build_v0_3_cert(module("Test.ReducibleBodyWork", Reducibility::Reducible));
+    let opaque = build_v0_4_cert(module("Test.OpaqueBodyWork", Reducibility::Opaque));
+    let reducible = build_v0_4_cert(module("Test.ReducibleBodyWork", Reducibility::Reducible));
     let mut opaque_counters = npa_kernel::KernelWorkCounters::default();
     let mut reducible_counters = npa_kernel::KernelWorkCounters::default();
     verify_module_cert_with_import_refs_and_kernel_options_and_work_counters(
@@ -1371,14 +2137,14 @@ fn opaque_body_check_consumes_same_kernel_work_as_reducible_body() {
 
 #[test]
 fn current_module_opaque_stale_dependency_evidence_is_rejected() {
-    let direct = build_v0_3_cert(opaque_nat_equality_module(nat_zero()));
+    let direct = build_v0_4_cert(opaque_nat_equality_module(nat_zero()));
     let beta_zero = Expr::app(Expr::lam("x", nat(), Expr::bvar(0)), nat_zero());
-    let mut changed = build_v0_3_cert(opaque_nat_equality_module(beta_zero));
+    let mut changed = build_v0_4_cert(opaque_nat_equality_module(beta_zero));
     let (consumer, dependency_index) = first_local_dependency(&changed);
-    let stale_hash = direct.declarations[decl_index_named(&direct, "hidden_nat")]
+    let stale_hash = direct.declarations()[decl_index_named(&direct, "hidden_nat")]
         .hashes
         .decl_certificate_hash;
-    let dependency = &changed.declarations[consumer].dependencies[dependency_index];
+    let dependency = &changed.declarations()[consumer].dependencies[dependency_index];
     let global_ref = dependency.global_ref().clone();
     let interface_hash = dependency.decl_interface_hash();
     replace_first_local_dependency_with_raw_implementation(
@@ -1440,9 +2206,9 @@ fn opaque_determinism_fuel_result(
 }
 
 fn opaque_determinism_snapshot() -> String {
-    let canonical_cert_a = build_v0_3_cert(opaque_alias_chain_module());
-    let canonical_cert_b = build_v0_3_cert(opaque_alias_chain_module());
-    let canonical_hash = hash_hex(canonical_cert_a.hashes.certificate_hash);
+    let canonical_cert_a = build_v0_4_cert(opaque_alias_chain_module());
+    let canonical_cert_b = build_v0_4_cert(opaque_alias_chain_module());
+    let canonical_hash = hash_hex(canonical_cert_a.hashes().certificate_hash);
     let canonical_a = encode_module_cert(&canonical_cert_a).unwrap();
     let canonical_b = encode_module_cert(&canonical_cert_b).unwrap();
     assert_eq!(
@@ -1450,14 +2216,14 @@ fn opaque_determinism_snapshot() -> String {
         "identical opaque source modules must have identical canonical certificates"
     );
 
-    let direct = build_v0_3_cert(opaque_nat_equality_module(nat_zero()));
+    let direct = build_v0_4_cert(opaque_nat_equality_module(nat_zero()));
     let beta_zero = Expr::app(Expr::lam("x", nat(), Expr::bvar(0)), nat_zero());
-    let mut changed = build_v0_3_cert(opaque_nat_equality_module(beta_zero));
+    let mut changed = build_v0_4_cert(opaque_nat_equality_module(beta_zero));
     let (consumer, dependency_index) = first_local_dependency(&changed);
-    let stale_hash = direct.declarations[decl_index_named(&direct, "hidden_nat")]
+    let stale_hash = direct.declarations()[decl_index_named(&direct, "hidden_nat")]
         .hashes
         .decl_certificate_hash;
-    let dependency = &changed.declarations[consumer].dependencies[dependency_index];
+    let dependency = &changed.declarations()[consumer].dependencies[dependency_index];
     let global_ref = dependency.global_ref().clone();
     let interface_hash = dependency.decl_interface_hash();
     replace_first_local_dependency_with_raw_implementation(
@@ -1467,7 +2233,7 @@ fn opaque_determinism_snapshot() -> String {
         stale_hash,
     );
     let stale_bytes = encode_module_cert(&changed).unwrap();
-    let stale_hash = hash_hex(changed.hashes.certificate_hash);
+    let stale_hash = hash_hex(changed.hashes().certificate_hash);
 
     let off_reason = opaque_determinism_stale_reason(
         &stale_bytes,
@@ -1549,44 +2315,13 @@ fn opaque_definition_determinism_is_stable_across_fresh_processes() {
 }
 
 #[test]
-fn verified_module_records_each_validated_compatibility_input_pair() {
-    let cert = build_module_cert(id_module("A", "x"), &[]).unwrap();
-    let compat = build_module_cert_v0_2_compat(id_module("A", "x"), &[]).unwrap();
-    let current = verify_module_cert_with_import_refs(
-        &encode_module_cert(&cert).unwrap(),
-        &[],
-        &AxiomPolicy::normal(),
-    )
-    .unwrap();
-    let previous = verify_module_cert_with_import_refs(
-        &previous_bytes_from_current_cert(compat.clone()),
-        &[],
-        &AxiomPolicy::normal(),
-    )
-    .unwrap();
-    let legacy = verify_module_cert_with_import_refs(
-        &legacy_bytes_from_current_cert(compat),
-        &[],
-        &AxiomPolicy::normal(),
-    )
-    .unwrap();
-
-    assert_eq!(current.certificate_format(), FORMAT);
-    assert_eq!(current.core_spec(), CORE_SPEC);
-    assert_eq!(previous.certificate_format(), PREVIOUS_FORMAT);
-    assert_eq!(previous.core_spec(), PREVIOUS_CORE_SPEC);
-    assert_eq!(legacy.certificate_format(), LEGACY_FORMAT);
-    assert_eq!(legacy.core_spec(), LEGACY_CORE_SPEC);
-}
-
-#[test]
 fn local_transparency_direct_dependency_matches_producer_and_verifier() {
-    let cert = v0_3_opaque_alias_cert_with_local_implementation_dependency();
+    let cert = v0_4_opaque_alias_cert_with_local_implementation_dependency();
     let hidden = decl_index_named(&cert, "opaque_id");
     let alias = decl_index_named(&cert, "opaque_id_alias");
 
     assert_eq!(local_implementation_targets(&cert, alias), [hidden].into());
-    for (decl_index, declaration) in cert.declarations.iter().enumerate() {
+    for (decl_index, declaration) in cert.declarations().iter().enumerate() {
         assert_eq!(
             declaration.dependencies,
             expected_dependencies_for_decl(&cert, &[], decl_index, &declaration.decl).unwrap()
@@ -1602,7 +2337,7 @@ fn local_transparency_direct_dependency_matches_producer_and_verifier() {
 
 #[test]
 fn local_transparency_alias_chain_propagates_existing_reducible_body_path() {
-    let cert = build_v0_3_cert(opaque_alias_chain_module());
+    let cert = build_v0_4_cert(opaque_alias_chain_module());
     let hidden = decl_index_named(&cert, "hidden");
     let alias = decl_index_named(&cert, "alias");
     let uses_alias = decl_index_named(&cert, "uses_alias");
@@ -1612,7 +2347,7 @@ fn local_transparency_alias_chain_propagates_existing_reducible_body_path() {
         local_implementation_targets(&cert, uses_alias),
         [hidden].into()
     );
-    assert!(cert.declarations[uses_alias]
+    assert!(cert.declarations()[uses_alias]
         .dependencies
         .iter()
         .any(|dependency| {
@@ -1623,12 +2358,12 @@ fn local_transparency_alias_chain_propagates_existing_reducible_body_path() {
                 )
         }));
     assert_eq!(
-        cert.declarations[uses_alias].dependencies,
+        cert.declarations()[uses_alias].dependencies,
         expected_dependencies_for_decl(
             &cert,
             &[],
             uses_alias,
-            &cert.declarations[uses_alias].decl,
+            &cert.declarations()[uses_alias].decl,
         )
         .unwrap()
     );
@@ -1636,7 +2371,7 @@ fn local_transparency_alias_chain_propagates_existing_reducible_body_path() {
 
 #[test]
 fn local_transparency_follows_referenced_declared_type() {
-    let cert = build_v0_3_cert(opaque_declared_type_module());
+    let cert = build_v0_4_cert(opaque_declared_type_module());
     let hidden_type = decl_index_named(&cert, "hidden_type");
     let hidden_witness = decl_index_named(&cert, "hidden_witness");
     let uses_witness = decl_index_named(&cert, "uses_witness_type");
@@ -1649,7 +2384,7 @@ fn local_transparency_follows_referenced_declared_type() {
         local_implementation_targets(&cert, uses_witness),
         [hidden_type].into()
     );
-    assert!(cert.declarations[uses_witness]
+    assert!(cert.declarations()[uses_witness]
         .dependencies
         .iter()
         .any(|dependency| {
@@ -1663,7 +2398,7 @@ fn local_transparency_follows_referenced_declared_type() {
 
 #[test]
 fn local_transparency_nested_opaque_bodies_propagate_all_reached_targets() {
-    let cert = build_v0_3_cert(nested_opaque_module());
+    let cert = build_v0_4_cert(nested_opaque_module());
     let inner = decl_index_named(&cert, "inner_hidden");
     let outer = decl_index_named(&cert, "outer_hidden");
     let consumer = decl_index_named(&cert, "uses_outer");
@@ -1677,8 +2412,8 @@ fn local_transparency_nested_opaque_bodies_propagate_all_reached_targets() {
 
 #[test]
 fn local_transparency_stops_at_referenced_theorem_proof() {
-    let direct = build_v0_3_cert(theorem_interface_only_module(id_value("A", "x")));
-    let changed = build_v0_3_cert(theorem_interface_only_module(id_value_with_beta_redex()));
+    let direct = build_v0_4_cert(theorem_interface_only_module(id_value("A", "x")));
+    let changed = build_v0_4_cert(theorem_interface_only_module(id_value_with_beta_redex()));
     let hidden = decl_index_named(&direct, "hidden");
     let theorem = decl_index_named(&direct, "stable_theorem");
     let consumer = decl_index_named(&direct, "uses_stable_theorem");
@@ -1690,25 +2425,27 @@ fn local_transparency_stops_at_referenced_theorem_proof() {
     assert!(local_implementation_targets(&direct, consumer).is_empty());
     assert_eq!(
         dependency_selective_fingerprint_canonical_bytes(
-            &direct.declarations[consumer].dependencies,
+            &direct.declarations()[consumer].dependencies,
         ),
         dependency_selective_fingerprint_canonical_bytes(
-            &changed.declarations[consumer].dependencies,
+            &changed.declarations()[consumer].dependencies,
         )
     );
     assert_eq!(
-        direct.declarations[consumer].hashes.decl_certificate_hash,
-        changed.declarations[consumer].hashes.decl_certificate_hash
+        direct.declarations()[consumer].hashes.decl_certificate_hash,
+        changed.declarations()[consumer]
+            .hashes
+            .decl_certificate_hash
     );
     assert_ne!(
-        direct.declarations[theorem].hashes.decl_certificate_hash,
-        changed.declarations[theorem].hashes.decl_certificate_hash
+        direct.declarations()[theorem].hashes.decl_certificate_hash,
+        changed.declarations()[theorem].hashes.decl_certificate_hash
     );
 }
 
 #[test]
 fn local_transparency_stops_at_imported_opaque_body() {
-    let imported_cert = build_v0_3_cert(CoreModule {
+    let imported_cert = build_v0_4_cert(CoreModule {
         name: Name::from_dotted("Test.ImportedOpaque"),
         declarations: vec![named_opaque_id("imported_hidden", id_value("A", "x"))],
     });
@@ -1733,7 +2470,7 @@ fn local_transparency_stops_at_imported_opaque_body() {
     .unwrap();
 
     assert!(local_implementation_targets(&cert, 0).is_empty());
-    assert!(cert.declarations[0]
+    assert!(cert.declarations()[0]
         .dependencies
         .iter()
         .all(|dependency| dependency.kind() == DependencyEntryKind::Interface));
@@ -1752,18 +2489,18 @@ fn local_transparency_dependency_selective_fingerprint_commits_only_reached_bodi
         Decl::Def { value, .. } => *value = id_value_with_beta_redex(),
         _ => panic!("expected opaque definition"),
     }
-    let direct = build_v0_3_cert(opaque_alias_chain_module());
-    let changed = build_v0_3_cert(changed_module);
+    let direct = build_v0_4_cert(opaque_alias_chain_module());
+    let changed = build_v0_4_cert(changed_module);
     let consumer = decl_index_named(&direct, "uses_alias");
     let direct_fingerprint = dependency_selective_fingerprint_canonical_bytes(
-        &direct.declarations[consumer].dependencies,
+        &direct.declarations()[consumer].dependencies,
     );
     let changed_fingerprint = dependency_selective_fingerprint_canonical_bytes(
-        &changed.declarations[consumer].dependencies,
+        &changed.declarations()[consumer].dependencies,
     );
 
     assert_ne!(direct_fingerprint, changed_fingerprint);
-    let mut reversed = direct.declarations[consumer].dependencies.clone();
+    let mut reversed = direct.declarations()[consumer].dependencies.clone();
     reversed.reverse();
     assert_eq!(
         direct_fingerprint,
@@ -1779,23 +2516,23 @@ fn local_transparency_declaration_order_uses_paths_without_bare_source_authority
         named_opaque_id("hidden", id_value("A", "x")),
         named_opaque_id("aaa_unrelated", id_value("A", "x")),
     ];
-    let cert = build_v0_3_cert(CoreModule {
+    let cert = build_v0_4_cert(CoreModule {
         name: Name::from_dotted("Test.OpaqueOrdering"),
         declarations: declarations.clone(),
     });
-    let reordered = build_v0_3_cert(CoreModule {
+    let reordered = build_v0_4_cert(CoreModule {
         name: Name::from_dotted("Test.OpaqueOrdering"),
         declarations: declarations.into_iter().rev().collect(),
     });
     let names = cert
-        .declarations
+        .declarations()
         .iter()
         .map(|declaration| {
             let name = match declaration.decl {
                 DeclPayload::Def { name, .. } | DeclPayload::Theorem { name, .. } => name,
                 _ => panic!("expected definition or theorem"),
             };
-            cert.name_table[name].clone()
+            cert.name_table()[name].clone()
         })
         .collect::<Vec<_>>();
     assert_eq!(
@@ -1817,9 +2554,9 @@ fn local_transparency_declaration_order_uses_paths_without_bare_source_authority
 
 #[test]
 fn local_transparency_wrong_reference_kinds_use_fixed_reason() {
-    let base = v0_3_opaque_alias_cert_with_local_implementation_dependency();
+    let base = v0_4_opaque_alias_cert_with_local_implementation_dependency();
     let (consumer, dependency_index) = first_local_dependency(&base);
-    let dependency = &base.declarations[consumer].dependencies[dependency_index];
+    let dependency = &base.declarations()[consumer].dependencies[dependency_index];
     let interface_hash = dependency.decl_interface_hash();
     let certificate_hash = dependency.decl_certificate_hash().unwrap();
     let target = match dependency.global_ref() {
@@ -1857,10 +2594,10 @@ fn local_transparency_wrong_reference_kinds_use_fixed_reason() {
 
 #[test]
 fn local_transparency_non_earlier_targets_use_fixed_reason() {
-    let base = v0_3_opaque_alias_cert_with_local_implementation_dependency();
+    let base = v0_4_opaque_alias_cert_with_local_implementation_dependency();
     let (consumer, dependency_index) = first_local_dependency(&base);
-    let dependency = &base.declarations[consumer].dependencies[dependency_index];
-    for target in [consumer, base.declarations.len() + 7] {
+    let dependency = &base.declarations()[consumer].dependencies[dependency_index];
+    for target in [consumer, base.declarations().len() + 7] {
         let mut cert = base.clone();
         replace_first_local_dependency_with_raw_implementation(
             &mut cert,
@@ -1874,27 +2611,29 @@ fn local_transparency_non_earlier_targets_use_fixed_reason() {
         );
     }
 
-    let mut later = build_v0_3_cert(nested_opaque_module());
+    let mut later = build_v0_4_cert(nested_opaque_module());
     let current = decl_index_named(&later, "outer_hidden");
     let later_target = decl_index_named(&later, "uses_outer");
-    let dependency_index = later.declarations[current]
+    let dependency_index = later.declarations()[current]
         .dependencies
         .iter()
         .position(|dependency| dependency.kind() == DependencyEntryKind::LocalImplementation)
         .unwrap();
-    let dependency = &later.declarations[current].dependencies[dependency_index];
+    let dependency = &later.declarations()[current].dependencies[dependency_index];
     let interface_hash = dependency.decl_interface_hash();
     let certificate_hash = dependency.decl_certificate_hash().unwrap();
-    later.declarations[current].dependencies[dependency_index] =
-        DependencyEntry::from_decoded_local_implementation(
-            GlobalRef::Local {
-                decl_index: later_target,
-            },
-            interface_hash,
-            certificate_hash,
-        );
-    later.declarations[current].dependencies.sort();
-    rehash_v0_3_dependency_change(&mut later, current);
+    later.mutate_parts_for_test(|parts| {
+        parts.declarations[current].dependencies[dependency_index] =
+            DependencyEntry::from_decoded_local_implementation(
+                GlobalRef::Local {
+                    decl_index: later_target,
+                },
+                interface_hash,
+                certificate_hash,
+            );
+        parts.declarations[current].dependencies.sort();
+    });
+    rehash_v0_4_dependency_change(&mut later, current);
     assert_local_implementation_error(
         &later,
         LocalImplementationDependencyErrorReason::TargetNotEarlier,
@@ -1940,7 +2679,7 @@ fn local_transparency_error_reason_vocabulary_is_exact() {
 
 #[test]
 fn local_transparency_non_opaque_target_uses_fixed_reason() {
-    let mut cert = build_v0_3_cert(CoreModule {
+    let mut cert = build_v0_4_cert(CoreModule {
         name: Name::from_dotted("Test.NonOpaqueImplementation"),
         declarations: vec![
             Decl::Def {
@@ -1955,8 +2694,8 @@ fn local_transparency_non_opaque_target_uses_fixed_reason() {
     });
     let target = decl_index_named(&cert, "plain");
     let consumer = decl_index_named(&cert, "uses_plain");
-    let target_hashes = cert.declarations[target].hashes.clone();
-    let dependency_index = cert.declarations[consumer]
+    let target_hashes = cert.declarations()[target].hashes.clone();
+    let dependency_index = cert.declarations()[consumer]
         .dependencies
         .iter()
         .position(|dependency| {
@@ -1966,14 +2705,16 @@ fn local_transparency_non_opaque_target_uses_fixed_reason() {
             )
         })
         .unwrap();
-    cert.declarations[consumer].dependencies[dependency_index] =
-        DependencyEntry::from_decoded_local_implementation(
-            GlobalRef::Local { decl_index: target },
-            target_hashes.decl_interface_hash,
-            target_hashes.decl_certificate_hash,
-        );
-    cert.declarations[consumer].dependencies.sort();
-    rehash_v0_3_dependency_change(&mut cert, consumer);
+    cert.mutate_parts_for_test(|parts| {
+        parts.declarations[consumer].dependencies[dependency_index] =
+            DependencyEntry::from_decoded_local_implementation(
+                GlobalRef::Local { decl_index: target },
+                target_hashes.decl_interface_hash,
+                target_hashes.decl_certificate_hash,
+            );
+        parts.declarations[consumer].dependencies.sort();
+    });
+    rehash_v0_4_dependency_change(&mut cert, consumer);
     assert_local_implementation_error(
         &cert,
         LocalImplementationDependencyErrorReason::TargetNotOpaque,
@@ -1982,9 +2723,9 @@ fn local_transparency_non_opaque_target_uses_fixed_reason() {
 
 #[test]
 fn local_transparency_forged_hashes_use_fixed_reasons() {
-    let base = v0_3_opaque_alias_cert_with_local_implementation_dependency();
+    let base = v0_4_opaque_alias_cert_with_local_implementation_dependency();
     let (consumer, dependency_index) = first_local_dependency(&base);
-    let dependency = &base.declarations[consumer].dependencies[dependency_index];
+    let dependency = &base.declarations()[consumer].dependencies[dependency_index];
     let global_ref = dependency.global_ref().clone();
     let interface_hash = dependency.decl_interface_hash();
     let certificate_hash = dependency.decl_certificate_hash().unwrap();
@@ -2020,13 +2761,13 @@ fn local_transparency_forged_hashes_use_fixed_reasons() {
 
 #[test]
 fn local_transparency_missing_and_surplus_entries_use_fixed_reasons() {
-    let missing = v0_3_opaque_alias_cert_with_interface_dependency();
+    let missing = v0_4_opaque_alias_cert_with_interface_dependency();
     assert_local_implementation_error(
         &missing,
         LocalImplementationDependencyErrorReason::MissingImplementationDependency,
     );
 
-    let mut surplus = build_v0_3_cert(CoreModule {
+    let mut surplus = build_v0_4_cert(CoreModule {
         name: Name::from_dotted("Test.SurplusImplementation"),
         declarations: vec![
             named_opaque_id("a_unrelated_hidden", id_value("A", "x")),
@@ -2044,14 +2785,16 @@ fn local_transparency_missing_and_surplus_entries_use_fixed_reasons() {
     let implementation = DependencyEntry::checked_local_implementation(
         GlobalRef::Local { decl_index: target },
         consumer,
-        &surplus.declarations,
+        surplus.declarations(),
     )
     .unwrap();
-    surplus.declarations[consumer]
-        .dependencies
-        .push(implementation);
-    surplus.declarations[consumer].dependencies.sort();
-    rehash_v0_3_dependency_change(&mut surplus, consumer);
+    surplus.mutate_parts_for_test(|parts| {
+        parts.declarations[consumer]
+            .dependencies
+            .push(implementation);
+        parts.declarations[consumer].dependencies.sort();
+    });
+    rehash_v0_4_dependency_change(&mut surplus, consumer);
     assert_local_implementation_error(
         &surplus,
         LocalImplementationDependencyErrorReason::SurplusImplementationDependency,
@@ -2076,10 +2819,10 @@ fn local_transparency_source_cycle_remains_rejected() {
 }
 
 #[test]
-fn binary_v0_3_local_implementation_dependency_round_trips_with_complete_payload() {
-    let cert = v0_3_opaque_alias_cert_with_local_implementation_dependency();
+fn binary_v0_4_local_implementation_dependency_round_trips_with_complete_payload() {
+    let cert = v0_4_opaque_alias_cert_with_local_implementation_dependency();
     let dependency = cert
-        .declarations
+        .declarations()
         .iter()
         .flat_map(|decl| &decl.dependencies)
         .find(|dependency| dependency.kind() == DependencyEntryKind::LocalImplementation)
@@ -2110,9 +2853,9 @@ fn binary_dependency_checked_constructors_enforce_hash_and_earlier_opaque_target
         })
     ));
 
-    let opaque = v0_3_opaque_alias_cert_with_interface_dependency();
+    let opaque = v0_4_opaque_alias_cert_with_interface_dependency();
     let (alias_index, target_ref) = opaque
-        .declarations
+        .declarations()
         .iter()
         .enumerate()
         .find_map(|(decl_index, decl)| {
@@ -2125,13 +2868,13 @@ fn binary_dependency_checked_constructors_enforce_hash_and_earlier_opaque_target
     let accepted = DependencyEntry::checked_local_implementation(
         target_ref.clone(),
         alias_index,
-        &opaque.declarations,
+        opaque.declarations(),
     )
     .unwrap();
     assert_eq!(accepted.kind(), DependencyEntryKind::LocalImplementation);
 
     assert!(matches!(
-        DependencyEntry::checked_local_implementation(target_ref, 0, &opaque.declarations,),
+        DependencyEntry::checked_local_implementation(target_ref, 0, opaque.declarations(),),
         Err(CertError::DependencyCycle { .. })
     ));
     assert!(matches!(
@@ -2141,7 +2884,7 @@ fn binary_dependency_checked_constructors_enforce_hash_and_earlier_opaque_target
                 decl_interface_hash: [0; 32],
             },
             alias_index,
-            &opaque.declarations,
+            opaque.declarations(),
         ),
         Err(CertError::DecodeError)
     ));
@@ -2151,22 +2894,22 @@ fn binary_dependency_checked_constructors_enforce_hash_and_earlier_opaque_target
         DependencyEntry::checked_local_implementation(
             GlobalRef::Local { decl_index: 0 },
             1,
-            &reducible.declarations,
+            reducible.declarations(),
         ),
         Err(CertError::DecodeError)
     ));
 }
 
 #[test]
-fn binary_v0_3_dependency_rejects_truncation_and_unknown_tag() {
-    let cert = v0_3_opaque_alias_cert_with_local_implementation_dependency();
+fn binary_v0_4_dependency_rejects_truncation_and_unknown_tag() {
+    let cert = v0_4_opaque_alias_cert_with_local_implementation_dependency();
     let dependency = cert
-        .declarations
+        .declarations()
         .iter()
         .flat_map(|decl| &decl.dependencies)
         .find(|dependency| dependency.kind() == DependencyEntryKind::LocalImplementation)
         .unwrap();
-    let dependency_bytes = v0_3_dependency_bytes(dependency);
+    let dependency_bytes = v0_4_dependency_bytes(dependency);
     let bytes = encode_module_cert(&cert).unwrap();
     let dependency_offset = bytes
         .windows(dependency_bytes.len())
@@ -2185,89 +2928,118 @@ fn binary_v0_3_dependency_rejects_truncation_and_unknown_tag() {
 }
 
 #[test]
-fn certificate_format_mixed_pair_rejects_before_v0_3_dependency_tag() {
-    let cert = v0_3_opaque_alias_cert_with_local_implementation_dependency();
-    let dependency = cert
-        .declarations
-        .iter()
-        .flat_map(|decl| &decl.dependencies)
-        .find(|dependency| dependency.kind() == DependencyEntryKind::LocalImplementation)
-        .unwrap();
-    let dependency_bytes = v0_3_dependency_bytes(dependency);
+fn certificate_format_old_pair_rejects_before_term_decoding() {
+    let cert = v0_4_opaque_alias_cert_with_local_implementation_dependency();
     let mut bytes = encode_module_cert(&cert).unwrap();
-    let dependency_offset = bytes
-        .windows(dependency_bytes.len())
-        .position(|window| window == dependency_bytes)
-        .unwrap();
-    bytes[dependency_offset] = 0x7f;
+    let term_offset = term_tag_offsets(&bytes)[0];
+    bytes[term_offset] = 0x06;
     let core_spec_offset = bytes
         .windows(CORE_SPEC.len())
         .position(|window| window == CORE_SPEC.as_bytes())
         .unwrap();
-    bytes[core_spec_offset..core_spec_offset + COMPAT_CORE_SPEC.len()]
-        .copy_from_slice(COMPAT_CORE_SPEC.as_bytes());
+    let old_core_spec = "NPA-Core-0.3.0";
+    bytes[core_spec_offset..core_spec_offset + old_core_spec.len()]
+        .copy_from_slice(old_core_spec.as_bytes());
 
     assert!(matches!(
         decode_module_cert(&bytes),
         Err(CertError::UnsupportedFormat { format, core_spec })
-            if format == FORMAT && core_spec == COMPAT_CORE_SPEC
+            if format == FORMAT && core_spec == old_core_spec
     ));
 }
 
 #[test]
 fn certificate_format_header_only_downgrade_cannot_erase_local_implementation_commitment() {
-    let mut cert = v0_3_opaque_alias_cert_with_local_implementation_dependency();
-    cert.header.format = COMPAT_FORMAT.to_owned();
-    cert.header.core_spec = COMPAT_CORE_SPEC.to_owned();
+    let mut cert = v0_4_opaque_alias_cert_with_local_implementation_dependency();
+    cert.mutate_parts_for_test(|parts| {
+        parts.header.format = "NPA-CERT-0.3.0".to_owned();
+        parts.header.core_spec = "NPA-Core-0.3.0".to_owned();
+    });
     assert!(matches!(
         encode_module_cert(&cert),
-        Err(CertError::LocalImplementationDependencyRequiresFormatUpgrade)
+        Err(CertError::UnsupportedFormat { .. })
     ));
 }
 
 #[test]
-fn certificate_format_header_only_upgrade_rejects_untagged_v0_2_dependencies() {
-    let cert = build_module_cert_v0_2_compat(opaque_alias_module(), &[]).unwrap();
-    let mut bytes = encode_module_cert(&cert).unwrap();
-    let format_offset = bytes
-        .windows(COMPAT_FORMAT.len())
-        .position(|window| window == COMPAT_FORMAT.as_bytes())
-        .unwrap();
-    bytes[format_offset..format_offset + FORMAT.len()].copy_from_slice(FORMAT.as_bytes());
-    let core_spec_offset = bytes
-        .windows(COMPAT_CORE_SPEC.len())
-        .position(|window| window == COMPAT_CORE_SPEC.as_bytes())
-        .unwrap();
-    bytes[core_spec_offset..core_spec_offset + CORE_SPEC.len()]
-        .copy_from_slice(CORE_SPEC.as_bytes());
-    assert!(decode_module_cert(&bytes).is_err());
-}
-
-#[test]
 fn certificate_format_accepts_only_exact_known_pairs() {
-    for (format, core_spec) in [
-        (FORMAT, COMPAT_CORE_SPEC),
-        (COMPAT_FORMAT, CORE_SPEC),
-        (PREVIOUS_FORMAT, LEGACY_CORE_SPEC),
-        (LEGACY_FORMAT, PREVIOUS_CORE_SPEC),
-        ("NPA-CERT-9.9.9", "NPA-Core-9.9.9"),
-    ] {
-        assert!(matches!(
-            certificate_format_version(&CertHeader {
-                format: format.to_owned(),
-                core_spec: core_spec.to_owned(),
-                module: Name::from_dotted("Test.MixedHeader"),
-            }),
-            Err(CertError::UnsupportedFormat { .. })
-        ));
+    let rows = v0_4_fixture_rows("header");
+    assert_eq!(rows.len(), 28);
+    for fields in rows {
+        let case_id = fields[0];
+        let format = fields[3];
+        let core_spec = fields[4];
+        let expected = fields[6];
+        let result = certificate_format_version(&CertHeader {
+            format: format.to_owned(),
+            core_spec: core_spec.to_owned(),
+            module: Name::from_dotted("Test.HeaderMatrix"),
+        });
+        if expected == "checked" {
+            assert_eq!(result, Ok(CertificateFormatVersion::V0_4_0), "{case_id}");
+            assert_eq!((format, core_spec), (FORMAT, CORE_SPEC), "{case_id}");
+        } else {
+            assert_eq!(expected, "unsupported_format", "{case_id}");
+            assert!(
+                matches!(result, Err(CertError::UnsupportedFormat { .. })),
+                "{case_id}: {result:?}"
+            );
+        }
     }
 }
 
 #[test]
-fn binary_v0_3_dependency_order_and_duplicates_are_rejected() {
-    let mut cert = v0_3_opaque_alias_cert_with_interface_dependency();
+fn v0_4_fixture_matrix_is_complete_and_has_closed_result_vocabularies() {
+    let rows = v0_4_fixture_matrix_rows();
+    assert_eq!(rows.len(), 72);
+    let mut case_ids = BTreeSet::new();
+    let mut classes = BTreeMap::new();
+    for fields in rows {
+        assert!(
+            case_ids.insert(fields[0]),
+            "duplicate case id: {}",
+            fields[0]
+        );
+        *classes.entry(fields[1]).or_insert(0usize) += 1;
+        let normalized = fields.join("\t").to_ascii_lowercase();
+        for forbidden in ["todo", "skip", "ignore", "expected-failure"] {
+            assert!(
+                !normalized.contains(forbidden),
+                "{} contains forbidden marker {forbidden}",
+                fields[0]
+            );
+        }
+        if fields[1].starts_with("source_") {
+            assert_eq!(fields[7], "not_applicable", "{}", fields[0]);
+            assert_eq!(fields[8], "not_applicable", "{}", fields[0]);
+        } else {
+            assert_ne!(fields[6], "not_applicable", "{}", fields[0]);
+            assert_ne!(fields[7], "not_applicable", "{}", fields[0]);
+            assert_ne!(fields[8], "not_applicable", "{}", fields[0]);
+        }
+    }
+    assert_eq!(
+        classes,
+        BTreeMap::from([
+            ("closure_rejection", 3),
+            ("hash", 10),
+            ("hash_rejection", 3),
+            ("header", 28),
+            ("positive_semantics", 3),
+            ("positive_structure", 2),
+            ("positive_term", 6),
+            ("retired_tag", 6),
+            ("source_positive", 6),
+            ("source_rejection", 5),
+        ])
+    );
+}
+
+#[test]
+fn binary_v0_4_dependency_order_and_duplicates_are_rejected() {
+    let mut cert = v0_4_opaque_alias_cert_with_interface_dependency();
     let (decl_index, dependency_index) = cert
-        .declarations
+        .declarations()
         .iter()
         .enumerate()
         .find_map(|(decl_index, decl)| {
@@ -2277,16 +3049,18 @@ fn binary_v0_3_dependency_order_and_duplicates_are_rejected() {
                 .map(|dependency_index| (decl_index, dependency_index))
         })
         .unwrap();
-    let interface = cert.declarations[decl_index].dependencies[dependency_index].clone();
+    let interface = cert.declarations()[decl_index].dependencies[dependency_index].clone();
     let implementation = DependencyEntry::checked_local_implementation(
         interface.global_ref().clone(),
         decl_index,
-        &cert.declarations,
+        cert.declarations(),
     )
     .unwrap();
     assert!(interface < implementation);
 
-    cert.declarations[decl_index].dependencies = vec![implementation, interface.clone()];
+    cert.mutate_parts_for_test(|parts| {
+        parts.declarations[decl_index].dependencies = vec![implementation, interface.clone()];
+    });
     assert!(matches!(
         decode_module_cert(&encode_module_cert(&cert).unwrap()),
         Err(CertError::NonCanonicalEncoding {
@@ -2294,7 +3068,9 @@ fn binary_v0_3_dependency_order_and_duplicates_are_rejected() {
         })
     ));
 
-    cert.declarations[decl_index].dependencies = vec![interface.clone(), interface];
+    cert.mutate_parts_for_test(|parts| {
+        parts.declarations[decl_index].dependencies = vec![interface.clone(), interface];
+    });
     assert!(matches!(
         decode_module_cert(&encode_module_cert(&cert).unwrap()),
         Err(CertError::NonCanonicalEncoding {
@@ -2304,9 +3080,9 @@ fn binary_v0_3_dependency_order_and_duplicates_are_rejected() {
 }
 
 #[test]
-fn structural_v0_3_local_implementation_counts_added_certificate_hash_bytes() {
-    let interface_cert = v0_3_opaque_alias_cert_with_interface_dependency();
-    let implementation_cert = v0_3_opaque_alias_cert_with_local_implementation_dependency();
+fn structural_v0_4_local_implementation_counts_added_certificate_hash_bytes() {
+    let interface_cert = v0_4_opaque_alias_cert_with_interface_dependency();
+    let implementation_cert = v0_4_opaque_alias_cert_with_local_implementation_dependency();
     let interface_bytes = encode_module_cert(&interface_cert).unwrap();
     let implementation_bytes = encode_module_cert(&implementation_cert).unwrap();
     assert_eq!(implementation_bytes.len(), interface_bytes.len() + 32);
@@ -2325,22 +3101,6 @@ fn structural_v0_3_local_implementation_counts_added_certificate_hash_bytes() {
 }
 
 #[test]
-fn legacy_constrained_public_exports_require_format_upgrade() {
-    let cert =
-        build_module_cert_v0_2_compat(constrained_axiom_module(vec![max_u_v_le_w()]), &[]).unwrap();
-    let bytes = legacy_bytes_from_current_cert(cert);
-
-    let err = verify_module_cert(&bytes, &mut VerifierSession::new(), &AxiomPolicy::normal())
-        .unwrap_err();
-
-    assert!(matches!(
-        err,
-        CertError::ConstrainedExportRequiresFormatUpgrade { name }
-            if name == Name::from_dotted("List.map")
-    ));
-}
-
-#[test]
 fn universe_constraints_fast_verifier_accepts_canonical_constraint_bytes() {
     let cert = build_module_cert(
         constrained_axiom_module(height_order_regression_constraints()),
@@ -2348,7 +3108,7 @@ fn universe_constraints_fast_verifier_accepts_canonical_constraint_bytes() {
     )
     .unwrap();
     assert!(matches!(
-        cert.declarations[0].decl,
+        cert.declarations()[0].decl,
         DeclPayload::AxiomConstrained { .. }
     ));
     let bytes = encode_module_cert(&cert).unwrap();
@@ -2385,16 +3145,18 @@ fn universe_constraints_fast_verifier_rejects_empty_constrained_payload() {
         name,
         universe_params,
         ty,
-    } = cert.declarations[0].decl.clone()
+    } = cert.declarations()[0].decl.clone()
     else {
         panic!("expected unconstrained axiom payload");
     };
-    cert.declarations[0].decl = DeclPayload::AxiomConstrained {
-        name,
-        universe_params,
-        universe_constraints: Vec::new(),
-        ty,
-    };
+    cert.mutate_parts_for_test(|parts| {
+        parts.declarations[0].decl = DeclPayload::AxiomConstrained {
+            name,
+            universe_params,
+            universe_constraints: Vec::new(),
+            ty,
+        };
+    });
     let bytes = encode_module_cert(&cert).unwrap();
     let err = verify_module_cert(&bytes, &mut VerifierSession::new(), &AxiomPolicy::normal())
         .unwrap_err();
@@ -2607,6 +3369,357 @@ fn use_imported_use_id_module() -> CoreModule {
             reducibility: Reducibility::Reducible,
         }],
     }
+}
+
+fn local_authoring_reconstruction_identity(
+    bytes: &[u8],
+    cert: &ModuleCert,
+    policy: &AxiomPolicy,
+) -> LocalAuthoringReconstructionIdentity {
+    LocalAuthoringReconstructionIdentity::new(
+        crate::local_authoring::certificate_file_hash(bytes),
+        cert.header().format.clone(),
+        cert.header().core_spec.clone(),
+        cert.header().module.clone(),
+        cert.imports().to_vec(),
+        cert.hashes().export_hash,
+        cert.hashes().axiom_report_hash,
+        cert.hashes().certificate_hash,
+        policy.policy_hash(),
+    )
+}
+
+fn local_authoring_interface_identity(cert: &ModuleCert) -> LocalAuthoringInterfaceIdentity {
+    LocalAuthoringInterfaceIdentity::new(
+        cert.header().module.clone(),
+        cert.hashes().export_hash,
+        cert.hashes().certificate_hash,
+    )
+}
+
+#[test]
+fn local_authoring_build_live_and_reconstructed_contexts_produce_identical_certificates() {
+    let policy = AxiomPolicy::normal();
+    let imported_cert = build_module_cert(id_module("A", "x"), &[]).unwrap();
+    let imported_bytes = encode_module_cert(&imported_cert).unwrap();
+    let verified_import =
+        verify_module_cert_with_import_refs(&imported_bytes, &[], &policy).unwrap();
+    let expected_bytes = encode_module_cert(
+        &build_module_cert_from_import_refs(use_id_module(), &[&verified_import]).unwrap(),
+    )
+    .unwrap();
+
+    let live_session = LocalAuthoringVerifierSession::new();
+    let live_import = live_session.register_verified_module(&verified_import);
+    let live_built = live_session
+        .build_module_cert(use_id_module(), &[&live_import], &BTreeMap::new())
+        .unwrap();
+    assert_eq!(live_built.certificate_bytes(), expected_bytes);
+    assert!(!live_built.observations().closure_used_cached_context());
+    let live_checked = live_session
+        .check_built_module_cert(live_built, &[&live_import], &policy)
+        .unwrap();
+
+    let reconstructed_session = LocalAuthoringVerifierSession::new();
+    let pending = reconstructed_session
+        .reconstruct_pending_context(
+            &imported_bytes,
+            &local_authoring_reconstruction_identity(&imported_bytes, &imported_cert, &policy),
+            &local_authoring_interface_identity(&imported_cert),
+            &[],
+            &policy,
+        )
+        .unwrap();
+    assert_eq!(pending.module(), &imported_cert.header().module);
+    let reconstructed_import = reconstructed_session.adopt_pending_context(pending);
+    let reconstructed_built = reconstructed_session
+        .build_module_cert(use_id_module(), &[&reconstructed_import], &BTreeMap::new())
+        .unwrap();
+    assert_eq!(reconstructed_built.certificate_bytes(), expected_bytes);
+    assert!(reconstructed_built
+        .observations()
+        .closure_used_cached_context());
+    let reconstructed_checked = reconstructed_session
+        .check_built_module_cert(reconstructed_built, &[&reconstructed_import], &policy)
+        .unwrap();
+
+    assert_eq!(live_checked.certificate_bytes(), expected_bytes);
+    assert_eq!(reconstructed_checked.certificate_bytes(), expected_bytes);
+    assert_eq!(
+        live_checked.context().module(),
+        reconstructed_checked.context().module()
+    );
+    assert_eq!(
+        live_checked.context().export_hash(),
+        reconstructed_checked.context().export_hash()
+    );
+    assert_eq!(
+        live_checked.context().certificate_hash(),
+        reconstructed_checked.context().certificate_hash()
+    );
+    assert_eq!(
+        live_import.kernel_declarations().unwrap(),
+        reconstructed_import.kernel_declarations().unwrap()
+    );
+    let exported_type = live_import.export_block()[0].ty;
+    assert_eq!(
+        live_import.term_expression(exported_type).unwrap(),
+        reconstructed_import.term_expression(exported_type).unwrap()
+    );
+    assert!(!live_checked.is_proof_evidence());
+    assert!(!reconstructed_checked.is_proof_evidence());
+    assert!(reconstructed_checked
+        .context()
+        .closure_used_cached_context());
+    assert!(!reconstructed_checked.context().is_publication_eligible());
+    assert!(!reconstructed_checked.context().is_proof_evidence());
+    let (bytes, observations, fresh_context) = reconstructed_checked.into_parts();
+    assert_eq!(bytes, expected_bytes);
+    assert!(observations.closure_used_cached_context());
+    assert!(fresh_context.closure_used_cached_context());
+    assert!(!fresh_context.is_publication_eligible());
+}
+
+#[test]
+fn local_authoring_reconstruction_rejects_certificate_and_interface_identity_drift() {
+    let policy = AxiomPolicy::normal();
+    let cert = build_module_cert(id_module("A", "x"), &[]).unwrap();
+    let bytes = encode_module_cert(&cert).unwrap();
+    let identity = local_authoring_reconstruction_identity(&bytes, &cert, &policy);
+    let interface = local_authoring_interface_identity(&cert);
+    let session = LocalAuthoringVerifierSession::new();
+
+    let mut wrong_file = identity.clone();
+    wrong_file.certificate_file_hash[0] ^= 1;
+    assert!(matches!(
+        session.reconstruct_pending_context(&bytes, &wrong_file, &interface, &[], &policy),
+        Err(CertError::NonCanonicalEncoding {
+            object: "local authoring certificate file identity"
+        })
+    ));
+
+    let mut wrong_imports = identity.clone();
+    wrong_imports.imports.push(ImportEntry {
+        module: Name::from_dotted("Test.Other"),
+        export_hash: [1; 32],
+        certificate_hash: None,
+    });
+    assert!(matches!(
+        session.reconstruct_pending_context(&bytes, &wrong_imports, &interface, &[], &policy),
+        Err(CertError::NonCanonicalEncoding {
+            object: "local authoring module/import identity"
+        })
+    ));
+
+    let wrong_interface = LocalAuthoringInterfaceIdentity::new(
+        cert.header().module.clone(),
+        [2; 32],
+        cert.hashes().certificate_hash,
+    );
+    assert!(matches!(
+        session.reconstruct_pending_context(&bytes, &identity, &wrong_interface, &[], &policy),
+        Err(CertError::NonCanonicalEncoding {
+            object: "local authoring parsed interface identity"
+        })
+    ));
+}
+
+#[test]
+fn local_authoring_reconstruction_resolves_an_exact_nonempty_import_table() {
+    let policy = AxiomPolicy::normal();
+    let base_cert = build_module_cert(id_module("A", "x"), &[]).unwrap();
+    let base_bytes = encode_module_cert(&base_cert).unwrap();
+    let verified_base = verify_module_cert_with_import_refs(&base_bytes, &[], &policy).unwrap();
+    let use_cert = build_module_cert_from_import_refs(use_id_module(), &[&verified_base]).unwrap();
+    let use_bytes = encode_module_cert(&use_cert).unwrap();
+    let verified_use =
+        verify_module_cert_with_import_refs(&use_bytes, &[&verified_base], &policy).unwrap();
+    let expected_bytes = encode_module_cert(
+        &build_module_cert_from_import_refs(
+            use_imported_use_id_module(),
+            &[&verified_base, &verified_use],
+        )
+        .unwrap(),
+    )
+    .unwrap();
+
+    let session = LocalAuthoringVerifierSession::new();
+    let base_pending = session
+        .reconstruct_pending_context(
+            &base_bytes,
+            &local_authoring_reconstruction_identity(&base_bytes, &base_cert, &policy),
+            &local_authoring_interface_identity(&base_cert),
+            &[],
+            &policy,
+        )
+        .unwrap();
+    let base_context = session.adopt_pending_context(base_pending);
+    let use_pending = session
+        .reconstruct_pending_context(
+            &use_bytes,
+            &local_authoring_reconstruction_identity(&use_bytes, &use_cert, &policy),
+            &local_authoring_interface_identity(&use_cert),
+            &[&base_context],
+            &policy,
+        )
+        .unwrap();
+    let use_context = session.adopt_pending_context(use_pending);
+    let built = session
+        .build_module_cert(
+            use_imported_use_id_module(),
+            &[&base_context, &use_context],
+            &BTreeMap::new(),
+        )
+        .unwrap();
+
+    assert_eq!(built.certificate_bytes(), expected_bytes);
+    assert!(built.observations().closure_used_cached_context());
+    assert!(!built.is_proof_evidence());
+    let checked = session
+        .check_built_module_cert(built, &[&base_context, &use_context], &policy)
+        .unwrap();
+    assert_eq!(checked.certificate_bytes(), expected_bytes);
+}
+
+#[test]
+fn local_authoring_reconstruction_rechecks_canonical_bytes_hashes_and_policy() {
+    let normal_policy = AxiomPolicy::normal();
+    let cert = build_module_cert(id_module("A", "x"), &[]).unwrap();
+    let bytes = encode_module_cert(&cert).unwrap();
+    let interface = local_authoring_interface_identity(&cert);
+    let session = LocalAuthoringVerifierSession::new();
+
+    let mut noncanonical = bytes.clone();
+    noncanonical.push(0);
+    let noncanonical_identity =
+        local_authoring_reconstruction_identity(&noncanonical, &cert, &normal_policy);
+    assert!(session
+        .reconstruct_pending_context(
+            &noncanonical,
+            &noncanonical_identity,
+            &interface,
+            &[],
+            &normal_policy,
+        )
+        .is_err());
+
+    let mut wrong_hash = local_authoring_reconstruction_identity(&bytes, &cert, &normal_policy);
+    wrong_hash.export_hash[0] ^= 1;
+    assert!(matches!(
+        session.reconstruct_pending_context(&bytes, &wrong_hash, &interface, &[], &normal_policy),
+        Err(CertError::HashMismatch {
+            object: HashObject::ExportBlock,
+            ..
+        })
+    ));
+
+    let high_trust_policy = AxiomPolicy::high_trust();
+    let normal_identity = local_authoring_reconstruction_identity(&bytes, &cert, &normal_policy);
+    assert!(matches!(
+        session.reconstruct_pending_context(
+            &bytes,
+            &normal_identity,
+            &interface,
+            &[],
+            &high_trust_policy,
+        ),
+        Err(CertError::NonCanonicalEncoding {
+            object: "local authoring axiom policy identity"
+        })
+    ));
+
+    let axiom_cert = build_module_cert(axiom_module(), &[]).unwrap();
+    let axiom_bytes = encode_module_cert(&axiom_cert).unwrap();
+    let high_trust_identity =
+        local_authoring_reconstruction_identity(&axiom_bytes, &axiom_cert, &high_trust_policy);
+    assert!(matches!(
+        session.reconstruct_pending_context(
+            &axiom_bytes,
+            &high_trust_identity,
+            &local_authoring_interface_identity(&axiom_cert),
+            &[],
+            &high_trust_policy,
+        ),
+        Err(CertError::ForbiddenAxiom { .. })
+    ));
+}
+
+#[test]
+fn local_authoring_reconstruction_is_structural_and_does_not_create_kernel_evidence() {
+    let policy = AxiomPolicy::normal();
+    let mut cert = build_module_cert(two_id_theorems_module(), &[]).unwrap();
+    cert.mutate_parts_for_test(|parts| match &mut parts.declarations[1].decl {
+        DeclPayload::Theorem { proof, ty, .. } => *proof = *ty,
+        _ => panic!("expected theorem"),
+    });
+    rehash_cert_after_decl_change(&mut cert);
+    let bytes = encode_module_cert(&cert).unwrap();
+    assert!(matches!(
+        verify_module_cert_with_import_refs(&bytes, &[], &policy),
+        Err(CertError::Kernel(_))
+    ));
+
+    let session = LocalAuthoringVerifierSession::new();
+    let pending = session
+        .reconstruct_pending_context(
+            &bytes,
+            &local_authoring_reconstruction_identity(&bytes, &cert, &policy),
+            &local_authoring_interface_identity(&cert),
+            &[],
+            &policy,
+        )
+        .unwrap();
+    let context = session.adopt_pending_context(pending);
+
+    assert_eq!(context.module(), &cert.header().module);
+    assert!(context.closure_used_cached_context());
+}
+
+#[test]
+fn local_authoring_contexts_are_rejected_by_a_different_session() {
+    let policy = AxiomPolicy::normal();
+    let cert = build_module_cert(id_module("A", "x"), &[]).unwrap();
+    let bytes = encode_module_cert(&cert).unwrap();
+    let verified = verify_module_cert_with_import_refs(&bytes, &[], &policy).unwrap();
+    let owner = LocalAuthoringVerifierSession::new();
+    let context = owner.register_verified_module(&verified);
+    let other = LocalAuthoringVerifierSession::new();
+
+    assert!(matches!(
+        other.build_module_cert(use_id_module(), &[&context], &BTreeMap::new()),
+        Err(CertError::ImportNotVerifiedInSession { module })
+            if &module == verified.module()
+    ));
+}
+
+#[test]
+fn local_authoring_built_check_preserves_cached_provenance_if_import_origin_changes() {
+    let policy = AxiomPolicy::normal();
+    let cert = build_module_cert(id_module("A", "x"), &[]).unwrap();
+    let bytes = encode_module_cert(&cert).unwrap();
+    let verified = verify_module_cert_with_import_refs(&bytes, &[], &policy).unwrap();
+    let session = LocalAuthoringVerifierSession::new();
+    let live = session.register_verified_module(&verified);
+    let pending = session
+        .reconstruct_pending_context(
+            &bytes,
+            &local_authoring_reconstruction_identity(&bytes, &cert, &policy),
+            &local_authoring_interface_identity(&cert),
+            &[],
+            &policy,
+        )
+        .unwrap();
+    let cached = session.adopt_pending_context(pending);
+    let built = session
+        .build_module_cert(use_id_module(), &[&live], &BTreeMap::new())
+        .unwrap();
+    assert!(!built.observations().closure_used_cached_context());
+
+    let checked = session
+        .check_built_module_cert(built, &[&cached], &policy)
+        .unwrap();
+    assert!(checked.observations().closure_used_cached_context());
+    assert!(checked.context().closure_used_cached_context());
 }
 
 fn eq_rec_alias_module() -> CoreModule {
@@ -3539,7 +4652,7 @@ fn skip_test_level_table(bytes: &[u8], offset: &mut usize) {
     }
 }
 
-fn first_term_tag_offset(bytes: &[u8]) -> usize {
+fn term_tag_offsets(bytes: &[u8]) -> Vec<usize> {
     let mut offset = 0;
     skip_test_string(bytes, &mut offset);
     skip_test_string(bytes, &mut offset);
@@ -3548,8 +4661,50 @@ fn first_term_tag_offset(bytes: &[u8]) -> usize {
     skip_test_name_table(bytes, &mut offset);
     skip_test_level_table(bytes, &mut offset);
     let term_len = read_test_uvar(bytes, &mut offset);
-    assert!(term_len > 0);
-    offset
+    let mut offsets = Vec::with_capacity(term_len as usize);
+    for _ in 0..term_len {
+        offsets.push(offset);
+        let tag = bytes[offset];
+        offset += 1;
+        match tag {
+            0x00 | 0x01 => {
+                read_test_uvar(bytes, &mut offset);
+            }
+            0x02 => {
+                let global_ref_tag = bytes[offset];
+                offset += 1;
+                match global_ref_tag {
+                    0x00 => {
+                        read_test_uvar(bytes, &mut offset);
+                        read_test_uvar(bytes, &mut offset);
+                        offset += 32;
+                    }
+                    0x01 => {
+                        read_test_uvar(bytes, &mut offset);
+                    }
+                    0x02 => {
+                        read_test_uvar(bytes, &mut offset);
+                        read_test_uvar(bytes, &mut offset);
+                    }
+                    0x03 => {
+                        read_test_uvar(bytes, &mut offset);
+                        offset += 32;
+                    }
+                    tag => panic!("unexpected global reference tag {tag}"),
+                }
+                let level_len = read_test_uvar(bytes, &mut offset);
+                for _ in 0..level_len {
+                    read_test_uvar(bytes, &mut offset);
+                }
+            }
+            0x03..=0x05 => {
+                read_test_uvar(bytes, &mut offset);
+                read_test_uvar(bytes, &mut offset);
+            }
+            tag => panic!("unexpected term tag {tag}"),
+        }
+    }
+    offsets
 }
 
 fn verify_cert(cert: &ModuleCert, session: &mut VerifierSession) -> VerifiedModule {
@@ -3563,7 +4718,7 @@ fn verify_cert(cert: &ModuleCert, session: &mut VerifierSession) -> VerifiedModu
 
 fn recursor_artifact_hashes(cert: &ModuleCert) -> (Hash, Hash) {
     let recursor = cert
-        .declarations
+        .declarations()
         .iter()
         .find_map(|decl| match &decl.decl {
             DeclPayload::Inductive {
@@ -3582,7 +4737,7 @@ fn recursor_artifact_hashes(cert: &ModuleCert) -> (Hash, Hash) {
 
 fn recursor_artifact_hashes_for(cert: &ModuleCert, name: &str) -> (Hash, Hash) {
     let recursor = cert
-        .declarations
+        .declarations()
         .iter()
         .find_map(|decl| match &decl.decl {
             DeclPayload::Inductive {
@@ -3594,10 +4749,10 @@ fn recursor_artifact_hashes_for(cert: &ModuleCert, name: &str) -> (Hash, Hash) {
                 name: decl_name,
                 recursor: Some(recursor),
                 ..
-            } if cert.name_table[*decl_name] == Name::from_dotted(name) => Some(recursor),
+            } if cert.name_table()[*decl_name] == Name::from_dotted(name) => Some(recursor),
             DeclPayload::MutualInductiveBlock { inductives, .. } => inductives
                 .iter()
-                .find(|inductive| cert.name_table[inductive.name] == Name::from_dotted(name))
+                .find(|inductive| cert.name_table()[inductive.name] == Name::from_dotted(name))
                 .and_then(|inductive| inductive.recursor.as_ref()),
             _ => None,
         })
@@ -3609,11 +4764,11 @@ fn recursor_artifact_hashes_for_recursor(
     cert: &ModuleCert,
     recursor: &RecursorSpec,
 ) -> (Hash, Hash) {
-    let level_hashes = compute_level_hashes(&cert.level_table, &cert.name_table).unwrap();
-    let term_hashes = compute_term_hashes(&cert.term_table, &level_hashes).unwrap();
+    let level_hashes = compute_level_hashes(cert.level_table(), cert.name_table()).unwrap();
+    let term_hashes = compute_term_hashes(cert.term_table(), &level_hashes).unwrap();
 
     (
-        generated_recursor_signature_hash(Some(recursor), &term_hashes, &cert.name_table).unwrap(),
+        generated_recursor_signature_hash(Some(recursor), &term_hashes, cert.name_table()).unwrap(),
         generated_computation_rule_hash(Some(recursor)),
     )
 }
@@ -3635,11 +4790,6 @@ fn remap_swapped_term_ids_in_term(term: &mut TermNode, lhs: TermId, rhs: TermId)
         }
         TermNode::Lam { ty, body } | TermNode::Pi { ty, body } => {
             remap_swapped_term_id(ty, lhs, rhs);
-            remap_swapped_term_id(body, lhs, rhs);
-        }
-        TermNode::Let { ty, value, body } => {
-            remap_swapped_term_id(ty, lhs, rhs);
-            remap_swapped_term_id(value, lhs, rhs);
             remap_swapped_term_id(body, lhs, rhs);
         }
     }
@@ -3700,13 +4850,15 @@ fn remap_swapped_term_ids_in_decl(decl: &mut DeclPayload, lhs: TermId, rhs: Term
 }
 
 fn swap_term_table_entries(cert: &mut ModuleCert, lhs: TermId, rhs: TermId) {
-    cert.term_table.swap(lhs, rhs);
-    for term in &mut cert.term_table {
-        remap_swapped_term_ids_in_term(term, lhs, rhs);
-    }
-    for decl in &mut cert.declarations {
-        remap_swapped_term_ids_in_decl(&mut decl.decl, lhs, rhs);
-    }
+    cert.mutate_parts_for_test(|parts| {
+        parts.term_table.swap(lhs, rhs);
+        for term in &mut parts.term_table {
+            remap_swapped_term_ids_in_term(term, lhs, rhs);
+        }
+        for decl in &mut parts.declarations {
+            remap_swapped_term_ids_in_decl(&mut decl.decl, lhs, rhs);
+        }
+    });
 }
 
 fn remap_swapped_level_id(level: &mut LevelId, lhs: LevelId, rhs: LevelId) {
@@ -3736,11 +4888,7 @@ fn remap_swapped_level_ids_in_term(term: &mut TermNode, lhs: LevelId, rhs: Level
                 remap_swapped_level_id(level, lhs, rhs);
             }
         }
-        TermNode::BVar(_)
-        | TermNode::App(_, _)
-        | TermNode::Lam { .. }
-        | TermNode::Pi { .. }
-        | TermNode::Let { .. } => {}
+        TermNode::BVar(_) | TermNode::App(_, _) | TermNode::Lam { .. } | TermNode::Pi { .. } => {}
     }
 }
 
@@ -3751,16 +4899,18 @@ fn remap_swapped_level_ids_in_decl(decl: &mut DeclPayload, lhs: LevelId, rhs: Le
 }
 
 fn swap_level_table_entries(cert: &mut ModuleCert, lhs: LevelId, rhs: LevelId) {
-    cert.level_table.swap(lhs, rhs);
-    for level in &mut cert.level_table {
-        remap_swapped_level_ids_in_level(level, lhs, rhs);
-    }
-    for term in &mut cert.term_table {
-        remap_swapped_level_ids_in_term(term, lhs, rhs);
-    }
-    for decl in &mut cert.declarations {
-        remap_swapped_level_ids_in_decl(&mut decl.decl, lhs, rhs);
-    }
+    cert.mutate_parts_for_test(|parts| {
+        parts.level_table.swap(lhs, rhs);
+        for level in &mut parts.level_table {
+            remap_swapped_level_ids_in_level(level, lhs, rhs);
+        }
+        for term in &mut parts.term_table {
+            remap_swapped_level_ids_in_term(term, lhs, rhs);
+        }
+        for decl in &mut parts.declarations {
+            remap_swapped_level_ids_in_decl(&mut decl.decl, lhs, rhs);
+        }
+    });
 }
 
 fn replace_level_refs(term: &mut TermNode, old: LevelId, new: LevelId) {
@@ -3777,38 +4927,38 @@ fn replace_level_refs(term: &mut TermNode, old: LevelId, new: LevelId) {
                 }
             }
         }
-        TermNode::BVar(_)
-        | TermNode::App(_, _)
-        | TermNode::Lam { .. }
-        | TermNode::Pi { .. }
-        | TermNode::Let { .. } => {}
+        TermNode::BVar(_) | TermNode::App(_, _) | TermNode::Lam { .. } | TermNode::Pi { .. } => {}
     }
 }
 
 fn rehash_cert_after_decl_change(cert: &mut ModuleCert) {
-    let version = certificate_format_version(&cert.header).unwrap();
-    let level_hashes = compute_level_hashes(&cert.level_table, &cert.name_table).unwrap();
-    let term_hashes = compute_term_hashes(&cert.term_table, &level_hashes).unwrap();
-    for decl in &mut cert.declarations {
-        decl.hashes = compute_decl_hashes(
-            version,
-            &decl.decl,
-            &decl.dependencies,
-            &decl.axiom_dependencies,
-            DeclHashTables {
-                terms: &cert.term_table,
-                level_hashes: &level_hashes,
-                term_hashes: &term_hashes,
-                names: &cert.name_table,
-            },
-        )
-        .unwrap();
-    }
+    let version = certificate_format_version(cert.header()).unwrap();
+    let level_hashes = compute_level_hashes(cert.level_table(), cert.name_table()).unwrap();
+    let term_hashes = compute_term_hashes(cert.term_table(), &level_hashes).unwrap();
+    let term_table = cert.term_table().to_vec();
+    let name_table = cert.name_table().to_vec();
+    cert.mutate_parts_for_test(|parts| {
+        for decl in &mut parts.declarations {
+            decl.hashes = compute_decl_hashes(
+                version,
+                &decl.decl,
+                &decl.dependencies,
+                &decl.axiom_dependencies,
+                DeclHashTables {
+                    terms: &term_table,
+                    level_hashes: &level_hashes,
+                    term_hashes: &term_hashes,
+                    names: &name_table,
+                },
+            )
+            .unwrap();
+        }
+    });
 
     let mut previous_axioms: Vec<Vec<AxiomRef>> = Vec::new();
     let mut reports = Vec::new();
-    for decl_index in 0..cert.declarations.len() {
-        let decl = cert.declarations[decl_index].decl.clone();
+    for decl_index in 0..cert.declarations().len() {
+        let decl = cert.declarations()[decl_index].decl.clone();
         let dependencies = expected_dependencies_for_decl(cert, &[], decl_index, &decl).unwrap();
         let (direct_axioms, transitive_axioms) = expected_axioms_for_decl(
             cert,
@@ -3819,8 +4969,10 @@ fn rehash_cert_after_decl_change(cert: &mut ModuleCert) {
             &previous_axioms,
         )
         .unwrap();
-        cert.declarations[decl_index].dependencies = dependencies;
-        cert.declarations[decl_index].axiom_dependencies = transitive_axioms.clone();
+        cert.mutate_parts_for_test(|parts| {
+            parts.declarations[decl_index].dependencies = dependencies;
+            parts.declarations[decl_index].axiom_dependencies = transitive_axioms.clone();
+        });
         previous_axioms.push(transitive_axioms.clone());
         reports.push(DeclAxiomReport {
             decl_index,
@@ -3828,7 +4980,7 @@ fn rehash_cert_after_decl_change(cert: &mut ModuleCert) {
             transitive_axioms,
         });
     }
-    cert.axiom_report = AxiomReport {
+    let axiom_report = AxiomReport {
         module_axioms: union_axioms(
             reports
                 .iter()
@@ -3837,36 +4989,44 @@ fn rehash_cert_after_decl_change(cert: &mut ModuleCert) {
         per_declaration: reports,
         core_features: Vec::new(),
     };
+    cert.mutate_parts_for_test(|parts| parts.axiom_report = axiom_report);
 
-    for decl in &mut cert.declarations {
-        decl.hashes = compute_decl_hashes(
-            version,
-            &decl.decl,
-            &decl.dependencies,
-            &decl.axiom_dependencies,
-            DeclHashTables {
-                terms: &cert.term_table,
-                level_hashes: &level_hashes,
-                term_hashes: &term_hashes,
-                names: &cert.name_table,
-            },
-        )
-        .unwrap();
-    }
-    cert.export_block =
-        build_export_block(&cert.declarations, &cert.term_table, &term_hashes).unwrap();
-    cert.hashes.export_hash = hash_with_domain(
-        MODULE_EXPORT_DOMAIN,
-        &encode_export_block(&cert.export_block),
-    );
-    cert.hashes.axiom_report_hash = hash_with_domain(
+    let term_table = cert.term_table().to_vec();
+    let name_table = cert.name_table().to_vec();
+    cert.mutate_parts_for_test(|parts| {
+        for decl in &mut parts.declarations {
+            decl.hashes = compute_decl_hashes(
+                version,
+                &decl.decl,
+                &decl.dependencies,
+                &decl.axiom_dependencies,
+                DeclHashTables {
+                    terms: &term_table,
+                    level_hashes: &level_hashes,
+                    term_hashes: &term_hashes,
+                    names: &name_table,
+                },
+            )
+            .unwrap();
+        }
+    });
+    let export_block =
+        build_export_block(cert.declarations(), cert.term_table(), &term_hashes).unwrap();
+    let export_hash = hash_with_domain(MODULE_EXPORT_DOMAIN, &encode_export_block(&export_block));
+    let axiom_report_hash = hash_with_domain(
         b"NPA-AXIOM-REPORT-0.1",
-        &encode_axiom_report(&cert.axiom_report),
+        &encode_axiom_report(cert.axiom_report()),
     );
-    cert.hashes.certificate_hash = hash_with_domain(
+    cert.mutate_parts_for_test(|parts| {
+        parts.export_block = export_block;
+        parts.hashes.export_hash = export_hash;
+        parts.hashes.axiom_report_hash = axiom_report_hash;
+    });
+    let certificate_hash = hash_with_domain(
         version.module_certificate_domain(),
         &encode_module_cert_without_certificate_hash_for_header(cert).unwrap(),
     );
+    cert.mutate_parts_for_test(|parts| parts.hashes.certificate_hash = certificate_hash);
 }
 
 #[derive(Clone, Copy)]
@@ -3905,17 +5065,17 @@ fn assert_golden_cert(label: &str, cert: &ModuleCert) {
         "{label}"
     );
     assert_eq!(
-        hash_hex(cert.hashes.export_hash),
+        hash_hex(cert.hashes().export_hash),
         expected.export_hash,
         "{label}"
     );
     assert_eq!(
-        hash_hex(cert.hashes.axiom_report_hash),
+        hash_hex(cert.hashes().axiom_report_hash),
         expected.axiom_report_hash,
         "{label}"
     );
     assert_eq!(
-        hash_hex(cert.hashes.certificate_hash),
+        hash_hex(cert.hashes().certificate_hash),
         expected.certificate_hash,
         "{label}"
     );
@@ -3931,8 +5091,8 @@ fn builds_encodes_decodes_and_verifies_id_certificate() {
     let mut session = VerifierSession::new();
     let verified = verify_module_cert(&bytes, &mut session, &AxiomPolicy::normal()).unwrap();
 
-    assert_eq!(verified.module, Name::from_dotted("Test.Id"));
-    assert_eq!(verified.declarations.len(), 1);
+    assert_eq!(verified.module(), &Name::from_dotted("Test.Id"));
+    assert_eq!(verified.declarations().len(), 1);
 }
 
 #[test]
@@ -3970,38 +5130,38 @@ fn golden_certificate_hashes_cover_core_shapes() {
 }
 
 #[test]
-fn golden_v0_3_certificate_hashes_cover_opaque_surface_cases() {
+fn golden_v0_4_certificate_hashes_cover_opaque_surface_cases() {
     let cases = [
-        ("v0_3_plain_id", build_v0_3_cert(id_module("A", "x"))),
+        ("v0_4_plain_id", build_v0_4_cert(id_module("A", "x"))),
         (
-            "v0_3_opaque_body_direct",
-            build_v0_3_cert(id_def_module_with_value_and_reducibility(
+            "v0_4_opaque_body_direct",
+            build_v0_4_cert(id_def_module_with_value_and_reducibility(
                 id_value("A", "x"),
                 Reducibility::Opaque,
             )),
         ),
         (
-            "v0_3_opaque_body_beta",
-            build_v0_3_cert(id_def_module_with_value_and_reducibility(
+            "v0_4_opaque_body_beta",
+            build_v0_4_cert(id_def_module_with_value_and_reducibility(
                 id_value_with_beta_redex(),
                 Reducibility::Opaque,
             )),
         ),
         (
-            "v0_3_axiom_proof_p1",
-            build_v0_3_cert(theorem_using_axiom_module("p1")),
+            "v0_4_axiom_proof_p1",
+            build_v0_4_cert(theorem_using_axiom_module("p1")),
         ),
         (
-            "v0_3_axiom_proof_p2",
-            build_v0_3_cert(theorem_using_axiom_module("p2")),
+            "v0_4_axiom_proof_p2",
+            build_v0_4_cert(theorem_using_axiom_module("p2")),
         ),
         (
-            "v0_3_opaque_alias_interface",
-            v0_3_opaque_alias_cert_with_interface_dependency(),
+            "v0_4_opaque_alias_interface",
+            v0_4_opaque_alias_cert_with_interface_dependency(),
         ),
         (
-            "v0_3_opaque_alias_implementation",
-            v0_3_opaque_alias_cert_with_local_implementation_dependency(),
+            "v0_4_opaque_alias_implementation",
+            v0_4_opaque_alias_cert_with_local_implementation_dependency(),
         ),
     ];
 
@@ -4015,17 +5175,17 @@ fn binder_names_do_not_affect_term_hashes() {
     let cert_a = build_module_cert(id_module("A", "x"), &[]).unwrap();
     let cert_b = build_module_cert(id_module("B", "y"), &[]).unwrap();
 
-    let value_a = match cert_a.declarations[0].decl {
+    let value_a = match cert_a.declarations()[0].decl {
         DeclPayload::Def { value, .. } => value,
         _ => panic!("expected def"),
     };
-    let value_b = match cert_b.declarations[0].decl {
+    let value_b = match cert_b.declarations()[0].decl {
         DeclPayload::Def { value, .. } => value,
         _ => panic!("expected def"),
     };
 
     assert_eq!(term_hash(&cert_a, value_a), term_hash(&cert_b, value_b));
-    assert_eq!(cert_a.hashes.export_hash, cert_b.hashes.export_hash);
+    assert_eq!(cert_a.hashes().export_hash, cert_b.hashes().export_hash);
 }
 
 #[test]
@@ -4181,16 +5341,16 @@ fn verified_module_can_be_imported_by_export_hash() {
     let verified_id = verify_module_cert(&id_bytes, &mut session, &AxiomPolicy::normal()).unwrap();
 
     let use_id_cert = build_module_cert(use_id_module(), &[verified_id]).unwrap();
-    assert_eq!(use_id_cert.imports.len(), 1);
+    assert_eq!(use_id_cert.imports().len(), 1);
     assert_eq!(
-        use_id_cert.imports[0].export_hash,
-        id_cert.hashes.export_hash
+        use_id_cert.imports()[0].export_hash,
+        id_cert.hashes().export_hash
     );
 
     let use_id_bytes = encode_module_cert(&use_id_cert).unwrap();
     let verified_use_id =
         verify_module_cert(&use_id_bytes, &mut session, &AxiomPolicy::normal()).unwrap();
-    assert_eq!(verified_use_id.module, Name::from_dotted("Test.UseId"));
+    assert_eq!(verified_use_id.module(), &Name::from_dotted("Test.UseId"));
 }
 
 #[test]
@@ -4216,7 +5376,7 @@ fn verified_module_can_be_merged_as_high_trust_import() {
     )
     .unwrap();
 
-    assert_eq!(verified_use_id.module, Name::from_dotted("Test.UseId"));
+    assert_eq!(verified_use_id.module(), &Name::from_dotted("Test.UseId"));
 }
 
 #[test]
@@ -4231,7 +5391,7 @@ fn duplicate_unused_imports_are_deduplicated_before_encoding() {
         &[verified_id.clone(), verified_id],
     )
     .unwrap();
-    assert_eq!(cert.imports.len(), 1);
+    assert_eq!(cert.imports().len(), 1);
 
     verify_module_cert(
         &encode_module_cert(&cert).unwrap(),
@@ -4263,18 +5423,19 @@ fn import_order_is_canonical_and_stable() {
         build_module_cert(use_two_axioms_module(), &[alpha.clone(), beta.clone()]).unwrap();
     let cert_ba = build_module_cert(use_two_axioms_module(), &[beta, alpha]).unwrap();
 
-    assert_eq!(cert_ab.imports, cert_ba.imports);
+    assert_eq!(cert_ab.imports(), cert_ba.imports());
     assert_eq!(
         encode_module_cert(&cert_ab).unwrap(),
         encode_module_cert(&cert_ba).unwrap()
     );
 
     let mut noncanonical = cert_ab;
-    noncanonical.imports.swap(0, 1);
-    noncanonical.hashes.certificate_hash = hash_with_domain(
+    noncanonical.mutate_parts_for_test(|parts| parts.imports.swap(0, 1));
+    let certificate_hash = hash_with_domain(
         MODULE_CERT_DOMAIN,
         &encode_module_cert_without_certificate_hash(&noncanonical),
     );
+    noncanonical.mutate_parts_for_test(|parts| parts.hashes.certificate_hash = certificate_hash);
     let err = verify_module_cert(
         &encode_module_cert(&noncanonical).unwrap(),
         &mut session,
@@ -4297,8 +5458,8 @@ fn declaration_order_is_canonical_and_stable() {
         encode_module_cert(&cert_ba).unwrap()
     );
     assert!(matches!(
-        cert_ba.declarations[0].decl,
-        DeclPayload::Axiom { name, .. } if cert_ba.name_table[name] == Name::from_dotted("A")
+        cert_ba.declarations()[0].decl,
+        DeclPayload::Axiom { name, .. } if cert_ba.name_table()[name] == Name::from_dotted("A")
     ));
 }
 
@@ -4308,20 +5469,21 @@ fn declaration_names_are_committed_to_interface_and_export_hashes() {
     let q_cert = build_module_cert(named_axiom_module("Test.NamedAxiom", "Q"), &[]).unwrap();
 
     assert_ne!(
-        p_cert.declarations[0].hashes.decl_interface_hash,
-        q_cert.declarations[0].hashes.decl_interface_hash
+        p_cert.declarations()[0].hashes.decl_interface_hash,
+        q_cert.declarations()[0].hashes.decl_interface_hash
     );
-    assert_ne!(p_cert.hashes.export_hash, q_cert.hashes.export_hash);
+    assert_ne!(p_cert.hashes().export_hash, q_cert.hashes().export_hash);
 }
 
 #[test]
 fn rejects_unused_name_table_entry_even_if_rehashed() {
     let mut cert = build_module_cert(id_module("A", "x"), &[]).unwrap();
-    cert.name_table.push(Name::from_dotted("zz.unused"));
-    cert.hashes.certificate_hash = hash_with_domain(
+    cert.mutate_parts_for_test(|parts| parts.name_table.push(Name::from_dotted("zz.unused")));
+    let certificate_hash = hash_with_domain(
         MODULE_CERT_DOMAIN,
         &encode_module_cert_without_certificate_hash(&cert),
     );
+    cert.mutate_parts_for_test(|parts| parts.hashes.certificate_hash = certificate_hash);
 
     let mut session = VerifierSession::new();
     let err = verify_module_cert(
@@ -4341,11 +5503,12 @@ fn rejects_unused_name_table_entry_even_if_rehashed() {
 #[test]
 fn verifier_rejects_noncanonical_declaration_order_even_if_rehashed() {
     let mut cert = build_module_cert(ordered_axioms_module(&["A", "B"]), &[]).unwrap();
-    cert.declarations.swap(0, 1);
-    cert.hashes.certificate_hash = hash_with_domain(
+    cert.mutate_parts_for_test(|parts| parts.declarations.swap(0, 1));
+    let certificate_hash = hash_with_domain(
         MODULE_CERT_DOMAIN,
         &encode_module_cert_without_certificate_hash(&cert),
     );
+    cert.mutate_parts_for_test(|parts| parts.hashes.certificate_hash = certificate_hash);
 
     let mut session = VerifierSession::new();
     let err = verify_module_cert(
@@ -4366,10 +5529,10 @@ fn verifier_rejects_noncanonical_declaration_order_even_if_rehashed() {
 fn forward_source_dependency_is_canonicalized_before_verification() {
     let cert = build_module_cert(forward_axiom_dependency_module(), &[]).unwrap();
     assert!(matches!(
-        cert.declarations[0].decl,
-        DeclPayload::Axiom { name, .. } if cert.name_table[name] == Name::from_dotted("P")
+        cert.declarations()[0].decl,
+        DeclPayload::Axiom { name, .. } if cert.name_table()[name] == Name::from_dotted("P")
     ));
-    assert!(cert.declarations[1]
+    assert!(cert.declarations()[1]
         .dependencies
         .iter()
         .any(|dependency| matches!(dependency.global_ref(), GlobalRef::Local { decl_index: 0 })));
@@ -4426,9 +5589,9 @@ fn imported_axioms_are_reported_in_caller_certificate() {
         verify_module_cert(&encode_module_cert(&p_cert).unwrap(), &mut session, &policy).unwrap();
 
     let use_p_cert = build_module_cert(use_axiom_module(), &[verified_p]).unwrap();
-    assert_eq!(use_p_cert.axiom_report.module_axioms.len(), 1);
-    let axiom = &use_p_cert.axiom_report.module_axioms[0];
-    assert_eq!(use_p_cert.name_table[axiom.name], Name::from_dotted("P"));
+    assert_eq!(use_p_cert.axiom_report().module_axioms.len(), 1);
+    let axiom = &use_p_cert.axiom_report().module_axioms[0];
+    assert_eq!(use_p_cert.name_table()[axiom.name], Name::from_dotted("P"));
     assert!(matches!(
         axiom.global_ref,
         GlobalRef::Imported {
@@ -4468,20 +5631,20 @@ fn transitive_imported_axiom_provenance_points_to_original_import() {
     let use_use_p_cert =
         build_module_cert(use_imported_use_p_module(), &[verified_use_p, verified_p]).unwrap();
     let p_import_index = use_use_p_cert
-        .imports
+        .imports()
         .iter()
         .position(|import| import.module == Name::from_dotted("Test.Axiom"))
         .unwrap();
     let use_p_import_index = use_use_p_cert
-        .imports
+        .imports()
         .iter()
         .position(|import| import.module == Name::from_dotted("Test.UseAxiom"))
         .unwrap();
     let axiom = use_use_p_cert
-        .axiom_report
+        .axiom_report()
         .module_axioms
         .iter()
-        .find(|axiom| use_use_p_cert.name_table[axiom.name] == Name::from_dotted("P"))
+        .find(|axiom| use_use_p_cert.name_table()[axiom.name] == Name::from_dotted("P"))
         .unwrap();
 
     assert!(matches!(
@@ -4514,15 +5677,17 @@ fn transitive_imported_builtin_axioms_remain_builtin() {
     let use_alias_cert =
         build_module_cert(use_imported_eq_rec_alias_module(), &[verified_eq_rec_alias]).unwrap();
     let axiom = use_alias_cert
-        .axiom_report
+        .axiom_report()
         .module_axioms
         .iter()
-        .find(|axiom| use_alias_cert.name_table[axiom.name] == Name::from_dotted("Eq.rec"))
+        .find(|axiom| use_alias_cert.name_table()[axiom.name] == Name::from_dotted("Eq.rec"))
         .expect("downstream module should report the builtin Eq.rec axiom");
 
     assert!(matches!(axiom.global_ref, GlobalRef::Builtin { .. }));
     assert!(matches!(
-        use_alias_cert.declarations[0].axiom_dependencies.as_slice(),
+        use_alias_cert.declarations()[0]
+            .axiom_dependencies
+            .as_slice(),
         [AxiomRef {
             global_ref: GlobalRef::Builtin { .. },
             ..
@@ -4550,10 +5715,10 @@ fn current_builtin_eq_rec_can_coexist_with_imported_eq_shape() {
     let use_eq_rec_cert =
         build_module_cert(use_builtin_eq_rec_with_imported_eq_module(), &[verified_eq]).unwrap();
     let axiom = use_eq_rec_cert
-        .axiom_report
+        .axiom_report()
         .module_axioms
         .iter()
-        .find(|axiom| use_eq_rec_cert.name_table[axiom.name] == Name::from_dotted("Eq.rec"))
+        .find(|axiom| use_eq_rec_cert.name_table()[axiom.name] == Name::from_dotted("Eq.rec"))
         .expect("current module should report the builtin Eq.rec axiom");
 
     assert!(matches!(axiom.global_ref, GlobalRef::Builtin { .. }));
@@ -4579,10 +5744,10 @@ fn current_builtin_eq_rec_remains_builtin_when_import_exports_builtin_eq_rec() {
     let use_eq_rec_cert =
         build_module_cert(use_builtin_eq_rec_with_imported_eq_module(), &[verified_eq]).unwrap();
     let axiom = use_eq_rec_cert
-        .axiom_report
+        .axiom_report()
         .module_axioms
         .iter()
-        .find(|axiom| use_eq_rec_cert.name_table[axiom.name] == Name::from_dotted("Eq.rec"))
+        .find(|axiom| use_eq_rec_cert.name_table()[axiom.name] == Name::from_dotted("Eq.rec"))
         .expect("current module should report the builtin Eq.rec axiom");
 
     assert!(matches!(axiom.global_ref, GlobalRef::Builtin { .. }));
@@ -4650,7 +5815,7 @@ fn import_export_name_matching_module_name_does_not_pull_unused_axioms() {
     let mut module = unary_inductive_module();
     module.name = Name::from_dotted("use_p");
     let cert = build_module_cert(module, &[verified_use_p, verified_p]).unwrap();
-    assert!(!cert.name_table.contains(&Name::from_dotted("P")));
+    assert!(!cert.name_table().contains(&Name::from_dotted("P")));
 
     verify_module_cert(
         &encode_module_cert(&cert).unwrap(),
@@ -4685,9 +5850,9 @@ fn downstream_import_uses_export_block_not_hidden_certificate_body_deps() {
 
     let use_public_id_cert = build_module_cert(use_public_id_module(), &[verified_public_id])
         .expect("hidden theorem and opaque def imports must not be required downstream");
-    assert_eq!(use_public_id_cert.imports.len(), 1);
+    assert_eq!(use_public_id_cert.imports().len(), 1);
     assert_eq!(
-        use_public_id_cert.imports[0].module,
+        use_public_id_cert.imports()[0].module,
         Name::from_dotted("Test.PublicIdWithHiddenProof")
     );
     verify_module_cert(
@@ -4704,21 +5869,21 @@ fn opaque_theorem_proof_change_keeps_export_hash_when_axioms_do_not_change() {
     let cert_b = build_module_cert(id_theorem_module(id_value_with_beta_redex()), &[]).unwrap();
 
     assert_eq!(
-        cert_a.declarations[0].hashes.decl_interface_hash,
-        cert_b.declarations[0].hashes.decl_interface_hash
+        cert_a.declarations()[0].hashes.decl_interface_hash,
+        cert_b.declarations()[0].hashes.decl_interface_hash
     );
     assert_ne!(
-        cert_a.declarations[0].hashes.decl_certificate_hash,
-        cert_b.declarations[0].hashes.decl_certificate_hash
+        cert_a.declarations()[0].hashes.decl_certificate_hash,
+        cert_b.declarations()[0].hashes.decl_certificate_hash
     );
-    assert_eq!(cert_a.hashes.export_hash, cert_b.hashes.export_hash);
+    assert_eq!(cert_a.hashes().export_hash, cert_b.hashes().export_hash);
     assert_eq!(
-        cert_a.hashes.axiom_report_hash,
-        cert_b.hashes.axiom_report_hash
+        cert_a.hashes().axiom_report_hash,
+        cert_b.hashes().axiom_report_hash
     );
     assert_ne!(
-        cert_a.hashes.certificate_hash,
-        cert_b.hashes.certificate_hash
+        cert_a.hashes().certificate_hash,
+        cert_b.hashes().certificate_hash
     );
 }
 
@@ -4736,17 +5901,17 @@ fn opaque_def_body_change_keeps_interface_and_export_hashes() {
     .unwrap();
 
     assert_eq!(
-        cert_a.declarations[0].hashes.decl_interface_hash,
-        cert_b.declarations[0].hashes.decl_interface_hash
+        cert_a.declarations()[0].hashes.decl_interface_hash,
+        cert_b.declarations()[0].hashes.decl_interface_hash
     );
     assert_ne!(
-        cert_a.declarations[0].hashes.decl_certificate_hash,
-        cert_b.declarations[0].hashes.decl_certificate_hash
+        cert_a.declarations()[0].hashes.decl_certificate_hash,
+        cert_b.declarations()[0].hashes.decl_certificate_hash
     );
-    assert_eq!(cert_a.hashes.export_hash, cert_b.hashes.export_hash);
+    assert_eq!(cert_a.hashes().export_hash, cert_b.hashes().export_hash);
     assert_ne!(
-        cert_a.hashes.certificate_hash,
-        cert_b.hashes.certificate_hash
+        cert_a.hashes().certificate_hash,
+        cert_b.hashes().certificate_hash
     );
 }
 
@@ -4757,17 +5922,17 @@ fn transparent_def_body_change_changes_interface_and_export_hashes() {
         build_module_cert(id_def_module_with_value(id_value_with_beta_redex()), &[]).unwrap();
 
     assert_ne!(
-        cert_a.declarations[0].hashes.decl_interface_hash,
-        cert_b.declarations[0].hashes.decl_interface_hash
+        cert_a.declarations()[0].hashes.decl_interface_hash,
+        cert_b.declarations()[0].hashes.decl_interface_hash
     );
     assert_ne!(
-        cert_a.declarations[0].hashes.decl_certificate_hash,
-        cert_b.declarations[0].hashes.decl_certificate_hash
+        cert_a.declarations()[0].hashes.decl_certificate_hash,
+        cert_b.declarations()[0].hashes.decl_certificate_hash
     );
-    assert_ne!(cert_a.hashes.export_hash, cert_b.hashes.export_hash);
+    assert_ne!(cert_a.hashes().export_hash, cert_b.hashes().export_hash);
     assert_ne!(
-        cert_a.hashes.certificate_hash,
-        cert_b.hashes.certificate_hash
+        cert_a.hashes().certificate_hash,
+        cert_b.hashes().certificate_hash
     );
 }
 
@@ -4809,10 +5974,10 @@ fn import_certificate_rebind_matches_ordinary_rebuild_for_export_stable_provider
         Err(CertError::ImportCertificateHashMismatch { .. })
     ));
     let expected = ModuleCertRebindExpectedIdentity {
-        module: dependent.header.module.clone(),
-        export_hash: dependent.hashes.export_hash,
-        axiom_report_hash: dependent.hashes.axiom_report_hash,
-        certificate_hash: dependent.hashes.certificate_hash,
+        module: dependent.header().module.clone(),
+        export_hash: dependent.hashes().export_hash,
+        axiom_report_hash: dependent.hashes().axiom_report_hash,
+        certificate_hash: dependent.hashes().certificate_hash,
     };
 
     let outcome = rebind_module_cert_import_certificate_hashes(
@@ -4836,26 +6001,29 @@ fn import_certificate_rebind_matches_ordinary_rebuild_for_export_stable_provider
     };
 
     assert_eq!(changed_imports, vec![Name::from_dotted("Test.Id")]);
-    assert_eq!(certificate.hashes.export_hash, dependent.hashes.export_hash);
     assert_eq!(
-        certificate.hashes.axiom_report_hash,
-        dependent.hashes.axiom_report_hash
+        certificate.hashes().export_hash,
+        dependent.hashes().export_hash
+    );
+    assert_eq!(
+        certificate.hashes().axiom_report_hash,
+        dependent.hashes().axiom_report_hash
     );
     assert_ne!(
-        certificate.hashes.certificate_hash,
-        dependent.hashes.certificate_hash
+        certificate.hashes().certificate_hash,
+        dependent.hashes().certificate_hash
     );
     assert_eq!(
         verified.certificate_hash(),
-        certificate.hashes.certificate_hash
+        certificate.hashes().certificate_hash
     );
     let rebuilt = build_module_cert(use_id_module(), &[new_verified]).unwrap();
     assert_eq!(bytes, encode_module_cert(&rebuilt).unwrap());
 }
 
 #[test]
-fn import_certificate_rebind_v0_3_preserves_payload_and_matches_ordinary_rebuild() {
-    let build_v0_3 = |module, imports: &[&VerifiedModule]| {
+fn import_certificate_rebind_v0_4_preserves_payload_and_matches_ordinary_rebuild() {
+    let build_v0_4 = |module, imports: &[&VerifiedModule]| {
         build_module_cert_from_import_refs_with_preferred_imports(
             module,
             imports,
@@ -4863,11 +6031,11 @@ fn import_certificate_rebind_v0_3_preserves_payload_and_matches_ordinary_rebuild
         )
         .unwrap()
     };
-    let old_provider = build_v0_3(
+    let old_provider = build_v0_4(
         id_def_module_with_value_and_reducibility(id_value("A", "x"), Reducibility::Opaque),
         &[],
     );
-    let new_provider = build_v0_3(
+    let new_provider = build_v0_4(
         id_def_module_with_value_and_reducibility(id_value_with_beta_redex(), Reducibility::Opaque),
         &[],
     );
@@ -4890,13 +6058,13 @@ fn import_certificate_rebind_v0_3_preserves_payload_and_matches_ordinary_rebuild
         new_verified.certificate_hash()
     );
 
-    let dependent = build_v0_3(use_id_module(), &[&old_verified]);
+    let dependent = build_v0_4(use_id_module(), &[&old_verified]);
     let dependent_bytes = encode_module_cert(&dependent).unwrap();
     let expected = ModuleCertRebindExpectedIdentity {
-        module: dependent.header.module.clone(),
-        export_hash: dependent.hashes.export_hash,
-        axiom_report_hash: dependent.hashes.axiom_report_hash,
-        certificate_hash: dependent.hashes.certificate_hash,
+        module: dependent.header().module.clone(),
+        export_hash: dependent.hashes().export_hash,
+        axiom_report_hash: dependent.hashes().axiom_report_hash,
+        certificate_hash: dependent.hashes().certificate_hash,
     };
     let outcome = rebind_module_cert_import_certificate_hashes(
         &dependent_bytes,
@@ -4918,38 +6086,41 @@ fn import_certificate_rebind_v0_3_preserves_payload_and_matches_ordinary_rebuild
         panic!("expected v0.3 rebound certificate");
     };
 
-    assert_eq!(certificate.header.format, FORMAT);
-    assert_eq!(certificate.header.core_spec, CORE_SPEC);
+    assert_eq!(certificate.header().format, FORMAT);
+    assert_eq!(certificate.header().core_spec, CORE_SPEC);
     assert_eq!(changed_imports, vec![Name::from_dotted("Test.Id")]);
-    assert_eq!(certificate.declarations, dependent.declarations);
-    assert_eq!(certificate.name_table, dependent.name_table);
-    assert_eq!(certificate.level_table, dependent.level_table);
-    assert_eq!(certificate.term_table, dependent.term_table);
-    assert_eq!(certificate.export_block, dependent.export_block);
-    assert_eq!(certificate.axiom_report, dependent.axiom_report);
-    assert_eq!(certificate.hashes.export_hash, dependent.hashes.export_hash);
+    assert_eq!(certificate.declarations(), dependent.declarations());
+    assert_eq!(certificate.name_table(), dependent.name_table());
+    assert_eq!(certificate.level_table(), dependent.level_table());
+    assert_eq!(certificate.term_table(), dependent.term_table());
+    assert_eq!(certificate.export_block(), dependent.export_block());
+    assert_eq!(certificate.axiom_report(), dependent.axiom_report());
     assert_eq!(
-        certificate.hashes.axiom_report_hash,
-        dependent.hashes.axiom_report_hash
+        certificate.hashes().export_hash,
+        dependent.hashes().export_hash
+    );
+    assert_eq!(
+        certificate.hashes().axiom_report_hash,
+        dependent.hashes().axiom_report_hash
     );
     assert_ne!(
-        certificate.hashes.certificate_hash,
-        dependent.hashes.certificate_hash
+        certificate.hashes().certificate_hash,
+        dependent.hashes().certificate_hash
     );
     assert_eq!(
         verified.certificate_hash(),
-        certificate.hashes.certificate_hash
+        certificate.hashes().certificate_hash
     );
 
-    let rebuilt = build_v0_3(use_id_module(), &[&new_verified]);
+    let rebuilt = build_v0_4(use_id_module(), &[&new_verified]);
     assert_eq!(bytes, encode_module_cert(&rebuilt).unwrap());
 }
 
 #[test]
-fn import_certificate_rebind_v0_3_rejects_stale_local_implementation_dependency() {
-    let mut stale = v0_3_opaque_alias_cert_with_local_implementation_dependency();
+fn import_certificate_rebind_v0_4_rejects_stale_local_implementation_dependency() {
+    let mut stale = v0_4_opaque_alias_cert_with_local_implementation_dependency();
     let (consumer, dependency_index) = first_local_dependency(&stale);
-    let dependency = &stale.declarations[consumer].dependencies[dependency_index];
+    let dependency = &stale.declarations()[consumer].dependencies[dependency_index];
     let global_ref = dependency.global_ref().clone();
     let interface_hash = dependency.decl_interface_hash();
     let mut stale_certificate_hash = dependency.decl_certificate_hash().unwrap();
@@ -4961,10 +6132,10 @@ fn import_certificate_rebind_v0_3_rejects_stale_local_implementation_dependency(
         stale_certificate_hash,
     );
     let expected = ModuleCertRebindExpectedIdentity {
-        module: stale.header.module.clone(),
-        export_hash: stale.hashes.export_hash,
-        axiom_report_hash: stale.hashes.axiom_report_hash,
-        certificate_hash: stale.hashes.certificate_hash,
+        module: stale.header().module.clone(),
+        export_hash: stale.hashes().export_hash,
+        axiom_report_hash: stale.hashes().axiom_report_hash,
+        certificate_hash: stale.hashes().certificate_hash,
     };
 
     let error = rebind_module_cert_import_certificate_hashes(
@@ -4995,10 +6166,10 @@ fn import_certificate_rebind_returns_unchanged_after_live_verification() {
         build_module_cert(use_id_module(), std::slice::from_ref(&verified_provider)).unwrap();
     let bytes = encode_module_cert(&dependent).unwrap();
     let expected = ModuleCertRebindExpectedIdentity {
-        module: dependent.header.module.clone(),
-        export_hash: dependent.hashes.export_hash,
-        axiom_report_hash: dependent.hashes.axiom_report_hash,
-        certificate_hash: dependent.hashes.certificate_hash,
+        module: dependent.header().module.clone(),
+        export_hash: dependent.hashes().export_hash,
+        axiom_report_hash: dependent.hashes().axiom_report_hash,
+        certificate_hash: dependent.hashes().certificate_hash,
     };
 
     let outcome = rebind_module_cert_import_certificate_hashes(
@@ -5022,7 +6193,7 @@ fn import_certificate_rebind_returns_unchanged_after_live_verification() {
     assert_eq!(certificate, dependent);
     assert_eq!(
         verified.certificate_hash(),
-        dependent.hashes.certificate_hash
+        dependent.hashes().certificate_hash
     );
 }
 
@@ -5047,10 +6218,10 @@ fn import_certificate_rebind_reports_local_export_change() {
     let dependent = build_module_cert(use_id_module(), &[old_verified]).unwrap();
     let bytes = encode_module_cert(&dependent).unwrap();
     let expected = ModuleCertRebindExpectedIdentity {
-        module: dependent.header.module.clone(),
-        export_hash: dependent.hashes.export_hash,
-        axiom_report_hash: dependent.hashes.axiom_report_hash,
-        certificate_hash: dependent.hashes.certificate_hash,
+        module: dependent.header().module.clone(),
+        export_hash: dependent.hashes().export_hash,
+        axiom_report_hash: dependent.hashes().axiom_report_hash,
+        certificate_hash: dependent.hashes().certificate_hash,
     };
 
     let outcome = rebind_module_cert_import_certificate_hashes(
@@ -5068,8 +6239,8 @@ fn import_certificate_rebind_reports_local_export_change() {
         outcome,
         ModuleCertImportRebindOutcome::ExportChanged {
             module: Name::from_dotted("Test.Id"),
-            expected: old_provider.hashes.export_hash,
-            actual: new_provider.hashes.export_hash,
+            expected: old_provider.hashes().export_hash,
+            actual: new_provider.hashes().export_hash,
         }
     );
 }
@@ -5102,12 +6273,12 @@ fn import_certificate_rebind_prioritizes_external_identity_failure_in_any_import
         let new_external =
             build_module_cert(external_with_value(id_value_with_beta_redex()), &[]).unwrap();
         assert_eq!(
-            old_external.hashes.export_hash,
-            new_external.hashes.export_hash
+            old_external.hashes().export_hash,
+            new_external.hashes().export_hash
         );
         assert_ne!(
-            old_external.hashes.certificate_hash,
-            new_external.hashes.certificate_hash
+            old_external.hashes().certificate_hash,
+            new_external.hashes().certificate_hash
         );
         let old_verified_external = verify_module_cert_with_import_refs(
             &encode_module_cert(&old_external).unwrap(),
@@ -5127,12 +6298,12 @@ fn import_certificate_rebind_prioritizes_external_identity_failure_in_any_import
         )
         .unwrap();
         let external_index = dependent
-            .imports
+            .imports()
             .iter()
             .position(|import| import.module == Name::from_dotted(external_module))
             .unwrap();
         let local_index = dependent
-            .imports
+            .imports()
             .iter()
             .position(|import| import.module == Name::from_dotted("Test.Id"))
             .unwrap();
@@ -5142,10 +6313,10 @@ fn import_certificate_rebind_prioritizes_external_identity_failure_in_any_import
         );
         let bytes = encode_module_cert(&dependent).unwrap();
         let expected = ModuleCertRebindExpectedIdentity {
-            module: dependent.header.module.clone(),
-            export_hash: dependent.hashes.export_hash,
-            axiom_report_hash: dependent.hashes.axiom_report_hash,
-            certificate_hash: dependent.hashes.certificate_hash,
+            module: dependent.header().module.clone(),
+            export_hash: dependent.hashes().export_hash,
+            axiom_report_hash: dependent.hashes().axiom_report_hash,
+            certificate_hash: dependent.hashes().certificate_hash,
         };
 
         let error = rebind_module_cert_import_certificate_hashes(
@@ -5201,28 +6372,31 @@ fn import_certificate_rebind_rejects_duplicate_certificate_module_before_mapped_
     .unwrap();
     let mut dependent =
         build_module_cert(use_id_module(), std::slice::from_ref(&old_verified)).unwrap();
-    dependent.imports.push(ImportEntry {
-        module: new_verified.module().clone(),
-        export_hash: new_verified.export_hash(),
-        certificate_hash: Some(new_verified.certificate_hash()),
+    dependent.mutate_parts_for_test(|parts| {
+        parts.imports.push(ImportEntry {
+            module: new_verified.module().clone(),
+            export_hash: new_verified.export_hash(),
+            certificate_hash: Some(new_verified.certificate_hash()),
+        });
+        parts.imports.sort_by_key(|import| {
+            (
+                import.module.clone(),
+                import.export_hash,
+                import.certificate_hash,
+            )
+        });
     });
-    dependent.imports.sort_by_key(|import| {
-        (
-            import.module.clone(),
-            import.export_hash,
-            import.certificate_hash,
-        )
-    });
-    dependent.hashes.certificate_hash = hash_with_domain(
+    let certificate_hash = hash_with_domain(
         MODULE_CERT_DOMAIN,
         &encode_module_cert_without_certificate_hash(&dependent),
     );
+    dependent.mutate_parts_for_test(|parts| parts.hashes.certificate_hash = certificate_hash);
     let bytes = encode_module_cert(&dependent).unwrap();
     let expected = ModuleCertRebindExpectedIdentity {
-        module: dependent.header.module.clone(),
-        export_hash: dependent.hashes.export_hash,
-        axiom_report_hash: dependent.hashes.axiom_report_hash,
-        certificate_hash: dependent.hashes.certificate_hash,
+        module: dependent.header().module.clone(),
+        export_hash: dependent.hashes().export_hash,
+        axiom_report_hash: dependent.hashes().axiom_report_hash,
+        certificate_hash: dependent.hashes().certificate_hash,
     };
 
     let error = rebind_module_cert_import_certificate_hashes(
@@ -5254,7 +6428,7 @@ fn import_certificate_rebind_rejects_duplicate_certificate_module_before_mapped_
 fn decl_interface_hash_def_payload_order_matches_certificate_contract() {
     let fixture = hash_contract_def_fixture();
     let hashes = compute_decl_hashes(
-        CertificateFormatVersion::V0_2_0,
+        CertificateFormatVersion::V0_4_0,
         &fixture.decl,
         &fixture.dependencies,
         &fixture.axiom_dependencies,
@@ -5317,7 +6491,7 @@ fn decl_interface_hash_def_payload_order_matches_certificate_contract() {
 fn reducible_def_decl_certificate_hash_includes_value_hash_directly() {
     let fixture = hash_contract_def_fixture();
     let hashes = compute_decl_hashes(
-        CertificateFormatVersion::V0_2_0,
+        CertificateFormatVersion::V0_4_0,
         &fixture.decl,
         &fixture.dependencies,
         &fixture.axiom_dependencies,
@@ -5337,33 +6511,45 @@ fn reducible_def_decl_certificate_hash_includes_value_hash_directly() {
     let mut expected = Vec::new();
     expected.extend_from_slice(&hashes.decl_interface_hash);
     expected.extend_from_slice(&fixture.term_hashes[value]);
-    encode_dependency_entries_to(&mut expected, &fixture.dependencies);
+    encode_dependency_entries_with_format_to(
+        &mut expected,
+        &fixture.dependencies,
+        CertificateFormatVersion::V0_4_0,
+    );
     encode_axiom_refs_to(&mut expected, &fixture.axiom_dependencies);
     assert_eq!(
         hashes.decl_certificate_hash,
-        hash_with_domain(b"NPA-DECL-CERT-0.1", &expected)
+        hash_with_domain(DECL_CERT_DOMAIN, &expected)
     );
 
     let mut changed_value_hash = Vec::new();
     changed_value_hash.extend_from_slice(&hashes.decl_interface_hash);
     changed_value_hash.extend_from_slice(&test_hash(0x21));
-    encode_dependency_entries_to(&mut changed_value_hash, &fixture.dependencies);
+    encode_dependency_entries_with_format_to(
+        &mut changed_value_hash,
+        &fixture.dependencies,
+        CertificateFormatVersion::V0_4_0,
+    );
     encode_axiom_refs_to(&mut changed_value_hash, &fixture.axiom_dependencies);
     assert_ne!(
         hashes.decl_certificate_hash,
-        hash_with_domain(b"NPA-DECL-CERT-0.1", &changed_value_hash)
+        hash_with_domain(DECL_CERT_DOMAIN, &changed_value_hash)
     );
 
     let mut legacy_without_direct_value_hash = Vec::new();
     legacy_without_direct_value_hash.extend_from_slice(&hashes.decl_interface_hash);
-    encode_dependency_entries_to(&mut legacy_without_direct_value_hash, &fixture.dependencies);
+    encode_dependency_entries_with_format_to(
+        &mut legacy_without_direct_value_hash,
+        &fixture.dependencies,
+        CertificateFormatVersion::V0_4_0,
+    );
     encode_axiom_refs_to(
         &mut legacy_without_direct_value_hash,
         &fixture.axiom_dependencies,
     );
     assert_ne!(
         hashes.decl_certificate_hash,
-        hash_with_domain(b"NPA-DECL-CERT-0.1", &legacy_without_direct_value_hash)
+        hash_with_domain(DECL_CERT_DOMAIN, &legacy_without_direct_value_hash)
     );
 }
 
@@ -5377,24 +6563,24 @@ fn local_transparent_dependency_change_propagates_to_dependents() {
     )
     .unwrap();
     let alias_a = cert_a
-        .declarations
+        .declarations()
         .iter()
         .find(|decl| {
             matches!(
                 &decl.decl,
                 DeclPayload::Def { name, .. }
-                    if cert_a.name_table[*name] == Name::from_dotted("alias")
+                    if cert_a.name_table()[*name] == Name::from_dotted("alias")
             )
         })
         .unwrap();
     let alias_b = cert_b
-        .declarations
+        .declarations()
         .iter()
         .find(|decl| {
             matches!(
                 &decl.decl,
                 DeclPayload::Def { name, .. }
-                    if cert_b.name_table[*name] == Name::from_dotted("alias")
+                    if cert_b.name_table()[*name] == Name::from_dotted("alias")
             )
         })
         .unwrap();
@@ -5403,7 +6589,7 @@ fn local_transparent_dependency_change_propagates_to_dependents() {
         alias_a.hashes.decl_interface_hash,
         alias_b.hashes.decl_interface_hash
     );
-    assert_ne!(cert_a.hashes.export_hash, cert_b.hashes.export_hash);
+    assert_ne!(cert_a.hashes().export_hash, cert_b.hashes().export_hash);
 }
 
 #[test]
@@ -5411,10 +6597,10 @@ fn opaque_theorem_axiom_change_changes_export_hash() {
     let cert_p1 = build_module_cert(theorem_using_axiom_module("p1"), &[]).unwrap();
     let cert_p2 = build_module_cert(theorem_using_axiom_module("p2"), &[]).unwrap();
 
-    assert_ne!(cert_p1.hashes.export_hash, cert_p2.hashes.export_hash);
+    assert_ne!(cert_p1.hashes().export_hash, cert_p2.hashes().export_hash);
     assert_ne!(
-        cert_p1.axiom_report.per_declaration[3].transitive_axioms,
-        cert_p2.axiom_report.per_declaration[3].transitive_axioms
+        cert_p1.axiom_report().per_declaration[3].transitive_axioms,
+        cert_p2.axiom_report().per_declaration[3].transitive_axioms
     );
 }
 
@@ -5483,7 +6669,7 @@ fn axiom_policy_canonical_bytes_sort_allowlist_and_change_by_policy() {
 fn axiom_policy_hash_is_not_certificate_identity() {
     let cert = build_module_cert(id_module("A", "x"), &[]).unwrap();
     let encoded = encode_module_cert(&cert).unwrap();
-    let certificate_hash = cert.hashes.certificate_hash;
+    let certificate_hash = cert.hashes().certificate_hash;
 
     let _normal_policy_hash = AxiomPolicy::normal().policy_hash();
     let mut high_trust_with_axiom = AxiomPolicy::high_trust();
@@ -5492,7 +6678,7 @@ fn axiom_policy_hash_is_not_certificate_identity() {
         .insert(Name::from_dotted("P"));
     let _high_trust_policy_hash = high_trust_with_axiom.policy_hash();
 
-    assert_eq!(certificate_hash, cert.hashes.certificate_hash);
+    assert_eq!(certificate_hash, cert.hashes().certificate_hash);
     assert_eq!(encoded, encode_module_cert(&cert).unwrap());
 }
 
@@ -5563,18 +6749,18 @@ fn normal_mode_enforces_non_empty_axiom_allowlist() {
 #[test]
 fn axiom_type_dependencies_are_reported_and_verified() {
     let cert = build_module_cert(theorem_using_axiom_module("p1"), &[]).unwrap();
-    assert!(cert.declarations[1]
+    assert!(cert.declarations()[1]
         .dependencies
         .iter()
         .any(|dependency| matches!(dependency.global_ref(), GlobalRef::Local { decl_index: 0 })));
-    assert!(cert.axiom_report.per_declaration[1]
+    assert!(cert.axiom_report().per_declaration[1]
         .transitive_axioms
         .iter()
         .any(|axiom| matches!(axiom.global_ref, GlobalRef::Local { decl_index: 0 })));
-    let theorem_direct_axioms = cert.axiom_report.per_declaration[3]
+    let theorem_direct_axioms = cert.axiom_report().per_declaration[3]
         .direct_axioms
         .iter()
-        .map(|axiom| cert.name_table[axiom.name].as_dotted())
+        .map(|axiom| cert.name_table()[axiom.name].as_dotted())
         .collect::<Vec<_>>();
     assert!(theorem_direct_axioms.iter().any(|name| name == "P"));
     assert!(theorem_direct_axioms.iter().any(|name| name == "p1"));
@@ -5595,19 +6781,19 @@ fn inductive_certificate_round_trips_and_verifies() {
     let mut session = VerifierSession::new();
     let verified = verify_module_cert(&bytes, &mut session, &AxiomPolicy::normal()).unwrap();
 
-    assert_eq!(verified.module, Name::from_dotted("Test.Unary"));
+    assert_eq!(verified.module(), &Name::from_dotted("Test.Unary"));
     assert!(matches!(
-        verified.declarations.first().map(|decl| &decl.decl),
+        verified.declarations().first().map(|decl| &decl.decl),
         Some(DeclPayload::Inductive { name, .. })
-            if verified.name_table[*name] == Name::from_dotted("Unary")
+            if verified.name_table()[*name] == Name::from_dotted("Unary")
     ));
-    assert!(cert.export_block.iter().any(|entry| {
+    assert!(cert.export_block().iter().any(|entry| {
         entry.kind == ExportKind::Constructor
-            && cert.name_table[entry.name] == Name::from_dotted("Unary.zero")
+            && cert.name_table()[entry.name] == Name::from_dotted("Unary.zero")
     }));
-    assert!(cert.export_block.iter().any(|entry| {
+    assert!(cert.export_block().iter().any(|entry| {
         entry.kind == ExportKind::Constructor
-            && cert.name_table[entry.name] == Name::from_dotted("Unary.succ")
+            && cert.name_table()[entry.name] == Name::from_dotted("Unary.succ")
     }));
 }
 
@@ -5618,14 +6804,14 @@ fn indexed_inductive_certificate_round_trips_and_verifies() {
     let mut session = VerifierSession::new();
     let verified = verify_module_cert(&bytes, &mut session, &AxiomPolicy::normal()).unwrap();
 
-    assert_eq!(verified.module, Name::from_dotted("Test.Indexed"));
+    assert_eq!(verified.module(), &Name::from_dotted("Test.Indexed"));
     for name in [
         "Vec", "Vec.nil", "Vec.cons", "Vec.rec", "Fin", "Fin.zero", "Fin.succ", "Fin.rec",
     ] {
         assert!(
-            cert.export_block
+            cert.export_block()
                 .iter()
-                .any(|entry| cert.name_table[entry.name] == Name::from_dotted(name)),
+                .any(|entry| cert.name_table()[entry.name] == Name::from_dotted(name)),
             "{name} must be exported from indexed inductive fixture"
         );
     }
@@ -5638,11 +6824,11 @@ fn mutual_inductive_even_odd_certificate_round_trips_and_verifies() {
     let mut session = VerifierSession::new();
     let verified = verify_module_cert(&bytes, &mut session, &AxiomPolicy::normal()).unwrap();
 
-    assert_eq!(verified.module, Name::from_dotted("Test.EvenOdd"));
+    assert_eq!(verified.module(), &Name::from_dotted("Test.EvenOdd"));
     assert!(matches!(
-        verified.declarations.first().map(|decl| &decl.decl),
+        verified.declarations().first().map(|decl| &decl.decl),
         Some(DeclPayload::MutualInductiveBlock { name, inductives, .. })
-            if verified.name_table[*name] == Name::from_dotted("EvenOdd")
+            if verified.name_table()[*name] == Name::from_dotted("EvenOdd")
                 && inductives.len() == 2
     ));
     for name in [
@@ -5655,9 +6841,9 @@ fn mutual_inductive_even_odd_certificate_round_trips_and_verifies() {
         "Odd.rec",
     ] {
         assert!(
-            cert.export_block
+            cert.export_block()
                 .iter()
-                .any(|entry| cert.name_table[entry.name] == Name::from_dotted(name)),
+                .any(|entry| cert.name_table()[entry.name] == Name::from_dotted(name)),
             "{name} must be exported from mutual inductive fixture"
         );
     }
@@ -5710,33 +6896,35 @@ fn mutual_inductive_rejects_non_positive_occurrence() {
 fn mutual_inductive_rejects_block_local_scope_mismatch_even_if_rehashed() {
     let mut cert = build_module_cert(even_odd_mutual_module(), &[]).unwrap();
     let even_name = cert
-        .name_table
+        .name_table()
         .iter()
         .position(|name| name == &Name::from_dotted("Even"))
         .unwrap();
     let odd_name = cert
-        .name_table
+        .name_table()
         .iter()
         .position(|name| name == &Name::from_dotted("Odd"))
         .unwrap();
     let mut changed = false;
-    for term in &mut cert.term_table {
-        if let TermNode::Const {
-            global_ref:
-                GlobalRef::LocalGenerated {
-                    decl_index: 0,
-                    name,
-                },
-            levels,
-        } = term
-        {
-            if *name == even_name && levels.is_empty() {
-                *name = odd_name;
-                changed = true;
-                break;
+    cert.mutate_parts_for_test(|parts| {
+        for term in &mut parts.term_table {
+            if let TermNode::Const {
+                global_ref:
+                    GlobalRef::LocalGenerated {
+                        decl_index: 0,
+                        name,
+                    },
+                levels,
+            } = term
+            {
+                if *name == even_name && levels.is_empty() {
+                    *name = odd_name;
+                    changed = true;
+                    break;
+                }
             }
         }
-    }
+    });
     assert!(changed, "Even local generated reference must exist");
     rehash_cert_after_decl_change(&mut cert);
 
@@ -5767,7 +6955,8 @@ fn inductive_nested_rose_certificate_round_trips_and_verifies() {
     let decoded = decode_module_cert(&encoded).unwrap();
 
     assert_eq!(
-        cert.hashes.certificate_hash, decoded.hashes.certificate_hash,
+        cert.hashes().certificate_hash,
+        decoded.hashes().certificate_hash,
         "nested Rose certificate hash must be stable after canonical decode"
     );
 
@@ -5776,9 +6965,9 @@ fn inductive_nested_rose_certificate_round_trips_and_verifies() {
         .expect("approved nested Rose certificate must verify");
 
     let rose_decl = decoded
-        .declarations
+        .declarations()
         .iter()
-        .find(|decl| matches!(decl.decl, DeclPayload::Inductive { name, .. } if decoded.name_table[name] == Name::from_dotted("Rose")))
+        .find(|decl| matches!(decl.decl, DeclPayload::Inductive { name, .. } if decoded.name_table()[name] == Name::from_dotted("Rose")))
         .expect("Rose declaration must be present");
     let DeclPayload::Inductive {
         recursor: Some(recursor),
@@ -5788,16 +6977,16 @@ fn inductive_nested_rose_certificate_round_trips_and_verifies() {
         panic!("Rose must have a generated recursor");
     };
     assert_eq!(
-        decoded.name_table[recursor.name],
+        decoded.name_table()[recursor.name],
         Name::from_dotted("Rose.rec")
     );
     assert!(generated_recursor_signature_hash(
         Some(recursor),
-        &(0..decoded.term_table.len())
+        &(0..decoded.term_table().len())
             .map(|term| term_hash(&decoded, term))
             .collect::<Result<Vec<_>>>()
             .unwrap(),
-        &decoded.name_table,
+        decoded.name_table(),
     )
     .is_ok());
     assert_ne!(generated_computation_rule_hash(Some(recursor)), [0; 32]);
@@ -5848,28 +7037,28 @@ fn mutual_inductive_generated_recursor_artifact_hashes_are_stable_and_scoped() {
     );
 
     let export_names = cert
-        .export_block
+        .export_block()
         .iter()
-        .map(|entry| cert.name_table[entry.name].clone())
+        .map(|entry| cert.name_table()[entry.name].clone())
         .collect::<Vec<_>>();
     let mut sorted_export_names = export_names.clone();
     sorted_export_names.sort();
     assert_eq!(export_names, sorted_export_names);
 
     let block_index = cert
-        .declarations
+        .declarations()
         .iter()
         .position(|decl| matches!(decl.decl, DeclPayload::MutualInductiveBlock { .. }))
         .unwrap();
     let (signature_hash, rule_hash) = recursor_artifact_hashes_for(&cert, "Even");
 
     let mut rules_changed = cert.clone();
-    match &mut rules_changed.declarations[block_index].decl {
+    rules_changed.mutate_parts_for_test(|parts| match &mut parts.declarations[block_index].decl {
         DeclPayload::MutualInductiveBlock { inductives, .. } => {
             inductives[0].recursor.as_mut().unwrap().rules.major_index += 1;
         }
         _ => panic!("expected mutual inductive block"),
-    }
+    });
     let (rules_changed_signature_hash, rules_changed_rule_hash) =
         recursor_artifact_hashes_for(&rules_changed, "Even");
     assert_eq!(signature_hash, rules_changed_signature_hash);
@@ -5879,7 +7068,7 @@ fn mutual_inductive_generated_recursor_artifact_hashes_are_stable_and_scoped() {
 #[test]
 fn local_generated_constructor_can_be_referenced_after_inductive() {
     let cert = build_module_cert(unary_with_local_constructor_use_module(), &[]).unwrap();
-    let def = &cert.declarations[1];
+    let def = &cert.declarations()[1];
     assert!(def
         .dependencies
         .iter()
@@ -5903,12 +7092,12 @@ fn imported_constructor_can_be_referenced_from_downstream_certificate() {
 
     let use_unary_cert =
         build_module_cert(use_imported_unary_constructor_module(), &[verified_unary]).unwrap();
-    let def = &use_unary_cert.declarations[0];
+    let def = &use_unary_cert.declarations()[0];
     assert!(def.dependencies.iter().any(|dependency| {
         matches!(
             dependency.global_ref(),
             GlobalRef::Imported { name, .. }
-                if use_unary_cert.name_table[*name] == Name::from_dotted("Unary.zero")
+                if use_unary_cert.name_table()[*name] == Name::from_dotted("Unary.zero")
         )
     }));
 
@@ -5923,9 +7112,9 @@ fn imported_constructor_can_be_referenced_from_downstream_certificate() {
 #[test]
 fn imported_recursor_can_be_referenced_from_downstream_certificate() {
     let unary_cert = build_module_cert(unary_inductive_with_recursor_module(), &[]).unwrap();
-    assert!(unary_cert.export_block.iter().any(|entry| {
+    assert!(unary_cert.export_block().iter().any(|entry| {
         entry.kind == ExportKind::Recursor
-            && unary_cert.name_table[entry.name] == Name::from_dotted("Unary.rec")
+            && unary_cert.name_table()[entry.name] == Name::from_dotted("Unary.rec")
     }));
 
     let mut session = VerifierSession::new();
@@ -5937,14 +7126,14 @@ fn imported_recursor_can_be_referenced_from_downstream_certificate() {
     .unwrap();
     let use_rec_cert =
         build_module_cert(use_imported_unary_recursor_module(), &[verified_unary]).unwrap();
-    assert!(use_rec_cert.declarations[0]
+    assert!(use_rec_cert.declarations()[0]
         .dependencies
         .iter()
         .any(|dependency| {
             matches!(
                 dependency.global_ref(),
                 GlobalRef::Imported { name, .. }
-                    if use_rec_cert.name_table[*name] == Name::from_dotted("Unary.rec")
+                    if use_rec_cert.name_table()[*name] == Name::from_dotted("Unary.rec")
             )
         }));
 
@@ -5967,12 +7156,12 @@ fn generated_recursor_artifact_hashes_are_stable_and_scoped() {
     );
 
     let inductive_index = cert
-        .declarations
+        .declarations()
         .iter()
         .position(|decl| matches!(decl.decl, DeclPayload::Inductive { .. }))
         .unwrap();
     let unary_term = cert
-        .term_table
+        .term_table()
         .iter()
         .position(|term| {
             matches!(
@@ -5986,26 +7175,30 @@ fn generated_recursor_artifact_hashes_are_stable_and_scoped() {
         .unwrap();
 
     let mut type_changed = cert.clone();
-    match &mut type_changed.declarations[inductive_index].decl {
-        DeclPayload::Inductive {
-            recursor: Some(recursor),
-            ..
-        } => recursor.ty = unary_term,
-        _ => panic!("expected inductive with recursor"),
-    }
+    type_changed.mutate_parts_for_test(|parts| {
+        match &mut parts.declarations[inductive_index].decl {
+            DeclPayload::Inductive {
+                recursor: Some(recursor),
+                ..
+            } => recursor.ty = unary_term,
+            _ => panic!("expected inductive with recursor"),
+        }
+    });
     let (type_changed_signature_hash, type_changed_rule_hash) =
         recursor_artifact_hashes(&type_changed);
     assert_ne!(signature_hash, type_changed_signature_hash);
     assert_eq!(rule_hash, type_changed_rule_hash);
 
     let mut rules_changed = cert.clone();
-    match &mut rules_changed.declarations[inductive_index].decl {
-        DeclPayload::Inductive {
-            recursor: Some(recursor),
-            ..
-        } => recursor.rules.major_index += 1,
-        _ => panic!("expected inductive with recursor"),
-    }
+    rules_changed.mutate_parts_for_test(|parts| {
+        match &mut parts.declarations[inductive_index].decl {
+            DeclPayload::Inductive {
+                recursor: Some(recursor),
+                ..
+            } => recursor.rules.major_index += 1,
+            _ => panic!("expected inductive with recursor"),
+        }
+    });
     let (rules_changed_signature_hash, rules_changed_rule_hash) =
         recursor_artifact_hashes(&rules_changed);
     assert_eq!(signature_hash, rules_changed_signature_hash);
@@ -6022,21 +7215,21 @@ fn indexed_inductive_generated_recursor_artifact_hashes_are_stable_and_scoped() 
     );
 
     let vec_index = cert
-        .declarations
+        .declarations()
         .iter()
         .position(|decl| {
             matches!(
                 &decl.decl,
                 DeclPayload::Inductive { name, .. }
                     | DeclPayload::InductiveConstrained { name, .. }
-                    if cert.name_table[*name] == Name::from_dotted("Vec")
+                    if cert.name_table()[*name] == Name::from_dotted("Vec")
             )
         })
         .unwrap();
     let (signature_hash, rule_hash) = recursor_artifact_hashes_for(&cert, "Vec");
 
     let mut rules_changed = cert.clone();
-    match &mut rules_changed.declarations[vec_index].decl {
+    rules_changed.mutate_parts_for_test(|parts| match &mut parts.declarations[vec_index].decl {
         DeclPayload::Inductive {
             recursor: Some(recursor),
             ..
@@ -6046,7 +7239,7 @@ fn indexed_inductive_generated_recursor_artifact_hashes_are_stable_and_scoped() 
             ..
         } => recursor.rules.major_index += 1,
         _ => panic!("expected indexed inductive with recursor"),
-    }
+    });
     let (rules_changed_signature_hash, rules_changed_rule_hash) =
         recursor_artifact_hashes_for(&rules_changed, "Vec");
     assert_eq!(signature_hash, rules_changed_signature_hash);
@@ -6057,15 +7250,15 @@ fn indexed_inductive_generated_recursor_artifact_hashes_are_stable_and_scoped() 
 fn inductive_decl_interface_hash_commits_generated_recursor_artifact_hashes() {
     let cert = build_module_cert(unary_inductive_with_recursor_type_anchor_module(), &[]).unwrap();
     let inductive_index = cert
-        .declarations
+        .declarations()
         .iter()
         .position(|decl| matches!(decl.decl, DeclPayload::Inductive { .. }))
         .unwrap();
-    let original_interface_hash = cert.declarations[inductive_index]
+    let original_interface_hash = cert.declarations()[inductive_index]
         .hashes
         .decl_interface_hash;
     let unary_term = cert
-        .term_table
+        .term_table()
         .iter()
         .position(|term| {
             matches!(
@@ -6079,29 +7272,33 @@ fn inductive_decl_interface_hash_commits_generated_recursor_artifact_hashes() {
         .unwrap();
 
     let mut signature_changed = cert.clone();
-    match &mut signature_changed.declarations[inductive_index].decl {
-        DeclPayload::Inductive {
-            recursor: Some(recursor),
-            ..
-        } => recursor.ty = unary_term,
-        _ => panic!("expected inductive with recursor"),
-    }
+    signature_changed.mutate_parts_for_test(|parts| {
+        match &mut parts.declarations[inductive_index].decl {
+            DeclPayload::Inductive {
+                recursor: Some(recursor),
+                ..
+            } => recursor.ty = unary_term,
+            _ => panic!("expected inductive with recursor"),
+        }
+    });
     rehash_cert_after_decl_change(&mut signature_changed);
 
     let mut rules_changed = cert.clone();
-    match &mut rules_changed.declarations[inductive_index].decl {
-        DeclPayload::Inductive {
-            recursor: Some(recursor),
-            ..
-        } => recursor.rules.major_index += 1,
-        _ => panic!("expected inductive with recursor"),
-    }
+    rules_changed.mutate_parts_for_test(|parts| {
+        match &mut parts.declarations[inductive_index].decl {
+            DeclPayload::Inductive {
+                recursor: Some(recursor),
+                ..
+            } => recursor.rules.major_index += 1,
+            _ => panic!("expected inductive with recursor"),
+        }
+    });
     rehash_cert_after_decl_change(&mut rules_changed);
 
-    let signature_changed_interface_hash = signature_changed.declarations[inductive_index]
+    let signature_changed_interface_hash = signature_changed.declarations()[inductive_index]
         .hashes
         .decl_interface_hash;
-    let rules_changed_interface_hash = rules_changed.declarations[inductive_index]
+    let rules_changed_interface_hash = rules_changed.declarations()[inductive_index]
         .hashes
         .decl_interface_hash;
     assert_ne!(original_interface_hash, signature_changed_interface_hash);
@@ -6115,13 +7312,13 @@ fn inductive_decl_interface_hash_commits_generated_recursor_artifact_hashes() {
 #[test]
 fn rejects_tampered_inductive_generated_recursor_rules_even_if_rehashed() {
     let mut cert = build_module_cert(unary_inductive_with_recursor_module(), &[]).unwrap();
-    match &mut cert.declarations[0].decl {
+    cert.mutate_parts_for_test(|parts| match &mut parts.declarations[0].decl {
         DeclPayload::Inductive {
             recursor: Some(recursor),
             ..
         } => recursor.rules.major_index += 1,
         _ => panic!("expected inductive with recursor"),
-    }
+    });
     rehash_cert_after_decl_change(&mut cert);
 
     let mut session = VerifierSession::new();
@@ -6146,12 +7343,12 @@ fn rejects_tampered_inductive_generated_recursor_type_even_if_rehashed() {
     let mut cert =
         build_module_cert(unary_inductive_with_recursor_type_anchor_module(), &[]).unwrap();
     let inductive_index = cert
-        .declarations
+        .declarations()
         .iter()
         .position(|decl| matches!(decl.decl, DeclPayload::Inductive { .. }))
         .unwrap();
     let unary_term = cert
-        .term_table
+        .term_table()
         .iter()
         .position(|term| {
             matches!(
@@ -6163,13 +7360,15 @@ fn rejects_tampered_inductive_generated_recursor_type_even_if_rehashed() {
             )
         })
         .unwrap();
-    match &mut cert.declarations[inductive_index].decl {
-        DeclPayload::Inductive {
-            recursor: Some(recursor),
-            ..
-        } => recursor.ty = unary_term,
-        _ => panic!("expected inductive with recursor"),
-    }
+    cert.mutate_parts_for_test(
+        |parts| match &mut parts.declarations[inductive_index].decl {
+            DeclPayload::Inductive {
+                recursor: Some(recursor),
+                ..
+            } => recursor.ty = unary_term,
+            _ => panic!("expected inductive with recursor"),
+        },
+    );
     rehash_cert_after_decl_change(&mut cert);
 
     let mut session = VerifierSession::new();
@@ -6214,14 +7413,17 @@ fn rejects_kernel_defeq_but_non_generated_recursor_type() {
 fn parameterized_inductive_exports_full_type_telescope() {
     let cert = build_module_cert(box_inductive_module(), &[]).unwrap();
     let box_entry = cert
-        .export_block
+        .export_block()
         .iter()
         .find(|entry| {
             entry.kind == ExportKind::Inductive
-                && cert.name_table[entry.name] == Name::from_dotted("Box")
+                && cert.name_table()[entry.name] == Name::from_dotted("Box")
         })
         .unwrap();
-    assert!(matches!(cert.term_table[box_entry.ty], TermNode::Pi { .. }));
+    assert!(matches!(
+        cert.term_table()[box_entry.ty],
+        TermNode::Pi { .. }
+    ));
 
     let mut session = VerifierSession::new();
     verify_module_cert(
@@ -6253,9 +7455,9 @@ fn rejects_tampered_certificate_hash() {
 #[test]
 fn rejects_tampered_decl_interface_hash() {
     let mut cert = build_module_cert(id_module("A", "x"), &[]).unwrap();
-    let actual = cert.declarations[0].hashes.decl_interface_hash;
-    cert.declarations[0].hashes.decl_interface_hash[0] ^= 0x01;
-    let expected = cert.declarations[0].hashes.decl_interface_hash;
+    let actual = cert.declarations()[0].hashes.decl_interface_hash;
+    cert.mutate_parts_for_test(|parts| parts.declarations[0].hashes.decl_interface_hash[0] ^= 1);
+    let expected = cert.declarations()[0].hashes.decl_interface_hash;
 
     let mut session = VerifierSession::new();
     let err = verify_module_cert(
@@ -6330,7 +7532,7 @@ fn rejects_inductive_wrapper_name_mismatch() {
 #[test]
 fn rejects_tampered_decl_certificate_hash() {
     let mut cert = build_module_cert(id_module("A", "x"), &[]).unwrap();
-    cert.declarations[0].hashes.decl_certificate_hash[0] ^= 0x01;
+    cert.mutate_parts_for_test(|parts| parts.declarations[0].hashes.decl_certificate_hash[0] ^= 1);
 
     let mut session = VerifierSession::new();
     let err = verify_module_cert(
@@ -6351,14 +7553,15 @@ fn rejects_tampered_decl_certificate_hash() {
 #[test]
 fn rejects_tampered_theorem_proof_body_even_if_certificate_rehashed() {
     let mut cert = build_module_cert(two_id_theorems_module(), &[]).unwrap();
-    match &mut cert.declarations[1].decl {
+    cert.mutate_parts_for_test(|parts| match &mut parts.declarations[1].decl {
         DeclPayload::Theorem { proof, ty, .. } => *proof = *ty,
         _ => panic!("expected theorem"),
-    }
-    cert.hashes.certificate_hash = hash_with_domain(
+    });
+    let certificate_hash = hash_with_domain(
         MODULE_CERT_DOMAIN,
         &encode_module_cert_without_certificate_hash(&cert),
     );
+    cert.mutate_parts_for_test(|parts| parts.hashes.certificate_hash = certificate_hash);
 
     let mut session = VerifierSession::new();
     let err = verify_module_cert(
@@ -6392,10 +7595,10 @@ fn mutation_p8h13_fixture_records_hashes_and_rejects_core_mutation_classes() {
     let mut artifact_hashes = Vec::new();
 
     let mut proof_cert = build_module_cert(two_id_theorems_module(), &[]).unwrap();
-    match &mut proof_cert.declarations[1].decl {
+    proof_cert.mutate_parts_for_test(|parts| match &mut parts.declarations[1].decl {
         DeclPayload::Theorem { proof, ty, .. } => *proof = *ty,
         _ => panic!("expected theorem"),
-    }
+    });
     rehash_cert_after_decl_change(&mut proof_cert);
     let proof_bytes = encode_module_cert(&proof_cert).unwrap();
     artifact_hashes.push(p8h13_mutation_artifact_hash(
@@ -6412,15 +7615,19 @@ fn mutation_p8h13_fixture_records_hashes_and_rejects_core_mutation_classes() {
     assert!(matches!(err, CertError::Kernel(_)));
 
     let mut axiom_report_cert = build_module_cert(axiom_module(), &[]).unwrap();
-    axiom_report_cert.axiom_report.module_axioms.clear();
-    axiom_report_cert.hashes.axiom_report_hash = hash_with_domain(
+    axiom_report_cert.mutate_parts_for_test(|parts| parts.axiom_report.module_axioms.clear());
+    let axiom_report_hash = hash_with_domain(
         b"NPA-AXIOM-REPORT-0.1",
-        &encode_axiom_report(&axiom_report_cert.axiom_report),
+        &encode_axiom_report(axiom_report_cert.axiom_report()),
     );
-    axiom_report_cert.hashes.certificate_hash = hash_with_domain(
+    axiom_report_cert
+        .mutate_parts_for_test(|parts| parts.hashes.axiom_report_hash = axiom_report_hash);
+    let certificate_hash = hash_with_domain(
         MODULE_CERT_DOMAIN,
         &encode_module_cert_without_certificate_hash(&axiom_report_cert),
     );
+    axiom_report_cert
+        .mutate_parts_for_test(|parts| parts.hashes.certificate_hash = certificate_hash);
     let axiom_report_bytes = encode_module_cert(&axiom_report_cert).unwrap();
     artifact_hashes.push(p8h13_mutation_artifact_hash(
         SEED,
@@ -6440,11 +7647,13 @@ fn mutation_p8h13_fixture_records_hashes_and_rejects_core_mutation_classes() {
     let mut session = VerifierSession::new();
     let verified_id = verify_module_cert(&id_bytes, &mut session, &AxiomPolicy::normal()).unwrap();
     let mut import_hash_cert = build_module_cert(use_id_module(), &[verified_id]).unwrap();
-    import_hash_cert.imports[0].export_hash[0] ^= 0x01;
-    import_hash_cert.hashes.certificate_hash = hash_with_domain(
+    import_hash_cert.mutate_parts_for_test(|parts| parts.imports[0].export_hash[0] ^= 1);
+    let certificate_hash = hash_with_domain(
         MODULE_CERT_DOMAIN,
         &encode_module_cert_without_certificate_hash(&import_hash_cert),
     );
+    import_hash_cert
+        .mutate_parts_for_test(|parts| parts.hashes.certificate_hash = certificate_hash);
     let import_hash_bytes = encode_module_cert(&import_hash_cert).unwrap();
     artifact_hashes.push(p8h13_mutation_artifact_hash(
         SEED,
@@ -6456,13 +7665,14 @@ fn mutation_p8h13_fixture_records_hashes_and_rejects_core_mutation_classes() {
     assert!(matches!(err, CertError::ImportHashMismatch { .. }));
 
     let mut noncanonical_table_cert = build_module_cert(id_module("A", "x"), &[]).unwrap();
-    noncanonical_table_cert
-        .term_table
-        .push(noncanonical_table_cert.term_table[0].clone());
-    noncanonical_table_cert.hashes.certificate_hash = hash_with_domain(
+    let duplicate = noncanonical_table_cert.term_table()[0].clone();
+    noncanonical_table_cert.mutate_parts_for_test(|parts| parts.term_table.push(duplicate));
+    let certificate_hash = hash_with_domain(
         MODULE_CERT_DOMAIN,
         &encode_module_cert_without_certificate_hash(&noncanonical_table_cert),
     );
+    noncanonical_table_cert
+        .mutate_parts_for_test(|parts| parts.hashes.certificate_hash = certificate_hash);
     let noncanonical_table_bytes = encode_module_cert(&noncanonical_table_cert).unwrap();
     artifact_hashes.push(p8h13_mutation_artifact_hash(
         SEED,
@@ -6593,28 +7803,65 @@ fn rejects_dotted_name_component_in_canonical_binary() {
 }
 
 #[test]
-fn rejects_unknown_term_tag_as_unsupported_encoding() {
-    let cert = build_module_cert(id_module("A", "x"), &[]).unwrap();
-    let mut bytes = encode_module_cert(&cert).unwrap();
-    let offset = first_term_tag_offset(&bytes);
-    bytes[offset] = 0x7f;
+fn v0_4_rejects_retired_let_tag_before_reading_former_children() {
+    let mut cert = build_module_cert(id_module("A", "x"), &[]).unwrap();
+    cert.mutate_parts_for_test(|parts| parts.term_table.push(TermNode::BVar(0)));
+    let bytes = encode_module_cert(&cert).unwrap();
+    let offsets = term_tag_offsets(&bytes);
+    let reachable_offset = offsets[0];
+    let unreachable_offset = *offsets.last().unwrap();
+    assert_ne!(reachable_offset, unreachable_offset);
 
-    let err = decode_module_cert(&bytes).unwrap_err();
-    assert!(matches!(err, CertError::UnsupportedEncoding { tag: 0x7f }));
+    let mut reachable = bytes.clone();
+    reachable[reachable_offset] = 0x06;
+    let mut unreachable = bytes.clone();
+    unreachable[unreachable_offset] = 0x06;
+    let mut tag_only = bytes[..reachable_offset].to_vec();
+    tag_only.push(0x06);
+    let mut one_former_child = tag_only.clone();
+    one_former_child.push(0x00);
+    let mut two_former_children = one_former_child.clone();
+    two_former_children.push(0x00);
+    let mut oversized_tail = tag_only.clone();
+    oversized_tail.extend([0xff; 9]);
+    oversized_tail.push(0x01);
+
+    let rows = v0_4_fixture_rows("retired_tag");
+    assert_eq!(rows.len(), 6);
+    for fields in rows {
+        let case_id = fields[0];
+        assert_eq!(fields[6], "unsupported_encoding:0x06", "{case_id}");
+        let malformed = match case_id {
+            "retired_06_reachable" => &reachable,
+            "retired_06_unused" => &unreachable,
+            "retired_06_tag_only" => &tag_only,
+            "retired_06_one_child" => &one_former_child,
+            "retired_06_two_children" => &two_former_children,
+            "retired_06_oversized_tail" => &oversized_tail,
+            _ => panic!("unmapped retired-tag fixture: {case_id}"),
+        };
+        let result = decode_module_cert(malformed);
+        assert!(
+            matches!(result, Err(CertError::UnsupportedEncoding { tag: 0x06 })),
+            "{case_id}: {result:?}"
+        );
+    }
 }
 
 #[test]
 fn rejects_export_block_that_was_rehashed_but_not_derived_from_declarations() {
     let mut cert = build_module_cert(id_module("A", "x"), &[]).unwrap();
-    cert.export_block.clear();
-    cert.hashes.export_hash = hash_with_domain(
+    cert.mutate_parts_for_test(|parts| parts.export_block.clear());
+    let export_hash = hash_with_domain(
         MODULE_EXPORT_DOMAIN,
-        &encode_export_block(&cert.export_block),
+        &encode_export_block(cert.export_block()),
     );
-    cert.hashes.certificate_hash = hash_with_domain(
+    cert.mutate_parts_for_test(|parts| parts.hashes.export_hash = export_hash);
+    let certificate_hash = hash_with_domain(
         MODULE_CERT_DOMAIN,
         &encode_module_cert_without_certificate_hash(&cert),
     );
+    cert.mutate_parts_for_test(|parts| parts.hashes.certificate_hash = certificate_hash);
 
     let mut session = VerifierSession::new();
     let err = verify_module_cert(
@@ -6635,15 +7882,17 @@ fn rejects_export_block_that_was_rehashed_but_not_derived_from_declarations() {
 #[test]
 fn rejects_axiom_report_that_was_rehashed_but_is_incomplete() {
     let mut cert = build_module_cert(axiom_module(), &[]).unwrap();
-    cert.axiom_report.module_axioms.clear();
-    cert.hashes.axiom_report_hash = hash_with_domain(
+    cert.mutate_parts_for_test(|parts| parts.axiom_report.module_axioms.clear());
+    let axiom_report_hash = hash_with_domain(
         b"NPA-AXIOM-REPORT-0.1",
-        &encode_axiom_report(&cert.axiom_report),
+        &encode_axiom_report(cert.axiom_report()),
     );
-    cert.hashes.certificate_hash = hash_with_domain(
+    cert.mutate_parts_for_test(|parts| parts.hashes.axiom_report_hash = axiom_report_hash);
+    let certificate_hash = hash_with_domain(
         MODULE_CERT_DOMAIN,
         &encode_module_cert_without_certificate_hash(&cert),
     );
+    cert.mutate_parts_for_test(|parts| parts.hashes.certificate_hash = certificate_hash);
 
     let bytes = encode_module_cert(&cert).unwrap();
     let mut session = VerifierSession::new();
@@ -6654,11 +7903,13 @@ fn rejects_axiom_report_that_was_rehashed_but_is_incomplete() {
 #[test]
 fn rejects_noncanonical_term_table_even_if_bytes_round_trip() {
     let mut cert = build_module_cert(id_module("A", "x"), &[]).unwrap();
-    cert.term_table.push(cert.term_table[0].clone());
-    cert.hashes.certificate_hash = hash_with_domain(
+    let duplicate = cert.term_table()[0].clone();
+    cert.mutate_parts_for_test(|parts| parts.term_table.push(duplicate));
+    let certificate_hash = hash_with_domain(
         MODULE_CERT_DOMAIN,
         &encode_module_cert_without_certificate_hash(&cert),
     );
+    cert.mutate_parts_for_test(|parts| parts.hashes.certificate_hash = certificate_hash);
 
     let bytes = encode_module_cert(&cert).unwrap();
     let mut session = VerifierSession::new();
@@ -6675,12 +7926,12 @@ fn rejects_noncanonical_term_table_even_if_bytes_round_trip() {
 fn rejects_term_table_ordered_by_hash_instead_of_structural_key() {
     let mut cert = build_module_cert(id_module("A", "x"), &[]).unwrap();
     let sort = cert
-        .term_table
+        .term_table()
         .iter()
         .position(|term| matches!(term, TermNode::Sort(_)))
         .unwrap();
     let bvar = cert
-        .term_table
+        .term_table()
         .iter()
         .position(|term| matches!(term, TermNode::BVar(0)))
         .unwrap();
@@ -6704,17 +7955,17 @@ fn rejects_term_table_ordered_by_hash_instead_of_structural_key() {
 fn rejects_level_table_ordered_by_hash_instead_of_structural_key() {
     let mut cert = build_module_cert(eq_module(), &[]).unwrap();
     let u = cert
-        .name_table
+        .name_table()
         .iter()
         .position(|name| *name == Name::from_dotted("u"))
         .unwrap();
     let zero = cert
-        .level_table
+        .level_table()
         .iter()
         .position(|level| matches!(level, LevelNode::Zero))
         .unwrap();
     let param = cert
-        .level_table
+        .level_table()
         .iter()
         .position(|level| matches!(level, LevelNode::Param(name) if *name == u))
         .unwrap();
@@ -6737,12 +7988,13 @@ fn rejects_level_table_ordered_by_hash_instead_of_structural_key() {
 #[test]
 fn rejects_unreachable_term_table_entry_even_if_rehashed() {
     let mut cert = build_module_cert(id_module("A", "x"), &[]).unwrap();
-    let last = cert.term_table.len() - 1;
-    cert.term_table.push(TermNode::App(last, last));
-    cert.hashes.certificate_hash = hash_with_domain(
+    let last = cert.term_table().len() - 1;
+    cert.mutate_parts_for_test(|parts| parts.term_table.push(TermNode::App(last, last)));
+    let certificate_hash = hash_with_domain(
         MODULE_CERT_DOMAIN,
         &encode_module_cert_without_certificate_hash(&cert),
     );
+    cert.mutate_parts_for_test(|parts| parts.hashes.certificate_hash = certificate_hash);
 
     let bytes = encode_module_cert(&cert).unwrap();
     let mut session = VerifierSession::new();
@@ -6759,16 +8011,18 @@ fn rejects_unreachable_term_table_entry_even_if_rehashed() {
 fn rejects_non_normalized_level_table_entry_even_if_rehashed() {
     let mut cert = build_module_cert(id_module("A", "x"), &[]).unwrap();
     let u = cert
-        .name_table
+        .name_table()
         .iter()
         .position(|name| *name == Name::from_dotted("u"))
         .unwrap();
-    assert_eq!(cert.level_table, vec![LevelNode::Param(u)]);
+    assert_eq!(cert.level_table(), [LevelNode::Param(u)]);
 
-    cert.level_table = vec![LevelNode::Zero, LevelNode::Param(u), LevelNode::Max(0, 1)];
-    for term in &mut cert.term_table {
-        replace_level_refs(term, 0, 2);
-    }
+    cert.mutate_parts_for_test(|parts| {
+        parts.level_table = vec![LevelNode::Zero, LevelNode::Param(u), LevelNode::Max(0, 1)];
+        for term in &mut parts.term_table {
+            replace_level_refs(term, 0, 2);
+        }
+    });
     rehash_cert_after_decl_change(&mut cert);
 
     let bytes = encode_module_cert(&cert).unwrap();
@@ -6785,12 +8039,13 @@ fn rejects_non_normalized_level_table_entry_even_if_rehashed() {
 #[test]
 fn rejects_unreachable_level_table_entry_even_if_rehashed() {
     let mut cert = build_module_cert(id_module("A", "x"), &[]).unwrap();
-    let last = cert.level_table.len() - 1;
-    cert.level_table.push(LevelNode::Succ(last));
-    cert.hashes.certificate_hash = hash_with_domain(
+    let last = cert.level_table().len() - 1;
+    cert.mutate_parts_for_test(|parts| parts.level_table.push(LevelNode::Succ(last)));
+    let certificate_hash = hash_with_domain(
         MODULE_CERT_DOMAIN,
         &encode_module_cert_without_certificate_hash(&cert),
     );
+    cert.mutate_parts_for_test(|parts| parts.hashes.certificate_hash = certificate_hash);
 
     let bytes = encode_module_cert(&cert).unwrap();
     let mut session = VerifierSession::new();
@@ -6807,18 +8062,19 @@ fn rejects_unreachable_level_table_entry_even_if_rehashed() {
 fn rejects_root_term_with_out_of_scope_bvar() {
     let mut cert = build_module_cert(id_module("A", "x"), &[]).unwrap();
     let bvar_zero = cert
-        .term_table
+        .term_table()
         .iter()
         .position(|term| matches!(term, TermNode::BVar(0)))
         .unwrap();
-    match &mut cert.declarations[0].decl {
+    cert.mutate_parts_for_test(|parts| match &mut parts.declarations[0].decl {
         DeclPayload::Def { value, .. } => *value = bvar_zero,
         _ => panic!("expected def"),
-    }
-    cert.hashes.certificate_hash = hash_with_domain(
+    });
+    let certificate_hash = hash_with_domain(
         MODULE_CERT_DOMAIN,
         &encode_module_cert_without_certificate_hash(&cert),
     );
+    cert.mutate_parts_for_test(|parts| parts.hashes.certificate_hash = certificate_hash);
 
     let bytes = encode_module_cert(&cert).unwrap();
     let mut session = VerifierSession::new();
@@ -6834,11 +8090,12 @@ fn normal_mode_allows_missing_import_certificate_hash_but_high_trust_rejects_it(
     let verified_id = verify_module_cert(&id_bytes, &mut session, &AxiomPolicy::normal()).unwrap();
 
     let mut use_id_cert = build_module_cert(use_id_module(), &[verified_id]).unwrap();
-    use_id_cert.imports[0].certificate_hash = None;
-    use_id_cert.hashes.certificate_hash = hash_with_domain(
+    use_id_cert.mutate_parts_for_test(|parts| parts.imports[0].certificate_hash = None);
+    let certificate_hash = hash_with_domain(
         MODULE_CERT_DOMAIN,
         &encode_module_cert_without_certificate_hash(&use_id_cert),
     );
+    use_id_cert.mutate_parts_for_test(|parts| parts.hashes.certificate_hash = certificate_hash);
     let use_id_bytes = encode_module_cert(&use_id_cert).unwrap();
 
     verify_module_cert(&use_id_bytes, &mut session, &AxiomPolicy::normal()).unwrap();
@@ -6861,11 +8118,12 @@ fn high_trust_rejects_import_verified_only_in_normal_mode() {
 
     let mut use_id_cert =
         build_module_cert(use_id_module(), std::slice::from_ref(&verified_id)).unwrap();
-    use_id_cert.imports[0].certificate_hash = None;
-    use_id_cert.hashes.certificate_hash = hash_with_domain(
+    use_id_cert.mutate_parts_for_test(|parts| parts.imports[0].certificate_hash = None);
+    let certificate_hash = hash_with_domain(
         MODULE_CERT_DOMAIN,
         &encode_module_cert_without_certificate_hash(&use_id_cert),
     );
+    use_id_cert.mutate_parts_for_test(|parts| parts.hashes.certificate_hash = certificate_hash);
     let verified_use_id = verify_module_cert(
         &encode_module_cert(&use_id_cert).unwrap(),
         &mut session,
@@ -6900,11 +8158,14 @@ fn rejects_import_certificate_hash_mismatch() {
         verify_module_cert(&id_bytes, &mut session, &AxiomPolicy::high_trust()).unwrap();
 
     let mut use_id_cert = build_module_cert(use_id_module(), &[verified_id]).unwrap();
-    use_id_cert.imports[0].certificate_hash.as_mut().unwrap()[0] ^= 0x01;
-    use_id_cert.hashes.certificate_hash = hash_with_domain(
+    use_id_cert.mutate_parts_for_test(|parts| {
+        parts.imports[0].certificate_hash.as_mut().unwrap()[0] ^= 1;
+    });
+    let certificate_hash = hash_with_domain(
         MODULE_CERT_DOMAIN,
         &encode_module_cert_without_certificate_hash(&use_id_cert),
     );
+    use_id_cert.mutate_parts_for_test(|parts| parts.hashes.certificate_hash = certificate_hash);
 
     let err = verify_module_cert(
         &encode_module_cert(&use_id_cert).unwrap(),
@@ -6926,11 +8187,14 @@ fn normal_mode_rejects_present_import_certificate_hash_mismatch() {
     let verified_id = verify_module_cert(&id_bytes, &mut session, &AxiomPolicy::normal()).unwrap();
 
     let mut use_id_cert = build_module_cert(use_id_module(), &[verified_id]).unwrap();
-    use_id_cert.imports[0].certificate_hash.as_mut().unwrap()[0] ^= 0x01;
-    use_id_cert.hashes.certificate_hash = hash_with_domain(
+    use_id_cert.mutate_parts_for_test(|parts| {
+        parts.imports[0].certificate_hash.as_mut().unwrap()[0] ^= 1;
+    });
+    let certificate_hash = hash_with_domain(
         MODULE_CERT_DOMAIN,
         &encode_module_cert_without_certificate_hash(&use_id_cert),
     );
+    use_id_cert.mutate_parts_for_test(|parts| parts.hashes.certificate_hash = certificate_hash);
 
     let err = verify_module_cert(
         &encode_module_cert(&use_id_cert).unwrap(),
@@ -6952,11 +8216,12 @@ fn rejects_import_export_hash_mismatch() {
     let verified_id = verify_module_cert(&id_bytes, &mut session, &AxiomPolicy::normal()).unwrap();
 
     let mut use_id_cert = build_module_cert(use_id_module(), &[verified_id]).unwrap();
-    use_id_cert.imports[0].export_hash[0] ^= 0x01;
-    use_id_cert.hashes.certificate_hash = hash_with_domain(
+    use_id_cert.mutate_parts_for_test(|parts| parts.imports[0].export_hash[0] ^= 1);
+    let certificate_hash = hash_with_domain(
         MODULE_CERT_DOMAIN,
         &encode_module_cert_without_certificate_hash(&use_id_cert),
     );
+    use_id_cert.mutate_parts_for_test(|parts| parts.hashes.certificate_hash = certificate_hash);
 
     let err = verify_module_cert(
         &encode_module_cert(&use_id_cert).unwrap(),
@@ -6981,7 +8246,7 @@ fn high_trust_rechecks_import_axiom_policy_even_when_unused() {
     .unwrap();
 
     let id_cert = build_module_cert(id_module("A", "x"), &[verified_p]).unwrap();
-    assert!(id_cert.axiom_report.module_axioms.is_empty());
+    assert!(id_cert.axiom_report().module_axioms.is_empty());
 
     let err = verify_module_cert(
         &encode_module_cert(&id_cert).unwrap(),
@@ -7019,4 +8284,1012 @@ fn high_trust_rejects_import_not_verified_in_current_session() {
     )
     .unwrap_err();
     assert!(matches!(err, CertError::ImportNotVerifiedInSession { .. }));
+}
+
+#[test]
+fn term_materialization_current_lane_is_measurement_independent() {
+    for module in [
+        id_module("A", "x"),
+        id_def_module_with_value(id_value_with_beta_redex()),
+    ] {
+        let cert = build_module_cert(module, &[]).unwrap();
+        let bytes = encode_module_cert(&cert).unwrap();
+        let expected =
+            verify_module_cert_with_import_refs(&bytes, &[], &AxiomPolicy::normal()).unwrap();
+
+        for kernel_options in [
+            KernelExecutionOptions::memo_off(),
+            KernelExecutionOptions::ephemeral_memo(),
+        ] {
+            let legacy_sink = KernelWorkCounterSink::default();
+            let legacy = crate::verify::verify_module_cert_with_import_refs_legacy_for_test(
+                &bytes,
+                &[],
+                &AxiomPolicy::normal(),
+                kernel_options,
+                Some(legacy_sink.clone()),
+            )
+            .unwrap();
+            let legacy_work = legacy_sink.snapshot();
+            let mut forward_work = KernelWorkCounters::default();
+            let mut term = CertificateTermMaterializationObservation::default();
+            let observed = verify_module_cert_with_import_refs_and_kernel_options_and_observations(
+                &bytes,
+                &[],
+                &AxiomPolicy::normal(),
+                kernel_options,
+                CertificateVerificationObservationSinks::new()
+                    .with_kernel(&mut forward_work)
+                    .with_term(&mut term),
+            )
+            .unwrap();
+
+            assert_eq!(observed, expected);
+            assert_eq!(observed, legacy);
+            assert_eq!(observed.certificate_hash(), cert.hashes().certificate_hash);
+            assert_eq!(forward_work.logical_fuel, legacy_work.logical_fuel);
+            assert_eq!(forward_work.successful_fuel, legacy_work.successful_fuel);
+            assert_eq!(forward_work.exhausted_fuel, legacy_work.exhausted_fuel);
+            assert_eq!(forward_work.fuel, legacy_work.fuel);
+            assert_eq!(
+                term.unique_nodes_materialized,
+                cert.term_table().len() as u64
+            );
+            assert!(term.root_requests > 0);
+            assert_eq!(term.materialization_slots, cert.term_table().len() as u64);
+            assert!(term.materialization_charged_bytes > 0);
+            assert_eq!(term.materialization_capacity_stops, 0);
+            assert_eq!(term.materialization_legacy_fallbacks, 0);
+            assert!(!term.overflowed);
+        }
+    }
+}
+
+#[test]
+fn term_materialization_import_plan_replays_differentially() {
+    let provider_cert = build_module_cert(id_module("A", "x"), &[]).unwrap();
+    let provider_bytes = encode_module_cert(&provider_cert).unwrap();
+    let provider =
+        verify_module_cert_with_import_refs(&provider_bytes, &[], &AxiomPolicy::normal()).unwrap();
+    let consumer_cert =
+        build_module_cert(use_id_module(), std::slice::from_ref(&provider)).unwrap();
+    let consumer_bytes = encode_module_cert(&consumer_cert).unwrap();
+    let imports = [&provider];
+    for policy in [AxiomPolicy::normal(), AxiomPolicy::high_trust()] {
+        for kernel_options in [
+            KernelExecutionOptions::memo_off(),
+            KernelExecutionOptions::ephemeral_memo(),
+        ] {
+            let legacy_sink = KernelWorkCounterSink::default();
+            let legacy = crate::verify::verify_module_cert_with_import_refs_legacy_for_test(
+                &consumer_bytes,
+                &imports,
+                &policy,
+                kernel_options,
+                Some(legacy_sink.clone()),
+            )
+            .unwrap();
+            let legacy_work = legacy_sink.snapshot();
+            let mut forward_work = KernelWorkCounters::default();
+            let mut term = CertificateTermMaterializationObservation::default();
+            let observed = verify_module_cert_with_import_refs_and_kernel_options_and_observations(
+                &consumer_bytes,
+                &imports,
+                &policy,
+                kernel_options,
+                CertificateVerificationObservationSinks::new()
+                    .with_kernel(&mut forward_work)
+                    .with_term(&mut term),
+            )
+            .unwrap();
+
+            assert_eq!(observed, legacy);
+            assert_eq!(observed.export_hash(), consumer_cert.hashes().export_hash);
+            assert_eq!(forward_work.logical_fuel, legacy_work.logical_fuel);
+            assert_eq!(forward_work.successful_fuel, legacy_work.successful_fuel);
+            assert_eq!(forward_work.exhausted_fuel, legacy_work.exhausted_fuel);
+            assert_eq!(forward_work.fuel, legacy_work.fuel);
+            assert!(
+                term.unique_nodes_materialized
+                    >= u64::try_from(consumer_cert.term_table().len()).unwrap()
+            );
+            assert!(term.root_requests > 0);
+            assert!(term.materialization_charged_bytes > 0);
+            assert_eq!(term.materialization_capacity_stops, 0);
+            assert_eq!(term.materialization_legacy_fallbacks, 0);
+        }
+    }
+}
+
+#[test]
+fn term_materialization_post_materialization_error_is_differential() {
+    let mut cert = build_module_cert(id_module("A", "x"), &[]).unwrap();
+    let bvar_zero = cert
+        .term_table()
+        .iter()
+        .position(|term| matches!(term, TermNode::BVar(0)))
+        .unwrap();
+    let mut parts = cert.into_parts();
+    match &mut parts.declarations[0].decl {
+        DeclPayload::Def { value, .. } => *value = bvar_zero,
+        _ => panic!("expected def"),
+    }
+    let unhashed = ModuleCert::from_parts(parts);
+    let certificate_hash = hash_with_domain(
+        MODULE_CERT_DOMAIN,
+        &encode_module_cert_without_certificate_hash(&unhashed),
+    );
+    let mut parts = unhashed.into_parts();
+    parts.hashes.certificate_hash = certificate_hash;
+    cert = ModuleCert::from_parts(parts);
+    let bytes = encode_module_cert(&cert).unwrap();
+
+    for kernel_options in [
+        KernelExecutionOptions::memo_off(),
+        KernelExecutionOptions::ephemeral_memo(),
+    ] {
+        let legacy_sink = KernelWorkCounterSink::default();
+        let legacy = crate::verify::verify_module_cert_with_import_refs_legacy_for_test(
+            &bytes,
+            &[],
+            &AxiomPolicy::normal(),
+            kernel_options,
+            Some(legacy_sink.clone()),
+        )
+        .unwrap_err();
+        let mut forward_work = KernelWorkCounters::default();
+        let mut term = CertificateTermMaterializationObservation::default();
+        let forward = verify_module_cert_with_import_refs_and_kernel_options_and_observations(
+            &bytes,
+            &[],
+            &AxiomPolicy::normal(),
+            kernel_options,
+            CertificateVerificationObservationSinks::new()
+                .with_kernel(&mut forward_work)
+                .with_term(&mut term),
+        )
+        .unwrap_err();
+
+        assert_eq!(forward, legacy);
+        let legacy_work = legacy_sink.snapshot();
+        assert_eq!(forward_work.logical_fuel, legacy_work.logical_fuel);
+        assert_eq!(forward_work.fuel, legacy_work.fuel);
+        // The malformed declaration is rejected by the existing structural
+        // preflight before either conversion lane starts.
+        assert_eq!(term, CertificateTermMaterializationObservation::default());
+    }
+}
+
+#[test]
+fn term_materialization_does_not_observe_pre_materialization_decode_failure() {
+    let cert = build_module_cert(id_module("A", "x"), &[]).unwrap();
+    let mut bytes = encode_module_cert(&cert).unwrap();
+    bytes.push(0);
+    let mut term = CertificateTermMaterializationObservation::default();
+
+    let result = verify_module_cert_with_import_refs_and_kernel_options_and_observations(
+        &bytes,
+        &[],
+        &AxiomPolicy::normal(),
+        npa_kernel::KernelExecutionOptions::default(),
+        CertificateVerificationObservationSinks::new().with_term(&mut term),
+    );
+
+    assert!(result.is_err());
+    assert_eq!(term, CertificateTermMaterializationObservation::default());
+}
+
+fn term_materialization_verified_pair() -> (VerifiedModule, VerifiedModule) {
+    let provider_cert = build_module_cert(id_module("A", "x"), &[]).unwrap();
+    let provider = verify_module_cert_with_import_refs(
+        &encode_module_cert(&provider_cert).unwrap(),
+        &[],
+        &AxiomPolicy::normal(),
+    )
+    .unwrap();
+    let consumer_cert =
+        build_module_cert(use_id_module(), std::slice::from_ref(&provider)).unwrap();
+    let consumer = verify_module_cert_with_import_refs(
+        &encode_module_cert(&consumer_cert).unwrap(),
+        &[&provider],
+        &AxiomPolicy::normal(),
+    )
+    .unwrap();
+    (provider, consumer)
+}
+
+#[derive(Clone)]
+struct TestCertificateImportView {
+    module: Name,
+    imports: Vec<ImportEntry>,
+    name_table: Vec<Name>,
+    level_table: Vec<LevelNode>,
+    term_table: Vec<TermNode>,
+    declarations: Vec<DeclCert>,
+    export_hash: Hash,
+    certificate_hash: Hash,
+    export_block: Vec<ExportEntry>,
+    axiom_report: AxiomReport,
+    structural_closure: StructuralClosureSummary,
+}
+
+impl TestCertificateImportView {
+    fn from_verified(module: &VerifiedModule) -> Self {
+        Self {
+            module: module.module().clone(),
+            imports: module.imports().to_vec(),
+            name_table: module.name_table().to_vec(),
+            level_table: module.level_table().to_vec(),
+            term_table: module.term_table().to_vec(),
+            declarations: module.declarations().to_vec(),
+            export_hash: module.export_hash(),
+            certificate_hash: module.certificate_hash(),
+            export_block: module.export_block().to_vec(),
+            axiom_report: module.axiom_report().clone(),
+            structural_closure: module.structural_closure().clone(),
+        }
+    }
+
+    fn from_cert(module: &ModuleCert) -> Self {
+        Self {
+            module: module.header().module.clone(),
+            imports: module.imports().to_vec(),
+            name_table: module.name_table().to_vec(),
+            level_table: module.level_table().to_vec(),
+            term_table: module.term_table().to_vec(),
+            declarations: module.declarations().to_vec(),
+            export_hash: module.hashes().export_hash,
+            certificate_hash: module.hashes().certificate_hash,
+            export_block: module.export_block().to_vec(),
+            axiom_report: module.axiom_report().clone(),
+            structural_closure: StructuralClosureSummary::default(),
+        }
+    }
+}
+
+impl crate::local_authoring::CertificateImportView for TestCertificateImportView {
+    fn module(&self) -> &Name {
+        &self.module
+    }
+
+    fn imports(&self) -> &[ImportEntry] {
+        &self.imports
+    }
+
+    fn name_table(&self) -> &[Name] {
+        &self.name_table
+    }
+
+    fn level_table(&self) -> &[LevelNode] {
+        &self.level_table
+    }
+
+    fn term_table(&self) -> &[TermNode] {
+        &self.term_table
+    }
+
+    fn declarations(&self) -> &[DeclCert] {
+        &self.declarations
+    }
+
+    fn export_hash(&self) -> Hash {
+        self.export_hash
+    }
+
+    fn certificate_hash(&self) -> Hash {
+        self.certificate_hash
+    }
+
+    fn export_block(&self) -> &[ExportEntry] {
+        &self.export_block
+    }
+
+    fn axiom_report(&self) -> &AxiomReport {
+        &self.axiom_report
+    }
+
+    fn structural_closure(&self) -> &StructuralClosureSummary {
+        &self.structural_closure
+    }
+}
+
+#[test]
+fn verified_module_projection_uses_one_table() {
+    let (provider, consumer) = term_materialization_verified_pair();
+    let mut env = Env::with_builtins().unwrap();
+    let mut observation = CertificateTermMaterializationObservation::default();
+    add_verified_module_referenced_imports_to_env_observed_for_test(
+        &mut env,
+        &consumer,
+        &[&provider],
+        &mut observation,
+    )
+    .unwrap();
+    assert!(env.decl("id").is_some());
+    assert_eq!(
+        observation.materialization_slots,
+        provider.term_table().len() as u64
+    );
+    assert!(observation.unique_nodes_materialized > 0);
+    assert_eq!(observation.materialization_legacy_fallbacks, 0);
+    assert_eq!(observation.materialization_capacity_stops, 0);
+
+    let projected = verified_module_to_kernel_decls(&consumer).unwrap();
+    assert_eq!(projected.len(), consumer.declarations().len());
+}
+
+#[test]
+fn imported_materialization_exact_identity_diamond() {
+    let (provider, _) = term_materialization_verified_pair();
+    let entry = &provider.export_block()[0];
+    let name = provider.name_table()[entry.name].clone();
+    let imports: [&dyn crate::local_authoring::CertificateImportView; 2] = [&provider, &provider];
+    let exports = [
+        (0, name.clone(), entry.decl_interface_hash),
+        (1, name, entry.decl_interface_hash),
+    ];
+    let mut env = Env::with_builtins().unwrap();
+    let mut observation = CertificateTermMaterializationObservation::default();
+    add_selected_import_exports_to_env_observed_for_test(
+        &mut env,
+        &imports,
+        &exports,
+        &mut observation,
+    )
+    .unwrap();
+    assert!(env.decl("id").is_some());
+    assert_eq!(
+        observation.materialization_slots,
+        provider.term_table().len() as u64
+    );
+    assert_eq!(observation.materialization_legacy_fallbacks, 0);
+
+    let mut alternate_identity = TestCertificateImportView::from_verified(&provider);
+    alternate_identity.certificate_hash[0] ^= 1;
+    let imports: [&dyn crate::local_authoring::CertificateImportView; 2] =
+        [&provider, &alternate_identity];
+    let exports = [
+        (0, Name::from_dotted("id"), entry.decl_interface_hash),
+        (1, Name::from_dotted("id"), entry.decl_interface_hash),
+    ];
+    let mut env = Env::with_builtins().unwrap();
+    let mut observation = CertificateTermMaterializationObservation::default();
+    let error = add_selected_import_exports_to_env_observed_for_test(
+        &mut env,
+        &imports,
+        &exports,
+        &mut observation,
+    )
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        CertError::Kernel(npa_kernel::Error::DuplicateDecl(ref name)) if name == "id"
+    ));
+    assert!(env.decl("id").is_some());
+    assert_eq!(
+        observation.materialization_slots,
+        2 * provider.term_table().len() as u64
+    );
+    assert_eq!(observation.materialization_legacy_fallbacks, 0);
+}
+
+#[test]
+fn imported_materialization_sparse_export() {
+    let provider_module = CoreModule {
+        name: Name::from_dotted("Test.SparseProvider"),
+        declarations: vec![
+            Decl::Def {
+                name: "first".to_owned(),
+                universe_params: vec!["u".to_owned()],
+                ty: id_type("A", "x"),
+                value: id_value("A", "x"),
+                reducibility: Reducibility::Reducible,
+            },
+            Decl::Def {
+                name: "second".to_owned(),
+                universe_params: vec!["u".to_owned()],
+                ty: id_type("B", "y"),
+                value: id_value_with_beta_redex(),
+                reducibility: Reducibility::Reducible,
+            },
+        ],
+    };
+    let cert = build_module_cert(provider_module, &[]).unwrap();
+    let provider = verify_module_cert_with_import_refs(
+        &encode_module_cert(&cert).unwrap(),
+        &[],
+        &AxiomPolicy::normal(),
+    )
+    .unwrap();
+    let entry = provider
+        .export_block()
+        .iter()
+        .find(|entry| provider.name_table()[entry.name] == Name::from_dotted("first"))
+        .unwrap();
+    let imports: [&dyn crate::local_authoring::CertificateImportView; 1] = [&provider];
+    let exports = [(0, Name::from_dotted("first"), entry.decl_interface_hash)];
+    let mut env = Env::with_builtins().unwrap();
+    let mut observation = CertificateTermMaterializationObservation::default();
+    add_selected_import_exports_to_env_observed_for_test(
+        &mut env,
+        &imports,
+        &exports,
+        &mut observation,
+    )
+    .unwrap();
+    assert!(env.decl("first").is_some());
+    assert!(env.decl("second").is_none());
+    assert!(observation.unique_nodes_materialized < provider.term_table().len() as u64);
+    assert_eq!(
+        observation.materialization_slots,
+        provider.term_table().len() as u64
+    );
+}
+
+#[test]
+fn term_materialization_aggregate_operation_budget() {
+    let provider_cert = build_module_cert(id_module("A", "x"), &[]).unwrap();
+    let provider = verify_module_cert_with_import_refs(
+        &encode_module_cert(&provider_cert).unwrap(),
+        &[],
+        &AxiomPolicy::normal(),
+    )
+    .unwrap();
+    let consumer_cert =
+        build_module_cert(use_id_module(), std::slice::from_ref(&provider)).unwrap();
+    let consumer = verify_module_cert_with_import_refs(
+        &encode_module_cert(&consumer_cert).unwrap(),
+        &[&provider],
+        &AxiomPolicy::normal(),
+    )
+    .unwrap();
+
+    let mut probe_budget = TermMaterializationBudgetV1::new();
+    let mut probe_observation = CertificateTermMaterializationObservation::default();
+    assert!(select_current_term_conversion_with_budget_for_test(
+        &consumer_cert,
+        &mut probe_budget,
+        Some(&mut probe_observation),
+    ));
+    let current_charge = probe_budget.admitted_bytes();
+    assert!(current_charge > 0);
+
+    let prefix = TERM_MATERIALIZATION_CHARGED_BYTE_LIMIT - current_charge - 1;
+    for observed in [false, true] {
+        let mut budget = TermMaterializationBudgetV1::with_admitted_bytes_for_test(prefix);
+        let mut observation = CertificateTermMaterializationObservation::default();
+        assert!(select_current_term_conversion_with_budget_for_test(
+            &consumer_cert,
+            &mut budget,
+            observed.then_some(&mut observation),
+        ));
+        assert_eq!(
+            budget.admitted_bytes(),
+            TERM_MATERIALIZATION_CHARGED_BYTE_LIMIT - 1
+        );
+
+        let mut env = Env::with_builtins().unwrap();
+        add_verified_module_referenced_imports_to_env_with_budget_and_optional_observation_for_test(
+            &mut env,
+            &consumer,
+            &[&provider],
+            &mut budget,
+            observed.then_some(&mut observation),
+        )
+        .unwrap();
+        assert!(env.decl("id").is_some());
+        assert_eq!(
+            budget.admitted_bytes(),
+            TERM_MATERIALIZATION_CHARGED_BYTE_LIMIT - 1
+        );
+        if observed {
+            assert_eq!(observation.materialization_capacity_stops, 1);
+            assert_eq!(observation.materialization_legacy_fallbacks, 1);
+            assert_eq!(observation.materialization_charged_bytes, current_charge);
+        } else {
+            assert_eq!(
+                observation,
+                CertificateTermMaterializationObservation::default()
+            );
+        }
+    }
+}
+
+#[test]
+fn imported_materialization_production_matrix() {
+    verified_module_projection_uses_one_table();
+    imported_materialization_exact_identity_diamond();
+    imported_materialization_sparse_export();
+
+    let (provider, _) = term_materialization_verified_pair();
+    let entry = &provider.export_block()[0];
+    let imports: [&dyn crate::local_authoring::CertificateImportView; 1] = [&provider];
+    let exports = [(
+        0,
+        provider.name_table()[entry.name].clone(),
+        entry.decl_interface_hash,
+    )];
+    let mut env = Env::with_builtins().unwrap();
+    let mut exhausted = TermMaterializationBudgetV1::exhausted_for_test();
+    let mut observation = CertificateTermMaterializationObservation::default();
+    add_selected_import_exports_to_env_with_budget_for_test(
+        &mut env,
+        &imports,
+        &exports,
+        &mut exhausted,
+        &mut observation,
+    )
+    .unwrap();
+    assert!(env.decl("id").is_some());
+    assert_eq!(observation.materialization_capacity_stops, 1);
+    assert_eq!(observation.materialization_legacy_fallbacks, 1);
+    assert_eq!(observation.materialization_charged_bytes, 0);
+    assert_eq!(
+        exhausted.admitted_bytes(),
+        TERM_MATERIALIZATION_CHARGED_BYTE_LIMIT
+    );
+}
+
+#[test]
+fn selected_export_borrowed_scratch_preflight_boundary() {
+    let (provider, _) = term_materialization_verified_pair();
+    let entry = &provider.export_block()[0];
+    let name = provider.name_table()[entry.name].clone();
+    let imports: [&dyn crate::local_authoring::CertificateImportView; 1] = [&provider];
+    let exports = [
+        (0, name.clone(), entry.decl_interface_hash),
+        (0, name, entry.decl_interface_hash),
+    ];
+    let mut env = Env::with_builtins().unwrap();
+    let mut exhausted = TermMaterializationBudgetV1::exhausted_for_test();
+    let mut observation = CertificateTermMaterializationObservation::default();
+
+    add_selected_import_exports_to_env_with_budget_for_test(
+        &mut env,
+        &imports,
+        &exports,
+        &mut exhausted,
+        &mut observation,
+    )
+    .unwrap();
+
+    // The raw duplicate request count is conservatively fitted before the
+    // borrowed selection scratch is reserved. At the exact operation limit,
+    // the planned lane therefore stops without a commit or Env effect and the
+    // unchanged legacy lane still deduplicates to the accepted declaration.
+    assert!(env.decl("id").is_some());
+    assert_eq!(observation.materialization_capacity_stops, 1);
+    assert_eq!(observation.materialization_legacy_fallbacks, 1);
+    assert_eq!(observation.materialization_charged_bytes, 0);
+    assert_eq!(
+        exhausted.admitted_bytes(),
+        TERM_MATERIALIZATION_CHARGED_BYTE_LIMIT
+    );
+}
+
+#[test]
+fn current_term_materialization_verifier_differential() {
+    term_materialization_current_lane_is_measurement_independent();
+    term_materialization_post_materialization_error_is_differential();
+}
+
+#[test]
+fn current_term_materialization_production_matrix() {
+    current_term_materialization_verifier_differential();
+    term_materialization_does_not_observe_pre_materialization_decode_failure();
+}
+
+#[test]
+fn imported_materialization_action_order_differential() {
+    let provider_cert = build_module_cert(id_module("A", "x"), &[]).unwrap();
+    let provider = verify_module_cert_with_import_refs(
+        &encode_module_cert(&provider_cert).unwrap(),
+        &[],
+        &AxiomPolicy::normal(),
+    )
+    .unwrap();
+    let consumer_cert =
+        build_module_cert(use_id_module(), std::slice::from_ref(&provider)).unwrap();
+    let consumer_view = TestCertificateImportView::from_cert(&consumer_cert);
+
+    let mut bad_builtin_provider = TestCertificateImportView::from_verified(&provider);
+    let nat_name = bad_builtin_provider.name_table.len();
+    bad_builtin_provider
+        .name_table
+        .push(Name::from_dotted("Nat"));
+    bad_builtin_provider.term_table[0] = TermNode::Const {
+        global_ref: GlobalRef::Builtin {
+            name: nat_name,
+            decl_interface_hash: test_hash(0xff),
+        },
+        levels: Vec::new(),
+    };
+    let bad_imports: [&dyn crate::local_authoring::CertificateImportView; 1] =
+        [&bad_builtin_provider];
+    let mut planned_env = Env::with_builtins().unwrap();
+    planned_env
+        .add_axiom("id", Vec::new(), Expr::sort(Level::zero()))
+        .unwrap();
+    let mut planned_observation = CertificateTermMaterializationObservation::default();
+    let mut planned_budget = TermMaterializationBudgetV1::new();
+    let planned_error = imported_materialization_action_order_with_budget_for_test(
+        &mut planned_env,
+        &consumer_view,
+        &bad_imports,
+        &mut planned_budget,
+        Some(&mut planned_observation),
+    )
+    .unwrap_err();
+    let mut legacy_env = Env::with_builtins().unwrap();
+    legacy_env
+        .add_axiom("id", Vec::new(), Expr::sort(Level::zero()))
+        .unwrap();
+    let legacy_error = add_root_referenced_imports_to_env_legacy_for_test(
+        &mut legacy_env,
+        &consumer_view,
+        &bad_imports,
+    )
+    .unwrap_err();
+    assert_eq!(planned_error, legacy_error);
+    assert!(matches!(
+        planned_error,
+        CertError::UnknownDependency { name } if name == Name::from_dotted("Nat")
+    ));
+    assert_eq!(planned_observation.materialization_legacy_fallbacks, 0);
+    assert_eq!(planned_observation.materialization_capacity_stops, 0);
+
+    let ordinary_imports: [&dyn crate::local_authoring::CertificateImportView; 1] = [&provider];
+    let mut planned_env = Env::with_builtins().unwrap();
+    planned_env
+        .add_axiom("id", Vec::new(), Expr::sort(Level::zero()))
+        .unwrap();
+    let mut planned_observation = CertificateTermMaterializationObservation::default();
+    let mut planned_budget = TermMaterializationBudgetV1::new();
+    let planned_error = imported_materialization_action_order_with_budget_for_test(
+        &mut planned_env,
+        &consumer_view,
+        &ordinary_imports,
+        &mut planned_budget,
+        Some(&mut planned_observation),
+    )
+    .unwrap_err();
+    let mut legacy_env = Env::with_builtins().unwrap();
+    legacy_env
+        .add_axiom("id", Vec::new(), Expr::sort(Level::zero()))
+        .unwrap();
+    let legacy_error = add_root_referenced_imports_to_env_legacy_for_test(
+        &mut legacy_env,
+        &consumer_view,
+        &ordinary_imports,
+    )
+    .unwrap_err();
+    assert_eq!(planned_error, legacy_error);
+    assert_eq!(planned_observation.materialization_legacy_fallbacks, 0);
+    assert_eq!(planned_observation.materialization_capacity_stops, 0);
+
+    let mut cyclic_provider = TestCertificateImportView::from_verified(&provider);
+    let entry = cyclic_provider.export_block[0].clone();
+    cyclic_provider.imports.push(ImportEntry {
+        module: cyclic_provider.module.clone(),
+        export_hash: cyclic_provider.export_hash,
+        certificate_hash: Some(cyclic_provider.certificate_hash),
+    });
+    cyclic_provider.term_table[0] = TermNode::Const {
+        global_ref: GlobalRef::Imported {
+            import_index: 0,
+            name: entry.name,
+            decl_interface_hash: entry.decl_interface_hash,
+        },
+        levels: Vec::new(),
+    };
+    let cyclic_imports: [&dyn crate::local_authoring::CertificateImportView; 1] =
+        [&cyclic_provider];
+    let mut env = Env::with_builtins().unwrap();
+    let mut budget = TermMaterializationBudgetV1::new();
+    let mut observation = CertificateTermMaterializationObservation::default();
+    let error = imported_materialization_action_order_with_budget_for_test(
+        &mut env,
+        &consumer_view,
+        &cyclic_imports,
+        &mut budget,
+        Some(&mut observation),
+    )
+    .unwrap_err();
+    assert!(matches!(error, CertError::DependencyCycle { .. }));
+    assert_eq!(observation.materialization_legacy_fallbacks, 1);
+    assert_eq!(observation.materialization_capacity_stops, 0);
+
+    let mut env = Env::with_builtins().unwrap();
+    let mut exhausted = TermMaterializationBudgetV1::exhausted_for_test();
+    let mut observation = CertificateTermMaterializationObservation::default();
+    imported_materialization_action_order_with_budget_for_test(
+        &mut env,
+        &consumer_view,
+        &ordinary_imports,
+        &mut exhausted,
+        Some(&mut observation),
+    )
+    .unwrap();
+    assert!(env.decl("id").is_some());
+    assert_eq!(observation.materialization_capacity_stops, 1);
+    assert_eq!(observation.materialization_legacy_fallbacks, 1);
+}
+
+#[test]
+fn term_materialization_fuel_differential() {
+    let cert =
+        build_module_cert(id_def_module_with_value(id_value_with_beta_redex()), &[]).unwrap();
+    let root = match &cert.declarations()[0].decl {
+        DeclPayload::Def { value, .. } => *value,
+        _ => unreachable!(),
+    };
+    let legacy_left = expr_from_term(&cert, root).unwrap();
+    let legacy_right = expr_from_term(&cert, root).unwrap();
+    let mut budget = TermMaterializationBudgetV1::new();
+    let MaterializationAttempt::Ready(table) =
+        KernelExprMaterialization::for_current_module(&cert, &[root], &mut budget, None)
+    else {
+        panic!("current fixture must materialize");
+    };
+    let materialized = table.root_expr(root, None).unwrap();
+
+    fn run(
+        options: KernelExecutionOptions,
+        lhs: &Expr,
+        rhs: &Expr,
+        fuel: usize,
+    ) -> (npa_kernel::Result<bool>, usize, KernelWorkCounters) {
+        let sink = KernelWorkCounterSink::default();
+        let env = Env::with_execution_options_and_work_counter_sink(options, sink.clone());
+        let mut remaining = fuel;
+        let result = env.is_defeq_with_fuel_metered(&Ctx::new(), &[], lhs, rhs, &mut remaining);
+        (result, remaining, sink.snapshot())
+    }
+
+    for options in [
+        KernelExecutionOptions::memo_off(),
+        KernelExecutionOptions::ephemeral_memo(),
+    ] {
+        let exact = (0..=4_096)
+            .find(|fuel| run(options, &legacy_left, &legacy_right, *fuel).0 == Ok(true))
+            .expect("small fixture must have a bounded success threshold");
+        assert!(exact > 0);
+        for fuel in [exact - 1, exact, exact + 1] {
+            let legacy = run(options, &legacy_left, &legacy_right, fuel);
+            let forward = run(options, &materialized, &legacy_right, fuel);
+            assert_eq!(forward.0, legacy.0, "fuel={fuel}, options={options:?}");
+            assert_eq!(forward.1, legacy.1, "fuel={fuel}, options={options:?}");
+            assert_eq!(forward.2.logical_fuel, legacy.2.logical_fuel);
+            assert_eq!(forward.2.successful_fuel, legacy.2.successful_fuel);
+            assert_eq!(forward.2.exhausted_fuel, legacy.2.exhausted_fuel);
+            if fuel < exact {
+                assert!(matches!(
+                    forward.0,
+                    Err(npa_kernel::Error::ResourceLimit {
+                        kind: ResourceLimitKind::Conversion
+                    })
+                ));
+            } else {
+                assert_eq!(forward.0, Ok(true));
+            }
+        }
+    }
+}
+
+#[test]
+fn term_materialization_diagnostic_differential() {
+    let cert =
+        build_module_cert(id_def_module_with_value(id_value_with_beta_redex()), &[]).unwrap();
+    let root = match &cert.declarations()[0].decl {
+        DeclPayload::Def { value, .. } => *value,
+        _ => unreachable!(),
+    };
+    let legacy_left = expr_from_term(&cert, root).unwrap();
+    let legacy_right = expr_from_term(&cert, root).unwrap();
+    let mut current_budget = TermMaterializationBudgetV1::new();
+    let MaterializationAttempt::Ready(current_table) =
+        KernelExprMaterialization::for_current_module(&cert, &[root], &mut current_budget, None)
+    else {
+        panic!("current fixture must materialize");
+    };
+    let current = current_table.root_expr(root, None).unwrap();
+    let mut selected_budget = TermMaterializationBudgetV1::new();
+    let MaterializationAttempt::Ready(selected_table) =
+        KernelExprMaterialization::for_selected_roots(&cert, &[root], &mut selected_budget, None)
+    else {
+        panic!("selected import fixture must materialize");
+    };
+    let selected = selected_table.root_expr(root, None).unwrap();
+
+    fn report_json(error: &npa_kernel::DiagnosedKernelError) -> String {
+        let context = error.context().expect("fuel error must carry context");
+        let conversion = context
+            .conversion()
+            .expect("fuel error must carry conversion context");
+        let (resource, path, path_truncated, overflowed) = if let Some(fuel) = context.kernel_fuel()
+        {
+            (
+                format!("\"{}\"", fuel.resource.as_str()),
+                fuel.comparison_path
+                    .steps
+                    .iter()
+                    .map(|step| format!("\"{}\"", step.as_str()))
+                    .collect::<Vec<_>>()
+                    .join(","),
+                fuel.comparison_path.truncated,
+                fuel.overflowed,
+            )
+        } else {
+            ("null".to_owned(), String::new(), false, false)
+        };
+        format!(
+            "{{\"error\":\"conversion_resource_limit\",\"phase\":\"{}\",\"outcome\":\"{}\",\"lhs_head\":\"{}\",\"rhs_head\":\"{}\",\"depth\":{},\"resource\":{},\"path\":[{}],\"path_truncated\":{},\"overflowed\":{}}}",
+            context.phase().as_str(),
+            conversion.outcome().as_str(),
+            conversion.lhs_head().as_str(),
+            conversion.rhs_head().as_str(),
+            conversion.depth(),
+            resource,
+            path,
+            path_truncated,
+            overflowed,
+        )
+    }
+
+    let env = Env::new();
+    let legacy = env
+        .is_defeq_diagnosed_with_fuel(&Ctx::new(), &[], &legacy_left, &legacy_right, 0)
+        .unwrap_err();
+    assert!(matches!(
+        legacy.error(),
+        npa_kernel::Error::ResourceLimit {
+            kind: ResourceLimitKind::Conversion
+        }
+    ));
+    let legacy_json = report_json(&legacy);
+    assert!(legacy_json.contains("\"phase\":\"definitional_equality\""));
+    assert!(legacy_json.contains("\"resource\":null"));
+    for candidate in [&current, &selected] {
+        let diagnosed = env
+            .is_defeq_diagnosed_with_fuel(&Ctx::new(), &[], candidate, &legacy_right, 0)
+            .unwrap_err();
+        assert_eq!(diagnosed, legacy);
+        assert_eq!(report_json(&diagnosed), legacy_json);
+    }
+}
+
+#[test]
+fn term_materialization_identity_differential() {
+    term_materialization_current_lane_is_measurement_independent();
+    term_materialization_import_plan_replays_differentially();
+}
+
+#[test]
+fn term_materialization_observation_failure_matrix() {
+    term_materialization_does_not_observe_pre_materialization_decode_failure();
+    term_materialization_post_materialization_error_is_differential();
+
+    let provider_cert = build_module_cert(id_module("A", "x"), &[]).unwrap();
+    let provider = verify_module_cert_with_import_refs(
+        &encode_module_cert(&provider_cert).unwrap(),
+        &[],
+        &AxiomPolicy::normal(),
+    )
+    .unwrap();
+    let consumer_cert =
+        build_module_cert(use_id_module(), std::slice::from_ref(&provider)).unwrap();
+    let consumer_view = TestCertificateImportView::from_cert(&consumer_cert);
+    let ordinary_imports: [&dyn crate::local_authoring::CertificateImportView; 1] = [&provider];
+
+    let mut exhausted = TermMaterializationBudgetV1::exhausted_for_test();
+    let mut stop_observation = CertificateTermMaterializationObservation::default();
+    let mut env = Env::with_builtins().unwrap();
+    imported_materialization_action_order_with_budget_for_test(
+        &mut env,
+        &consumer_view,
+        &ordinary_imports,
+        &mut exhausted,
+        Some(&mut stop_observation),
+    )
+    .unwrap();
+    assert_eq!(stop_observation.materialization_capacity_stops, 1);
+    assert_eq!(stop_observation.materialization_legacy_fallbacks, 1);
+    assert_eq!(stop_observation.materialization_charged_bytes, 0);
+
+    let mut env = Env::with_builtins().unwrap();
+    env.add_axiom("id", Vec::new(), Expr::sort(Level::zero()))
+        .unwrap();
+    let mut failure_budget = TermMaterializationBudgetV1::new();
+    let mut failure_observation = CertificateTermMaterializationObservation::default();
+    assert!(imported_materialization_action_order_with_budget_for_test(
+        &mut env,
+        &consumer_view,
+        &ordinary_imports,
+        &mut failure_budget,
+        Some(&mut failure_observation),
+    )
+    .is_err());
+    assert!(failure_observation.unique_nodes_materialized > 0);
+    assert!(failure_observation.materialization_charged_bytes > 0);
+    assert_eq!(failure_observation.materialization_capacity_stops, 0);
+    assert_eq!(failure_observation.materialization_legacy_fallbacks, 0);
+
+    let mut off_budget = TermMaterializationBudgetV1::new();
+    let mut env = Env::with_builtins().unwrap();
+    imported_materialization_action_order_with_budget_for_test(
+        &mut env,
+        &consumer_view,
+        &ordinary_imports,
+        &mut off_budget,
+        None,
+    )
+    .unwrap();
+    assert!(env.decl("id").is_some());
+}
+
+#[test]
+fn certificate_observation_sink_bundle_matrix() {
+    let cert = build_module_cert(id_module("A", "x"), &[]).unwrap();
+    let bytes = encode_module_cert(&cert).unwrap();
+    let empty = verify_module_cert_with_import_refs_and_kernel_options_and_observations(
+        &bytes,
+        &[],
+        &AxiomPolicy::normal(),
+        KernelExecutionOptions::default(),
+        CertificateVerificationObservationSinks::new(),
+    )
+    .unwrap();
+
+    let mut term_only = CertificateTermMaterializationObservation::default();
+    let term_observed = verify_module_cert_with_import_refs_and_kernel_options_and_observations(
+        &bytes,
+        &[],
+        &AxiomPolicy::normal(),
+        KernelExecutionOptions::default(),
+        CertificateVerificationObservationSinks::new().with_term(&mut term_only),
+    )
+    .unwrap();
+
+    let mut kernel_with_term = KernelWorkCounters::default();
+    let mut term_with_kernel = CertificateTermMaterializationObservation::default();
+    let kernel_term_observed =
+        verify_module_cert_with_import_refs_and_kernel_options_and_observations(
+            &bytes,
+            &[],
+            &AxiomPolicy::normal(),
+            KernelExecutionOptions::default(),
+            CertificateVerificationObservationSinks::new()
+                .with_kernel(&mut kernel_with_term)
+                .with_term(&mut term_with_kernel),
+        )
+        .unwrap();
+
+    let mut kernel_full = KernelWorkCounters::default();
+    let mut term_full = CertificateTermMaterializationObservation::default();
+    let mut payload_full = CertificatePayloadObservation::default();
+    let full_observed = verify_module_cert_with_import_refs_and_kernel_options_and_observations(
+        &bytes,
+        &[],
+        &AxiomPolicy::normal(),
+        KernelExecutionOptions::default(),
+        CertificateVerificationObservationSinks::new()
+            .with_kernel(&mut kernel_full)
+            .with_term(&mut term_full)
+            .with_payload(&mut payload_full),
+    )
+    .unwrap();
+
+    assert_eq!(term_observed, empty);
+    assert_eq!(kernel_term_observed, empty);
+    assert_eq!(full_observed, empty);
+    assert_eq!(term_only, term_with_kernel);
+    assert_eq!(term_only, term_full);
+    assert_eq!(kernel_with_term, kernel_full);
+    assert!(kernel_full.infer_calls > 0);
+    assert!(term_full.unique_nodes_materialized > 0);
+    assert_eq!(term_full.root_requests, term_full.owned_root_handoffs);
+    assert!(!term_full.overflowed);
+    assert!(payload_full.payloads_frozen > 0);
+    assert!(payload_full.payload_unique_bytes > 0);
+    assert!(!payload_full.overflowed);
 }

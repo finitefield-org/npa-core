@@ -2,17 +2,18 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs, io,
+    io,
     path::Path,
     sync::atomic::{AtomicU64, Ordering},
 };
 
 use npa_api::PackageArtifactReferenceSummaryMode;
 use npa_cert::{
-    declaration_dependency_closure, normalized_declaration_closure_hash,
-    normalized_declaration_closure_projection, resolve_verified_declaration_export,
-    DeclarationClosureLimits, GlobalDeclarationIdentity, Name, ValidatedSourceDeclarationFamilies,
-    VerifiedModule,
+    declaration_dependency_closure,
+    declaration_dependency_closure_with_transported_externalizations,
+    normalized_declaration_closure_hash, normalized_declaration_closure_projection,
+    resolve_verified_declaration_export, DeclarationClosureLimits, GlobalDeclarationIdentity, Name,
+    ValidatedSourceDeclarationFamilies, VerifiedModule,
 };
 use npa_frontend::{collect_human_source_declaration_families, FileId};
 use npa_package::{
@@ -32,9 +33,8 @@ use crate::{
     },
     diagnostic::{CommandArtifact, CommandDiagnostic, CommandResult, DiagnosticKind},
     fs::render_package_root,
-    governance_writer::{
-        confined_governance_path, write_governance_artifact, GovernanceOutputPolicy,
-    },
+    generated_artifact_writer::read_package_regular_file_no_follow,
+    governance_writer::{write_governance_artifact, GovernanceOutputPolicy},
     package_api::v1::{build_certs_check, verify_certs_full},
     package_artifacts::{
         load_package_audit_snapshot, LoadedPackageAuditSnapshot, PackageGeneratedArtifactReadMode,
@@ -46,13 +46,14 @@ use crate::{
     package_hashes::run_package_check_hashes,
     package_index::run_package_index,
     package_promotion_materialize::{
-        build_declaration_materialization_candidate, declaration_plan_inputs_current,
+        build_declaration_materialization_candidate_in_tree, declaration_plan_inputs_current,
         declaration_target_artifact_collision, declaration_target_diff_is_scoped, tree_snapshot,
         validate_materialized_declaration_inventory, write_tree_snapshot,
     },
     package_promotion_prepare_declaration::{
         direct_import_interfaces, endpoint_record, plan_declarations, read_declaration_source,
-        reconcile_families, DeclarationSourceExtractionError, HumanMemberMap,
+        reconcile_families, transported_declaration_externalizations,
+        DeclarationSourceExtractionError, HumanMemberMap,
     },
     package_promotion_registry::{promotion_plan_generated_read_mode, validate_checked_generated},
     package_publish::run_package_publish_plan,
@@ -633,7 +634,7 @@ fn deterministic_rebuilds(
     static NEXT_REBUILD: AtomicU64 = AtomicU64::new(0);
 
     let parent = baseline_root.parent().unwrap_or_else(|| Path::new("."));
-    let (first, second) = loop {
+    let (first, second, first_tree, second_tree) = loop {
         let sequence = NEXT_REBUILD.fetch_add(1, Ordering::Relaxed);
         let prefix = format!(
             ".npa-promotion-verify-{}-{}-{}-",
@@ -643,17 +644,18 @@ fn deterministic_rebuilds(
         );
         let first = parent.join(format!("{prefix}a"));
         let second = parent.join(format!("{prefix}b"));
-        match write_tree_snapshot(baseline, &first) {
-            Ok(()) => {}
+        let first_tree = match write_tree_snapshot(baseline, &first) {
+            Ok(tree) => tree,
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(_) => return Err("promotion_materialization_nondeterministic"),
-        }
+        };
         match write_tree_snapshot(baseline, &second) {
-            Ok(()) => break (first, second),
+            Ok(second_tree) => break (first, second, first_tree, second_tree),
             Err(error) => {
-                // `first` was created by this invocation. Never remove the
+                // `first` still has the exact baseline catalog. Never infer a
+                // cleanup catalog from the live filesystem and never remove a
                 // colliding `second`, which may belong to another validator.
-                let _ = fs::remove_dir_all(&first);
+                let _ = first_tree.cleanup(baseline);
                 if error.kind() == io::ErrorKind::AlreadyExists {
                     continue;
                 }
@@ -661,47 +663,36 @@ fn deterministic_rebuilds(
             }
         }
     };
-    let cleanup = || {
-        let _ = fs::remove_dir_all(&first);
-        let _ = fs::remove_dir_all(&second);
-    };
-    let first_omissions =
-        match build_declaration_materialization_candidate(source_root, &first, plan) {
-            Ok(rows) => rows,
-            Err(reason) => {
-                cleanup();
-                return Err(reason);
-            }
-        };
-    let second_omissions =
-        match build_declaration_materialization_candidate(source_root, &second, plan) {
-            Ok(rows) => rows,
-            Err(reason) => {
-                cleanup();
-                return Err(reason);
-            }
-        };
-    let (first_tree, second_tree) = snapshot_rebuild_trees_and_cleanup(&first, &second)?;
-    if first_tree != second_tree || first_omissions != second_omissions {
+    let first_omissions = build_declaration_materialization_candidate_in_tree(
+        source_root,
+        &first_tree,
+        &first,
+        plan,
+    )?;
+    // The builder may have partially changed the tree. Without a successfully
+    // frozen catalog, `?` leaves it for manual inspection instead of trying to
+    // infer and recursively delete an unknown live layout.
+    let second_omissions = build_declaration_materialization_candidate_in_tree(
+        source_root,
+        &second_tree,
+        &second,
+        plan,
+    )?;
+    let first_snapshot =
+        tree_snapshot(&first).map_err(|_| "promotion_materialization_nondeterministic")?;
+    let second_snapshot =
+        tree_snapshot(&second).map_err(|_| "promotion_materialization_nondeterministic")?;
+    let snapshots_match = first_snapshot == second_snapshot;
+    let first_scoped = declaration_target_diff_is_scoped(baseline, &first_snapshot, plan);
+    let second_scoped = declaration_target_diff_is_scoped(baseline, &second_snapshot, plan);
+    if snapshots_match && first_scoped && second_scoped {
+        let _ = first_tree.cleanup(&first_snapshot);
+        let _ = second_tree.cleanup(&second_snapshot);
+    }
+    if !snapshots_match || !first_scoped || !second_scoped || first_omissions != second_omissions {
         return Err("promotion_materialization_nondeterministic");
     }
-    Ok((first_tree, first_omissions))
-}
-
-fn snapshot_rebuild_trees_and_cleanup(
-    first: &Path,
-    second: &Path,
-) -> Result<(RebuiltTree, RebuiltTree), &'static str> {
-    let result = (|| {
-        let first_tree =
-            tree_snapshot(first).map_err(|_| "promotion_materialization_nondeterministic")?;
-        let second_tree =
-            tree_snapshot(second).map_err(|_| "promotion_materialization_nondeterministic")?;
-        Ok((first_tree, second_tree))
-    })();
-    let _ = fs::remove_dir_all(first);
-    let _ = fs::remove_dir_all(second);
-    result
+    Ok((first_snapshot, first_omissions))
 }
 
 fn short_hash(hash: PackageHash) -> String {
@@ -781,11 +772,13 @@ pub(crate) fn normalized_closure_identity(
         }
         target_external.insert(target_id.clone(), target_id);
     }
-    let source_closure = declaration_dependency_closure(
+    let source_transports = transported_declaration_externalizations(&source_external);
+    let source_closure = declaration_dependency_closure_with_transported_externalizations(
         &source_modules,
         &source_roots,
         &source_families,
         &source_external,
+        &source_transports,
         DeclarationClosureLimits::default(),
     )
     .map_err(|_| "promotion_declaration_semantic_mismatch")?;
@@ -976,14 +969,7 @@ fn record_for<'a>(
 }
 
 fn read_confined(root: &Path, path: &PackagePath) -> Option<Vec<u8>> {
-    let full = confined_governance_path(
-        root,
-        path,
-        path.as_str(),
-        "promotion_verification_attestation_stale",
-    )
-    .ok()?;
-    fs::read(full).ok()
+    read_package_regular_file_no_follow(root, path).ok()
 }
 
 fn failure(root: &str, reason: &str, path: &str) -> CommandResult {
@@ -996,6 +982,7 @@ fn failure(root: &str, reason: &str, path: &str) -> CommandResult {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     #[cfg(unix)]
     use std::os::unix::fs::symlink;
 
@@ -1003,7 +990,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn rebuild_snapshot_failure_cleans_both_scratch_trees() {
+    fn rebuild_snapshot_failure_refuses_to_delete_an_unclosed_scratch_tree() {
         static NEXT_TEST: AtomicU64 = AtomicU64::new(0);
 
         let root = std::env::temp_dir().join(format!(
@@ -1018,14 +1005,14 @@ mod tests {
         symlink("missing", first.join("invalid-symlink")).unwrap();
         fs::write(second.join("state.txt"), b"second").unwrap();
 
-        assert_eq!(
-            snapshot_rebuild_trees_and_cleanup(&first, &second),
-            Err("promotion_materialization_nondeterministic")
-        );
-        assert!(fs::symlink_metadata(&first)
-            .is_err_and(|error| error.kind() == io::ErrorKind::NotFound));
-        assert!(fs::symlink_metadata(&second)
-            .is_err_and(|error| error.kind() == io::ErrorKind::NotFound));
+        assert!(tree_snapshot(&first).is_err());
+        assert_eq!(fs::read(second.join("state.txt")).unwrap(), b"second");
+        assert!(fs::symlink_metadata(first.join("invalid-symlink"))
+            .is_ok_and(|metadata| metadata.file_type().is_symlink()));
+        fs::remove_file(first.join("invalid-symlink")).unwrap();
+        fs::remove_dir(first).unwrap();
+        fs::remove_file(second.join("state.txt")).unwrap();
+        fs::remove_dir(second).unwrap();
         fs::remove_dir(root).unwrap();
     }
 }

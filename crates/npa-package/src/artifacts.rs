@@ -11,7 +11,7 @@ use npa_cert::Name;
 use crate::{
     error::{PackageArtifactError, PackageArtifactErrorReason, PackageArtifactResult},
     hash::{format_package_hash, parse_package_hash, PackageHash},
-    json::{parse_json, JsonMember, JsonValue},
+    json::{parse_json, parse_json_with_limits, JsonMember, JsonResourceLimits, JsonValue},
     manifest::PackageVersion,
     name::{validate_package_id, PackageId},
     path::{validate_package_path, PackagePath},
@@ -242,6 +242,14 @@ pub struct PackageGlobalRefView {
 
 pub(crate) fn parse_artifact_json(source: &str) -> PackageArtifactResult<JsonValue> {
     parse_json(source).map_err(|error| PackageArtifactError::invalid_json(error.to_string()))
+}
+
+pub(crate) fn parse_artifact_json_with_limits(
+    source: &str,
+    limits: JsonResourceLimits,
+) -> PackageArtifactResult<JsonValue> {
+    parse_json_with_limits(source, limits)
+        .map_err(|error| PackageArtifactError::invalid_json(error.to_string()))
 }
 
 pub(crate) fn validate_package_identity(

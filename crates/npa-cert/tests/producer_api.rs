@@ -1,5 +1,6 @@
 use npa_cert::{
-    build_module_cert, build_module_cert_from_checked_candidates, canonical_import_env_keys,
+    build_module_cert, build_module_cert_from_checked_candidates,
+    build_module_cert_from_checked_candidates_observed, canonical_import_env_keys,
     canonical_import_export_views, check_core_decl_candidates,
     check_core_decl_candidates_with_measurement, encode_module_cert, initial_env_fingerprint,
     post_env_fingerprint, precheck_core_decl_candidate, prior_chain_fingerprint,
@@ -8,12 +9,12 @@ use npa_cert::{
     producer_limits_canonical_bytes, producer_limits_hash, producer_lookup_env, stricter_or_equal,
     validate_candidate_batch_imports, validate_prior_current_decls, verify_module_cert,
     AxiomPolicy, AxiomRef, CandidateBatch, CandidateBatchResult, CandidateHashPreview,
-    CandidateStatus, CertError, CertReducibility, CheckedDeclCandidate, CoreDeclCandidate,
-    CoreModule, DeclPayload, DependencyEntryKind, GlobalRef, ModuleCert, Name,
-    ProducerBatchMeasurement, ProducerCheckedDeclInterface, ProducerEnvFingerprintBytes,
-    ProducerImportEnvKey, ProducerLimitKind, ProducerLimits, ProducerPriorChainBytes,
-    ProducerPriorChainEntry, ProducerProfile, ProducerTokenHashField, VerifiedModule,
-    VerifierSession,
+    CandidateStatus, CertError, CertReducibility, CertificatePayloadObservation,
+    CheckedDeclCandidate, CoreDeclCandidate, CoreModule, DeclPayload, DependencyEntryKind,
+    GlobalRef, ModuleCert, Name, ProducerBatchMeasurement, ProducerCheckedDeclInterface,
+    ProducerEnvFingerprintBytes, ProducerImportEnvKey, ProducerLimitKind, ProducerLimits,
+    ProducerPriorChainBytes, ProducerPriorChainEntry, ProducerProfile, ProducerTokenHashField,
+    VerifiedModule, VerifierSession,
 };
 use npa_kernel::{
     Decl, Env, Error as KernelError, Expr, KernelExecutionOptions, Level, Reducibility,
@@ -133,9 +134,9 @@ fn build_bytes_and_hashes_with_out_of_band_sidecar(
     let bytes = encode_module_cert(&cert).unwrap();
     (
         bytes,
-        cert.hashes.export_hash,
-        cert.hashes.axiom_report_hash,
-        cert.hashes.certificate_hash,
+        cert.hashes().export_hash,
+        cert.hashes().axiom_report_hash,
+        cert.hashes().certificate_hash,
     )
 }
 
@@ -435,11 +436,11 @@ fn check_core_decl_candidates_accepts_in_input_order_and_extends_local_environme
     .unwrap();
     assert_eq!(
         type_token.decl_interface_hash(),
-        cert.declarations[0].hashes.decl_interface_hash
+        cert.declarations()[0].hashes.decl_interface_hash
     );
     assert_eq!(
         value_token.decl_interface_hash(),
-        cert.declarations[1].hashes.decl_interface_hash
+        cert.declarations()[1].hashes.decl_interface_hash
     );
     assert_eq!(
         type_token.pre_env_fingerprint(),
@@ -498,7 +499,7 @@ fn check_core_decl_candidates_accepts_import_and_builtin_references() {
     .unwrap();
     assert_eq!(
         imported_tokens[0].decl_interface_hash(),
-        imported_cert.declarations[0].hashes.decl_interface_hash
+        imported_cert.declarations()[0].hashes.decl_interface_hash
     );
 
     let builtin_decl = Decl::Theorem {
@@ -550,7 +551,7 @@ fn opaque_alias_body_chain(value: Expr) -> Vec<Decl> {
 }
 
 #[test]
-fn producer_opaque_candidate_chain_uses_local_view_and_builds_v0_3_certificate() {
+fn producer_opaque_candidate_chain_uses_local_view_and_builds_v0_4_certificate() {
     let declarations = opaque_alias_body_chain(Expr::sort(Level::zero()));
     let tokens = checked_tokens(declarations);
 
@@ -576,9 +577,9 @@ fn producer_opaque_candidate_chain_uses_local_view_and_builds_v0_3_certificate()
         &tokens,
     )
     .unwrap();
-    assert_eq!(cert.header.format, "NPA-CERT-0.3.0");
+    assert_eq!(cert.header().format, "NPA-CERT-0.4.0");
     assert!(matches!(
-        cert.declarations[0].decl,
+        cert.declarations()[0].decl,
         DeclPayload::Def {
             reducibility: CertReducibility::Opaque,
             ..
@@ -765,7 +766,7 @@ fn producer_candidate_precheck_is_identical_with_memo_off_and_on_local_opaque_vi
 }
 
 #[test]
-fn producer_selected_v0_3_pair_survives_rejected_opaque_candidate() {
+fn producer_selected_v0_4_pair_survives_rejected_opaque_candidate() {
     let result = check_core_decl_candidates(CandidateBatch {
         imports: &[],
         prior_current_decls: &[],
@@ -798,7 +799,7 @@ fn producer_selected_v0_3_pair_survives_rejected_opaque_candidate() {
         &[first],
     )
     .unwrap();
-    assert_eq!(cert.header.format, "NPA-CERT-0.3.0");
+    assert_eq!(cert.header().format, "NPA-CERT-0.4.0");
 }
 
 #[test]
@@ -833,7 +834,7 @@ fn producer_plain_prior_token_is_already_current_before_late_opaque_candidate() 
         &[plain, opaque],
     )
     .unwrap();
-    assert_eq!(cert.header.format, "NPA-CERT-0.3.0");
+    assert_eq!(cert.header().format, "NPA-CERT-0.4.0");
 }
 
 #[test]
@@ -898,7 +899,7 @@ fn check_core_decl_candidates_rejects_placeholder_like_ai_candidates() {
     ));
     assert!(matches!(
         &result.statuses[2],
-        CandidateStatus::Rejected(CertError::NonCanonicalEncoding { object: "Name" })
+        CandidateStatus::Rejected(CertError::UnresolvedMetavariable)
     ));
 }
 
@@ -1302,9 +1303,9 @@ fn build_module_cert_from_checked_candidates_builds_verifiable_certificate() {
         &tokens,
     )
     .unwrap();
-    assert_eq!(cert.declarations.len(), 2);
-    assert_eq!(cert.header.format, "NPA-CERT-0.3.0");
-    assert_eq!(cert.header.core_spec, "NPA-Core-0.3.0");
+    assert_eq!(cert.declarations().len(), 2);
+    assert_eq!(cert.header().format, "NPA-CERT-0.4.0");
+    assert_eq!(cert.header().core_spec, "NPA-Core-0.4.0");
 
     let bytes = encode_module_cert(&cert).unwrap();
     let mut session = VerifierSession::new();
@@ -1314,6 +1315,71 @@ fn build_module_cert_from_checked_candidates_builds_verifiable_certificate() {
         verified.module(),
         &Name::from_dotted("Producer.CheckedBuild")
     );
+}
+
+#[test]
+fn observed_checked_candidate_build() {
+    let declarations = [
+        trivial_axiom("ObservedCheckedBuildT"),
+        axiom_over("UsesObservedCheckedBuildT", "ObservedCheckedBuildT"),
+    ];
+    let tokens = accepted_tokens(
+        check_core_decl_candidates(CandidateBatch {
+            imports: &[],
+            prior_current_decls: &[],
+            candidates: declarations
+                .iter()
+                .cloned()
+                .map(|declaration| CoreDeclCandidate { declaration })
+                .collect(),
+            limits: generous_limits_with_declarations(2),
+        })
+        .unwrap(),
+    );
+    let module_name = Name::from_dotted("Producer.ObservedCheckedBuild");
+    let ordinary =
+        build_module_cert_from_checked_candidates(module_name.clone(), &[], &tokens).unwrap();
+    let mut observation = CertificatePayloadObservation::default();
+    let observed = build_module_cert_from_checked_candidates_observed(
+        module_name,
+        &[],
+        &tokens,
+        Some(&mut observation),
+    )
+    .unwrap();
+
+    assert_eq!(
+        encode_module_cert(&ordinary).unwrap(),
+        encode_module_cert(&observed).unwrap()
+    );
+    assert_eq!(observation.payloads_frozen, 1);
+    assert_eq!(
+        observation.payload_unique_bytes,
+        observed.logical_retained_bytes_v1()
+    );
+
+    let mut invalid_tokens = tokens;
+    invalid_tokens.reverse();
+    let before = CertificatePayloadObservation {
+        payloads_frozen: 9,
+        ..CertificatePayloadObservation::default()
+    };
+    let mut retained = before;
+    let ordinary_error = build_module_cert_from_checked_candidates(
+        Name::from_dotted("Producer.ObservedCheckedBuild"),
+        &[],
+        &invalid_tokens,
+    )
+    .unwrap_err();
+    let observed_error = build_module_cert_from_checked_candidates_observed(
+        Name::from_dotted("Producer.ObservedCheckedBuild"),
+        &[],
+        &invalid_tokens,
+        Some(&mut retained),
+    )
+    .unwrap_err();
+    assert_eq!(ordinary_error, observed_error);
+    assert_eq!(retained, before);
 }
 
 #[test]
@@ -1651,11 +1717,11 @@ fn producer_checked_decl_interface_matches_certificate_generation_for_imported_a
 
     assert_eq!(
         interface.decl_interface_hash,
-        cert.declarations[0].hashes.decl_interface_hash
+        cert.declarations()[0].hashes.decl_interface_hash
     );
     assert_eq!(
         interface.axiom_dependencies,
-        cert.declarations[0].axiom_dependencies
+        cert.declarations()[0].axiom_dependencies
     );
 }
 
@@ -1807,8 +1873,8 @@ fn prior_chain_fingerprint_changes_for_body_only_certificate_hash_change() {
         &[],
     )
     .unwrap();
-    let decl_a = &cert_a.declarations[0];
-    let decl_b = &cert_b.declarations[0];
+    let decl_a = &cert_a.declarations()[0];
+    let decl_b = &cert_b.declarations()[0];
 
     assert_eq!(
         decl_a.hashes.decl_interface_hash,
@@ -1871,10 +1937,10 @@ fn prior_chain_fingerprint_changes_for_opaque_def_body_only_certificate_hash_cha
         &[],
     )
     .unwrap();
-    let decl_a = &cert_a.declarations[0];
-    let decl_b = &cert_b.declarations[0];
+    let decl_a = &cert_a.declarations()[0];
+    let decl_b = &cert_b.declarations()[0];
 
-    assert_eq!(cert_a.hashes.export_hash, cert_b.hashes.export_hash);
+    assert_eq!(cert_a.hashes().export_hash, cert_b.hashes().export_hash);
     assert_eq!(
         decl_a.hashes.decl_interface_hash,
         decl_b.hashes.decl_interface_hash
@@ -2021,15 +2087,18 @@ fn human_and_ai_producer_sidecars_emit_same_certificate_for_same_core_declaratio
     let ai_bytes = encode_module_cert(&ai_cert).unwrap();
 
     assert_eq!(human_bytes, ai_bytes);
-    assert_eq!(human_cert.hashes, ai_cert.hashes);
-    assert_eq!(human_cert.hashes.export_hash, ai_cert.hashes.export_hash);
+    assert_eq!(human_cert.hashes(), ai_cert.hashes());
     assert_eq!(
-        human_cert.hashes.axiom_report_hash,
-        ai_cert.hashes.axiom_report_hash
+        human_cert.hashes().export_hash,
+        ai_cert.hashes().export_hash
     );
     assert_eq!(
-        human_cert.hashes.certificate_hash,
-        ai_cert.hashes.certificate_hash
+        human_cert.hashes().axiom_report_hash,
+        ai_cert.hashes().axiom_report_hash
+    );
+    assert_eq!(
+        human_cert.hashes().certificate_hash,
+        ai_cert.hashes().certificate_hash
     );
 
     let mut session = VerifierSession::new();
@@ -2100,7 +2169,7 @@ fn checked_candidate_certificate_is_independent_of_cache_sidecar_state() {
     let cache_miss_bytes = encode_module_cert(&cache_miss_cert).unwrap();
 
     assert_eq!(cache_hit_bytes, cache_miss_bytes);
-    assert_eq!(cache_hit_cert.hashes, cache_miss_cert.hashes);
+    assert_eq!(cache_hit_cert.hashes(), cache_miss_cert.hashes());
 
     let mut session = VerifierSession::new();
     verify_module_cert(&cache_hit_bytes, &mut session, &AxiomPolicy::normal()).unwrap();

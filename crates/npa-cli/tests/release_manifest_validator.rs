@@ -5,15 +5,17 @@ use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use npa_api::JsonDocument;
-use npa_cli::release_manifest::validate_release_manifest;
+use npa_cli::release_manifest::{validate_current_release_manifest, validate_release_manifest};
 
 const V0_1_SCHEMA: &str = "npa.generated_artifact_release_manifest.v0.1";
 const V0_2_SCHEMA: &str = "npa.generated_artifact_release_manifest.v0.2";
-const VALIDATION_SCHEMA: &str = "npa.generated_artifact_release_manifest.validation.v0.1";
+const V0_3_SCHEMA: &str = "npa.generated_artifact_release_manifest.v0.3";
+const VALIDATION_SCHEMA: &str = "npa.generated_artifact_release_manifest.validation.v0.2";
 const COMMAND_RESULT_V0_1: &str = "npa.package.command_result.v0.1";
 const COMMAND_RESULT_V0_2: &str = "npa.package.command_result.v0.2";
 const COMMAND_RESULT_V0_3: &str = "npa.package.command_result.v0.3";
 const COMMAND_RESULT_V0_4: &str = "npa.package.command_result.v0.4";
+const COMMAND_RESULT_V0_5: &str = "npa.package.command_result.v0.5";
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -56,6 +58,32 @@ fn run_path(path: &Path, require_v0_2: bool) -> Output {
 
 fn run_fixture(name: &str, require_v0_2: bool) -> Output {
     run_path(&fixture_dir().join(name), require_v0_2)
+}
+
+fn run_current_fixture(name: &str) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_npa-release-manifest-validator"))
+        .arg("--require-v0.3")
+        .arg(fixture_dir().join(name))
+        .current_dir(aggregate_root())
+        .output()
+        .expect("run current release-manifest validator")
+}
+
+fn run_current_document(source: &str) -> Output {
+    let serial = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!(
+        "npa-release-manifest-validator-current-{}-{serial}.json",
+        std::process::id()
+    ));
+    fs::write(&path, source).expect("write temporary current manifest");
+    let output = Command::new(env!("CARGO_BIN_EXE_npa-release-manifest-validator"))
+        .arg("--require-v0.3")
+        .arg(&path)
+        .current_dir(aggregate_root())
+        .output()
+        .expect("run current release-manifest validator");
+    fs::remove_file(&path).expect("remove temporary current manifest");
+    output
 }
 
 fn run_document(source: &str, require_v0_2: bool) -> Output {
@@ -164,7 +192,6 @@ fn positive_fixtures_have_exact_deterministic_classification() {
     );
 
     for name in [
-        "valid-v0.2-current.json",
         "valid-v0.2-in-process.json",
         "valid-v0.2-fast.json",
         "valid-v0.2-external.json",
@@ -174,9 +201,17 @@ fn positive_fixtures_have_exact_deterministic_classification() {
         assert_eq!(stderr(&output), "");
         assert_eq!(
             stdout(&output),
-            expected_success(V0_2_SCHEMA, "checked-v0.2")
+            expected_success(V0_2_SCHEMA, "historical-v0.2")
         );
     }
+
+    let current = run_current_fixture("valid-v0.3-current.json");
+    assert!(current.status.success(), "{}", stderr(&current));
+    assert_eq!(stderr(&current), "");
+    assert_eq!(
+        stdout(&current),
+        expected_success(V0_3_SCHEMA, "checked-v0.3")
+    );
 
     let default_v0_2 = run_fixture("valid-v0.2-in-process.json", false);
     assert!(default_v0_2.status.success(), "{}", stderr(&default_v0_2));
@@ -192,6 +227,25 @@ fn require_v0_2_rejects_historical_without_schema_invalid_claim() {
         "error: historical v0.1 evidence does not satisfy --require-v0.2\n"
     );
     assert!(!stderr(&output).contains("schema-invalid"));
+}
+
+#[test]
+fn require_v0_3_rejects_both_historical_manifest_schemas() {
+    for (name, message) in [
+        (
+            "valid-v0.1.json",
+            "historical v0.1 evidence does not satisfy --require-v0.3",
+        ),
+        (
+            "valid-v0.2-in-process.json",
+            "historical v0.2 evidence does not satisfy --require-v0.3",
+        ),
+    ] {
+        let output = run_current_fixture(name);
+        assert_eq!(output.status.code(), Some(1));
+        assert_eq!(stdout(&output), "");
+        assert!(stderr(&output).contains(message), "{}", stderr(&output));
+    }
 }
 
 #[test]
@@ -215,10 +269,10 @@ fn cli_argument_errors_and_option_separator_are_deterministic() {
 
     let separated = Command::new(env!("CARGO_BIN_EXE_npa-release-manifest-validator"))
         .args([
-            "--require-v0.2",
+            "--require-v0.3",
             "--",
             fixture_dir()
-                .join("valid-v0.2-fast.json")
+                .join("valid-v0.3-current.json")
                 .to_str()
                 .expect("UTF-8 fixture path"),
         ])
@@ -226,6 +280,21 @@ fn cli_argument_errors_and_option_separator_are_deterministic() {
         .output()
         .expect("run validator with option separator");
     assert!(separated.status.success(), "{}", stderr(&separated));
+
+    let conflicting = Command::new(env!("CARGO_BIN_EXE_npa-release-manifest-validator"))
+        .args([
+            "--require-v0.2",
+            "--require-v0.3",
+            fixture_dir()
+                .join("valid-v0.3-current.json")
+                .to_str()
+                .expect("UTF-8 fixture path"),
+        ])
+        .current_dir(aggregate_root())
+        .output()
+        .expect("run validator with conflicting requirements");
+    assert_eq!(conflicting.status.code(), Some(2));
+    assert!(stderr(&conflicting).contains("mutually exclusive"));
 }
 
 #[test]
@@ -292,8 +361,8 @@ fn every_named_negative_fixture_fails_at_its_intended_guard() {
             "must be null for in-process modes",
         ),
         (
-            "invalid-incompatible-cli-version.json",
-            "command_result.schema does not match verification.npa_cli_crate_version",
+            "invalid-unsupported-cli-version.json",
+            "npa_cli_crate_version is unsupported",
         ),
         (
             "invalid-locally-accelerated.json",
@@ -478,6 +547,41 @@ fn reference_commands_reject_parallel_jobs() {
 }
 
 #[test]
+fn release_manifest_rejects_partial_verification_selection_metadata() {
+    let source = fixture("valid-v0.3-current.json");
+    let selected = replace_once(
+        &source,
+        "      \"artifacts\": []\n    },",
+        concat!(
+            "      \"artifacts\": [],\n",
+            "      \"verify_selection\": {",
+            "\"schema\":\"npa.package.verify-selection.v0.1\",",
+            "\"trusted\":false,\"proof_evidence\":false,",
+            "\"mode\":\"modules\",\"outcome\":\"targeted\",",
+            "\"requested_base\":null,\"base_commit\":null,",
+            "\"merge_base\":null,\"head_commit\":null,",
+            "\"changed_path_count\":null,",
+            "\"seed_modules\":{\"attempted\":1,\"retained\":1,\"omitted\":0},",
+            "\"seed_details\":[\"Proofs.Ai.Basic\"],",
+            "\"seed_identity\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",",
+            "\"closure_module_count\":1,",
+            "\"escalation_reasons\":{\"attempted\":0,\"retained\":0,\"omitted\":0},",
+            "\"escalation_details\":[],",
+            "\"escalation_identity\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",",
+            "\"detail_truncated\":false,\"overflowed\":false}\n",
+            "    },"
+        ),
+    );
+
+    let output = run_current_document(&selected);
+    assert_invalid(&output);
+    assert_eq!(
+        stderr(&output),
+        "error: verification.command_result has unknown field 'verify_selection'\n"
+    );
+}
+
+#[test]
 fn package_lock_path_is_bound_to_package_root() {
     let source = fixture("valid-v0.2-fast.json");
     let changed_root = replace_once(
@@ -498,7 +602,7 @@ fn package_lock_path_is_bound_to_package_root() {
 }
 
 #[test]
-fn v0_2_pairs_historical_and_current_cli_command_result_series() {
+fn v0_2_pairs_only_retained_historical_cli_command_result_series() {
     let source = fixture("valid-v0.2-in-process.json");
     for version in ["0.3.0", "0.3.99", "0.4.0", "0.4.12"] {
         let changed = source
@@ -520,7 +624,7 @@ fn v0_2_pairs_historical_and_current_cli_command_result_series() {
         let output = run_document(&changed, true);
         assert!(output.status.success(), "{version}: {}", stderr(&output));
     }
-    for version in ["0.6.0", "0.6.12", "0.7.0", "0.7.12"] {
+    for version in ["0.6.0", "0.6.12"] {
         let changed = source
             .replace(
                 "\"npa_cli_crate_version\": \"0.3.0\"",
@@ -530,35 +634,15 @@ fn v0_2_pairs_historical_and_current_cli_command_result_series() {
         let output = run_document(&changed, true);
         assert!(output.status.success(), "{version}: {}", stderr(&output));
     }
-    for version in ["0.8.0", "0.8.12"] {
-        let changed = source
-            .replace(
-                "\"npa_cli_crate_version\": \"0.3.0\"",
-                &format!("\"npa_cli_crate_version\": \"{version}\""),
-            )
-            .replace(COMMAND_RESULT_V0_1, COMMAND_RESULT_V0_4);
-        let output = run_document(&changed, true);
-        assert!(output.status.success(), "{version}: {}", stderr(&output));
-    }
     for (version, schema) in [
         ("0.3.0", COMMAND_RESULT_V0_2),
         ("0.3.0", COMMAND_RESULT_V0_3),
-        ("0.3.0", COMMAND_RESULT_V0_4),
         ("0.4.12", COMMAND_RESULT_V0_2),
         ("0.4.12", COMMAND_RESULT_V0_3),
-        ("0.4.12", COMMAND_RESULT_V0_4),
         ("0.5.0", COMMAND_RESULT_V0_1),
         ("0.5.0", COMMAND_RESULT_V0_3),
-        ("0.5.0", COMMAND_RESULT_V0_4),
         ("0.6.0", COMMAND_RESULT_V0_1),
         ("0.6.0", COMMAND_RESULT_V0_2),
-        ("0.6.0", COMMAND_RESULT_V0_4),
-        ("0.7.0", COMMAND_RESULT_V0_1),
-        ("0.7.0", COMMAND_RESULT_V0_2),
-        ("0.7.0", COMMAND_RESULT_V0_4),
-        ("0.8.0", COMMAND_RESULT_V0_1),
-        ("0.8.0", COMMAND_RESULT_V0_2),
-        ("0.8.0", COMMAND_RESULT_V0_3),
     ] {
         let changed = source
             .replace(
@@ -573,6 +657,77 @@ fn v0_2_pairs_historical_and_current_cli_command_result_series() {
             "error: verification.command_result.schema does not match verification.npa_cli_crate_version\n"
         );
     }
+}
+
+#[test]
+fn retired_and_current_hosts_cannot_be_smuggled_into_v0_2_manifests() {
+    let source = fixture("valid-v0.2-in-process.json");
+    for (version, formerly_matching_schema) in [
+        ("0.7.0", COMMAND_RESULT_V0_3),
+        ("0.7.12", COMMAND_RESULT_V0_3),
+        ("0.8.0", COMMAND_RESULT_V0_4),
+        ("0.8.12", COMMAND_RESULT_V0_4),
+        ("0.9.0", COMMAND_RESULT_V0_5),
+    ] {
+        let changed = source
+            .replace(
+                "\"npa_cli_crate_version\": \"0.3.0\"",
+                &format!("\"npa_cli_crate_version\": \"{version}\""),
+            )
+            .replace(COMMAND_RESULT_V0_1, formerly_matching_schema);
+        let output = run_document(&changed, true);
+        assert_invalid(&output);
+        let expected = if version == "0.9.0" {
+            "npa_cli_crate_version is unsupported for manifest.schema"
+        } else {
+            "npa_cli_crate_version is unsupported"
+        };
+        assert!(stderr(&output).contains(expected), "{}", stderr(&output));
+        assert!(!stderr(&output).contains("command_result.schema"));
+    }
+}
+
+#[test]
+fn v0_3_accepts_only_the_exact_current_host_and_result_schema() {
+    let source = fixture("valid-v0.3-current.json");
+    assert!(run_current_document(&source).status.success());
+
+    for version in ["0.7.0", "0.8.0", "0.9.1", "1.0.0"] {
+        let changed = source.replace(
+            "\"npa_cli_crate_version\": \"0.9.0\"",
+            &format!("\"npa_cli_crate_version\": \"{version}\""),
+        );
+        let output = run_current_document(&changed);
+        assert_invalid(&output);
+        assert!(
+            stderr(&output).contains("npa_cli_crate_version is unsupported"),
+            "{}",
+            stderr(&output)
+        );
+    }
+
+    for schema in [
+        COMMAND_RESULT_V0_1,
+        COMMAND_RESULT_V0_2,
+        COMMAND_RESULT_V0_3,
+    ] {
+        let changed = source.replace(COMMAND_RESULT_V0_5, schema);
+        let output = run_current_document(&changed);
+        assert_invalid(&output);
+        assert!(
+            stderr(&output).contains("command_result.schema does not match"),
+            "{}",
+            stderr(&output)
+        );
+    }
+    let removed_schema = source.replace(COMMAND_RESULT_V0_5, COMMAND_RESULT_V0_4);
+    let output = run_current_document(&removed_schema);
+    assert_invalid(&output);
+    assert!(
+        stderr(&output).contains("command_result.schema is unsupported"),
+        "{}",
+        stderr(&output)
+    );
 }
 
 #[test]
@@ -742,7 +897,7 @@ fn relative_direct_manifest_path_and_timing_identity_are_supported() {
     assert_eq!(stderr(&output), "");
     assert_eq!(
         stdout(&output),
-        expected_success(V0_2_SCHEMA, "checked-v0.2")
+        expected_success(V0_2_SCHEMA, "historical-v0.2")
     );
 
     let invalid = replace_once(
@@ -817,4 +972,7 @@ fn duplicate_fields_and_shell_tokenization_are_rejected_or_supported() {
         "--manifest-path 'npa-core/Cargo.toml'",
     );
     validate_release_manifest(&quoted, true).expect("quoted command path remains valid");
+
+    let current = fixture("valid-v0.3-current.json");
+    validate_current_release_manifest(&current).expect("current manifest remains valid");
 }

@@ -1,0 +1,1 @@
+{"schema":"npa.certificate-term-dag-materialization.fixture.v0.1","id":"sparse-import","kind":"sparse-import","artifact_kind":"runtime-generation-recipe","production_adapter":"selected-plan-v1","case_ids":["selected-64"],"generator":"canonical-graph-v2"}

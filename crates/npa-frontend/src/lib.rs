@@ -23,6 +23,9 @@ mod resolver;
 mod span;
 mod term_source;
 
+/// Semantic ABI of Human authoring interfaces consumed across cache boundaries.
+pub const HUMAN_AUTHORING_INTERFACE_ABI: &str = "npa.frontend.human_authoring_interface_abi.v2";
+
 /// Source-level reducibility selected for a definition item.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum DefinitionReducibility {
@@ -92,7 +95,9 @@ pub use equation::{
     human_equation_constructor_family_table_from_resolved_module,
     human_equation_constructor_order_from_resolved_module, human_equation_global_ref_sort_key,
     lower_human_equation_decision_tree_to_core,
+    lower_human_equation_decision_tree_to_core_with_sharing_validator,
     lower_human_equation_decision_tree_to_core_with_theorems,
+    lower_human_equation_decision_tree_to_core_with_theorems_and_sharing_validator,
     normalize_human_equation_pattern_matrix,
     normalize_human_equation_pattern_matrix_with_constructor_order, HumanEquationBudget,
     HumanEquationBudgetError, HumanEquationBudgetField, HumanEquationBudgetUsage,
@@ -108,19 +113,20 @@ pub use equation::{
     HumanEquationDecisionTree, HumanEquationDecisionTreeError, HumanEquationDecisionTreeMetrics,
     HumanEquationDecisionTreeNode, HumanEquationDecisionTreeResult, HumanEquationEqRecTransport,
     HumanEquationHelperCandidate, HumanEquationHelperSplitPlan, HumanEquationImpossibleBranchFact,
-    HumanEquationLoweringBinder, HumanEquationLoweringError, HumanEquationLoweringMetrics,
-    HumanEquationLoweringProfile, HumanEquationLoweringResult, HumanEquationMatrixError,
-    HumanEquationMeasureDecreaseObligation, HumanEquationMeasureLoweringPlan,
-    HumanEquationMeasureLoweringStrategy, HumanEquationMissingConstructorSet,
-    HumanEquationMutualCycle, HumanEquationPatternMatrix, HumanEquationPatternMatrixCell,
-    HumanEquationPatternMatrixColumn, HumanEquationPatternMatrixColumnPath,
-    HumanEquationPatternMatrixConstructor, HumanEquationPatternMatrixConstructorSet,
-    HumanEquationPatternMatrixPathSegment, HumanEquationPatternMatrixRow,
-    HumanEquationPatternMatrixRowKind, HumanEquationPatternMatrixRowProvenance,
-    HumanEquationRecursionBlockResult, HumanEquationRecursionDefinition,
-    HumanEquationRecursionDiagnostic, HumanEquationRecursionDiagnosticKind,
-    HumanEquationRecursionGraph, HumanEquationRecursionResult, HumanEquationRecursiveCall,
-    HumanEquationRecursorLoweringProfile, HumanEquationStructuralDecreaseEvidence,
+    HumanEquationKernelSharingValidator, HumanEquationLoweringBinder, HumanEquationLoweringError,
+    HumanEquationLoweringMetrics, HumanEquationLoweringProfile, HumanEquationLoweringResult,
+    HumanEquationMatrixError, HumanEquationMeasureDecreaseObligation,
+    HumanEquationMeasureLoweringPlan, HumanEquationMeasureLoweringStrategy,
+    HumanEquationMissingConstructorSet, HumanEquationMutualCycle, HumanEquationPatternMatrix,
+    HumanEquationPatternMatrixCell, HumanEquationPatternMatrixColumn,
+    HumanEquationPatternMatrixColumnPath, HumanEquationPatternMatrixConstructor,
+    HumanEquationPatternMatrixConstructorSet, HumanEquationPatternMatrixPathSegment,
+    HumanEquationPatternMatrixRow, HumanEquationPatternMatrixRowKind,
+    HumanEquationPatternMatrixRowProvenance, HumanEquationRecursionBlockResult,
+    HumanEquationRecursionDefinition, HumanEquationRecursionDiagnostic,
+    HumanEquationRecursionDiagnosticKind, HumanEquationRecursionGraph,
+    HumanEquationRecursionResult, HumanEquationRecursiveCall, HumanEquationRecursorLoweringProfile,
+    HumanEquationSharingValidator, HumanEquationStructuralDecreaseEvidence,
     HumanEquationTheoremBudget, HumanEquationTheoremBudgetError, HumanEquationTheoremBudgetField,
     HumanEquationTheoremBudgetUsage, HumanEquationTheoremPlan, HumanEquationTheoremProofStrategy,
     HumanEquationTheoremRequest, HumanEquationTheoremSource, HumanEquationTheoremSpec,
@@ -143,7 +149,8 @@ pub use human::{
     HUMAN_DECLARATION_OBSERVATION_LIMIT,
 };
 pub use human_diagnostic::{
-    HumanDiagnostic, HumanDiagnosticConversionContext, HumanDiagnosticKind, HumanDiagnosticPayload,
+    HumanDelimiterDiagnostic, HumanDelimiterDiagnosticKind, HumanDiagnostic,
+    HumanDiagnosticConversionContext, HumanDiagnosticKind, HumanDiagnosticPayload,
     HumanDiagnosticPhase, HumanDiagnosticSeverity, HumanHoleGoal, HumanHoleGoalLocal,
     HumanKernelComparisonPath, HumanKernelDeclarationSummary, HumanKernelDeclarationWork,
     HumanKernelDeltaHotsetEntry, HumanKernelDeltaHotsetSummary, HumanKernelFuelDiagnostic,
@@ -152,8 +159,10 @@ pub use human_diagnostic::{
     HumanUnsolvedMeta, HumanUnsolvedMetaKind,
 };
 pub use human_elaborator::{
+    certificate_authoring_import_selection_for_human_core_module,
     certificate_imports_for_human_core_module,
     collect_human_by_proof_targets_with_source_interfaces,
+    compile_human_source_to_authoring_certificate_output_with_available_imports_and_axiom_policy,
     compile_human_source_to_built_certificate_only_with_available_import_refs,
     compile_human_source_to_built_certificate_only_with_import_refs,
     compile_human_source_to_built_certificate_output_with_available_import_refs,
@@ -175,16 +184,19 @@ pub use human_elaborator::{
     compile_human_source_to_observed_certificate_output_with_import_refs_and_axiom_policy,
     compile_human_source_to_observed_certificate_output_with_source_interfaces,
     compile_human_source_to_observed_certificate_output_with_source_interfaces_and_axiom_policy,
-    elaborate_human_module, elaborate_human_tactic_term_check, elaborate_human_tactic_term_infer,
-    prepare_human_proof_start_core_with_source_interfaces,
+    elaborate_human_module, elaborate_human_module_with_authoring_imports,
+    elaborate_human_module_with_available_authoring_imports, elaborate_human_tactic_term_check,
+    elaborate_human_tactic_term_infer, prepare_human_proof_start_core_with_source_interfaces,
     prepare_human_proof_start_core_with_source_interfaces_and_by_proofs,
-    search_human_typeclass_from_source, HumanBuiltCertificateCompileOutput,
-    HumanBuiltCertificateOnlyCompileOutput, HumanByProofCore, HumanByProofTarget,
-    HumanByProofTargetsOutput, HumanCertificateCompileOutput, HumanCoreCompileOutput,
-    HumanObservedBuiltCertificateCompileOutput, HumanObservedBuiltCertificateOnlyCompileOutput,
-    HumanObservedCertificateCompileOutput, HumanProofStartCore, HumanProofStartCoreOutput,
-    HumanProofStartCoreWithProofsRequest, HumanTacticTermCheckOutput, HumanTacticTermElabContext,
-    HumanTacticTermElabContextRequest, HumanTacticTermInferOutput,
+    search_human_typeclass_from_source, source_interface_with_certificate_hashes,
+    HumanAuthoringCertificateCompileOutput, HumanAuthoringCertificateImportSelection,
+    HumanBuiltCertificateCompileOutput, HumanBuiltCertificateOnlyCompileOutput, HumanByProofCore,
+    HumanByProofTarget, HumanByProofTargetsOutput, HumanCertificateCompileOutput,
+    HumanCoreCompileOutput, HumanObservedBuiltCertificateCompileOutput,
+    HumanObservedBuiltCertificateOnlyCompileOutput, HumanObservedCertificateCompileOutput,
+    HumanProofStartCore, HumanProofStartCoreOutput, HumanProofStartCoreWithProofsRequest,
+    HumanTacticTermCheckOutput, HumanTacticTermElabContext, HumanTacticTermElabContextRequest,
+    HumanTacticTermInferOutput,
 };
 pub use human_extraction::{
     collect_human_source_declaration_families, extract_human_declaration_source,
@@ -195,10 +207,13 @@ pub use human_extraction::{
 };
 pub use human_parser::{
     parse_human_import_spans, parse_human_module, parse_human_module_with_source_interfaces,
-    parse_human_name_spans, parse_human_term, HumanImportSpan, HumanNameSpan,
+    parse_human_name_spans, parse_human_term, validate_human_source_lexical_structure,
+    HumanImportSpan, HumanNameSpan,
 };
 pub use human_resolver::{
     bind_human_source_interface_to_verified_import, resolve_human_module,
+    resolve_human_module_with_authoring_imports,
+    resolve_human_module_with_authoring_imports_and_source_interfaces,
     resolve_human_module_with_source_interfaces, HumanEquationSemanticIdentity, HumanGlobalRef,
     HumanGlobalScope, HumanGlobalScopeEntry, HumanResolvedEquationItem, HumanResolvedEquationRow,
     HumanResolvedMeasureDecreaseProof, HumanResolvedName, HumanResolvedNameUse,
@@ -216,8 +231,8 @@ pub use machine::{
 };
 pub use parser::{parse_machine_module, parse_machine_term};
 pub use resolver::{
-    resolve_machine_module, resolve_machine_module_with_options, ResolvedMachineModule,
-    VerifiedDependency, VerifiedExport, VerifiedImport,
+    resolve_machine_module, resolve_machine_module_with_options, HumanAuthoringImport,
+    ResolvedMachineModule, VerifiedDependency, VerifiedExport, VerifiedImport,
 };
 pub use span::{ByteOffset, FileId, Span};
 pub use term_source::{

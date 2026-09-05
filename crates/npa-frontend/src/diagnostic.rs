@@ -31,7 +31,7 @@ pub enum MachineDiagnosticKind {
     ImplicitArgumentRequired,
     MissingExplicitUniverse,
     UnannotatedBinder,
-    UnannotatedLet,
+    RemovedTermLet,
     HoleNotAllowed,
     ExpectedFunctionType,
     ExpectedSort,
@@ -117,6 +117,14 @@ impl MachineDiagnostic {
 
     pub fn parse(primary_span: Span, message: impl Into<String>) -> Self {
         Self::error(MachineDiagnosticKind::ParseError, primary_span, message)
+    }
+
+    pub fn removed_term_let(primary_span: Span) -> Self {
+        Self::error(
+            MachineDiagnosticKind::RemovedTermLet,
+            primary_span,
+            "term-level `let` has been removed; substitute the value directly, apply an explicitly typed `fun`, use `have` for a local proof, or introduce a named module-level declaration",
+        )
     }
 
     pub fn unsupported_syntax(primary_span: Span, syntax: impl Into<String>) -> Self {

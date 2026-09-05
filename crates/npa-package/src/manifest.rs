@@ -66,6 +66,35 @@ pub struct PackageManifest {
     pub imports: Option<Vec<PackageExternalImport>>,
 }
 
+impl PackageManifest {
+    /// Return the content-addressable identity of one local module without
+    /// retaining its ephemeral manifest index.
+    pub fn local_module_identity(&self, module_index: usize) -> Option<PackageModuleIdentity> {
+        self.modules
+            .get(module_index)
+            .map(|module| PackageModuleIdentity {
+                package: self.package.clone(),
+                version: self.version.clone(),
+                module: module.module.clone(),
+            })
+    }
+}
+
+/// Stable origin identity of a local package module.
+///
+/// This type deliberately excludes manifest indices, graph positions, and
+/// filesystem paths so callers cannot accidentally persist traversal state as
+/// module identity.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct PackageModuleIdentity {
+    /// Owning package id.
+    pub package: PackageId,
+    /// Exact owning package version.
+    pub version: PackageVersion,
+    /// Canonical module name.
+    pub module: Name,
+}
+
 /// Package-level axiom policy.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PackagePolicy {

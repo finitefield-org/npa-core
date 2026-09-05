@@ -515,13 +515,6 @@ pub enum HumanExpr {
         body: Box<HumanExpr>,
         span: Span,
     },
-    Let {
-        name: HumanName,
-        ty: Option<Box<HumanExpr>>,
-        value: Box<HumanExpr>,
-        body: Box<HumanExpr>,
-        span: Span,
-    },
     Annot {
         expr: Box<HumanExpr>,
         ty: Box<HumanExpr>,
@@ -551,7 +544,6 @@ impl HumanExpr {
             | Self::App { span, .. }
             | Self::Lam { span, .. }
             | Self::Pi { span, .. }
-            | Self::Let { span, .. }
             | Self::Annot { span, .. }
             | Self::Arrow { span, .. }
             | Self::Hole { span, .. }
@@ -581,19 +573,6 @@ impl HumanExpr {
             },
             Self::Pi { binders, body, .. } => Self::Pi {
                 binders,
-                body,
-                span,
-            },
-            Self::Let {
-                name,
-                ty,
-                value,
-                body,
-                ..
-            } => Self::Let {
-                name,
-                ty,
-                value,
                 body,
                 span,
             },
@@ -877,6 +856,9 @@ pub struct HumanCompilationObservations {
     pub attempted: u64,
     pub omitted: u64,
     pub overflowed: bool,
+    /// Source-free built-certificate verification only; zero when that phase
+    /// was not requested or passive measurement was disabled.
+    pub source_free_verification_elapsed_ns: u64,
 }
 
 #[cfg(test)]

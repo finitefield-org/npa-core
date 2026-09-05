@@ -140,7 +140,7 @@ fn promotion_prepare_materialize_transport_and_registry_end_to_end() {
             )
         })
         .collect::<Vec<_>>();
-    assert_eq!(theorems.len(), 11);
+    assert_eq!(theorems.len(), 9);
 
     let mut review_inputs = Vec::new();
     let mut reviews = Vec::new();
@@ -241,7 +241,7 @@ fn promotion_prepare_materialize_transport_and_registry_end_to_end() {
         },
     )));
     assert_eq!(in_place.status, CommandStatus::Passed, "{in_place:?}");
-    assert!(!fixture.source.join("l2-acceptance.json.lock").exists());
+    assert!(fixture.source.join("l2-acceptance.json.lock").is_file());
 
     let mapping_path = PathBuf::from("l2-transports/reduction.transport-request.json");
     let request = L2NamespaceTransportRequest {
@@ -782,8 +782,11 @@ fn run_recovery_case(
     }
 
     let promotion_id = package_file_hash(label.as_bytes());
+    let canonical_target = fs::canonicalize(&target).unwrap();
+    let target_path_hash = package_file_hash(canonical_target.to_string_lossy().as_bytes());
     let transaction = root.join(format!(
-        ".npa-promotion-transaction-{}",
+        ".npa-promotion-transaction-{}-{}",
+        format_package_hash(&target_path_hash).trim_start_matches("sha256:"),
         format_package_hash(&promotion_id).trim_start_matches("sha256:")
     ));
     fs::create_dir_all(transaction.join("old")).unwrap();
@@ -813,14 +816,11 @@ fn run_recovery_case(
             }
         })
         .collect();
-    let canonical_target = fs::canonicalize(&target).unwrap();
     let mut journal = PromotionTransactionJournal {
         schema: MATHLIB_PROMOTION_TRANSACTION_SCHEMA.to_owned(),
         promotion_id,
         phase: PromotionTransactionPhase::Tracked,
-        target_canonical_path_hash: package_file_hash(
-            canonical_target.to_string_lossy().as_bytes(),
-        ),
+        target_canonical_path_hash: target_path_hash,
         transaction_state,
         rows,
         journal_hash: PackageHash::new([0; 32]),

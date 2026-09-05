@@ -241,7 +241,6 @@ impl Parser {
         match self.peek_kind() {
             TokenKind::Fun => self.parse_lam(),
             TokenKind::Forall => self.parse_pi(),
-            TokenKind::Let => self.parse_let(),
             _ => self.parse_annotation(),
         }
     }
@@ -295,35 +294,6 @@ impl Parser {
 
         Ok(MachineTerm::Pi {
             binders,
-            body: Box::new(body),
-            span,
-        })
-    }
-
-    fn parse_let(&mut self) -> Result<MachineTerm> {
-        let start = self.expect_let()?;
-        let (name, name_span) = self.expect_ident("expected let binding name")?;
-
-        if matches!(self.peek_kind(), TokenKind::ColonEq) {
-            return Err(MachineDiagnostic::error(
-                MachineDiagnosticKind::UnannotatedLet,
-                name_span,
-                "Machine Surface let bindings must have an explicit type annotation",
-            ));
-        }
-
-        self.expect_colon()?;
-        let ty = self.parse_term()?;
-        self.expect_colon_eq()?;
-        let value = self.parse_term()?;
-        self.expect_in()?;
-        let body = self.parse_term()?;
-        let span = start.join(body.span());
-
-        Ok(MachineTerm::Let {
-            name,
-            ty: Box::new(ty),
-            value: Box::new(value),
             body: Box::new(body),
             span,
         })
@@ -628,14 +598,6 @@ impl Parser {
         self.expect_unit(TokenKindName::Forall, "expected forall")
     }
 
-    fn expect_let(&mut self) -> Result<Span> {
-        self.expect_unit(TokenKindName::Let, "expected let")
-    }
-
-    fn expect_in(&mut self) -> Result<Span> {
-        self.expect_unit(TokenKindName::In, "expected in")
-    }
-
     fn expect_prop(&mut self) -> Result<Span> {
         self.expect_unit(TokenKindName::Prop, "expected Prop")
     }
@@ -705,8 +667,6 @@ fn reserved_name_component_spelling(kind: &TokenKind) -> Option<&'static str> {
         TokenKind::Theorem => "theorem",
         TokenKind::Fun => "fun",
         TokenKind::Forall => "forall",
-        TokenKind::Let => "let",
-        TokenKind::In => "in",
         TokenKind::Prop => "Prop",
         TokenKind::Type => "Type",
         TokenKind::Sort => "Sort",
@@ -735,8 +695,6 @@ enum TokenKindName {
     Theorem,
     Fun,
     Forall,
-    Let,
-    In,
     Prop,
     Type,
     Sort,
@@ -762,8 +720,6 @@ impl TokenKindName {
                 | (Self::Theorem, TokenKind::Theorem)
                 | (Self::Fun, TokenKind::Fun)
                 | (Self::Forall, TokenKind::Forall)
-                | (Self::Let, TokenKind::Let)
-                | (Self::In, TokenKind::In)
                 | (Self::Prop, TokenKind::Prop)
                 | (Self::Type, TokenKind::Type)
                 | (Self::Sort, TokenKind::Sort)
@@ -922,18 +878,6 @@ mod tests {
                     .join(","),
                 term_snapshot(body)
             ),
-            MachineTerm::Let {
-                name,
-                ty,
-                value,
-                body,
-                ..
-            } => format!(
-                "let({name}:{}={}; {})",
-                term_snapshot(ty),
-                term_snapshot(value),
-                term_snapshot(body)
-            ),
             MachineTerm::Annot { expr, ty, .. } => {
                 format!("({} : {})", term_snapshot(expr), term_snapshot(ty))
             }
@@ -988,6 +932,32 @@ mod tests {
             &universe_args.as_ref().expect("universe args")[0],
             MachineLevel::Succ { .. }
         ));
+    }
+
+    #[test]
+    fn parses_in_as_an_identifier_in_machine_surface_positions() {
+        let module = parse("import in.in\ndef in.{in} (in : Sort in) : in := in");
+
+        let MachineItem::Import { module: import, .. } = &module.items[0] else {
+            panic!("expected import item")
+        };
+        assert_eq!(import.as_dotted(), "in.in");
+        let MachineItem::Def(definition) = &module.items[1] else {
+            panic!("expected definition")
+        };
+        let declaration = &definition.declaration;
+        assert_eq!(declaration.name.as_dotted(), "in");
+        assert_eq!(declaration.universe_params[0].name, "in");
+        assert_eq!(declaration.binders[0].name, "in");
+        assert!(matches!(
+            &declaration.binders[0].ty,
+            MachineTerm::Sort {
+                level: MachineLevel::Param { name, .. },
+                ..
+            } if name == "in"
+        ));
+        assert_eq!(ident_name(&declaration.ty), "in");
+        assert_eq!(ident_name(&declaration.value), "in");
     }
 
     #[test]
@@ -1109,10 +1079,9 @@ mod tests {
     }
 
     #[test]
-    fn parses_typed_fun_forall_let_and_annotation() {
-        let module = parse(
-            "def Test.f : forall (A : Sort 1), A := fun (A : Sort 1) => let x : A := (x : A) in x",
-        );
+    fn parses_typed_fun_forall_and_annotation() {
+        let module =
+            parse("def Test.f : forall (A : Sort 1), Sort 1 := fun (A : Sort 1) => (A : Sort 1)");
 
         let MachineItem::Def(definition) = &module.items[0] else {
             panic!("expected def item");
@@ -1122,10 +1091,7 @@ mod tests {
         let MachineTerm::Lam { body, .. } = &decl.value else {
             panic!("expected lambda value");
         };
-        let MachineTerm::Let { value, .. } = body.as_ref() else {
-            panic!("expected let body");
-        };
-        assert!(matches!(value.as_ref(), MachineTerm::Annot { .. }));
+        assert!(matches!(body.as_ref(), MachineTerm::Annot { .. }));
     }
 
     #[test]
@@ -1147,7 +1113,7 @@ def Test.id.{u} (A : Sort u) (x : A) : A := (x : A)";
 import Std.Nat.Basic
 def Test.id.{u} (A : Sort u) (x : A) : A := x
 theorem Test.self_eq (n : Nat) : Eq.{1} Nat n n := @Eq.refl.{1} Nat n
-def Test.f : forall (A : Sort 1), A := fun (A : Sort 1) => let x : A := (x : A) in x",
+def Test.f : forall (A : Sort 1), Sort 1 := fun (A : Sort 1) => (A : Sort 1)",
         );
 
         assert_eq!(
@@ -1156,7 +1122,7 @@ def Test.f : forall (A : Sort 1), A := fun (A : Sort 1) => let x : A := (x : A) 
                 "import Std.Nat.Basic",
                 "def Test.id.{u}[A:Sort(u),x:A]:=A := x",
                 "theorem Test.self_eq.{}[n:Nat]:=app(app(app(Eq.{1}, Nat), n), n) := app(app(@Eq.refl.{1}, Nat), n)",
-                "def Test.f.{}[]:=forall(A:Sort(1); A) := fun(A:Sort(1); let(x:A=(x : A); x))",
+                "def Test.f.{}[]:=forall(A:Sort(1); Sort(1)) := fun(A:Sort(1); (A : Sort(1)))",
             ]
         );
     }
@@ -1305,10 +1271,34 @@ def Test.f : forall (A : Sort 1), A := fun (A : Sort 1) => let x : A := (x : A) 
     }
 
     #[test]
-    fn rejects_unannotated_let() {
+    fn rejects_removed_term_let_with_exact_span_for_typed_and_untyped_forms() {
+        for source in [
+            "def Test.x : Nat := let x := Nat.zero in x",
+            "def Test.x : Nat := let x : Nat := Nat.zero in x",
+            "def let : Nat := Nat.zero",
+        ] {
+            let start = source.find("let").expect("fixture contains retired lexeme") as u32;
+            let diagnostic = parse_machine_module(FileId(9), source)
+                .expect_err("every complete `let` lexeme should be rejected");
+            assert_eq!(diagnostic.kind, MachineDiagnosticKind::RemovedTermLet);
+            assert_eq!(
+                diagnostic.primary_span,
+                Span::new(FileId(9), start, start + 3)
+            );
+        }
+    }
+
+    #[test]
+    fn rejection_only_machine_fixture_reports_removed_term_let() {
+        let source = include_str!("../../../testdata/removed-term-let/machine.npa");
+        let start = source.find("let").expect("fixture contains retired lexeme") as u32;
+        let diagnostic = parse_machine_module(FileId(12), source)
+            .expect_err("rejection-only fixture must not become accepted source");
+
+        assert_eq!(diagnostic.kind, MachineDiagnosticKind::RemovedTermLet);
         assert_eq!(
-            parse_err("def Test.x : Nat := let x := Nat.zero in x"),
-            MachineDiagnosticKind::UnannotatedLet
+            diagnostic.primary_span,
+            Span::new(FileId(12), start, start + 3)
         );
     }
 

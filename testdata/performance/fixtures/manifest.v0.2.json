@@ -1,0 +1,532 @@
+{
+  "schema": "npa.performance.fixtures.v0.2",
+  "scenarios": [
+    {
+      "id": "compact-package-fast",
+      "kind": "warmed-checked-artifact-verifier",
+      "package_root": "testdata/package/npa-std",
+      "verifier": "fast",
+      "cache_policy": "disabled",
+      "warmup": 1,
+      "samples": 3,
+      "notes": "Compact two-module checked-artifact fixture; process is warm after one unmeasured run, OS filesystem pages are not claimed cold."
+    },
+    {
+      "id": "targeted-build-certs-small-off",
+      "kind": "targeted-build-certs",
+      "package_root": "generated/targeted-build-certs-small",
+      "verifier": "build-certs-check",
+      "cache_policy": "off",
+      "warmup": 1,
+      "samples": 5,
+      "support_module_count": 2,
+      "target_module_count": 1,
+      "target_edit": "append-comment-without-support-identity-change",
+      "population_modules": [],
+      "removed_support_modules": [],
+      "notes": "Generated two-support-module chain plus one edited target; every sample runs in a fresh process with a fresh explicit cache root."
+    },
+    {
+      "id": "targeted-build-certs-small-read-through-cold",
+      "kind": "targeted-build-certs",
+      "package_root": "generated/targeted-build-certs-small",
+      "verifier": "build-certs-check",
+      "cache_policy": "read-through-cold",
+      "warmup": 1,
+      "samples": 5,
+      "support_module_count": 2,
+      "target_module_count": 1,
+      "target_edit": "append-comment-without-support-identity-change",
+      "population_modules": [],
+      "removed_support_modules": [],
+      "notes": "Generated two-support-module chain plus one edited target; every measured consumer gets an empty fresh explicit cache root."
+    },
+    {
+      "id": "targeted-build-certs-small-read-through-warm",
+      "kind": "targeted-build-certs",
+      "package_root": "generated/targeted-build-certs-small",
+      "verifier": "build-certs-check",
+      "cache_policy": "read-through-warm",
+      "warmup": 1,
+      "samples": 5,
+      "support_module_count": 2,
+      "target_module_count": 1,
+      "target_edit": "append-comment-without-support-identity-change",
+      "population_modules": ["Fixture.Small.Target"],
+      "removed_support_modules": [],
+      "notes": "Generated two-support-module chain plus one edited target; an unmeasured producer process populates each sample root before a distinct measured consumer process."
+    },
+    {
+      "id": "targeted-build-certs-large-off",
+      "kind": "targeted-build-certs",
+      "package_root": "generated/targeted-build-certs-large",
+      "verifier": "build-certs-check",
+      "cache_policy": "off",
+      "warmup": 1,
+      "samples": 5,
+      "support_module_count": 24,
+      "target_module_count": 1,
+      "target_edit": "append-comment-without-support-identity-change",
+      "population_modules": [],
+      "removed_support_modules": [],
+      "notes": "Generated 24-support-module chain plus one edited target; every sample runs in a fresh process with a fresh explicit cache root."
+    },
+    {
+      "id": "targeted-build-certs-large-read-through-cold",
+      "kind": "targeted-build-certs",
+      "package_root": "generated/targeted-build-certs-large",
+      "verifier": "build-certs-check",
+      "cache_policy": "read-through-cold",
+      "warmup": 1,
+      "samples": 5,
+      "support_module_count": 24,
+      "target_module_count": 1,
+      "target_edit": "append-comment-without-support-identity-change",
+      "population_modules": [],
+      "removed_support_modules": [],
+      "notes": "Generated 24-support-module chain plus one edited target; every measured consumer gets an empty fresh explicit cache root."
+    },
+    {
+      "id": "targeted-build-certs-large-read-through-warm",
+      "kind": "targeted-build-certs",
+      "package_root": "generated/targeted-build-certs-large",
+      "verifier": "build-certs-check",
+      "cache_policy": "read-through-warm",
+      "warmup": 1,
+      "samples": 5,
+      "support_module_count": 24,
+      "target_module_count": 1,
+      "target_edit": "append-comment-without-support-identity-change",
+      "population_modules": ["Fixture.Large.Target"],
+      "removed_support_modules": [],
+      "notes": "Generated 24-support-module chain plus one edited target; an unmeasured producer process populates each sample root before a distinct measured consumer process."
+    },
+    {
+      "id": "targeted-build-certs-small-local-hit-cold",
+      "kind": "targeted-build-certs",
+      "package_root": "generated/targeted-build-certs-small",
+      "verifier": "build-certs-check",
+      "cache_policy": "local-hit-cold",
+      "warmup": 1,
+      "samples": 5,
+      "support_module_count": 2,
+      "target_module_count": 1,
+      "target_edit": "append-comment-without-support-identity-change",
+      "population_modules": [],
+      "removed_support_modules": [],
+      "notes": "Fresh local-hit consumer process with an empty explicit cache root; eligible live miss subtrees may be published after live checking."
+    },
+    {
+      "id": "targeted-build-certs-small-local-hit-warm",
+      "kind": "targeted-build-certs",
+      "package_root": "generated/targeted-build-certs-small",
+      "verifier": "build-certs-check",
+      "cache_policy": "local-hit-warm",
+      "warmup": 1,
+      "samples": 5,
+      "support_module_count": 2,
+      "target_module_count": 1,
+      "target_edit": "append-comment-without-support-identity-change",
+      "population_modules": ["Fixture.Small.Target"],
+      "removed_support_modules": [],
+      "notes": "A distinct unmeasured targeted read-through process covers both eligible support nodes before each measured local-hit consumer."
+    },
+    {
+      "id": "targeted-build-certs-large-local-hit-cold",
+      "kind": "targeted-build-certs",
+      "package_root": "generated/targeted-build-certs-large",
+      "verifier": "build-certs-check",
+      "cache_policy": "local-hit-cold",
+      "warmup": 1,
+      "samples": 5,
+      "support_module_count": 24,
+      "target_module_count": 1,
+      "target_edit": "append-comment-without-support-identity-change",
+      "population_modules": [],
+      "removed_support_modules": [],
+      "notes": "Fresh local-hit consumer process with an empty explicit cache root; eligible live miss subtrees may be published after live checking."
+    },
+    {
+      "id": "targeted-build-certs-large-local-hit-partially-warm",
+      "kind": "targeted-build-certs",
+      "package_root": "generated/targeted-build-certs-large",
+      "verifier": "build-certs-check",
+      "cache_policy": "local-hit-partially-warm",
+      "warmup": 1,
+      "samples": 5,
+      "support_module_count": 24,
+      "target_module_count": 1,
+      "target_edit": "append-comment-without-support-identity-change",
+      "population_modules": ["Fixture.Large.Target"],
+      "removed_support_modules": ["Fixture.Large.Support12"],
+      "notes": "A distinct unmeasured targeted read-through process first covers every eligible support node; the harness then removes only Support12 from the temporary cache so the measured local-hit run retains 11 hits, bypasses 12 predecessor hits, and live-checks the 13-node promoted subtree."
+    },
+    {
+      "id": "targeted-build-certs-large-local-hit-fully-warm",
+      "kind": "targeted-build-certs",
+      "package_root": "generated/targeted-build-certs-large",
+      "verifier": "build-certs-check",
+      "cache_policy": "local-hit-fully-warm",
+      "warmup": 1,
+      "samples": 5,
+      "support_module_count": 24,
+      "target_module_count": 1,
+      "target_edit": "append-comment-without-support-identity-change",
+      "population_modules": ["Fixture.Large.Target"],
+      "removed_support_modules": [],
+      "notes": "A distinct unmeasured targeted read-through process covers every eligible support node before each measured local-hit consumer."
+    },
+    {
+      "id": "package.verifier.process_memo_scope.v1.small.empty.disabled.j1.off",
+      "kind": "package-verifier-process-memo-scope",
+      "package_root": "testdata/package/npa-std",
+      "verifier": "fast",
+      "cache_policy": "disabled",
+      "warmup": 1,
+      "samples": 7,
+      "notes": "Closed empty-selection process-memo-disabled small-package profile."
+    },
+    {
+      "id": "package.verifier.process_memo_scope.v1.small.leaf.warm.j1.off",
+      "kind": "package-verifier-process-memo-scope",
+      "package_root": "testdata/package/npa-std",
+      "verifier": "fast",
+      "cache_policy": "disabled",
+      "warmup": 1,
+      "samples": 7,
+      "notes": "Closed one-leaf warm-handle small-package profile."
+    },
+    {
+      "id": "package.verifier.process_memo_scope.v1.small.full.disabled.j1.off",
+      "kind": "package-verifier-process-memo-scope",
+      "package_root": "testdata/package/npa-std",
+      "verifier": "fast",
+      "cache_policy": "disabled",
+      "warmup": 1,
+      "samples": 7,
+      "notes": "Closed full-selection serial memo-disabled small-package profile."
+    },
+    {
+      "id": "package.verifier.process_memo_scope.v1.small.full.disabled.j4.off",
+      "kind": "package-verifier-process-memo-scope",
+      "package_root": "testdata/package/npa-std",
+      "verifier": "fast",
+      "cache_policy": "disabled",
+      "warmup": 1,
+      "samples": 7,
+      "notes": "Closed full-selection four-job memo-disabled small-package profile."
+    },
+    {
+      "id": "package.verifier.process_memo_scope.v1.small.full.warm.j1.off",
+      "kind": "package-verifier-process-memo-scope",
+      "package_root": "testdata/package/npa-std",
+      "verifier": "fast",
+      "cache_policy": "disabled",
+      "warmup": 1,
+      "samples": 7,
+      "notes": "Closed full-selection warm-handle small-package profile."
+    },
+    {
+      "id": "package.verifier.process_memo_scope.v1.iut.empty.disabled.j4.off",
+      "kind": "package-verifier-process-memo-scope",
+      "package_root": "external/npa-project-iut/proofs",
+      "verifier": "fast",
+      "cache_policy": "disabled",
+      "warmup": 1,
+      "samples": 7,
+      "notes": "Closed IUT empty-selection timing-off profile using a separately supplied root."
+    },
+    {
+      "id": "package.verifier.process_memo_scope.v1.iut.empty.disabled.j4.summary",
+      "kind": "package-verifier-process-memo-scope",
+      "package_root": "external/npa-project-iut/proofs",
+      "verifier": "fast",
+      "cache_policy": "disabled",
+      "warmup": 1,
+      "samples": 7,
+      "notes": "Closed IUT empty-selection Summary profile using a separately supplied root."
+    },
+    {
+      "id": "package.verifier.linear_dag_planning.v1.iut992.empty.j4.off",
+      "kind": "warmed-checked-artifact-verifier",
+      "package_root": "external/npa-project-iut/proofs",
+      "verifier": "fast",
+      "cache_policy": "disabled",
+      "warmup": 1,
+      "samples": 7,
+      "notes": "Closed reconstructed-lock IUT empty-selection timing-off planning profile."
+    },
+    {
+      "id": "package.verifier.linear_dag_planning.v1.iut992.empty.j4.summary",
+      "kind": "warmed-checked-artifact-verifier",
+      "package_root": "external/npa-project-iut/proofs",
+      "verifier": "fast",
+      "cache_policy": "disabled",
+      "warmup": 1,
+      "samples": 7,
+      "notes": "Closed reconstructed-lock IUT empty-selection Summary planning profile."
+    },
+    {
+      "id": "package.verifier.linear_dag_planning.v1.iut992.empty.j4.detailed",
+      "kind": "warmed-checked-artifact-verifier",
+      "package_root": "external/npa-project-iut/proofs",
+      "verifier": "fast",
+      "cache_policy": "disabled",
+      "warmup": 1,
+      "samples": 7,
+      "notes": "Closed reconstructed-lock IUT empty-selection Detailed planning profile."
+    },
+    {
+      "id": "package.verifier.process_memo_scope.v1.iut.leaf.warm.j1.off",
+      "kind": "package-verifier-process-memo-scope",
+      "package_root": "external/npa-project-iut/proofs",
+      "verifier": "fast",
+      "cache_policy": "disabled",
+      "warmup": 1,
+      "samples": 7,
+      "notes": "Closed IUT fixed-leaf serial warm-handle profile."
+    },
+    {
+      "id": "package.verifier.process_memo_scope.v1.iut.leaf.warm.j4.off",
+      "kind": "package-verifier-process-memo-scope",
+      "package_root": "external/npa-project-iut/proofs",
+      "verifier": "fast",
+      "cache_policy": "disabled",
+      "warmup": 1,
+      "samples": 7,
+      "notes": "Closed IUT fixed-leaf four-job warm-handle profile."
+    },
+    {
+      "id": "package.verifier.process_memo_scope.v1.iut.full.warm.j1.off",
+      "kind": "package-verifier-process-memo-scope",
+      "package_root": "external/npa-project-iut/proofs",
+      "verifier": "fast",
+      "cache_policy": "disabled",
+      "warmup": 1,
+      "samples": 7,
+      "notes": "Closed IUT full-selection serial warm-handle profile."
+    },
+    {
+      "id": "package.verifier.process_memo_scope.v1.iut.full.warm.j4.off",
+      "kind": "package-verifier-process-memo-scope",
+      "package_root": "external/npa-project-iut/proofs",
+      "verifier": "fast",
+      "cache_policy": "disabled",
+      "warmup": 1,
+      "samples": 7,
+      "notes": "Closed IUT full-selection four-job warm-handle profile."
+    },
+    {
+      "id": "package.changed_selection.git_batching.v1.empty0.clean",
+      "kind": "package-changed-selection-git-batching", "package_root": "generated/empty-package", "verifier": "fast", "cache_policy": "disabled", "warmup": 1, "samples": 7,
+      "notes": "Zero-candidate deterministic changed-selection profile."
+    },
+    {
+      "id": "package.changed_selection.git_batching.v1.tiny1.clean",
+      "kind": "package-changed-selection-git-batching", "package_root": "generated/short-package", "verifier": "fast", "cache_policy": "disabled", "warmup": 1, "samples": 7,
+      "notes": "One short clean candidate."
+    },
+    {
+      "id": "package.changed_selection.git_batching.v1.tiny1.tracked1",
+      "kind": "package-changed-selection-git-batching", "package_root": "generated/short-package", "verifier": "fast", "cache_policy": "disabled", "warmup": 1, "samples": 7,
+      "notes": "One short tracked candidate."
+    },
+    {
+      "id": "package.changed_selection.git_batching.v1.tiny1.untracked1",
+      "kind": "package-changed-selection-git-batching", "package_root": "generated/short-package", "verifier": "fast", "cache_policy": "disabled", "warmup": 1, "samples": 7,
+      "notes": "One short untracked candidate."
+    },
+    {
+      "id": "package.changed_selection.git_batching.v1.former127.clean",
+      "kind": "package-changed-selection-git-batching", "package_root": "generated/short-package", "verifier": "fast", "cache_policy": "disabled", "warmup": 1, "samples": 7,
+      "notes": "127-candidate former count boundary."
+    },
+    {
+      "id": "package.changed_selection.git_batching.v1.former128.clean",
+      "kind": "package-changed-selection-git-batching", "package_root": "generated/short-package", "verifier": "fast", "cache_policy": "disabled", "warmup": 1, "samples": 7,
+      "notes": "128-candidate former count boundary."
+    },
+    {
+      "id": "package.changed_selection.git_batching.v1.former129.clean",
+      "kind": "package-changed-selection-git-batching", "package_root": "generated/short-package", "verifier": "fast", "cache_policy": "disabled", "warmup": 1, "samples": 7,
+      "notes": "129-candidate former count boundary."
+    },
+    {
+      "id": "package.changed_selection.git_batching.v1.count1023.clean",
+      "kind": "package-changed-selection-git-batching", "package_root": "generated/count-package", "verifier": "fast", "cache_policy": "disabled", "warmup": 1, "samples": 7,
+      "notes": "1023-candidate secondary count boundary."
+    },
+    {
+      "id": "package.changed_selection.git_batching.v1.count1024.clean",
+      "kind": "package-changed-selection-git-batching", "package_root": "generated/count-package", "verifier": "fast", "cache_policy": "disabled", "warmup": 1, "samples": 7,
+      "notes": "1024-candidate secondary count boundary."
+    },
+    {
+      "id": "package.changed_selection.git_batching.v1.count1025.clean",
+      "kind": "package-changed-selection-git-batching", "package_root": "generated/count-package", "verifier": "fast", "cache_policy": "disabled", "warmup": 1, "samples": 7,
+      "notes": "1025-candidate secondary count boundary."
+    },
+    {
+      "id": "package.changed_selection.git_batching.v1.byte65535.clean",
+      "kind": "package-changed-selection-git-batching", "package_root": "generated/byte-boundary-package", "verifier": "fast", "cache_policy": "disabled", "warmup": 1, "samples": 7,
+      "notes": "65535-byte argv-charge boundary."
+    },
+    {
+      "id": "package.changed_selection.git_batching.v1.byte65536.clean",
+      "kind": "package-changed-selection-git-batching", "package_root": "generated/byte-boundary-package", "verifier": "fast", "cache_policy": "disabled", "warmup": 1, "samples": 7,
+      "notes": "65536-byte argv-charge boundary."
+    },
+    {
+      "id": "package.changed_selection.git_batching.v1.byte65537.clean",
+      "kind": "package-changed-selection-git-batching", "package_root": "generated/byte-boundary-package", "verifier": "fast", "cache_policy": "disabled", "warmup": 1, "samples": 7,
+      "notes": "65537-byte argv-charge boundary."
+    },
+    {
+      "id": "package.changed_selection.git_batching.v1.long32.mixed",
+      "kind": "package-changed-selection-git-batching", "package_root": "generated/long-path-package", "verifier": "fast", "cache_policy": "disabled", "warmup": 1, "samples": 7,
+      "notes": "32 long candidates with mixed changes."
+    },
+    {
+      "id": "package.changed_selection.git_batching.v1.long128.mixed",
+      "kind": "package-changed-selection-git-batching", "package_root": "generated/long-path-package", "verifier": "fast", "cache_policy": "disabled", "warmup": 1, "samples": 7,
+      "notes": "128 long candidates with mixed changes."
+    },
+    {
+      "id": "package.changed_selection.git_batching.v1.long1024.mixed",
+      "kind": "package-changed-selection-git-batching", "package_root": "generated/long-path-package", "verifier": "fast", "cache_policy": "disabled", "warmup": 1, "samples": 7,
+      "notes": "1024 long candidates with mixed changes."
+    },
+    {
+      "id": "package.changed_selection.git_batching.v1.fallback1.clean",
+      "kind": "package-changed-selection-git-batching", "package_root": "generated/fallback-package", "verifier": "fast", "cache_policy": "disabled", "warmup": 1, "samples": 7,
+      "notes": "One-candidate zero-headroom fallback."
+    },
+    {
+      "id": "package.changed_selection.git_batching.v1.fallback129.clean",
+      "kind": "package-changed-selection-git-batching", "package_root": "generated/fallback-package", "verifier": "fast", "cache_policy": "disabled", "warmup": 1, "samples": 7,
+      "notes": "129-candidate zero-headroom fallback."
+    },
+    {
+      "id": "package.changed_selection.git_batching.v1.fallback1024.clean",
+      "kind": "package-changed-selection-git-batching", "package_root": "generated/fallback-package", "verifier": "fast", "cache_policy": "disabled", "warmup": 1, "samples": 7,
+      "notes": "1024-candidate zero-headroom fallback."
+    },
+    {
+      "id": "package.changed_selection.git_batching.v1.inflated129.clean",
+      "kind": "package-changed-selection-git-batching", "package_root": "generated/inflated-environment-package", "verifier": "fast", "cache_policy": "disabled", "warmup": 1, "samples": 7,
+      "notes": "129 candidates with 16-KiB headroom."
+    },
+    {
+      "id": "package.changed_selection.git_batching.v1.inflated992.clean",
+      "kind": "package-changed-selection-git-batching", "package_root": "generated/inflated-environment-package", "verifier": "fast", "cache_policy": "disabled", "warmup": 1, "samples": 7,
+      "notes": "992 candidates with 16-KiB headroom."
+    },
+    {
+      "id": "package.changed_selection.git_batching.v1.iut1401.clean",
+      "kind": "package-changed-selection-git-batching", "package_root": "npa-project-iut/proofs", "verifier": "fast", "cache_policy": "disabled", "warmup": 1, "samples": 7,
+      "notes": "Exact 1401-local-module IUT catalog, clean."
+    },
+    {
+      "id": "package.changed_selection.git_batching.v1.iut1401.tracked1",
+      "kind": "package-changed-selection-git-batching", "package_root": "npa-project-iut/proofs", "verifier": "fast", "cache_policy": "disabled", "warmup": 1, "samples": 7,
+      "notes": "Exact 1401-local-module IUT catalog, one tracked change."
+    },
+    {
+      "id": "package.changed_selection.git_batching.v1.iut1401.untracked1",
+      "kind": "package-changed-selection-git-batching", "package_root": "npa-project-iut/proofs", "verifier": "fast", "cache_policy": "disabled", "warmup": 1, "samples": 7,
+      "notes": "Exact 1401-local-module IUT catalog, one untracked change."
+    },
+    {
+      "id": "package.changed_selection.git_batching.v1.large4096.mixed",
+      "kind": "package-changed-selection-git-batching", "package_root": "generated/large-package", "verifier": "fast", "cache_policy": "disabled", "warmup": 1, "samples": 7,
+      "notes": "4096-candidate synthetic mixed-change profile."
+    },
+    {"id":"package-artifact-snapshot-rep-api-pm0-dc0-fast-raw-j1","kind":"package-artifact-snapshot","measurement_mode":"detailed","warmup":1,"samples":5,"notes":"Blocking deterministic counters; elapsed and RSS advisory.","interleave_group":"package-artifact-snapshot-rep-api-pm0-dc0-fast-j1","package_root":"generated/representative-1000-certificates","execution_lane":"api","fixture_profile":"representative-1000-certificates","artifact_mode":"raw","artifact_bytes":49283072,"verifier":"fast","audit_cache_policy":"off","disk_memo_policy":"off","process_memo_policy":"disabled","decode_cache_policy":"disabled","jobs":1},
+    {"id":"package-artifact-snapshot-rep-api-pm0-dc0-fast-snapshot-j1","kind":"package-artifact-snapshot","measurement_mode":"detailed","warmup":1,"samples":5,"notes":"Blocking deterministic counters; elapsed and RSS advisory.","interleave_group":"package-artifact-snapshot-rep-api-pm0-dc0-fast-j1","package_root":"generated/representative-1000-certificates","execution_lane":"api","fixture_profile":"representative-1000-certificates","artifact_mode":"snapshot","artifact_bytes":49283072,"verifier":"fast","audit_cache_policy":"off","disk_memo_policy":"off","process_memo_policy":"disabled","decode_cache_policy":"disabled","jobs":1},
+    {"id":"package-artifact-snapshot-1k-api-pm0-dc0-fast-raw-j1","kind":"package-artifact-snapshot","measurement_mode":"detailed","warmup":1,"samples":5,"notes":"Blocking deterministic counters; elapsed and RSS advisory.","interleave_group":"package-artifact-snapshot-1k-api-pm0-dc0-fast-j1","package_root":"generated/synthetic-1kib","execution_lane":"api","fixture_profile":"synthetic-1kib","artifact_mode":"raw","artifact_bytes":1024,"verifier":"fast","audit_cache_policy":"off","disk_memo_policy":"off","process_memo_policy":"disabled","decode_cache_policy":"disabled","jobs":1},
+    {"id":"package-artifact-snapshot-1k-api-pm0-dc0-fast-snapshot-j1","kind":"package-artifact-snapshot","measurement_mode":"detailed","warmup":1,"samples":5,"notes":"Blocking deterministic counters; elapsed and RSS advisory.","interleave_group":"package-artifact-snapshot-1k-api-pm0-dc0-fast-j1","package_root":"generated/synthetic-1kib","execution_lane":"api","fixture_profile":"synthetic-1kib","artifact_mode":"snapshot","artifact_bytes":1024,"verifier":"fast","audit_cache_policy":"off","disk_memo_policy":"off","process_memo_policy":"disabled","decode_cache_policy":"disabled","jobs":1},
+    {"id":"package-artifact-snapshot-1m-api-pm0-dc0-fast-raw-j1","kind":"package-artifact-snapshot","measurement_mode":"detailed","warmup":1,"samples":5,"notes":"Blocking deterministic counters; elapsed and RSS advisory.","interleave_group":"package-artifact-snapshot-1m-api-pm0-dc0-fast-j1","package_root":"generated/synthetic-1mib","execution_lane":"api","fixture_profile":"synthetic-1mib","artifact_mode":"raw","artifact_bytes":1048576,"verifier":"fast","audit_cache_policy":"off","disk_memo_policy":"off","process_memo_policy":"disabled","decode_cache_policy":"disabled","jobs":1},
+    {"id":"package-artifact-snapshot-1m-api-pm0-dc0-fast-snapshot-j1","kind":"package-artifact-snapshot","measurement_mode":"detailed","warmup":1,"samples":5,"notes":"Blocking deterministic counters; elapsed and RSS advisory.","interleave_group":"package-artifact-snapshot-1m-api-pm0-dc0-fast-j1","package_root":"generated/synthetic-1mib","execution_lane":"api","fixture_profile":"synthetic-1mib","artifact_mode":"snapshot","artifact_bytes":1048576,"verifier":"fast","audit_cache_policy":"off","disk_memo_policy":"off","process_memo_policy":"disabled","decode_cache_policy":"disabled","jobs":1},
+    {"id":"package-artifact-snapshot-near-api-pm0-dc0-fast-raw-j1","kind":"package-artifact-snapshot","measurement_mode":"detailed","warmup":1,"samples":5,"notes":"Blocking deterministic counters; elapsed and RSS advisory.","interleave_group":"package-artifact-snapshot-near-api-pm0-dc0-fast-j1","package_root":"generated/synthetic-near-limit","execution_lane":"api","fixture_profile":"synthetic-near-limit","artifact_mode":"raw","artifact_bytes":67108000,"verifier":"fast","audit_cache_policy":"off","disk_memo_policy":"off","process_memo_policy":"disabled","decode_cache_policy":"disabled","jobs":1},
+    {"id":"package-artifact-snapshot-near-api-pm0-dc0-fast-snapshot-j1","kind":"package-artifact-snapshot","measurement_mode":"detailed","warmup":1,"samples":5,"notes":"Blocking deterministic counters; elapsed and RSS advisory.","interleave_group":"package-artifact-snapshot-near-api-pm0-dc0-fast-j1","package_root":"generated/synthetic-near-limit","execution_lane":"api","fixture_profile":"synthetic-near-limit","artifact_mode":"snapshot","artifact_bytes":67108000,"verifier":"fast","audit_cache_policy":"off","disk_memo_policy":"off","process_memo_policy":"disabled","decode_cache_policy":"disabled","jobs":1},
+    {"id":"package-artifact-snapshot-rep-api-pm0-dcp-fast-raw-j1","kind":"package-artifact-snapshot","measurement_mode":"detailed","warmup":1,"samples":5,"notes":"Blocking deterministic counters; elapsed and RSS advisory.","interleave_group":"package-artifact-snapshot-rep-api-pm0-dcp-fast-j1","package_root":"generated/representative-1000-certificates","execution_lane":"api","fixture_profile":"representative-1000-certificates","artifact_mode":"raw","artifact_bytes":49283072,"verifier":"fast","audit_cache_policy":"off","disk_memo_policy":"off","process_memo_policy":"disabled","decode_cache_policy":"process-local","jobs":1},
+    {"id":"package-artifact-snapshot-rep-api-pm0-dcp-fast-snapshot-j1","kind":"package-artifact-snapshot","measurement_mode":"detailed","warmup":1,"samples":5,"notes":"Blocking deterministic counters; elapsed and RSS advisory.","interleave_group":"package-artifact-snapshot-rep-api-pm0-dcp-fast-j1","package_root":"generated/representative-1000-certificates","execution_lane":"api","fixture_profile":"representative-1000-certificates","artifact_mode":"snapshot","artifact_bytes":49283072,"verifier":"fast","audit_cache_policy":"off","disk_memo_policy":"off","process_memo_policy":"disabled","decode_cache_policy":"process-local","jobs":1},
+    {"id":"package-artifact-snapshot-rep-api-pm0-dcpp-fast-raw-j1","kind":"package-artifact-snapshot","measurement_mode":"detailed","warmup":1,"samples":5,"notes":"Blocking deterministic counters; elapsed and RSS advisory.","interleave_group":"package-artifact-snapshot-rep-api-pm0-dcpp-fast-j1","package_root":"generated/representative-1000-certificates","execution_lane":"api","fixture_profile":"representative-1000-certificates","artifact_mode":"raw","artifact_bytes":49283072,"verifier":"fast","audit_cache_policy":"off","disk_memo_policy":"off","process_memo_policy":"disabled","decode_cache_policy":"process-local-and-persistent","jobs":1},
+    {"id":"package-artifact-snapshot-rep-api-pm0-dcpp-fast-snapshot-j1","kind":"package-artifact-snapshot","measurement_mode":"detailed","warmup":1,"samples":5,"notes":"Blocking deterministic counters; elapsed and RSS advisory.","interleave_group":"package-artifact-snapshot-rep-api-pm0-dcpp-fast-j1","package_root":"generated/representative-1000-certificates","execution_lane":"api","fixture_profile":"representative-1000-certificates","artifact_mode":"snapshot","artifact_bytes":49283072,"verifier":"fast","audit_cache_policy":"off","disk_memo_policy":"off","process_memo_policy":"disabled","decode_cache_policy":"process-local-and-persistent","jobs":1},
+    {"id":"package-artifact-snapshot-rep-api-pmp-dc0-fast-raw-j1","kind":"package-artifact-snapshot","measurement_mode":"detailed","warmup":1,"samples":5,"notes":"Blocking deterministic counters; elapsed and RSS advisory.","interleave_group":"package-artifact-snapshot-rep-api-pmp-dc0-fast-j1","package_root":"generated/representative-1000-certificates","execution_lane":"api","fixture_profile":"representative-1000-certificates","artifact_mode":"raw","artifact_bytes":49283072,"verifier":"fast","audit_cache_policy":"off","disk_memo_policy":"off","process_memo_policy":"process-local","decode_cache_policy":"disabled","jobs":1},
+    {"id":"package-artifact-snapshot-rep-api-pmp-dc0-fast-snapshot-j1","kind":"package-artifact-snapshot","measurement_mode":"detailed","warmup":1,"samples":5,"notes":"Blocking deterministic counters; elapsed and RSS advisory.","interleave_group":"package-artifact-snapshot-rep-api-pmp-dc0-fast-j1","package_root":"generated/representative-1000-certificates","execution_lane":"api","fixture_profile":"representative-1000-certificates","artifact_mode":"snapshot","artifact_bytes":49283072,"verifier":"fast","audit_cache_policy":"off","disk_memo_policy":"off","process_memo_policy":"process-local","decode_cache_policy":"disabled","jobs":1},
+    {"id":"package-artifact-snapshot-rep-api-pmp-dcp-fast-raw-j1","kind":"package-artifact-snapshot","measurement_mode":"detailed","warmup":1,"samples":5,"notes":"Blocking deterministic counters; elapsed and RSS advisory.","interleave_group":"package-artifact-snapshot-rep-api-pmp-dcp-fast-j1","package_root":"generated/representative-1000-certificates","execution_lane":"api","fixture_profile":"representative-1000-certificates","artifact_mode":"raw","artifact_bytes":49283072,"verifier":"fast","audit_cache_policy":"off","disk_memo_policy":"off","process_memo_policy":"process-local","decode_cache_policy":"process-local","jobs":1},
+    {"id":"package-artifact-snapshot-rep-api-pmp-dcp-fast-snapshot-j1","kind":"package-artifact-snapshot","measurement_mode":"detailed","warmup":1,"samples":5,"notes":"Blocking deterministic counters; elapsed and RSS advisory.","interleave_group":"package-artifact-snapshot-rep-api-pmp-dcp-fast-j1","package_root":"generated/representative-1000-certificates","execution_lane":"api","fixture_profile":"representative-1000-certificates","artifact_mode":"snapshot","artifact_bytes":49283072,"verifier":"fast","audit_cache_policy":"off","disk_memo_policy":"off","process_memo_policy":"process-local","decode_cache_policy":"process-local","jobs":1},
+    {"id":"package-artifact-snapshot-rep-api-pmp-dcpp-fast-raw-j1","kind":"package-artifact-snapshot","measurement_mode":"detailed","warmup":1,"samples":5,"notes":"Blocking deterministic counters; elapsed and RSS advisory.","interleave_group":"package-artifact-snapshot-rep-api-pmp-dcpp-fast-j1","package_root":"generated/representative-1000-certificates","execution_lane":"api","fixture_profile":"representative-1000-certificates","artifact_mode":"raw","artifact_bytes":49283072,"verifier":"fast","audit_cache_policy":"off","disk_memo_policy":"off","process_memo_policy":"process-local","decode_cache_policy":"process-local-and-persistent","jobs":1},
+    {"id":"package-artifact-snapshot-rep-api-pmp-dcpp-fast-snapshot-j1","kind":"package-artifact-snapshot","measurement_mode":"detailed","warmup":1,"samples":5,"notes":"Blocking deterministic counters; elapsed and RSS advisory.","interleave_group":"package-artifact-snapshot-rep-api-pmp-dcpp-fast-j1","package_root":"generated/representative-1000-certificates","execution_lane":"api","fixture_profile":"representative-1000-certificates","artifact_mode":"snapshot","artifact_bytes":49283072,"verifier":"fast","audit_cache_policy":"off","disk_memo_policy":"off","process_memo_policy":"process-local","decode_cache_policy":"process-local-and-persistent","jobs":1},
+    {"id":"package-artifact-snapshot-rep-cli-off-fast-raw-j1","kind":"package-artifact-snapshot","measurement_mode":"detailed","warmup":1,"samples":5,"notes":"Blocking deterministic counters; elapsed and RSS advisory.","interleave_group":"package-artifact-snapshot-rep-cli-off-fast-j1","package_root":"generated/representative-1000-certificates","execution_lane":"cli-local","fixture_profile":"representative-1000-certificates","artifact_mode":"raw","artifact_bytes":49283072,"verifier":"fast","audit_cache_policy":"off","disk_memo_policy":"off","process_memo_policy":"disabled","decode_cache_policy":"disabled","jobs":1},
+    {"id":"package-artifact-snapshot-rep-cli-off-fast-snapshot-j1","kind":"package-artifact-snapshot","measurement_mode":"detailed","warmup":1,"samples":5,"notes":"Blocking deterministic counters; elapsed and RSS advisory.","interleave_group":"package-artifact-snapshot-rep-cli-off-fast-j1","package_root":"generated/representative-1000-certificates","execution_lane":"cli-local","fixture_profile":"representative-1000-certificates","artifact_mode":"snapshot","artifact_bytes":49283072,"verifier":"fast","audit_cache_policy":"off","disk_memo_policy":"off","process_memo_policy":"disabled","decode_cache_policy":"disabled","jobs":1},
+    {"id":"package-artifact-snapshot-rep-cli-audit-read-fast-raw-j1","kind":"package-artifact-snapshot","measurement_mode":"detailed","warmup":1,"samples":5,"notes":"Blocking deterministic counters; elapsed and RSS advisory.","interleave_group":"package-artifact-snapshot-rep-cli-audit-read-fast-j1","package_root":"generated/representative-1000-certificates","execution_lane":"cli-local","fixture_profile":"representative-1000-certificates","artifact_mode":"raw","artifact_bytes":49283072,"verifier":"fast","audit_cache_policy":"read-through","disk_memo_policy":"off","process_memo_policy":"disabled","decode_cache_policy":"disabled","jobs":1},
+    {"id":"package-artifact-snapshot-rep-cli-audit-read-fast-snapshot-j1","kind":"package-artifact-snapshot","measurement_mode":"detailed","warmup":1,"samples":5,"notes":"Blocking deterministic counters; elapsed and RSS advisory.","interleave_group":"package-artifact-snapshot-rep-cli-audit-read-fast-j1","package_root":"generated/representative-1000-certificates","execution_lane":"cli-local","fixture_profile":"representative-1000-certificates","artifact_mode":"snapshot","artifact_bytes":49283072,"verifier":"fast","audit_cache_policy":"read-through","disk_memo_policy":"off","process_memo_policy":"disabled","decode_cache_policy":"disabled","jobs":1},
+    {"id":"package-artifact-snapshot-rep-cli-audit-hit-fast-raw-j1","kind":"package-artifact-snapshot","measurement_mode":"detailed","warmup":1,"samples":5,"notes":"Blocking deterministic counters; elapsed and RSS advisory.","interleave_group":"package-artifact-snapshot-rep-cli-audit-hit-fast-j1","package_root":"generated/representative-1000-certificates","execution_lane":"cli-local","fixture_profile":"representative-1000-certificates","artifact_mode":"raw","artifact_bytes":49283072,"verifier":"fast","audit_cache_policy":"local-hit","disk_memo_policy":"off","process_memo_policy":"disabled","decode_cache_policy":"disabled","jobs":1},
+    {"id":"package-artifact-snapshot-rep-cli-audit-hit-fast-snapshot-j1","kind":"package-artifact-snapshot","measurement_mode":"detailed","warmup":1,"samples":5,"notes":"Blocking deterministic counters; elapsed and RSS advisory.","interleave_group":"package-artifact-snapshot-rep-cli-audit-hit-fast-j1","package_root":"generated/representative-1000-certificates","execution_lane":"cli-local","fixture_profile":"representative-1000-certificates","artifact_mode":"snapshot","artifact_bytes":49283072,"verifier":"fast","audit_cache_policy":"local-hit","disk_memo_policy":"off","process_memo_policy":"disabled","decode_cache_policy":"disabled","jobs":1},
+    {"id":"package-artifact-snapshot-rep-cli-disk-read-fast-raw-j1","kind":"package-artifact-snapshot","measurement_mode":"detailed","warmup":1,"samples":5,"notes":"Blocking deterministic counters; elapsed and RSS advisory.","interleave_group":"package-artifact-snapshot-rep-cli-disk-read-fast-j1","package_root":"generated/representative-1000-certificates","execution_lane":"cli-local","fixture_profile":"representative-1000-certificates","artifact_mode":"raw","artifact_bytes":49283072,"verifier":"fast","audit_cache_policy":"off","disk_memo_policy":"read-through","process_memo_policy":"disabled","decode_cache_policy":"disabled","jobs":1},
+    {"id":"package-artifact-snapshot-rep-cli-disk-read-fast-snapshot-j1","kind":"package-artifact-snapshot","measurement_mode":"detailed","warmup":1,"samples":5,"notes":"Blocking deterministic counters; elapsed and RSS advisory.","interleave_group":"package-artifact-snapshot-rep-cli-disk-read-fast-j1","package_root":"generated/representative-1000-certificates","execution_lane":"cli-local","fixture_profile":"representative-1000-certificates","artifact_mode":"snapshot","artifact_bytes":49283072,"verifier":"fast","audit_cache_policy":"off","disk_memo_policy":"read-through","process_memo_policy":"disabled","decode_cache_policy":"disabled","jobs":1},
+    {"id":"package-artifact-snapshot-rep-cli-disk-hit-fast-raw-j1","kind":"package-artifact-snapshot","measurement_mode":"detailed","warmup":1,"samples":5,"notes":"Blocking deterministic counters; elapsed and RSS advisory.","interleave_group":"package-artifact-snapshot-rep-cli-disk-hit-fast-j1","package_root":"generated/representative-1000-certificates","execution_lane":"cli-local","fixture_profile":"representative-1000-certificates","artifact_mode":"raw","artifact_bytes":49283072,"verifier":"fast","audit_cache_policy":"off","disk_memo_policy":"disk","process_memo_policy":"disabled","decode_cache_policy":"disabled","jobs":1},
+    {"id":"package-artifact-snapshot-rep-cli-disk-hit-fast-snapshot-j1","kind":"package-artifact-snapshot","measurement_mode":"detailed","warmup":1,"samples":5,"notes":"Blocking deterministic counters; elapsed and RSS advisory.","interleave_group":"package-artifact-snapshot-rep-cli-disk-hit-fast-j1","package_root":"generated/representative-1000-certificates","execution_lane":"cli-local","fixture_profile":"representative-1000-certificates","artifact_mode":"snapshot","artifact_bytes":49283072,"verifier":"fast","audit_cache_policy":"off","disk_memo_policy":"disk","process_memo_policy":"disabled","decode_cache_policy":"disabled","jobs":1},
+    {"id":"package-artifact-snapshot-rep-cli-off-reference-raw-j1","kind":"package-artifact-snapshot","measurement_mode":"detailed","warmup":1,"samples":5,"notes":"Blocking deterministic counters; elapsed and RSS advisory.","interleave_group":"package-artifact-snapshot-rep-cli-off-reference-j1","package_root":"generated/representative-1000-certificates","execution_lane":"cli-local","fixture_profile":"representative-1000-certificates","artifact_mode":"raw","artifact_bytes":49283072,"verifier":"reference","audit_cache_policy":"off","disk_memo_policy":"off","process_memo_policy":"disabled","decode_cache_policy":"disabled","jobs":1},
+    {"id":"package-artifact-snapshot-rep-cli-off-reference-snapshot-j1","kind":"package-artifact-snapshot","measurement_mode":"detailed","warmup":1,"samples":5,"notes":"Blocking deterministic counters; elapsed and RSS advisory.","interleave_group":"package-artifact-snapshot-rep-cli-off-reference-j1","package_root":"generated/representative-1000-certificates","execution_lane":"cli-local","fixture_profile":"representative-1000-certificates","artifact_mode":"snapshot","artifact_bytes":49283072,"verifier":"reference","audit_cache_policy":"off","disk_memo_policy":"off","process_memo_policy":"disabled","decode_cache_policy":"disabled","jobs":1},
+    {"id":"package-artifact-snapshot-rep-cli-audit-read-reference-raw-j1","kind":"package-artifact-snapshot","measurement_mode":"detailed","warmup":1,"samples":5,"notes":"Blocking deterministic counters; elapsed and RSS advisory.","interleave_group":"package-artifact-snapshot-rep-cli-audit-read-reference-j1","package_root":"generated/representative-1000-certificates","execution_lane":"cli-local","fixture_profile":"representative-1000-certificates","artifact_mode":"raw","artifact_bytes":49283072,"verifier":"reference","audit_cache_policy":"read-through","disk_memo_policy":"off","process_memo_policy":"disabled","decode_cache_policy":"disabled","jobs":1},
+    {"id":"package-artifact-snapshot-rep-cli-audit-read-reference-snapshot-j1","kind":"package-artifact-snapshot","measurement_mode":"detailed","warmup":1,"samples":5,"notes":"Blocking deterministic counters; elapsed and RSS advisory.","interleave_group":"package-artifact-snapshot-rep-cli-audit-read-reference-j1","package_root":"generated/representative-1000-certificates","execution_lane":"cli-local","fixture_profile":"representative-1000-certificates","artifact_mode":"snapshot","artifact_bytes":49283072,"verifier":"reference","audit_cache_policy":"read-through","disk_memo_policy":"off","process_memo_policy":"disabled","decode_cache_policy":"disabled","jobs":1},
+    {"id":"package-artifact-snapshot-rep-cli-audit-hit-reference-raw-j1","kind":"package-artifact-snapshot","measurement_mode":"detailed","warmup":1,"samples":5,"notes":"Blocking deterministic counters; elapsed and RSS advisory.","interleave_group":"package-artifact-snapshot-rep-cli-audit-hit-reference-j1","package_root":"generated/representative-1000-certificates","execution_lane":"cli-local","fixture_profile":"representative-1000-certificates","artifact_mode":"raw","artifact_bytes":49283072,"verifier":"reference","audit_cache_policy":"local-hit","disk_memo_policy":"off","process_memo_policy":"disabled","decode_cache_policy":"disabled","jobs":1},
+    {"id":"package-artifact-snapshot-rep-cli-audit-hit-reference-snapshot-j1","kind":"package-artifact-snapshot","measurement_mode":"detailed","warmup":1,"samples":5,"notes":"Blocking deterministic counters; elapsed and RSS advisory.","interleave_group":"package-artifact-snapshot-rep-cli-audit-hit-reference-j1","package_root":"generated/representative-1000-certificates","execution_lane":"cli-local","fixture_profile":"representative-1000-certificates","artifact_mode":"snapshot","artifact_bytes":49283072,"verifier":"reference","audit_cache_policy":"local-hit","disk_memo_policy":"off","process_memo_policy":"disabled","decode_cache_policy":"disabled","jobs":1},
+    {"id":"package-artifact-snapshot-rep-cli-disk-read-reference-raw-j1","kind":"package-artifact-snapshot","measurement_mode":"detailed","warmup":1,"samples":5,"notes":"Blocking deterministic counters; elapsed and RSS advisory.","interleave_group":"package-artifact-snapshot-rep-cli-disk-read-reference-j1","package_root":"generated/representative-1000-certificates","execution_lane":"cli-local","fixture_profile":"representative-1000-certificates","artifact_mode":"raw","artifact_bytes":49283072,"verifier":"reference","audit_cache_policy":"off","disk_memo_policy":"read-through","process_memo_policy":"disabled","decode_cache_policy":"disabled","jobs":1},
+    {"id":"package-artifact-snapshot-rep-cli-disk-read-reference-snapshot-j1","kind":"package-artifact-snapshot","measurement_mode":"detailed","warmup":1,"samples":5,"notes":"Blocking deterministic counters; elapsed and RSS advisory.","interleave_group":"package-artifact-snapshot-rep-cli-disk-read-reference-j1","package_root":"generated/representative-1000-certificates","execution_lane":"cli-local","fixture_profile":"representative-1000-certificates","artifact_mode":"snapshot","artifact_bytes":49283072,"verifier":"reference","audit_cache_policy":"off","disk_memo_policy":"read-through","process_memo_policy":"disabled","decode_cache_policy":"disabled","jobs":1},
+    {"id":"package-artifact-snapshot-rep-cli-disk-hit-reference-raw-j1","kind":"package-artifact-snapshot","measurement_mode":"detailed","warmup":1,"samples":5,"notes":"Blocking deterministic counters; elapsed and RSS advisory.","interleave_group":"package-artifact-snapshot-rep-cli-disk-hit-reference-j1","package_root":"generated/representative-1000-certificates","execution_lane":"cli-local","fixture_profile":"representative-1000-certificates","artifact_mode":"raw","artifact_bytes":49283072,"verifier":"reference","audit_cache_policy":"off","disk_memo_policy":"disk","process_memo_policy":"disabled","decode_cache_policy":"disabled","jobs":1},
+    {"id":"package-artifact-snapshot-rep-cli-disk-hit-reference-snapshot-j1","kind":"package-artifact-snapshot","measurement_mode":"detailed","warmup":1,"samples":5,"notes":"Blocking deterministic counters; elapsed and RSS advisory.","interleave_group":"package-artifact-snapshot-rep-cli-disk-hit-reference-j1","package_root":"generated/representative-1000-certificates","execution_lane":"cli-local","fixture_profile":"representative-1000-certificates","artifact_mode":"snapshot","artifact_bytes":49283072,"verifier":"reference","audit_cache_policy":"off","disk_memo_policy":"disk","process_memo_policy":"disabled","decode_cache_policy":"disabled","jobs":1},
+    {"id":"package-artifact-snapshot-rep-api-pm0-dc0-fast-raw-j8","kind":"package-artifact-snapshot","measurement_mode":"detailed","warmup":1,"samples":5,"notes":"Blocking deterministic counters; elapsed and RSS advisory.","interleave_group":"package-artifact-snapshot-rep-api-pm0-dc0-fast-j8","package_root":"generated/representative-1000-certificates","execution_lane":"api","fixture_profile":"representative-1000-certificates","artifact_mode":"raw","artifact_bytes":49283072,"verifier":"fast","audit_cache_policy":"off","disk_memo_policy":"off","process_memo_policy":"disabled","decode_cache_policy":"disabled","jobs":8},
+    {"id":"package-artifact-snapshot-rep-api-pm0-dc0-fast-snapshot-j8","kind":"package-artifact-snapshot","measurement_mode":"detailed","warmup":1,"samples":5,"notes":"Blocking deterministic counters; elapsed and RSS advisory.","interleave_group":"package-artifact-snapshot-rep-api-pm0-dc0-fast-j8","package_root":"generated/representative-1000-certificates","execution_lane":"api","fixture_profile":"representative-1000-certificates","artifact_mode":"snapshot","artifact_bytes":49283072,"verifier":"fast","audit_cache_policy":"off","disk_memo_policy":"off","process_memo_policy":"disabled","decode_cache_policy":"disabled","jobs":8},
+    {"id":"shared-payload-clone-1m-c1-legacy","kind":"shared-payload-clone","measurement_mode":"detailed","warmup":1,"samples":7,"notes":"Blocking deterministic counters; elapsed and RSS advisory.","interleave_group":"shared-payload-clone-1m-c1","implementation":"legacy-model","fixture_profile":"payload-1mib","payload_bytes":1048576,"clone_count":1},
+    {"id":"shared-payload-clone-1m-c1-shared","kind":"shared-payload-clone","measurement_mode":"detailed","warmup":1,"samples":7,"notes":"Blocking deterministic counters; elapsed and RSS advisory.","interleave_group":"shared-payload-clone-1m-c1","implementation":"shared-handle","fixture_profile":"payload-1mib","payload_bytes":1048576,"clone_count":1},
+    {"id":"shared-payload-clone-1m-c8-legacy","kind":"shared-payload-clone","measurement_mode":"detailed","warmup":1,"samples":7,"notes":"Blocking deterministic counters; elapsed and RSS advisory.","interleave_group":"shared-payload-clone-1m-c8","implementation":"legacy-model","fixture_profile":"payload-1mib","payload_bytes":1048576,"clone_count":8},
+    {"id":"shared-payload-clone-1m-c8-shared","kind":"shared-payload-clone","measurement_mode":"detailed","warmup":1,"samples":7,"notes":"Blocking deterministic counters; elapsed and RSS advisory.","interleave_group":"shared-payload-clone-1m-c8","implementation":"shared-handle","fixture_profile":"payload-1mib","payload_bytes":1048576,"clone_count":8},
+    {"id":"shared-payload-clone-1m-c32-legacy","kind":"shared-payload-clone","measurement_mode":"detailed","warmup":1,"samples":7,"notes":"Blocking deterministic counters; elapsed and RSS advisory.","interleave_group":"shared-payload-clone-1m-c32","implementation":"legacy-model","fixture_profile":"payload-1mib","payload_bytes":1048576,"clone_count":32},
+    {"id":"shared-payload-clone-1m-c32-shared","kind":"shared-payload-clone","measurement_mode":"detailed","warmup":1,"samples":7,"notes":"Blocking deterministic counters; elapsed and RSS advisory.","interleave_group":"shared-payload-clone-1m-c32","implementation":"shared-handle","fixture_profile":"payload-1mib","payload_bytes":1048576,"clone_count":32},
+    {"id":"shared-payload-clone-1m-c256-legacy","kind":"shared-payload-clone","measurement_mode":"detailed","warmup":1,"samples":7,"notes":"Blocking deterministic counters; elapsed and RSS advisory.","interleave_group":"shared-payload-clone-1m-c256","implementation":"legacy-model","fixture_profile":"payload-1mib","payload_bytes":1048576,"clone_count":256},
+    {"id":"shared-payload-clone-1m-c256-shared","kind":"shared-payload-clone","measurement_mode":"detailed","warmup":1,"samples":7,"notes":"Blocking deterministic counters; elapsed and RSS advisory.","interleave_group":"shared-payload-clone-1m-c256","implementation":"shared-handle","fixture_profile":"payload-1mib","payload_bytes":1048576,"clone_count":256},
+    {"id":"shared-payload-clone-16m-c1-legacy","kind":"shared-payload-clone","measurement_mode":"detailed","warmup":1,"samples":7,"notes":"Blocking deterministic counters; elapsed and RSS advisory.","interleave_group":"shared-payload-clone-16m-c1","implementation":"legacy-model","fixture_profile":"payload-16mib","payload_bytes":16777216,"clone_count":1},
+    {"id":"shared-payload-clone-16m-c1-shared","kind":"shared-payload-clone","measurement_mode":"detailed","warmup":1,"samples":7,"notes":"Blocking deterministic counters; elapsed and RSS advisory.","interleave_group":"shared-payload-clone-16m-c1","implementation":"shared-handle","fixture_profile":"payload-16mib","payload_bytes":16777216,"clone_count":1},
+    {"id":"shared-payload-clone-16m-c8-legacy","kind":"shared-payload-clone","measurement_mode":"detailed","warmup":1,"samples":7,"notes":"Blocking deterministic counters; elapsed and RSS advisory.","interleave_group":"shared-payload-clone-16m-c8","implementation":"legacy-model","fixture_profile":"payload-16mib","payload_bytes":16777216,"clone_count":8},
+    {"id":"shared-payload-clone-16m-c8-shared","kind":"shared-payload-clone","measurement_mode":"detailed","warmup":1,"samples":7,"notes":"Blocking deterministic counters; elapsed and RSS advisory.","interleave_group":"shared-payload-clone-16m-c8","implementation":"shared-handle","fixture_profile":"payload-16mib","payload_bytes":16777216,"clone_count":8},
+    {"id":"shared-payload-clone-16m-c32-legacy","kind":"shared-payload-clone","measurement_mode":"detailed","warmup":1,"samples":7,"notes":"Blocking deterministic counters; elapsed and RSS advisory.","interleave_group":"shared-payload-clone-16m-c32","implementation":"legacy-model","fixture_profile":"payload-16mib","payload_bytes":16777216,"clone_count":32},
+    {"id":"shared-payload-clone-16m-c32-shared","kind":"shared-payload-clone","measurement_mode":"detailed","warmup":1,"samples":7,"notes":"Blocking deterministic counters; elapsed and RSS advisory.","interleave_group":"shared-payload-clone-16m-c32","implementation":"shared-handle","fixture_profile":"payload-16mib","payload_bytes":16777216,"clone_count":32},
+    {"id":"shared-payload-clone-16m-c256-legacy","kind":"shared-payload-clone","measurement_mode":"detailed","warmup":1,"samples":7,"notes":"Blocking deterministic counters; elapsed and RSS advisory.","interleave_group":"shared-payload-clone-16m-c256","implementation":"legacy-model","fixture_profile":"payload-16mib","payload_bytes":16777216,"clone_count":256},
+    {"id":"shared-payload-clone-16m-c256-shared","kind":"shared-payload-clone","measurement_mode":"detailed","warmup":1,"samples":7,"notes":"Blocking deterministic counters; elapsed and RSS advisory.","interleave_group":"shared-payload-clone-16m-c256","implementation":"shared-handle","fixture_profile":"payload-16mib","payload_bytes":16777216,"clone_count":256},
+    {"id":"shared-payload-clone-near-c1-legacy","kind":"shared-payload-clone","measurement_mode":"detailed","warmup":1,"samples":7,"notes":"Blocking deterministic counters; elapsed and RSS advisory.","interleave_group":"shared-payload-clone-near-c1","implementation":"legacy-model","fixture_profile":"payload-near-limit","payload_bytes":67108000,"clone_count":1},
+    {"id":"shared-payload-clone-near-c1-shared","kind":"shared-payload-clone","measurement_mode":"detailed","warmup":1,"samples":7,"notes":"Blocking deterministic counters; elapsed and RSS advisory.","interleave_group":"shared-payload-clone-near-c1","implementation":"shared-handle","fixture_profile":"payload-near-limit","payload_bytes":67108000,"clone_count":1},
+    {"id":"shared-payload-clone-near-c8-legacy","kind":"shared-payload-clone","measurement_mode":"detailed","warmup":1,"samples":7,"notes":"Blocking deterministic counters; elapsed and RSS advisory.","interleave_group":"shared-payload-clone-near-c8","implementation":"legacy-model","fixture_profile":"payload-near-limit","payload_bytes":67108000,"clone_count":8},
+    {"id":"shared-payload-clone-near-c8-shared","kind":"shared-payload-clone","measurement_mode":"detailed","warmup":1,"samples":7,"notes":"Blocking deterministic counters; elapsed and RSS advisory.","interleave_group":"shared-payload-clone-near-c8","implementation":"shared-handle","fixture_profile":"payload-near-limit","payload_bytes":67108000,"clone_count":8},
+    {"id":"shared-payload-clone-near-c32-legacy","kind":"shared-payload-clone","measurement_mode":"detailed","warmup":1,"samples":7,"notes":"Blocking deterministic counters; elapsed and RSS advisory.","interleave_group":"shared-payload-clone-near-c32","implementation":"legacy-model","fixture_profile":"payload-near-limit","payload_bytes":67108000,"clone_count":32},
+    {"id":"shared-payload-clone-near-c32-shared","kind":"shared-payload-clone","measurement_mode":"detailed","warmup":1,"samples":7,"notes":"Blocking deterministic counters; elapsed and RSS advisory.","interleave_group":"shared-payload-clone-near-c32","implementation":"shared-handle","fixture_profile":"payload-near-limit","payload_bytes":67108000,"clone_count":32},
+    {"id":"shared-payload-clone-near-c256-legacy","kind":"shared-payload-clone","measurement_mode":"detailed","warmup":1,"samples":7,"notes":"Blocking deterministic counters; elapsed and RSS advisory.","interleave_group":"shared-payload-clone-near-c256","implementation":"legacy-model","fixture_profile":"payload-near-limit","payload_bytes":67108000,"clone_count":256},
+    {"id":"shared-payload-clone-near-c256-shared","kind":"shared-payload-clone","measurement_mode":"detailed","warmup":1,"samples":7,"notes":"Blocking deterministic counters; elapsed and RSS advisory.","interleave_group":"shared-payload-clone-near-c256","implementation":"shared-handle","fixture_profile":"payload-near-limit","payload_bytes":67108000,"clone_count":256},
+    {"id":"shared-payload-cache-1m-cold-disabled","kind":"shared-payload-cache","measurement_mode":"detailed","warmup":1,"samples":7,"notes":"Blocking deterministic counters; elapsed and RSS advisory.","interleave_group":"shared-payload-cache-1m","fixture_profile":"payload-1mib","payload_bytes":1048576,"phase":"cold","decode_cache_policy":"disabled"},
+    {"id":"shared-payload-cache-1m-miss-process-local","kind":"shared-payload-cache","measurement_mode":"detailed","warmup":1,"samples":7,"notes":"Blocking deterministic counters; elapsed and RSS advisory.","interleave_group":"shared-payload-cache-1m","fixture_profile":"payload-1mib","payload_bytes":1048576,"phase":"miss-insert","decode_cache_policy":"process-local"},
+    {"id":"shared-payload-cache-1m-hit-process-local","kind":"shared-payload-cache","measurement_mode":"detailed","warmup":1,"samples":7,"notes":"Blocking deterministic counters; elapsed and RSS advisory.","interleave_group":"shared-payload-cache-1m","fixture_profile":"payload-1mib","payload_bytes":1048576,"phase":"hit","decode_cache_policy":"process-local"},
+    {"id":"shared-payload-cache-1m-miss-persistent","kind":"shared-payload-cache","measurement_mode":"detailed","warmup":1,"samples":7,"notes":"Blocking deterministic counters; elapsed and RSS advisory.","interleave_group":"shared-payload-cache-1m","fixture_profile":"payload-1mib","payload_bytes":1048576,"phase":"miss-insert","decode_cache_policy":"process-local-and-persistent"},
+    {"id":"shared-payload-cache-1m-hit-persistent","kind":"shared-payload-cache","measurement_mode":"detailed","warmup":1,"samples":7,"notes":"Blocking deterministic counters; elapsed and RSS advisory.","interleave_group":"shared-payload-cache-1m","fixture_profile":"payload-1mib","payload_bytes":1048576,"phase":"hit","decode_cache_policy":"process-local-and-persistent"},
+    {"id":"shared-payload-memo-multi-miss","kind":"shared-payload-memo","measurement_mode":"detailed","warmup":1,"samples":7,"notes":"Blocking deterministic counters; elapsed and RSS advisory.","interleave_group":"shared-payload-memo-multi","fixture_profile":"payload-heavy-multi-module","phase":"miss","decode_cache_policy":"disabled","process_memo_policy":"process-local","jobs":1},
+    {"id":"shared-payload-memo-multi-hit","kind":"shared-payload-memo","measurement_mode":"detailed","warmup":1,"samples":7,"notes":"Blocking deterministic counters; elapsed and RSS advisory.","interleave_group":"shared-payload-memo-multi","fixture_profile":"payload-heavy-multi-module","phase":"hit","decode_cache_policy":"disabled","process_memo_policy":"process-local","jobs":1},
+    {"id":"shared-payload-session-s1-snapshot-legacy","kind":"shared-payload-session","measurement_mode":"detailed","warmup":1,"samples":7,"notes":"Blocking deterministic counters; elapsed and RSS advisory.","interleave_group":"shared-payload-session-s1-snapshot","implementation":"legacy-model","fixture_profile":"session-index","session_entries":1,"phase":"snapshot"},
+    {"id":"shared-payload-session-s1-snapshot-shared","kind":"shared-payload-session","measurement_mode":"detailed","warmup":1,"samples":7,"notes":"Blocking deterministic counters; elapsed and RSS advisory.","interleave_group":"shared-payload-session-s1-snapshot","implementation":"shared-handle","fixture_profile":"session-index","session_entries":1,"phase":"snapshot"},
+    {"id":"shared-payload-session-s1-first-cow-legacy","kind":"shared-payload-session","measurement_mode":"detailed","warmup":1,"samples":7,"notes":"Blocking deterministic counters; elapsed and RSS advisory.","interleave_group":"shared-payload-session-s1-first-cow","implementation":"legacy-model","fixture_profile":"session-index","session_entries":1,"phase":"first-cow"},
+    {"id":"shared-payload-session-s1-first-cow-shared","kind":"shared-payload-session","measurement_mode":"detailed","warmup":1,"samples":7,"notes":"Blocking deterministic counters; elapsed and RSS advisory.","interleave_group":"shared-payload-session-s1-first-cow","implementation":"shared-handle","fixture_profile":"session-index","session_entries":1,"phase":"first-cow"},
+    {"id":"shared-payload-session-s64-snapshot-legacy","kind":"shared-payload-session","measurement_mode":"detailed","warmup":1,"samples":7,"notes":"Blocking deterministic counters; elapsed and RSS advisory.","interleave_group":"shared-payload-session-s64-snapshot","implementation":"legacy-model","fixture_profile":"session-index","session_entries":64,"phase":"snapshot"},
+    {"id":"shared-payload-session-s64-snapshot-shared","kind":"shared-payload-session","measurement_mode":"detailed","warmup":1,"samples":7,"notes":"Blocking deterministic counters; elapsed and RSS advisory.","interleave_group":"shared-payload-session-s64-snapshot","implementation":"shared-handle","fixture_profile":"session-index","session_entries":64,"phase":"snapshot"},
+    {"id":"shared-payload-session-s64-first-cow-legacy","kind":"shared-payload-session","measurement_mode":"detailed","warmup":1,"samples":7,"notes":"Blocking deterministic counters; elapsed and RSS advisory.","interleave_group":"shared-payload-session-s64-first-cow","implementation":"legacy-model","fixture_profile":"session-index","session_entries":64,"phase":"first-cow"},
+    {"id":"shared-payload-session-s64-first-cow-shared","kind":"shared-payload-session","measurement_mode":"detailed","warmup":1,"samples":7,"notes":"Blocking deterministic counters; elapsed and RSS advisory.","interleave_group":"shared-payload-session-s64-first-cow","implementation":"shared-handle","fixture_profile":"session-index","session_entries":64,"phase":"first-cow"},
+    {"id":"shared-payload-session-s1024-snapshot-legacy","kind":"shared-payload-session","measurement_mode":"detailed","warmup":1,"samples":7,"notes":"Blocking deterministic counters; elapsed and RSS advisory.","interleave_group":"shared-payload-session-s1024-snapshot","implementation":"legacy-model","fixture_profile":"session-index","session_entries":1024,"phase":"snapshot"},
+    {"id":"shared-payload-session-s1024-snapshot-shared","kind":"shared-payload-session","measurement_mode":"detailed","warmup":1,"samples":7,"notes":"Blocking deterministic counters; elapsed and RSS advisory.","interleave_group":"shared-payload-session-s1024-snapshot","implementation":"shared-handle","fixture_profile":"session-index","session_entries":1024,"phase":"snapshot"},
+    {"id":"shared-payload-session-s1024-first-cow-legacy","kind":"shared-payload-session","measurement_mode":"detailed","warmup":1,"samples":7,"notes":"Blocking deterministic counters; elapsed and RSS advisory.","interleave_group":"shared-payload-session-s1024-first-cow","implementation":"legacy-model","fixture_profile":"session-index","session_entries":1024,"phase":"first-cow"},
+    {"id":"shared-payload-session-s1024-first-cow-shared","kind":"shared-payload-session","measurement_mode":"detailed","warmup":1,"samples":7,"notes":"Blocking deterministic counters; elapsed and RSS advisory.","interleave_group":"shared-payload-session-s1024-first-cow","implementation":"shared-handle","fixture_profile":"session-index","session_entries":1024,"phase":"first-cow"},
+    {"id":"shared-payload-shard-multi-j1","kind":"shared-payload-shard","measurement_mode":"detailed","warmup":1,"samples":7,"notes":"Blocking deterministic counters; elapsed and RSS advisory.","interleave_group":"shared-payload-shard-multi","fixture_profile":"payload-heavy-multi-module","decode_cache_policy":"disabled","process_memo_policy":"disabled","jobs":1},
+    {"id":"shared-payload-shard-multi-j8","kind":"shared-payload-shard","measurement_mode":"detailed","warmup":1,"samples":7,"notes":"Blocking deterministic counters; elapsed and RSS advisory.","interleave_group":"shared-payload-shard-multi","fixture_profile":"payload-heavy-multi-module","decode_cache_policy":"disabled","process_memo_policy":"disabled","jobs":8},
+    {"id":"shared-payload-small-1k-c256-legacy","kind":"shared-payload-small","measurement_mode":"detailed","warmup":1,"samples":7,"notes":"Blocking deterministic counters; elapsed and RSS advisory.","interleave_group":"shared-payload-small-1k-c256","implementation":"legacy-model","fixture_profile":"small-certificate","payload_bytes":1024,"clone_count":256},
+    {"id":"shared-payload-small-1k-c256-shared","kind":"shared-payload-small","measurement_mode":"detailed","warmup":1,"samples":7,"notes":"Blocking deterministic counters; elapsed and RSS advisory.","interleave_group":"shared-payload-small-1k-c256","implementation":"shared-handle","fixture_profile":"small-certificate","payload_bytes":1024,"clone_count":256}
+  ]
+}

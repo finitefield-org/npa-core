@@ -1,13 +1,13 @@
 //! Shared package root loading and package command entry points.
 
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use npa_package::{parse_and_validate_manifest_str, PackagePath, ValidatedPackageManifest};
 
 use crate::args::PackageCommand;
 use crate::diagnostic::{CommandDiagnostic, CommandResult, DiagnosticKind};
-use crate::fs::{artifact_io_error, join_package_path, render_package_path, render_package_root};
+use crate::fs::{render_package_path, render_package_root};
+use crate::generated_artifact_writer::read_package_regular_file_no_follow;
 use crate::package_artifact_ledger::run_package_artifact_ledger_audit;
 use crate::package_artifacts::run_package_check_generated;
 use crate::package_axiom_report::run_package_axiom_report;
@@ -37,6 +37,7 @@ use crate::package_promotion_registry::{
 use crate::package_promotion_registry_reconcile::run_package_reconcile_promotion_origin_registry;
 use crate::package_publish::run_package_publish_plan;
 use crate::package_refactor_plan::run_package_refactor_plan;
+use crate::package_source_structure::run_package_check_source_structure;
 use crate::package_theorem_premise_report::run_package_theorem_premise_report;
 use crate::package_verify::run_package_verify_certs;
 
@@ -67,32 +68,15 @@ pub fn load_package_root(
     let command = command.into();
     let root_display = render_package_root(root);
     let manifest_path = PackagePath::new(PACKAGE_MANIFEST_PATH);
-    let full_manifest_path = match join_package_path(root, &manifest_path, "$.manifest") {
-        Ok(path) => path,
-        Err(diagnostic) => {
-            return Err(CommandResult::failed(
-                command,
-                root_display,
-                vec![*diagnostic],
-            ));
-        }
-    };
-
-    let manifest_source = match fs::read_to_string(&full_manifest_path) {
-        Ok(source) => source,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+    let manifest_source = match read_package_regular_file_no_follow(root, &manifest_path)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+    {
+        Some(source) => source,
+        None => {
             let diagnostic =
                 CommandDiagnostic::error(DiagnosticKind::PackageManifest, "manifest_missing")
                     .with_path(render_package_path(&manifest_path));
-            return Err(CommandResult::failed(
-                command,
-                root_display,
-                vec![diagnostic],
-            ));
-        }
-        Err(_) => {
-            let diagnostic =
-                artifact_io_error("manifest_missing", render_package_path(&manifest_path));
             return Err(CommandResult::failed(
                 command,
                 root_display,
@@ -126,6 +110,9 @@ pub fn load_package_root(
 pub fn run_package_command(command: PackageCommand) -> CommandResult {
     match command {
         PackageCommand::Check(options) => run_package_check(options),
+        PackageCommand::CheckSourceStructure(options) => {
+            run_package_check_source_structure(options)
+        }
         PackageCommand::CheckInterfaceProposals(options) => {
             run_package_check_interface_proposals(options)
         }

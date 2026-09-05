@@ -19,6 +19,7 @@ use crate::{
     args::PackagePreparePromotionOptions,
     diagnostic::{CommandArtifact, CommandDiagnostic, CommandResult, DiagnosticKind},
     fs::render_package_root,
+    generated_artifact_writer::{read_package_regular_file_no_follow, read_regular_file_no_follow},
     governance_writer::{
         confined_governance_path, write_governance_artifact, GovernanceOutputPolicy,
     },
@@ -468,11 +469,11 @@ fn validate_governance_and_mapping(
             || !transport_policy
                 .allowed_source_prefixes
                 .iter()
-                .any(|prefix| row.source.module.as_dotted().starts_with(prefix))
+                .any(|prefix| npa_package::l2_namespace_prefix_matches(&row.source.module, prefix))
             || !transport_policy
                 .allowed_target_prefixes
                 .iter()
-                .any(|prefix| row.target.module.as_dotted().starts_with(prefix))
+                .any(|prefix| npa_package::l2_namespace_prefix_matches(&row.target.module, prefix))
     }) {
         return Err(policy_diagnostic(
             "promotion_plan_declaration_rename_unsupported",
@@ -709,24 +710,20 @@ fn project_selected_module(
         })
         .collect::<Vec<_>>();
     theorems.sort();
-    let source_path = confined_governance_path(
-        root,
-        &module.source,
-        module.source.as_str(),
-        "promotion_plan_generated_identity_mismatch",
-    )?;
     let mut imports = module.imports.clone();
     imports.sort();
     Ok(PromotionPlanSelectedModule {
         source_module: module.module.clone(),
         target_module: mapping.target.module.clone(),
         source_path: module.source.clone(),
-        source_file_hash: package_file_hash(&fs::read(source_path).map_err(|_| {
-            policy_diagnostic(
-                "promotion_plan_generated_identity_mismatch",
-                module.source.as_str(),
-            )
-        })?),
+        source_file_hash: package_file_hash(
+            &read_package_regular_file_no_follow(root, &module.source).map_err(|_| {
+                policy_diagnostic(
+                    "promotion_plan_generated_identity_mismatch",
+                    module.source.as_str(),
+                )
+            })?,
+        ),
         certificate_file_hash: module.expected_certificate_file_hash,
         certificate_hash: module.expected_certificate_hash,
         export_hash: module.expected_export_hash,
@@ -793,20 +790,16 @@ pub(crate) fn project_equivalent_source(
                     &expected.module.as_dotted(),
                 )
             })?;
-        let path = confined_governance_path(
-            root,
-            &module.source,
-            module.source.as_str(),
-            "promotion_plan_generated_identity_mismatch",
-        )?;
         let actual = PromotionSourceModule {
             module: module.module.clone(),
-            source_file_hash: package_file_hash(&fs::read(path).map_err(|_| {
-                policy_diagnostic(
-                    "promotion_plan_generated_identity_mismatch",
-                    module.source.as_str(),
-                )
-            })?),
+            source_file_hash: package_file_hash(
+                &read_package_regular_file_no_follow(root, &module.source).map_err(|_| {
+                    policy_diagnostic(
+                        "promotion_plan_generated_identity_mismatch",
+                        module.source.as_str(),
+                    )
+                })?,
+            ),
             certificate_file_hash: module.expected_certificate_file_hash,
             certificate_hash: module.expected_certificate_hash,
             export_hash: module.expected_export_hash,
@@ -860,7 +853,9 @@ fn read_workspace_file(
     path: &std::path::Path,
     reason: &str,
 ) -> Result<String, Box<CommandDiagnostic>> {
-    fs::read_to_string(path).map_err(|_| policy_diagnostic(reason, &path.display().to_string()))
+    let bytes = read_regular_file_no_follow(path)
+        .map_err(|_| policy_diagnostic(reason, &path.display().to_string()))?;
+    String::from_utf8(bytes).map_err(|_| policy_diagnostic(reason, &path.display().to_string()))
 }
 
 fn read_source_file(
@@ -868,8 +863,9 @@ fn read_source_file(
     path: &PackagePath,
     reason: &str,
 ) -> Result<String, Box<CommandDiagnostic>> {
-    let full = confined_governance_path(root, path, path.as_str(), reason)?;
-    fs::read_to_string(full).map_err(|_| policy_diagnostic(reason, path.as_str()))
+    let bytes = read_package_regular_file_no_follow(root, path)
+        .map_err(|_| policy_diagnostic(reason, path.as_str()))?;
+    String::from_utf8(bytes).map_err(|_| policy_diagnostic(reason, path.as_str()))
 }
 
 fn version_tuple(version: &PackageVersion) -> (u64, u64, u64) {

@@ -117,6 +117,28 @@ pub struct ResolvedModuleImport {
     pub certificate_hash: PackageHash,
 }
 
+impl ResolvedModuleImport {
+    /// Project this resolved edge to its index-neutral Human-import identity.
+    pub fn semantic_identity(&self) -> ResolvedModuleImportIdentity {
+        ResolvedModuleImportIdentity {
+            module: self.module.clone(),
+            export_hash: self.export_hash,
+            certificate_hash: self.certificate_hash,
+        }
+    }
+}
+
+/// Index-neutral semantic identity of one resolved Human Surface import.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ResolvedModuleImportIdentity {
+    /// Imported module name.
+    pub module: Name,
+    /// Required export hash.
+    pub export_hash: PackageHash,
+    /// Required canonical certificate hash.
+    pub certificate_hash: PackageHash,
+}
+
 /// Classification for a resolved module-level import.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ResolvedModuleImportKind {

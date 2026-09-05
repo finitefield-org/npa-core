@@ -16,8 +16,6 @@ pub enum TokenKind {
     Theorem,
     Fun,
     Forall,
-    Let,
-    In,
     Prop,
     Type,
     Sort,
@@ -129,7 +127,7 @@ pub fn lex(file_id: crate::FileId, source: &str) -> Result<Vec<Token>> {
             },
             '?' => lex_named_hole(file_id, source, start, &mut chars),
             '0'..='9' => lex_number(file_id, source, start, offset, ch, &mut chars)?,
-            ch if is_ident_start(ch) => lex_ident(file_id, source, start, offset, &mut chars),
+            ch if is_ident_start(ch) => lex_ident(file_id, source, start, offset, &mut chars)?,
             ch => Token {
                 kind: TokenKind::Unsupported(ch),
                 span: Span::new(file_id, start, start + ch.len_utf8() as u32),
@@ -216,7 +214,7 @@ fn lex_ident(
     start: u32,
     first_offset: usize,
     chars: &mut std::iter::Peekable<std::str::CharIndices<'_>>,
-) -> Token {
+) -> Result<Token> {
     let mut end = first_offset;
 
     while let Some((offset, ch)) = chars.peek().copied() {
@@ -235,6 +233,11 @@ fn lex_ident(
             .expect("identifier has a character")
             .len_utf8();
     let text = &source[start as usize..end];
+    if text == "let" {
+        return Err(MachineDiagnostic::removed_term_let(Span::new(
+            file_id, start, end as u32,
+        )));
+    }
     let kind = match text {
         "import" => TokenKind::Import,
         "opaque" => TokenKind::Opaque,
@@ -242,8 +245,6 @@ fn lex_ident(
         "theorem" => TokenKind::Theorem,
         "fun" => TokenKind::Fun,
         "forall" => TokenKind::Forall,
-        "let" => TokenKind::Let,
-        "in" => TokenKind::In,
         "Prop" => TokenKind::Prop,
         "Type" => TokenKind::Type,
         "Sort" => TokenKind::Sort,
@@ -263,10 +264,10 @@ fn lex_ident(
         _ => TokenKind::Ident(text.to_owned()),
     };
 
-    Token {
+    Ok(Token {
         kind,
         span: Span::new(file_id, start, end as u32),
-    }
+    })
 }
 
 fn lex_number(
@@ -373,6 +374,69 @@ mod tests {
         assert_eq!(tokens[0].kind, TokenKind::Opaque);
         assert_eq!(tokens[0].span, Span::new(FileId(0), 0, 6));
         assert_eq!(tokens[1].kind, TokenKind::Ident("opaqueValue".to_owned()));
+    }
+
+    #[test]
+    fn removed_let_tombstone_consumes_the_shared_source_fixture_matrix() {
+        let matrix = include_str!("../../../testdata/certificate-v0.4/fixture-matrix.tsv");
+        let rows = matrix
+            .lines()
+            .skip(1)
+            .map(|line| {
+                let fields = line.split('\t').collect::<Vec<_>>();
+                assert_eq!(fields.len(), 10, "malformed fixture row: {line}");
+                fields
+            })
+            .filter(|fields| fields[1].starts_with("source_"))
+            .collect::<Vec<_>>();
+        assert_eq!(rows.len(), 11);
+
+        for fields in rows {
+            let source = match fields[0] {
+                "source_typed_let" => "def Test.x : Nat := let x : Nat := Nat.zero in x",
+                "source_unannotated_let" => "def Test.x : Nat := let x := Nat.zero in x",
+                "source_nested_let" => {
+                    "def Test.x : Nat := let x : Nat := Nat.zero in let y : Nat := x in y"
+                }
+                "source_declaration_name_let" => "def let : Nat := Nat.zero",
+                "source_binder_name_let" => "def Test.bad (let : Nat) : Nat := Nat.zero",
+                "source_letter_identifier" => "letter",
+                "source_comment_let" => "-- let",
+                "source_string_let" => "\"let\"",
+                "source_in_declaration_name" => "def in : Nat := Nat.zero",
+                "source_in_binder_name" => "def Test.in (in : Nat) : Nat := in",
+                "source_in_reference" => "in",
+                case_id => panic!("unmapped source fixture: {case_id}"),
+            };
+            match fields[6] {
+                "accepted" => {
+                    lex(FileId(4), source)
+                        .unwrap_or_else(|error| panic!("{}: {error:?}", fields[0]));
+                }
+                "removed_term_let" => {
+                    let start = source.find("let").expect("negative fixture contains let") as u32;
+                    let diagnostic = lex(FileId(5), source)
+                        .expect_err("the complete retired identifier should be rejected");
+                    assert_eq!(
+                        diagnostic.kind,
+                        crate::MachineDiagnosticKind::RemovedTermLet,
+                        "{}",
+                        fields[0]
+                    );
+                    assert_eq!(
+                        diagnostic.primary_span,
+                        Span::new(FileId(5), start, start + 3),
+                        "{}",
+                        fields[0]
+                    );
+                    for replacement in ["substitute", "`fun`", "`have`", "module-level declaration"]
+                    {
+                        assert!(diagnostic.message.contains(replacement));
+                    }
+                }
+                result => panic!("unmapped source result for {}: {result}", fields[0]),
+            }
+        }
     }
 
     #[test]

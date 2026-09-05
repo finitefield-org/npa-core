@@ -94,6 +94,7 @@ fn package_gate_plan_policy_covers_pas16_impact_classes() {
         "proofs/generated/package-lock.json",
         "proofs/generated/theorem-index.json",
         "proofs/generated/theorem-premise-report.json",
+        "proofs/generated/theorem-premise-report-chunks/fixture.part",
     ] {
         let plan = package_gate_plan_from_paths([path]);
         assert_eq!(

@@ -933,22 +933,6 @@ fn expression_charge(
                 stack.push(ty);
                 stack.push(body);
             }
-            Expr::Let {
-                binder,
-                ty,
-                value,
-                body,
-            } => {
-                bytes = bytes
-                    .checked_add(binder.capacity())?
-                    .checked_add(3usize.saturating_mul(ARC_ALLOCATION_HEADER_BYTES))?;
-                if bytes > remaining_bytes {
-                    return None;
-                }
-                stack.push(ty);
-                stack.push(value);
-                stack.push(body);
-            }
         }
     }
     Some(RetainedCharge {

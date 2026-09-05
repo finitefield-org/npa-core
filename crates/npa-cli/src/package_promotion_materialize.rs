@@ -2,15 +2,16 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs::{self, File, OpenOptions},
+    ffi::{OsStr, OsString},
+    fs,
     io::{self, Write},
     path::{Path, PathBuf},
 };
 
 use npa_api::PackageArtifactReferenceSummaryMode;
 use npa_cert::{
-    declaration_dependency_closure, resolve_verified_declaration_export, DeclarationClosureLimits,
-    GlobalDeclarationIdentity, Name,
+    declaration_dependency_closure_with_transported_externalizations,
+    resolve_verified_declaration_export, DeclarationClosureLimits, GlobalDeclarationIdentity, Name,
 };
 use npa_frontend::{
     collect_human_source_declaration_families, extract_human_declaration_source,
@@ -57,8 +58,16 @@ use crate::{
     diagnostic::{
         CommandArtifact, CommandDiagnostic, CommandResult, CommandStatus, DiagnosticKind,
     },
-    fs::render_package_root,
-    governance_writer::confined_governance_path,
+    fs::{
+        no_follow_directory::{
+            regular_file_identity, require_named_regular_file_identity, Directory, DirectoryChild,
+            Identity,
+        },
+        render_package_root,
+    },
+    generated_artifact_writer::{
+        open_package_parent_from_directory, read_package_regular_file_no_follow,
+    },
     package_api::v1::refresh_artifacts_write,
     package_artifacts::{
         load_package_audit_snapshot, PackageGeneratedArtifactReadMode, PACKAGE_AXIOM_REPORT_PATH,
@@ -78,8 +87,9 @@ use crate::{
     },
     package_promotion_prepare_declaration::{
         direct_import_interfaces, endpoint_record, plan_declarations, plan_roots,
-        read_declaration_source, reconcile_families, registry_owns_active_target, resolve_roots,
-        DeclarationSourceExtractionError,
+        read_declaration_source, reconcile_families,
+        registry_attests_transported_declaration_mapping, registry_owns_active_target,
+        resolve_roots, transported_declaration_externalizations, DeclarationSourceExtractionError,
     },
     package_promotion_registry::{
         parse_promotion_origin_registry_versioned, promotion_plan_generated_read_mode,
@@ -319,21 +329,22 @@ fn materialize_normal(options: PackageMaterializePromotionOptions) -> CommandRes
         std::process::id(),
         short_hash(plan.promotion_id)
     ));
-    if write_tree_snapshot(&captured_target, &stage).is_err() {
-        return failure(
-            &root_display,
-            "promotion_concurrent_update",
-            "--target-root",
-        );
-    }
-    let build_result = materialize_stage(&materialization_source, &stage, &plan);
+    let stage_tree = match write_tree_snapshot(&captured_target, &stage) {
+        Ok(tree) => tree,
+        Err(_) => {
+            return failure(
+                &root_display,
+                "promotion_concurrent_update",
+                "--target-root",
+            )
+        }
+    };
+    let build_result = materialize_stage(&materialization_source, &stage_tree, &stage, &plan);
     if let Err(reason) = build_result {
-        let _ = fs::remove_dir_all(&stage);
         return failure(&root_display, reason, "--plan");
     }
     let attestation = if phase == PackagePromotionPhase::Tracked {
         let Some(attestation_arg) = options.transport_attestation.as_ref() else {
-            let _ = fs::remove_dir_all(&stage);
             return failure(
                 &root_display,
                 "promotion_materialize_transport_attestation_required",
@@ -344,7 +355,6 @@ fn materialize_normal(options: PackageMaterializePromotionOptions) -> CommandRes
         let bytes = match read_confined(&options.common.root, &path) {
             Ok(bytes) => bytes,
             Err(_) => {
-                let _ = fs::remove_dir_all(&stage);
                 return failure(
                     &root_display,
                     "promotion_materialize_transport_attestation_stale",
@@ -355,7 +365,6 @@ fn materialize_normal(options: PackageMaterializePromotionOptions) -> CommandRes
         let source = match String::from_utf8(bytes.clone()) {
             Ok(source) => source,
             Err(_) => {
-                let _ = fs::remove_dir_all(&stage);
                 return failure(
                     &root_display,
                     "promotion_materialize_transport_attestation_stale",
@@ -379,7 +388,6 @@ fn materialize_normal(options: PackageMaterializePromotionOptions) -> CommandRes
                 check: true,
             });
         if transport_check.status != CommandStatus::Passed {
-            let _ = fs::remove_dir_all(&stage);
             return failure(
                 &root_display,
                 "promotion_materialize_transport_attestation_stale",
@@ -389,7 +397,6 @@ fn materialize_normal(options: PackageMaterializePromotionOptions) -> CommandRes
         let parsed = match parse_l2_namespace_transport_attestation_json(&source) {
             Ok(parsed) => parsed,
             Err(_) => {
-                let _ = fs::remove_dir_all(&stage);
                 return failure(
                     &root_display,
                     "promotion_materialize_transport_attestation_stale",
@@ -397,8 +404,7 @@ fn materialize_normal(options: PackageMaterializePromotionOptions) -> CommandRes
                 );
             }
         };
-        if !attestation_matches(&parsed, &plan, baseline_root, &stage) {
-            let _ = fs::remove_dir_all(&stage);
+        if !attestation_matches(&parsed, &plan, baseline_root, &stage_tree, &stage) {
             return failure(
                 &root_display,
                 "promotion_materialize_transport_attestation_stale",
@@ -406,6 +412,7 @@ fn materialize_normal(options: PackageMaterializePromotionOptions) -> CommandRes
             );
         }
         if update_stage_registry(
+            &stage_tree,
             &stage,
             &plan_path,
             &plan_bytes,
@@ -416,7 +423,6 @@ fn materialize_normal(options: PackageMaterializePromotionOptions) -> CommandRes
         )
         .is_err()
         {
-            let _ = fs::remove_dir_all(&stage);
             return failure(
                 &root_display,
                 "promotion_registry_transition_not_append_only",
@@ -430,7 +436,6 @@ fn materialize_normal(options: PackageMaterializePromotionOptions) -> CommandRes
     let staged_files = match tree_snapshot(&stage) {
         Ok(files) => files,
         Err(_) => {
-            let _ = fs::remove_dir_all(&stage);
             return failure(
                 &root_display,
                 "promotion_materialize_target_identity_mismatch",
@@ -442,7 +447,6 @@ fn materialize_normal(options: PackageMaterializePromotionOptions) -> CommandRes
         .keys()
         .find(|path| !staged_files.contains_key(path))
     {
-        let _ = fs::remove_dir_all(&stage);
         return failure(
             &root_display,
             "promotion_materialize_unscoped_path",
@@ -455,7 +459,6 @@ fn materialize_normal(options: PackageMaterializePromotionOptions) -> CommandRes
         .iter()
         .find(|change| !change_is_scoped(change, &plan, phase))
     {
-        let _ = fs::remove_dir_all(&stage);
         return failure(
             &root_display,
             "promotion_materialize_unscoped_path",
@@ -463,7 +466,7 @@ fn materialize_normal(options: PackageMaterializePromotionOptions) -> CommandRes
         );
     }
     if !options.apply {
-        let _ = fs::remove_dir_all(&stage);
+        let _ = stage_tree.cleanup(&staged_files);
         let mut result = CommandResult::passed(COMMAND, root_display);
         for change in changes {
             result.artifacts.push(CommandArtifact {
@@ -482,7 +485,7 @@ fn materialize_normal(options: PackageMaterializePromotionOptions) -> CommandRes
     let mut lock = match TargetLock::acquire(&options.target_root) {
         Ok(lock) => lock,
         Err(_) => {
-            let _ = fs::remove_dir_all(&stage);
+            let _ = stage_tree.cleanup(&staged_files);
             return failure(
                 &root_display,
                 "promotion_concurrent_update",
@@ -490,27 +493,14 @@ fn materialize_normal(options: PackageMaterializePromotionOptions) -> CommandRes
             );
         }
     };
-    if let Err(reason) = locked_apply_preflight(&options.target_root, &captured_target) {
+    if let Err(reason) = locked_apply_preflight(&lock, &captured_target) {
         drop(lock);
-        let _ = fs::remove_dir_all(&stage);
+        let _ = stage_tree.cleanup(&staged_files);
         return failure(&root_display, reason, "--target-root");
     }
-    let transaction = match transaction_path(&options.target_root, plan.promotion_id) {
-        Ok(path) => path,
-        Err(_) => {
-            drop(lock);
-            let _ = fs::remove_dir_all(&stage);
-            return failure(
-                &root_display,
-                "promotion_materialize_unscoped_path",
-                "--target-root",
-            );
-        }
-    };
-    let journal_name = transaction
-        .file_name()
-        .and_then(|name| name.to_str())
-        .map(str::to_owned);
+    let journal_name = transaction_name(lock.target_path_hash(), plan.promotion_id)
+        .into_string()
+        .ok();
     if lock
         .record(
             Some(plan.promotion_id),
@@ -520,7 +510,7 @@ fn materialize_normal(options: PackageMaterializePromotionOptions) -> CommandRes
         .is_err()
     {
         drop(lock);
-        let _ = fs::remove_dir_all(&stage);
+        let _ = stage_tree.cleanup(&staged_files);
         return failure(
             &root_display,
             "promotion_concurrent_update",
@@ -529,17 +519,17 @@ fn materialize_normal(options: PackageMaterializePromotionOptions) -> CommandRes
     }
     let mut transaction_visible = false;
     let apply = apply_transaction(
-        &options.target_root,
+        &mut lock,
         phase,
         plan.promotion_id,
         &changes,
         &mut transaction_visible,
     );
     if apply.is_err() {
-        let rolled_back = !transaction_visible
-            || rollback_transaction(&options.target_root, &transaction).is_ok();
+        let rolled_back =
+            !transaction_visible || rollback_transaction(&mut lock, plan.promotion_id).is_ok();
         drop(lock);
-        let _ = fs::remove_dir_all(&stage);
+        let _ = stage_tree.cleanup(&staged_files);
         return failure(
             &root_display,
             if rolled_back {
@@ -551,9 +541,9 @@ fn materialize_normal(options: PackageMaterializePromotionOptions) -> CommandRes
         );
     }
     if tree_snapshot(&options.target_root).ok().as_ref() != Some(&staged_files) {
-        let rolled_back = rollback_transaction(&options.target_root, &transaction).is_ok();
+        let rolled_back = rollback_transaction(&mut lock, plan.promotion_id).is_ok();
         drop(lock);
-        let _ = fs::remove_dir_all(&stage);
+        let _ = stage_tree.cleanup(&staged_files);
         return failure(
             &root_display,
             if rolled_back {
@@ -572,9 +562,9 @@ fn materialize_normal(options: PackageMaterializePromotionOptions) -> CommandRes
     ) {
         Ok(snapshot) => snapshot,
         Err(_) => {
-            let rolled_back = rollback_transaction(&options.target_root, &transaction).is_ok();
+            let rolled_back = rollback_transaction(&mut lock, plan.promotion_id).is_ok();
             drop(lock);
-            let _ = fs::remove_dir_all(&stage);
+            let _ = stage_tree.cleanup(&staged_files);
             return failure(
                 &root_display,
                 if rolled_back {
@@ -587,9 +577,9 @@ fn materialize_normal(options: PackageMaterializePromotionOptions) -> CommandRes
         }
     };
     if validate_checked_generated(&written).is_err() {
-        let rolled_back = rollback_transaction(&options.target_root, &transaction).is_ok();
+        let rolled_back = rollback_transaction(&mut lock, plan.promotion_id).is_ok();
         drop(lock);
-        let _ = fs::remove_dir_all(&stage);
+        let _ = stage_tree.cleanup(&staged_files);
         return failure(
             &root_display,
             if rolled_back {
@@ -616,9 +606,9 @@ fn materialize_normal(options: PackageMaterializePromotionOptions) -> CommandRes
         .status
             != CommandStatus::Passed
     {
-        let rolled_back = rollback_transaction(&options.target_root, &transaction).is_ok();
+        let rolled_back = rollback_transaction(&mut lock, plan.promotion_id).is_ok();
         drop(lock);
-        let _ = fs::remove_dir_all(&stage);
+        let _ = stage_tree.cleanup(&staged_files);
         return failure(
             &root_display,
             if rolled_back {
@@ -629,9 +619,9 @@ fn materialize_normal(options: PackageMaterializePromotionOptions) -> CommandRes
             MATHLIB_PROMOTION_REGISTRY_PATH,
         );
     }
-    if finalize_transaction(&transaction).is_err() {
+    if finalize_transaction(&mut lock, plan.promotion_id).is_err() {
         drop(lock);
-        let _ = fs::remove_dir_all(&stage);
+        let _ = stage_tree.cleanup(&staged_files);
         return failure(
             &root_display,
             "promotion_recovery_required",
@@ -639,7 +629,7 @@ fn materialize_normal(options: PackageMaterializePromotionOptions) -> CommandRes
         );
     }
     let _ = lock.record(Some(plan.promotion_id), "materialize", None);
-    let _ = fs::remove_dir_all(&stage);
+    let _ = stage_tree.cleanup(&staged_files);
     drop(lock);
     let mut result = CommandResult::passed(COMMAND, root_display);
     for change in changes {
@@ -658,10 +648,11 @@ fn materialize_normal(options: PackageMaterializePromotionOptions) -> CommandRes
 
 fn materialize_stage(
     source_snapshot: &MaterializationSourceSnapshot,
+    stage_tree: &SnapshotTree,
     stage: &Path,
     plan: &MathlibPromotionPlan,
 ) -> Result<(), &'static str> {
-    let preserved_modules = capture_existing_module_artifacts(stage)?;
+    let preserved_modules = capture_existing_module_artifacts(stage_tree)?;
     let mut import_map = BTreeMap::new();
     for module in &plan.selected_modules {
         import_map.insert(
@@ -681,21 +672,24 @@ fn materialize_stage(
             .get(&module.source_module)
             .ok_or("promotion_materialize_source_rewrite_failed")?;
         let rewritten = rewrite_imports(&captured.source, &import_map)?;
-        let target_dir = stage.join(module.target_module.as_dotted().replace('.', "/"));
-        fs::create_dir_all(&target_dir)
+        let target_base = module.target_module.as_dotted().replace('.', "/");
+        stage_tree
+            .write(
+                &PackagePath::new(format!("{target_base}/source.npa")),
+                rewritten.as_bytes(),
+            )
             .map_err(|_| "promotion_materialize_source_rewrite_failed")?;
-        fs::write(target_dir.join("source.npa"), rewritten)
+        stage_tree
+            .write(
+                &PackagePath::new(format!("{target_base}/replay.json")),
+                source_replay_json(captured, &module.target_module)?.as_bytes(),
+            )
             .map_err(|_| "promotion_materialize_source_rewrite_failed")?;
-        fs::write(
-            target_dir.join("replay.json"),
-            source_replay_json(captured, &module.target_module)?,
-        )
-        .map_err(|_| "promotion_materialize_source_rewrite_failed")?;
     }
-    edit_manifest(stage, plan, &import_map)?;
+    edit_manifest(stage_tree, plan, &import_map)?;
     // Selected modules must bind to the preserved baseline certificate for an
     // existing target dependency, not to a transient rebuild of that module.
-    externalize_preserved_dependencies(stage, plan, &preserved_modules)?;
+    externalize_preserved_dependencies(stage_tree, plan, &preserved_modules)?;
     let common = PackageCommonOptions {
         root: stage.to_path_buf(),
         json: false,
@@ -704,11 +698,17 @@ fn materialize_stage(
     if build.status != CommandStatus::Passed {
         return Err("promotion_materialize_compile_failed");
     }
-    restore_existing_module_artifacts(stage, plan, &preserved_modules)?;
+    stage_tree
+        .verify_after_path_based_operation()
+        .map_err(|_| "promotion_materialize_target_identity_mismatch")?;
+    restore_existing_module_artifacts(stage_tree, plan, &preserved_modules)?;
     let lock = run_package_lock_command(PackageLockCommand::Write(common.clone()));
     if lock.status != CommandStatus::Passed {
         return Err("promotion_materialize_target_identity_mismatch");
     }
+    stage_tree
+        .verify_after_path_based_operation()
+        .map_err(|_| "promotion_materialize_target_identity_mismatch")?;
     let axiom = run_package_axiom_report(PackageAxiomReportOptions {
         common: common.clone(),
         check: false,
@@ -722,7 +722,10 @@ fn materialize_stage(
     if axiom.status != CommandStatus::Passed || index.status != CommandStatus::Passed {
         return Err("promotion_materialize_target_identity_mismatch");
     }
-    write_meta_sidecars(stage, plan)?;
+    stage_tree
+        .verify_after_path_based_operation()
+        .map_err(|_| "promotion_materialize_target_identity_mismatch")?;
+    write_meta_sidecars(stage_tree, stage, plan)?;
     // Keep disposable and tracked materializations byte-identical before the
     // tracked-only registry update. Build-certs invalidates these generated
     // files after the manifest changes, so both phases must regenerate them.
@@ -740,11 +743,17 @@ fn materialize_stage(
     if export.status != CommandStatus::Passed || publish.status != CommandStatus::Passed {
         return Err("promotion_materialize_target_identity_mismatch");
     }
+    stage_tree
+        .verify_after_path_based_operation()
+        .map_err(|_| "promotion_materialize_target_identity_mismatch")?;
     Ok(())
 }
 
-fn capture_existing_module_artifacts(stage: &Path) -> Result<PreservedTargetModules, &'static str> {
-    let manifest_source = fs::read_to_string(stage.join("npa-package.toml"))
+fn capture_existing_module_artifacts(
+    stage: &SnapshotTree,
+) -> Result<PreservedTargetModules, &'static str> {
+    let manifest_source = stage
+        .read_string(&PackagePath::new("npa-package.toml"))
         .map_err(|_| "promotion_materialize_target_identity_mismatch")?;
     let manifest = parse_and_validate_manifest_str(&manifest_source)
         .map_err(|_| "promotion_materialize_target_identity_mismatch")?
@@ -761,12 +770,13 @@ fn capture_existing_module_artifacts(stage: &Path) -> Result<PreservedTargetModu
             let Some(path) = path else {
                 continue;
             };
-            match fs::read(stage.join(path.as_str())) {
-                Ok(bytes) => {
+            match stage.read_optional(&path) {
+                Ok(Some(bytes)) => {
                     artifacts.insert(path, bytes);
                 }
-                Err(error) if !required && error.kind() == io::ErrorKind::NotFound => {}
+                Ok(None) if !required => {}
                 Err(_) => return Err("promotion_materialize_target_identity_mismatch"),
+                Ok(None) => return Err("promotion_materialize_target_identity_mismatch"),
             }
         }
     }
@@ -777,20 +787,18 @@ fn capture_existing_module_artifacts(stage: &Path) -> Result<PreservedTargetModu
 }
 
 fn restore_existing_module_artifacts(
-    stage: &Path,
+    stage: &SnapshotTree,
     plan: &MathlibPromotionPlan,
     preserved: &PreservedTargetModules,
 ) -> Result<(), &'static str> {
     for (path, bytes) in &preserved.artifacts {
-        let full = stage.join(path.as_str());
-        if let Some(parent) = full.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|_| "promotion_materialize_target_identity_mismatch")?;
-        }
-        fs::write(full, bytes).map_err(|_| "promotion_materialize_target_identity_mismatch")?;
+        stage
+            .write(path, bytes)
+            .map_err(|_| "promotion_materialize_target_identity_mismatch")?;
     }
-    let manifest_path = stage.join("npa-package.toml");
-    let built_document = fs::read_to_string(&manifest_path)
+    let manifest_path = PackagePath::new("npa-package.toml");
+    let built_document = stage
+        .read_string(&manifest_path)
         .map_err(|_| "promotion_materialize_target_identity_mismatch")?
         .parse::<DocumentMut>()
         .map_err(|_| "promotion_materialize_target_identity_mismatch")?;
@@ -828,13 +836,14 @@ fn restore_existing_module_artifacts(
     for table in selected_tables {
         tables.push(table);
     }
-    fs::write(manifest_path, document.to_string())
+    stage
+        .write(&manifest_path, document.to_string().as_bytes())
         .map_err(|_| "promotion_materialize_target_identity_mismatch")?;
     Ok(())
 }
 
 fn externalize_preserved_dependencies(
-    stage: &Path,
+    stage: &SnapshotTree,
     plan: &MathlibPromotionPlan,
     preserved: &PreservedTargetModules,
 ) -> Result<(), &'static str> {
@@ -860,8 +869,9 @@ fn externalize_preserved_dependencies(
         })
         .collect::<Result<Vec<_>, _>>()?;
 
-    let manifest_path = stage.join("npa-package.toml");
-    let mut document = fs::read_to_string(&manifest_path)
+    let manifest_path = PackagePath::new("npa-package.toml");
+    let mut document = stage
+        .read_string(&manifest_path)
         .map_err(|_| "promotion_materialize_target_identity_mismatch")?
         .parse::<DocumentMut>()
         .map_err(|_| "promotion_materialize_target_identity_mismatch")?;
@@ -891,7 +901,8 @@ fn externalize_preserved_dependencies(
             toml_edit::value(format_package_hash(&module.expected_certificate_hash));
         imports.push(table);
     }
-    fs::write(manifest_path, document.to_string())
+    stage
+        .write(&manifest_path, document.to_string().as_bytes())
         .map_err(|_| "promotion_materialize_target_identity_mismatch")
 }
 
@@ -926,13 +937,14 @@ fn rewrite_imports(
 }
 
 fn edit_manifest(
-    stage: &Path,
+    stage: &SnapshotTree,
     plan: &MathlibPromotionPlan,
     mapping: &BTreeMap<String, String>,
 ) -> Result<(), &'static str> {
-    let path = stage.join("npa-package.toml");
-    let source =
-        fs::read_to_string(&path).map_err(|_| "promotion_materialize_target_identity_mismatch")?;
+    let path = PackagePath::new("npa-package.toml");
+    let source = stage
+        .read_string(&path)
+        .map_err(|_| "promotion_materialize_target_identity_mismatch")?;
     let mut document = source
         .parse::<DocumentMut>()
         .map_err(|_| "promotion_materialize_target_identity_mismatch")?;
@@ -994,7 +1006,8 @@ fn edit_manifest(
         table["axioms"] = Item::Value(axioms.into());
         tables.push(table);
     }
-    fs::write(path, document.to_string())
+    stage
+        .write(&path, document.to_string().as_bytes())
         .map_err(|_| "promotion_materialize_target_identity_mismatch")
 }
 
@@ -1041,7 +1054,11 @@ fn selected_topological_order(
     Ok(ordered)
 }
 
-fn write_meta_sidecars(stage: &Path, plan: &MathlibPromotionPlan) -> Result<(), &'static str> {
+fn write_meta_sidecars(
+    stage_tree: &SnapshotTree,
+    stage: &Path,
+    plan: &MathlibPromotionPlan,
+) -> Result<(), &'static str> {
     let loaded = crate::package::load_package_root(stage, COMMAND)
         .map_err(|_| "promotion_materialize_target_identity_mismatch")?;
     for selected in &plan.selected_modules {
@@ -1099,7 +1116,8 @@ fn write_meta_sidecars(stage: &Path, plan: &MathlibPromotionPlan) -> Result<(), 
             .meta
             .as_ref()
             .ok_or("promotion_materialize_target_identity_mismatch")?;
-        fs::write(stage.join(path.as_str()), json)
+        stage_tree
+            .write(path, json.as_bytes())
             .map_err(|_| "promotion_materialize_target_identity_mismatch")?;
     }
     Ok(())
@@ -1220,32 +1238,20 @@ fn capture_materialization_source(
         if module.source != selected.source_path {
             return None;
         }
-        let source_path = confined_governance_path(
-            root,
-            &module.source,
-            module.source.as_str(),
-            "promotion_materialize_source_rewrite_failed",
-        )
-        .ok()?;
-        let source_bytes = fs::read(source_path).ok()?;
+        let source_bytes = read_package_regular_file_no_follow(root, &module.source).ok()?;
         if package_file_hash(&source_bytes) != selected.source_file_hash {
             return None;
         }
         let replay_path = module.replay.as_ref()?;
-        let replay_path = confined_governance_path(
-            root,
-            replay_path,
-            replay_path.as_str(),
-            "promotion_materialize_source_rewrite_failed",
-        )
-        .ok()?;
+        let replay_bytes = read_package_regular_file_no_follow(root, replay_path).ok()?;
         modules.insert(
             selected.source_module.clone(),
             MaterializationSourceModule {
                 source: String::from_utf8(source_bytes).ok()?,
                 replay: {
                     let replay =
-                        parse_package_proof_replay(&fs::read_to_string(replay_path).ok()?).ok()?;
+                        parse_package_proof_replay(std::str::from_utf8(&replay_bytes).ok()?)
+                            .ok()?;
                     if replay.module != selected.source_module
                         || replay
                             .accepted_artifact
@@ -1270,16 +1276,18 @@ fn revalidate_plan_inputs(
     materialization_source: &MaterializationSourceSnapshot,
     plan: &MathlibPromotionPlan,
 ) -> bool {
-    let acceptance_policy_path = baseline_root.join("policy/l2-acceptance-policy.json");
-    let transport_policy_path = baseline_root.join("policy/l2-namespace-transport-policy.json");
-    let acceptance_policy_bytes = match fs::read(&acceptance_policy_path) {
-        Ok(bytes) => bytes,
-        Err(_) => return false,
-    };
-    let transport_policy_bytes = match fs::read(&transport_policy_path) {
-        Ok(bytes) => bytes,
-        Err(_) => return false,
-    };
+    let acceptance_policy_path = PackagePath::new("policy/l2-acceptance-policy.json");
+    let transport_policy_path = PackagePath::new("policy/l2-namespace-transport-policy.json");
+    let acceptance_policy_bytes =
+        match read_package_regular_file_no_follow(baseline_root, &acceptance_policy_path) {
+            Ok(bytes) => bytes,
+            Err(_) => return false,
+        };
+    let transport_policy_bytes =
+        match read_package_regular_file_no_follow(baseline_root, &transport_policy_path) {
+            Ok(bytes) => bytes,
+            Err(_) => return false,
+        };
     let acceptance_bytes = match read_confined(source_root, &plan.governance.source_acceptance_path)
     {
         Ok(bytes) => bytes,
@@ -1366,14 +1374,12 @@ fn revalidate_plan_inputs(
                 || row.target.package != mapping.target.package
                 || row.target.version != mapping.target.version
                 || row.target.origin != npa_package::PackageArtifactOrigin::Local
-                || !transport
-                    .allowed_source_prefixes
-                    .iter()
-                    .any(|prefix| row.source.module.as_dotted().starts_with(prefix))
-                || !transport
-                    .allowed_target_prefixes
-                    .iter()
-                    .any(|prefix| row.target.module.as_dotted().starts_with(prefix))
+                || !transport.allowed_source_prefixes.iter().any(|prefix| {
+                    npa_package::l2_namespace_prefix_matches(&row.source.module, prefix)
+                })
+                || !transport.allowed_target_prefixes.iter().any(|prefix| {
+                    npa_package::l2_namespace_prefix_matches(&row.target.module, prefix)
+                })
         })
     {
         return false;
@@ -1543,6 +1549,7 @@ fn attestation_matches(
     attestation: &npa_package::L2NamespaceTransportAttestation,
     plan: &MathlibPromotionPlan,
     baseline: &Path,
+    stage_tree: &SnapshotTree,
     stage: &Path,
 ) -> bool {
     let files = match tree_snapshot(stage) {
@@ -1611,7 +1618,7 @@ fn attestation_matches(
             Some(target) => target,
             None => return false,
         };
-        let target_source_hash = match fs::read(stage.join(target.source.as_str())) {
+        let target_source_hash = match stage_tree.read(&target.source) {
             Ok(bytes) => package_file_hash(&bytes),
             Err(_) => return false,
         };
@@ -1689,7 +1696,9 @@ fn attestation_matches(
     expected_changes == attested_changes
 }
 
+#[allow(clippy::too_many_arguments)]
 fn update_stage_registry(
+    stage_tree: &SnapshotTree,
     stage: &Path,
     plan_path: &PackagePath,
     plan_bytes: &[u8],
@@ -1703,8 +1712,8 @@ fn update_stage_registry(
         V2(npa_package::PromotionOriginRegistryV2),
         V3(npa_package::PromotionOriginRegistryV3),
     }
-    let registry_path = stage.join(MATHLIB_PROMOTION_REGISTRY_PATH);
-    let registry_source = fs::read_to_string(&registry_path).map_err(|_| ())?;
+    let registry_path = PackagePath::new(MATHLIB_PROMOTION_REGISTRY_PATH);
+    let registry_source = stage_tree.read_string(&registry_path).map_err(|_| ())?;
     let (previous, mut registry) = match parse_promotion_origin_registry_versioned(&registry_source)
         .map_err(|_| ())?
     {
@@ -1725,7 +1734,7 @@ fn update_stage_registry(
         stage,
         COMMAND,
         PackageGeneratedArtifactReadMode::all(),
-        PackageArtifactReferenceSummaryMode::Include,
+        PackageArtifactReferenceSummaryMode::Omit,
     )
     .map_err(|_| ())?;
     let index = audit.snapshot.project_theorem_index().map_err(|_| ())?;
@@ -1738,8 +1747,7 @@ fn update_stage_registry(
             .iter()
             .find(|module| module.module == selected.target_module)
             .ok_or(())?;
-        let source_hash =
-            package_file_hash(&fs::read(stage.join(target.source.as_str())).map_err(|_| ())?);
+        let source_hash = package_file_hash(&stage_tree.read(&target.source).map_err(|_| ())?);
         let mut theorems = selected
             .theorems
             .iter()
@@ -1848,11 +1856,20 @@ fn update_stage_registry(
         }
         PreviousRegistry::V3(previous) => {
             let next = merge_v3_source_registry(previous, registry)?;
-            return fs::write(registry_path, next.canonical_json().map_err(|_| ())?)
+            return stage_tree
+                .write(
+                    &registry_path,
+                    next.canonical_json().map_err(|_| ())?.as_bytes(),
+                )
                 .map_err(|_| ());
         }
     }
-    fs::write(registry_path, registry.canonical_json().map_err(|_| ())?).map_err(|_| ())
+    stage_tree
+        .write(
+            &registry_path,
+            registry.canonical_json().map_err(|_| ())?.as_bytes(),
+        )
+        .map_err(|_| ())
 }
 
 fn v3_source_registry(
@@ -1949,89 +1966,427 @@ fn change_is_scoped(
     ) || (phase == PackagePromotionPhase::Tracked && path == MATHLIB_PROMOTION_REGISTRY_PATH)
 }
 
-pub(crate) fn tree_snapshot(root: &Path) -> io::Result<BTreeMap<PackagePath, Vec<u8>>> {
-    fn snapshot_path(relative: &Path) -> io::Result<PackagePath> {
-        let mut components = Vec::new();
-        for component in relative.components() {
-            let std::path::Component::Normal(component) = component else {
-                return Err(io::Error::other("snapshot path"));
-            };
-            components.push(
-                component
-                    .to_str()
-                    .ok_or_else(|| io::Error::other("snapshot path encoding"))?,
-            );
+const MAX_PROMOTION_SNAPSHOT_FILE_BYTES: u64 = 67_108_864;
+const MAX_PROMOTION_SNAPSHOT_TOTAL_BYTES: u64 = 536_870_912;
+const MAX_PROMOTION_SNAPSHOT_ENTRIES: usize = 16_384;
+
+#[cfg(test)]
+thread_local! {
+    static SNAPSHOT_CATALOG_TEST_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+fn run_snapshot_catalog_test_hook() {
+    SNAPSHOT_CATALOG_TEST_HOOK.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook();
         }
-        let path = PackagePath::new(components.join("/"));
-        validate_package_path(&path, "snapshot.path")
-            .map_err(|_| io::Error::other("snapshot path"))?;
-        Ok(path)
-    }
+    });
+}
+
+#[cfg(not(test))]
+fn run_snapshot_catalog_test_hook() {}
+
+pub(crate) fn tree_snapshot(root: &Path) -> io::Result<BTreeMap<PackagePath, Vec<u8>>> {
+    use std::io::Read as _;
 
     fn walk(
-        root: &Path,
-        current: &Path,
+        directory: &Directory,
+        prefix: &mut Vec<String>,
+        root: bool,
         out: &mut BTreeMap<PackagePath, Vec<u8>>,
+        total: &mut u64,
     ) -> io::Result<()> {
-        let mut entries = fs::read_dir(current)?.collect::<Result<Vec<_>, _>>()?;
-        entries.sort_by_key(|entry| entry.file_name());
-        for entry in entries {
-            let name = entry.file_name();
-            if current == root && name == ".git" {
+        let root_identity = directory.identity()?;
+        let mut names = directory.entry_names()?;
+        names.sort();
+        run_snapshot_catalog_test_hook();
+        for name in &names {
+            if root && name == OsStr::new(".git") {
                 continue;
             }
-            let path = entry.path();
-            let ty = entry.file_type()?;
-            if ty.is_symlink() {
-                return Err(io::Error::other("symlink"));
-            }
-            if ty.is_dir() {
-                walk(root, &path, out)?;
-            } else if ty.is_file() {
-                let relative = path
-                    .strip_prefix(root)
-                    .map_err(|_| io::Error::other("path"))?;
-                let package_path = snapshot_path(relative)?;
-                if out.insert(package_path, fs::read(path)?).is_some() {
-                    return Err(io::Error::other("duplicate snapshot path"));
+            let name_text = name
+                .to_str()
+                .ok_or_else(|| io::Error::other("snapshot path encoding"))?
+                .to_owned();
+            prefix.push(name_text);
+            let path = PackagePath::new(prefix.join("/"));
+            validate_package_path(&path, "snapshot.path")
+                .map_err(|_| io::Error::other("snapshot path"))?;
+            match directory.open_child(name)? {
+                DirectoryChild::Directory(child) => {
+                    let identity = child.identity()?;
+                    if identity.device != root_identity.device {
+                        return Err(io::Error::other(
+                            "snapshot directory crosses a device boundary",
+                        ));
+                    }
+                    walk(&child, prefix, false, out, total)?;
+                    let DirectoryChild::Directory(reopened) = directory.open_child(name)? else {
+                        return Err(io::Error::other(
+                            "snapshot directory changed during traversal",
+                        ));
+                    };
+                    if reopened.identity()? != identity {
+                        return Err(io::Error::other(
+                            "snapshot directory identity changed during traversal",
+                        ));
+                    }
+                }
+                DirectoryChild::Regular(mut file) => {
+                    let identity = regular_file_identity(&file)?;
+                    let metadata = file.metadata()?;
+                    if metadata.len() > MAX_PROMOTION_SNAPSHOT_FILE_BYTES {
+                        return Err(io::Error::other("snapshot file exceeds byte limit"));
+                    }
+                    *total = total
+                        .checked_add(metadata.len())
+                        .ok_or_else(|| io::Error::other("snapshot byte total overflow"))?;
+                    if *total > MAX_PROMOTION_SNAPSHOT_TOTAL_BYTES {
+                        return Err(io::Error::other("snapshot exceeds total byte limit"));
+                    }
+                    let mut bytes = Vec::new();
+                    std::io::Read::by_ref(&mut file)
+                        .take(MAX_PROMOTION_SNAPSHOT_FILE_BYTES + 1)
+                        .read_to_end(&mut bytes)?;
+                    if bytes.len() as u64 > MAX_PROMOTION_SNAPSHOT_FILE_BYTES {
+                        return Err(io::Error::other("snapshot file exceeds byte limit"));
+                    }
+                    if out.len() >= MAX_PROMOTION_SNAPSHOT_ENTRIES {
+                        return Err(io::Error::other("snapshot exceeds entry limit"));
+                    }
+                    if out.insert(path, bytes).is_some() {
+                        return Err(io::Error::other("duplicate snapshot path"));
+                    }
+                    require_named_regular_file_identity(directory, name, identity)?;
                 }
             }
+            prefix.pop();
+        }
+        let mut names_after = directory.entry_names()?;
+        names_after.sort();
+        if names_after != names {
+            return Err(io::Error::other(
+                "snapshot directory catalog changed during traversal",
+            ));
+        }
+        Ok(())
+    }
+
+    let directory = crate::fs::no_follow_directory::open_absolute_directory(root, false)
+        .map_err(|error| io::Error::new(error.kind(), format!("snapshot root: {error}")))?;
+    let mut out = BTreeMap::new();
+    let mut total = 0;
+    walk(&directory, &mut Vec::new(), true, &mut out, &mut total)
+        .map_err(|error| io::Error::new(error.kind(), format!("snapshot walk: {error}")))?;
+    Ok(out)
+}
+
+fn snapshot_directory_catalog(snapshot: &BTreeMap<PackagePath, Vec<u8>>) -> BTreeSet<PackagePath> {
+    let mut directories = BTreeSet::new();
+    for path in snapshot.keys() {
+        let components = path.as_str().split('/').collect::<Vec<_>>();
+        for length in 1..components.len() {
+            directories.insert(PackagePath::new(components[..length].join("/")));
+        }
+    }
+    directories
+}
+
+pub(crate) struct SnapshotTree {
+    parent: Directory,
+    directory: Directory,
+    name: OsString,
+    identity: crate::fs::no_follow_directory::Identity,
+}
+
+impl SnapshotTree {
+    fn ensure_named_identity(&self) -> io::Result<()> {
+        let named = self.parent.open_or_create_directory(&self.name, false)?;
+        if named.identity()? != self.identity || self.directory.identity()? != self.identity {
+            return Err(io::Error::other("snapshot root identity changed"));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn cleanup(&self, snapshot: &BTreeMap<PackagePath, Vec<u8>>) -> io::Result<()> {
+        cleanup_tree_snapshot(self, snapshot)
+    }
+
+    fn read(&self, path: &PackagePath) -> io::Result<Vec<u8>> {
+        self.ensure_named_identity()?;
+        let (parent, leaf) = open_package_parent_from_directory(&self.directory, path, false)?;
+        let bytes = read_regular_limited(&parent, &leaf)?;
+        self.ensure_named_identity()?;
+        Ok(bytes)
+    }
+
+    fn read_string(&self, path: &PackagePath) -> io::Result<String> {
+        String::from_utf8(self.read(path)?)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "stage file is not UTF-8"))
+    }
+
+    fn read_optional(&self, path: &PackagePath) -> io::Result<Option<Vec<u8>>> {
+        self.ensure_named_identity()?;
+        let bytes = read_optional_target(&self.directory, path)?;
+        self.ensure_named_identity()?;
+        Ok(bytes)
+    }
+
+    fn write(&self, path: &PackagePath, bytes: &[u8]) -> io::Result<()> {
+        self.ensure_named_identity()?;
+        let current = read_optional_target_with_identity(&self.directory, path)?;
+        replace_file_if_identity_with_publication(
+            &self.directory,
+            path,
+            bytes,
+            current.as_ref().map(|entry| entry.identity),
+            |parent, temporary, leaf| {
+                self.ensure_named_identity()?;
+                parent.replace_file_under_cooperative_lock(temporary, leaf)?;
+                self.ensure_named_identity()
+            },
+        )?;
+        self.ensure_named_identity()
+    }
+
+    fn verify_after_path_based_operation(&self) -> io::Result<()> {
+        self.ensure_named_identity()
+    }
+
+    fn remove_regular_file(
+        &self,
+        directory: &Directory,
+        name: &OsStr,
+        identity: Identity,
+    ) -> io::Result<()> {
+        self.ensure_named_identity()?;
+        directory.remove_regular_file_under_cooperative_lock(name, identity)?;
+        self.ensure_named_identity()
+    }
+
+    fn remove_empty_directory(
+        &self,
+        directory: &Directory,
+        name: &OsStr,
+        identity: Identity,
+    ) -> io::Result<()> {
+        self.ensure_named_identity()?;
+        directory.remove_empty_directory_under_cooperative_lock(name, identity)?;
+        self.ensure_named_identity()
+    }
+}
+
+fn cleanup_tree_snapshot(
+    tree: &SnapshotTree,
+    snapshot: &BTreeMap<PackagePath, Vec<u8>>,
+) -> io::Result<()> {
+    tree.ensure_named_identity()?;
+    let actual = tree_snapshot_at(&tree.directory)?;
+    if &actual != snapshot {
+        return Err(io::Error::other("snapshot cleanup layout changed"));
+    }
+    let directory_catalog = snapshot_directory_catalog(snapshot);
+    let mut directory_identities = BTreeMap::new();
+    for path in directory_catalog.iter() {
+        let (parent, leaf) = open_package_parent_from_directory(&tree.directory, path, false)?;
+        let directory = parent.open_or_create_directory(&leaf, false)?;
+        directory_identities.insert(path.clone(), directory.identity()?);
+    }
+    let mut file_identities = BTreeMap::new();
+    for path in snapshot.keys() {
+        let (directory, leaf) = open_package_parent_from_directory(&tree.directory, path, false)?;
+        let file = directory
+            .open_regular_file(&leaf)?
+            .ok_or_else(|| io::Error::other("snapshot cleanup file disappeared"))?;
+        file_identities.insert(path.clone(), regular_file_identity(&file)?);
+    }
+    for path in snapshot.keys() {
+        tree.ensure_named_identity()?;
+        let (directory, leaf) = open_package_parent_from_directory(&tree.directory, path, false)?;
+        if let Some((parent_path, _)) = path.as_str().rsplit_once('/') {
+            if directory.identity()? != directory_identities[&PackagePath::new(parent_path)] {
+                return Err(io::Error::other("snapshot directory identity changed"));
+            }
+        } else if directory.identity()? != tree.identity {
+            return Err(io::Error::other("snapshot root identity changed"));
+        }
+        tree.remove_regular_file(&directory, &leaf, file_identities[path])?;
+    }
+    let mut directories = directory_catalog.into_iter().collect::<Vec<_>>();
+    directories.sort_by_key(|path| std::cmp::Reverse(path.as_str().split('/').count()));
+    for path in directories {
+        tree.ensure_named_identity()?;
+        let components = path.as_str().split('/').collect::<Vec<_>>();
+        let leaf = OsString::from(components.last().expect("nonempty snapshot directory"));
+        let parent_path = if components.len() == 1 {
+            None
+        } else {
+            Some(PackagePath::new(
+                components[..components.len() - 1].join("/"),
+            ))
+        };
+        let directory = match parent_path {
+            Some(parent_path) => {
+                let (grandparent, parent_leaf) =
+                    open_package_parent_from_directory(&tree.directory, &parent_path, false)?;
+                grandparent.open_or_create_directory(&parent_leaf, false)?
+            }
+            None => tree.directory.try_clone()?,
+        };
+        let child = directory.open_or_create_directory(&leaf, false)?;
+        if child.identity()? != directory_identities[&path] {
+            return Err(io::Error::other("snapshot directory identity changed"));
+        }
+        tree.remove_empty_directory(&directory, &leaf, child.identity()?)?;
+    }
+    tree.ensure_named_identity()?;
+    tree.ensure_named_identity()?;
+    tree.parent
+        .remove_empty_directory_under_cooperative_lock(&tree.name, tree.identity)?;
+    tree.parent.sync_all()
+}
+
+fn tree_snapshot_at(root: &Directory) -> io::Result<BTreeMap<PackagePath, Vec<u8>>> {
+    // Reuse the public fd-walker without reopening the path by spelling its
+    // traversal locally through a retained clone.
+    fn walk(
+        directory: &Directory,
+        prefix: &mut Vec<String>,
+        out: &mut BTreeMap<PackagePath, Vec<u8>>,
+        total: &mut u64,
+    ) -> io::Result<()> {
+        use std::io::Read as _;
+        let identity = directory.identity()?;
+        let mut names = directory.entry_names()?;
+        names.sort();
+        run_snapshot_catalog_test_hook();
+        for name in &names {
+            let component = name
+                .to_str()
+                .ok_or_else(|| io::Error::other("snapshot path encoding"))?
+                .to_owned();
+            prefix.push(component);
+            let path = PackagePath::new(prefix.join("/"));
+            validate_package_path(&path, "snapshot.path")
+                .map_err(|_| io::Error::other("snapshot path"))?;
+            match directory.open_child(name)? {
+                DirectoryChild::Directory(child) => {
+                    let child_identity = child.identity()?;
+                    if child_identity.device != identity.device {
+                        return Err(io::Error::other(
+                            "snapshot directory crosses a device boundary",
+                        ));
+                    }
+                    walk(&child, prefix, out, total)?;
+                    let DirectoryChild::Directory(reopened) = directory.open_child(name)? else {
+                        return Err(io::Error::other(
+                            "snapshot directory changed during traversal",
+                        ));
+                    };
+                    if reopened.identity()? != child_identity {
+                        return Err(io::Error::other(
+                            "snapshot directory identity changed during traversal",
+                        ));
+                    }
+                }
+                DirectoryChild::Regular(mut file) => {
+                    let file_identity = regular_file_identity(&file)?;
+                    let metadata = file.metadata()?;
+                    if metadata.len() > MAX_PROMOTION_SNAPSHOT_FILE_BYTES {
+                        return Err(io::Error::other("snapshot file exceeds byte limit"));
+                    }
+                    *total = total
+                        .checked_add(metadata.len())
+                        .ok_or_else(|| io::Error::other("snapshot byte total overflow"))?;
+                    if *total > MAX_PROMOTION_SNAPSHOT_TOTAL_BYTES
+                        || out.len() >= MAX_PROMOTION_SNAPSHOT_ENTRIES
+                    {
+                        return Err(io::Error::other("snapshot exceeds resource limit"));
+                    }
+                    let mut bytes = Vec::new();
+                    std::io::Read::by_ref(&mut file)
+                        .take(MAX_PROMOTION_SNAPSHOT_FILE_BYTES + 1)
+                        .read_to_end(&mut bytes)?;
+                    if bytes.len() as u64 > MAX_PROMOTION_SNAPSHOT_FILE_BYTES {
+                        return Err(io::Error::other("snapshot file exceeds byte limit"));
+                    }
+                    if out.insert(path, bytes).is_some() {
+                        return Err(io::Error::other("duplicate snapshot path"));
+                    }
+                    require_named_regular_file_identity(directory, name, file_identity)?;
+                }
+            }
+            prefix.pop();
+        }
+        let mut names_after = directory.entry_names()?;
+        names_after.sort();
+        if names_after != names {
+            return Err(io::Error::other(
+                "snapshot directory catalog changed during traversal",
+            ));
         }
         Ok(())
     }
     let mut out = BTreeMap::new();
-    walk(root, root, &mut out)?;
+    let mut total = 0;
+    walk(root, &mut Vec::new(), &mut out, &mut total)?;
     Ok(out)
 }
 
 pub(crate) fn write_tree_snapshot(
     snapshot: &BTreeMap<PackagePath, Vec<u8>>,
     target: &Path,
-) -> io::Result<()> {
-    fs::create_dir(target)?;
+) -> io::Result<SnapshotTree> {
+    let mut total_bytes = 0_u64;
+    for (path, bytes) in snapshot {
+        validate_package_path(path, "snapshot.path")
+            .map_err(|_| io::Error::other("snapshot path"))?;
+        if bytes.len() as u64 > MAX_PROMOTION_SNAPSHOT_FILE_BYTES {
+            return Err(io::Error::other("snapshot file exceeds byte limit"));
+        }
+        total_bytes = total_bytes
+            .checked_add(bytes.len() as u64)
+            .ok_or_else(|| io::Error::other("snapshot byte total overflow"))?;
+    }
+    if snapshot.len() >= MAX_PROMOTION_SNAPSHOT_ENTRIES
+        || total_bytes > MAX_PROMOTION_SNAPSHOT_TOTAL_BYTES
+    {
+        return Err(io::Error::other("snapshot exceeds resource limit"));
+    }
+    let parent_path = target
+        .parent()
+        .ok_or_else(|| io::Error::other("snapshot target parent"))?;
+    let name = target
+        .file_name()
+        .ok_or_else(|| io::Error::other("snapshot target name"))?;
+    let parent = crate::fs::no_follow_directory::open_absolute_directory(parent_path, false)?;
+    let target = parent.create_new_directory(name)?;
+    let identity = target.identity()?;
+    let tree = SnapshotTree {
+        parent,
+        directory: target,
+        name: name.to_owned(),
+        identity,
+    };
     let write_result = (|| {
         for (path, bytes) in snapshot {
-            validate_package_path(path, "snapshot.path")
-                .map_err(|_| io::Error::other("snapshot path"))?;
-            let destination = confined_governance_path(
-                target,
-                path,
-                path.as_str(),
-                "promotion_materialize_unscoped_path",
-            )
-            .map_err(|_| io::Error::other("snapshot path"))?;
-            let parent = destination
-                .parent()
-                .ok_or_else(|| io::Error::other("snapshot path parent"))?;
-            fs::create_dir_all(parent)?;
-            fs::write(destination, bytes)?;
+            let (directory, leaf) =
+                open_package_parent_from_directory(&tree.directory, path, true)?;
+            let mut file = directory.create_new_regular_file(&leaf)?;
+            file.write_all(bytes)?;
+            file.sync_all()?;
         }
-        Ok(())
+        tree.directory.sync_all()
     })();
-    if write_result.is_err() {
-        let _ = fs::remove_dir_all(target);
+    if let Err(error) = write_result {
+        // Cleanup is attempted only after an exact catalog comparison; an
+        // attacker-added or replaced entry therefore prevents every unlink.
+        let _ = tree.cleanup(snapshot);
+        return Err(error);
     }
-    write_result
+    Ok(tree)
 }
 
 fn diff_snapshots(
@@ -2064,35 +2419,242 @@ fn change_order(change: &Change) -> (u8, String) {
     (class, path.to_owned())
 }
 
+const MAX_PROMOTION_TRANSACTION_FILE_BYTES: u64 = 67_108_864;
+
+struct OpenedRegularBytes {
+    bytes: Vec<u8>,
+    identity: Identity,
+}
+
+fn transaction_name(target_path_hash: PackageHash, promotion_id: PackageHash) -> OsString {
+    OsString::from(format!(
+        ".npa-promotion-transaction-{}-{}",
+        format_package_hash(&target_path_hash).trim_start_matches("sha256:"),
+        format_package_hash(&promotion_id).trim_start_matches("sha256:")
+    ))
+}
+
+fn read_regular_limited(directory: &Directory, name: &OsStr) -> io::Result<Vec<u8>> {
+    Ok(read_regular_limited_with_identity(directory, name)?.bytes)
+}
+
+fn read_regular_limited_with_identity(
+    directory: &Directory,
+    name: &OsStr,
+) -> io::Result<OpenedRegularBytes> {
+    use std::io::Read as _;
+
+    let mut file = directory
+        .open_regular_file(name)?
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "regular file is unavailable"))?;
+    let identity = regular_file_identity(&file)?;
+    let metadata = file.metadata()?;
+    if metadata.len() > MAX_PROMOTION_TRANSACTION_FILE_BYTES {
+        return Err(io::Error::other("transaction file exceeds byte limit"));
+    }
+    let mut bytes = Vec::new();
+    std::io::Read::by_ref(&mut file)
+        .take(MAX_PROMOTION_TRANSACTION_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_PROMOTION_TRANSACTION_FILE_BYTES {
+        return Err(io::Error::other("transaction file exceeds byte limit"));
+    }
+    require_named_regular_file_identity(directory, name, identity)?;
+    Ok(OpenedRegularBytes { bytes, identity })
+}
+
+fn write_sync_at(directory: &Directory, name: &OsStr, bytes: &[u8]) -> io::Result<()> {
+    if bytes.len() as u64 > MAX_PROMOTION_TRANSACTION_FILE_BYTES {
+        return Err(io::Error::other("transaction file exceeds byte limit"));
+    }
+    let mut file = directory.create_new_regular_file(name)?;
+    let identity = regular_file_identity(&file)?;
+    if let Err(error) = file.write_all(bytes).and_then(|_| file.sync_all()) {
+        drop(file);
+        let _ = directory.remove_regular_file_if_identity(name, identity);
+        return Err(error);
+    }
+    if let Err(error) = require_named_regular_file_identity(directory, name, identity) {
+        let _ = directory.remove_regular_file_if_identity(name, identity);
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn read_optional_target(root: &Directory, path: &PackagePath) -> io::Result<Option<Vec<u8>>> {
+    Ok(read_optional_target_with_identity(root, path)?.map(|opened| opened.bytes))
+}
+
+fn read_optional_target_with_identity(
+    root: &Directory,
+    path: &PackagePath,
+) -> io::Result<Option<OpenedRegularBytes>> {
+    let (parent, leaf) = match open_package_parent_from_directory(root, path, false) {
+        Ok(opened) => opened,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    match parent.open_regular_file(&leaf)? {
+        Some(mut file) => {
+            use std::io::Read as _;
+
+            let identity = regular_file_identity(&file)?;
+            let metadata = file.metadata()?;
+            if metadata.len() > MAX_PROMOTION_TRANSACTION_FILE_BYTES {
+                return Err(io::Error::other("transaction file exceeds byte limit"));
+            }
+            let mut bytes = Vec::new();
+            std::io::Read::by_ref(&mut file)
+                .take(MAX_PROMOTION_TRANSACTION_FILE_BYTES + 1)
+                .read_to_end(&mut bytes)?;
+            if bytes.len() as u64 > MAX_PROMOTION_TRANSACTION_FILE_BYTES {
+                return Err(io::Error::other("transaction file exceeds byte limit"));
+            }
+            require_named_regular_file_identity(&parent, &leaf, identity)?;
+            Ok(Some(OpenedRegularBytes { bytes, identity }))
+        }
+        None => Ok(None),
+    }
+}
+
+fn replace_target_file(
+    lock: &TargetLock,
+    root: &Directory,
+    path: &PackagePath,
+    bytes: &[u8],
+) -> io::Result<()> {
+    let current = read_optional_target_with_identity(root, path)?;
+    replace_target_file_if_identity(
+        lock,
+        root,
+        path,
+        bytes,
+        current.as_ref().map(|entry| entry.identity),
+    )
+}
+
+fn replace_target_file_if_identity(
+    lock: &TargetLock,
+    root: &Directory,
+    path: &PackagePath,
+    bytes: &[u8],
+    expected_current: Option<Identity>,
+) -> io::Result<()> {
+    replace_file_if_identity_with_publication(
+        root,
+        path,
+        bytes,
+        expected_current,
+        |parent, temporary, leaf| lock.replace_file_under_lock(parent, temporary, leaf),
+    )
+}
+
+fn replace_file_if_identity_with_publication(
+    root: &Directory,
+    path: &PackagePath,
+    bytes: &[u8],
+    expected_current: Option<Identity>,
+    publish: impl FnOnce(&Directory, &OsStr, &OsStr) -> io::Result<()>,
+) -> io::Result<()> {
+    let (parent, leaf) = open_package_parent_from_directory(root, path, true)?;
+    let path_hash =
+        promotion_transaction_path_hash(path).map_err(|_| io::Error::other("logical path hash"))?;
+    let temporary = OsString::from(format!(
+        ".npa-promotion-tmp-{}",
+        format_package_hash(&path_hash).trim_start_matches("sha256:")
+    ));
+    let mut file = parent.create_new_regular_file(&temporary)?;
+    let temporary_identity = regular_file_identity(&file)?;
+    if let Err(error) = file.write_all(bytes).and_then(|_| file.sync_all()) {
+        drop(file);
+        let _ = parent.remove_regular_file_if_identity(&temporary, temporary_identity);
+        return Err(error);
+    }
+    drop(file);
+    let publication = (|| {
+        require_named_regular_file_identity(&parent, &temporary, temporary_identity)?;
+        match expected_current {
+            Some(identity) => require_named_regular_file_identity(&parent, &leaf, identity)?,
+            None => {
+                if parent.open_regular_file(&leaf)?.is_some() {
+                    return Err(io::Error::other(
+                        "promotion target appeared before replacement",
+                    ));
+                }
+            }
+        }
+        publish(&parent, &temporary, &leaf)?;
+        require_named_regular_file_identity(&parent, &leaf, temporary_identity)?;
+        parent.sync_all()
+    })();
+    if publication.is_err() {
+        let _ = parent.remove_regular_file_if_identity(&temporary, temporary_identity);
+    }
+    publication
+}
+
+fn write_journal_transition_at(
+    lock: &TargetLock,
+    transaction: &Directory,
+    journal: &PromotionTransactionJournal,
+) -> io::Result<()> {
+    let bytes = journal
+        .canonical_json()
+        .map_err(|_| io::Error::other("journal"))?;
+    write_sync_at(transaction, OsStr::new("journal.next"), bytes.as_bytes())?;
+    let _ = transaction.open_regular_file(OsStr::new("journal.json"))?;
+    lock.replace_file_under_lock(
+        transaction,
+        OsStr::new("journal.next"),
+        OsStr::new("journal.json"),
+    )?;
+    transaction.sync_all()
+}
+
 fn apply_transaction(
-    target: &Path,
+    lock: &mut TargetLock,
     phase: PackagePromotionPhase,
     promotion_id: PackageHash,
     changes: &[Change],
     transaction_visible: &mut bool,
 ) -> io::Result<()> {
     *transaction_visible = false;
-    let canonical = fs::canonicalize(target)?;
-    let transaction = transaction_path(target, promotion_id)?;
-    let preparing = preparing_transaction_path(target, promotion_id)?;
-    match fs::symlink_metadata(&transaction) {
+    lock.ensure_target_identity()?;
+    let target = lock.target_directory()?;
+    let parent = lock.parent_directory()?;
+    let transaction_name = transaction_name(lock.target_path_hash(), promotion_id);
+    match parent.open_or_create_directory(&transaction_name, false) {
         Ok(_) => return Err(io::Error::other("recovery required")),
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(error),
     }
-    if changes.iter().any(|change| {
-        replacement_temp_path(target, &change.path)
-            .and_then(|path| path_entry_exists(&path))
-            .unwrap_or(true)
-    }) {
-        return Err(io::Error::other("replacement temporary path exists"));
+    for change in changes {
+        let (directory, _) = open_package_parent_from_directory(&target, &change.path, true)?;
+        let path_hash = promotion_transaction_path_hash(&change.path)
+            .map_err(|_| io::Error::other("logical path hash"))?;
+        let temporary = OsString::from(format!(
+            ".npa-promotion-tmp-{}",
+            format_package_hash(&path_hash).trim_start_matches("sha256:")
+        ));
+        if directory.open_regular_file(&temporary)?.is_some() {
+            return Err(io::Error::other("replacement temporary path exists"));
+        }
     }
-    let mut preparing_created = false;
+    let preparing_name = (0_u32..=u32::MAX)
+        .map(|serial| {
+            OsString::from(format!(
+                ".npa-promotion-preparing-{}-{}-{serial}",
+                format_package_hash(&promotion_id).trim_start_matches("sha256:"),
+                std::process::id()
+            ))
+        })
+        .find(|name| matches!(parent.open_or_create_directory(name, false), Err(error) if error.kind() == io::ErrorKind::NotFound))
+        .ok_or_else(|| io::Error::other("preparing transaction path"))?;
+    let preparing = parent.create_new_directory(&preparing_name)?;
+    let preparing_identity = preparing.identity()?;
     let prepared = (|| -> io::Result<PromotionTransactionJournal> {
-        fs::create_dir(&preparing)?;
-        preparing_created = true;
-        fs::create_dir(preparing.join("old"))?;
-        fs::create_dir(preparing.join("new"))?;
+        let old_directory = preparing.create_new_directory(OsStr::new("old"))?;
+        let new = preparing.create_new_directory(OsStr::new("new"))?;
         let mut rows = Vec::new();
         for (index, change) in changes.iter().enumerate() {
             let path_hash = promotion_transaction_path_hash(&change.path)
@@ -2101,9 +2663,9 @@ fn apply_transaction(
                 .trim_start_matches("sha256:")
                 .to_owned();
             if let Some(old) = &change.old {
-                write_sync(&preparing.join("old").join(&filename), old)?;
+                write_sync_at(&old_directory, OsStr::new(&filename), old)?;
             }
-            write_sync(&preparing.join("new").join(&filename), &change.new)?;
+            write_sync_at(&new, OsStr::new(&filename), &change.new)?;
             rows.push(PromotionTransactionRow {
                 replacement_order: index as u64,
                 logical_path: change.path.clone(),
@@ -2125,7 +2687,9 @@ fn apply_transaction(
                 PackagePromotionPhase::Temporary => PromotionTransactionPhase::Temporary,
                 PackagePromotionPhase::Tracked => PromotionTransactionPhase::Tracked,
             },
-            target_canonical_path_hash: package_file_hash(canonical.to_string_lossy().as_bytes()),
+            target_canonical_path_hash: package_file_hash(
+                lock.canonical_target().to_string_lossy().as_bytes(),
+            ),
             transaction_state: PromotionTransactionState::Applying,
             rows,
             journal_hash: PackageHash::new([0; 32]),
@@ -2134,149 +2698,277 @@ fn apply_transaction(
         journal
             .refresh_hash()
             .map_err(|_| io::Error::other("journal"))?;
-        write_journal_transition(&preparing, &journal)?;
-        sync_directory(&preparing.join("old"))?;
-        sync_directory(&preparing.join("new"))?;
-        sync_directory(&preparing)?;
-        fs::rename(&preparing, &transaction)?;
+        write_journal_transition_at(lock, &preparing, &journal)?;
+        old_directory.sync_all()?;
+        new.sync_all()?;
+        preparing.sync_all()?;
+        parent.rename_entry(&preparing_name, &transaction_name)?;
+        let transaction = parent.open_or_create_directory(&transaction_name, false)?;
+        if transaction.identity()? != preparing_identity {
+            return Err(io::Error::other("transaction identity changed"));
+        }
+        lock.attach_transaction(transaction_name.clone(), &transaction)?;
         *transaction_visible = true;
-        sync_directory(
-            transaction
-                .parent()
-                .ok_or_else(|| io::Error::other("transaction parent"))?,
-        )?;
+        parent.sync_all()?;
         Ok(journal)
     })();
     let mut journal = match prepared {
         Ok(journal) => journal,
         Err(error) => {
-            if preparing_created {
-                let _ = fs::remove_dir_all(&preparing);
-            }
+            let _ = cleanup_failed_preparing_transaction(
+                lock,
+                &parent,
+                &preparing_name,
+                &preparing,
+                preparing_identity,
+                changes,
+            );
             return Err(error);
         }
     };
+    let transaction = lock
+        .active_transaction_directory()?
+        .ok_or_else(|| io::Error::other("transaction unavailable"))?;
     for (index, change) in changes.iter().enumerate() {
-        replace_file(target, &change.path, &change.new)?;
+        lock.ensure_target_identity()?;
+        replace_target_file(lock, &target, &change.path, &change.new)?;
         journal.rows[index].replacement_state = PromotionReplacementState::Replaced;
         journal
             .refresh_hash()
             .map_err(|_| io::Error::other("journal"))?;
-        write_journal_transition(&transaction, &journal)?;
+        write_journal_transition_at(lock, &transaction, &journal)?;
     }
     Ok(())
 }
 
+fn cleanup_failed_preparing_transaction(
+    lock: &TargetLock,
+    parent: &Directory,
+    preparing_name: &OsStr,
+    preparing: &Directory,
+    preparing_identity: crate::fs::no_follow_directory::Identity,
+    changes: &[Change],
+) -> io::Result<()> {
+    let old = preparing.open_or_create_directory(OsStr::new("old"), false)?;
+    let new = preparing.open_or_create_directory(OsStr::new("new"), false)?;
+    let old_identity = old.identity()?;
+    let new_identity = new.identity()?;
+    if old_identity.device != preparing_identity.device
+        || new_identity.device != preparing_identity.device
+    {
+        return Err(io::Error::other(
+            "preparing directory crosses a device boundary",
+        ));
+    }
+    let expected_old = changes
+        .iter()
+        .filter(|change| change.old.is_some())
+        .map(|change| {
+            promotion_transaction_path_hash(&change.path)
+                .map_err(|_| io::Error::other("preparing path hash"))
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .map(|hash| OsString::from(format_package_hash(&hash).trim_start_matches("sha256:")))
+        .collect::<BTreeSet<_>>();
+    let expected_new = changes
+        .iter()
+        .map(|change| {
+            promotion_transaction_path_hash(&change.path)
+                .map_err(|_| io::Error::other("preparing path hash"))
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .map(|hash| OsString::from(format_package_hash(&hash).trim_start_matches("sha256:")))
+        .collect::<BTreeSet<_>>();
+    let expected_root = BTreeSet::from([
+        OsString::from("old"),
+        OsString::from("new"),
+        OsString::from("journal.json"),
+    ]);
+    let expected_interrupted_root = BTreeSet::from([
+        OsString::from("old"),
+        OsString::from("new"),
+        OsString::from("journal.next"),
+    ]);
+    let root_names = preparing
+        .entry_names()?
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    if root_names != expected_root && root_names != expected_interrupted_root {
+        return Err(io::Error::other("preparing root layout is not closed"));
+    }
+    if old.entry_names()?.into_iter().collect::<BTreeSet<_>>() != expected_old
+        || new.entry_names()?.into_iter().collect::<BTreeSet<_>>() != expected_new
+    {
+        return Err(io::Error::other("preparing file layout is not closed"));
+    }
+    // Complete the type preflight before the first unlink.
+    let old_files = expected_old
+        .iter()
+        .map(|name| {
+            let file = old
+                .open_regular_file(name)?
+                .ok_or_else(|| io::Error::other("preparing old file is unavailable"))?;
+            Ok((name.clone(), regular_file_identity(&file)?))
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    let new_files = expected_new
+        .iter()
+        .map(|name| {
+            let file = new
+                .open_regular_file(name)?
+                .ok_or_else(|| io::Error::other("preparing new file is unavailable"))?;
+            Ok((name.clone(), regular_file_identity(&file)?))
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    let journal_name = if root_names.contains(OsStr::new("journal.json")) {
+        OsStr::new("journal.json")
+    } else {
+        OsStr::new("journal.next")
+    };
+    let journal = preparing
+        .open_regular_file(journal_name)?
+        .ok_or_else(|| io::Error::other("preparing journal is unavailable"))?;
+    let journal_identity = regular_file_identity(&journal)?;
+
+    let ensure_preparing_identity = || -> io::Result<()> {
+        let named = parent.open_or_create_directory(preparing_name, false)?;
+        if named.identity()? != preparing_identity || preparing.identity()? != preparing_identity {
+            return Err(io::Error::other("preparing directory identity changed"));
+        }
+        Ok(())
+    };
+    let ensure_preparing_child_identity =
+        |name: &OsStr, expected: crate::fs::no_follow_directory::Identity| -> io::Result<()> {
+            ensure_preparing_identity()?;
+            let named = preparing.open_or_create_directory(name, false)?;
+            if named.identity()? != expected {
+                return Err(io::Error::other("preparing child identity changed"));
+            }
+            Ok(())
+        };
+
+    for (name, identity) in old_files {
+        ensure_preparing_child_identity(OsStr::new("old"), old_identity)?;
+        lock.remove_regular_file_under_lock(&old, &name, identity)?;
+    }
+    for (name, identity) in new_files {
+        ensure_preparing_child_identity(OsStr::new("new"), new_identity)?;
+        lock.remove_regular_file_under_lock(&new, &name, identity)?;
+    }
+    old.sync_all()?;
+    new.sync_all()?;
+    ensure_preparing_identity()?;
+    lock.remove_empty_directory_under_lock(preparing, OsStr::new("old"), old_identity)?;
+    ensure_preparing_identity()?;
+    lock.remove_empty_directory_under_lock(preparing, OsStr::new("new"), new_identity)?;
+    ensure_preparing_identity()?;
+    lock.remove_regular_file_under_lock(preparing, journal_name, journal_identity)?;
+    preparing.sync_all()?;
+    ensure_preparing_identity()?;
+    lock.remove_empty_directory_under_lock(parent, preparing_name, preparing_identity)?;
+    parent.sync_all()
+}
+
+#[cfg(test)]
 fn transaction_path(target: &Path, promotion_id: PackageHash) -> io::Result<std::path::PathBuf> {
     let canonical = fs::canonicalize(target)?;
     let parent = canonical
         .parent()
         .ok_or_else(|| io::Error::other("target parent"))?;
-    Ok(parent.join(format!(
-        ".npa-promotion-transaction-{}",
-        format_package_hash(&promotion_id).trim_start_matches("sha256:")
+    Ok(parent.join(transaction_name(
+        package_file_hash(canonical.to_string_lossy().as_bytes()),
+        promotion_id,
     )))
 }
 
-fn preparing_transaction_path(
-    target: &Path,
-    promotion_id: PackageHash,
-) -> io::Result<std::path::PathBuf> {
-    let canonical = fs::canonicalize(target)?;
-    let parent = canonical
-        .parent()
-        .ok_or_else(|| io::Error::other("target parent"))?;
-    let promotion = format_package_hash(&promotion_id);
-    for serial in 0_u32..=u32::MAX {
-        let candidate = parent.join(format!(
-            ".npa-promotion-preparing-{}-{}-{serial}",
-            promotion.trim_start_matches("sha256:"),
-            std::process::id()
-        ));
-        match fs::symlink_metadata(&candidate) {
-            Ok(_) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(candidate),
-            Err(error) => return Err(error),
-        }
-    }
-    Err(io::Error::other("preparing transaction path"))
-}
-
 fn pending_transaction_exists(target: &Path) -> bool {
-    let canonical = match fs::canonicalize(target) {
-        Ok(path) => path,
+    let lock = match TargetLock::acquire_shared(target) {
+        Ok(lock) => lock,
         Err(_) => return true,
     };
-    let parent = match canonical.parent() {
-        Some(parent) => parent,
-        None => return true,
+    let parent = match lock.parent_directory() {
+        Ok(parent) => parent,
+        Err(_) => return true,
     };
-    fs::read_dir(parent).map_or(true, |mut entries| {
-        entries.any(|entry| {
-            entry.is_err()
-                || entry.ok().is_some_and(|entry| {
-                    entry
-                        .file_name()
-                        .to_str()
-                        .is_some_and(|name| name.starts_with(".npa-promotion-transaction-"))
-                })
+    pending_transaction_exists_at(&parent)
+}
+
+fn pending_transaction_exists_at(parent: &Directory) -> bool {
+    parent.entry_names().map_or(true, |entries| {
+        entries.into_iter().any(|name| {
+            name.to_str()
+                .is_some_and(|name| name.starts_with(".npa-promotion-transaction-"))
         })
     })
 }
 
 fn locked_apply_preflight(
-    target: &Path,
+    lock: &TargetLock,
     captured_target: &BTreeMap<PackagePath, Vec<u8>>,
 ) -> Result<(), &'static str> {
-    if pending_transaction_exists(target) {
+    lock.ensure_target_identity()
+        .map_err(|_| "promotion_concurrent_update")?;
+    let parent = lock
+        .parent_directory()
+        .map_err(|_| "promotion_concurrent_update")?;
+    if pending_transaction_exists_at(&parent) {
         return Err("promotion_recovery_required");
     }
-    if tree_snapshot(target).ok().as_ref() != Some(captured_target) {
+    let target = lock
+        .target_directory()
+        .map_err(|_| "promotion_concurrent_update")?;
+    if tree_snapshot_at(&target).ok().as_ref() != Some(captured_target) {
         return Err("promotion_concurrent_update");
     }
     Ok(())
 }
 
-fn rollback_transaction(target: &Path, transaction: &Path) -> io::Result<()> {
-    match fs::symlink_metadata(transaction) {
-        Ok(metadata) if metadata.file_type().is_dir() => {}
-        Ok(_) => return Err(io::Error::other("invalid transaction path type")),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error),
-    }
-    let source = fs::read_to_string(transaction.join("journal.json"))?;
+fn rollback_transaction(lock: &mut TargetLock, promotion_id: PackageHash) -> io::Result<()> {
+    lock.ensure_target_identity()?;
+    let target = lock.target_directory()?;
+    let transaction = match lock.active_transaction_directory()? {
+        Some(transaction) => transaction,
+        None => lock
+            .attach_existing_transaction(transaction_name(lock.target_path_hash(), promotion_id))?,
+    };
+    let source = String::from_utf8(read_regular_limited(
+        &transaction,
+        OsStr::new("journal.json"),
+    )?)
+    .map_err(|_| io::Error::other("journal"))?;
     let journal =
         parse_promotion_transaction_json(&source).map_err(|_| io::Error::other("journal"))?;
+    let old_directory = transaction.open_or_create_directory(OsStr::new("old"), false)?;
     for row in journal.rows.iter().rev() {
-        let temporary = replacement_temp_path(target, &row.logical_path)?;
-        match fs::symlink_metadata(&temporary) {
-            Ok(metadata) if !metadata.file_type().is_file() => {
+        let (target_parent, target_leaf) =
+            open_package_parent_from_directory(&target, &row.logical_path, false)?;
+        let temporary_name = OsString::from(format!(
+            ".npa-promotion-tmp-{}",
+            format_package_hash(&row.logical_path_hash).trim_start_matches("sha256:")
+        ));
+        if target_parent.open_regular_file(&temporary_name)?.is_some() {
+            let temporary = read_regular_limited_with_identity(&target_parent, &temporary_name)?;
+            let temporary_hash = package_file_hash(&temporary.bytes);
+            let old_hash = match row.old {
+                PromotionOldFile::Absent => None,
+                PromotionOldFile::Present(hash) => Some(hash),
+            };
+            if temporary_hash != row.new_file_hash && Some(temporary_hash) != old_hash {
                 return Err(io::Error::other("replacement temporary conflict"));
             }
-            Ok(_) => {
-                let temporary_hash = package_file_hash(&fs::read(&temporary)?);
-                let old_hash = match row.old {
-                    PromotionOldFile::Absent => None,
-                    PromotionOldFile::Present(hash) => Some(hash),
-                };
-                if temporary_hash != row.new_file_hash && Some(temporary_hash) != old_hash {
-                    return Err(io::Error::other("replacement temporary conflict"));
-                }
-                fs::remove_file(&temporary)?;
-                if let Some(parent) = temporary.parent() {
-                    sync_directory(parent)?;
-                }
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
+            lock.remove_regular_file_under_lock(
+                &target_parent,
+                &temporary_name,
+                temporary.identity,
+            )?;
+            target_parent.sync_all()?;
         }
-        let target_path = confined_target_path(target, &row.logical_path)?;
-        let current = match fs::read(&target_path) {
-            Ok(bytes) => Some(bytes),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-            Err(error) => return Err(error),
-        };
-        let current_hash = current.as_deref().map(package_file_hash);
+        let current = read_optional_target_with_identity(&target, &row.logical_path)?;
+        let current_hash = current
+            .as_ref()
+            .map(|current| package_file_hash(&current.bytes));
         let old_hash = match row.old {
             PromotionOldFile::Absent => None,
             PromotionOldFile::Present(hash) => Some(hash),
@@ -2287,10 +2979,12 @@ fn rollback_transaction(target: &Path, transaction: &Path) -> io::Result<()> {
         match row.old {
             PromotionOldFile::Absent => {
                 if current_hash == Some(row.new_file_hash) {
-                    fs::remove_file(&target_path)?;
-                    if let Some(parent) = target_path.parent() {
-                        sync_directory(parent)?;
-                    }
+                    let identity = current
+                        .as_ref()
+                        .ok_or_else(|| io::Error::other("target disappeared"))?
+                        .identity;
+                    lock.remove_regular_file_under_lock(&target_parent, &target_leaf, identity)?;
+                    target_parent.sync_all()?;
                 }
             }
             PromotionOldFile::Present(expected) => {
@@ -2298,20 +2992,35 @@ fn rollback_transaction(target: &Path, transaction: &Path) -> io::Result<()> {
                     let filename = format_package_hash(&row.logical_path_hash)
                         .trim_start_matches("sha256:")
                         .to_owned();
-                    let bytes = fs::read(transaction.join("old").join(filename))?;
+                    let bytes = read_regular_limited(&old_directory, OsStr::new(&filename))?;
                     if package_file_hash(&bytes) != expected {
                         return Err(io::Error::other("old hash"));
                     }
-                    replace_file(target, &row.logical_path, &bytes)?;
+                    replace_target_file_if_identity(
+                        lock,
+                        &target,
+                        &row.logical_path,
+                        &bytes,
+                        current.as_ref().map(|entry| entry.identity),
+                    )?;
                 }
             }
         }
     }
-    remove_transaction(transaction)
+    cleanup_transaction(lock, &journal)
 }
 
-fn finalize_transaction(transaction: &Path) -> io::Result<()> {
-    let source = fs::read_to_string(transaction.join("journal.json"))?;
+fn finalize_transaction(lock: &mut TargetLock, promotion_id: PackageHash) -> io::Result<()> {
+    let transaction = match lock.active_transaction_directory()? {
+        Some(transaction) => transaction,
+        None => lock
+            .attach_existing_transaction(transaction_name(lock.target_path_hash(), promotion_id))?,
+    };
+    let source = String::from_utf8(read_regular_limited(
+        &transaction,
+        OsStr::new("journal.json"),
+    )?)
+    .map_err(|_| io::Error::other("journal"))?;
     let mut journal =
         parse_promotion_transaction_json(&source).map_err(|_| io::Error::other("journal"))?;
     if journal
@@ -2325,8 +3034,131 @@ fn finalize_transaction(transaction: &Path) -> io::Result<()> {
     journal
         .refresh_hash()
         .map_err(|_| io::Error::other("journal"))?;
-    write_journal_transition(transaction, &journal)?;
-    remove_transaction(transaction)
+    write_journal_transition_at(lock, &transaction, &journal)?;
+    cleanup_transaction(lock, &journal)
+}
+
+fn cleanup_transaction(
+    lock: &mut TargetLock,
+    journal: &PromotionTransactionJournal,
+) -> io::Result<()> {
+    let transaction = lock
+        .active_transaction_directory()?
+        .ok_or_else(|| io::Error::other("transaction unavailable"))?;
+    let old = transaction.open_or_create_directory(OsStr::new("old"), false)?;
+    let new = transaction.open_or_create_directory(OsStr::new("new"), false)?;
+    let old_identity = old.identity()?;
+    let new_identity = new.identity()?;
+    let transaction_identity = transaction.identity()?;
+    if old_identity.device != transaction_identity.device
+        || new_identity.device != transaction_identity.device
+    {
+        return Err(io::Error::other(
+            "transaction directory crosses a device boundary",
+        ));
+    }
+    let expected_old = journal
+        .rows
+        .iter()
+        .filter(|row| matches!(row.old, PromotionOldFile::Present(_)))
+        .map(|row| {
+            OsString::from(
+                format_package_hash(&row.logical_path_hash).trim_start_matches("sha256:"),
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    let expected_new = journal
+        .rows
+        .iter()
+        .map(|row| {
+            OsString::from(
+                format_package_hash(&row.logical_path_hash).trim_start_matches("sha256:"),
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    let root_names = transaction
+        .entry_names()?
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let expected_root = BTreeSet::from([
+        OsString::from("journal.json"),
+        OsString::from("new"),
+        OsString::from("old"),
+    ]);
+    let interrupted_root = BTreeSet::from([
+        OsString::from("journal.json"),
+        OsString::from("journal.next"),
+        OsString::from("new"),
+        OsString::from("old"),
+    ]);
+    if root_names != expected_root && root_names != interrupted_root {
+        return Err(io::Error::other("transaction root layout is not closed"));
+    }
+    if old.entry_names()?.into_iter().collect::<BTreeSet<_>>() != expected_old
+        || new.entry_names()?.into_iter().collect::<BTreeSet<_>>() != expected_new
+    {
+        return Err(io::Error::other("transaction layout is not closed"));
+    }
+    // Complete the type and identity preflight before the first unlink.  The
+    // transaction may be inspected after a failed recovery, so an unknown or
+    // replaced entry must leave the whole closed layout untouched.
+    let old_files = expected_old
+        .iter()
+        .map(|name| {
+            let file = old
+                .open_regular_file(name)?
+                .ok_or_else(|| io::Error::other("old file"))?;
+            Ok((name.clone(), regular_file_identity(&file)?))
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    let new_files = expected_new
+        .iter()
+        .map(|name| {
+            let file = new
+                .open_regular_file(name)?
+                .ok_or_else(|| io::Error::other("new file"))?;
+            Ok((name.clone(), regular_file_identity(&file)?))
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    let journal_file = transaction
+        .open_regular_file(OsStr::new("journal.json"))?
+        .ok_or_else(|| io::Error::other("journal"))?;
+    let journal_identity = regular_file_identity(&journal_file)?;
+    let journal_next_identity = if root_names.contains(OsStr::new("journal.next")) {
+        let file = transaction
+            .open_regular_file(OsStr::new("journal.next"))?
+            .ok_or_else(|| io::Error::other("journal.next"))?;
+        Some(regular_file_identity(&file)?)
+    } else {
+        None
+    };
+
+    for (name, identity) in old_files {
+        lock.ensure_active_transaction_child_identity(OsStr::new("old"), old_identity)?;
+        lock.remove_regular_file_under_lock(&old, &name, identity)?;
+    }
+    for (name, identity) in new_files {
+        lock.ensure_active_transaction_child_identity(OsStr::new("new"), new_identity)?;
+        lock.remove_regular_file_under_lock(&new, &name, identity)?;
+    }
+    old.sync_all()?;
+    new.sync_all()?;
+    lock.ensure_active_transaction_identity()?;
+    lock.remove_empty_directory_under_lock(&transaction, OsStr::new("old"), old_identity)?;
+    lock.ensure_active_transaction_identity()?;
+    lock.remove_empty_directory_under_lock(&transaction, OsStr::new("new"), new_identity)?;
+    if let Some(identity) = journal_next_identity {
+        lock.ensure_active_transaction_identity()?;
+        lock.remove_regular_file_under_lock(&transaction, OsStr::new("journal.next"), identity)?;
+    }
+    lock.ensure_active_transaction_identity()?;
+    lock.remove_regular_file_under_lock(
+        &transaction,
+        OsStr::new("journal.json"),
+        journal_identity,
+    )?;
+    transaction.sync_all()?;
+    lock.remove_empty_active_transaction()
 }
 
 fn recover_transaction(target: &Path, journal_path: &Path) -> CommandResult {
@@ -2341,35 +3173,50 @@ fn recover_transaction(target: &Path, journal_path: &Path) -> CommandResult {
             )
         }
     };
-    let canonical_target = match fs::canonicalize(target) {
-        Ok(path) => path,
-        Err(_) => {
-            return failure(
-                &root_display,
-                "promotion_recovery_conflict",
-                "--target-root",
-            )
+    let canonical_target = lock.canonical_target().to_owned();
+    let expected_parent = canonical_target.parent().unwrap_or_else(|| Path::new("."));
+    // Treat the user-supplied path only as a namespace selector.  The journal
+    // bytes and all layout checks below are performed through the retained
+    // target-parent descriptor, so a component replacement cannot redirect
+    // recovery after this lexical comparison.
+    let supplied = if journal_path.is_absolute() {
+        journal_path.to_owned()
+    } else {
+        match std::env::current_dir() {
+            Ok(current) => current.join(journal_path),
+            Err(_) => return failure(&root_display, "promotion_recovery_conflict", "--recover"),
         }
     };
-    let canonical_journal = match fs::canonicalize(journal_path) {
-        Ok(path) => path,
-        Err(_) => return failure(&root_display, "promotion_recovery_conflict", "--recover"),
+    let Some(supplied_name) = supplied.file_name() else {
+        return failure(&root_display, "promotion_recovery_conflict", "--recover");
     };
-    let transaction = match canonical_journal.parent() {
-        Some(path) => path,
-        None => return failure(&root_display, "promotion_recovery_conflict", "--recover"),
+    let Some(supplied_transaction) = supplied.parent() else {
+        return failure(&root_display, "promotion_recovery_conflict", "--recover");
     };
-    let expected_parent = canonical_target.parent().unwrap_or_else(|| Path::new("."));
-    if transaction.parent() != Some(expected_parent)
-        || canonical_journal.file_name().and_then(|name| name.to_str()) != Some("journal.json")
-        || !transaction
-            .file_name()
-            .and_then(|name| name.to_str())
+    let Some(supplied_parent) = supplied_transaction.parent() else {
+        return failure(&root_display, "promotion_recovery_conflict", "--recover");
+    };
+    let Some(supplied_transaction_name) = supplied_transaction.file_name() else {
+        return failure(&root_display, "promotion_recovery_conflict", "--recover");
+    };
+    if supplied_name != OsStr::new("journal.json")
+        || normalize_macos_compatibility_alias(supplied_parent)
+            != normalize_macos_compatibility_alias(expected_parent)
+        || !supplied_transaction_name
+            .to_str()
             .is_some_and(|name| name.starts_with(".npa-promotion-transaction-"))
     {
         return failure(&root_display, "promotion_recovery_conflict", "--recover");
     }
-    let source = match fs::read_to_string(&canonical_journal) {
+    let transaction_directory =
+        match lock.attach_existing_transaction(supplied_transaction_name.to_owned()) {
+            Ok(directory) => directory,
+            Err(_) => return failure(&root_display, "promotion_recovery_conflict", "--recover"),
+        };
+    let source = match read_regular_limited(&transaction_directory, OsStr::new("journal.json"))
+        .and_then(|bytes| {
+            String::from_utf8(bytes).map_err(|_| io::Error::other("journal encoding"))
+        }) {
         Ok(source) => source,
         Err(_) => return failure(&root_display, "promotion_recovery_conflict", "--recover"),
     };
@@ -2377,7 +3224,7 @@ fn recover_transaction(target: &Path, journal_path: &Path) -> CommandResult {
         Ok(journal) => journal,
         Err(_) => return failure(&root_display, "promotion_recovery_conflict", "--recover"),
     };
-    let journal_name = transaction.file_name().and_then(|name| name.to_str());
+    let journal_name = supplied_transaction_name.to_str();
     if lock
         .record(Some(journal.promotion_id), "recover", journal_name)
         .is_err()
@@ -2393,25 +3240,26 @@ fn recover_transaction(target: &Path, journal_path: &Path) -> CommandResult {
             "--target-root",
         );
     }
-    let expected_name = format!(
-        ".npa-promotion-transaction-{}",
-        format_package_hash(&journal.promotion_id).trim_start_matches("sha256:")
-    );
-    if transaction.file_name().and_then(|name| name.to_str()) != Some(expected_name.as_str())
-        || !transaction_layout_is_exact(transaction, &journal)
+    let expected_name = transaction_name(journal.target_canonical_path_hash, journal.promotion_id);
+    if supplied_transaction_name != expected_name
+        || !transaction_layout_is_exact_at(&transaction_directory, &journal)
     {
         return failure(&root_display, "promotion_recovery_conflict", "--recover");
     }
     if journal.transaction_state == PromotionTransactionState::Applying {
-        if rollback_transaction(target, transaction).is_err() {
+        if rollback_transaction(&mut lock, journal.promotion_id).is_err() {
             return failure(&root_display, "promotion_recovery_conflict", "--recover");
         }
     } else {
-        if journal.rows.iter().any(|row| {
-            read_confined(target, &row.logical_path)
-                .ok()
-                .is_none_or(|bytes| package_file_hash(&bytes) != row.new_file_hash)
-        }) || remove_transaction(transaction).is_err()
+        let target_directory = lock.target_directory();
+        if target_directory.is_err()
+            || journal.rows.iter().any(|row| {
+                read_optional_target(target_directory.as_ref().unwrap(), &row.logical_path)
+                    .ok()
+                    .flatten()
+                    .is_none_or(|bytes| package_file_hash(&bytes) != row.new_file_hash)
+            })
+            || cleanup_transaction(&mut lock, &journal).is_err()
         {
             return failure(&root_display, "promotion_recovery_conflict", "--recover");
         }
@@ -2420,39 +3268,66 @@ fn recover_transaction(target: &Path, journal_path: &Path) -> CommandResult {
     CommandResult::passed(COMMAND, root_display)
 }
 
-fn transaction_layout_is_exact(transaction: &Path, journal: &PromotionTransactionJournal) -> bool {
-    let read_names = |path: &Path| -> Option<BTreeSet<String>> {
-        let mut names = BTreeSet::new();
-        for entry in fs::read_dir(path).ok()? {
-            names.insert(entry.ok()?.file_name().into_string().ok()?);
+fn normalize_macos_compatibility_alias(path: &Path) -> PathBuf {
+    if cfg!(target_os = "macos") && path.is_absolute() {
+        for (alias, physical) in [("/var", "/private/var"), ("/tmp", "/private/tmp")] {
+            if let Ok(suffix) = path.strip_prefix(alias) {
+                return Path::new(physical).join(suffix);
+            }
         }
-        Some(names)
-    };
-    let Some(root_names) = read_names(transaction) else {
+    }
+    path.to_owned()
+}
+
+fn transaction_layout_is_exact_at(
+    transaction: &Directory,
+    journal: &PromotionTransactionJournal,
+) -> bool {
+    let Some(root_names) = transaction
+        .entry_names()
+        .ok()
+        .map(|names| names.into_iter().collect::<BTreeSet<_>>())
+    else {
         return false;
     };
     let expected_root = BTreeSet::from([
-        "journal.json".to_owned(),
-        "new".to_owned(),
-        "old".to_owned(),
+        OsString::from("journal.json"),
+        OsString::from("new"),
+        OsString::from("old"),
     ]);
     let mut interrupted_root = expected_root.clone();
-    interrupted_root.insert("journal.next".to_owned());
+    interrupted_root.insert(OsString::from("journal.next"));
     if root_names != expected_root && root_names != interrupted_root {
         return false;
     }
-    if !fs::symlink_metadata(transaction.join("journal.json"))
-        .is_ok_and(|metadata| metadata.file_type().is_file())
-        || !fs::symlink_metadata(transaction.join("old"))
-            .is_ok_and(|metadata| metadata.file_type().is_dir())
-        || !fs::symlink_metadata(transaction.join("new"))
-            .is_ok_and(|metadata| metadata.file_type().is_dir())
+    if !transaction
+        .open_regular_file(OsStr::new("journal.json"))
+        .is_ok_and(|file| file.is_some())
     {
         return false;
     }
-    let next = transaction.join("journal.next");
-    if root_names.contains("journal.next")
-        && !fs::symlink_metadata(&next).is_ok_and(|metadata| metadata.file_type().is_file())
+    if root_names.contains(OsStr::new("journal.next"))
+        && !transaction
+            .open_regular_file(OsStr::new("journal.next"))
+            .is_ok_and(|file| file.is_some())
+    {
+        return false;
+    }
+    let Ok(old) = transaction.open_or_create_directory(OsStr::new("old"), false) else {
+        return false;
+    };
+    let Ok(new) = transaction.open_or_create_directory(OsStr::new("new"), false) else {
+        return false;
+    };
+    let Ok(transaction_identity) = transaction.identity() else {
+        return false;
+    };
+    if !old
+        .identity()
+        .is_ok_and(|identity| identity.device == transaction_identity.device)
+        || !new
+            .identity()
+            .is_ok_and(|identity| identity.device == transaction_identity.device)
     {
         return false;
     }
@@ -2464,6 +3339,7 @@ fn transaction_layout_is_exact(transaction: &Path, journal: &PromotionTransactio
                 .trim_start_matches("sha256:")
                 .to_owned()
         })
+        .map(OsString::from)
         .collect::<BTreeSet<_>>();
     let expected_old = journal
         .rows
@@ -2474,137 +3350,41 @@ fn transaction_layout_is_exact(transaction: &Path, journal: &PromotionTransactio
                 .trim_start_matches("sha256:")
                 .to_owned()
         })
+        .map(OsString::from)
         .collect::<BTreeSet<_>>();
-    let read_regular_file_names = |path: &Path| -> Option<BTreeSet<String>> {
-        let mut names = BTreeSet::new();
-        for entry in fs::read_dir(path).ok()? {
-            let entry = entry.ok()?;
-            if !entry.file_type().ok()?.is_file() {
-                return None;
-            }
-            names.insert(entry.file_name().into_string().ok()?);
+    let read_regular_file_names = |directory: &Directory| -> Option<BTreeSet<OsString>> {
+        let names = directory
+            .entry_names()
+            .ok()?
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        for name in names.iter() {
+            directory.open_regular_file(name).ok()??;
         }
         Some(names)
     };
-    read_regular_file_names(&transaction.join("new")).as_ref() == Some(&expected_new)
-        && read_regular_file_names(&transaction.join("old")).as_ref() == Some(&expected_old)
+    read_regular_file_names(&new).as_ref() == Some(&expected_new)
+        && read_regular_file_names(&old).as_ref() == Some(&expected_old)
 }
 
-fn replace_file(root: &Path, path: &PackagePath, bytes: &[u8]) -> io::Result<()> {
-    let target = confined_target_path(root, path)?;
-    let parent = target
-        .parent()
-        .ok_or_else(|| io::Error::other("parent"))?
-        .to_path_buf();
-    fs::create_dir_all(&parent)?;
-    let target = confined_target_path(root, path)?;
-    let temporary = replacement_temp_path(root, path)?;
-    let mut temporary_file = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&temporary)?;
-    if let Err(error) = temporary_file
-        .write_all(bytes)
-        .and_then(|()| temporary_file.sync_all())
-    {
-        drop(temporary_file);
-        let _ = fs::remove_file(&temporary);
-        return Err(error);
-    }
-    drop(temporary_file);
-    fs::rename(temporary, target)?;
-    File::open(parent)?.sync_all()
-}
-
-fn replacement_temp_path(root: &Path, path: &PackagePath) -> io::Result<PathBuf> {
-    let target = confined_target_path(root, path)?;
-    let parent = target.parent().ok_or_else(|| io::Error::other("parent"))?;
-    let path_hash =
-        promotion_transaction_path_hash(path).map_err(|_| io::Error::other("logical path hash"))?;
-    Ok(parent.join(format!(
-        ".npa-promotion-tmp-{}",
-        format_package_hash(&path_hash).trim_start_matches("sha256:")
-    )))
-}
-
-fn confined_target_path(root: &Path, path: &PackagePath) -> io::Result<PathBuf> {
-    confined_governance_path(
-        root,
-        path,
-        path.as_str(),
-        "promotion_materialize_unscoped_path",
-    )
-    .map_err(|_| io::Error::other("confined target path"))
+#[cfg(test)]
+fn transaction_layout_is_exact(transaction: &Path, journal: &PromotionTransactionJournal) -> bool {
+    crate::fs::no_follow_directory::open_absolute_directory(transaction, false)
+        .is_ok_and(|directory| transaction_layout_is_exact_at(&directory, journal))
 }
 
 fn target_path_is_absent(root: &Path, path: &PackagePath) -> bool {
-    let Ok(full) = confined_target_path(root, path) else {
-        return false;
-    };
-    fs::symlink_metadata(full).is_err_and(|error| error.kind() == io::ErrorKind::NotFound)
-}
-
-fn path_entry_exists(path: &Path) -> io::Result<bool> {
-    match fs::symlink_metadata(path) {
-        Ok(_) => Ok(true),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(error),
+    match crate::generated_artifact_writer::open_package_parent_no_follow(root, path, false) {
+        Ok((parent, leaf)) => parent
+            .open_child(&leaf)
+            .is_err_and(|error| error.kind() == io::ErrorKind::NotFound),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => true,
+        Err(_) => false,
     }
-}
-
-fn write_sync(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let mut file = File::create(path)?;
-    file.write_all(bytes)?;
-    file.sync_all()
-}
-
-fn write_journal_transition(
-    transaction: &Path,
-    journal: &PromotionTransactionJournal,
-) -> io::Result<()> {
-    let next = transaction.join("journal.next");
-    let mut file = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&next)?;
-    let bytes = journal
-        .canonical_json()
-        .map_err(|_| io::Error::other("journal"))?;
-    if let Err(error) = file
-        .write_all(bytes.as_bytes())
-        .and_then(|()| file.sync_all())
-    {
-        drop(file);
-        let _ = fs::remove_file(&next);
-        return Err(error);
-    }
-    drop(file);
-    fs::rename(next, transaction.join("journal.json"))?;
-    sync_directory(transaction)
-}
-
-fn sync_directory(path: &Path) -> io::Result<()> {
-    File::open(path)?.sync_all()
-}
-
-fn remove_transaction(transaction: &Path) -> io::Result<()> {
-    let parent = transaction
-        .parent()
-        .ok_or_else(|| io::Error::other("transaction parent"))?
-        .to_path_buf();
-    fs::remove_dir_all(transaction)?;
-    sync_directory(&parent)
 }
 
 fn read_confined(root: &Path, path: &PackagePath) -> io::Result<Vec<u8>> {
-    let full = confined_governance_path(
-        root,
-        path,
-        path.as_str(),
-        "promotion_materialize_unscoped_path",
-    )
-    .map_err(|_| io::Error::other("confined path"))?;
-    fs::read(full)
+    read_package_regular_file_no_follow(root, path)
 }
 
 fn short_hash(hash: PackageHash) -> String {
@@ -2745,17 +3525,22 @@ fn materialize_declaration_normal(
         std::process::id(),
         short_hash(plan.promotion_id)
     ));
-    if write_tree_snapshot(&captured_target, &stage).is_err() {
-        return failure(
-            &root_display,
-            "promotion_concurrent_update",
-            "--target-root",
-        );
-    }
-    if let Err(reason) =
-        build_declaration_materialization_candidate(&options.common.root, &stage, &plan)
-    {
-        let _ = fs::remove_dir_all(&stage);
+    let stage_tree = match write_tree_snapshot(&captured_target, &stage) {
+        Ok(tree) => tree,
+        Err(_) => {
+            return failure(
+                &root_display,
+                "promotion_concurrent_update",
+                "--target-root",
+            )
+        }
+    };
+    if let Err(reason) = build_declaration_materialization_candidate_in_tree(
+        &options.common.root,
+        &stage_tree,
+        &stage,
+        &plan,
+    ) {
         return failure(&root_display, reason, "--plan");
     }
     if phase == PackagePromotionPhase::Tracked {
@@ -2767,7 +3552,6 @@ fn materialize_declaration_normal(
         let attestation_bytes = match read_confined(&options.common.root, &attestation_path) {
             Ok(bytes) => bytes,
             Err(_) => {
-                let _ = fs::remove_dir_all(&stage);
                 return failure(
                     &root_display,
                     "promotion_verification_attestation_stale",
@@ -2778,7 +3562,6 @@ fn materialize_declaration_normal(
         let attestation_source = match String::from_utf8(attestation_bytes.clone()) {
             Ok(source) => source,
             Err(_) => {
-                let _ = fs::remove_dir_all(&stage);
                 return failure(
                     &root_display,
                     "promotion_verification_attestation_stale",
@@ -2790,7 +3573,6 @@ fn materialize_declaration_normal(
         {
             Ok(attestation) => attestation,
             Err(_) => {
-                let _ = fs::remove_dir_all(&stage);
                 return failure(
                     &root_display,
                     "promotion_verification_attestation_stale",
@@ -2815,6 +3597,7 @@ fn materialize_declaration_normal(
             || attestation.promotion_id != plan.promotion_id
             || attestation.plan.file_hash != package_file_hash(&plan_bytes)
             || update_stage_registry_v2(
+                &stage_tree,
                 &stage,
                 &plan_path,
                 &plan_bytes,
@@ -2825,7 +3608,6 @@ fn materialize_declaration_normal(
             )
             .is_err()
         {
-            let _ = fs::remove_dir_all(&stage);
             return failure(
                 &root_display,
                 "promotion_verification_attestation_stale",
@@ -2836,7 +3618,6 @@ fn materialize_declaration_normal(
     let staged_files = match tree_snapshot(&stage) {
         Ok(files) => files,
         Err(_) => {
-            let _ = fs::remove_dir_all(&stage);
             return failure(
                 &root_display,
                 "promotion_materialize_target_identity_mismatch",
@@ -2850,7 +3631,6 @@ fn materialize_declaration_normal(
         .iter()
         .find(|change| !declaration_change_is_scoped(change, &plan, phase))
     {
-        let _ = fs::remove_dir_all(&stage);
         return failure(
             &root_display,
             "promotion_materialize_unscoped_path",
@@ -2858,7 +3638,7 @@ fn materialize_declaration_normal(
         );
     }
     if !options.apply {
-        let _ = fs::remove_dir_all(&stage);
+        let _ = stage_tree.cleanup(&staged_files);
         return change_result(root_display, changes);
     }
     apply_declaration_stage(
@@ -2868,13 +3648,14 @@ fn materialize_declaration_normal(
         &captured_target,
         &staged_files,
         &changes,
-        &stage,
+        &stage_tree,
     )
 }
 
-/// Build the deterministic declaration target into an exact baseline copy.
-pub(crate) fn build_declaration_materialization_candidate(
+/// Build the deterministic declaration target into an exact retained baseline copy.
+pub(crate) fn build_declaration_materialization_candidate_in_tree(
     source_root: &Path,
+    stage_tree: &SnapshotTree,
     stage: &Path,
     plan: &MathlibPromotionPlanV2,
 ) -> Result<Vec<PromotionReplayOmission>, &'static str> {
@@ -2973,9 +3754,11 @@ pub(crate) fn build_declaration_materialization_candidate(
     )
     .map_err(|_| "promotion_materialize_source_rewrite_failed")?;
     let target_base = plan.selection.target_module.as_dotted().replace('.', "/");
-    let target_dir = stage.join(&target_base);
-    fs::create_dir_all(&target_dir).map_err(|_| "promotion_materialize_source_rewrite_failed")?;
-    fs::write(target_dir.join("source.npa"), extracted.source)
+    stage_tree
+        .write(
+            &PackagePath::new(format!("{target_base}/source.npa")),
+            extracted.source.as_bytes(),
+        )
         .map_err(|_| "promotion_materialize_source_rewrite_failed")?;
     let replay_bytes = read_confined(source_root, &plan.selection.replay_path)
         .map_err(|_| "promotion_materialize_source_rewrite_failed")?;
@@ -2985,12 +3768,16 @@ pub(crate) fn build_declaration_materialization_candidate(
     let replay_source = std::str::from_utf8(&replay_bytes)
         .map_err(|_| "promotion_materialize_source_rewrite_failed")?;
     let (replay, omissions) = filtered_declaration_replay(replay_source, plan)?;
-    fs::write(target_dir.join("replay.json"), replay)
+    stage_tree
+        .write(
+            &PackagePath::new(format!("{target_base}/replay.json")),
+            replay.as_bytes(),
+        )
         .map_err(|_| "promotion_materialize_source_rewrite_failed")?;
 
-    let preserved = capture_existing_module_artifacts(stage)?;
-    edit_manifest_v2(stage, plan)?;
-    externalize_preserved_dependencies_v2(stage, plan, &preserved)?;
+    let preserved = capture_existing_module_artifacts(stage_tree)?;
+    edit_manifest_v2(stage_tree, plan)?;
+    externalize_preserved_dependencies_v2(stage_tree, plan, &preserved)?;
     let common = PackageCommonOptions {
         root: stage.to_path_buf(),
         json: false,
@@ -3000,7 +3787,10 @@ pub(crate) fn build_declaration_materialization_candidate(
     {
         return Err("promotion_materialize_compile_failed");
     }
-    restore_existing_module_artifacts_v2(stage, plan, &preserved)?;
+    stage_tree
+        .verify_after_path_based_operation()
+        .map_err(|_| "promotion_materialize_target_identity_mismatch")?;
+    restore_existing_module_artifacts_v2(stage_tree, plan, &preserved)?;
     if run_package_lock_command(PackageLockCommand::Write(common.clone())).status
         != CommandStatus::Passed
         || run_package_axiom_report(PackageAxiomReportOptions {
@@ -3027,7 +3817,10 @@ pub(crate) fn build_declaration_materialization_candidate(
     {
         return Err("promotion_materialize_target_identity_mismatch");
     }
-    write_meta_sidecar_v2(stage, plan)?;
+    stage_tree
+        .verify_after_path_based_operation()
+        .map_err(|_| "promotion_materialize_target_identity_mismatch")?;
+    write_meta_sidecar_v2(stage_tree, stage, plan)?;
     if run_package_export_summary(PackageExportSummaryOptions {
         common: common.clone(),
         out: None,
@@ -3046,7 +3839,13 @@ pub(crate) fn build_declaration_materialization_candidate(
     {
         return Err("promotion_materialize_target_identity_mismatch");
     }
+    stage_tree
+        .verify_after_path_based_operation()
+        .map_err(|_| "promotion_materialize_target_identity_mismatch")?;
     validate_materialized_declaration_inventory(stage, plan)?;
+    stage_tree
+        .verify_after_path_based_operation()
+        .map_err(|_| "promotion_materialize_target_identity_mismatch")?;
     Ok(omissions)
 }
 
@@ -3132,9 +3931,13 @@ pub(crate) fn filtered_declaration_replay(
     Ok((replay.canonical_json(), omissions))
 }
 
-fn edit_manifest_v2(stage: &Path, plan: &MathlibPromotionPlanV2) -> Result<(), &'static str> {
-    let path = stage.join("npa-package.toml");
-    let mut document = fs::read_to_string(&path)
+fn edit_manifest_v2(
+    stage: &SnapshotTree,
+    plan: &MathlibPromotionPlanV2,
+) -> Result<(), &'static str> {
+    let path = PackagePath::new("npa-package.toml");
+    let mut document = stage
+        .read_string(&path)
         .map_err(|_| "promotion_materialize_target_identity_mismatch")?
         .parse::<DocumentMut>()
         .map_err(|_| "promotion_materialize_target_identity_mismatch")?;
@@ -3183,7 +3986,8 @@ fn edit_manifest_v2(stage: &Path, plan: &MathlibPromotionPlanV2) -> Result<(), &
     }
     table["axioms"] = Item::Value(Array::new().into());
     append_module_table(&mut document, table)?;
-    fs::write(path, document.to_string())
+    stage
+        .write(&path, document.to_string().as_bytes())
         .map_err(|_| "promotion_materialize_target_identity_mismatch")
 }
 
@@ -3221,20 +4025,18 @@ fn import_tables_mut(document: &mut DocumentMut) -> Result<&mut ArrayOfTables, &
 }
 
 fn restore_existing_module_artifacts_v2(
-    stage: &Path,
+    stage: &SnapshotTree,
     plan: &MathlibPromotionPlanV2,
     preserved: &PreservedTargetModules,
 ) -> Result<(), &'static str> {
     for (path, bytes) in &preserved.artifacts {
-        let full = stage.join(path.as_str());
-        if let Some(parent) = full.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|_| "promotion_materialize_target_identity_mismatch")?;
-        }
-        fs::write(full, bytes).map_err(|_| "promotion_materialize_target_identity_mismatch")?;
+        stage
+            .write(path, bytes)
+            .map_err(|_| "promotion_materialize_target_identity_mismatch")?;
     }
-    let manifest_path = stage.join("npa-package.toml");
-    let built = fs::read_to_string(&manifest_path)
+    let manifest_path = PackagePath::new("npa-package.toml");
+    let built = stage
+        .read_string(&manifest_path)
         .map_err(|_| "promotion_materialize_target_identity_mismatch")?
         .parse::<DocumentMut>()
         .map_err(|_| "promotion_materialize_target_identity_mismatch")?;
@@ -3255,12 +4057,13 @@ fn restore_existing_module_artifacts_v2(
     document["version"] = toml_edit::value(plan.target_baseline.planned_version.as_str());
     append_module_table(&mut document, selected)
         .map_err(|_| "promotion_materialize_target_identity_mismatch")?;
-    fs::write(manifest_path, document.to_string())
+    stage
+        .write(&manifest_path, document.to_string().as_bytes())
         .map_err(|_| "promotion_materialize_target_identity_mismatch")
 }
 
 fn externalize_preserved_dependencies_v2(
-    stage: &Path,
+    stage: &SnapshotTree,
     plan: &MathlibPromotionPlanV2,
     preserved: &PreservedTargetModules,
 ) -> Result<(), &'static str> {
@@ -3286,8 +4089,9 @@ fn externalize_preserved_dependencies_v2(
                 .ok_or("promotion_materialize_target_identity_mismatch")
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let manifest_path = stage.join("npa-package.toml");
-    let mut document = fs::read_to_string(&manifest_path)
+    let manifest_path = PackagePath::new("npa-package.toml");
+    let mut document = stage
+        .read_string(&manifest_path)
         .map_err(|_| "promotion_materialize_target_identity_mismatch")?
         .parse::<DocumentMut>()
         .map_err(|_| "promotion_materialize_target_identity_mismatch")?;
@@ -3317,11 +4121,16 @@ fn externalize_preserved_dependencies_v2(
             toml_edit::value(format_package_hash(&module.expected_certificate_hash));
         imports.push(table);
     }
-    fs::write(manifest_path, document.to_string())
+    stage
+        .write(&manifest_path, document.to_string().as_bytes())
         .map_err(|_| "promotion_materialize_target_identity_mismatch")
 }
 
-fn write_meta_sidecar_v2(stage: &Path, plan: &MathlibPromotionPlanV2) -> Result<(), &'static str> {
+fn write_meta_sidecar_v2(
+    stage_tree: &SnapshotTree,
+    stage: &Path,
+    plan: &MathlibPromotionPlanV2,
+) -> Result<(), &'static str> {
     let loaded = crate::package::load_package_root(stage, COMMAND)
         .map_err(|_| "promotion_materialize_target_identity_mismatch")?;
     let module = loaded
@@ -3361,17 +4170,15 @@ fn write_meta_sidecar_v2(stage: &Path, plan: &MathlibPromotionPlanV2) -> Result<
         format_package_hash(&module.expected_export_hash), format_package_hash(&module.expected_axiom_report_hash),
         format_package_hash(&module.expected_certificate_hash), imports, declarations,
     );
-    fs::write(
-        stage.join(
+    stage_tree
+        .write(
             module
                 .meta
                 .as_ref()
-                .ok_or("promotion_materialize_target_identity_mismatch")?
-                .as_str(),
-        ),
-        json,
-    )
-    .map_err(|_| "promotion_materialize_target_identity_mismatch")
+                .ok_or("promotion_materialize_target_identity_mismatch")?,
+            json.as_bytes(),
+        )
+        .map_err(|_| "promotion_materialize_target_identity_mismatch")
 }
 
 pub(crate) fn validate_materialized_declaration_inventory(
@@ -3448,6 +4255,11 @@ pub(crate) fn declaration_plan_inputs_current(
 ) -> bool {
     let source_manifest = source.snapshot.validated.manifest();
     let baseline_manifest = baseline.snapshot.validated.manifest();
+    let registry_path = PackagePath::new(MATHLIB_PROMOTION_REGISTRY_PATH);
+    let registry_bytes = match read_confined(baseline_root, &registry_path) {
+        Ok(bytes) => bytes,
+        Err(_) => return false,
+    };
     if run_package_validate_promotion_origin_registry(
         PackageValidatePromotionOriginRegistryOptions {
             common: PackageCommonOptions {
@@ -3463,13 +4275,11 @@ pub(crate) fn declaration_plan_inputs_current(
     {
         return false;
     }
-    let registry_bytes = match read_confined(
-        baseline_root,
-        &PackagePath::new(MATHLIB_PROMOTION_REGISTRY_PATH),
-    ) {
-        Ok(bytes) => bytes,
-        Err(_) => return false,
-    };
+    if read_confined(baseline_root, &registry_path).ok().as_deref()
+        != Some(registry_bytes.as_slice())
+    {
+        return false;
+    }
     if package_file_hash(&registry_bytes) != plan.target_baseline.registry_file_hash {
         return false;
     }
@@ -3505,6 +4315,23 @@ pub(crate) fn declaration_plan_inputs_current(
         ) else {
             return false;
         };
+        if source_identity.identity.decl_interface_hash
+            != target_identity.identity.decl_interface_hash
+            && !registry_attests_transported_declaration_mapping(
+                &registry,
+                &mapping.source,
+                &mapping.target,
+                source_root,
+                source,
+                baseline,
+                source_record,
+                target_record,
+                &source_identity.identity,
+                &target_identity.identity,
+            )
+        {
+            return false;
+        }
         if source_external
             .insert(
                 source_identity.identity.clone(),
@@ -3523,6 +4350,7 @@ pub(crate) fn declaration_plan_inputs_current(
             return false;
         }
     }
+    let transported_externalizations = transported_declaration_externalizations(&source_external);
     let request = read_confined(source_root, &plan.governance.request_path)
         .ok()
         .and_then(|bytes| String::from_utf8(bytes).ok())
@@ -3674,7 +4502,14 @@ pub(crate) fn declaration_plan_inputs_current(
                 .is_some_and(|bytes| package_file_hash(&bytes) == *hash)
         });
     artifact_inputs_current
-        && declaration_plan_selection_current(source_root, source, &request, plan, &source_external)
+        && declaration_plan_selection_current(
+            source_root,
+            source,
+            &request,
+            plan,
+            &source_external,
+            &transported_externalizations,
+        )
 }
 
 pub(crate) fn declaration_plan_selection_current(
@@ -3683,6 +4518,7 @@ pub(crate) fn declaration_plan_selection_current(
     request: &npa_package::DeclarationPromotionRequest,
     plan: &MathlibPromotionPlanV2,
     source_external: &BTreeMap<GlobalDeclarationIdentity, GlobalDeclarationIdentity>,
+    transported_externalizations: &BTreeSet<(GlobalDeclarationIdentity, GlobalDeclarationIdentity)>,
 ) -> bool {
     let manifest = source.snapshot.validated.manifest();
     let Some(module) = manifest
@@ -3734,11 +4570,12 @@ pub(crate) fn declaration_plan_selection_current(
         .values()
         .map(|record| (record.key.module.clone(), record.verified_module.clone()))
         .collect::<BTreeMap<_, _>>();
-    let Ok(closure) = declaration_dependency_closure(
+    let Ok(closure) = declaration_dependency_closure_with_transported_externalizations(
         &modules,
         &roots,
         &families,
         source_external,
+        transported_externalizations,
         DeclarationClosureLimits::default(),
     ) else {
         return false;
@@ -3895,13 +4732,13 @@ fn apply_declaration_stage(
     captured: &BTreeMap<PackagePath, Vec<u8>>,
     staged: &BTreeMap<PackagePath, Vec<u8>>,
     changes: &[Change],
-    stage: &Path,
+    stage_tree: &SnapshotTree,
 ) -> CommandResult {
     let root_display = render_package_root(&options.target_root);
     let mut lock = match TargetLock::acquire(&options.target_root) {
         Ok(lock) => lock,
         Err(_) => {
-            let _ = fs::remove_dir_all(stage);
+            let _ = stage_tree.cleanup(staged);
             return failure(
                 &root_display,
                 "promotion_concurrent_update",
@@ -3909,33 +4746,20 @@ fn apply_declaration_stage(
             );
         }
     };
-    if let Err(reason) = locked_apply_preflight(&options.target_root, captured) {
+    if let Err(reason) = locked_apply_preflight(&lock, captured) {
         drop(lock);
-        let _ = fs::remove_dir_all(stage);
+        let _ = stage_tree.cleanup(staged);
         return failure(&root_display, reason, "--target-root");
     }
-    let transaction = match transaction_path(&options.target_root, promotion_id) {
-        Ok(path) => path,
-        Err(_) => {
-            drop(lock);
-            let _ = fs::remove_dir_all(stage);
-            return failure(
-                &root_display,
-                "promotion_materialize_unscoped_path",
-                "--target-root",
-            );
-        }
-    };
-    let journal = transaction
-        .file_name()
-        .and_then(|name| name.to_str())
-        .map(str::to_owned);
+    let journal = transaction_name(lock.target_path_hash(), promotion_id)
+        .into_string()
+        .ok();
     if lock
         .record(Some(promotion_id), "materialize", journal.as_deref())
         .is_err()
     {
         drop(lock);
-        let _ = fs::remove_dir_all(stage);
+        let _ = stage_tree.cleanup(staged);
         return failure(
             &root_display,
             "promotion_concurrent_update",
@@ -3943,19 +4767,10 @@ fn apply_declaration_stage(
         );
     }
     let mut visible = false;
-    if apply_transaction(
-        &options.target_root,
-        phase,
-        promotion_id,
-        changes,
-        &mut visible,
-    )
-    .is_err()
-    {
-        let rolled_back =
-            !visible || rollback_transaction(&options.target_root, &transaction).is_ok();
+    if apply_transaction(&mut lock, phase, promotion_id, changes, &mut visible).is_err() {
+        let rolled_back = !visible || rollback_transaction(&mut lock, promotion_id).is_ok();
         drop(lock);
-        let _ = fs::remove_dir_all(stage);
+        let _ = stage_tree.cleanup(staged);
         return failure(
             &root_display,
             if rolled_back {
@@ -3967,9 +4782,9 @@ fn apply_declaration_stage(
         );
     }
     if tree_snapshot(&options.target_root).ok().as_ref() != Some(staged) {
-        let rolled_back = rollback_transaction(&options.target_root, &transaction).is_ok();
+        let rolled_back = rollback_transaction(&mut lock, promotion_id).is_ok();
         drop(lock);
-        let _ = fs::remove_dir_all(stage);
+        let _ = stage_tree.cleanup(staged);
         return failure(
             &root_display,
             if rolled_back {
@@ -3989,9 +4804,9 @@ fn apply_declaration_stage(
     .ok()
     .is_some_and(|snapshot| validate_checked_generated(&snapshot).is_ok());
     if !valid {
-        let rolled_back = rollback_transaction(&options.target_root, &transaction).is_ok();
+        let rolled_back = rollback_transaction(&mut lock, promotion_id).is_ok();
         drop(lock);
-        let _ = fs::remove_dir_all(stage);
+        let _ = stage_tree.cleanup(staged);
         return failure(
             &root_display,
             if rolled_back {
@@ -4018,9 +4833,9 @@ fn apply_declaration_stage(
         .status
             != CommandStatus::Passed
     {
-        let rolled_back = rollback_transaction(&options.target_root, &transaction).is_ok();
+        let rolled_back = rollback_transaction(&mut lock, promotion_id).is_ok();
         drop(lock);
-        let _ = fs::remove_dir_all(stage);
+        let _ = stage_tree.cleanup(staged);
         return failure(
             &root_display,
             if rolled_back {
@@ -4031,9 +4846,9 @@ fn apply_declaration_stage(
             MATHLIB_PROMOTION_REGISTRY_PATH,
         );
     }
-    if finalize_transaction(&transaction).is_err() {
+    if finalize_transaction(&mut lock, promotion_id).is_err() {
         drop(lock);
-        let _ = fs::remove_dir_all(stage);
+        let _ = stage_tree.cleanup(staged);
         return failure(
             &root_display,
             "promotion_recovery_required",
@@ -4042,11 +4857,13 @@ fn apply_declaration_stage(
     }
     let _ = lock.record(Some(promotion_id), "materialize", None);
     drop(lock);
-    let _ = fs::remove_dir_all(stage);
+    let _ = stage_tree.cleanup(staged);
     change_result(root_display, changes.to_vec())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn update_stage_registry_v2(
+    stage_tree: &SnapshotTree,
     stage: &Path,
     plan_path: &PackagePath,
     plan_bytes: &[u8],
@@ -4055,8 +4872,8 @@ fn update_stage_registry_v2(
     plan: &MathlibPromotionPlanV2,
     attestation: &npa_package::VerifiedMaterializationAttestation,
 ) -> Result<(), ()> {
-    let registry_path = stage.join(MATHLIB_PROMOTION_REGISTRY_PATH);
-    let registry_source = fs::read_to_string(&registry_path).map_err(|_| ())?;
+    let registry_path = PackagePath::new(MATHLIB_PROMOTION_REGISTRY_PATH);
+    let registry_source = stage_tree.read_string(&registry_path).map_err(|_| ())?;
     enum Previous {
         V1(npa_package::PromotionOriginRegistry),
         V2(npa_package::PromotionOriginRegistryV2),
@@ -4173,11 +4990,20 @@ fn update_stage_registry_v2(
         }
         Previous::V3(previous) => {
             let next = merge_v3_source_registry(previous, registry)?;
-            return fs::write(registry_path, next.canonical_json().map_err(|_| ())?)
+            return stage_tree
+                .write(
+                    &registry_path,
+                    next.canonical_json().map_err(|_| ())?.as_bytes(),
+                )
                 .map_err(|_| ());
         }
     }
-    fs::write(registry_path, registry.canonical_json().map_err(|_| ())?).map_err(|_| ())
+    stage_tree
+        .write(
+            &registry_path,
+            registry.canonical_json().map_err(|_| ())?.as_bytes(),
+        )
+        .map_err(|_| ())
 }
 
 #[cfg(test)]
@@ -4219,9 +5045,10 @@ mod tests {
         promotion_id: PackageHash,
         changes: &[Change],
     ) -> io::Result<()> {
+        let mut lock = TargetLock::acquire(target)?;
         let mut transaction_visible = false;
         apply_transaction(
-            target,
+            &mut lock,
             phase,
             promotion_id,
             changes,
@@ -4352,6 +5179,30 @@ mod tests {
     }
 
     #[test]
+    fn tree_snapshot_rejects_catalog_additions_during_traversal() {
+        let serial = NEXT_TEST_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "npa-promotion-snapshot-catalog-race-{}-{serial}",
+            std::process::id()
+        ));
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("stable.txt"), b"stable").unwrap();
+        let inserted = root.join("inserted-after-catalog.txt");
+        SNAPSHOT_CATALOG_TEST_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                fs::write(inserted, b"inserted").unwrap();
+            }));
+        });
+
+        let error = tree_snapshot(&root).unwrap_err();
+        assert!(
+            error.to_string().contains("catalog changed"),
+            "unexpected snapshot error: {error}"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn write_tree_snapshot_rejects_absolute_package_paths() {
         let serial = NEXT_TEST_DIRECTORY.fetch_add(1, Ordering::Relaxed);
         let target = std::env::temp_dir().join(format!(
@@ -4450,11 +5301,19 @@ mod tests {
         ];
         let promotion_id = package_file_hash(b"transaction-test");
         let transaction = transaction_path(&target, promotion_id).unwrap();
-        let colliding_temporary = replacement_temp_path(&target, &changes[0].path).unwrap();
+        if transaction.exists() {
+            fs::remove_dir_all(&transaction).unwrap();
+        }
+        let path_hash = promotion_transaction_path_hash(&changes[0].path).unwrap();
+        let colliding_temporary = target.join(format!(
+            ".npa-promotion-tmp-{}",
+            format_package_hash(&path_hash).trim_start_matches("sha256:")
+        ));
         fs::write(&colliding_temporary, b"preexisting").unwrap();
         let mut transaction_visible = true;
+        let mut lock = TargetLock::acquire(&target).unwrap();
         assert!(apply_transaction(
-            &target,
+            &mut lock,
             PackagePromotionPhase::Temporary,
             promotion_id,
             &changes,
@@ -4465,6 +5324,7 @@ mod tests {
         assert_eq!(fs::read(&colliding_temporary).unwrap(), b"preexisting");
         assert!(!transaction.exists());
         fs::remove_file(colliding_temporary).unwrap();
+        drop(lock);
 
         apply_test_transaction(
             &target,
@@ -4474,9 +5334,11 @@ mod tests {
         )
         .unwrap();
         fs::write(transaction.join("journal.next"), b"interrupted replacement").unwrap();
-        rollback_transaction(&target, &transaction).unwrap();
+        let mut lock = TargetLock::acquire(&target).unwrap();
+        rollback_transaction(&mut lock, promotion_id).unwrap();
         assert_eq!(fs::read(target.join("old.txt")).unwrap(), b"old");
         assert!(!target.join("created.txt").exists());
+        drop(lock);
 
         apply_test_transaction(
             &target,
@@ -4485,7 +5347,8 @@ mod tests {
             &changes,
         )
         .unwrap();
-        finalize_transaction(&transaction).unwrap();
+        let mut lock = TargetLock::acquire(&target).unwrap();
+        finalize_transaction(&mut lock, promotion_id).unwrap();
         assert_eq!(fs::read(target.join("old.txt")).unwrap(), b"new");
         assert_eq!(fs::read(target.join("created.txt")).unwrap(), b"created");
         assert!(!transaction.exists());
@@ -4525,7 +5388,8 @@ mod tests {
         fs::write(outside.join("state.txt"), b"new").unwrap();
         symlink(&outside, target.join("nested")).unwrap();
 
-        assert!(rollback_transaction(&target, &transaction).is_err());
+        let mut lock = TargetLock::acquire(&target).unwrap();
+        assert!(rollback_transaction(&mut lock, promotion_id).is_err());
         assert_eq!(fs::read(outside.join("state.txt")).unwrap(), b"new");
         assert!(transaction.exists());
         fs::remove_dir_all(root).unwrap();
@@ -4580,11 +5444,14 @@ mod tests {
         symlink("missing-transaction", &transaction).unwrap();
 
         assert!(pending_transaction_exists(&target));
+        let lock = TargetLock::acquire_shared(&target).unwrap();
         assert_eq!(
-            locked_apply_preflight(&target, &BTreeMap::new()),
+            locked_apply_preflight(&lock, &BTreeMap::new()),
             Err("promotion_recovery_required")
         );
-        assert!(rollback_transaction(&target, &transaction).is_err());
+        drop(lock);
+        let mut lock = TargetLock::acquire(&target).unwrap();
+        assert!(rollback_transaction(&mut lock, promotion_id).is_err());
         fs::remove_file(&transaction).unwrap();
 
         let change = Change {
@@ -4592,7 +5459,11 @@ mod tests {
             old: None,
             new: b"new".to_vec(),
         };
-        let temporary = replacement_temp_path(&target, &change.path).unwrap();
+        let path_hash = promotion_transaction_path_hash(&change.path).unwrap();
+        let temporary = target.join(format!(
+            ".npa-promotion-tmp-{}",
+            format_package_hash(&path_hash).trim_start_matches("sha256:")
+        ));
         symlink("missing-temporary", &temporary).unwrap();
         assert!(apply_test_transaction(
             &target,
@@ -4601,7 +5472,214 @@ mod tests {
             &[change]
         )
         .is_err());
-        assert!(!path_entry_exists(&transaction).unwrap());
+        assert!(!transaction.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn transaction_cleanup_rejects_unknown_entries_before_any_unlink() {
+        let serial = NEXT_TEST_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "npa-promotion-closed-cleanup-{}-{serial}",
+            std::process::id()
+        ));
+        let target = root.join("target");
+        fs::create_dir_all(&target).unwrap();
+        let changes = vec![Change {
+            path: PackagePath::new("state.txt"),
+            old: None,
+            new: b"new".to_vec(),
+        }];
+        let promotion_id = package_file_hash(b"closed-cleanup-test");
+        let transaction = transaction_path(&target, promotion_id).unwrap();
+        apply_test_transaction(
+            &target,
+            PackagePromotionPhase::Tracked,
+            promotion_id,
+            &changes,
+        )
+        .unwrap();
+        let journal = parse_promotion_transaction_json(
+            &fs::read_to_string(transaction.join("journal.json")).unwrap(),
+        )
+        .unwrap();
+        fs::write(transaction.join("unknown"), b"sentinel").unwrap();
+        let new_name = format_package_hash(&journal.rows[0].logical_path_hash)
+            .trim_start_matches("sha256:")
+            .to_owned();
+        let new_before = fs::read(transaction.join("new").join(&new_name)).unwrap();
+
+        let mut lock = TargetLock::acquire(&target).unwrap();
+        lock.attach_existing_transaction(transaction_name(lock.target_path_hash(), promotion_id))
+            .unwrap();
+        assert!(cleanup_transaction(&mut lock, &journal).is_err());
+        assert_eq!(
+            fs::read(transaction.join("new").join(&new_name)).unwrap(),
+            new_before
+        );
+        assert_eq!(fs::read(transaction.join("unknown")).unwrap(), b"sentinel");
+        drop(lock);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn transaction_cleanup_rejects_renamed_out_transaction_without_touching_either_tree() {
+        let serial = NEXT_TEST_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "npa-promotion-renamed-transaction-{}-{serial}",
+            std::process::id()
+        ));
+        let target = root.join("target");
+        fs::create_dir_all(&target).unwrap();
+        let changes = vec![Change {
+            path: PackagePath::new("state.txt"),
+            old: None,
+            new: b"new".to_vec(),
+        }];
+        let promotion_id = package_file_hash(b"renamed-transaction-test");
+        let transaction = transaction_path(&target, promotion_id).unwrap();
+        apply_test_transaction(
+            &target,
+            PackagePromotionPhase::Tracked,
+            promotion_id,
+            &changes,
+        )
+        .unwrap();
+        let journal = parse_promotion_transaction_json(
+            &fs::read_to_string(transaction.join("journal.json")).unwrap(),
+        )
+        .unwrap();
+        let relocated = root.join("relocated-transaction");
+        let mut lock = TargetLock::acquire(&target).unwrap();
+        lock.attach_existing_transaction(transaction_name(lock.target_path_hash(), promotion_id))
+            .unwrap();
+        fs::rename(&transaction, &relocated).unwrap();
+        fs::create_dir_all(transaction.join("old")).unwrap();
+        fs::create_dir_all(transaction.join("new")).unwrap();
+        fs::write(transaction.join("journal.json"), b"replacement sentinel").unwrap();
+        fs::write(relocated.join("relocated-sentinel"), b"outside sentinel").unwrap();
+
+        assert!(cleanup_transaction(&mut lock, &journal).is_err());
+        assert_eq!(
+            fs::read(transaction.join("journal.json")).unwrap(),
+            b"replacement sentinel"
+        );
+        assert_eq!(
+            fs::read(relocated.join("relocated-sentinel")).unwrap(),
+            b"outside sentinel"
+        );
+        drop(lock);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn target_lock_rejects_target_replacement_before_record_or_mutation() {
+        let serial = NEXT_TEST_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "npa-promotion-renamed-target-{}-{serial}",
+            std::process::id()
+        ));
+        let target = root.join("target");
+        let relocated = root.join("relocated-target");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("sentinel"), b"original").unwrap();
+        let mut lock = TargetLock::acquire(&target).unwrap();
+        fs::rename(&target, &relocated).unwrap();
+        fs::create_dir(&target).unwrap();
+        fs::write(target.join("sentinel"), b"replacement").unwrap();
+
+        assert!(lock.record(None, "materialize", None).is_err());
+        assert!(lock.target_directory().is_err());
+        assert_eq!(fs::read(relocated.join("sentinel")).unwrap(), b"original");
+        assert_eq!(fs::read(target.join("sentinel")).unwrap(), b"replacement");
+        drop(lock);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn shared_target_lock_cannot_authorize_replacement_or_removal() {
+        let serial = NEXT_TEST_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "npa-promotion-shared-lock-mutation-{}-{serial}",
+            std::process::id()
+        ));
+        let target = root.join("target");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("temporary"), b"new").unwrap();
+        fs::write(target.join("destination"), b"old").unwrap();
+
+        let lock = TargetLock::acquire_shared(&target).unwrap();
+        let directory = lock.target_directory().unwrap();
+        let destination = directory
+            .open_regular_file(OsStr::new("destination"))
+            .unwrap()
+            .unwrap();
+        let destination_identity = regular_file_identity(&destination).unwrap();
+        let replace = lock
+            .replace_file_under_lock(
+                &directory,
+                OsStr::new("temporary"),
+                OsStr::new("destination"),
+            )
+            .unwrap_err();
+        assert_eq!(replace.kind(), io::ErrorKind::PermissionDenied);
+        let remove = lock
+            .remove_regular_file_under_lock(
+                &directory,
+                OsStr::new("destination"),
+                destination_identity,
+            )
+            .unwrap_err();
+        assert_eq!(remove.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(fs::read(target.join("temporary")).unwrap(), b"new");
+        assert_eq!(fs::read(target.join("destination")).unwrap(), b"old");
+        drop(lock);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn target_lock_keeps_original_parent_capability_after_parent_is_renamed() {
+        let serial = NEXT_TEST_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "npa-promotion-renamed-parent-{}-{serial}",
+            std::process::id()
+        ));
+        let parent = root.join("parent");
+        let relocated = root.join("relocated-parent");
+        let target = parent.join("target");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("sentinel"), b"original").unwrap();
+        let mut lock = TargetLock::acquire(&target).unwrap();
+
+        fs::rename(&parent, &relocated).unwrap();
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("sentinel"), b"replacement").unwrap();
+
+        // The retained parent still names the original target. Operations do
+        // not get redirected to the replacement pathname.
+        lock.record(None, "materialize", None).unwrap();
+        assert_eq!(
+            fs::read(relocated.join("target/sentinel")).unwrap(),
+            b"original"
+        );
+        assert_eq!(fs::read(target.join("sentinel")).unwrap(), b"replacement");
+        drop(lock);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn snapshot_reader_rejects_sparse_files_over_the_member_limit() {
+        let serial = NEXT_TEST_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "npa-promotion-snapshot-limit-{}-{serial}",
+            std::process::id()
+        ));
+        fs::create_dir(&root).unwrap();
+        let file = fs::File::create(root.join("too-large")).unwrap();
+        file.set_len(MAX_PROMOTION_SNAPSHOT_FILE_BYTES + 1).unwrap();
+        drop(file);
+
+        assert!(tree_snapshot(&root).is_err());
         fs::remove_dir_all(root).unwrap();
     }
 }

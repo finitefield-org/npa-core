@@ -1,11 +1,16 @@
 [package]
 name = "npa-package"
-version = "0.3.0"
+version = "0.4.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+default = []
+planning-benchmark = []
+
 [dependencies]
+libc = "0.2"
 npa-cert = { path = "../npa-cert" }
 sha2 = "0.10"
 toml = "0.8"

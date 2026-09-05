@@ -35,6 +35,328 @@ pub struct VerifiedImport {
     pub kernel_decl_dependencies: BTreeMap<String, BTreeSet<VerifiedDependency>>,
 }
 
+pub(crate) trait FrontendImportView {
+    fn module(&self) -> &npa_cert::ModuleName;
+    fn export_hash(&self) -> npa_cert::Hash;
+    fn certificate_hash(&self) -> Option<npa_cert::Hash>;
+    fn exports(&self) -> &[VerifiedExport];
+    fn declaration_interface_hashes(&self) -> &BTreeMap<npa_cert::Name, npa_cert::Hash>;
+    fn kernel_declarations(&self) -> &[npa_kernel::Decl];
+    fn kernel_declaration_dependencies(&self) -> &BTreeMap<String, BTreeSet<VerifiedDependency>>;
+}
+
+impl FrontendImportView for VerifiedImport {
+    fn module(&self) -> &npa_cert::ModuleName {
+        &self.module
+    }
+
+    fn export_hash(&self) -> npa_cert::Hash {
+        self.export_hash
+    }
+
+    fn certificate_hash(&self) -> Option<npa_cert::Hash> {
+        self.certificate_hash
+    }
+
+    fn exports(&self) -> &[VerifiedExport] {
+        &self.exports
+    }
+
+    fn declaration_interface_hashes(&self) -> &BTreeMap<npa_cert::Name, npa_cert::Hash> {
+        &self.decl_interface_hashes
+    }
+
+    fn kernel_declarations(&self) -> &[npa_kernel::Decl] {
+        &self.kernel_decls
+    }
+
+    fn kernel_declaration_dependencies(&self) -> &BTreeMap<String, BTreeSet<VerifiedDependency>> {
+        &self.kernel_decl_dependencies
+    }
+}
+
+/// Opaque, command-local import projection for Human authoring.
+///
+/// This type contains the same read-only frontend capabilities as
+/// [`VerifiedImport`] without exposing a conversion to that ordinary import
+/// type or to certificate proof evidence.
+///
+/// ```compile_fail
+/// use npa_frontend::{HumanAuthoringImport, VerifiedImport};
+///
+/// fn promote(import: HumanAuthoringImport<'_>) -> VerifiedImport {
+///     import.into()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use npa_cert::{LocalAuthoringVerifierSession, VerifiedModule};
+/// use npa_frontend::HumanAuthoringImport;
+///
+/// fn escape<'a>(module: &VerifiedModule) -> HumanAuthoringImport<'a> {
+///     let session = LocalAuthoringVerifierSession::new();
+///     let context = session.register_verified_module(module);
+///     HumanAuthoringImport::from_local_authoring_context(&context).unwrap()
+/// }
+/// ```
+#[derive(Clone, Debug)]
+pub struct HumanAuthoringImport<'session> {
+    frontend: HumanAuthoringFrontendProjection,
+    certificate: HumanAuthoringCertificateProjection,
+    local_context: Option<npa_cert::LocalAuthoringImportContext<'session>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct HumanAuthoringFrontendProjection {
+    module: npa_cert::ModuleName,
+    export_hash: npa_cert::Hash,
+    certificate_hash: Option<npa_cert::Hash>,
+    exports: Vec<VerifiedExport>,
+    declaration_interface_hashes: BTreeMap<npa_cert::Name, npa_cert::Hash>,
+    kernel_declarations: Vec<npa_kernel::Decl>,
+    kernel_declaration_dependencies: BTreeMap<String, BTreeSet<VerifiedDependency>>,
+}
+
+#[derive(Clone, Debug)]
+struct HumanAuthoringCertificateProjection {
+    module: npa_cert::ModuleName,
+    imports: Vec<npa_cert::ImportEntry>,
+    name_table: Vec<npa_cert::Name>,
+    term_table: Vec<npa_cert::TermNode>,
+    declarations: Vec<npa_cert::DeclCert>,
+    export_hash: npa_cert::Hash,
+    certificate_hash: npa_cert::Hash,
+    export_block: Vec<npa_cert::ExportEntry>,
+}
+
+pub(crate) trait FrontendCertificateImportView {
+    fn module(&self) -> &npa_cert::ModuleName;
+    fn imports(&self) -> &[npa_cert::ImportEntry];
+    fn name_table(&self) -> &[npa_cert::Name];
+    fn term_table(&self) -> &[npa_cert::TermNode];
+    fn declarations(&self) -> &[npa_cert::DeclCert];
+    fn export_hash(&self) -> npa_cert::Hash;
+    fn certificate_hash(&self) -> npa_cert::Hash;
+    fn export_block(&self) -> &[npa_cert::ExportEntry];
+}
+
+impl FrontendCertificateImportView for npa_cert::VerifiedModule {
+    fn module(&self) -> &npa_cert::ModuleName {
+        self.module()
+    }
+
+    fn imports(&self) -> &[npa_cert::ImportEntry] {
+        self.imports()
+    }
+
+    fn name_table(&self) -> &[npa_cert::Name] {
+        self.name_table()
+    }
+
+    fn term_table(&self) -> &[npa_cert::TermNode] {
+        self.term_table()
+    }
+
+    fn declarations(&self) -> &[npa_cert::DeclCert] {
+        self.declarations()
+    }
+
+    fn export_hash(&self) -> npa_cert::Hash {
+        self.export_hash()
+    }
+
+    fn certificate_hash(&self) -> npa_cert::Hash {
+        self.certificate_hash()
+    }
+
+    fn export_block(&self) -> &[npa_cert::ExportEntry] {
+        self.export_block()
+    }
+}
+
+impl FrontendCertificateImportView for HumanAuthoringImport<'_> {
+    fn module(&self) -> &npa_cert::ModuleName {
+        &self.certificate.module
+    }
+
+    fn imports(&self) -> &[npa_cert::ImportEntry] {
+        &self.certificate.imports
+    }
+
+    fn name_table(&self) -> &[npa_cert::Name] {
+        &self.certificate.name_table
+    }
+
+    fn term_table(&self) -> &[npa_cert::TermNode] {
+        &self.certificate.term_table
+    }
+
+    fn declarations(&self) -> &[npa_cert::DeclCert] {
+        &self.certificate.declarations
+    }
+
+    fn export_hash(&self) -> npa_cert::Hash {
+        self.certificate.export_hash
+    }
+
+    fn certificate_hash(&self) -> npa_cert::Hash {
+        self.certificate.certificate_hash
+    }
+
+    fn export_block(&self) -> &[npa_cert::ExportEntry] {
+        &self.certificate.export_block
+    }
+}
+
+impl FrontendImportView for HumanAuthoringImport<'_> {
+    fn module(&self) -> &npa_cert::ModuleName {
+        &self.frontend.module
+    }
+
+    fn export_hash(&self) -> npa_cert::Hash {
+        self.frontend.export_hash
+    }
+
+    fn certificate_hash(&self) -> Option<npa_cert::Hash> {
+        self.frontend.certificate_hash
+    }
+
+    fn exports(&self) -> &[VerifiedExport] {
+        &self.frontend.exports
+    }
+
+    fn declaration_interface_hashes(&self) -> &BTreeMap<npa_cert::Name, npa_cert::Hash> {
+        &self.frontend.declaration_interface_hashes
+    }
+
+    fn kernel_declarations(&self) -> &[npa_kernel::Decl] {
+        &self.frontend.kernel_declarations
+    }
+
+    fn kernel_declaration_dependencies(&self) -> &BTreeMap<String, BTreeSet<VerifiedDependency>> {
+        &self.frontend.kernel_declaration_dependencies
+    }
+}
+
+impl HumanAuthoringFrontendProjection {
+    fn from_verified_module(module: &npa_cert::VerifiedModule) -> Self {
+        let import = VerifiedImport::from(module);
+        Self {
+            module: import.module,
+            export_hash: import.export_hash,
+            certificate_hash: import.certificate_hash,
+            exports: import.exports,
+            declaration_interface_hashes: import.decl_interface_hashes,
+            kernel_declarations: import.kernel_decls,
+            kernel_declaration_dependencies: import.kernel_decl_dependencies,
+        }
+    }
+}
+
+impl HumanAuthoringCertificateProjection {
+    fn from_verified_module(module: &npa_cert::VerifiedModule) -> Self {
+        Self {
+            module: module.module().clone(),
+            imports: module.imports().to_vec(),
+            name_table: module.name_table().to_vec(),
+            term_table: module.term_table().to_vec(),
+            declarations: module.declarations().to_vec(),
+            export_hash: module.export_hash(),
+            certificate_hash: module.certificate_hash(),
+            export_block: module.export_block().to_vec(),
+        }
+    }
+
+    fn from_local_context(context: &npa_cert::LocalAuthoringImportContext<'_>) -> Self {
+        Self {
+            module: context.module().clone(),
+            imports: context.imports().to_vec(),
+            name_table: context.name_table().to_vec(),
+            term_table: context.term_table().to_vec(),
+            declarations: context.declarations().to_vec(),
+            export_hash: context.export_hash(),
+            certificate_hash: context.certificate_hash(),
+            export_block: context.export_block().to_vec(),
+        }
+    }
+}
+
+impl HumanAuthoringImport<'static> {
+    /// Project an ordinary live verified module into the authoring-only frontend lane.
+    pub fn from_verified_module(module: &npa_cert::VerifiedModule) -> Self {
+        Self {
+            frontend: HumanAuthoringFrontendProjection::from_verified_module(module),
+            certificate: HumanAuthoringCertificateProjection::from_verified_module(module),
+            local_context: None,
+        }
+    }
+}
+
+impl<'session> HumanAuthoringImport<'session> {
+    /// Project a command-local certificate authoring context into the frontend lane.
+    pub fn from_local_authoring_context(
+        context: &npa_cert::LocalAuthoringImportContext<'session>,
+    ) -> npa_cert::Result<Self> {
+        Ok(Self {
+            frontend: frontend_projection_from_local_authoring_context(context)?,
+            certificate: HumanAuthoringCertificateProjection::from_local_context(context),
+            local_context: Some(context.clone()),
+        })
+    }
+
+    /// Return the imported module identity.
+    pub fn module(&self) -> &npa_cert::ModuleName {
+        FrontendImportView::module(self)
+    }
+
+    /// Return the imported public-interface hash.
+    pub fn export_hash(&self) -> npa_cert::Hash {
+        FrontendImportView::export_hash(self)
+    }
+
+    /// Return the imported certificate hash.
+    pub fn certificate_hash(&self) -> Option<npa_cert::Hash> {
+        FrontendImportView::certificate_hash(self)
+    }
+
+    /// Return the exported declarations consumed by Human resolution.
+    pub fn exports(&self) -> &[VerifiedExport] {
+        FrontendImportView::exports(self)
+    }
+
+    /// Return declaration interface hashes consumed by Human elaboration.
+    pub fn declaration_interface_hashes(&self) -> &BTreeMap<npa_cert::Name, npa_cert::Hash> {
+        FrontendImportView::declaration_interface_hashes(self)
+    }
+
+    /// Return read-only kernel declarations consumed by Human elaboration.
+    pub fn kernel_declarations(&self) -> &[npa_kernel::Decl] {
+        FrontendImportView::kernel_declarations(self)
+    }
+
+    /// Return the kernel dependency projection consumed for transitive import loading.
+    pub fn kernel_declaration_dependencies(
+        &self,
+    ) -> &BTreeMap<String, BTreeSet<VerifiedDependency>> {
+        FrontendImportView::kernel_declaration_dependencies(self)
+    }
+
+    /// Frontend authoring imports never constitute proof evidence.
+    pub const fn is_proof_evidence(&self) -> bool {
+        false
+    }
+
+    pub(crate) fn local_authoring_context(
+        &self,
+    ) -> npa_cert::Result<&npa_cert::LocalAuthoringImportContext<'session>> {
+        self.local_context
+            .as_ref()
+            .ok_or_else(|| npa_cert::CertError::ImportNotVerifiedInSession {
+                module: self.frontend.module.clone(),
+            })
+    }
+}
+
 impl From<&npa_cert::VerifiedModule> for VerifiedImport {
     fn from(module: &npa_cert::VerifiedModule) -> Self {
         let exports = module
@@ -81,6 +403,69 @@ impl From<&npa_cert::VerifiedModule> for VerifiedImport {
     }
 }
 
+fn frontend_projection_from_local_authoring_context(
+    context: &npa_cert::LocalAuthoringImportContext<'_>,
+) -> npa_cert::Result<HumanAuthoringFrontendProjection> {
+    let exports = context
+        .export_block()
+        .iter()
+        .map(|entry| {
+            Ok(VerifiedExport {
+                reducibility: entry.reducibility,
+                name: context
+                    .name_table()
+                    .get(entry.name)
+                    .ok_or(npa_cert::CertError::DecodeError)?
+                    .clone(),
+                universe_params: entry
+                    .universe_params
+                    .iter()
+                    .map(|name| {
+                        context
+                            .name_table()
+                            .get(*name)
+                            .map(npa_cert::Name::as_dotted)
+                            .ok_or(npa_cert::CertError::DecodeError)
+                    })
+                    .collect::<npa_cert::Result<Vec<_>>>()?,
+                ty: context.term_expression(entry.ty)?,
+                decl_interface_hash: entry.decl_interface_hash,
+            })
+        })
+        .collect::<npa_cert::Result<Vec<_>>>()?;
+    let kernel_decls = context.kernel_declarations()?;
+    let kernel_decl_dependencies = kernel_decl_dependencies_from_parts(
+        context.imports(),
+        context.name_table(),
+        context.declarations(),
+        &kernel_decls,
+    )?;
+    let decl_interface_hashes = context
+        .declarations()
+        .iter()
+        .map(|decl| {
+            Ok((
+                context
+                    .name_table()
+                    .get(decl_payload_name(&decl.decl))
+                    .ok_or(npa_cert::CertError::DecodeError)?
+                    .clone(),
+                decl.hashes.decl_interface_hash,
+            ))
+        })
+        .collect::<npa_cert::Result<BTreeMap<_, _>>>()?;
+
+    Ok(HumanAuthoringFrontendProjection {
+        module: context.module().clone(),
+        export_hash: context.export_hash(),
+        certificate_hash: Some(context.certificate_hash()),
+        exports,
+        declaration_interface_hashes: decl_interface_hashes,
+        kernel_declarations: kernel_decls,
+        kernel_declaration_dependencies: kernel_decl_dependencies,
+    })
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct VerifiedImportIdentity {
     pub module: npa_cert::ModuleName,
@@ -94,30 +479,43 @@ pub(crate) enum VerifiedImportLookupError {
     Ambiguous,
 }
 
-pub(crate) fn verified_import_identity(import: &VerifiedImport) -> VerifiedImportIdentity {
+pub(crate) fn verified_import_identity(import: &impl FrontendImportView) -> VerifiedImportIdentity {
     VerifiedImportIdentity {
-        module: import.module.clone(),
-        export_hash: import.export_hash,
-        certificate_hash: import.certificate_hash,
+        module: import.module().clone(),
+        export_hash: import.export_hash(),
+        certificate_hash: import.certificate_hash(),
     }
 }
 
-pub(crate) fn find_unique_verified_import_by_module<'a>(
-    verified_imports: &'a [VerifiedImport],
+pub(crate) fn find_unique_verified_import_by_module<'a, T: FrontendImportView>(
+    verified_imports: &'a [T],
     import_module: &npa_cert::ModuleName,
-) -> std::result::Result<&'a VerifiedImport, VerifiedImportLookupError> {
+) -> std::result::Result<&'a T, VerifiedImportLookupError> {
     let mut matches = verified_imports
         .iter()
-        .filter(|import| &import.module == import_module);
+        .filter(|import| import.module() == import_module);
     let Some(first) = matches.next() else {
         return Err(VerifiedImportLookupError::Missing);
     };
 
-    if matches.any(|import| import != first) {
+    if matches.any(|import| !frontend_import_views_equal(import, first)) {
         return Err(VerifiedImportLookupError::Ambiguous);
     }
 
     Ok(first)
+}
+
+pub(crate) fn frontend_import_views_equal(
+    left: &impl FrontendImportView,
+    right: &impl FrontendImportView,
+) -> bool {
+    left.module() == right.module()
+        && left.export_hash() == right.export_hash()
+        && left.certificate_hash() == right.certificate_hash()
+        && left.exports() == right.exports()
+        && left.declaration_interface_hashes() == right.declaration_interface_hashes()
+        && left.kernel_declarations() == right.kernel_declarations()
+        && left.kernel_declaration_dependencies() == right.kernel_declaration_dependencies()
 }
 
 fn decl_payload_name(decl: &npa_cert::DeclPayload) -> npa_cert::NameId {
@@ -399,26 +797,6 @@ impl<'a> Resolver<'a> {
                 }
                 Ok(MachineTerm::Pi {
                     binders: resolved_binders,
-                    body: Box::new(self.resolve_term(*body, &nested_locals, universe_params)?),
-                    span,
-                })
-            }
-            MachineTerm::Let {
-                name,
-                ty,
-                value,
-                body,
-                span,
-            } => {
-                self.ensure_local_does_not_shadow_global(&name, span)?;
-                let ty = self.resolve_term(*ty, locals, universe_params)?;
-                let value = self.resolve_term(*value, locals, universe_params)?;
-                let mut nested_locals = locals.clone();
-                nested_locals.push(name.clone());
-                Ok(MachineTerm::Let {
-                    name,
-                    ty: Box::new(ty),
-                    value: Box::new(value),
                     body: Box::new(self.resolve_term(*body, &nested_locals, universe_params)?),
                     span,
                 })
@@ -738,12 +1116,6 @@ fn expr_from_verified_term(
             expr_from_verified_term(module, *ty),
             expr_from_verified_term(module, *body),
         ),
-        npa_cert::TermNode::Let { ty, value, body } => npa_kernel::Expr::let_in(
-            "_",
-            expr_from_verified_term(module, *ty),
-            expr_from_verified_term(module, *value),
-            expr_from_verified_term(module, *body),
-        ),
     }
 }
 
@@ -801,17 +1173,31 @@ fn kernel_decl_dependencies_from_verified_module(
     module: &npa_cert::VerifiedModule,
     kernel_decls: &[npa_kernel::Decl],
 ) -> npa_cert::Result<BTreeMap<String, BTreeSet<VerifiedDependency>>> {
-    if module.declarations().len() != kernel_decls.len() {
+    kernel_decl_dependencies_from_parts(
+        module.imports(),
+        module.name_table(),
+        module.declarations(),
+        kernel_decls,
+    )
+}
+
+fn kernel_decl_dependencies_from_parts(
+    imports: &[npa_cert::ImportEntry],
+    name_table: &[npa_cert::Name],
+    declarations: &[npa_cert::DeclCert],
+    kernel_decls: &[npa_kernel::Decl],
+) -> npa_cert::Result<BTreeMap<String, BTreeSet<VerifiedDependency>>> {
+    if declarations.len() != kernel_decls.len() {
         return Err(npa_cert::CertError::DecodeError);
     }
 
     let mut dependencies = BTreeMap::new();
-    for (decl_cert, decl) in module.declarations().iter().zip(kernel_decls) {
+    for (decl_cert, decl) in declarations.iter().zip(kernel_decls) {
         let mut names = BTreeSet::new();
         collect_const_names_from_decl(&mut names, decl);
         let decl_dependencies = verified_dependencies_from_entries(
-            module.imports(),
-            module.name_table(),
+            imports,
+            name_table,
             &names,
             &decl_cert.dependencies,
         )?;
@@ -961,13 +1347,6 @@ fn collect_const_names_from_expr(names: &mut BTreeSet<String>, expr: &npa_kernel
         }
         npa_kernel::Expr::Lam { ty, body, .. } | npa_kernel::Expr::Pi { ty, body, .. } => {
             collect_const_names_from_expr(names, ty);
-            collect_const_names_from_expr(names, body);
-        }
-        npa_kernel::Expr::Let {
-            ty, value, body, ..
-        } => {
-            collect_const_names_from_expr(names, ty);
-            collect_const_names_from_expr(names, value);
             collect_const_names_from_expr(names, body);
         }
     }
@@ -1349,17 +1728,6 @@ def Test.ok : Nat := Nat.zero",
     fn rejects_current_declaration_root_shadowed_by_local() {
         assert_eq!(
             resolve_err("def Test.bad (Test : Type) : Test := Test", &[]),
-            MachineDiagnosticKind::GlobalShadowedByLocal
-        );
-    }
-
-    #[test]
-    fn rejects_current_declaration_root_shadowed_by_let() {
-        assert_eq!(
-            resolve_err(
-                "def Test.bad : Type := let Test : Type := Type in Test",
-                &[],
-            ),
             MachineDiagnosticKind::GlobalShadowedByLocal
         );
     }

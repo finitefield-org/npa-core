@@ -1,5 +1,4 @@
 use std::env;
-use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::process;
 
@@ -10,9 +9,15 @@ use npa_api::{
     parse_independent_checker_identity_manifest, parse_independent_checker_runner_policy,
     IndependentCheckerBinaryRegistryRootKind,
 };
+use npa_cli::fs::BoundedReadRoot;
 
 const RUNNER_ID: &str = "npa-cli-package-external-runner";
 const RUNNER_VERSION: &str = "0.1.0";
+const MAX_POLICY_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_IDENTITY_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_REGISTRY_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_AXIOM_POLICY_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_CHECKER_BINARY_BYTES: u64 = 1024 * 1024 * 1024;
 
 fn output_schema() -> &'static str {
     match env!("CARGO_CRATE_NAME") {
@@ -79,7 +84,7 @@ where
     })
 }
 
-fn checked_join(root: &Path, locator: &Path) -> Result<PathBuf, String> {
+fn checked_locator(locator: &Path) -> Result<&Path, String> {
     if locator.as_os_str().is_empty()
         || locator.is_absolute()
         || locator
@@ -91,11 +96,12 @@ fn checked_join(root: &Path, locator: &Path) -> Result<PathBuf, String> {
             locator.display()
         ));
     }
-    Ok(root.join(locator))
+    Ok(locator)
 }
 
-fn read_bytes(path: &Path) -> Result<Vec<u8>, String> {
-    fs::read(path).map_err(|error| format!("cannot read {}: {error}", path.display()))
+fn read_bytes(root: &BoundedReadRoot, path: &Path, maximum_bytes: u64) -> Result<Vec<u8>, String> {
+    root.read(checked_locator(path)?, maximum_bytes)
+        .map_err(|error| format!("cannot read {}: {error}", path.display()))
 }
 
 fn json_string(value: &str) -> String {
@@ -118,13 +124,11 @@ fn json_string(value: &str) -> String {
 }
 
 fn inspect(inputs: &Inputs) -> Result<String, String> {
-    let root = inputs
-        .root
-        .canonicalize()
-        .map_err(|error| format!("cannot resolve root {}: {error}", inputs.root.display()))?;
-    let policy_path = checked_join(&root, &inputs.runner_policy)?;
-    let registry_path = checked_join(&root, &inputs.checker_registry)?;
-    let policy_bytes = read_bytes(&policy_path)?;
+    let root = BoundedReadRoot::open(&inputs.root)
+        .map_err(|error| format!("cannot open root {}: {error}", inputs.root.display()))?;
+    let policy_path = checked_locator(&inputs.runner_policy)?;
+    let registry_path = checked_locator(&inputs.checker_registry)?;
+    let policy_bytes = read_bytes(&root, policy_path, MAX_POLICY_BYTES)?;
     let policy_source = String::from_utf8(policy_bytes.clone())
         .map_err(|_| format!("runner policy is not UTF-8: {}", policy_path.display()))?;
     let policy = parse_independent_checker_runner_policy(&policy_source)
@@ -145,8 +149,8 @@ fn inspect(inputs: &Inputs) -> Result<String, String> {
         .checker_identity_manifest
         .as_ref()
         .ok_or("runner policy is missing checker identity manifest")?;
-    let identity_path = checked_join(&root, Path::new(&identity_reference.path))?;
-    let identity_bytes = read_bytes(&identity_path)?;
+    let identity_path = checked_locator(Path::new(&identity_reference.path))?;
+    let identity_bytes = read_bytes(&root, identity_path, MAX_IDENTITY_BYTES)?;
     let identity_hash = independent_checker_file_hash(&identity_bytes);
     if identity_hash != identity_reference.manifest_hash {
         return Err("identity manifest raw hash mismatch".to_owned());
@@ -203,7 +207,7 @@ fn inspect(inputs: &Inputs) -> Result<String, String> {
         return Err("fixture-only checker identity carries a version".to_owned());
     }
 
-    let registry_bytes = read_bytes(&registry_path)?;
+    let registry_bytes = read_bytes(&root, registry_path, MAX_REGISTRY_BYTES)?;
     let registry_source = String::from_utf8(registry_bytes.clone())
         .map_err(|_| format!("checker registry is not UTF-8: {}", registry_path.display()))?;
     let registry = parse_independent_checker_binary_registry(&registry_source)
@@ -217,14 +221,15 @@ fn inspect(inputs: &Inputs) -> Result<String, String> {
     if registry_entry.binary_id != external_selected.binary_id {
         return Err("checker registry binary id mismatch".to_owned());
     }
-    let checker_path = checked_join(&root, Path::new(&registry_entry.path))?;
-    let checker_hash = independent_checker_file_hash(&read_bytes(&checker_path)?);
+    let checker_path = checked_locator(Path::new(&registry_entry.path))?;
+    let checker_hash =
+        independent_checker_file_hash(&read_bytes(&root, checker_path, MAX_CHECKER_BINARY_BYTES)?);
     if checker_hash != external_selected.binary_hash {
         return Err("checker binary raw hash mismatch".to_owned());
     }
 
-    let axiom_path = checked_join(&root, Path::new(&policy.axiom_policy.path))?;
-    let axiom_bytes = read_bytes(&axiom_path)?;
+    let axiom_path = checked_locator(Path::new(&policy.axiom_policy.path))?;
+    let axiom_bytes = read_bytes(&root, axiom_path, MAX_AXIOM_POLICY_BYTES)?;
     if independent_checker_file_hash(&axiom_bytes) != policy.axiom_policy.hash {
         return Err("axiom policy raw hash mismatch".to_owned());
     }
@@ -288,9 +293,12 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        checked_join, expected_external_checker_version, output_schema, parse_inputs, Inputs,
+        checked_locator, expected_external_checker_version, output_schema, parse_inputs,
+        read_bytes, Inputs, MAX_POLICY_BYTES,
     };
     use std::path::{Path, PathBuf};
+
+    use npa_cli::fs::BoundedReadRoot;
 
     fn parse(args: &[&str]) -> Result<Inputs, String> {
         parse_inputs(args.iter().map(|arg| (*arg).to_owned()))
@@ -377,14 +385,38 @@ mod tests {
     }
 
     #[test]
-    fn checked_join_rejects_noncanonical_locators() {
-        let root = Path::new("/tmp/root");
+    fn checked_locator_rejects_noncanonical_locators() {
         for locator in ["", "/absolute", "../escape", "a/../escape", "./dot"] {
-            assert!(checked_join(root, Path::new(locator)).is_err(), "{locator}");
+            assert!(checked_locator(Path::new(locator)).is_err(), "{locator}");
         }
         assert_eq!(
-            checked_join(root, Path::new("ci/policy.json")).unwrap(),
-            root.join("ci/policy.json")
+            checked_locator(Path::new("ci/policy.json")).unwrap(),
+            Path::new("ci/policy.json")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retained_policy_root_rejects_links_and_oversized_inputs() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!(
+            "npa-inspect-ext-policy-reader-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("real")).unwrap();
+        std::fs::write(root.join("real/policy.json"), b"{}\n").unwrap();
+        let reader = BoundedReadRoot::open(&root).unwrap();
+        assert_eq!(
+            read_bytes(&reader, Path::new("real/policy.json"), MAX_POLICY_BYTES).unwrap(),
+            b"{}\n"
+        );
+        symlink(root.join("real"), root.join("linked")).unwrap();
+        assert!(read_bytes(&reader, Path::new("linked/policy.json"), MAX_POLICY_BYTES).is_err());
+        let oversized = std::fs::File::create(root.join("real/oversized.json")).unwrap();
+        oversized.set_len(MAX_POLICY_BYTES + 1).unwrap();
+        assert!(read_bytes(&reader, Path::new("real/oversized.json"), MAX_POLICY_BYTES).is_err());
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

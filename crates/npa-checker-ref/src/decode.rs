@@ -20,13 +20,8 @@ use crate::{
     ReferencePublicEnvironment, ReferencePublicExport, ReferencePublicInductiveGroup,
     ReferencePublicInductiveLayout, ReferencePublicRecursorLayout, ReferenceResolvedImport,
     ReferenceStructuralClosureSummary, ReferenceStructuralIdentity, ReferenceStructuralLimitKind,
-    ReferenceTrustMode, REFERENCE_CERTIFICATE_FORMAT, REFERENCE_COMPAT_CERTIFICATE_FORMAT,
-    REFERENCE_COMPAT_CORE_SPEC, REFERENCE_COMPAT_MODULE_CERT_DOMAIN, REFERENCE_CORE_SPEC,
-    REFERENCE_LEGACY_CERTIFICATE_FORMAT, REFERENCE_LEGACY_CORE_SPEC,
-    REFERENCE_LEGACY_MODULE_CERT_DOMAIN, REFERENCE_LEGACY_MODULE_EXPORT_DOMAIN,
-    REFERENCE_MODULE_CERT_DOMAIN, REFERENCE_MODULE_EXPORT_DOMAIN,
-    REFERENCE_PREVIOUS_CERTIFICATE_FORMAT, REFERENCE_PREVIOUS_CORE_SPEC,
-    REFERENCE_PREVIOUS_MODULE_CERT_DOMAIN, REFERENCE_PREVIOUS_MODULE_EXPORT_DOMAIN,
+    ReferenceTrustMode, REFERENCE_CERTIFICATE_FORMAT, REFERENCE_CORE_SPEC,
+    REFERENCE_DECL_CERT_DOMAIN, REFERENCE_MODULE_CERT_DOMAIN, REFERENCE_MODULE_EXPORT_DOMAIN,
 };
 
 type DecodeResult<T> = Result<T, ReferenceCheckError>;
@@ -78,23 +73,8 @@ fn import_target(
 fn reference_certificate_format_version(
     header: &ReferenceCertificateHeader,
 ) -> Option<ReferenceCertificateFormatVersion> {
-    if header.format == REFERENCE_CERTIFICATE_FORMAT && header.core_spec == REFERENCE_CORE_SPEC {
-        Some(ReferenceCertificateFormatVersion::Current)
-    } else if header.format == REFERENCE_COMPAT_CERTIFICATE_FORMAT
-        && header.core_spec == REFERENCE_COMPAT_CORE_SPEC
-    {
-        Some(ReferenceCertificateFormatVersion::Compatibility)
-    } else if header.format == REFERENCE_PREVIOUS_CERTIFICATE_FORMAT
-        && header.core_spec == REFERENCE_PREVIOUS_CORE_SPEC
-    {
-        Some(ReferenceCertificateFormatVersion::Previous)
-    } else if header.format == REFERENCE_LEGACY_CERTIFICATE_FORMAT
-        && header.core_spec == REFERENCE_LEGACY_CORE_SPEC
-    {
-        Some(ReferenceCertificateFormatVersion::Legacy)
-    } else {
-        None
-    }
+    (header.format == REFERENCE_CERTIFICATE_FORMAT && header.core_spec == REFERENCE_CORE_SPEC)
+        .then_some(ReferenceCertificateFormatVersion::Current)
 }
 
 pub(crate) fn decode_certificate_impl(bytes: &[u8]) -> DecodeResult<ReferenceDecodedCertificate> {
@@ -435,7 +415,7 @@ impl DecodedModuleCertificate {
             })?;
         for (index, located) in self.term_table.iter().enumerate() {
             self.validate_term_refs(index, located)?;
-            let mut term_children = [0usize; 3];
+            let mut term_children = [0usize; 2];
             let term_child_count;
             let mut level_children: &[usize] = &[];
             match &located.value {
@@ -455,10 +435,6 @@ impl DecodedModuleCertificate {
                 TermNode::Lam { ty, body } | TermNode::Pi { ty, body } => {
                     term_children[..2].copy_from_slice(&[*ty, *body]);
                     term_child_count = 2;
-                }
-                TermNode::Let { ty, value, body } => {
-                    term_children.copy_from_slice(&[*ty, *value, *body]);
-                    term_child_count = 3;
                 }
             }
             let term_children = &term_children[..term_child_count];
@@ -1058,11 +1034,6 @@ impl DecodedModuleCertificate {
                     pending.push(*ty);
                     pending.push(*body);
                 }
-                TermNode::Let { ty, value, body } => {
-                    pending.push(*ty);
-                    pending.push(*value);
-                    pending.push(*body);
-                }
                 TermNode::Sort(_) | TermNode::BVar(_) | TermNode::Const { .. } => {}
             }
         }
@@ -1300,29 +1271,9 @@ impl DecodedModuleCertificate {
             .iter()
             .map(|entry| entry.value.clone())
             .collect::<Vec<_>>();
-        self.verify_export_format_compatibility(&expected_export_block, version)?;
-        let (export_domain, export_bytes, cert_domain) = match version {
-            ReferenceCertificateFormatVersion::Current => (
-                REFERENCE_MODULE_EXPORT_DOMAIN,
-                encode_export_block(&expected_export_block),
-                REFERENCE_MODULE_CERT_DOMAIN,
-            ),
-            ReferenceCertificateFormatVersion::Compatibility => (
-                REFERENCE_MODULE_EXPORT_DOMAIN,
-                encode_export_block(&expected_export_block),
-                REFERENCE_COMPAT_MODULE_CERT_DOMAIN,
-            ),
-            ReferenceCertificateFormatVersion::Previous => (
-                REFERENCE_PREVIOUS_MODULE_EXPORT_DOMAIN,
-                encode_export_block_previous(&expected_export_block),
-                REFERENCE_PREVIOUS_MODULE_CERT_DOMAIN,
-            ),
-            ReferenceCertificateFormatVersion::Legacy => (
-                REFERENCE_LEGACY_MODULE_EXPORT_DOMAIN,
-                encode_export_block_legacy(&expected_export_block),
-                REFERENCE_LEGACY_MODULE_CERT_DOMAIN,
-            ),
-        };
+        let export_domain = REFERENCE_MODULE_EXPORT_DOMAIN;
+        let export_bytes = encode_export_block(&expected_export_block);
+        let cert_domain = REFERENCE_MODULE_CERT_DOMAIN;
         let expected_export_hash = hash_with_domain(export_domain, &export_bytes);
         if expected_export_block != actual_export_block
             || expected_export_hash != self.hashes.export_hash
@@ -1367,25 +1318,6 @@ impl DecodedModuleCertificate {
         Ok(())
     }
 
-    fn verify_export_format_compatibility(
-        &self,
-        expected_export_block: &[ExportEntry],
-        version: ReferenceCertificateFormatVersion,
-    ) -> DecodeResult<()> {
-        if version == ReferenceCertificateFormatVersion::Legacy
-            && expected_export_block
-                .iter()
-                .any(|entry| !entry.universe_constraints.is_empty())
-        {
-            return Err(ReferenceCheckError::malformed(
-                ReferenceCertificateSection::ExportBlock,
-                0,
-                ReferenceCheckReason::ConstrainedExportRequiresFormatUpgrade,
-            ));
-        }
-        Ok(())
-    }
-
     fn expected_dependencies_for_decl(
         &self,
         imports: &ReferenceImportEnvironment,
@@ -1394,54 +1326,16 @@ impl DecodedModuleCertificate {
         offset: usize,
         local_transparency_budget: &mut ReferenceLocalTransparencyBudget,
     ) -> DecodeResult<Vec<DependencyEntry>> {
-        if reference_certificate_format_version(&self.header)
-            == Some(ReferenceCertificateFormatVersion::Current)
-        {
-            return self.expected_dependencies_v0_3(
-                imports,
-                decl_index,
-                decl,
-                offset,
-                local_transparency_budget,
-            );
-        }
-        let mut refs = BTreeSet::new();
-        for term in decl_term_ids(decl) {
-            collect_global_refs_from_term(&self.term_table, term, &mut refs)?;
-        }
-
-        let allow_self_reference = matches!(
+        self.expected_dependencies_current(
+            imports,
+            decl_index,
             decl,
-            DeclPayload::Inductive { .. }
-                | DeclPayload::InductiveConstrained { .. }
-                | DeclPayload::MutualInductiveBlock { .. }
-        );
-        refs.into_iter()
-            .filter(|global_ref| {
-                !matches!(
-                    global_ref,
-                    GlobalRef::Local {
-                        decl_index: referenced_decl_index,
-                    } | GlobalRef::LocalGenerated {
-                        decl_index: referenced_decl_index,
-                        ..
-                    } if allow_self_reference && *referenced_decl_index == decl_index
-                )
-            })
-            .map(|global_ref| {
-                let decl_interface_hash =
-                    self.interface_hash_for_global_ref(imports, decl_index, &global_ref, offset)?;
-                Ok(DependencyEntry {
-                    global_ref,
-                    decl_interface_hash,
-                    decl_certificate_hash: None,
-                    kind: DependencyEntryKind::Interface,
-                })
-            })
-            .collect()
+            offset,
+            local_transparency_budget,
+        )
     }
 
-    fn expected_dependencies_v0_3(
+    fn expected_dependencies_current(
         &self,
         imports: &ReferenceImportEnvironment,
         decl_index: usize,
@@ -2261,11 +2155,6 @@ impl DecodedModuleCertificate {
                     ty: Arc::new(terms[*ty].clone()),
                     body: Arc::new(terms[*body].clone()),
                 },
-                TermNode::Let { ty, value, body } => ReferenceCoreExpr::Let {
-                    ty: Arc::new(terms[*ty].clone()),
-                    value: Arc::new(terms[*value].clone()),
-                    body: Arc::new(terms[*body].clone()),
-                },
             });
         }
         Ok(terms)
@@ -2791,10 +2680,6 @@ impl DecodedModuleCertificate {
                 TermNode::Lam { ty, body } | TermNode::Pi { ty, body } => {
                     heights[*ty].max(heights[*body]).saturating_add(1)
                 }
-                TermNode::Let { ty, value, body } => heights[*ty]
-                    .max(heights[*value])
-                    .max(heights[*body])
-                    .saturating_add(1),
             };
             keys.push((height, key.clone()));
             hashes.push(hash_with_domain(b"NPA-TERM-0.1", &key));
@@ -2841,11 +2726,6 @@ impl DecodedModuleCertificate {
             }
             TermNode::Lam { ty, body } | TermNode::Pi { ty, body } => {
                 self.require_previous_term(index, *ty, located.offset)?;
-                self.require_previous_term(index, *body, located.offset)
-            }
-            TermNode::Let { ty, value, body } => {
-                self.require_previous_term(index, *ty, located.offset)?;
-                self.require_previous_term(index, *value, located.offset)?;
                 self.require_previous_term(index, *body, located.offset)
             }
         }
@@ -3308,11 +3188,6 @@ impl DecodedModuleCertificate {
                 }
                 TermNode::Lam { ty, body } | TermNode::Pi { ty, body } => {
                     push_term(*ty, used, &mut stack);
-                    push_term(*body, used, &mut stack);
-                }
-                TermNode::Let { ty, value, body } => {
-                    push_term(*ty, used, &mut stack);
-                    push_term(*value, used, &mut stack);
                     push_term(*body, used, &mut stack);
                 }
             }
@@ -5829,15 +5704,6 @@ impl<'a> TypeChecker<'a> {
                     )),
                 }
             }
-            ReferenceCoreExpr::Let { ty, value, body } => {
-                self.expect_sort_with_fuel(ctx, universe_context, ty, offset, fuel)?;
-                self.check_with_fuel(ctx, universe_context, value, ty, offset, fuel)?;
-                let mut body_ctx = ctx.clone();
-                body_ctx.push_definition((**ty).clone(), (**value).clone());
-                let body_ty =
-                    self.infer_with_fuel(&body_ctx, universe_context, body, offset, fuel)?;
-                instantiate(&body_ty, value, offset)
-            }
         }
     }
 
@@ -6055,7 +5921,6 @@ impl<'a> TypeChecker<'a> {
             App,
             Lam,
             Pi,
-            Let,
         }
         enum Frame<'a> {
             Visit(&'a ReferenceCoreExpr),
@@ -6121,15 +5986,6 @@ impl<'a> TypeChecker<'a> {
                             pending.push(Frame::Visit(body));
                             pending.push(Frame::Visit(ty));
                         }
-                        ReferenceCoreExpr::Let { ty, value, body } => {
-                            pending.push(Frame::Build {
-                                kind: Build::Let,
-                                source_key,
-                            });
-                            pending.push(Frame::Visit(body));
-                            pending.push(Frame::Visit(value));
-                            pending.push(Frame::Visit(ty));
-                        }
                     }
                 }
                 Frame::Build { kind, source_key } => {
@@ -6175,35 +6031,7 @@ impl<'a> TypeChecker<'a> {
                                     ty: Arc::new(ty),
                                     body: Arc::new(body),
                                 },
-                                Build::App | Build::Let => unreachable!(),
-                            }
-                        }
-                        Build::Let => {
-                            let body = mapped.pop().ok_or_else(|| {
-                                ReferenceCheckError::malformed(
-                                    ReferenceCertificateSection::Declarations,
-                                    offset,
-                                    ReferenceCheckReason::DanglingReference,
-                                )
-                            })?;
-                            let value = mapped.pop().ok_or_else(|| {
-                                ReferenceCheckError::malformed(
-                                    ReferenceCertificateSection::Declarations,
-                                    offset,
-                                    ReferenceCheckReason::DanglingReference,
-                                )
-                            })?;
-                            let ty = mapped.pop().ok_or_else(|| {
-                                ReferenceCheckError::malformed(
-                                    ReferenceCertificateSection::Declarations,
-                                    offset,
-                                    ReferenceCheckReason::DanglingReference,
-                                )
-                            })?;
-                            ReferenceCoreExpr::Let {
-                                ty: Arc::new(ty),
-                                value: Arc::new(value),
-                                body: Arc::new(body),
+                                Build::App => unreachable!(),
                             }
                         }
                     };
@@ -6375,11 +6203,8 @@ impl<'a> TypeChecker<'a> {
 
             match current {
                 ReferenceCoreExpr::BVar(index) => {
-                    if let Some(value) = ctx.lookup_value(index, offset)? {
-                        current = value;
-                    } else {
-                        return Ok(ReferenceCoreExpr::BVar(index));
-                    }
+                    ctx.ensure_bound(index, offset)?;
+                    return Ok(ReferenceCoreExpr::BVar(index));
                 }
                 ReferenceCoreExpr::Const {
                     ref global_ref,
@@ -6405,9 +6230,6 @@ impl<'a> TypeChecker<'a> {
                         continue;
                     }
                     return Ok(app);
-                }
-                ReferenceCoreExpr::Let { value, body, .. } => {
-                    current = instantiate(&body, &value, offset)?;
                 }
                 _ => return Ok(current),
             }
@@ -7252,25 +7074,26 @@ fn unique_public_export<'a>(
 
 #[derive(Clone, Debug, Default)]
 struct TypeContext {
-    locals: Vec<LocalType>,
+    locals: Vec<ReferenceCoreExpr>,
 }
 
 impl TypeContext {
     fn push_assumption(&mut self, ty: ReferenceCoreExpr) {
-        self.locals.push(LocalType { ty, value: None });
-    }
-
-    fn push_definition(&mut self, ty: ReferenceCoreExpr, value: ReferenceCoreExpr) {
-        self.locals.push(LocalType {
-            ty,
-            value: Some(value),
-        });
+        self.locals.push(ty);
     }
 
     fn lookup_type(&self, index: u32, offset: usize) -> DecodeResult<ReferenceCoreExpr> {
+        let local = self.lookup(index, offset)?;
+        shift(local, index as i32 + 1, 0, offset)
+    }
+
+    fn ensure_bound(&self, index: u32, offset: usize) -> DecodeResult<()> {
+        self.lookup(index, offset).map(|_| ())
+    }
+
+    fn lookup(&self, index: u32, offset: usize) -> DecodeResult<&ReferenceCoreExpr> {
         let index = index as usize;
-        let local = self
-            .locals
+        self.locals
             .get(self.locals.len().checked_sub(index + 1).ok_or_else(|| {
                 ReferenceCheckError::type_check(
                     ReferenceCertificateSection::Declarations,
@@ -7284,40 +7107,8 @@ impl TypeContext {
                     offset,
                     ReferenceCheckReason::InvalidBVar,
                 )
-            })?;
-        shift(&local.ty, index as i32 + 1, 0, offset)
+            })
     }
-
-    fn lookup_value(&self, index: u32, offset: usize) -> DecodeResult<Option<ReferenceCoreExpr>> {
-        let index = index as usize;
-        let local = self
-            .locals
-            .get(self.locals.len().checked_sub(index + 1).ok_or_else(|| {
-                ReferenceCheckError::type_check(
-                    ReferenceCertificateSection::Declarations,
-                    offset,
-                    ReferenceCheckReason::InvalidBVar,
-                )
-            })?)
-            .ok_or_else(|| {
-                ReferenceCheckError::type_check(
-                    ReferenceCertificateSection::Declarations,
-                    offset,
-                    ReferenceCheckReason::InvalidBVar,
-                )
-            })?;
-        local
-            .value
-            .as_ref()
-            .map(|value| shift(value, index as i32 + 1, 0, offset))
-            .transpose()
-    }
-}
-
-#[derive(Clone, Debug)]
-struct LocalType {
-    ty: ReferenceCoreExpr,
-    value: Option<ReferenceCoreExpr>,
 }
 
 fn spend_fuel(fuel: &mut usize, offset: usize) -> DecodeResult<()> {
@@ -7385,11 +7176,6 @@ fn ensure_levels_wf_in_expr(
         }
         ReferenceCoreExpr::Lam { ty, body } | ReferenceCoreExpr::Pi { ty, body } => {
             ensure_levels_wf_in_expr(ty, delta, offset)?;
-            ensure_levels_wf_in_expr(body, delta, offset)
-        }
-        ReferenceCoreExpr::Let { ty, value, body } => {
-            ensure_levels_wf_in_expr(ty, delta, offset)?;
-            ensure_levels_wf_in_expr(value, delta, offset)?;
             ensure_levels_wf_in_expr(body, delta, offset)
         }
     }
@@ -8340,33 +8126,6 @@ fn remap_bvars(
                 )?),
             })
         }
-        ReferenceCoreExpr::Let { ty, value, body } => {
-            let mut body_map = source_to_target.to_vec();
-            body_map.push(target_ctx_len);
-            Ok(ReferenceCoreExpr::Let {
-                ty: Arc::new(remap_bvars(
-                    ty,
-                    source_ctx_len,
-                    target_ctx_len,
-                    source_to_target,
-                    offset,
-                )?),
-                value: Arc::new(remap_bvars(
-                    value,
-                    source_ctx_len,
-                    target_ctx_len,
-                    source_to_target,
-                    offset,
-                )?),
-                body: Arc::new(remap_bvars(
-                    body,
-                    source_ctx_len + 1,
-                    target_ctx_len + 1,
-                    &body_map,
-                    offset,
-                )?),
-            })
-        }
     }
 }
 
@@ -8425,9 +8184,7 @@ fn recursive_occurrences_strictly_positive(
                     offset,
                 )?
         }
-        ReferenceCoreExpr::Lam { .. } | ReferenceCoreExpr::Let { .. } => {
-            !contains_inductive_const(domain, data)
-        }
+        ReferenceCoreExpr::Lam { .. } => !contains_inductive_const(domain, data),
     })
 }
 
@@ -8479,9 +8236,7 @@ fn mutual_recursive_occurrences_strictly_positive(
                     offset,
                 )?
         }
-        ReferenceCoreExpr::Lam { .. } | ReferenceCoreExpr::Let { .. } => {
-            !contains_any_inductive_const(domain, block)
-        }
+        ReferenceCoreExpr::Lam { .. } => !contains_any_inductive_const(domain, block),
     })
 }
 
@@ -8849,26 +8604,6 @@ fn instantiate_constructor_args_at(
                 offset,
             )?),
         }),
-        ReferenceCoreExpr::Let { ty, value, body } => Ok(ReferenceCoreExpr::Let {
-            ty: Arc::new(instantiate_constructor_args_at(
-                ty,
-                args_by_abs,
-                depth,
-                offset,
-            )?),
-            value: Arc::new(instantiate_constructor_args_at(
-                value,
-                args_by_abs,
-                depth,
-                offset,
-            )?),
-            body: Arc::new(instantiate_constructor_args_at(
-                body,
-                args_by_abs,
-                depth + 1,
-                offset,
-            )?),
-        }),
     }
 }
 
@@ -8881,11 +8616,6 @@ fn contains_inductive_const(expr: &ReferenceCoreExpr, data: &ReferenceInductiveS
         }
         ReferenceCoreExpr::Lam { ty, body } | ReferenceCoreExpr::Pi { ty, body } => {
             contains_inductive_const(ty, data) || contains_inductive_const(body, data)
-        }
-        ReferenceCoreExpr::Let { ty, value, body } => {
-            contains_inductive_const(ty, data)
-                || contains_inductive_const(value, data)
-                || contains_inductive_const(body, data)
         }
     }
 }
@@ -8978,19 +8708,6 @@ fn subst_levels_expr_changed(
             }
             Some(ReferenceCoreExpr::Pi {
                 ty: new_ty.unwrap_or_else(|| Arc::clone(ty)),
-                body: new_body.unwrap_or_else(|| Arc::clone(body)),
-            })
-        }
-        ReferenceCoreExpr::Let { ty, value, body } => {
-            let new_ty = subst_levels_expr_rc(ty, params, levels);
-            let new_value = subst_levels_expr_rc(value, params, levels);
-            let new_body = subst_levels_expr_rc(body, params, levels);
-            if new_ty.is_none() && new_value.is_none() && new_body.is_none() {
-                return None;
-            }
-            Some(ReferenceCoreExpr::Let {
-                ty: new_ty.unwrap_or_else(|| Arc::clone(ty)),
-                value: new_value.unwrap_or_else(|| Arc::clone(value)),
                 body: new_body.unwrap_or_else(|| Arc::clone(body)),
             })
         }
@@ -9113,19 +8830,6 @@ fn shift_changed(
                 body: new_body.unwrap_or_else(|| Arc::clone(body)),
             }))
         }
-        ReferenceCoreExpr::Let { ty, value, body } => {
-            let new_ty = shift_rc(ty, amount, cutoff, offset)?;
-            let new_value = shift_rc(value, amount, cutoff, offset)?;
-            let new_body = shift_rc(body, amount, cutoff + 1, offset)?;
-            if new_ty.is_none() && new_value.is_none() && new_body.is_none() {
-                return Ok(None);
-            }
-            Ok(Some(ReferenceCoreExpr::Let {
-                ty: new_ty.unwrap_or_else(|| Arc::clone(ty)),
-                value: new_value.unwrap_or_else(|| Arc::clone(value)),
-                body: new_body.unwrap_or_else(|| Arc::clone(body)),
-            }))
-        }
     }
 }
 
@@ -9192,19 +8896,6 @@ fn substitute_changed(
             }
             Ok(Some(ReferenceCoreExpr::Pi {
                 ty: new_ty.unwrap_or_else(|| Arc::clone(ty)),
-                body: new_body.unwrap_or_else(|| Arc::clone(body)),
-            }))
-        }
-        ReferenceCoreExpr::Let { ty, value, body } => {
-            let new_ty = substitute_rc(ty, target, replacement, offset)?;
-            let new_value = substitute_rc(value, target, replacement, offset)?;
-            let new_body = substitute_rc(body, target + 1, replacement, offset)?;
-            if new_ty.is_none() && new_value.is_none() && new_body.is_none() {
-                return Ok(None);
-            }
-            Ok(Some(ReferenceCoreExpr::Let {
-                ty: new_ty.unwrap_or_else(|| Arc::clone(ty)),
-                value: new_value.unwrap_or_else(|| Arc::clone(value)),
                 body: new_body.unwrap_or_else(|| Arc::clone(body)),
             }))
         }
@@ -9275,11 +8966,6 @@ enum TermNode {
     },
     Pi {
         ty: usize,
-        body: usize,
-    },
-    Let {
-        ty: usize,
-        value: usize,
         body: usize,
     },
 }
@@ -10027,34 +9713,19 @@ impl<'a> Decoder<'a> {
     fn header(&mut self) -> DecodeResult<ReferenceCertificateHeader> {
         let format = self.string(ReferenceCertificateSection::HeaderFormat)?;
         let format_offset = self.offset;
-        if format != REFERENCE_CERTIFICATE_FORMAT
-            && format != REFERENCE_COMPAT_CERTIFICATE_FORMAT
-            && format != REFERENCE_PREVIOUS_CERTIFICATE_FORMAT
-            && format != REFERENCE_LEGACY_CERTIFICATE_FORMAT
-        {
+        let core_spec = self.string(ReferenceCertificateSection::HeaderCoreSpec)?;
+        let core_spec_offset = self.offset;
+        if format != REFERENCE_CERTIFICATE_FORMAT {
             return Err(ReferenceCheckError::malformed(
                 ReferenceCertificateSection::HeaderFormat,
                 format_offset,
                 ReferenceCheckReason::FormatMismatch,
             ));
         }
-        let core_spec = self.string(ReferenceCertificateSection::HeaderCoreSpec)?;
-        let core_matches_current =
-            format == REFERENCE_CERTIFICATE_FORMAT && core_spec == REFERENCE_CORE_SPEC;
-        let core_matches_compat = format == REFERENCE_COMPAT_CERTIFICATE_FORMAT
-            && core_spec == REFERENCE_COMPAT_CORE_SPEC;
-        let core_matches_previous = format == REFERENCE_PREVIOUS_CERTIFICATE_FORMAT
-            && core_spec == REFERENCE_PREVIOUS_CORE_SPEC;
-        let core_matches_legacy = format == REFERENCE_LEGACY_CERTIFICATE_FORMAT
-            && core_spec == REFERENCE_LEGACY_CORE_SPEC;
-        if !core_matches_current
-            && !core_matches_compat
-            && !core_matches_previous
-            && !core_matches_legacy
-        {
+        if core_spec != REFERENCE_CORE_SPEC {
             return Err(ReferenceCheckError::malformed(
                 ReferenceCertificateSection::HeaderCoreSpec,
-                self.offset,
+                core_spec_offset,
                 ReferenceCheckReason::CoreSpecMismatch,
             ));
         }
@@ -10166,11 +9837,6 @@ impl<'a> Decoder<'a> {
                 },
                 0x05 => TermNode::Pi {
                     ty: self.usize(ReferenceCertificateSection::TermTable)?,
-                    body: self.usize(ReferenceCertificateSection::TermTable)?,
-                },
-                0x06 => TermNode::Let {
-                    ty: self.usize(ReferenceCertificateSection::TermTable)?,
-                    value: self.usize(ReferenceCertificateSection::TermTable)?,
                     body: self.usize(ReferenceCertificateSection::TermTable)?,
                 },
                 tag => {
@@ -11105,12 +10771,6 @@ fn term_node_key(
             payload.extend(child_hashes[*ty]);
             payload.extend(child_hashes[*body]);
         }
-        TermNode::Let { ty, value, body } => {
-            payload.push(0x06);
-            payload.extend(child_hashes[*ty]);
-            payload.extend(child_hashes[*value]);
-            payload.extend(child_hashes[*body]);
-        }
     }
     Ok(payload)
 }
@@ -11171,11 +10831,7 @@ fn compute_decl_hashes(
         )?,
     );
     let certificate_hash = hash_with_domain(
-        if version == ReferenceCertificateFormatVersion::Current {
-            b"NPA-DECL-CERT-0.3.0"
-        } else {
-            b"NPA-DECL-CERT-0.1"
-        },
+        REFERENCE_DECL_CERT_DOMAIN,
         &decl_certificate_payload(
             version,
             decl,
@@ -11700,11 +11356,6 @@ fn scan_local_transparency_term_roots(
                 pending.push((*body, depth.saturating_add(1)));
                 pending.push((*ty, depth.saturating_add(1)));
             }
-            TermNode::Let { ty, value, body } => {
-                pending.push((*body, depth.saturating_add(1)));
-                pending.push((*value, depth.saturating_add(1)));
-                pending.push((*ty, depth.saturating_add(1)));
-            }
         }
     }
     Ok(references)
@@ -11833,11 +11484,6 @@ fn collect_global_refs_from_term(
             }
             TermNode::Lam { ty, body } | TermNode::Pi { ty, body } => {
                 pending.push(*body);
-                pending.push(*ty);
-            }
-            TermNode::Let { ty, value, body } => {
-                pending.push(*body);
-                pending.push(*value);
                 pending.push(*ty);
             }
         }
@@ -12033,14 +11679,6 @@ fn encode_recursor_rules_to(out: &mut Vec<u8>, rules: &RecursorRulesSpec) {
 
 fn encode_export_block(block: &[ExportEntry]) -> Vec<u8> {
     encode_export_block_with_format(block, ReferenceCertificateFormatVersion::Current)
-}
-
-fn encode_export_block_legacy(block: &[ExportEntry]) -> Vec<u8> {
-    encode_export_block_with_format(block, ReferenceCertificateFormatVersion::Legacy)
-}
-
-fn encode_export_block_previous(block: &[ExportEntry]) -> Vec<u8> {
-    encode_export_block_with_format(block, ReferenceCertificateFormatVersion::Previous)
 }
 
 fn encode_export_block_with_format(
@@ -12278,12 +11916,12 @@ fn encode_uvar_to(out: &mut Vec<u8>, mut value: u64) {
 }
 
 #[cfg(test)]
-pub(crate) fn reject_missing_v0_3_implementation_after_hash_check_impl(
+pub(crate) fn reject_missing_current_implementation_after_hash_check_impl(
     bytes: &[u8],
 ) -> ReferenceCheckError {
-    let mut cert = decode_module_certificate(bytes).expect("v0.3 test certificate decodes");
+    let mut cert = decode_module_certificate(bytes).expect("current test certificate decodes");
     cert.verify_hashes(bytes)
-        .expect("v0.3 test certificate hashes verify before semantic forgery");
+        .expect("current test certificate hashes verify before semantic forgery");
     let declaration = cert
         .declarations
         .iter_mut()
@@ -12294,7 +11932,7 @@ pub(crate) fn reject_missing_v0_3_implementation_after_hash_check_impl(
                 .iter()
                 .any(|entry| entry.kind == DependencyEntryKind::LocalImplementation)
         })
-        .expect("v0.3 test certificate has an implementation dependency");
+        .expect("current test certificate has an implementation dependency");
     declaration
         .value
         .dependencies
@@ -12302,7 +11940,7 @@ pub(crate) fn reject_missing_v0_3_implementation_after_hash_check_impl(
     let policy = ReferenceCheckerPolicy::default();
     let imports = cert
         .build_import_environment(&ReferenceImportStore::default(), &policy)
-        .expect("v0.3 test certificate has no unresolved imports");
+        .expect("current test certificate has no unresolved imports");
     cert.verify_axiom_report(&imports, &policy)
         .expect_err("missing implementation dependency must be rejected")
 }
@@ -12313,10 +11951,10 @@ mod tests {
     use crate::ReferenceStructuralLimit;
 
     const MUTUAL_PROVIDER: &[u8] = include_bytes!(
-        "../../../checkers/npa-checker-ext/test/fixtures/conformance/mutual-v0.2.npcert"
+        "../../../checkers/npa-checker-ext/test/fixtures/conformance/mutual-v0.4.npcert"
     );
     const MUTUAL_CONSUMER: &[u8] = include_bytes!(
-        "../../../checkers/npa-checker-ext/test/fixtures/conformance/imported-mutual-iota-v0.2.npcert"
+        "../../../checkers/npa-checker-ext/test/fixtures/conformance/imported-mutual-iota-v0.4.npcert"
     );
 
     fn param(name: &str) -> ReferenceCoreLevel {
@@ -12331,10 +11969,10 @@ mod tests {
         level_table: Vec<npa_cert::LevelNode>,
         root: usize,
     ) -> npa_cert::ModuleCert {
-        npa_cert::ModuleCert {
+        npa_cert::ModuleCert::from_parts(npa_cert::ModuleCertParts {
             header: npa_cert::CertHeader {
-                format: "NPA-CERT-0.2.0".to_string(),
-                core_spec: "NPA-Core-0.2.0".to_string(),
+                format: REFERENCE_CERTIFICATE_FORMAT.to_string(),
+                core_spec: REFERENCE_CORE_SPEC.to_string(),
                 module: npa_cert::Name(vec!["ReferenceStructuralTest".to_string()]),
             },
             imports: vec![],
@@ -12365,7 +12003,7 @@ mod tests {
                 axiom_report_hash: [0; 32],
                 certificate_hash: [0; 32],
             },
-        }
+        })
     }
 
     fn structural_doubling_levels(steps: usize) -> Vec<npa_cert::LevelNode> {
@@ -12437,21 +12075,23 @@ mod tests {
 
     #[test]
     fn structural_preflight_reports_dangling_global_ref_before_depth() {
-        let mut certificate = structural_certificate(vec![npa_cert::LevelNode::Zero], 0);
+        let certificate = structural_certificate(vec![npa_cert::LevelNode::Zero], 0);
+        let mut parts = certificate.into_parts();
         let mut terms = vec![npa_cert::TermNode::BVar(0)];
         for index in 0..MAX_STRUCTURAL_DEPTH {
             terms.push(npa_cert::TermNode::Lam { ty: 0, body: index });
         }
         terms.push(npa_cert::TermNode::Const {
             global_ref: npa_cert::GlobalRef::Local {
-                decl_index: certificate.declarations.len(),
+                decl_index: parts.declarations.len(),
             },
             levels: vec![],
         });
-        certificate.term_table = terms;
-        if let npa_cert::DeclPayload::Axiom { ty, .. } = &mut certificate.declarations[0].decl {
+        parts.term_table = terms;
+        if let npa_cert::DeclPayload::Axiom { ty, .. } = &mut parts.declarations[0].decl {
             *ty = 0;
         }
+        let certificate = npa_cert::ModuleCert::from_parts(parts);
         let bytes = npa_cert::encode_module_cert(&certificate).unwrap();
         let error = decode_module_certificate(&bytes).unwrap_err();
 
@@ -12462,9 +12102,11 @@ mod tests {
     #[test]
     fn structural_preflight_counts_repeated_roots_in_certificate_total() {
         let levels = structural_doubling_levels(18);
-        let mut certificate = structural_certificate(levels.clone(), levels.len() - 1);
-        let declaration = certificate.declarations[0].clone();
-        certificate.declarations = vec![declaration; 33];
+        let certificate = structural_certificate(levels.clone(), levels.len() - 1);
+        let mut parts = certificate.into_parts();
+        let declaration = parts.declarations[0].clone();
+        parts.declarations = vec![declaration; 33];
+        let certificate = npa_cert::ModuleCert::from_parts(parts);
         let bytes = npa_cert::encode_module_cert(&certificate).unwrap();
         let error = decode_module_certificate(&bytes).unwrap_err();
 
@@ -13038,5 +12680,30 @@ mod tests {
                 .unwrap(),
             "constant universe arguments must compare after level normalization"
         );
+    }
+
+    #[test]
+    fn definitional_equality_rejects_out_of_scope_bvar() {
+        let certificate = decode_module_certificate(MUTUAL_PROVIDER).unwrap();
+        certificate.verify_hashes(MUTUAL_PROVIDER).unwrap();
+        let imports = certificate
+            .build_import_environment(
+                &ReferenceImportStore::default(),
+                &ReferenceCheckerPolicy::default(),
+            )
+            .unwrap();
+        let checker = TypeChecker::new(&certificate, &imports, ReferenceTrustMode::Normal).unwrap();
+
+        let error = checker
+            .is_defeq(
+                &TypeContext::default(),
+                &[],
+                &ReferenceCoreExpr::BVar(0),
+                &ReferenceCoreExpr::Sort(ReferenceCoreLevel::Zero),
+                0,
+            )
+            .expect_err("an unbound de Bruijn index must remain invalid during conversion");
+
+        assert_eq!(error.reason, Some(ReferenceCheckReason::InvalidBVar));
     }
 }

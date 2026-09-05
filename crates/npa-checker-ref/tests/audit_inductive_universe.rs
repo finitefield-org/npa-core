@@ -11,7 +11,7 @@ const MUTUAL_SMALL_UNIVERSE_CERTIFICATE: &[u8] = include_bytes!(
 );
 
 #[test]
-fn reference_checker_rejects_single_and_mutual_small_universe_fixtures() {
+fn reference_checker_rejects_retired_security_fixtures_before_payload_decoding() {
     for (fixture_name, certificate) in [
         ("single", SMALL_UNIVERSE_CERTIFICATE),
         ("mutual", MUTUAL_SMALL_UNIVERSE_CERTIFICATE),
@@ -29,12 +29,9 @@ fn reference_checker_rejects_single_and_mutual_small_universe_fixtures() {
                      {trust_mode:?}"
                 );
             };
-            assert_eq!(error.kind, ReferenceCheckErrorKind::TypeCheck);
-            assert_eq!(error.section, ReferenceCertificateSection::Declarations);
-            assert_eq!(
-                error.reason,
-                Some(ReferenceCheckReason::ConstructorUniverseBoundViolation)
-            );
+            assert_eq!(error.kind, ReferenceCheckErrorKind::MalformedCertificate);
+            assert_eq!(error.section, ReferenceCertificateSection::HeaderFormat);
+            assert_eq!(error.reason, Some(ReferenceCheckReason::FormatMismatch));
         }
     }
 }

@@ -694,7 +694,7 @@ fn package_refactor_plan_public_command_outputs_filtered_both_scope_candidates()
 
     let json = result.render_json();
     assert!(!json.contains(&package.path().display().to_string()));
-    assert!(json.contains(r#""schema":"npa.package.command_result.v0.4""#));
+    assert!(json.contains(r#""schema":"npa.package.command_result.v0.5""#));
     assert!(json.contains(r#""artifacts":[]}"#));
 }
 

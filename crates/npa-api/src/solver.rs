@@ -6873,13 +6873,6 @@ fn bitblast_expr_node_count(expr: &Expr, limit: u64) -> Result<u64, SolverContra
                 visit(ty, count, limit)?;
                 visit(body, count, limit)
             }
-            Expr::Let {
-                ty, value, body, ..
-            } => {
-                visit(ty, count, limit)?;
-                visit(value, count, limit)?;
-                visit(body, count, limit)
-            }
         }
     }
     let mut count = 0;
@@ -8908,13 +8901,6 @@ fn ring_nf_expr_node_count(expr: &Expr, limit: u64) -> Result<u64, SolverContrac
                 visit(ty, count, limit)?;
                 visit(body, count, limit)
             }
-            Expr::Let {
-                ty, value, body, ..
-            } => {
-                visit(ty, count, limit)?;
-                visit(value, count, limit)?;
-                visit(body, count, limit)
-            }
         }
     }
     let mut count = 0;
@@ -10890,13 +10876,6 @@ fn omega_expr_node_count(expr: &Expr, limit: u64) -> Result<u64, SolverContractE
             }
             Expr::Lam { ty, body, .. } | Expr::Pi { ty, body, .. } => {
                 visit(ty, count, limit)?;
-                visit(body, count, limit)
-            }
-            Expr::Let {
-                ty, value, body, ..
-            } => {
-                visit(ty, count, limit)?;
-                visit(value, count, limit)?;
                 visit(body, count, limit)
             }
         }

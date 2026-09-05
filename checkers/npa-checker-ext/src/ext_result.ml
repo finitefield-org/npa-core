@@ -2,11 +2,11 @@ let schema = "npa.independent-checker.checker_raw_result.v2"
 
 let checker_id = "npa-checker-ext"
 
-let checker_version = "0.3.0"
+let checker_version = "0.4.0"
 
-let certificate_format = "NPA-CERT-0.3.0"
+let certificate_format = "NPA-CERT-0.4.0"
 
-let core_spec = "NPA-Core-0.3.0"
+let core_spec = "NPA-Core-0.4.0"
 
 let implementation_profile = "ocaml-clean-room"
 

@@ -33,9 +33,9 @@ use crate::{
     MachineApiDiagnosticProjection, MachineApiTacticKind,
 };
 
-pub const MACHINE_API_VERSION: &str = "npa.machine-api.v1";
-pub const MACHINE_DISPLAY_PROFILE_ID: &str = "npa.machine-api.display.v1";
-pub const HUMAN_DISPLAY_PROFILE_ID: &str = "npa.human-api.display.v1";
+pub const MACHINE_API_VERSION: &str = "npa.machine-api.v2";
+pub const MACHINE_DISPLAY_PROFILE_ID: &str = "npa.machine-api.display.v2";
+pub const HUMAN_DISPLAY_PROFILE_ID: &str = "npa.human-api.display.v2";
 pub const MACHINE_TACTIC_CANDIDATE_OUTPUT_SCHEMA: &str = "npa.machine_tactic_candidate.v1";
 pub const KERNEL_CHECK_PROFILE_BUILTIN_NAT_EQ_REC: &str = "npa.kernel.v0.1.builtin-nat-eq-rec";
 pub const KERNEL_CHECK_PROFILE_BUILTIN_NONE: &str = "npa.kernel.v0.1.builtin-none";
@@ -433,7 +433,6 @@ pub struct HumanLspHoleGoal {
 pub struct HumanLspHoleGoalLocal {
     pub name: String,
     pub ty: String,
-    pub value: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -706,7 +705,6 @@ impl HumanDisplayMode {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HumanDisplayContextOptions {
     pub max_context_items: Option<usize>,
-    pub fold_local_def_values: bool,
     pub relevant_first: bool,
 }
 
@@ -714,7 +712,6 @@ impl Default for HumanDisplayContextOptions {
     fn default() -> Self {
         Self {
             max_context_items: None,
-            fold_local_def_values: false,
             relevant_first: true,
         }
     }
@@ -1941,8 +1938,6 @@ pub struct StructuredHypothesis {
     pub local_id: LocalId,
     pub name: String,
     pub ty: StructuredExpr,
-    pub value: Option<StructuredExpr>,
-    pub is_local_def: bool,
     pub is_implicit: bool,
     pub depends_on: Vec<LocalId>,
     pub binder_index: u32,
@@ -2659,7 +2654,6 @@ pub struct MachineLocalView {
     pub machine_name: String,
     pub display_name: String,
     pub ty: MachineExprView,
-    pub value: Option<MachineExprView>,
     pub depends_on: Vec<LocalId>,
     pub binder_index: u32,
 }
@@ -4022,7 +4016,7 @@ fn parse_hex_digest(value: &str) -> Result<Hash, MachineWireGrammarError> {
         ));
     }
     let mut out = [0u8; 32];
-    for (index, chunk) in value.as_bytes().chunks_exact(2).enumerate() {
+    for (index, chunk) in value.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         let high = lowercase_hex_value(chunk[0])?;
         let low = lowercase_hex_value(chunk[1])?;
         out[index] = (high << 4) | low;

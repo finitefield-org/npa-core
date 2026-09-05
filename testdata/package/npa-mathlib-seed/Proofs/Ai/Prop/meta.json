@@ -6,19 +6,12 @@
   "producer_profile": "human-surface-explicit-term",
   "trusted_status": "verified_by_certificate",
   "source_sha256": "sha256:466c82f2aa00708bbf9d91d7e59a5f0a629f5f61af979711c325a0f4ce29dec6",
-  "certificate_file_sha256": "sha256:2329dde6bd60cfa6b42abfdf776cd5d876582f8e26332c7f2fdf8b1395e96e6e",
-  "export_hash": "sha256:2be3062e9adb565d319e67b416e96dd6c5f5ec6bb4fa9fd1902c256bf06c8613",
+  "certificate_file_sha256": "sha256:45ec8458c494d75daa81a8c263d0d2b0724e016c304c2dee6acdf390bd7df478",
+  "export_hash": "sha256:63b1200408966ee2058d38d7d2eabccf025b23943de3a9d05a8fe8671e853ad8",
   "axiom_report_hash": "sha256:70b2d0f35f9ebfff46bdf399b80487f0c76ffd6460ab930f733af1f889d2fc65",
-  "certificate_hash": "sha256:8f6914e6d85bd0113fba91ac8fb67824f7fd0a770424a41044686428252fe442",
+  "certificate_hash": "sha256:6ad8cffdd60b790593cd8068161fbb45d80f34e0e9c880374dd5ddc879c8c3c4",
   "imports": [],
   "axioms": [],
-  "declarations": [
-    { "name": "imp_chain4", "kind": "theorem" },
-    { "name": "imp_permute3", "kind": "theorem" },
-    { "name": "imp_apply_twice", "kind": "theorem" },
-    { "name": "imp_const3", "kind": "theorem" },
-    { "name": "imp_flip_chain", "kind": "theorem" },
-    { "name": "imp_higher_apply", "kind": "theorem" }
-  ],
+  "declarations": [{"name":"imp_chain4","kind":"theorem"},{"name":"imp_permute3","kind":"theorem"},{"name":"imp_apply_twice","kind":"theorem"},{"name":"imp_const3","kind":"theorem"},{"name":"imp_flip_chain","kind":"theorem"},{"name":"imp_higher_apply","kind":"theorem"}],
   "trust_boundary": "source, replay, and metadata are non-trusted sidecars; only the canonical certificate verified by npa-cert is accepted"
 }

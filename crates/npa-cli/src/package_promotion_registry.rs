@@ -2,7 +2,6 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs,
     path::Path,
 };
 
@@ -34,7 +33,8 @@ use crate::{
         CommandArtifact, CommandDiagnostic, CommandResult, CommandStatus, DiagnosticKind,
     },
     fs::render_package_root,
-    governance_writer::{confined_governance_path, lock_governance_artifact},
+    generated_artifact_writer::{read_package_regular_file_no_follow, read_regular_file_no_follow},
+    governance_writer::{lock_governance_artifact, read_governance_artifact},
     package_artifacts::{
         load_package_audit_snapshot, PackageGeneratedArtifactReadMode, PACKAGE_AXIOM_REPORT_PATH,
         PACKAGE_THEOREM_INDEX_PATH,
@@ -43,7 +43,9 @@ use crate::{
     package_promotion_materialize::{
         declaration_plan_selection_current, filtered_declaration_replay,
     },
-    package_promotion_prepare_declaration::endpoint_record,
+    package_promotion_prepare_declaration::{
+        endpoint_record, transported_declaration_externalizations,
+    },
     package_promotion_transaction::TargetLock,
 };
 
@@ -127,7 +129,7 @@ pub fn run_package_validate_promotion_origin_registry(
         }
     };
     if let Some(path) = &options.previous_registry {
-        let previous = match fs::read_to_string(path)
+        let previous = match read_regular_file_no_follow(path)
             .map_err(|_| {
                 diagnostic(
                     DiagnosticKind::ArtifactIo,
@@ -135,8 +137,15 @@ pub fn run_package_validate_promotion_origin_registry(
                     path.display().to_string(),
                 )
             })
-            .and_then(|source| {
-                parse_promotion_origin_registry_json(&source).map_err(|_| {
+            .and_then(|bytes| {
+                let source = std::str::from_utf8(&bytes).map_err(|_| {
+                    diagnostic(
+                        DiagnosticKind::GeneratedArtifact,
+                        "promotion_registry_noncanonical",
+                        path.display().to_string(),
+                    )
+                })?;
+                parse_promotion_origin_registry_json(source).map_err(|_| {
                     diagnostic(
                         DiagnosticKind::GeneratedArtifact,
                         "promotion_registry_noncanonical",
@@ -471,28 +480,18 @@ fn run_register_equivalent_v2(
                     "$.entries",
                 );
             };
-            let source_path = match confined_governance_path(
-                &options.common.root,
-                &module.source,
-                module.source.as_str(),
-                "promotion_registry_source_identity_mismatch",
-            ) {
-                Ok(path) => path,
-                Err(diagnostic) => {
-                    return CommandResult::failed(REGISTER_COMMAND, root_display, vec![*diagnostic])
-                }
-            };
-            let bytes = match fs::read(source_path) {
-                Ok(bytes) => bytes,
-                Err(_) => {
-                    return mismatch_result(
-                        REGISTER_COMMAND,
-                        root_display,
-                        "promotion_registry_source_identity_mismatch",
-                        module.source.as_str(),
-                    )
-                }
-            };
+            let bytes =
+                match read_package_regular_file_no_follow(&options.common.root, &module.source) {
+                    Ok(bytes) => bytes,
+                    Err(_) => {
+                        return mismatch_result(
+                            REGISTER_COMMAND,
+                            root_display,
+                            "promotion_registry_source_identity_mismatch",
+                            module.source.as_str(),
+                        )
+                    }
+                };
             let canonical = &entry.canonical_source;
             if package_file_hash(&bytes) != canonical.source_file_hash
                 || module.expected_certificate_file_hash != canonical.certificate_file_hash
@@ -673,13 +672,13 @@ fn v3_source_registry_for_equivalent(
 
 fn load_registry_source(root: &Path) -> Result<String, Box<CommandDiagnostic>> {
     let path = npa_package::PackagePath::new(MATHLIB_PROMOTION_REGISTRY_PATH);
-    let full = confined_governance_path(
+    let bytes = read_governance_artifact(
         root,
         &path,
         path.as_str(),
         "promotion_registry_noncanonical",
     )?;
-    fs::read_to_string(full).map_err(|_| {
+    String::from_utf8(bytes).map_err(|_| {
         diagnostic(
             DiagnosticKind::ArtifactIo,
             "promotion_registry_noncanonical",
@@ -693,13 +692,13 @@ pub(crate) fn load_registry_versioned_with_source(
     _command: &str,
 ) -> Result<(ParsedPromotionOriginRegistry, String), Box<CommandDiagnostic>> {
     let path = npa_package::PackagePath::new(MATHLIB_PROMOTION_REGISTRY_PATH);
-    let full = confined_governance_path(
+    let bytes = read_governance_artifact(
         root,
         &path,
         path.as_str(),
         "promotion_registry_noncanonical",
     )?;
-    let source = fs::read_to_string(full).map_err(|_| {
+    let source = String::from_utf8(bytes).map_err(|_| {
         diagnostic(
             DiagnosticKind::ArtifactIo,
             "promotion_registry_noncanonical",
@@ -722,9 +721,12 @@ fn run_validate_registry_v2(
 ) -> CommandResult {
     let root_display = render_package_root(&options.common.root);
     if let Some(path) = &options.previous_registry {
-        let previous = match fs::read_to_string(path) {
-            Ok(source) => source,
-            Err(_) => {
+        let previous = match read_regular_file_no_follow(path)
+            .ok()
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+        {
+            Some(source) => source,
+            None => {
                 return mismatch_result(
                     VALIDATE_COMMAND,
                     root_display,
@@ -986,9 +988,12 @@ fn run_validate_registry_v3(
 ) -> CommandResult {
     let root_display = render_package_root(&options.common.root);
     if let Some(path) = &options.previous_registry {
-        let previous = match fs::read_to_string(path) {
-            Ok(source) => source,
-            Err(_) => {
+        let previous = match read_regular_file_no_follow(path)
+            .ok()
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+        {
+            Some(source) => source,
+            None => {
                 return mismatch_result(
                     VALIDATE_COMMAND,
                     root_display,
@@ -1160,7 +1165,7 @@ fn run_validate_registry_v3(
             root,
             VALIDATE_COMMAND,
             promotion_plan_generated_read_mode(),
-            PackageArtifactReferenceSummaryMode::Include,
+            PackageArtifactReferenceSummaryMode::Omit,
         ) {
             Ok(snapshot) => snapshot,
             Err(result) => return result,
@@ -1292,19 +1297,12 @@ fn read_governance_bytes(
     root: &Path,
     path: &npa_package::PackagePath,
 ) -> Result<Vec<u8>, Box<CommandDiagnostic>> {
-    let full = confined_governance_path(
+    read_governance_artifact(
         root,
         path,
         path.as_str(),
         "promotion_registry_evidence_hash_mismatch",
-    )?;
-    fs::read(full).map_err(|_| {
-        diagnostic(
-            DiagnosticKind::ArtifactIo,
-            "promotion_registry_evidence_hash_mismatch",
-            path.as_str(),
-        )
-    })
+    )
 }
 
 fn validate_effective_declaration_revision(
@@ -1323,23 +1321,13 @@ fn validate_effective_declaration_revision(
         .ok_or_else(|| identity_mismatch(module_name))?;
     let hash_optional = |path: Option<&npa_package::PackagePath>| {
         path.map_or(Ok(npa_package::PackageHash::new([0; 32])), |path| {
-            fs::read(confined_governance_path(
-                root,
-                path,
-                path.as_str(),
-                "promotion_registry_target_identity_mismatch",
-            )?)
-            .map(|bytes| package_file_hash(&bytes))
-            .map_err(|_| identity_mismatch(module_name))
+            read_package_regular_file_no_follow(root, path)
+                .map(|bytes| package_file_hash(&bytes))
+                .map_err(|_| identity_mismatch(module_name))
         })
     };
-    let source = fs::read(confined_governance_path(
-        root,
-        &module.source,
-        module.source.as_str(),
-        "promotion_registry_target_identity_mismatch",
-    )?)
-    .map_err(|_| identity_mismatch(module_name))?;
+    let source = read_package_regular_file_no_follow(root, &module.source)
+        .map_err(|_| identity_mismatch(module_name))?;
     if package_file_hash(&source) != revision.target_source_file_hash
         || hash_optional(module.meta.as_ref())? != revision.target_meta_file_hash
         || hash_optional(module.replay.as_ref())? != revision.target_replay_file_hash
@@ -1395,13 +1383,8 @@ fn validate_declaration_target_v2(
     {
         return Err(identity_mismatch(&entry.target_module));
     }
-    let source = fs::read(confined_governance_path(
-        root,
-        &module.source,
-        module.source.as_str(),
-        "promotion_registry_target_identity_mismatch",
-    )?)
-    .map_err(|_| identity_mismatch(&entry.target_module))?;
+    let source = read_package_regular_file_no_follow(root, &module.source)
+        .map_err(|_| identity_mismatch(&entry.target_module))?;
     let meta_path = module
         .meta
         .as_ref()
@@ -1410,20 +1393,10 @@ fn validate_declaration_target_v2(
         .replay
         .as_ref()
         .ok_or_else(|| identity_mismatch(&entry.target_module))?;
-    let meta = fs::read(confined_governance_path(
-        root,
-        meta_path,
-        meta_path.as_str(),
-        "promotion_registry_target_identity_mismatch",
-    )?)
-    .map_err(|_| identity_mismatch(&entry.target_module))?;
-    let replay = fs::read(confined_governance_path(
-        root,
-        replay_path,
-        replay_path.as_str(),
-        "promotion_registry_target_identity_mismatch",
-    )?)
-    .map_err(|_| identity_mismatch(&entry.target_module))?;
+    let meta = read_package_regular_file_no_follow(root, meta_path)
+        .map_err(|_| identity_mismatch(&entry.target_module))?;
+    let replay = read_package_regular_file_no_follow(root, replay_path)
+        .map_err(|_| identity_mismatch(&entry.target_module))?;
     if package_file_hash(&source) != revision.target_source_file_hash
         || package_file_hash(&meta) != revision.target_meta_file_hash
         || package_file_hash(&replay) != revision.target_replay_file_hash
@@ -1472,13 +1445,8 @@ fn validate_declaration_source_v2(
         .iter()
         .find(|module| module.module == origin.source_module)
         .ok_or_else(|| source_mismatch(&origin.source_module))?;
-    let bytes = fs::read(confined_governance_path(
-        root,
-        &module.source,
-        module.source.as_str(),
-        "promotion_registry_source_identity_mismatch",
-    )?)
-    .map_err(|_| source_mismatch(&origin.source_module))?;
+    let bytes = read_package_regular_file_no_follow(root, &module.source)
+        .map_err(|_| source_mismatch(&origin.source_module))?;
     if manifest.package != origin.package
         || manifest.version != origin.version
         || package_file_hash(&bytes) != origin.source_file_hash
@@ -1494,20 +1462,11 @@ fn validate_declaration_source_v2(
     {
         return Ok(());
     }
-    let plan_bytes = fs::read(confined_governance_path(
-        root,
-        &entry.evidence.plan_path,
-        entry.evidence.plan_path.as_str(),
-        "promotion_registry_source_identity_mismatch",
-    )?)
-    .map_err(|_| source_mismatch(&origin.source_module))?;
-    let attestation_bytes = fs::read(confined_governance_path(
-        root,
-        &entry.evidence.attestation_path,
-        entry.evidence.attestation_path.as_str(),
-        "promotion_registry_source_identity_mismatch",
-    )?)
-    .map_err(|_| source_mismatch(&origin.source_module))?;
+    let plan_bytes = read_package_regular_file_no_follow(root, &entry.evidence.plan_path)
+        .map_err(|_| source_mismatch(&origin.source_module))?;
+    let attestation_bytes =
+        read_package_regular_file_no_follow(root, &entry.evidence.attestation_path)
+            .map_err(|_| source_mismatch(&origin.source_module))?;
     let plan = std::str::from_utf8(&plan_bytes)
         .ok()
         .and_then(|source| parse_mathlib_promotion_plan_v2_json(source).ok())
@@ -1516,19 +1475,15 @@ fn validate_declaration_source_v2(
         .ok()
         .and_then(|source| parse_verified_materialization_attestation_json(source).ok())
         .ok_or_else(|| source_mismatch(&origin.source_module))?;
-    let request_bytes = fs::read(confined_governance_path(
-        root,
-        &plan.governance.request_path,
-        plan.governance.request_path.as_str(),
-        "promotion_registry_source_identity_mismatch",
-    )?)
-    .map_err(|_| source_mismatch(&origin.source_module))?;
+    let request_bytes = read_package_regular_file_no_follow(root, &plan.governance.request_path)
+        .map_err(|_| source_mismatch(&origin.source_module))?;
     let request = std::str::from_utf8(&request_bytes)
         .ok()
         .and_then(|source| parse_declaration_promotion_request_json(source).ok())
         .ok_or_else(|| source_mismatch(&origin.source_module))?;
     let source_external = declaration_registry_mapping_identities(source, target, &plan)
         .ok_or_else(|| source_mismatch(&origin.source_module))?;
+    let transported_externalizations = transported_declaration_externalizations(&source_external);
     let normalized_closure_hash =
         normalized_closure_identity(root, target_root, source, target, target, &plan)
             .map_err(|_| source_mismatch(&origin.source_module))?;
@@ -1540,20 +1495,10 @@ fn validate_declaration_source_v2(
         .replay
         .as_ref()
         .ok_or_else(|| source_mismatch(&origin.source_module))?;
-    let meta_bytes = fs::read(confined_governance_path(
-        root,
-        meta_path,
-        meta_path.as_str(),
-        "promotion_registry_source_identity_mismatch",
-    )?)
-    .map_err(|_| source_mismatch(&origin.source_module))?;
-    let replay_bytes = fs::read(confined_governance_path(
-        root,
-        replay_path,
-        replay_path.as_str(),
-        "promotion_registry_source_identity_mismatch",
-    )?)
-    .map_err(|_| source_mismatch(&origin.source_module))?;
+    let meta_bytes = read_package_regular_file_no_follow(root, meta_path)
+        .map_err(|_| source_mismatch(&origin.source_module))?;
+    let replay_bytes = read_package_regular_file_no_follow(root, replay_path)
+        .map_err(|_| source_mismatch(&origin.source_module))?;
     let replay_source =
         std::str::from_utf8(&replay_bytes).map_err(|_| source_mismatch(&origin.source_module))?;
     let (expected_target_replay, expected_omissions) =
@@ -1562,22 +1507,6 @@ fn validate_declaration_source_v2(
     if package_file_hash(&plan_bytes) != entry.evidence.plan_file_hash
         || package_file_hash(&attestation_bytes) != entry.evidence.attestation_file_hash
         || validate_declaration_registry_entry_admission(entry, &plan, &attestation).is_err()
-        || source.snapshot.manifest.file_hash != plan.source.manifest_file_hash
-        || package_file_hash(source.package_lock_json.as_bytes()) != plan.source.lock_file_hash
-        || source
-            .checked_generated
-            .axiom_report_json
-            .as_deref()
-            .is_none_or(|value| {
-                package_file_hash(value.as_bytes()) != plan.source.axiom_report_file_hash
-            })
-        || source
-            .checked_generated
-            .theorem_index_json
-            .as_deref()
-            .is_none_or(|value| {
-                package_file_hash(value.as_bytes()) != plan.source.theorem_index_file_hash
-            })
         || module.source != plan.selection.source_path
         || module.certificate != plan.selection.certificate_path
         || meta_path != &plan.selection.meta_path
@@ -1588,7 +1517,14 @@ fn validate_declaration_source_v2(
         || package_file_hash(expected_target_replay.as_bytes())
             != attestation.target.replay_file_hash
         || expected_omissions != attestation.replay_omissions
-        || !declaration_plan_selection_current(root, source, &request, &plan, &source_external)
+        || !declaration_plan_selection_current(
+            root,
+            source,
+            &request,
+            &plan,
+            &source_external,
+            &transported_externalizations,
+        )
         || normalized_closure_hash != entry.evidence.normalized_closure_hash
         || plan.promotion_id != entry.promotion_id
         || attestation.promotion_id != entry.promotion_id
@@ -1876,14 +1812,10 @@ fn validate_target_route_base<T>(
     if version_tuple(&revision.target_version) > version_tuple(&manifest.version) {
         return Err(identity_mismatch(module_name));
     }
-    let source = confined_governance_path(
-        root,
-        &module.source,
-        module.source.as_str(),
-        "promotion_registry_target_identity_mismatch",
-    )?;
-    let source_hash =
-        package_file_hash(&fs::read(source).map_err(|_| identity_mismatch(module_name))?);
+    let source_hash = package_file_hash(
+        &read_package_regular_file_no_follow(root, &module.source)
+            .map_err(|_| identity_mismatch(module_name))?,
+    );
     if source_hash != revision.target_source_file_hash
         || module.expected_certificate_file_hash != revision.target_certificate_file_hash
         || module.expected_certificate_hash != revision.target_certificate_hash
@@ -1943,14 +1875,9 @@ fn validate_source_origin(
             .iter()
             .find(|module| module.module == expected.module)
             .ok_or_else(|| source_mismatch(&expected.module))?;
-        let source_path = confined_governance_path(
-            root,
-            &module.source,
-            module.source.as_str(),
-            "promotion_registry_source_identity_mismatch",
-        )?;
         let source_hash = package_file_hash(
-            &fs::read(source_path).map_err(|_| source_mismatch(&expected.module))?,
+            &read_package_regular_file_no_follow(root, &module.source)
+                .map_err(|_| source_mismatch(&expected.module))?,
         );
         if source_hash != expected.source_file_hash
             || module.expected_certificate_file_hash != expected.certificate_file_hash
@@ -1995,19 +1922,14 @@ fn validate_registry_evidence(
     } = evidence
     {
         if audit_location.repository == "npa-mathlib" {
-            let full = confined_governance_path(
-                root,
-                &audit_location.path,
-                audit_location.path.as_str(),
-                "promotion_registry_target_identity_mismatch",
-            )?;
-            let bytes = fs::read(full).map_err(|_| {
-                diagnostic(
-                    DiagnosticKind::ArtifactIo,
-                    "promotion_registry_target_identity_mismatch",
-                    audit_location.path.as_str(),
-                )
-            })?;
+            let bytes =
+                read_package_regular_file_no_follow(root, &audit_location.path).map_err(|_| {
+                    diagnostic(
+                        DiagnosticKind::ArtifactIo,
+                        "promotion_registry_target_identity_mismatch",
+                        audit_location.path.as_str(),
+                    )
+                })?;
             if package_file_hash(&bytes) != *audit_file_hash {
                 return Err(diagnostic(
                     DiagnosticKind::HashMismatch,
@@ -2031,19 +1953,14 @@ fn validate_registry_lifecycle(
     } = lifecycle
     {
         if audit_location.repository == "npa-mathlib" {
-            let full = confined_governance_path(
-                root,
-                &audit_location.path,
-                audit_location.path.as_str(),
-                "promotion_registry_target_identity_mismatch",
-            )?;
-            let bytes = fs::read(full).map_err(|_| {
-                diagnostic(
-                    DiagnosticKind::ArtifactIo,
-                    "promotion_registry_target_identity_mismatch",
-                    audit_location.path.as_str(),
-                )
-            })?;
+            let bytes =
+                read_package_regular_file_no_follow(root, &audit_location.path).map_err(|_| {
+                    diagnostic(
+                        DiagnosticKind::ArtifactIo,
+                        "promotion_registry_target_identity_mismatch",
+                        audit_location.path.as_str(),
+                    )
+                })?;
             if package_file_hash(&bytes) != *audit_file_hash {
                 return Err(diagnostic(
                     DiagnosticKind::HashMismatch,
@@ -2081,16 +1998,11 @@ fn project_equivalent_origin(
             .iter()
             .find(|module| module.module == canonical_module.module)
             .ok_or_else(|| source_mismatch(&canonical_module.module))?;
-        let path = confined_governance_path(
-            root,
-            &module.source,
-            module.source.as_str(),
-            "promotion_registry_source_identity_mismatch",
-        )?;
         let projected = PromotionSourceModule {
             module: module.module.clone(),
             source_file_hash: package_file_hash(
-                &fs::read(path).map_err(|_| source_mismatch(&module.module))?,
+                &read_package_regular_file_no_follow(root, &module.source)
+                    .map_err(|_| source_mismatch(&module.module))?,
             ),
             certificate_file_hash: module.expected_certificate_file_hash,
             certificate_hash: module.expected_certificate_hash,

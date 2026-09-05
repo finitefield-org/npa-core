@@ -5,12 +5,12 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
-pub const PROOF_SKELETON_API_VERSION: &str = "npa.proof-skeleton.v1";
-pub const PROOF_SKELETON_HASH_DOMAIN: &str = "npa.proof-skeleton.skeleton-hash.v1";
-pub const PROOF_SKELETON_HOLE_HASH_DOMAIN: &str = "npa.proof-skeleton.hole-hash.v1";
-pub const PROOF_SKELETON_CORE_EXPR_ENCODING: &str = "npa.core-expr.canonical-bytes.v0.1";
-pub const PROOF_SKELETON_CORE_EXPR_ARTIFACT_SCHEMA: &str = "npa.core-expr-artifact.v0.1";
-pub const PROOF_SKELETON_TERM_KINDS: &[&str] = &["core", "app", "lam", "let", "hole"];
+pub const PROOF_SKELETON_API_VERSION: &str = "npa.proof-skeleton.v2";
+pub const PROOF_SKELETON_HASH_DOMAIN: &str = "npa.proof-skeleton.skeleton-hash.v2";
+pub const PROOF_SKELETON_HOLE_HASH_DOMAIN: &str = "npa.proof-skeleton.hole-hash.v2";
+pub const PROOF_SKELETON_CORE_EXPR_ENCODING: &str = "npa.core-expr.canonical-bytes.v0.2";
+pub const PROOF_SKELETON_CORE_EXPR_ARTIFACT_SCHEMA: &str = "npa.core-expr-artifact.v0.2";
+pub const PROOF_SKELETON_TERM_KINDS: &[&str] = &["core", "app", "lam", "hole"];
 
 const ROOT_FIELDS: &[&str] = &[
     "api_version",
@@ -34,14 +34,12 @@ const TERM_FIELDS: &[&str] = &[
     "function",
     "argument",
     "binder_type",
-    "value",
     "body",
     "hole_id",
 ];
 const TERM_CORE_FIELDS: &[&str] = &["kind", "core_expr"];
 const TERM_APP_FIELDS: &[&str] = &["kind", "function", "argument"];
 const TERM_LAM_FIELDS: &[&str] = &["kind", "binder_type", "body"];
-const TERM_LET_FIELDS: &[&str] = &["kind", "binder_type", "value", "body"];
 const TERM_HOLE_FIELDS: &[&str] = &["kind", "hole_id"];
 const CORE_EXPR_SOURCE_FIELDS: &[&str] = &[
     "kind",
@@ -124,11 +122,6 @@ pub enum ProofSkeletonTerm {
     },
     Lam {
         binder_type: ProofSkeletonCoreExpr,
-        body: Box<ProofSkeletonTerm>,
-    },
-    Let {
-        binder_type: ProofSkeletonCoreExpr,
-        value: Box<ProofSkeletonTerm>,
         body: Box<ProofSkeletonTerm>,
     },
     Hole {
@@ -732,26 +725,6 @@ fn parse_term(
                 )?),
             })
         }
-        "let" => {
-            let members = object_map(value, path, TERM_LET_FIELDS)?;
-            Ok(ProofSkeletonTerm::Let {
-                binder_type: parse_core_expr_source(
-                    required_value(&members, "binder_type", path)?,
-                    &format!("{path}.binder_type"),
-                    artifacts,
-                )?,
-                value: Box::new(parse_term(
-                    required_value(&members, "value", path)?,
-                    &format!("{path}.value"),
-                    artifacts,
-                )?),
-                body: Box::new(parse_term(
-                    required_value(&members, "body", path)?,
-                    &format!("{path}.body"),
-                    artifacts,
-                )?),
-            })
-        }
         "hole" => {
             let members = object_map(value, path, TERM_HOLE_FIELDS)?;
             Ok(ProofSkeletonTerm::Hole {
@@ -1172,10 +1145,6 @@ fn collect_term_hole_ids(term: &ProofSkeletonTerm, ids: &mut BTreeSet<String>) {
             collect_term_hole_ids(argument, ids);
         }
         ProofSkeletonTerm::Lam { body, .. } => collect_term_hole_ids(body, ids),
-        ProofSkeletonTerm::Let { value, body, .. } => {
-            collect_term_hole_ids(value, ids);
-            collect_term_hole_ids(body, ids);
-        }
         ProofSkeletonTerm::Hole { hole_id } => {
             ids.insert(hole_id.clone());
         }
@@ -1505,19 +1474,6 @@ fn encode_term_to(out: &mut Vec<u8>, term: &ProofSkeletonTerm) {
             encode_string_to(out, "body");
             encode_term_to(out, body);
         }
-        ProofSkeletonTerm::Let {
-            binder_type,
-            value,
-            body,
-        } => {
-            encode_string_to(out, "let");
-            encode_string_to(out, "binder_type");
-            encode_core_expr_to(out, binder_type);
-            encode_string_to(out, "value");
-            encode_term_to(out, value);
-            encode_string_to(out, "body");
-            encode_term_to(out, body);
-        }
         ProofSkeletonTerm::Hole { hole_id } => {
             encode_string_to(out, "hole");
             encode_string_to(out, "hole_id");
@@ -1655,4 +1611,31 @@ fn sha256_hash(bytes: &[u8]) -> Hash {
     let mut hash = [0u8; 32];
     hash.copy_from_slice(&digest);
     hash
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retired_v1_api_and_let_term_are_not_current() {
+        let version_error = parse_proof_skeleton(r#"{"api_version":"npa.proof-skeleton.v1"}"#)
+            .expect_err("the value-bearing v1 grammar must not remain current");
+        assert_eq!(
+            version_error.kind(),
+            &ProofSkeletonSchemaErrorKind::InvalidApiVersion {
+                value: "npa.proof-skeleton.v1".to_owned(),
+            }
+        );
+
+        let document = JsonDocument::parse(r#"{"kind":"let"}"#).unwrap();
+        let error = parse_term(document.root(), "$.root", &BTreeMap::new())
+            .expect_err("let must not have a current proof-skeleton variant");
+        assert_eq!(
+            error.kind(),
+            &ProofSkeletonSchemaErrorKind::InvalidTermKind {
+                value: "let".to_owned(),
+            }
+        );
+    }
 }

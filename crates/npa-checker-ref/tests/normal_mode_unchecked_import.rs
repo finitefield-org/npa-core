@@ -58,25 +58,27 @@ fn hash_with_domain(domain: &[u8], payload: &[u8]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
-fn recompute_module_certificate_hash(cert: &mut ModuleCert) {
-    let encoded = encode_module_cert(cert).unwrap();
+fn recompute_module_certificate_hash(cert: ModuleCert) -> ModuleCert {
+    let encoded = encode_module_cert(&cert).unwrap();
     let payload = &encoded[..encoded.len() - 32];
-    cert.hashes.certificate_hash = hash_with_domain(b"NPA-MODULE-CERT-0.3.0", payload);
+    let mut parts = cert.into_parts();
+    parts.hashes.certificate_hash = hash_with_domain(b"NPA-MODULE-CERT-0.4.0", payload);
+    ModuleCert::from_parts(parts)
 }
 
-fn semantically_invalid_provider(mut cert: ModuleCert) -> ModuleCert {
+fn semantically_invalid_provider(cert: ModuleCert) -> ModuleCert {
     let bvar_zero = cert
-        .term_table
+        .term_table()
         .iter()
         .position(|term| matches!(term, TermNode::BVar(0)))
         .expect("identity certificate contains bvar 0");
     let bvar_one = cert
-        .term_table
+        .term_table()
         .iter()
         .position(|term| matches!(term, TermNode::BVar(1)))
         .expect("identity certificate contains bvar 1");
     let inner_lambda = cert
-        .term_table
+        .term_table()
         .iter()
         .position(|term| {
             matches!(
@@ -85,22 +87,24 @@ fn semantically_invalid_provider(mut cert: ModuleCert) -> ModuleCert {
             )
         })
         .expect("identity certificate contains its inner lambda");
-    match &mut cert.term_table[inner_lambda] {
+    let mut parts = cert.into_parts();
+    match &mut parts.term_table[inner_lambda] {
         TermNode::Lam { body, .. } => *body = bvar_one,
         term => panic!("expected inner identity lambda, got {term:?}"),
     }
-    let proof = match cert.declarations[0].decl {
+    let cert = ModuleCert::from_parts(parts);
+    let proof = match cert.declarations()[0].decl {
         DeclPayload::Theorem { proof, .. } => proof,
         ref decl => panic!("expected identity theorem, got {decl:?}"),
     };
     let mut payload = Vec::new();
-    payload.extend(cert.declarations[0].hashes.decl_interface_hash);
+    payload.extend(cert.declarations()[0].hashes.decl_interface_hash);
     payload.extend(term_hash(&cert, proof).unwrap());
     payload.push(0); // Empty dependency vector.
-    cert.declarations[0].hashes.decl_certificate_hash =
-        hash_with_domain(b"NPA-DECL-CERT-0.3.0", &payload);
-    recompute_module_certificate_hash(&mut cert);
-    cert
+    let mut parts = cert.into_parts();
+    parts.declarations[0].hashes.decl_certificate_hash =
+        hash_with_domain(b"NPA-DECL-CERT-0.4.0", &payload);
+    recompute_module_certificate_hash(ModuleCert::from_parts(parts))
 }
 
 fn unchecked_import_fixture(pin_bad_certificate: bool) -> (ModuleCert, ModuleCert, Vec<u8>) {
@@ -110,10 +114,11 @@ fn unchecked_import_fixture(pin_bad_certificate: bool) -> (ModuleCert, ModuleCer
     let good = verify_module_cert(&good_bytes, &mut session, &AxiomPolicy::normal()).unwrap();
 
     let bad_cert = semantically_invalid_provider(good_cert.clone());
-    let mut leaf_cert = build_module_cert(consumer(), &[good]).unwrap();
-    leaf_cert.imports[0].certificate_hash =
-        pin_bad_certificate.then_some(bad_cert.hashes.certificate_hash);
-    recompute_module_certificate_hash(&mut leaf_cert);
+    let leaf_cert = build_module_cert(consumer(), &[good]).unwrap();
+    let mut parts = leaf_cert.into_parts();
+    parts.imports[0].certificate_hash =
+        pin_bad_certificate.then_some(bad_cert.hashes().certificate_hash);
+    let leaf_cert = recompute_module_certificate_hash(ModuleCert::from_parts(parts));
     let leaf_bytes = encode_module_cert(&leaf_cert).unwrap();
     (good_cert, bad_cert, leaf_bytes)
 }
@@ -158,10 +163,13 @@ fn write_cli_fixture(dir: &std::path::Path, bad_cert: &ModuleCert, leaf_bytes: &
 fn normal_mode_leaf_accepts_semantically_unchecked_import() {
     let (good_cert, bad_cert, leaf_bytes) = unchecked_import_fixture(false);
     let bad_bytes = encode_module_cert(&bad_cert).unwrap();
-    assert_eq!(good_cert.hashes.export_hash, bad_cert.hashes.export_hash);
+    assert_eq!(
+        good_cert.hashes().export_hash,
+        bad_cert.hashes().export_hash
+    );
     assert_ne!(
-        good_cert.hashes.certificate_hash,
-        bad_cert.hashes.certificate_hash
+        good_cert.hashes().certificate_hash,
+        bad_cert.hashes().certificate_hash
     );
     assert!(matches!(
         check_certificate(
@@ -197,7 +205,7 @@ fn cli_normal_mode_accepts_leaf_with_semantically_unchecked_import() {
 }
 
 #[test]
-fn cli_high_trust_rejects_leaf_with_semantically_unchecked_import() {
+fn high_trust_api_rejects_unchecked_import_and_cli_rejects_trust_override() {
     let (_, bad_cert, leaf_bytes) = unchecked_import_fixture(true);
     let bad_bytes = encode_module_cert(&bad_cert).unwrap();
     let unchecked =
@@ -220,9 +228,10 @@ fn cli_high_trust_rejects_leaf_with_semantically_unchecked_import() {
     let output = run_cli(&dir, Some(&policy_path));
     let stdout = String::from_utf8(output.stdout).unwrap();
 
-    assert_eq!(output.status.code(), Some(1), "{stdout}");
-    assert!(stdout.contains("\"status\":\"failed\""), "{stdout}");
-    assert!(stdout.contains("\"kind\":\"import_not_found\""), "{stdout}");
-    assert!(stdout.contains("\"section\":\"imports\""), "{stdout}");
+    assert_eq!(output.status.code(), Some(2), "{stdout}");
+    assert!(
+        stdout.contains("\"kind\":\"checker_internal_error\""),
+        "{stdout}"
+    );
     let _ = fs::remove_dir_all(dir);
 }

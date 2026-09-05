@@ -6,7 +6,6 @@
 //! not proof input.
 
 use std::collections::BTreeMap;
-use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
 
@@ -38,7 +37,8 @@ use npa_package::{
 
 use crate::args::{PackageCommonOptions, PackageHighTrustOptions};
 use crate::diagnostic::{CommandArtifact, CommandDiagnostic, CommandResult, DiagnosticKind};
-use crate::fs::{join_package_path, render_package_root};
+use crate::fs::render_package_root;
+use crate::generated_artifact_writer::read_package_regular_file_no_follow;
 use crate::package_publish::{load_package_publish_inputs, LoadedPackagePublishInputs};
 
 /// Stable command name for `npa package high-trust`.
@@ -216,18 +216,18 @@ fn read_publish_plan_hash(
     inputs: &LoadedPackagePublishInputs,
 ) -> Result<Option<PackageHash>, CommandResult> {
     let path = PackagePath::new(PACKAGE_PUBLISH_PLAN_PATH);
-    let full_path = match join_package_path(&options.root, &path, "publish_plan.path") {
-        Ok(path) => path,
-        Err(diagnostic) => {
-            return Err(CommandResult::failed(
+    let source = match read_package_regular_file_no_follow(&options.root, &path) {
+        Ok(bytes) => String::from_utf8(bytes).map_err(|_| {
+            CommandResult::failed(
                 COMMAND,
                 inputs.root_display.clone(),
-                vec![*diagnostic],
-            ))
-        }
-    };
-    let source = match fs::read_to_string(full_path) {
-        Ok(source) => source,
+                vec![CommandDiagnostic::error(
+                    DiagnosticKind::GeneratedArtifact,
+                    "publish_plan_unreadable",
+                )
+                .with_path(PACKAGE_PUBLISH_PLAN_PATH)],
+            )
+        })?,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(_) => {
             return Err(CommandResult::failed(
@@ -382,18 +382,18 @@ fn load_high_trust_evidence(
     policies: &HighTrustPolicies,
 ) -> Result<HighTrustEvidence, Box<CommandDiagnostic>> {
     let manifest_path = PackagePath::new(DEFAULT_RELEASE_AUDIT_BUNDLE_MANIFEST_PATH);
-    let manifest_full_path = join_package_path(
-        &options.root,
-        &manifest_path,
-        "release_audit_bundle_manifest.path",
-    )?;
-    let manifest_source = fs::read_to_string(&manifest_full_path).map_err(|error| {
-        let reason = if error.kind() == io::ErrorKind::NotFound {
-            "not_verified"
-        } else {
-            "release_audit_bundle_manifest_unreadable"
-        };
-        Box::new(
+    let manifest_source = read_package_regular_file_no_follow(&options.root, &manifest_path)
+        .and_then(|bytes| {
+            String::from_utf8(bytes)
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "manifest is not UTF-8"))
+        })
+        .map_err(|error| {
+            let reason = if error.kind() == io::ErrorKind::NotFound {
+                "not_verified"
+            } else {
+                "release_audit_bundle_manifest_unreadable"
+            };
+            Box::new(
             CommandDiagnostic::error(DiagnosticKind::ExternalVerifier, reason)
                 .with_path(DEFAULT_RELEASE_AUDIT_BUNDLE_MANIFEST_PATH)
                 .with_field("release_audit_bundle_manifest")
@@ -402,7 +402,7 @@ fn load_high_trust_evidence(
                 )
                 .with_actual_value("missing"),
         )
-    })?;
+        })?;
     let manifest_file_hash = independent_checker_file_hash(manifest_source.as_bytes());
     let manifest = parse_independent_checker_release_audit_bundle_manifest(&manifest_source)
         .map_err(|error| {
@@ -420,7 +420,9 @@ fn load_high_trust_evidence(
         DEFAULT_RELEASE_AUDIT_BUNDLE_MANIFEST_PATH,
     )?;
 
-    let bundle_root = manifest_full_path
+    let bundle_root = options
+        .root
+        .join(DEFAULT_RELEASE_AUDIT_BUNDLE_MANIFEST_PATH)
         .parent()
         .map(Path::to_path_buf)
         .unwrap_or_else(|| options.root.clone());
@@ -851,22 +853,18 @@ fn read_bundle_artifact_bytes(
     artifact: &IndependentCheckerReleaseAuditBundleArtifact,
 ) -> Result<Vec<u8>, Box<CommandDiagnostic>> {
     let package_path = package_path_from_str(&artifact.path, "release_audit_bundle.artifact.path")?;
-    let full_path = join_package_path(
-        bundle_root,
-        &package_path,
-        "release_audit_bundle.artifact.path",
-    )?;
-    let bytes = fs::read(full_path).map_err(|error| {
-        let reason = if error.kind() == io::ErrorKind::NotFound {
-            "release_audit_bundle_artifact_missing"
-        } else {
-            "release_audit_bundle_artifact_unreadable"
-        };
-        Box::new(
-            CommandDiagnostic::error(DiagnosticKind::ExternalVerifier, reason)
-                .with_path(artifact.path.clone()),
-        )
-    })?;
+    let bytes =
+        read_package_regular_file_no_follow(bundle_root, &package_path).map_err(|error| {
+            let reason = if error.kind() == io::ErrorKind::NotFound {
+                "release_audit_bundle_artifact_missing"
+            } else {
+                "release_audit_bundle_artifact_unreadable"
+            };
+            Box::new(
+                CommandDiagnostic::error(DiagnosticKind::ExternalVerifier, reason)
+                    .with_path(artifact.path.clone()),
+            )
+        })?;
     let actual_hash = independent_checker_file_hash(&bytes);
     ensure_hash(
         artifact.file_hash,
@@ -1058,47 +1056,32 @@ fn output_target(
 }
 
 fn read_output_json(target: &OutputTarget) -> Result<String, Box<CommandDiagnostic>> {
-    fs::read_to_string(&target.full_path).map_err(|error| {
-        let reason = if error.kind() == io::ErrorKind::NotFound {
-            "verified_high_trust_missing"
-        } else {
-            "generated_artifact_read_failed"
-        };
+    let bytes = crate::generated_artifact_writer::read_regular_file_no_follow(&target.full_path)
+        .map_err(|error| {
+            let reason = if error.kind() == io::ErrorKind::NotFound {
+                "verified_high_trust_missing"
+            } else {
+                "generated_artifact_read_failed"
+            };
+            Box::new(
+                CommandDiagnostic::error(DiagnosticKind::GeneratedArtifact, reason)
+                    .with_path(target.display_path.clone()),
+            )
+        })?;
+    String::from_utf8(bytes).map_err(|_| {
         Box::new(
-            CommandDiagnostic::error(DiagnosticKind::GeneratedArtifact, reason)
-                .with_path(target.display_path.clone()),
+            CommandDiagnostic::error(
+                DiagnosticKind::GeneratedArtifact,
+                "generated_artifact_read_failed",
+            )
+            .with_path(target.display_path.clone()),
         )
     })
 }
 
 fn write_output_json(target: &OutputTarget, json: &[u8]) -> Result<(), Box<CommandDiagnostic>> {
-    match fs::read(&target.full_path) {
-        Ok(existing) if existing == json => return Ok(()),
-        Ok(_) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(_) => return Err(Box::new(write_failed_diagnostic(&target.display_path))),
-    }
-    if let Some(parent) = target.full_path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|_| Box::new(write_failed_diagnostic(&target.display_path)))?;
-    }
-    let temp_path = temporary_write_path(&target.full_path);
-    if fs::write(&temp_path, json).is_err() {
-        return Err(Box::new(write_failed_diagnostic(&target.display_path)));
-    }
-    if fs::rename(&temp_path, &target.full_path).is_err() {
-        let _ = fs::remove_file(&temp_path);
-        return Err(Box::new(write_failed_diagnostic(&target.display_path)));
-    }
-    Ok(())
-}
-
-fn temporary_write_path(path: &Path) -> PathBuf {
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("verified-high-trust.json");
-    path.with_file_name(format!(".{file_name}.npa-high-trust.tmp"))
+    crate::generated_artifact_writer::write_regular_file_atomic_no_follow(&target.full_path, json)
+        .map_err(|_| Box::new(write_failed_diagnostic(&target.display_path)))
 }
 
 fn passed_result(root_display: String, path: String) -> CommandResult {
@@ -1123,17 +1106,21 @@ fn read_workspace_text(
     missing_reason: &'static str,
 ) -> Result<String, Box<CommandDiagnostic>> {
     validate_workspace_relative_path(path, "path")?;
-    fs::read_to_string(path).map_err(|error| {
-        let reason = if error.kind() == io::ErrorKind::NotFound {
-            missing_reason
-        } else {
-            "artifact_unreadable"
-        };
-        Box::new(
-            CommandDiagnostic::error(DiagnosticKind::ArtifactIo, reason)
-                .with_path(workspace_path_display(path)),
-        )
-    })
+    crate::generated_artifact_writer::read_regular_file_no_follow(path)
+        .and_then(|bytes| {
+            String::from_utf8(bytes).map_err(|_| io::Error::other("artifact is not UTF-8"))
+        })
+        .map_err(|error| {
+            let reason = if error.kind() == io::ErrorKind::NotFound {
+                missing_reason
+            } else {
+                "artifact_unreadable"
+            };
+            Box::new(
+                CommandDiagnostic::error(DiagnosticKind::ArtifactIo, reason)
+                    .with_path(workspace_path_display(path)),
+            )
+        })
 }
 
 fn validate_workspace_relative_path(

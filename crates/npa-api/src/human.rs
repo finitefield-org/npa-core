@@ -641,15 +641,7 @@ fn human_state_goal_summaries_for_api(
         let mut context = Vec::with_capacity(goal.context.len());
         for local in &goal.context {
             let ty = human_structured_expr_pretty(&local.ty, &local_names);
-            let value = local
-                .value
-                .as_ref()
-                .map(|value| human_structured_expr_pretty(value, &local_names));
-            context.push(human_state_goal_summary_hypothesis_pretty(
-                &local.name,
-                &ty,
-                value.as_deref(),
-            ));
+            context.push(human_state_goal_summary_hypothesis_pretty(&local.name, &ty));
             local_names.push(local.name.clone());
         }
         let target = human_structured_expr_pretty(&goal.target, &local_names);
@@ -661,11 +653,8 @@ fn human_state_goal_summaries_for_api(
     Ok(goals)
 }
 
-fn human_state_goal_summary_hypothesis_pretty(name: &str, ty: &str, value: Option<&str>) -> String {
-    match value {
-        Some(value) => format!("{name} : {ty} := {value}"),
-        None => format!("{name} : {ty}"),
-    }
+fn human_state_goal_summary_hypothesis_pretty(name: &str, ty: &str) -> String {
+    format!("{name} : {ty}")
 }
 
 fn human_state_goal_summary_pretty(context: &[String], target: &str) -> String {
@@ -1735,7 +1724,6 @@ fn human_lsp_diagnostic_data(
                             .map(|local| HumanLspHoleGoalLocal {
                                 name: local.name.clone(),
                                 ty: local.ty.clone(),
-                                value: local.value.clone(),
                             })
                             .collect(),
                         target: goal.target.clone(),
@@ -1756,6 +1744,7 @@ fn human_lsp_diagnostic_kind_code(kind: &npa_frontend::HumanDiagnosticKind) -> &
     match kind {
         npa_frontend::HumanDiagnosticKind::NotImplemented => "not_implemented",
         npa_frontend::HumanDiagnosticKind::ParseError => "parse_error",
+        npa_frontend::HumanDiagnosticKind::RemovedTermLet => "removed_term_let",
         npa_frontend::HumanDiagnosticKind::OpaqueModifierNotFollowedByDef => {
             "opaque_modifier_not_followed_by_def"
         }
@@ -2066,8 +2055,7 @@ fn human_builtin_tactic_suggestions(
         .enumerate()
         .rev()
         .filter(|(local_index, local)| {
-            local.value.is_none()
-                && human_tactic_local_type_matches_target(state, goal, *local_index, &local.ty)
+            human_tactic_local_type_matches_target(state, goal, *local_index, &local.ty)
         })
     {
         suggestions.push(human_tactic_builtin_suggestion(
@@ -2108,7 +2096,7 @@ fn human_builtin_tactic_suggestions(
         .context
         .iter()
         .rev()
-        .filter(|local| local.value.is_none() && human_expr_concludes_eq(&local.ty))
+        .filter(|local| human_expr_concludes_eq(&local.ty))
     {
         suggestions.push(human_tactic_builtin_suggestion(
             67,
@@ -2158,7 +2146,7 @@ fn human_builtin_tactic_suggestions(
     for local in goal
         .context
         .iter()
-        .filter(|local| local.value.is_none() && human_expr_is_nat(&local.ty))
+        .filter(|local| human_expr_is_nat(&local.ty))
     {
         suggestions.push(human_tactic_builtin_suggestion(
             58,
@@ -2171,7 +2159,7 @@ fn human_builtin_tactic_suggestions(
         for local in goal
             .context
             .iter()
-            .filter(|local| local.value.is_none() && human_expr_is_nat(&local.ty))
+            .filter(|local| human_expr_is_nat(&local.ty))
         {
             suggestions.push(human_tactic_builtin_suggestion(
                 55,
@@ -2323,13 +2311,6 @@ fn human_expr_contains_nat(expr: &Expr) -> bool {
         Expr::App(func, arg) => human_expr_contains_nat(func) || human_expr_contains_nat(arg),
         Expr::Lam { ty, body, .. } | Expr::Pi { ty, body, .. } => {
             human_expr_contains_nat(ty) || human_expr_contains_nat(body)
-        }
-        Expr::Let {
-            ty, value, body, ..
-        } => {
-            human_expr_contains_nat(ty)
-                || human_expr_contains_nat(value)
-                || human_expr_contains_nat(body)
         }
         Expr::Sort(_) | Expr::BVar(_) => false,
     }
@@ -2970,9 +2951,7 @@ fn human_display_context_text(
         HumanDisplayMode::Pretty => structured
             .context
             .iter()
-            .map(|hypothesis| {
-                human_display_structured_hypothesis_text(hypothesis, options.fold_local_def_values)
-            })
+            .map(human_display_structured_hypothesis_text)
             .collect(),
         HumanDisplayMode::Explicit => human_display_machine_context_lines(machine_goal, false),
         HumanDisplayMode::Core => human_display_machine_context_lines(machine_goal, true),
@@ -3004,15 +2983,8 @@ fn human_display_context_text(
     )
 }
 
-fn human_display_structured_hypothesis_text(
-    hypothesis: &StructuredHypothesis,
-    fold_local_def_value: bool,
-) -> String {
-    if fold_local_def_value && hypothesis.value.is_some() {
-        format!("{} : {} := ...", hypothesis.name, hypothesis.ty.pretty)
-    } else {
-        hypothesis.pretty.clone()
-    }
+fn human_display_structured_hypothesis_text(hypothesis: &StructuredHypothesis) -> String {
+    hypothesis.pretty.clone()
 }
 
 struct HumanDisplayContextProjection {
@@ -3093,18 +3065,7 @@ fn human_display_machine_context_lines(
         } else {
             human_render_core_expr(&local.ty, &local_names)
         };
-        let value = local.value.as_ref().map(|value| {
-            if core_mode {
-                render_kernel_core_expr(value)
-            } else {
-                human_render_core_expr(value, &local_names)
-            }
-        });
-        lines.push(human_state_goal_summary_hypothesis_pretty(
-            &local.name,
-            &ty,
-            value.as_deref(),
-        ));
+        lines.push(human_state_goal_summary_hypothesis_pretty(&local.name, &ty));
         local_names.push(local.name.clone());
     }
     lines
@@ -3303,16 +3264,10 @@ fn human_display_context_json(context: &[StructuredHypothesis]) -> String {
 
 fn human_display_hypothesis_json(hypothesis: &StructuredHypothesis) -> String {
     format!(
-        "{{\"local_id\":{},\"name\":{},\"ty\":{},\"value\":{},\"is_local_def\":{},\"is_implicit\":{},\"depends_on\":{},\"binder_index\":{},\"pretty\":{}}}",
+        "{{\"local_id\":{},\"name\":{},\"ty\":{},\"is_implicit\":{},\"depends_on\":{},\"binder_index\":{},\"pretty\":{}}}",
         hypothesis.local_id.0,
         human_json_string(&hypothesis.name),
         human_display_structured_expr_json(&hypothesis.ty),
-        hypothesis
-            .value
-            .as_ref()
-            .map(human_display_structured_expr_json)
-            .unwrap_or_else(|| "null".to_owned()),
-        hypothesis.is_local_def,
         hypothesis.is_implicit,
         human_json_u32_array(hypothesis.depends_on.iter().map(|local_id| local_id.0)),
         hypothesis.binder_index,
@@ -3453,24 +3408,17 @@ fn materialize_human_structured_hypothesis(
         }
     })?);
     let ty = materialize_human_structured_expr(entry, &local.ty, local_names)?;
-    let value = local
-        .value
-        .as_ref()
-        .map(|value| materialize_human_structured_expr(entry, value, local_names))
-        .transpose()?;
-    let depends_on = human_structured_hypothesis_dependencies(&ty, value.as_ref());
+    let depends_on = human_structured_hypothesis_dependencies(&ty);
     let binder_index =
         u32::try_from(index).map_err(|_| HumanStructuredProofStateError::LocalIndexExhausted {
             state_id: entry.state_id.clone(),
         })?;
-    let pretty = human_structured_hypothesis_pretty(&local.name, &ty, value.as_ref());
+    let pretty = human_structured_hypothesis_pretty(&local.name, &ty);
 
     Ok(StructuredHypothesis {
         local_id,
         name: local.name.clone(),
         ty,
-        value,
-        is_local_def: local.value.is_some(),
         is_implicit: false,
         depends_on,
         binder_index,
@@ -3499,27 +3447,14 @@ fn materialize_human_structured_expr(
     })
 }
 
-fn human_structured_hypothesis_dependencies(
-    ty: &StructuredExpr,
-    value: Option<&StructuredExpr>,
-) -> Vec<LocalId> {
+fn human_structured_hypothesis_dependencies(ty: &StructuredExpr) -> Vec<LocalId> {
     let mut dependencies = BTreeSet::new();
     dependencies.extend(ty.free_locals.iter().copied());
-    if let Some(value) = value {
-        dependencies.extend(value.free_locals.iter().copied());
-    }
     dependencies.into_iter().collect()
 }
 
-fn human_structured_hypothesis_pretty(
-    name: &str,
-    ty: &StructuredExpr,
-    value: Option<&StructuredExpr>,
-) -> String {
-    match value {
-        Some(value) => format!("{name} : {} := {}", ty.pretty, value.pretty),
-        None => format!("{name} : {}", ty.pretty),
-    }
+fn human_structured_hypothesis_pretty(name: &str, ty: &StructuredExpr) -> String {
+    format!("{name} : {}", ty.pretty)
 }
 
 fn human_structured_goal_pretty(
@@ -3953,7 +3888,7 @@ pub fn verify_human_session(
         human_verify_root_decl_index(&handoff.certificate, &entry.state, error_context)?;
     let root_decl = handoff
         .certificate
-        .declarations
+        .declarations()
         .get(root_decl_index)
         .ok_or_else(|| {
             error_context.error("verified certificate root declaration index is out of range")
@@ -4021,7 +3956,7 @@ fn human_verify_root_decl_index(
     error_context: HumanVerifyErrorContext<'_>,
 ) -> Result<usize, HumanSessionVerifyError> {
     let mut matches = cert
-        .declarations
+        .declarations()
         .iter()
         .enumerate()
         .filter_map(
@@ -4039,7 +3974,7 @@ fn human_verify_root_decl_index(
     }
     let index = matches.pop().expect("len checked above");
     if !matches!(
-        cert.declarations[index].decl,
+        cert.declarations()[index].decl,
         DeclPayload::Theorem {
             opacity: npa_cert::Opacity::Opaque,
             ..
@@ -4116,7 +4051,7 @@ fn human_verify_axiom_ref_to_wire(
             decl_interface_hash,
             ..
         } => {
-            let import = context.cert.imports.get(*import_index).ok_or_else(|| {
+            let import = context.cert.imports().get(*import_index).ok_or_else(|| {
                 error_context
                     .error("verifier output imported axiom ref has out-of-range import_index")
             })?;
@@ -4128,9 +4063,14 @@ fn human_verify_axiom_ref_to_wire(
             })
         }
         GlobalRef::Local { decl_index } => {
-            let decl = context.cert.declarations.get(*decl_index).ok_or_else(|| {
-                error_context.error("verifier output local axiom ref has out-of-range decl_index")
-            })?;
+            let decl = context
+                .cert
+                .declarations()
+                .get(*decl_index)
+                .ok_or_else(|| {
+                    error_context
+                        .error("verifier output local axiom ref has out-of-range decl_index")
+                })?;
             if !matches!(decl.decl, DeclPayload::Axiom { .. }) {
                 return Err(error_context
                     .error("verifier output local axiom ref does not point at an axiom"));
@@ -4143,7 +4083,7 @@ fn human_verify_axiom_ref_to_wire(
                     error_context.error("verifier output local axiom ref has no Human source_index")
                 })?;
             Ok(MachineAxiomRefWire::CurrentModule {
-                module: context.cert.header.module.clone(),
+                module: context.cert.header().module.clone(),
                 name,
                 source_index,
                 decl_interface_hash: axiom.decl_interface_hash,
@@ -4237,7 +4177,7 @@ fn human_verify_decl_payload_name(
         | DeclPayload::InductiveConstrained { name, .. }
         | DeclPayload::MutualInductiveBlock { name, .. } => *name,
     };
-    cert.name_table.get(name).cloned().ok_or_else(|| {
+    cert.name_table().get(name).cloned().ok_or_else(|| {
         "verified Human certificate declaration references an out-of-range name table entry"
             .to_owned()
     })
@@ -4248,7 +4188,7 @@ fn human_verify_cert_name(
     name: NameId,
     error_context: HumanVerifyErrorContext<'_>,
 ) -> Result<Name, HumanSessionVerifyError> {
-    cert.name_table.get(name).cloned().ok_or_else(|| {
+    cert.name_table().get(name).cloned().ok_or_else(|| {
         error_context
             .error("verified Human certificate axiom report references an out-of-range name")
     })
@@ -5386,13 +5326,6 @@ fn human_collect_expr_constants(expr: &Expr, out: &mut BTreeSet<Name>) {
             human_collect_expr_constants(ty, out);
             human_collect_expr_constants(body, out);
         }
-        Expr::Let {
-            ty, value, body, ..
-        } => {
-            human_collect_expr_constants(ty, out);
-            human_collect_expr_constants(value, out);
-            human_collect_expr_constants(body, out);
-        }
     }
 }
 
@@ -5430,12 +5363,6 @@ fn human_expr_from_verified_term(
         TermNode::Pi { ty, body } => Ok(Expr::pi(
             "_",
             human_expr_from_verified_term(module, *ty)?,
-            human_expr_from_verified_term(module, *body)?,
-        )),
-        TermNode::Let { ty, value, body } => Ok(Expr::let_in(
-            "_",
-            human_expr_from_verified_term(module, *ty)?,
-            human_expr_from_verified_term(module, *value)?,
             human_expr_from_verified_term(module, *body)?,
         )),
     }
@@ -5781,7 +5708,7 @@ fn build_human_document_incremental_cache(
     prior: Option<&HumanDocumentIncrementalCache>,
 ) -> HumanDocumentIncrementalCache {
     let import_interface_hash = human_document_import_interface_hash(document, collection);
-    let (owner_certificate_format, owner_core_spec) = ("NPA-CERT-0.3.0", "NPA-Core-0.3.0");
+    let (owner_certificate_format, owner_core_spec) = ("NPA-CERT-0.4.0", "NPA-Core-0.4.0");
     let canonical_checked_current = human_document_checked_current_facts(
         document,
         collection,
@@ -6624,11 +6551,11 @@ fn human_source_interface_with_certificate_hashes(
 ) -> npa_frontend::HumanSourceInterface {
     let module_name = source_interface.module.clone();
     let export_facts: BTreeMap<_, _> = cert
-        .export_block
+        .export_block()
         .iter()
         .map(|entry| {
             (
-                cert.name_table[entry.name].clone(),
+                cert.name_table()[entry.name].clone(),
                 (entry.decl_interface_hash, entry.reducibility),
             )
         })
@@ -6717,14 +6644,9 @@ fn human_tactic_goal_display(
     let mut context = Vec::with_capacity(goal.context.len());
     for local in &goal.context {
         let ty = human_render_core_expr(&local.ty, &local_names);
-        let value = local
-            .value
-            .as_ref()
-            .map(|value| human_render_core_expr(value, &local_names));
         context.push(npa_frontend::HumanHoleGoalLocal {
             name: local.name.clone(),
             ty,
-            value,
         });
         local_names.push(local.name.clone());
     }
@@ -6832,23 +6754,6 @@ fn human_render_core_expr_with_names(
             let body = human_render_core_expr_with_names(body, local_names, 0);
             local_names.pop();
             (format!("forall ({binder} : {ty}), {body}"), PREC_BINDER)
-        }
-        Expr::Let {
-            binder,
-            ty,
-            value,
-            body,
-        } => {
-            let binder = human_fresh_binder_name(binder, local_names);
-            let ty = human_render_core_expr_with_names(ty, local_names, 0);
-            let value = human_render_core_expr_with_names(value, local_names, 0);
-            local_names.push(binder.clone());
-            let body = human_render_core_expr_with_names(body, local_names, 0);
-            local_names.pop();
-            (
-                format!("let {binder} : {ty} := {value} in {body}"),
-                PREC_BINDER,
-            )
         }
     };
 
@@ -7028,7 +6933,6 @@ pub fn check_human_tactic_term(
         .map(|local| npa_frontend::MachineLocalDecl {
             name: local.name.clone(),
             ty: local.ty.clone(),
-            value: local.value.clone(),
         })
         .collect::<Vec<_>>();
     let context = npa_frontend::HumanTacticTermElabContext::from_request(
@@ -8642,10 +8546,7 @@ fn human_apply_goal_ctx(
                 format!("cannot inspect local context for apply: {err:?}"),
             )
         })?;
-        match &local.value {
-            Some(value) => ctx.push_definition(local.name.clone(), local.ty.clone(), value.clone()),
-            None => ctx.push_assumption(local.name.clone(), local.ty.clone()),
-        }
+        ctx.push_assumption(local.name.clone(), local.ty.clone());
     }
     Ok(ctx)
 }
@@ -10204,8 +10105,8 @@ axiom P : Prop",
         )
         .expect("initial reducible Human document should be cached");
         assert!(created.incremental_cache.declarations.iter().all(|entry| {
-            entry.owner_certificate_format == "NPA-CERT-0.3.0"
-                && entry.owner_core_spec == "NPA-Core-0.3.0"
+            entry.owner_certificate_format == "NPA-CERT-0.4.0"
+                && entry.owner_core_spec == "NPA-Core-0.4.0"
                 && entry.dependency_selective_fingerprint_is_canonical
         }));
 
@@ -10232,8 +10133,8 @@ axiom P : Prop",
             Some(npa_frontend::DefinitionReducibility::Opaque)
         );
         assert!(updated.incremental_cache.declarations.iter().all(|entry| {
-            entry.owner_certificate_format == "NPA-CERT-0.3.0"
-                && entry.owner_core_spec == "NPA-Core-0.3.0"
+            entry.owner_certificate_format == "NPA-CERT-0.4.0"
+                && entry.owner_core_spec == "NPA-Core-0.4.0"
                 && entry.dependency_selective_fingerprint_is_canonical
                 && entry.reuse == HumanDocumentIncrementalDeclReuse::Fresh
         }));
@@ -10469,6 +10370,35 @@ theorem target : P := by simp-lite",
         assert_eq!(lsp.code, "type_mismatch");
         assert_eq!(lsp.data.phase.as_deref(), Some("elaborator"));
         assert_eq!(lsp.data.detail.as_deref(), Some("expected Nat"));
+    }
+
+    #[test]
+    fn human_lsp_reports_removed_term_let_with_exact_code_and_range() {
+        let source = include_str!("../../../testdata/removed-term-let/human.npa");
+        let file_id = npa_frontend::FileId(62);
+        let diagnostic = npa_frontend::parse_human_module(file_id, source)
+            .expect_err("rejection-only Human fixture must fail during parsing");
+        let lsp = human_lsp_diagnostic_from_human(
+            HumanCurrentModuleSource { file_id, source },
+            &diagnostic,
+        );
+
+        assert_eq!(lsp.code, "removed_term_let");
+        assert_eq!(lsp.data.kind, "removed_term_let");
+        assert_eq!(lsp.data.phase.as_deref(), Some("parser"));
+        assert_eq!(
+            lsp.range,
+            HumanLspRange {
+                start: HumanLspPosition {
+                    line: 1,
+                    character: 2,
+                },
+                end: HumanLspPosition {
+                    line: 1,
+                    character: 5,
+                },
+            }
+        );
     }
 
     #[test]
@@ -11773,7 +11703,6 @@ theorem target (n : Nat) : Eq.{1} n n := by simp-lite";
         assert_eq!(local.ty.constants, vec![npa_cert::Name::from_dotted("Nat")]);
         assert!(local.ty.free_locals.is_empty());
         assert!(local.depends_on.is_empty());
-        assert!(!local.is_local_def);
         assert!(!local.is_implicit);
         assert_eq!(goal.target.pretty, "n = n");
         assert_eq!(
@@ -12191,7 +12120,6 @@ theorem target : forall (A : Type), forall (x : A), forall (h : Eq.{1} x x), Eq.
                 mode: HumanDisplayMode::Pretty,
                 context_options: HumanDisplayContextOptions {
                     max_context_items: Some(2),
-                    fold_local_def_values: false,
                     relevant_first: true,
                 },
             },
@@ -14226,8 +14154,8 @@ theorem open_goal : forall (A : Type), Type := by
             options: options.clone(),
         })
         .expect("proof-start should retain the local opaque checking view");
-        assert_eq!(started.state.env.owner_certificate_format, "NPA-CERT-0.3.0");
-        assert_eq!(started.state.env.owner_core_spec, "NPA-Core-0.3.0");
+        assert_eq!(started.state.env.owner_certificate_format, "NPA-CERT-0.4.0");
+        assert_eq!(started.state.env.owner_core_spec, "NPA-Core-0.4.0");
         assert!(matches!(
             started.state.env.checked_current_decls[0].core_decl(),
             Decl::Def {
@@ -14250,8 +14178,8 @@ theorem open_goal : forall (A : Type), Type := by
             &[],
             0,
             machine_core.declarations[0].clone(),
-            "NPA-CERT-0.3.0",
-            "NPA-Core-0.3.0",
+            "NPA-CERT-0.4.0",
+            "NPA-Core-0.4.0",
         )
         .expect("equivalent Machine opaque definition should produce a checked-current token");
         let Decl::Theorem {
@@ -14297,8 +14225,8 @@ theorem open_goal : forall (A : Type), Type := by
             options,
         })
         .expect("Human by tactics should use the local opaque body");
-        assert_eq!(compiled.certificate.header.format, "NPA-CERT-0.3.0");
-        assert_eq!(compiled.certificate.header.core_spec, "NPA-Core-0.3.0");
+        assert_eq!(compiled.certificate.header().format, "NPA-CERT-0.4.0");
+        assert_eq!(compiled.certificate.header().core_spec, "NPA-Core-0.4.0");
         assert_eq!(
             compiled.source_interface.declarations[0].definition_reducibility,
             Some(npa_frontend::DefinitionReducibility::Opaque)
@@ -15946,7 +15874,7 @@ theorem bad_induction (n : Nat) (h : Eq.{1} n n) : Eq.{1} n n := by
     #[test]
     fn machine_session_api_stays_machine_surface_only() {
         let body = r#"{
-            "protocol_version": "npa.machine-api.v1",
+            "protocol_version": "npa.machine-api.v2",
             "root": {
                 "module": "Api.Machine",
                 "theorem_name": "Api.Machine.thm",
@@ -16131,7 +16059,7 @@ inductive Eq.{u} {A : Sort u} (a : A) : forall (b : A), Prop where
     fn phase5_machine_minimal_session_json(theorem_type: &str) -> String {
         format!(
             r#"{{
-              "protocol_version":"npa.machine-api.v1",
+              "protocol_version":"npa.machine-api.v2",
               "root":{{
                 "module":"Scratch",
                 "theorem_name":"Scratch.t",
@@ -16369,7 +16297,9 @@ theorem target (n : Nat) : Eq.{1} (Nat.add n Nat.zero) n := by simp-lite";
         assert!(value.len().is_multiple_of(2));
         value
             .as_bytes()
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|chunk| (human_verify_hex_value(chunk[0]) << 4) | human_verify_hex_value(chunk[1]))
             .collect()
     }

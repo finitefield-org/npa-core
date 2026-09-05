@@ -20,16 +20,6 @@
       "term": "fun n => fun m => (fun (x : Nat) => fun (y : Nat) => x) n m"
     },
     {
-      "declaration": "let_id_nat",
-      "source_kind": "explicit_term",
-      "term": "fun n => let x : Nat := n in x"
-    },
-    {
-      "declaration": "let_const_nat",
-      "source_kind": "explicit_term",
-      "term": "fun n => let z : Nat := Nat.zero in z"
-    },
-    {
       "declaration": "delta_id_nat",
       "source_kind": "explicit_term",
       "term": "reduction_id_nat"

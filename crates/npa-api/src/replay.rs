@@ -857,7 +857,7 @@ mod tests {
     fn minimal_session_json(theorem_type: &str) -> String {
         format!(
             r#"{{
-              "protocol_version":"npa.machine-api.v1",
+              "protocol_version":"npa.machine-api.v2",
               "root":{{
                 "module":"Scratch",
                 "theorem_name":"Scratch.t",
@@ -930,7 +930,7 @@ mod tests {
             r#"{{
               "session_id":"{}",
               "plan":{{
-                "protocol_version":"npa.machine-api.v1",
+                "protocol_version":"npa.machine-api.v2",
                 "session_root_hash":"{}",
                 "initial_state_fingerprint":"{}",
                 "steps":{},
@@ -1767,7 +1767,7 @@ mod tests {
             r#"{{
               "session_id":"{}",
               "plan":{{
-                "protocol_version":"npa.machine-api.v1",
+                "protocol_version":"npa.machine-api.v2",
                 "session_root_hash":"sha256:0000000000000000000000000000000000000000000000000000000000000000",
                 "initial_state_fingerprint":"{}",
                 "steps":[],
@@ -1798,7 +1798,7 @@ mod tests {
             r#"{{
               "session_id":"{}",
               "plan":{{
-                "protocol_version":"npa.machine-api.v1",
+                "protocol_version":"npa.machine-api.v2",
                 "session_root_hash":"sha256:0000000000000000000000000000000000000000000000000000000000000000",
                 "initial_state_fingerprint":"{}",
                 "steps":[{{

@@ -605,6 +605,7 @@ pub fn map_frontend_diagnostic_kind(
     use MachineApiErrorKind as Api;
 
     match diagnostic.kind {
+        Frontend::RemovedTermLet => Api::RemovedTermLet,
         Frontend::ParseError
         | Frontend::OpaqueModifierNotFollowedByDef
         | Frontend::DuplicateOpaqueModifier => Api::MachineTermParseError,
@@ -618,7 +619,6 @@ pub fn map_frontend_diagnostic_kind(
         | Frontend::UnknownUniverseParam
         | Frontend::UniverseLevelTooLarge
         | Frontend::UnannotatedBinder
-        | Frontend::UnannotatedLet
         | Frontend::HoleNotAllowed
         | Frontend::UnsolvedUniverseMeta
         | Frontend::KernelRejected
@@ -837,7 +837,9 @@ fn machine_tactic_start_proof_phase(
     diagnostic: &MachineTacticDiagnostic,
 ) -> MachineApiDiagnosticPhase {
     match map_machine_tactic_diagnostic_kind(diagnostic) {
-        MachineApiErrorKind::MachineTermParseError => MachineApiDiagnosticPhase::MachineTermParse,
+        MachineApiErrorKind::RemovedTermLet | MachineApiErrorKind::MachineTermParseError => {
+            MachineApiDiagnosticPhase::MachineTermParse
+        }
         MachineApiErrorKind::MachineTermElaborationError
         | MachineApiErrorKind::UnknownName
         | MachineApiErrorKind::ImplicitArgumentRequired
@@ -861,7 +863,9 @@ fn machine_tactic_run_phase(diagnostic: &MachineTacticDiagnostic) -> MachineApiD
 
     match map_machine_tactic_diagnostic_kind(diagnostic) {
         MachineApiErrorKind::InvalidCandidate => MachineApiDiagnosticPhase::CandidateValidation,
-        MachineApiErrorKind::MachineTermParseError => MachineApiDiagnosticPhase::MachineTermParse,
+        MachineApiErrorKind::RemovedTermLet | MachineApiErrorKind::MachineTermParseError => {
+            MachineApiDiagnosticPhase::MachineTermParse
+        }
         MachineApiErrorKind::MachineTermElaborationError
         | MachineApiErrorKind::UnknownName
         | MachineApiErrorKind::ImplicitArgumentRequired
@@ -918,7 +922,10 @@ fn machine_tactic_primary_name_for_api(
 }
 
 fn frontend_term_phase(diagnostic: &npa_frontend::MachineDiagnostic) -> MachineApiDiagnosticPhase {
-    if map_frontend_diagnostic_kind(diagnostic) == MachineApiErrorKind::MachineTermParseError {
+    if matches!(
+        map_frontend_diagnostic_kind(diagnostic),
+        MachineApiErrorKind::RemovedTermLet | MachineApiErrorKind::MachineTermParseError
+    ) {
         MachineApiDiagnosticPhase::MachineTermParse
     } else {
         MachineApiDiagnosticPhase::MachineTermCheck
@@ -973,7 +980,7 @@ fn is_fully_qualified_name(name: &Name) -> bool {
 mod tests {
     use super::*;
     use npa_kernel::{Expr, Level};
-    use npa_tactic::RawMachineTerm;
+    use npa_tactic::{RawMachineTerm, RefinePayload};
 
     fn prop() -> Expr {
         Expr::sort(Level::zero())
@@ -1048,6 +1055,52 @@ mod tests {
     }
 
     #[test]
+    fn removed_term_let_candidate_has_exact_parse_diagnostic_and_no_hash() {
+        let candidate = MachineTacticCandidate::Exact {
+            term: RawMachineTerm::new("let value : Prop := Prop in value"),
+        };
+
+        let err =
+            machine_tactic_validate_machine_tactic_candidate(GoalId(8), candidate).unwrap_err();
+
+        assert_eq!(err.diagnostic.kind, MachineApiErrorKind::RemovedTermLet);
+        assert_eq!(
+            err.diagnostic.phase,
+            MachineApiDiagnosticPhase::MachineTermParse
+        );
+        assert_eq!(err.diagnostic.goal_id, Some(GoalId(8)));
+        assert_eq!(
+            err.diagnostic.tactic_kind,
+            Some(MachineApiTacticKind::Exact)
+        );
+        assert_eq!(err.candidate_hash, None);
+        assert_eq!(err.deterministic_budget_hash, None);
+        assert_eq!(err.cache_key_hash, None);
+    }
+
+    #[test]
+    fn refine_cannot_bypass_removed_term_let_prepass() {
+        let candidate = MachineTacticCandidate::Refine(RefinePayload {
+            term: RawMachineTerm::new("let value : Prop := Prop in _"),
+            max_holes: Some(1),
+        });
+
+        let err =
+            machine_tactic_validate_machine_tactic_candidate(GoalId(9), candidate).unwrap_err();
+
+        assert_eq!(err.diagnostic.kind, MachineApiErrorKind::RemovedTermLet);
+        assert_eq!(
+            err.diagnostic.phase,
+            MachineApiDiagnosticPhase::MachineTermParse
+        );
+        assert_eq!(
+            err.diagnostic.tactic_kind,
+            Some(MachineApiTacticKind::Refine)
+        );
+        assert_eq!(err.candidate_hash, None);
+    }
+
+    #[test]
     fn start_proof_theorem_type_check_error_uses_machine_term_check_phase() {
         let spec = MachineProofSpec {
             theorem_type: Expr::lam("x", type0(), Expr::bvar(0)),
@@ -1105,7 +1158,7 @@ mod tests {
     #[test]
     fn start_proof_theorem_type_type_mismatch_keeps_hashes() {
         let spec = MachineProofSpec {
-            theorem_type: Expr::let_in("x", prop(), type0(), Expr::bvar(0)),
+            theorem_type: Expr::app(Expr::lam("x", prop(), Expr::bvar(0)), type0()),
             ..trivial_spec(type0())
         };
 

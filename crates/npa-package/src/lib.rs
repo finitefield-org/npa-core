@@ -90,6 +90,7 @@
 #![deny(missing_docs)]
 
 pub mod artifact_ledger;
+pub mod artifact_snapshot;
 pub mod artifacts;
 pub mod audit_cache;
 pub mod audit_selection;
@@ -125,6 +126,7 @@ pub mod proof_replay;
 pub mod publish_plan;
 pub mod registry;
 pub mod schema;
+pub mod targeted_authoring_cache;
 pub mod theorem_index;
 pub mod theorem_premise_report;
 pub mod validate;
@@ -136,6 +138,14 @@ pub use artifact_ledger::{
     PackageArtifactLedgerMetadata, PackageArtifactLedgerMetadataError,
     PackageArtifactLedgerMetadataErrorReason, PackageArtifactLedgerMetadataRefreshInput,
     PACKAGE_ARTIFACT_LEDGER_METADATA_SCHEMA,
+};
+pub use artifact_snapshot::{
+    HashedPackageLockArtifact, OwnedPackageLockArtifact, PackageArtifactPreparationObservation,
+    PackageCertificateArtifactSnapshot, PackageLockArtifactSnapshots,
+    PreparedArtifactObservationMode, PreparedArtifactRelease, PreparedArtifactReleaseReason,
+    PreparedArtifactRetentionObservation, PreparedArtifactRetentionPolicy,
+    PreparedPackageArtifactView, PreparedPackageArtifactWorkerView, PreparedPackageArtifacts,
+    PREPARED_ARTIFACT_RETAINED_BYTE_LIMIT_V1, PREPARED_ARTIFACT_RETAINED_ENTRY_LIMIT_V1,
 };
 pub use artifacts::{
     PackageArtifactFileReference, PackageArtifactOrigin, PackageArtifactPolicy,
@@ -169,10 +179,17 @@ pub use audit_cache::{
 };
 pub use audit_selection::{
     package_lock_reverse_dependencies, package_lock_topological_layers,
-    select_package_audit_modules, select_package_cache_aware_live_modules, PackageAuditChangeKind,
-    PackageAuditChangedModule, PackageAuditSelectedModule, PackageAuditSelection,
-    PackageAuditSelectionReason, PackageCacheAwareLiveModule, PackageCacheAwareLiveReason,
-    PackageCacheAwareLiveSelection, PackageTopologicalLayers,
+    select_package_audit_modules, select_package_audit_modules_indexed,
+    select_package_cache_aware_live_modules, select_package_cache_aware_live_modules_indexed,
+    PackageAuditChangeKind, PackageAuditChangedModule, PackageAuditSelectedModule,
+    PackageAuditSelection, PackageAuditSelectionReason, PackageCacheAwareLiveModule,
+    PackageCacheAwareLiveReason, PackageCacheAwareLiveSelection, PackageTopologicalLayers,
+};
+#[cfg(any(test, feature = "planning-benchmark"))]
+#[doc(hidden)]
+pub use audit_selection::{
+    select_package_audit_modules_indexed_with_planning_counters,
+    select_package_cache_aware_live_modules_indexed_with_planning_counters,
 };
 pub use axiom_report::{
     compute_package_axiom_report_hash, package_axiom_report_incremental_projection_plan,
@@ -183,12 +200,20 @@ pub use axiom_report::{
     PackageAxiomReportSummary,
 };
 pub use build_check_cache::{
-    package_build_check_cache_key, package_build_check_cache_key_material,
+    package_build_check_cache_default_base_relative_path, package_build_check_cache_key,
+    package_build_check_cache_key_material, package_build_check_cache_legacy_relative_path,
+    package_build_check_cache_namespace_digest, package_build_check_cache_namespace_material,
     package_build_check_result_entry_json, parse_package_build_check_result_entry_json,
     validate_package_build_check_result_entry, PackageBuildCheckCacheKeyInput,
     PackageBuildCheckCachedStatus, PackageBuildCheckImportIdentity, PackageBuildCheckResultEntry,
-    PACKAGE_BUILD_CHECK_CACHE_LAYOUT_DIR, PACKAGE_BUILD_CHECK_CACHE_SCHEMA,
-    PACKAGE_BUILD_CHECK_RESULT_SCHEMA,
+    PackageCacheKeyDigest, PackageCacheNamespaceDigest, PackageCacheStoreLayout,
+    PackageCacheStoreVersion, PackageCacheTemporaryName, TargetedAuthoringCacheLimitsV1,
+    PACKAGE_BUILD_CHECK_CACHE_BASE_LAYOUT_DIR, PACKAGE_BUILD_CHECK_CACHE_DIGEST_HEX_BYTES,
+    PACKAGE_BUILD_CHECK_CACHE_LAYOUT_DIR, PACKAGE_BUILD_CHECK_CACHE_NAMESPACE_SCHEMA,
+    PACKAGE_BUILD_CHECK_CACHE_PACKAGES_LAYOUT_DIR, PACKAGE_BUILD_CHECK_CACHE_SCHEMA,
+    PACKAGE_BUILD_CHECK_RESULT_SCHEMA, PACKAGE_BUILD_CHECK_RESULT_STORE_VERSION,
+    PACKAGE_TARGETED_AUTHORING_SUPPORT_STORE_VERSION, TARGETED_AUTHORING_CACHE_LIMITS_SCHEMA_V1,
+    TARGETED_AUTHORING_CACHE_LIMITS_V1,
 };
 pub use catalog_registry_change_request::{
     catalog_registry_change_request_hash, parse_catalog_registry_change_request_json,
@@ -227,7 +252,7 @@ pub use gate_plan::{
 };
 pub use graph::{
     package_graph_dependent_closure, package_graph_transitive_dependencies, resolve_package_graph,
-    PackageGraph, ResolvedModuleImport, ResolvedModuleImportKind,
+    PackageGraph, ResolvedModuleImport, ResolvedModuleImportIdentity, ResolvedModuleImportKind,
 };
 pub use hash::{
     format_package_hash, package_file_hash, parse_package_hash, PackageHash, PackageHashBytes,
@@ -262,14 +287,15 @@ pub use l2_acceptance_v2::{
     L2AcceptanceApprovalV2, L2AcceptanceEntryV2, L2AcceptanceReviewReportRef, L2AcceptanceV2,
 };
 pub use l2_namespace_transport::{
-    l2_transport_derived_mapping_hash, l2_transport_module_declaration_names,
-    l2_transport_module_projection, l2_transport_module_projection_subset,
-    l2_transport_normalized_closure_hash, parse_l2_namespace_transport_attestation_json,
-    parse_l2_namespace_transport_policy_json, parse_l2_namespace_transport_request_json,
-    L2NamespaceTransportAttestation, L2NamespaceTransportPolicy, L2NamespaceTransportRequest,
-    L2TransportAttestationChangedPath, L2TransportAttestationModulePair,
-    L2TransportAttestationTheoremPair, L2TransportDeclarationRename, L2TransportEndpoint,
-    L2TransportModuleMapping, L2TransportModuleRole, L2TransportPackageIdentity,
+    l2_namespace_prefix_matches, l2_transport_derived_mapping_hash,
+    l2_transport_module_declaration_names, l2_transport_module_projection,
+    l2_transport_module_projection_subset, l2_transport_normalized_closure_hash,
+    parse_l2_namespace_transport_attestation_json, parse_l2_namespace_transport_policy_json,
+    parse_l2_namespace_transport_request_json, L2NamespaceTransportAttestation,
+    L2NamespaceTransportPolicy, L2NamespaceTransportRequest, L2TransportAttestationChangedPath,
+    L2TransportAttestationModulePair, L2TransportAttestationTheoremPair,
+    L2TransportDeclarationRename, L2TransportEndpoint, L2TransportModuleMapping,
+    L2TransportModuleRole, L2TransportPackageIdentity,
 };
 pub use l2_review::{
     compute_l2_review_input_v2_hash, parse_l2_review_input_json, parse_l2_review_report_json,
@@ -278,19 +304,30 @@ pub use l2_review::{
     L2ReviewInputSource, L2ReviewReport,
 };
 pub use lock::{
+    build_indexed_package_lock_and_snapshot_owned_artifacts_with_payload_observation,
+    build_indexed_package_lock_graph, build_package_lock_and_snapshot_owned_artifacts,
+    build_package_lock_and_snapshot_owned_artifacts_with_payload_observation,
     build_package_lock_from_artifacts,
     build_package_lock_from_artifacts_allowing_local_hash_updates,
     build_package_lock_from_package_root,
     build_package_lock_from_package_root_allowing_local_hash_updates, build_package_lock_graph,
-    parse_package_lock_json, validate_observed_package_lock_against_manifest_graph,
-    validate_package_lock_against_manifest_graph, validate_package_lock_manifest,
+    normalize_package_lock_against_manifest_for_comparison, parse_package_lock_json,
+    validate_observed_package_lock_against_manifest_graph,
+    validate_observed_package_lock_against_manifest_indexed,
+    validate_package_lock_against_manifest_graph, validate_package_lock_against_manifest_indexed,
+    validate_package_lock_manifest, IndexedPackageLockGraph, IndexedPackageLockGraphError,
     PackageLockArtifact, PackageLockEntry, PackageLockEntryOrigin, PackageLockGraph,
-    PackageLockImport, PackageLockManifest, PackageLockManifestReference,
-    PackageLockResolvedImport,
+    PackageLockGraphIndex, PackageLockImport, PackageLockIndexInvariantError, PackageLockManifest,
+    PackageLockManifestReference, PackageLockResolvedImport,
+};
+#[cfg(any(test, feature = "planning-benchmark"))]
+#[doc(hidden)]
+pub use lock::{
+    build_indexed_package_lock_graph_with_planning_counters, PackageGraphPlanningCounterSummary,
 };
 pub use manifest::{
-    parse_manifest_str, PackageExternalImport, PackageManifest, PackageModule, PackagePolicy,
-    PackageVersion,
+    parse_manifest_str, PackageExternalImport, PackageManifest, PackageModule,
+    PackageModuleIdentity, PackagePolicy, PackageVersion,
 };
 pub use name::{
     validate_canonical_axiom_name, validate_canonical_declaration_name,
@@ -394,6 +431,7 @@ pub use schema::{
     PACKAGE_LOCK_SCHEMA, PACKAGE_MANIFEST_SCHEMA, PACKAGE_PUBLISH_PLAN_SCHEMA,
     PACKAGE_THEOREM_INDEX_SCHEMA, PACKAGE_VERIFIED_HIGH_TRUST_SCHEMA, REGISTRY_MODULE_SCHEMA,
 };
+pub use targeted_authoring_cache::*;
 pub use theorem_index::{
     compute_package_theorem_index_hash, package_theorem_index_incremental_projection_plan,
     package_theorem_index_summary, parse_package_theorem_index_json,

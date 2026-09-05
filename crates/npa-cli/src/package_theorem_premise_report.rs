@@ -5,18 +5,18 @@ use npa_api::{
 };
 use npa_package::{
     format_package_hash, package_file_hash, parse_package_theorem_premise_report_json,
-    PackageArtifactError, PackageArtifactErrorKind, PackageArtifactErrorReason, PackagePath,
+    PackageArtifactError, PackageArtifactErrorKind, PackageArtifactErrorReason,
     PackageTheoremPremiseReport,
 };
 
 use crate::args::{PackageCommonOptions, PackageTheoremPremiseReportOptions};
 use crate::diagnostic::{CommandArtifact, CommandDiagnostic, CommandResult, DiagnosticKind};
-use crate::generated_artifact_writer::write_package_generated_artifact_atomic;
 use crate::package_artifacts::{
     load_package_artifact_extraction_with_timings, LoadedPackageArtifactExtraction,
     LoadedPackageAuditSnapshot, PackageGeneratedArtifactReadMode,
     PACKAGE_THEOREM_PREMISE_REPORT_PATH,
 };
+use crate::package_promotion_transaction::TargetLock;
 use crate::timing::{
     PackageTimingCollector, TIMING_ARTIFACT_COMPARE_MS, TIMING_JSON_WRITE_MS, TIMING_PROJECTION_MS,
 };
@@ -135,6 +135,16 @@ pub(crate) fn run_package_theorem_premise_report_check_with_snapshot(
 }
 
 fn run_write(options: PackageCommonOptions, timings: &mut PackageTimingCollector) -> CommandResult {
+    let mutation_lock = match TargetLock::acquire(&options.root) {
+        Ok(lock) => lock,
+        Err(_) => {
+            return CommandResult::failed(
+                COMMAND,
+                crate::fs::render_package_root(&options.root),
+                vec![write_failed_diagnostic()],
+            );
+        }
+    };
     let loaded = match load_package_artifact_extraction_with_timings(
         &options.root,
         COMMAND,
@@ -149,24 +159,30 @@ fn run_write(options: PackageCommonOptions, timings: &mut PackageTimingCollector
         Ok((_, json)) => json,
         Err(result) => return result,
     };
-    let package_path = PackagePath::new(PACKAGE_THEOREM_PREMISE_REPORT_PATH);
-    if timings
-        .time_phase(TIMING_JSON_WRITE_MS, || {
-            write_package_generated_artifact_atomic(
-                &options.root,
-                &package_path,
-                generated_json.as_bytes(),
-            )
-        })
-        .is_err()
-    {
-        return CommandResult::failed(
-            COMMAND,
-            loaded.root_display,
-            vec![write_failed_diagnostic()],
-        );
-    }
-    passed_result(loaded.root_display)
+    let chunks = match timings.time_phase(TIMING_JSON_WRITE_MS, || {
+        crate::theorem_premise_report_storage::write_report(
+            &options.root,
+            &generated_json,
+            &mutation_lock,
+        )
+    }) {
+        Ok(chunks) => chunks,
+        Err(error) => {
+            return CommandResult::failed(
+                COMMAND,
+                loaded.root_display,
+                vec![write_failed_diagnostic().with_actual_value(error.to_string())],
+            );
+        }
+    };
+    let mut result = passed_result(loaded.root_display);
+    result
+        .artifacts
+        .extend(chunks.into_iter().map(|path| CommandArtifact {
+            kind: "package_theorem_premise_report_chunk".to_owned(),
+            path: path.as_str().to_owned(),
+        }));
+    result
 }
 
 fn generate_from_loaded(

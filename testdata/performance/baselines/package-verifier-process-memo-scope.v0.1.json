@@ -1,0 +1,116 @@
+{
+  "schema": "npa.package_verifier.process_memo_scope.baselines.v0.1",
+  "scenarios": [
+    {
+      "id": "package.verifier.process_memo_scope.v1.small.empty.disabled.j1.off",
+      "status": "passed",
+      "selection": {"kind": "empty", "module": null, "closure_module_count": 0, "closure_certificate_bytes": 0},
+      "jobs": 1,
+      "measurement_mode": "off",
+      "memo": {"mode": "disabled", "max_entries": null, "max_weighted_certificate_bytes": null},
+      "measured_run_memo_counters": {"hits": 0, "misses": 0, "inserted": 0, "keys_built": 0, "certificate_bytes_hashed": 0, "evicted": 0, "rejected_oversize": 0, "bypassed_store_unavailable": 0},
+      "post_warmup_store": null
+    },
+    {
+      "id": "package.verifier.process_memo_scope.v1.small.leaf.warm.j1.off",
+      "status": "passed",
+      "selection": {"kind": "leaf", "module": "Std.Nat.Basic", "closure_module_count": 1, "closure_certificate_bytes": 655},
+      "jobs": 1,
+      "measurement_mode": "off",
+      "memo": {"mode": "warm", "max_entries": 1, "max_weighted_certificate_bytes": 655},
+      "measured_run_memo_counters": {"hits": 1, "misses": 0, "inserted": 0, "keys_built": 1, "certificate_bytes_hashed": 655, "evicted": 0, "rejected_oversize": 0, "bypassed_store_unavailable": 0},
+      "post_warmup_store": {"retained_entries": 1, "retained_weighted_certificate_bytes": 655, "cumulative_hits": 0, "cumulative_misses": 1, "cumulative_inserted": 1, "cumulative_evicted": 0, "cumulative_rejected_oversize": 0}
+    },
+    {
+      "id": "package.verifier.process_memo_scope.v1.small.full.disabled.j1.off",
+      "status": "passed",
+      "selection": {"kind": "full", "module": null, "closure_module_count": 2, "closure_certificate_bytes": 1106},
+      "jobs": 1,
+      "measurement_mode": "off",
+      "memo": {"mode": "disabled", "max_entries": null, "max_weighted_certificate_bytes": null},
+      "measured_run_memo_counters": {"hits": 0, "misses": 0, "inserted": 0, "keys_built": 0, "certificate_bytes_hashed": 0, "evicted": 0, "rejected_oversize": 0, "bypassed_store_unavailable": 0},
+      "post_warmup_store": null
+    },
+    {
+      "id": "package.verifier.process_memo_scope.v1.small.full.disabled.j4.off",
+      "status": "passed",
+      "selection": {"kind": "full", "module": null, "closure_module_count": 2, "closure_certificate_bytes": 1106},
+      "jobs": 4,
+      "measurement_mode": "off",
+      "memo": {"mode": "disabled", "max_entries": null, "max_weighted_certificate_bytes": null},
+      "measured_run_memo_counters": {"hits": 0, "misses": 0, "inserted": 0, "keys_built": 0, "certificate_bytes_hashed": 0, "evicted": 0, "rejected_oversize": 0, "bypassed_store_unavailable": 0},
+      "post_warmup_store": null
+    },
+    {
+      "id": "package.verifier.process_memo_scope.v1.small.full.warm.j1.off",
+      "status": "passed",
+      "selection": {"kind": "full", "module": null, "closure_module_count": 2, "closure_certificate_bytes": 1106},
+      "jobs": 1,
+      "measurement_mode": "off",
+      "memo": {"mode": "warm", "max_entries": 2, "max_weighted_certificate_bytes": 1106},
+      "measured_run_memo_counters": {"hits": 2, "misses": 0, "inserted": 0, "keys_built": 2, "certificate_bytes_hashed": 1106, "evicted": 0, "rejected_oversize": 0, "bypassed_store_unavailable": 0},
+      "post_warmup_store": {"retained_entries": 2, "retained_weighted_certificate_bytes": 1106, "cumulative_hits": 0, "cumulative_misses": 2, "cumulative_inserted": 2, "cumulative_evicted": 0, "cumulative_rejected_oversize": 0}
+    },
+    {
+      "id": "package.verifier.process_memo_scope.v1.iut.empty.disabled.j4.off",
+      "status": "passed",
+      "selection": {"kind": "empty", "module": null, "closure_module_count": 0, "closure_certificate_bytes": 0},
+      "jobs": 4,
+      "measurement_mode": "off",
+      "memo": {"mode": "disabled", "max_entries": null, "max_weighted_certificate_bytes": null},
+      "measured_run_memo_counters": {"hits": 0, "misses": 0, "inserted": 0, "keys_built": 0, "certificate_bytes_hashed": 0, "evicted": 0, "rejected_oversize": 0, "bypassed_store_unavailable": 0},
+      "post_warmup_store": null
+    },
+    {
+      "id": "package.verifier.process_memo_scope.v1.iut.empty.disabled.j4.summary",
+      "status": "passed",
+      "selection": {"kind": "empty", "module": null, "closure_module_count": 0, "closure_certificate_bytes": 0},
+      "jobs": 4,
+      "measurement_mode": "summary",
+      "memo": {"mode": "disabled", "max_entries": null, "max_weighted_certificate_bytes": null},
+      "measured_run_memo_counters": {"hits": 0, "misses": 0, "inserted": 0, "keys_built": 0, "certificate_bytes_hashed": 0, "evicted": 0, "rejected_oversize": 0, "bypassed_store_unavailable": 0},
+      "post_warmup_store": null
+    },
+    {
+      "id": "package.verifier.process_memo_scope.v1.iut.leaf.warm.j1.off",
+      "status": "passed",
+      "selection": {"kind": "leaf", "module": "Proofs.Ai.Iut.Foundation.ArithmeticGeometry.RationalPrimeAdicLegendreTateJIdentification", "closure_module_count": 611, "closure_certificate_bytes": 33462537},
+      "jobs": 1,
+      "measurement_mode": "off",
+      "memo": {"mode": "warm", "max_entries": 611, "max_weighted_certificate_bytes": 33462537},
+      "measured_run_memo_counters": {"hits": 611, "misses": 0, "inserted": 0, "keys_built": 611, "certificate_bytes_hashed": 33462537, "evicted": 0, "rejected_oversize": 0, "bypassed_store_unavailable": 0},
+      "post_warmup_store": {"retained_entries": 611, "retained_weighted_certificate_bytes": 33462537, "cumulative_hits": 0, "cumulative_misses": 611, "cumulative_inserted": 611, "cumulative_evicted": 0, "cumulative_rejected_oversize": 0}
+    },
+    {
+      "id": "package.verifier.process_memo_scope.v1.iut.leaf.warm.j4.off",
+      "status": "passed",
+      "selection": {"kind": "leaf", "module": "Proofs.Ai.Iut.Foundation.ArithmeticGeometry.RationalPrimeAdicLegendreTateJIdentification", "closure_module_count": 611, "closure_certificate_bytes": 33462537},
+      "jobs": 4,
+      "measurement_mode": "off",
+      "memo": {"mode": "warm", "max_entries": 611, "max_weighted_certificate_bytes": 33462537},
+      "measured_run_memo_counters": {"hits": 611, "misses": 0, "inserted": 0, "keys_built": 611, "certificate_bytes_hashed": 33462537, "evicted": 0, "rejected_oversize": 0, "bypassed_store_unavailable": 0},
+      "post_warmup_store": {"retained_entries": 611, "retained_weighted_certificate_bytes": 33462537, "cumulative_hits": 0, "cumulative_misses": 611, "cumulative_inserted": 611, "cumulative_evicted": 0, "cumulative_rejected_oversize": 0}
+    },
+    {
+      "id": "package.verifier.process_memo_scope.v1.iut.full.warm.j1.off",
+      "status": "passed",
+      "selection": {"kind": "full", "module": null, "closure_module_count": 998, "closure_certificate_bytes": 46772555},
+      "jobs": 1,
+      "measurement_mode": "off",
+      "memo": {"mode": "warm", "max_entries": 998, "max_weighted_certificate_bytes": 46772555},
+      "measured_run_memo_counters": {"hits": 998, "misses": 0, "inserted": 0, "keys_built": 998, "certificate_bytes_hashed": 46772555, "evicted": 0, "rejected_oversize": 0, "bypassed_store_unavailable": 0},
+      "post_warmup_store": {"retained_entries": 998, "retained_weighted_certificate_bytes": 46772555, "cumulative_hits": 0, "cumulative_misses": 998, "cumulative_inserted": 998, "cumulative_evicted": 0, "cumulative_rejected_oversize": 0}
+    },
+    {
+      "id": "package.verifier.process_memo_scope.v1.iut.full.warm.j4.off",
+      "status": "passed",
+      "selection": {"kind": "full", "module": null, "closure_module_count": 998, "closure_certificate_bytes": 46772555},
+      "jobs": 4,
+      "measurement_mode": "off",
+      "memo": {"mode": "warm", "max_entries": 998, "max_weighted_certificate_bytes": 46772555},
+      "measured_run_memo_counters": {"hits": 998, "misses": 0, "inserted": 0, "keys_built": 998, "certificate_bytes_hashed": 46772555, "evicted": 0, "rejected_oversize": 0, "bypassed_store_unavailable": 0},
+      "post_warmup_store": {"retained_entries": 998, "retained_weighted_certificate_bytes": 46772555, "cumulative_hits": 0, "cumulative_misses": 998, "cumulative_inserted": 998, "cumulative_evicted": 0, "cumulative_rejected_oversize": 0}
+    }
+  ],
+  "update_policy": "Manual review only. Record the reason for every deterministic baseline change in the reviewing commit or pull request."
+}

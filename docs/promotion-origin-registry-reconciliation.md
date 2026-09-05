@@ -376,6 +376,15 @@ version and event ID, with at most one event per target version. Version
 ordering uses the existing validated `PackageVersion` numeric tuple, never
 lexical string ordering.
 
+Event intervals are nonoverlapping. When no separately tracked catalog state
+exists between events, the next `previous_target` projection must equal the
+preceding event's `target` projection. When source-backed promotions advanced
+the validated registry and catalog without adding reconciliation events, a
+later event may begin at that strictly newer exact package projection. The
+reconciliation transaction proves that supplied previous package against all
+active registry routes; the registry must not invent identities for the
+intervening versions.
+
 `catalog_target_v1` has this canonical payload:
 
 ```json
@@ -560,9 +569,12 @@ generation once, preserve all old entries and reservations exactly except for
 newly added catalog-target entries, and append exactly one event for the
 requested older-to-newer version interval. Versions
 must increase strictly, but need not be consecutive; one event may summarize
-any number of skipped releases. Reconciliation may be run again for every
-later target version. Existing v1 and v2 readers remain supported. Any tracked
-writer that receives v3 must preserve v3 and its events.
+any number of skipped releases. A source-backed promotion may also advance the
+next exact previous endpoint without adding an event; the following interval
+must start strictly after the preceding event target in that case.
+Reconciliation may be run again for every later target version. Existing v1
+and v2 readers remain supported. Any tracked writer that receives v3 must
+preserve v3 and its events.
 
 V1 and v2 validation retains its historical strict behavior. V3 target
 coverage uses the first-observed version semantics above. The v1/v2-to-v3
@@ -679,6 +691,16 @@ The command performs these steps in order:
 18. Re-run registry validation against the current target.
 19. Remove the recovery journal only after validation passes.
 
+`TargetLock` is a cooperative, same-owner namespace contract, not an operating
+system sandbox. Every supported promotion/registry writer must acquire it, and
+the operator must keep non-cooperating same-owner tools quiescent while an
+apply or recovery operation runs. Generic replacement and identity-only
+removal remain fail-closed; the narrow rename/unlink primitives used here are
+reachable only through an exact retained target plus an exclusive (never
+shared) `TargetLock`, which is revalidated around every syscall. Unknown or
+replaced transaction entries are preserved and force recovery rather than
+being cleaned up online.
+
 Apply is idempotent. Repeating the same command after success returns passed
 with `already_applied`; it must not add another event or generation. If the
 registry is v3 but the requested attestation or event differs, fail closed.
@@ -768,6 +790,10 @@ No implementation may add a general “ignore registry mismatch” flag.
 - deterministic event, revision, change-set, registry, and attestation hashes;
 - accepted exact v1-to-v3 and v2-to-v3 reconciliation;
 - accepted repeated v3-to-v3 synchronization across nonconsecutive versions;
+- accepted later reconciliation whose previous endpoint advanced through one
+  or more source-backed promotions after the preceding catalog event;
+- rejection of overlapping event intervals and of a different projection at
+  the same adjacent endpoint version;
 - unchanged old revision accepted in a newer v3 target without a duplicate
   revision;
 - old artifact identity rejected when hashes differ despite a newer event;

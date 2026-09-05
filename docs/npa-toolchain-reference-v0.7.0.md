@@ -332,6 +332,13 @@ npa package verify-certs --root . --package-lock checked --checker external \
   --checker-registry ci/checker-binaries.json --json
 ```
 
+The external command above records the intended compatibility ABI only. The
+current host fails closed with `external_checker_supervisor_unavailable` before
+creating imports or results because it cannot yet enforce descendant memory
+and timeout together with authenticated step accounting. Fast and reference
+commands remain operational; no external checked evidence may be inferred from
+the fail-closed result.
+
 The current Linux closure gate is:
 
 ```sh

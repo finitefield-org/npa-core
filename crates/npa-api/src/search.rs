@@ -6836,13 +6836,6 @@ fn collect_expr_lexical_tokens(expr: &Expr, out: &mut BTreeSet<String>) {
             collect_expr_lexical_tokens(ty, out);
             collect_expr_lexical_tokens(body, out);
         }
-        Expr::Let {
-            ty, value, body, ..
-        } => {
-            collect_expr_lexical_tokens(ty, out);
-            collect_expr_lexical_tokens(value, out);
-            collect_expr_lexical_tokens(body, out);
-        }
     }
 }
 
@@ -6974,10 +6967,7 @@ fn type_aware_premise_metadata_for_goal(
 fn machine_goal_kernel_context(goal: &npa_tactic::MachineGoal) -> Ctx {
     let mut ctx = Ctx::new();
     for local in &goal.context {
-        match &local.value {
-            Some(value) => ctx.push_definition(local.name.clone(), local.ty.clone(), value.clone()),
-            None => ctx.push_assumption(local.name.clone(), local.ty.clone()),
-        }
+        ctx.push_assumption(local.name.clone(), local.ty.clone());
     }
     ctx
 }
@@ -7225,43 +7215,6 @@ fn structural_expr_shape_and_universes(
             );
             (ty_shape && body_shape, ty_universe && body_universe)
         }
-        (
-            Expr::Let {
-                ty: lhs_ty,
-                value: lhs_value,
-                body: lhs_body,
-                ..
-            },
-            Expr::Let {
-                ty: rhs_ty,
-                value: rhs_value,
-                body: rhs_body,
-                ..
-            },
-        ) => {
-            let (ty_shape, ty_universe) = structural_expr_shape_and_universes(
-                lhs_ty,
-                rhs_ty,
-                universe_param_set,
-                universe_bindings,
-            );
-            let (value_shape, value_universe) = structural_expr_shape_and_universes(
-                lhs_value,
-                rhs_value,
-                universe_param_set,
-                universe_bindings,
-            );
-            let (body_shape, body_universe) = structural_expr_shape_and_universes(
-                lhs_body,
-                rhs_body,
-                universe_param_set,
-                universe_bindings,
-            );
-            (
-                ty_shape && value_shape && body_shape,
-                ty_universe && value_universe && body_universe,
-            )
-        }
         _ => (false, true),
     }
 }
@@ -7379,9 +7332,6 @@ fn expr_node_count(expr: &Expr) -> u64 {
         Expr::Lam { ty, body, .. } | Expr::Pi { ty, body, .. } => {
             1 + expr_node_count(ty) + expr_node_count(body)
         }
-        Expr::Let {
-            ty, value, body, ..
-        } => 1 + expr_node_count(ty) + expr_node_count(value) + expr_node_count(body),
     }
 }
 
@@ -7742,32 +7692,6 @@ fn collect_term_display_scope_entries(
                 session,
                 owner,
                 ty,
-                visited,
-                views_by_name,
-                entries,
-            )?;
-            collect_term_display_scope_entries(
-                session,
-                owner,
-                body,
-                visited,
-                views_by_name,
-                entries,
-            )
-        }
-        TermNode::Let { ty, value, body } => {
-            collect_term_display_scope_entries(
-                session,
-                owner,
-                ty,
-                visited,
-                views_by_name,
-                entries,
-            )?;
-            collect_term_display_scope_entries(
-                session,
-                owner,
-                value,
                 visited,
                 views_by_name,
                 entries,
@@ -8247,13 +8171,6 @@ fn collect_expression_structural_refs_into(
             collect_expression_structural_refs_into(ty, display_scope, refs);
             collect_expression_structural_refs_into(body, display_scope, refs);
         }
-        Expr::Let {
-            ty, value, body, ..
-        } => {
-            collect_expression_structural_refs_into(ty, display_scope, refs);
-            collect_expression_structural_refs_into(value, display_scope, refs);
-            collect_expression_structural_refs_into(body, display_scope, refs);
-        }
     }
 }
 
@@ -8290,13 +8207,6 @@ fn collect_expression_propositional_connectives(
             collect_expression_propositional_connectives(ty, out);
             collect_expression_propositional_connectives(body, out);
         }
-        Expr::Let {
-            ty, value, body, ..
-        } => {
-            collect_expression_propositional_connectives(ty, out);
-            collect_expression_propositional_connectives(value, out);
-            collect_expression_propositional_connectives(body, out);
-        }
     }
 }
 
@@ -8307,13 +8217,6 @@ fn expr_contains_bvar(expr: &Expr, index: u32) -> bool {
         Expr::App(func, arg) => expr_contains_bvar(func, index) || expr_contains_bvar(arg, index),
         Expr::Lam { ty, body, .. } | Expr::Pi { ty, body, .. } => {
             expr_contains_bvar(ty, index) || expr_contains_bvar(body, index.saturating_add(1))
-        }
-        Expr::Let {
-            ty, value, body, ..
-        } => {
-            expr_contains_bvar(ty, index)
-                || expr_contains_bvar(value, index)
-                || expr_contains_bvar(body, index.saturating_add(1))
         }
     }
 }
@@ -8350,13 +8253,6 @@ fn collect_expression_level_bytes(expr: &Expr, out: &mut Vec<Vec<u8>>) {
         }
         Expr::Lam { ty, body, .. } | Expr::Pi { ty, body, .. } => {
             collect_expression_level_bytes(ty, out);
-            collect_expression_level_bytes(body, out);
-        }
-        Expr::Let {
-            ty, value, body, ..
-        } => {
-            collect_expression_level_bytes(ty, out);
-            collect_expression_level_bytes(value, out);
             collect_expression_level_bytes(body, out);
         }
     }
@@ -10454,6 +10350,16 @@ mod tests {
         )
     }
 
+    #[test]
+    fn search_projection_one_table() {
+        let module = nat_fixture_module();
+        let first = npa_cert::verified_module_to_kernel_decls(&module.verified).unwrap();
+        let second = npa_cert::verified_module_to_kernel_decls(&module.verified).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first.len(), module.verified.declarations().len());
+        assert!(first.iter().any(|decl| decl.name() == "Nat"));
+    }
+
     fn eq_fixture_module() -> FixtureModule {
         fixture_module(
             CoreModule {
@@ -10655,7 +10561,7 @@ mod tests {
     ) -> String {
         format!(
             r#"{{
-              "protocol_version":"npa.machine-api.v1",
+              "protocol_version":"npa.machine-api.v2",
               "root":{{
                 "module":"Scratch",
                 "theorem_name":"Scratch.t",
@@ -10746,7 +10652,7 @@ mod tests {
         );
         let body = format!(
             r#"{{
-              "protocol_version":"npa.machine-api.v1",
+              "protocol_version":"npa.machine-api.v2",
               "root":{{
                 "module":"Scratch",
                 "theorem_name":"Scratch.t",
@@ -10785,7 +10691,7 @@ mod tests {
         }
         let mut policy = AxiomPolicy::high_trust();
         policy.allowlisted_axioms.extend(
-            cert.name_table
+            cert.name_table()
                 .iter()
                 .filter_map(|name| name.is_canonical().then_some(name.clone())),
         );
@@ -11992,11 +11898,11 @@ mod tests {
         );
         assert_eq!(
             format_hash_string(&first_fields.query_fingerprint),
-            "sha256:cbeeb0aa5a6f2f5c5b92f9cc4b7e979b6708c281bdbf2c9e93ae0d12ff9f4e55"
+            "sha256:c377d7131345018e225a79678cf463f980c1d102b368398934f56212f613f99c"
         );
         assert_eq!(
             format_hash_string(&first_fields.theorem_index_fingerprint),
-            "sha256:f029d673950ce2dd62ace06f0066bc32582942913d177ba64d2fe835f6ccd041"
+            "sha256:0a40c975fbcc2d2139bbd3c1f8d74ee4702a9c73be02135ecf38999c566b7fa6"
         );
         assert_eq!(first_fields.results, second_fields.results);
         assert_eq!(first_fields.results.len(), 1);

@@ -4,50 +4,21 @@ let domain_term = "NPA-TERM-0.1"
 
 let domain_decl_interface = "NPA-DECL-IFACE-0.1"
 
-let domain_decl_certificate_current = "NPA-DECL-CERT-0.3.0"
-
-let domain_decl_certificate_compatibility = "NPA-DECL-CERT-0.1"
-
-let domain_decl_certificate = domain_decl_certificate_compatibility
+let domain_decl_certificate = "NPA-DECL-CERT-0.4.0"
 
 let domain_generated_recursor_signature = "NPA-GEN-REC-SIG-0.1"
 
 let domain_generated_computation_rule = "NPA-GEN-COMP-RULE-0.1"
 
-let domain_module_export_current = "NPA-MODULE-EXPORT-0.2.0"
-
-let domain_module_export_compatibility = domain_module_export_current
-
-let domain_module_export_previous = "NPA-MODULE-EXPORT-0.1.2"
-
-let domain_module_export_legacy = "NPA-MODULE-EXPORT-0.1"
-
-(* Legacy alias retained for the existing legacy golden-vector tests. *)
-let domain_module_export = domain_module_export_legacy
+let domain_module_export = "NPA-MODULE-EXPORT-0.2.0"
 
 let domain_axiom_report = "NPA-AXIOM-REPORT-0.1"
 
-let domain_module_certificate_current = "NPA-MODULE-CERT-0.3.0"
+let domain_module_certificate = "NPA-MODULE-CERT-0.4.0"
 
-let domain_module_certificate_compatibility = "NPA-MODULE-CERT-0.2.0"
+let module_export_domain Ext_cert.Current = domain_module_export
 
-let domain_module_certificate_previous = "NPA-MODULE-CERT-0.1.2"
-
-let domain_module_certificate_legacy = "NPA-MODULE-CERT-0.1"
-
-let domain_module_certificate = domain_module_certificate_legacy
-
-let module_export_domain = function
-  | Ext_cert.Current -> domain_module_export_current
-  | Ext_cert.Compatibility -> domain_module_export_compatibility
-  | Ext_cert.Previous -> domain_module_export_previous
-  | Ext_cert.Legacy -> domain_module_export_legacy
-
-let module_certificate_domain = function
-  | Ext_cert.Current -> domain_module_certificate_current
-  | Ext_cert.Compatibility -> domain_module_certificate_compatibility
-  | Ext_cert.Previous -> domain_module_certificate_previous
-  | Ext_cert.Legacy -> domain_module_certificate_legacy
+let module_certificate_domain Ext_cert.Current = domain_module_certificate
 
 let bind result f =
   match result with
@@ -227,11 +198,6 @@ let term_hash section offset name_table root =
                 Ok
                   (byte 0x05 ^ Term_hash_cache.find term_cache ty
                  ^ Term_hash_cache.find term_cache body)
-            | Ext_term.Let (ty, value, body) ->
-                Ok
-                  (byte 0x06 ^ Term_hash_cache.find term_cache ty
-                 ^ Term_hash_cache.find term_cache value
-                 ^ Term_hash_cache.find term_cache body)
           in
           bind payload (fun payload ->
               Term_hash_cache.add term_cache term
@@ -245,8 +211,6 @@ let term_hash section offset name_table root =
             | Ext_term.Lam (fn, arg)
             | Ext_term.Pi (fn, arg) ->
                 [ (fn, false); (arg, false) ]
-            | Ext_term.Let (ty, value, body) ->
-                [ (ty, false); (value, false); (body, false) ]
           in
           loop ((term, true) :: children @ rest)
   in
@@ -347,14 +311,6 @@ let term_entry_payload section offset name_table level_table level_hashes previo
           bind
             (lookup_term_hash section offset previous_terms previous_hashes body)
             (fun body_hash -> Ok (byte 0x05 ^ ty_hash ^ body_hash)))
-  | Ext_term.Let (ty, value, body) ->
-      bind (lookup_term_hash section offset previous_terms previous_hashes ty) (fun ty_hash ->
-          bind
-            (lookup_term_hash section offset previous_terms previous_hashes value)
-            (fun value_hash ->
-              bind
-                (lookup_term_hash section offset previous_terms previous_hashes body)
-                (fun body_hash -> Ok (byte 0x06 ^ ty_hash ^ value_hash ^ body_hash))))
 
 let term_hashes name_table level_table level_hashes term_table =
   let rec loop processed_terms processed_hashes remaining =
@@ -424,7 +380,7 @@ let encode_option_reducibility value =
 
 let encode_option_opacity value = encode_option (fun opacity -> Ok (encode_opacity opacity)) value
 
-let encode_dependency_entries version section offset name_table dependencies =
+let encode_dependency_entries_with_tags tagged section offset name_table dependencies =
   let rec loop remaining encoded =
     match remaining with
     | [] -> Ok (encode_uvar (List.length dependencies) ^ String.concat "" (List.rev encoded))
@@ -437,7 +393,7 @@ let encode_dependency_entries version section offset name_table dependencies =
               encode_hash (Ext_cert.dependency_decl_interface_hash dependency)
             in
             let encoded_dependency =
-              if Ext_cert.version_encodes_tagged_dependencies version then
+              if tagged then
                 match dependency with
                 | Ext_cert.Interface_dependency _ -> byte 0x00 ^ global_ref ^ interface_hash
                 | Ext_cert.Local_implementation_dependency
@@ -449,6 +405,12 @@ let encode_dependency_entries version section offset name_table dependencies =
             loop rest (encoded_dependency :: encoded))
   in
   loop dependencies []
+
+let encode_dependency_entries _version section offset name_table dependencies =
+  encode_dependency_entries_with_tags true section offset name_table dependencies
+
+let encode_interface_dependency_entries section offset name_table dependencies =
+  encode_dependency_entries_with_tags false section offset name_table dependencies
 
 let encode_axiom_refs section offset name_table axioms =
   let rec loop remaining encoded =
@@ -481,9 +443,7 @@ let collect_global_refs_from_term term refs =
         | Ext_term.App (fn, arg)
         | Ext_term.Lam (fn, arg)
         | Ext_term.Pi (fn, arg) ->
-            loop (fn :: arg :: rest) collected
-        | Ext_term.Let (ty, value, body) ->
-            loop (ty :: value :: body :: rest) collected)
+            loop (fn :: arg :: rest) collected)
   in
   loop [ term ] refs
 
@@ -652,7 +612,7 @@ let declaration_interface_payload name_table level_table term_table payload depe
       let constraints = encode_universe_constraints section offset level_table table_level_hashes in
       let interface_dependencies = interface_dependencies_for_decl payload dependencies in
       let deps =
-        encode_dependency_entries Ext_cert.Compatibility section offset name_table
+        encode_interface_dependency_entries section offset name_table
           interface_dependencies
       in
       let axioms = encode_axiom_refs section offset name_table axiom_dependencies in
@@ -851,13 +811,9 @@ let declaration_hashes version name_table level_table term_table
            declaration.Ext_cert.payload interface_hash declaration.Ext_cert.dependencies
            declaration.Ext_cert.axiom_dependencies)
         (fun certificate_payload ->
-          let certificate_domain =
-            match version with
-            | Ext_cert.Current -> domain_decl_certificate_current
-            | Ext_cert.Compatibility | Ext_cert.Previous | Ext_cert.Legacy ->
-                domain_decl_certificate_compatibility
-          in
-          Ok (interface_hash, hash_with_domain certificate_domain certificate_payload)))
+          Ok
+            ( interface_hash,
+              hash_with_domain domain_decl_certificate certificate_payload )))
 
 let interface_payload_has_dependency_material (declaration : Ext_cert.declaration) =
   interface_dependencies_for_decl declaration.Ext_cert.payload declaration.Ext_cert.dependencies <> []
@@ -986,10 +942,8 @@ let encode_export_entries version name_table level_table term_table entries =
               (list_name_ids section offset name_table export.Ext_cert.export_universe_params)
               (fun universe_param_ids ->
                 bind
-                  (if Ext_cert.version_encodes_export_universe_constraints version then
-                     encode_universe_constraint_ids section offset level_table
-                       export.Ext_cert.export_universe_constraints
-                   else Ok "")
+                  (encode_universe_constraint_ids section offset level_table
+                     export.Ext_cert.export_universe_constraints)
                   (fun universe_constraints ->
                 bind (term_id section offset term_table export.Ext_cert.export_ty) (fun ty_id ->
                     bind
@@ -1127,13 +1081,6 @@ let encode_term_table_binary name_table level_table term_table =
         bind (term_id section offset term_table ty) (fun ty_id ->
             bind (term_id section offset term_table body) (fun body_id ->
                 Ok (byte 0x05 ^ encode_uvar ty_id ^ encode_uvar body_id)))
-    | Ext_term.Let (ty, value, body) ->
-        bind (term_id section offset term_table ty) (fun ty_id ->
-            bind (term_id section offset term_table value) (fun value_id ->
-                bind (term_id section offset term_table body) (fun body_id ->
-                    Ok
-                      (byte 0x06 ^ encode_uvar ty_id ^ encode_uvar value_id
-                     ^ encode_uvar body_id))))
   in
   let rec loop remaining encoded =
     match remaining with
@@ -2045,21 +1992,6 @@ let make_module_hash_mismatch decoded role expected_hash actual_hash =
 
 let verify_module_hashes certificate_bytes (decoded : Ext_cert.decoded_module) =
   bind (expected_export_block decoded) (fun expected_exports ->
-      let legacy_compatibility =
-        if decoded.Ext_cert.header.Ext_cert.version <> Ext_cert.Legacy then Ok ()
-        else
-          match
-            List.find_opt
-              (fun export ->
-                export.Ext_cert.export_universe_constraints <> [])
-              expected_exports
-          with
-          | None -> Ok ()
-          | Some export ->
-              error Ext_bytes.Export_block export.Ext_cert.export_offset
-                Ext_bytes.Constrained_export_requires_format_upgrade
-      in
-      bind legacy_compatibility (fun () ->
       bind
         (encode_export_entries decoded.Ext_cert.header.Ext_cert.version
            decoded.Ext_cert.name_table decoded.Ext_cert.level_table
@@ -2100,4 +2032,4 @@ let verify_module_hashes certificate_bytes (decoded : Ext_cert.decoded_module) =
                           (Module_hash_mismatch
                              (make_module_hash_mismatch decoded Certificate_hash
                                 expected_certificate_hash stored_certificate_hash))
-                      else Ok Module_hashes_ok)))))
+                      else Ok Module_hashes_ok))))

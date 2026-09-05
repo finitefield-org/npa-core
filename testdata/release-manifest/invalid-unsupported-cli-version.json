@@ -68,7 +68,7 @@
     "npa_core_source_kind": "aggregate",
     "npa_core_checkout_revision": "2222222222222222222222222222222222222222",
     "npa_core_tree_hash": "3333333333333333333333333333333333333333",
-    "npa_cli_crate_version": "0.7.0",
+    "npa_cli_crate_version": "1.0.0",
     "cargo_manifest_path": "npa-core/Cargo.toml",
     "cargo_lock_path": "npa-core/Cargo.lock",
     "cargo_lock_sha256": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",

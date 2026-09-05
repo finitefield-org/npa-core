@@ -1,7 +1,7 @@
 use npa_cert::{
-    build_module_cert, decode_module_cert, generate_inductive_artifacts_v1,
-    precheck_core_decl_candidate, verify_module_cert, AxiomPolicy, CertError, CoreDeclCandidate,
-    CoreModule, Name, ProducerLimits, VerifierSession,
+    build_module_cert, generate_inductive_artifacts_v1, precheck_core_decl_candidate,
+    verify_module_cert, AxiomPolicy, CertError, CoreDeclCandidate, CoreModule, Name,
+    ProducerLimits, VerifierSession,
 };
 use npa_kernel::{
     ConstructorDecl, Decl, Env, Error, Expr, InductiveDecl, Level, MutualInductiveBlock,
@@ -195,10 +195,7 @@ fn producer_candidate_api_rejects_inductive_exploit_fail_closed() {
 }
 
 #[test]
-fn verifier_rejects_frozen_axiom_free_small_universe_in_every_policy_mode() {
-    let decoded = decode_module_cert(SMALL_UNIVERSE_CERTIFICATE).unwrap();
-    assert!(decoded.axiom_report.module_axioms.is_empty());
-
+fn verifier_rejects_retired_single_security_fixture_before_payload_decoding() {
     for policy in [AxiomPolicy::normal(), AxiomPolicy::high_trust()] {
         let error = verify_module_cert(
             SMALL_UNIVERSE_CERTIFICATE,
@@ -206,15 +203,16 @@ fn verifier_rejects_frozen_axiom_free_small_universe_in_every_policy_mode() {
             &policy,
         )
         .unwrap_err();
-        assert_universe_bound_error(error);
+        assert!(matches!(
+            error,
+            CertError::UnsupportedFormat { ref format, ref core_spec }
+                if format == "NPA-CERT-0.1" && core_spec == "NPA-Core-0.1"
+        ));
     }
 }
 
 #[test]
-fn verifier_rejects_frozen_axiom_free_mutual_small_universe_in_every_policy_mode() {
-    let decoded = decode_module_cert(MUTUAL_SMALL_UNIVERSE_CERTIFICATE).unwrap();
-    assert!(decoded.axiom_report.module_axioms.is_empty());
-
+fn verifier_rejects_retired_mutual_security_fixture_before_payload_decoding() {
     for policy in [AxiomPolicy::normal(), AxiomPolicy::high_trust()] {
         let error = verify_module_cert(
             MUTUAL_SMALL_UNIVERSE_CERTIFICATE,
@@ -222,6 +220,10 @@ fn verifier_rejects_frozen_axiom_free_mutual_small_universe_in_every_policy_mode
             &policy,
         )
         .unwrap_err();
-        assert_mutual_universe_bound_error(error);
+        assert!(matches!(
+            error,
+            CertError::UnsupportedFormat { ref format, ref core_spec }
+                if format == "NPA-CERT-0.2.0" && core_spec == "NPA-Core-0.2.0"
+        ));
     }
 }

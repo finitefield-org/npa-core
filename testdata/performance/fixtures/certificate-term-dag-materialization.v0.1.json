@@ -1,0 +1,22 @@
+{
+  "schema": "npa.certificate-term-dag-materialization.fixtures.v0.1",
+  "budget_policy": "npa.certificate-term-materialization-budget.v1",
+  "charged_byte_limit": 268435456,
+  "expr_inline_charge_bytes": 64,
+  "arc_node_metadata_charge_bytes": 64,
+  "arc_layout_allowance_bytes": 48,
+  "option_arc_slot_charge_bytes": 8,
+  "term_id_slot_charge_bytes": 8,
+  "selection_slot_charge_bytes": 1,
+  "level_node_charge_bytes": 64,
+  "planner_record_charge_bytes": 256,
+  "scenarios": [
+    {"id":"shared-doubling","kind":"shared-doubling","fixture_root":"testdata/performance/certificate-term-dag-materialization/shared-doubling","fixture_tree_sha256":"e2f65e7ffe5141107a821afa8dd8e62ca7811b3d281a394c003ab1b3f800bc0d","verifier":"fast","package_lock":"checked","decode_cache":"off","verifier_memo":"off","measurement_mode":"detailed","warmup":1,"samples":3,"requested_jobs":[1],"process_rss_required":true,"baseline_key":"shared-doubling","heights":[8,12,16,18]},
+    {"id":"nonsharing-chain","kind":"nonsharing-chain","fixture_root":"testdata/performance/certificate-term-dag-materialization/nonsharing-chain","fixture_tree_sha256":"ac64189955532f634b9244433107ed3d707998e6c6a9aa3887ca5727227fa8a3","verifier":"fast","package_lock":"checked","decode_cache":"off","verifier_memo":"off","measurement_mode":"detailed","warmup":1,"samples":3,"requested_jobs":[1],"process_rss_required":true,"baseline_key":"nonsharing-chain","lengths":[256,2048,8191]},
+    {"id":"repeated-declaration-roots","kind":"repeated-declaration-roots","fixture_root":"testdata/performance/certificate-term-dag-materialization/repeated-declaration-roots","fixture_tree_sha256":"52e20305d027e32f56ccbcd4f6131307f19c755a821924ce1436d5d9e96aaf48","verifier":"fast","package_lock":"checked","decode_cache":"off","verifier_memo":"off","measurement_mode":"detailed","warmup":1,"samples":3,"requested_jobs":[1],"process_rss_required":true,"baseline_key":"repeated-declaration-roots","declaration_count":4096,"shared_dag_height":8},
+    {"id":"sparse-import","kind":"sparse-import","fixture_root":"testdata/performance/certificate-term-dag-materialization/sparse-import","fixture_tree_sha256":"11192f4a793f4c64d1516ea523193ec65b861fd35f4f255bb29dd327965a5d2a","verifier":"fast","package_lock":"checked","decode_cache":"off","verifier_memo":"off","measurement_mode":"detailed","warmup":1,"samples":3,"requested_jobs":[1],"process_rss_required":true,"baseline_key":"sparse-import","evidence_scope":"selected-plan-microfixture-only","modeled_provider_term_nodes":262144,"materialized_selected_nodes":64,"materialized_table_slots":64},
+    {"id":"import-diamond","kind":"import-diamond","fixture_root":"testdata/performance/certificate-term-dag-materialization/import-diamond","fixture_tree_sha256":"5ba5cba27bd97a7cd0458db465afab6d354b142bc78aafbc27e9a7eb9259503a","verifier":"fast","package_lock":"checked","decode_cache":"off","verifier_memo":"off","measurement_mode":"detailed","warmup":1,"samples":3,"requested_jobs":[1],"process_rss_required":true,"baseline_key":"import-diamond","evidence_scope":"shared-roots-microfixture-only","modeled_diamond_arms":8,"modeled_module_slots":10,"materialized_selected_nodes":4096},
+    {"id":"term-materialization-near-limit","kind":"near-limit-lifetime","fixture_root":"testdata/performance/certificate-term-dag-materialization/term-materialization-near-limit","fixture_tree_sha256":"cb699f17af2d0c3a55db57dd90b8a882276b6361a89952b2978699724be23559","verifier":"fast","package_lock":"checked","decode_cache":"off","verifier_memo":"off","measurement_mode":"detailed","warmup":1,"samples":3,"requested_jobs":[1],"process_rss_required":true,"baseline_key":"term-materialization-near-limit","materialized_fixture_charge_bytes":1450,"admission_probe_charge_targets_bytes":[268435455,268435456,268435457]},
+    {"id":"wide-term-materialization-package","kind":"wide-package-model","fixture_root":"testdata/performance/certificate-term-dag-materialization/wide-term-materialization-package","fixture_tree_sha256":"b7092010b61cf7fba585dd29f2c886651d11dd7741e82d91cf3087e87a591dba","verifier":"fast","package_lock":"checked","decode_cache":"off","verifier_memo":"off","measurement_mode":"detailed","warmup":1,"samples":3,"requested_jobs":[1,2,3,4,16],"process_rss_required":true,"baseline_key":"wide-term-materialization-package","materialized_module_count":16,"materialized_per_module_charge_bytes":1450,"admission_probe_per_module_charge_bytes":268435456,"model_case":"active-guarded"}
+  ]
+}

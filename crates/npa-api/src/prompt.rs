@@ -33,8 +33,8 @@ use crate::validation::{
 };
 use crate::{validate_machine_endpoint_envelope, MachineApiUpstreamDiagnostic, MachineApiVersion};
 
-const PROMPT_PAYLOAD_TAG: &str = "npa.machine-api.prompt-payload.v1";
-const PROMPT_RENDERED_CONTENT_TAG: &str = "npa.machine-api.prompt-rendered-content.v1";
+const PROMPT_PAYLOAD_TAG: &str = "npa.machine-api.prompt-payload.v2";
+const PROMPT_RENDERED_CONTENT_TAG: &str = "npa.machine-api.prompt-rendered-content.v2";
 
 const PREMISE_SELECTION_FIELDS: &[FieldSpec] = &[
     FieldSpec::required("modes", JsonFieldType::Array),
@@ -82,8 +82,6 @@ pub struct MachinePromptLocal {
     pub machine_name: String,
     pub display_name: Option<String>,
     pub type_machine: String,
-    pub value_machine: Option<String>,
-    pub value_pretty: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -578,17 +576,6 @@ fn prompt_goal_from_view(goal: &MachineGoalView, include_pretty: bool) -> Machin
                 machine_name: local.machine_name.clone(),
                 display_name: include_pretty.then(|| local.display_name.clone()),
                 type_machine: local.ty.machine.clone(),
-                value_machine: local.value.as_ref().map(|value| value.machine.clone()),
-                value_pretty: if include_pretty {
-                    local.value.as_ref().map(|value| {
-                        value
-                            .pretty
-                            .clone()
-                            .unwrap_or_else(|| value.machine.clone())
-                    })
-                } else {
-                    None
-                },
             })
             .collect(),
     }
@@ -719,8 +706,6 @@ fn prompt_rendered_content_canonical_bytes(
         encode_string(&mut out, &local.machine_name);
         encode_option_string(&mut out, local.display_name.as_deref());
         encode_string(&mut out, &local.type_machine);
-        encode_option_string(&mut out, local.value_machine.as_deref());
-        encode_option_string(&mut out, local.value_pretty.as_deref());
     }
     encode_list_len(&mut out, premises.len());
     for premise in premises {
@@ -1164,7 +1149,7 @@ mod tests {
         );
         let body = format!(
             r#"{{
-              "protocol_version":"npa.machine-api.v1",
+              "protocol_version":"npa.machine-api.v2",
               "root":{{
                 "module":"Scratch",
                 "theorem_name":"Scratch.t",

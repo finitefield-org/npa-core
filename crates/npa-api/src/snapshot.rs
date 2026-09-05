@@ -27,7 +27,7 @@ use crate::{
     MachineApiDiagnosticProjection, MachineApiUpstreamDiagnostic,
 };
 
-const STORED_SNAPSHOT_VIEW_TAG: &str = "npa.machine-api.stored-snapshot-view.v1";
+const STORED_SNAPSHOT_VIEW_TAG: &str = "npa.machine-api.stored-snapshot-view.v2";
 const STORED_EXPR_VIEW_TAG: &str = "npa.machine-api.stored-expr-view.v1";
 const LOCAL_NAME_MAP_TAG: &str = "npa.machine-api.local-name-map.v1";
 const GOAL_FINGERPRINT_TAG: &str = "npa.machine-api.goal-fingerprint.v1";
@@ -555,18 +555,7 @@ fn materialize_local_view(
             source: Box::new(source),
         }
     })?;
-    let value = local
-        .value
-        .as_ref()
-        .map(|value| {
-            render_machine_expr_view(value, &ty_context).map_err(|source| {
-                MachineSnapshotMaterializationError::RenderFailed {
-                    source: Box::new(source),
-                }
-            })
-        })
-        .transpose()?;
-    let depends_on = local_depends_on(goal_id, local_id, index, &ty, value.as_ref())?;
+    let depends_on = local_depends_on(goal_id, local_id, index, &ty)?;
     let binder_index = u32::try_from(index).map_err(|_| {
         MachineSnapshotMaterializationError::BinderIndexMismatch {
             goal_id,
@@ -581,7 +570,6 @@ fn materialize_local_view(
         machine_name: local.name.clone(),
         display_name: local.name.clone(),
         ty,
-        value,
         depends_on,
         binder_index,
     })
@@ -591,7 +579,6 @@ fn frontend_local_decl(local: &MachineLocalDecl) -> npa_frontend::MachineLocalDe
     npa_frontend::MachineLocalDecl {
         name: local.name.clone(),
         ty: local.ty.clone(),
-        value: local.value.clone(),
     }
 }
 
@@ -600,14 +587,9 @@ fn local_depends_on(
     local_id: LocalId,
     context_index: usize,
     ty: &MachineExprView,
-    value: Option<&MachineExprView>,
 ) -> Result<Vec<LocalId>, MachineSnapshotMaterializationError> {
     let mut deps = BTreeSet::new();
-    for dependency in ty
-        .free_locals
-        .iter()
-        .chain(value.into_iter().flat_map(|view| view.free_locals.iter()))
-    {
+    for dependency in &ty.free_locals {
         if dependency.0 as usize >= context_index {
             return Err(
                 MachineSnapshotMaterializationError::InvalidLocalDependency {
@@ -734,13 +716,6 @@ fn encode_local_view(out: &mut Vec<u8>, local: &MachineLocalView) {
     encode_string(out, &local.machine_name);
     encode_string(out, &local.display_name);
     encode_expr_view(out, &local.ty);
-    match &local.value {
-        Some(value) => {
-            out.push(0x01);
-            encode_expr_view(out, value);
-        }
-        None => out.push(0x00),
-    }
     encode_list_len(out, local.depends_on.len());
     for dependency in &local.depends_on {
         out.extend(dependency.canonical_bytes());
@@ -779,9 +754,6 @@ fn attach_pretty_projection(snapshot: &mut MachineProofSnapshot) {
         attach_expr_pretty(&mut goal.target);
         for local in &mut goal.context {
             attach_expr_pretty(&mut local.ty);
-            if let Some(value) = &mut local.value {
-                attach_expr_pretty(value);
-            }
         }
     }
 }
@@ -982,7 +954,7 @@ mod tests {
     fn minimal_session_json(theorem_type: &str) -> String {
         format!(
             r#"{{
-              "protocol_version":"npa.machine-api.v1",
+              "protocol_version":"npa.machine-api.v2",
               "root":{{
                 "module":"Scratch",
                 "theorem_name":"Scratch.t",

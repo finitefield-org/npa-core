@@ -1,0 +1,1 @@
+{"schema":"npa.certificate-term-dag-materialization.fixture.v0.1","id":"term-materialization-near-limit","kind":"near-limit-lifetime","artifact_kind":"runtime-generation-recipe","production_adapter":"selected-plan-v1","case_ids":["charge-268435455","charge-268435456","charge-268435457"],"generator":"canonical-graph-v2"}

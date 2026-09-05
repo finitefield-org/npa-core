@@ -25,10 +25,7 @@ type error = {
   offset : Ext_bytes.offset;
 }
 
-type local_binding = {
-  local_ty : Ext_term.t;
-  local_value : Ext_term.t option;
-}
+type local_binding = { local_ty : Ext_term.t }
 
 type context = local_binding list
 
@@ -36,10 +33,7 @@ let max_fuel = 100_000
 
 let empty_context = []
 
-let push_assumption context ty = { local_ty = ty; local_value = None } :: context
-
-let push_definition context ty value =
-  { local_ty = ty; local_value = Some value } :: context
+let push_assumption context ty = { local_ty = ty } :: context
 
 let error section offset reason = Error { reason; section; offset }
 
@@ -204,11 +198,6 @@ let rec subst_levels_term params levels term =
       Ext_term.Lam (subst_levels_term params levels ty, subst_levels_term params levels body)
   | Ext_term.Pi (ty, body) ->
       Ext_term.Pi (subst_levels_term params levels ty, subst_levels_term params levels body)
-  | Ext_term.Let (ty, value, body) ->
-      Ext_term.Let
-        ( subst_levels_term params levels ty,
-          subst_levels_term params levels value,
-          subst_levels_term params levels body )
 
 let rec shift_at section offset term amount cutoff =
   match term with
@@ -232,11 +221,6 @@ let rec shift_at section offset term amount cutoff =
       bind (shift_at section offset ty amount cutoff) (fun shifted_ty ->
           bind (shift_at section offset body amount (cutoff + 1)) (fun shifted_body ->
               Ok (Ext_term.Pi (shifted_ty, shifted_body))))
-  | Ext_term.Let (ty, value, body) ->
-      bind (shift_at section offset ty amount cutoff) (fun shifted_ty ->
-          bind (shift_at section offset value amount cutoff) (fun shifted_value ->
-              bind (shift_at section offset body amount (cutoff + 1)) (fun shifted_body ->
-                  Ok (Ext_term.Let (shifted_ty, shifted_value, shifted_body)))))
 
 let shift section offset term amount cutoff =
   if cutoff < 0 then error section offset Invalid_bvar
@@ -262,12 +246,6 @@ let rec substitute_at section offset term target replacement =
       bind (substitute_at section offset ty target replacement) (fun substituted_ty ->
           bind (substitute_at section offset body (target + 1) replacement)
             (fun substituted_body -> Ok (Ext_term.Pi (substituted_ty, substituted_body))))
-  | Ext_term.Let (ty, value, body) ->
-      bind (substitute_at section offset ty target replacement) (fun substituted_ty ->
-          bind (substitute_at section offset value target replacement) (fun substituted_value ->
-              bind (substitute_at section offset body (target + 1) replacement)
-                (fun substituted_body ->
-                  Ok (Ext_term.Let (substituted_ty, substituted_value, substituted_body)))))
 
 let substitute section offset term target replacement =
   if target < 0 then error section offset Invalid_bvar
@@ -283,14 +261,6 @@ let lookup_binding section offset context index =
 let lookup_type section offset context index =
   bind (lookup_binding section offset context index) (fun binding ->
       shift section offset binding.local_ty (index + 1) 0)
-
-let lookup_value section offset context index =
-  bind (lookup_binding section offset context index) (fun binding ->
-      match binding.local_value with
-      | None -> Ok None
-      | Some value ->
-          bind (shift section offset value (index + 1) 0) (fun shifted ->
-              Ok (Some shifted)))
 
 let levels_equal lhs rhs =
   List.length lhs = List.length rhs
@@ -443,18 +413,6 @@ let rec instantiate_constructor_args_at section offset term args_by_abs depth =
             (instantiate_constructor_args_at section offset body args_by_abs
                (depth + 1))
             (fun body -> Ok (Ext_term.Pi (ty, body))))
-  | Ext_term.Let (ty, value, body) ->
-      bind
-        (instantiate_constructor_args_at section offset ty args_by_abs depth)
-        (fun ty ->
-          bind
-            (instantiate_constructor_args_at section offset value args_by_abs
-               depth)
-            (fun value ->
-              bind
-                (instantiate_constructor_args_at section offset body args_by_abs
-                   (depth + 1))
-                (fun body -> Ok (Ext_term.Let (ty, value, body)))))
 
 let instantiate_constructor_args section offset term args_by_abs =
   instantiate_constructor_args_at section offset term args_by_abs 0
@@ -470,9 +428,7 @@ let rec whnf_with_fuel env context section offset delta term fuel =
   bind (spend_fuel section offset fuel) (fun () ->
       match term with
       | Ext_term.BVar index ->
-          bind (lookup_value section offset context index) (function
-            | None -> Ok term
-            | Some value -> whnf_with_fuel env context section offset delta value fuel)
+          bind (lookup_binding section offset context index) (fun _ -> Ok term)
       | Ext_term.Const (global_ref, levels) ->
           bind (resolve_signature section offset env global_ref) (fun signature ->
               if
@@ -516,9 +472,6 @@ let rec whnf_with_fuel env context section offset delta term fuel =
                             | Some reduced ->
                                 whnf_with_fuel env context section offset delta reduced
                                   fuel)))
-      | Ext_term.Let (_, value, body) ->
-          bind (instantiate section offset body value) (fun instantiated ->
-              whnf_with_fuel env context section offset delta instantiated fuel)
       | Ext_term.Sort _ | Ext_term.Lam _ | Ext_term.Pi _ -> Ok term)
 
 and reduce_nat_rec_iota env context section offset delta term fuel =
@@ -974,24 +927,6 @@ let rec is_defeq_with_fuel env context section offset delta lhs rhs fuel =
                         let body_context = push_assumption context lhs_ty in
                         is_defeq_with_fuel env body_context section offset delta lhs_body
                           rhs_body fuel)
-              | ( Ext_term.Let (lhs_ty, lhs_value, lhs_body),
-                  Ext_term.Let (rhs_ty, rhs_value, rhs_body) ) ->
-                  bind
-                    (is_defeq_with_fuel env context section offset delta lhs_ty rhs_ty fuel)
-                    (fun ty_equal ->
-                      if not ty_equal then Ok false
-                      else
-                        bind
-                          (is_defeq_with_fuel env context section offset delta lhs_value
-                             rhs_value fuel)
-                          (fun value_equal ->
-                            if not value_equal then Ok false
-                            else
-                              let body_context =
-                                push_definition context lhs_ty lhs_value
-                              in
-                              is_defeq_with_fuel env body_context section offset delta
-                                lhs_body rhs_body fuel))
               | _ -> Ok false)))
 
 let is_defeq ?(section = Ext_bytes.Declarations) ?(offset = 0) ?(delta = []) env context lhs
@@ -1077,19 +1012,6 @@ let rec infer ?(section = Ext_bytes.Declarations) ?(offset = 0) ?(delta = [])
                      arg domain_ty)
                   (fun () -> instantiate section offset body_ty arg)
             | _ -> error section offset Expected_function))
-  | Ext_term.Let (ty, value, body) ->
-      bind
-        (expect_sort ~section ~offset ~delta ~universe_context ~fuel env context ty)
-        (fun _ ->
-          bind
-            (check ~section ~offset ~delta ~universe_context ~fuel env context value
-               ty)
-            (fun () ->
-              let body_context = push_definition context ty value in
-              bind
-                (infer ~section ~offset ~delta ~universe_context ~fuel env
-                   body_context body)
-                (fun body_ty -> instantiate section offset body_ty value)))
 
 and check ?(section = Ext_bytes.Declarations) ?(offset = 0) ?(delta = [])
     ?(universe_context = Ext_universe.empty) ?(fuel = ref max_fuel) env context term
@@ -1340,21 +1262,6 @@ let rec remap_bvars section offset term source_ctx_len target_ctx_len source_to_
             (remap_bvars section offset body (source_ctx_len + 1)
                (target_ctx_len + 1) (source_to_target @ [ target_ctx_len ]))
             (fun remapped_body -> Ok (Ext_term.Pi (remapped_ty, remapped_body))))
-  | Ext_term.Let (ty, value, body) ->
-      bind
-        (remap_bvars section offset ty source_ctx_len target_ctx_len
-           source_to_target)
-        (fun remapped_ty ->
-          bind
-            (remap_bvars section offset value source_ctx_len target_ctx_len
-               source_to_target)
-            (fun remapped_value ->
-              bind
-                (remap_bvars section offset body (source_ctx_len + 1)
-                   (target_ctx_len + 1)
-                   (source_to_target @ [ target_ctx_len ]))
-                (fun remapped_body ->
-                  Ok (Ext_term.Let (remapped_ty, remapped_value, remapped_body)))))
 
 let rec mk_pi_from_domains domains body =
   match domains with
@@ -2045,14 +1952,6 @@ let rec localize_imported_group_term import_index decl_interface_hash
             family_name generated_names synthetic_decl_index ty,
           localize_imported_group_term import_index decl_interface_hash
             family_name generated_names synthetic_decl_index body )
-  | Ext_term.Let (ty, value, body) ->
-      Ext_term.Let
-        ( localize_imported_group_term import_index decl_interface_hash
-            family_name generated_names synthetic_decl_index ty,
-          localize_imported_group_term import_index decl_interface_hash
-            family_name generated_names synthetic_decl_index value,
-          localize_imported_group_term import_index decl_interface_hash
-            family_name generated_names synthetic_decl_index body )
 
 let public_exports_with_kind_and_hash kind decl_interface_hash exports =
   List.filter
@@ -2126,14 +2025,6 @@ let rec localize_imported_mutual_group_term import_index decl_interface_hash
       Ext_term.Pi
         ( localize_imported_mutual_group_term import_index decl_interface_hash
             localized_names synthetic_decl_index ty,
-          localize_imported_mutual_group_term import_index decl_interface_hash
-            localized_names synthetic_decl_index body )
-  | Ext_term.Let (ty, value, body) ->
-      Ext_term.Let
-        ( localize_imported_mutual_group_term import_index decl_interface_hash
-            localized_names synthetic_decl_index ty,
-          localize_imported_mutual_group_term import_index decl_interface_hash
-            localized_names synthetic_decl_index value,
           localize_imported_mutual_group_term import_index decl_interface_hash
             localized_names synthetic_decl_index body )
 
@@ -2304,8 +2195,7 @@ let reconstruct_imported_mutual_recursors env section offset import_index
                                      }
                                     :: accumulated)))
                 | Ext_term.Sort _ | Ext_term.BVar _ | Ext_term.Const _
-                | Ext_term.App _ | Ext_term.Lam _ | Ext_term.Pi _
-                | Ext_term.Let _ -> Ok []))
+                | Ext_term.App _ | Ext_term.Lam _ | Ext_term.Pi _ -> Ok []))
   in
   bind (build_families layouts []) (fun mutuals ->
       match mutuals with
@@ -2685,8 +2575,8 @@ let reconstruct_imported_recursor_uncached env section offset fuel import_index
                           in
                           try_param_count 0
                       | Ext_term.Sort _ | Ext_term.BVar _ | Ext_term.Const _
-                      | Ext_term.App _ | Ext_term.Lam _ | Ext_term.Pi _
-                      | Ext_term.Let _ -> Ok None)))
+                      | Ext_term.App _ | Ext_term.Lam _ | Ext_term.Pi _ ->
+                          Ok None)))
       | _ -> Ok None)
 
 let reconstruct_imported_recursor env section offset fuel import_index

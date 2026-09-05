@@ -1,1 +1,2709 @@
-{"schema":"npa.performance.baselines.v0.1","measurement_schema":"npa.performance.measurements.v0.3","scenarios":[{"id":"compact-package-fast","status":"passed","module_count":2,"deterministic_counters":{"package.certificate_bytes":1106,"package.declarations":2,"package.effective_jobs":1,"package.imports":0,"package.live_results":2,"package.modules_checked":2,"package.modules_decoded":2,"package.requested_jobs":1},"coverage":{"live_results_min":2,"proof_evidence_reduction_allowed":false}}],"update_policy":"Manual review only. Record the reason for every deterministic baseline change in the reviewing commit or pull request."}
+{
+  "schema": "npa.performance.baselines.v0.1",
+  "measurement_schema": "npa.performance.measurements.v0.9",
+  "scenarios": [
+    {
+      "id": "compact-package-fast",
+      "status": "passed",
+      "module_count": 2,
+      "deterministic_counters": {
+        "package.certificate_bytes": 1106,
+        "package.declarations": 2,
+        "package.effective_jobs": 1,
+        "package.imports": 0,
+        "package.live_results": 2,
+        "package.modules_checked": 2,
+        "package.modules_decoded": 2,
+        "package.requested_jobs": 1
+      },
+      "coverage": {
+        "live_results_min": 2,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "package.verifier.process_memo_scope.v1.iut.empty.disabled.j4.summary",
+      "status": "passed",
+      "module_count": 0,
+      "deterministic_counters": {
+        "package.cache_results": 0,
+        "package.certificate_bytes": 0,
+        "package.effective_jobs": 0,
+        "package.live_results": 0,
+        "package.memo_results": 0,
+        "package.modules_checked": 0,
+        "package.requested_jobs": 4
+      },
+      "coverage": {
+        "live_results_min": 0,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "package.verifier.linear_dag_planning.v1.iut992.empty.j4.summary",
+      "status": "passed",
+      "module_count": 0,
+      "deterministic_counters": {
+        "package.cache_results": 0,
+        "package.certificate_bytes": 0,
+        "package.effective_jobs": 0,
+        "package.live_results": 0,
+        "package.memo_results": 0,
+        "package.modules_checked": 0,
+        "package.requested_jobs": 4
+      },
+      "coverage": {
+        "live_results_min": 0,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "package.verifier.linear_dag_planning.v1.iut992.empty.j4.detailed",
+      "status": "passed",
+      "module_count": 0,
+      "deterministic_counters": {
+        "package.cache_results": 0,
+        "package.certificate_bytes": 0,
+        "package.effective_jobs": 0,
+        "package.live_results": 0,
+        "package.memo_results": 0,
+        "package.modules_checked": 0,
+        "package.requested_jobs": 4
+      },
+      "coverage": {
+        "live_results_min": 0,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "package.changed_selection.git_batching.v1.empty0.clean",
+      "status": "passed",
+      "module_count": 0,
+      "deterministic_counters": {
+        "package.selection_candidate_paths": 0,
+        "package.selection_changed_paths": 0,
+        "package.selection_effective_argv_charge_bytes": 0,
+        "package.selection_head_queries": 0,
+        "package.selection_max_batch_argv_charge_bytes": 0,
+        "package.selection_max_batch_payload_bytes": 0,
+        "package.selection_pathspec_batches": 0,
+        "package.selection_pathspec_payload_bytes": 0,
+        "package.selection_tracked_output_paths": 0,
+        "package.selection_tracked_queries": 0,
+        "package.selection_untracked_output_paths": 0,
+        "package.selection_untracked_queries": 0,
+        "package.selection_worktree_root_queries": 0
+      },
+      "coverage": {
+        "live_results_min": 0,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "package.changed_selection.git_batching.v1.tiny1.clean",
+      "status": "passed",
+      "module_count": 0,
+      "deterministic_counters": {
+        "package.selection_candidate_paths": 1,
+        "package.selection_changed_paths": 0,
+        "package.selection_effective_argv_charge_bytes": 65536,
+        "package.selection_exec_budget_policy": 1,
+        "package.selection_head_queries": 1,
+        "package.selection_max_batch_argv_charge_bytes": 246,
+        "package.selection_max_batch_payload_bytes": 230,
+        "package.selection_pathspec_batches": 1,
+        "package.selection_pathspec_payload_bytes": 230,
+        "package.selection_tracked_output_paths": 0,
+        "package.selection_tracked_queries": 1,
+        "package.selection_untracked_output_paths": 0,
+        "package.selection_untracked_queries": 1,
+        "package.selection_worktree_root_queries": 1
+      },
+      "coverage": {
+        "live_results_min": 0,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "package.changed_selection.git_batching.v1.tiny1.tracked1",
+      "status": "passed",
+      "module_count": 0,
+      "deterministic_counters": {
+        "package.selection_candidate_paths": 1,
+        "package.selection_changed_paths": 1,
+        "package.selection_effective_argv_charge_bytes": 65536,
+        "package.selection_exec_budget_policy": 1,
+        "package.selection_head_queries": 1,
+        "package.selection_max_batch_argv_charge_bytes": 246,
+        "package.selection_max_batch_payload_bytes": 230,
+        "package.selection_pathspec_batches": 1,
+        "package.selection_pathspec_payload_bytes": 230,
+        "package.selection_tracked_output_paths": 1,
+        "package.selection_tracked_queries": 1,
+        "package.selection_untracked_output_paths": 0,
+        "package.selection_untracked_queries": 1,
+        "package.selection_worktree_root_queries": 1
+      },
+      "coverage": {
+        "live_results_min": 0,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "package.changed_selection.git_batching.v1.tiny1.untracked1",
+      "status": "passed",
+      "module_count": 0,
+      "deterministic_counters": {
+        "package.selection_candidate_paths": 1,
+        "package.selection_changed_paths": 1,
+        "package.selection_effective_argv_charge_bytes": 65536,
+        "package.selection_exec_budget_policy": 1,
+        "package.selection_head_queries": 1,
+        "package.selection_max_batch_argv_charge_bytes": 246,
+        "package.selection_max_batch_payload_bytes": 230,
+        "package.selection_pathspec_batches": 1,
+        "package.selection_pathspec_payload_bytes": 230,
+        "package.selection_tracked_output_paths": 1,
+        "package.selection_tracked_queries": 1,
+        "package.selection_untracked_output_paths": 1,
+        "package.selection_untracked_queries": 1,
+        "package.selection_worktree_root_queries": 1
+      },
+      "coverage": {
+        "live_results_min": 0,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "package.changed_selection.git_batching.v1.former127.clean",
+      "status": "passed",
+      "module_count": 0,
+      "deterministic_counters": {
+        "package.selection_candidate_paths": 127,
+        "package.selection_changed_paths": 0,
+        "package.selection_effective_argv_charge_bytes": 65536,
+        "package.selection_exec_budget_policy": 1,
+        "package.selection_head_queries": 1,
+        "package.selection_max_batch_argv_charge_bytes": 31242,
+        "package.selection_max_batch_payload_bytes": 29210,
+        "package.selection_pathspec_batches": 1,
+        "package.selection_pathspec_payload_bytes": 29210,
+        "package.selection_tracked_output_paths": 0,
+        "package.selection_tracked_queries": 1,
+        "package.selection_untracked_output_paths": 0,
+        "package.selection_untracked_queries": 1,
+        "package.selection_worktree_root_queries": 1
+      },
+      "coverage": {
+        "live_results_min": 0,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "package.changed_selection.git_batching.v1.former128.clean",
+      "status": "passed",
+      "module_count": 0,
+      "deterministic_counters": {
+        "package.selection_candidate_paths": 128,
+        "package.selection_changed_paths": 0,
+        "package.selection_effective_argv_charge_bytes": 65536,
+        "package.selection_exec_budget_policy": 1,
+        "package.selection_head_queries": 1,
+        "package.selection_max_batch_argv_charge_bytes": 31488,
+        "package.selection_max_batch_payload_bytes": 29440,
+        "package.selection_pathspec_batches": 1,
+        "package.selection_pathspec_payload_bytes": 29440,
+        "package.selection_tracked_output_paths": 0,
+        "package.selection_tracked_queries": 1,
+        "package.selection_untracked_output_paths": 0,
+        "package.selection_untracked_queries": 1,
+        "package.selection_worktree_root_queries": 1
+      },
+      "coverage": {
+        "live_results_min": 0,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "package.changed_selection.git_batching.v1.former129.clean",
+      "status": "passed",
+      "module_count": 0,
+      "deterministic_counters": {
+        "package.selection_candidate_paths": 129,
+        "package.selection_changed_paths": 0,
+        "package.selection_effective_argv_charge_bytes": 65536,
+        "package.selection_exec_budget_policy": 1,
+        "package.selection_head_queries": 1,
+        "package.selection_max_batch_argv_charge_bytes": 31734,
+        "package.selection_max_batch_payload_bytes": 29670,
+        "package.selection_pathspec_batches": 1,
+        "package.selection_pathspec_payload_bytes": 29670,
+        "package.selection_tracked_output_paths": 0,
+        "package.selection_tracked_queries": 1,
+        "package.selection_untracked_output_paths": 0,
+        "package.selection_untracked_queries": 1,
+        "package.selection_worktree_root_queries": 1
+      },
+      "coverage": {
+        "live_results_min": 0,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "package.changed_selection.git_batching.v1.count1023.clean",
+      "status": "passed",
+      "module_count": 0,
+      "deterministic_counters": {
+        "package.selection_candidate_paths": 1023,
+        "package.selection_changed_paths": 0,
+        "package.selection_effective_argv_charge_bytes": 65536,
+        "package.selection_exec_budget_policy": 1,
+        "package.selection_head_queries": 1,
+        "package.selection_max_batch_argv_charge_bytes": 60416,
+        "package.selection_max_batch_payload_bytes": 52224,
+        "package.selection_pathspec_batches": 2,
+        "package.selection_pathspec_payload_bytes": 104346,
+        "package.selection_tracked_output_paths": 0,
+        "package.selection_tracked_queries": 2,
+        "package.selection_untracked_output_paths": 0,
+        "package.selection_untracked_queries": 2,
+        "package.selection_worktree_root_queries": 1
+      },
+      "coverage": {
+        "live_results_min": 0,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "package.changed_selection.git_batching.v1.count1024.clean",
+      "status": "passed",
+      "module_count": 0,
+      "deterministic_counters": {
+        "package.selection_candidate_paths": 1024,
+        "package.selection_changed_paths": 0,
+        "package.selection_effective_argv_charge_bytes": 65536,
+        "package.selection_exec_budget_policy": 1,
+        "package.selection_head_queries": 1,
+        "package.selection_max_batch_argv_charge_bytes": 60416,
+        "package.selection_max_batch_payload_bytes": 52224,
+        "package.selection_pathspec_batches": 2,
+        "package.selection_pathspec_payload_bytes": 104448,
+        "package.selection_tracked_output_paths": 0,
+        "package.selection_tracked_queries": 2,
+        "package.selection_untracked_output_paths": 0,
+        "package.selection_untracked_queries": 2,
+        "package.selection_worktree_root_queries": 1
+      },
+      "coverage": {
+        "live_results_min": 0,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "package.changed_selection.git_batching.v1.count1025.clean",
+      "status": "passed",
+      "module_count": 0,
+      "deterministic_counters": {
+        "package.selection_candidate_paths": 1025,
+        "package.selection_changed_paths": 0,
+        "package.selection_effective_argv_charge_bytes": 65536,
+        "package.selection_exec_budget_policy": 1,
+        "package.selection_head_queries": 1,
+        "package.selection_max_batch_argv_charge_bytes": 60416,
+        "package.selection_max_batch_payload_bytes": 52224,
+        "package.selection_pathspec_batches": 3,
+        "package.selection_pathspec_payload_bytes": 104550,
+        "package.selection_tracked_output_paths": 0,
+        "package.selection_tracked_queries": 3,
+        "package.selection_untracked_output_paths": 0,
+        "package.selection_untracked_queries": 3,
+        "package.selection_worktree_root_queries": 1
+      },
+      "coverage": {
+        "live_results_min": 0,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "package.changed_selection.git_batching.v1.byte65535.clean",
+      "status": "passed",
+      "module_count": 0,
+      "deterministic_counters": {
+        "package.selection_candidate_paths": 550,
+        "package.selection_changed_paths": 0,
+        "package.selection_effective_argv_charge_bytes": 65536,
+        "package.selection_exec_budget_policy": 1,
+        "package.selection_head_queries": 1,
+        "package.selection_max_batch_argv_charge_bytes": 65436,
+        "package.selection_max_batch_payload_bytes": 61180,
+        "package.selection_pathspec_batches": 3,
+        "package.selection_pathspec_payload_bytes": 126670,
+        "package.selection_tracked_output_paths": 0,
+        "package.selection_tracked_queries": 3,
+        "package.selection_untracked_output_paths": 0,
+        "package.selection_untracked_queries": 3,
+        "package.selection_worktree_root_queries": 1
+      },
+      "coverage": {
+        "live_results_min": 0,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "package.changed_selection.git_batching.v1.byte65536.clean",
+      "status": "passed",
+      "module_count": 0,
+      "deterministic_counters": {
+        "package.selection_candidate_paths": 550,
+        "package.selection_changed_paths": 0,
+        "package.selection_effective_argv_charge_bytes": 65536,
+        "package.selection_exec_budget_policy": 1,
+        "package.selection_head_queries": 1,
+        "package.selection_max_batch_argv_charge_bytes": 65436,
+        "package.selection_max_batch_payload_bytes": 61180,
+        "package.selection_pathspec_batches": 3,
+        "package.selection_pathspec_payload_bytes": 126672,
+        "package.selection_tracked_output_paths": 0,
+        "package.selection_tracked_queries": 3,
+        "package.selection_untracked_output_paths": 0,
+        "package.selection_untracked_queries": 3,
+        "package.selection_worktree_root_queries": 1
+      },
+      "coverage": {
+        "live_results_min": 0,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "package.changed_selection.git_batching.v1.byte65537.clean",
+      "status": "passed",
+      "module_count": 0,
+      "deterministic_counters": {
+        "package.selection_candidate_paths": 550,
+        "package.selection_changed_paths": 0,
+        "package.selection_effective_argv_charge_bytes": 65536,
+        "package.selection_exec_budget_policy": 1,
+        "package.selection_head_queries": 1,
+        "package.selection_max_batch_argv_charge_bytes": 65436,
+        "package.selection_max_batch_payload_bytes": 61180,
+        "package.selection_pathspec_batches": 3,
+        "package.selection_pathspec_payload_bytes": 126674,
+        "package.selection_tracked_output_paths": 0,
+        "package.selection_tracked_queries": 3,
+        "package.selection_untracked_output_paths": 0,
+        "package.selection_untracked_queries": 3,
+        "package.selection_worktree_root_queries": 1
+      },
+      "coverage": {
+        "live_results_min": 0,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "package.changed_selection.git_batching.v1.long32.mixed",
+      "status": "passed",
+      "module_count": 0,
+      "deterministic_counters": {
+        "package.selection_candidate_paths": 32,
+        "package.selection_changed_paths": 4,
+        "package.selection_effective_argv_charge_bytes": 65536,
+        "package.selection_exec_budget_policy": 1,
+        "package.selection_head_queries": 1,
+        "package.selection_max_batch_argv_charge_bytes": 50880,
+        "package.selection_max_batch_payload_bytes": 50368,
+        "package.selection_pathspec_batches": 1,
+        "package.selection_pathspec_payload_bytes": 50368,
+        "package.selection_tracked_output_paths": 4,
+        "package.selection_tracked_queries": 1,
+        "package.selection_untracked_output_paths": 1,
+        "package.selection_untracked_queries": 1,
+        "package.selection_worktree_root_queries": 1
+      },
+      "coverage": {
+        "live_results_min": 0,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "package.changed_selection.git_batching.v1.long128.mixed",
+      "status": "passed",
+      "module_count": 0,
+      "deterministic_counters": {
+        "package.selection_candidate_paths": 128,
+        "package.selection_changed_paths": 4,
+        "package.selection_effective_argv_charge_bytes": 65536,
+        "package.selection_exec_budget_policy": 1,
+        "package.selection_head_queries": 1,
+        "package.selection_max_batch_argv_charge_bytes": 65190,
+        "package.selection_max_batch_payload_bytes": 64534,
+        "package.selection_pathspec_batches": 4,
+        "package.selection_pathspec_payload_bytes": 201472,
+        "package.selection_tracked_output_paths": 4,
+        "package.selection_tracked_queries": 4,
+        "package.selection_untracked_output_paths": 1,
+        "package.selection_untracked_queries": 4,
+        "package.selection_worktree_root_queries": 1
+      },
+      "coverage": {
+        "live_results_min": 0,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "package.changed_selection.git_batching.v1.long1024.mixed",
+      "status": "passed",
+      "module_count": 0,
+      "deterministic_counters": {
+        "package.selection_candidate_paths": 1024,
+        "package.selection_changed_paths": 4,
+        "package.selection_effective_argv_charge_bytes": 65536,
+        "package.selection_exec_budget_policy": 1,
+        "package.selection_head_queries": 1,
+        "package.selection_max_batch_argv_charge_bytes": 65190,
+        "package.selection_max_batch_payload_bytes": 64534,
+        "package.selection_pathspec_batches": 25,
+        "package.selection_pathspec_payload_bytes": 1611776,
+        "package.selection_tracked_output_paths": 4,
+        "package.selection_tracked_queries": 25,
+        "package.selection_untracked_output_paths": 1,
+        "package.selection_untracked_queries": 25,
+        "package.selection_worktree_root_queries": 1
+      },
+      "coverage": {
+        "live_results_min": 0,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "package.changed_selection.git_batching.v1.fallback1.clean",
+      "status": "passed",
+      "module_count": 0,
+      "deterministic_counters": {
+        "package.selection_candidate_paths": 1,
+        "package.selection_changed_paths": 0,
+        "package.selection_effective_argv_charge_bytes": 0,
+        "package.selection_head_queries": 1,
+        "package.selection_legacy128_policy": 1,
+        "package.selection_max_batch_argv_charge_bytes": 246,
+        "package.selection_max_batch_payload_bytes": 230,
+        "package.selection_pathspec_batches": 1,
+        "package.selection_pathspec_payload_bytes": 230,
+        "package.selection_tracked_output_paths": 0,
+        "package.selection_tracked_queries": 1,
+        "package.selection_untracked_output_paths": 0,
+        "package.selection_untracked_queries": 1,
+        "package.selection_worktree_root_queries": 1
+      },
+      "coverage": {
+        "live_results_min": 0,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "package.changed_selection.git_batching.v1.fallback129.clean",
+      "status": "passed",
+      "module_count": 0,
+      "deterministic_counters": {
+        "package.selection_candidate_paths": 129,
+        "package.selection_changed_paths": 0,
+        "package.selection_effective_argv_charge_bytes": 0,
+        "package.selection_head_queries": 1,
+        "package.selection_legacy128_policy": 1,
+        "package.selection_max_batch_argv_charge_bytes": 15744,
+        "package.selection_max_batch_payload_bytes": 14720,
+        "package.selection_pathspec_batches": 3,
+        "package.selection_pathspec_payload_bytes": 29670,
+        "package.selection_tracked_output_paths": 0,
+        "package.selection_tracked_queries": 3,
+        "package.selection_untracked_output_paths": 0,
+        "package.selection_untracked_queries": 3,
+        "package.selection_worktree_root_queries": 1
+      },
+      "coverage": {
+        "live_results_min": 0,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "package.changed_selection.git_batching.v1.fallback1024.clean",
+      "status": "passed",
+      "module_count": 0,
+      "deterministic_counters": {
+        "package.selection_candidate_paths": 1024,
+        "package.selection_changed_paths": 0,
+        "package.selection_effective_argv_charge_bytes": 0,
+        "package.selection_head_queries": 1,
+        "package.selection_legacy128_policy": 1,
+        "package.selection_max_batch_argv_charge_bytes": 15744,
+        "package.selection_max_batch_payload_bytes": 14720,
+        "package.selection_pathspec_batches": 16,
+        "package.selection_pathspec_payload_bytes": 235520,
+        "package.selection_tracked_output_paths": 0,
+        "package.selection_tracked_queries": 16,
+        "package.selection_untracked_output_paths": 0,
+        "package.selection_untracked_queries": 16,
+        "package.selection_worktree_root_queries": 1
+      },
+      "coverage": {
+        "live_results_min": 0,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "package.changed_selection.git_batching.v1.inflated129.clean",
+      "status": "passed",
+      "module_count": 0,
+      "deterministic_counters": {
+        "package.selection_candidate_paths": 129,
+        "package.selection_changed_paths": 0,
+        "package.selection_effective_argv_charge_bytes": 16384,
+        "package.selection_exec_budget_policy": 1,
+        "package.selection_head_queries": 1,
+        "package.selection_max_batch_argv_charge_bytes": 16236,
+        "package.selection_max_batch_payload_bytes": 15180,
+        "package.selection_pathspec_batches": 2,
+        "package.selection_pathspec_payload_bytes": 29670,
+        "package.selection_tracked_output_paths": 0,
+        "package.selection_tracked_queries": 2,
+        "package.selection_untracked_output_paths": 0,
+        "package.selection_untracked_queries": 2,
+        "package.selection_worktree_root_queries": 1
+      },
+      "coverage": {
+        "live_results_min": 0,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "package.changed_selection.git_batching.v1.inflated992.clean",
+      "status": "passed",
+      "module_count": 0,
+      "deterministic_counters": {
+        "package.selection_candidate_paths": 992,
+        "package.selection_changed_paths": 0,
+        "package.selection_effective_argv_charge_bytes": 16384,
+        "package.selection_exec_budget_policy": 1,
+        "package.selection_head_queries": 1,
+        "package.selection_max_batch_argv_charge_bytes": 16236,
+        "package.selection_max_batch_payload_bytes": 15180,
+        "package.selection_pathspec_batches": 16,
+        "package.selection_pathspec_payload_bytes": 228160,
+        "package.selection_tracked_output_paths": 0,
+        "package.selection_tracked_queries": 16,
+        "package.selection_untracked_output_paths": 0,
+        "package.selection_untracked_queries": 16,
+        "package.selection_worktree_root_queries": 1
+      },
+      "coverage": {
+        "live_results_min": 0,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "package.changed_selection.git_batching.v1.iut1401.clean",
+      "status": "passed",
+      "module_count": 0,
+      "deterministic_counters": {
+        "package.selection_candidate_paths": 1401,
+        "package.selection_changed_paths": 0,
+        "package.selection_effective_argv_charge_bytes": 65536,
+        "package.selection_exec_budget_policy": 1,
+        "package.selection_head_queries": 1,
+        "package.selection_max_batch_argv_charge_bytes": 65422,
+        "package.selection_max_batch_payload_bytes": 62402,
+        "package.selection_pathspec_batches": 10,
+        "package.selection_pathspec_payload_bytes": 408388,
+        "package.selection_tracked_output_paths": 0,
+        "package.selection_tracked_queries": 10,
+        "package.selection_untracked_output_paths": 0,
+        "package.selection_untracked_queries": 10,
+        "package.selection_worktree_root_queries": 1
+      },
+      "coverage": {
+        "live_results_min": 0,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "package.changed_selection.git_batching.v1.iut1401.tracked1",
+      "status": "passed",
+      "module_count": 0,
+      "deterministic_counters": {
+        "package.selection_candidate_paths": 1401,
+        "package.selection_changed_paths": 1,
+        "package.selection_effective_argv_charge_bytes": 65536,
+        "package.selection_exec_budget_policy": 1,
+        "package.selection_head_queries": 1,
+        "package.selection_max_batch_argv_charge_bytes": 65422,
+        "package.selection_max_batch_payload_bytes": 62402,
+        "package.selection_pathspec_batches": 10,
+        "package.selection_pathspec_payload_bytes": 408388,
+        "package.selection_tracked_output_paths": 1,
+        "package.selection_tracked_queries": 10,
+        "package.selection_untracked_output_paths": 0,
+        "package.selection_untracked_queries": 10,
+        "package.selection_worktree_root_queries": 1
+      },
+      "coverage": {
+        "live_results_min": 0,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "package.changed_selection.git_batching.v1.iut1401.untracked1",
+      "status": "passed",
+      "module_count": 0,
+      "deterministic_counters": {
+        "package.selection_candidate_paths": 1401,
+        "package.selection_changed_paths": 1,
+        "package.selection_effective_argv_charge_bytes": 65536,
+        "package.selection_exec_budget_policy": 1,
+        "package.selection_head_queries": 1,
+        "package.selection_max_batch_argv_charge_bytes": 65422,
+        "package.selection_max_batch_payload_bytes": 62402,
+        "package.selection_pathspec_batches": 10,
+        "package.selection_pathspec_payload_bytes": 408388,
+        "package.selection_tracked_output_paths": 1,
+        "package.selection_tracked_queries": 10,
+        "package.selection_untracked_output_paths": 1,
+        "package.selection_untracked_queries": 10,
+        "package.selection_worktree_root_queries": 1
+      },
+      "coverage": {
+        "live_results_min": 0,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "package.changed_selection.git_batching.v1.large4096.mixed",
+      "status": "passed",
+      "module_count": 0,
+      "deterministic_counters": {
+        "package.selection_candidate_paths": 4096,
+        "package.selection_changed_paths": 4,
+        "package.selection_effective_argv_charge_bytes": 65536,
+        "package.selection_exec_budget_policy": 1,
+        "package.selection_head_queries": 1,
+        "package.selection_max_batch_argv_charge_bytes": 65436,
+        "package.selection_max_batch_payload_bytes": 61180,
+        "package.selection_pathspec_batches": 16,
+        "package.selection_pathspec_payload_bytes": 942080,
+        "package.selection_tracked_output_paths": 4,
+        "package.selection_tracked_queries": 16,
+        "package.selection_untracked_output_paths": 1,
+        "package.selection_untracked_queries": 16,
+        "package.selection_worktree_root_queries": 1
+      },
+      "coverage": {
+        "live_results_min": 0,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "shared-payload-clone-1m-c1-legacy",
+      "status": "passed",
+      "module_count": 0,
+      "deterministic_counters": {
+        "package.avoided_module_payload_clone_bytes": 0,
+        "package.module_payload_handle_clones": 0,
+        "package.module_payload_unique_bytes": 0,
+        "package.module_payloads_frozen": 0
+      },
+      "coverage": {
+        "live_results_min": 0,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "shared-payload-clone-1m-c1-shared",
+      "status": "passed",
+      "module_count": 0,
+      "deterministic_counters": {
+        "package.avoided_module_payload_clone_bytes": 1201286,
+        "package.module_payload_handle_clones": 1,
+        "package.module_payload_unique_bytes": 0,
+        "package.module_payloads_frozen": 0
+      },
+      "coverage": {
+        "live_results_min": 0,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "shared-payload-clone-1m-c8-legacy",
+      "status": "passed",
+      "module_count": 0,
+      "deterministic_counters": {
+        "package.avoided_module_payload_clone_bytes": 0,
+        "package.module_payload_handle_clones": 0,
+        "package.module_payload_unique_bytes": 0,
+        "package.module_payloads_frozen": 0
+      },
+      "coverage": {
+        "live_results_min": 0,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "shared-payload-clone-1m-c8-shared",
+      "status": "passed",
+      "module_count": 0,
+      "deterministic_counters": {
+        "package.avoided_module_payload_clone_bytes": 9610288,
+        "package.module_payload_handle_clones": 8,
+        "package.module_payload_unique_bytes": 0,
+        "package.module_payloads_frozen": 0
+      },
+      "coverage": {
+        "live_results_min": 0,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "shared-payload-clone-1m-c32-legacy",
+      "status": "passed",
+      "module_count": 0,
+      "deterministic_counters": {
+        "package.avoided_module_payload_clone_bytes": 0,
+        "package.module_payload_handle_clones": 0,
+        "package.module_payload_unique_bytes": 0,
+        "package.module_payloads_frozen": 0
+      },
+      "coverage": {
+        "live_results_min": 0,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "shared-payload-clone-1m-c32-shared",
+      "status": "passed",
+      "module_count": 0,
+      "deterministic_counters": {
+        "package.avoided_module_payload_clone_bytes": 38441152,
+        "package.module_payload_handle_clones": 32,
+        "package.module_payload_unique_bytes": 0,
+        "package.module_payloads_frozen": 0
+      },
+      "coverage": {
+        "live_results_min": 0,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "shared-payload-clone-1m-c256-legacy",
+      "status": "passed",
+      "module_count": 0,
+      "deterministic_counters": {
+        "package.avoided_module_payload_clone_bytes": 0,
+        "package.module_payload_handle_clones": 0,
+        "package.module_payload_unique_bytes": 0,
+        "package.module_payloads_frozen": 0
+      },
+      "coverage": {
+        "live_results_min": 0,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "shared-payload-clone-1m-c256-shared",
+      "status": "passed",
+      "module_count": 0,
+      "deterministic_counters": {
+        "package.avoided_module_payload_clone_bytes": 307529216,
+        "package.module_payload_handle_clones": 256,
+        "package.module_payload_unique_bytes": 0,
+        "package.module_payloads_frozen": 0
+      },
+      "coverage": {
+        "live_results_min": 0,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "shared-payload-clone-16m-c1-legacy",
+      "status": "passed",
+      "module_count": 0,
+      "deterministic_counters": {
+        "package.avoided_module_payload_clone_bytes": 0,
+        "package.module_payload_handle_clones": 0,
+        "package.module_payload_unique_bytes": 0,
+        "package.module_payloads_frozen": 0
+      },
+      "coverage": {
+        "live_results_min": 0,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "shared-payload-clone-16m-c1-shared",
+      "status": "passed",
+      "module_count": 0,
+      "deterministic_counters": {
+        "package.avoided_module_payload_clone_bytes": 19195370,
+        "package.module_payload_handle_clones": 1,
+        "package.module_payload_unique_bytes": 0,
+        "package.module_payloads_frozen": 0
+      },
+      "coverage": {
+        "live_results_min": 0,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "shared-payload-clone-16m-c8-legacy",
+      "status": "passed",
+      "module_count": 0,
+      "deterministic_counters": {
+        "package.avoided_module_payload_clone_bytes": 0,
+        "package.module_payload_handle_clones": 0,
+        "package.module_payload_unique_bytes": 0,
+        "package.module_payloads_frozen": 0
+      },
+      "coverage": {
+        "live_results_min": 0,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "shared-payload-clone-16m-c8-shared",
+      "status": "passed",
+      "module_count": 0,
+      "deterministic_counters": {
+        "package.avoided_module_payload_clone_bytes": 153562960,
+        "package.module_payload_handle_clones": 8,
+        "package.module_payload_unique_bytes": 0,
+        "package.module_payloads_frozen": 0
+      },
+      "coverage": {
+        "live_results_min": 0,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "shared-payload-clone-16m-c32-legacy",
+      "status": "passed",
+      "module_count": 0,
+      "deterministic_counters": {
+        "package.avoided_module_payload_clone_bytes": 0,
+        "package.module_payload_handle_clones": 0,
+        "package.module_payload_unique_bytes": 0,
+        "package.module_payloads_frozen": 0
+      },
+      "coverage": {
+        "live_results_min": 0,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "shared-payload-clone-16m-c32-shared",
+      "status": "passed",
+      "module_count": 0,
+      "deterministic_counters": {
+        "package.avoided_module_payload_clone_bytes": 614251840,
+        "package.module_payload_handle_clones": 32,
+        "package.module_payload_unique_bytes": 0,
+        "package.module_payloads_frozen": 0
+      },
+      "coverage": {
+        "live_results_min": 0,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "shared-payload-clone-16m-c256-legacy",
+      "status": "passed",
+      "module_count": 0,
+      "deterministic_counters": {
+        "package.avoided_module_payload_clone_bytes": 0,
+        "package.module_payload_handle_clones": 0,
+        "package.module_payload_unique_bytes": 0,
+        "package.module_payloads_frozen": 0
+      },
+      "coverage": {
+        "live_results_min": 0,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "shared-payload-clone-16m-c256-shared",
+      "status": "passed",
+      "module_count": 0,
+      "deterministic_counters": {
+        "package.avoided_module_payload_clone_bytes": 4914014720,
+        "package.module_payload_handle_clones": 256,
+        "package.module_payload_unique_bytes": 0,
+        "package.module_payloads_frozen": 0
+      },
+      "coverage": {
+        "live_results_min": 0,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "shared-payload-clone-near-c1-legacy",
+      "status": "passed",
+      "module_count": 0,
+      "deterministic_counters": {
+        "package.avoided_module_payload_clone_bytes": 0,
+        "package.module_payload_handle_clones": 0,
+        "package.module_payload_unique_bytes": 0,
+        "package.module_payloads_frozen": 0
+      },
+      "coverage": {
+        "live_results_min": 0,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "shared-payload-clone-near-c1-shared",
+      "status": "passed",
+      "module_count": 0,
+      "deterministic_counters": {
+        "package.avoided_module_payload_clone_bytes": 76775582,
+        "package.module_payload_handle_clones": 1,
+        "package.module_payload_unique_bytes": 0,
+        "package.module_payloads_frozen": 0
+      },
+      "coverage": {
+        "live_results_min": 0,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "shared-payload-clone-near-c8-legacy",
+      "status": "passed",
+      "module_count": 0,
+      "deterministic_counters": {
+        "package.avoided_module_payload_clone_bytes": 0,
+        "package.module_payload_handle_clones": 0,
+        "package.module_payload_unique_bytes": 0,
+        "package.module_payloads_frozen": 0
+      },
+      "coverage": {
+        "live_results_min": 0,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "shared-payload-clone-near-c8-shared",
+      "status": "passed",
+      "module_count": 0,
+      "deterministic_counters": {
+        "package.avoided_module_payload_clone_bytes": 614204656,
+        "package.module_payload_handle_clones": 8,
+        "package.module_payload_unique_bytes": 0,
+        "package.module_payloads_frozen": 0
+      },
+      "coverage": {
+        "live_results_min": 0,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "shared-payload-clone-near-c32-legacy",
+      "status": "passed",
+      "module_count": 0,
+      "deterministic_counters": {
+        "package.avoided_module_payload_clone_bytes": 0,
+        "package.module_payload_handle_clones": 0,
+        "package.module_payload_unique_bytes": 0,
+        "package.module_payloads_frozen": 0
+      },
+      "coverage": {
+        "live_results_min": 0,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "shared-payload-clone-near-c32-shared",
+      "status": "passed",
+      "module_count": 0,
+      "deterministic_counters": {
+        "package.avoided_module_payload_clone_bytes": 2456818624,
+        "package.module_payload_handle_clones": 32,
+        "package.module_payload_unique_bytes": 0,
+        "package.module_payloads_frozen": 0
+      },
+      "coverage": {
+        "live_results_min": 0,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "shared-payload-clone-near-c256-legacy",
+      "status": "passed",
+      "module_count": 0,
+      "deterministic_counters": {
+        "package.avoided_module_payload_clone_bytes": 0,
+        "package.module_payload_handle_clones": 0,
+        "package.module_payload_unique_bytes": 0,
+        "package.module_payloads_frozen": 0
+      },
+      "coverage": {
+        "live_results_min": 0,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "shared-payload-clone-near-c256-shared",
+      "status": "passed",
+      "module_count": 0,
+      "deterministic_counters": {
+        "package.avoided_module_payload_clone_bytes": 19654548992,
+        "package.module_payload_handle_clones": 256,
+        "package.module_payload_unique_bytes": 0,
+        "package.module_payloads_frozen": 0
+      },
+      "coverage": {
+        "live_results_min": 0,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "shared-payload-cache-1m-cold-disabled",
+      "status": "passed",
+      "module_count": 1,
+      "deterministic_counters": {
+        "package.decode_cache_capacity_stops": 0,
+        "package.decode_cache_peak_retained_bytes": 0,
+        "package.decode_cache_retained_bytes": 0,
+        "package.module_payload_handle_clones": 1,
+        "package.module_payload_unique_bytes": 1193678,
+        "package.module_payloads_frozen": 1,
+        "package.modules_decoded": 1
+      },
+      "coverage": {
+        "live_results_min": 1,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "shared-payload-cache-1m-miss-process-local",
+      "status": "passed",
+      "module_count": 1,
+      "deterministic_counters": {
+        "package.decode_cache_capacity_stops": 0,
+        "package.decode_cache_peak_retained_bytes": 1193877,
+        "package.decode_cache_retained_bytes": 1193877,
+        "package.module_payload_handle_clones": 2,
+        "package.module_payload_unique_bytes": 1193678,
+        "package.module_payloads_frozen": 1,
+        "package.modules_decoded": 1
+      },
+      "coverage": {
+        "live_results_min": 1,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "shared-payload-cache-1m-hit-process-local",
+      "status": "passed",
+      "module_count": 1,
+      "deterministic_counters": {
+        "package.decode_cache_capacity_stops": 0,
+        "package.decode_cache_peak_retained_bytes": 1193877,
+        "package.decode_cache_retained_bytes": 1193877,
+        "package.module_payload_handle_clones": 2,
+        "package.module_payload_unique_bytes": 0,
+        "package.module_payloads_frozen": 0,
+        "package.modules_decoded": 0
+      },
+      "coverage": {
+        "live_results_min": 1,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "shared-payload-cache-1m-miss-persistent",
+      "status": "passed",
+      "module_count": 1,
+      "deterministic_counters": {
+        "package.decode_cache_capacity_stops": 0,
+        "package.decode_cache_peak_retained_bytes": 1193877,
+        "package.decode_cache_retained_bytes": 1193877,
+        "package.module_payload_handle_clones": 2,
+        "package.module_payload_unique_bytes": 1193678,
+        "package.module_payloads_frozen": 1,
+        "package.modules_decoded": 1
+      },
+      "coverage": {
+        "live_results_min": 1,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "shared-payload-cache-1m-hit-persistent",
+      "status": "passed",
+      "module_count": 1,
+      "deterministic_counters": {
+        "package.decode_cache_capacity_stops": 0,
+        "package.decode_cache_peak_retained_bytes": 1193877,
+        "package.decode_cache_retained_bytes": 1193877,
+        "package.module_payload_handle_clones": 2,
+        "package.module_payload_unique_bytes": 0,
+        "package.module_payloads_frozen": 0,
+        "package.modules_decoded": 0
+      },
+      "coverage": {
+        "live_results_min": 1,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "shared-payload-memo-multi-miss",
+      "status": "passed",
+      "module_count": 64,
+      "deterministic_counters": {
+        "package.module_payload_handle_clones": 64,
+        "package.module_payload_unique_bytes": 76522272,
+        "package.module_payloads_frozen": 64,
+        "package.modules_decoded": 64,
+        "package.process_memo_payload_handle_clones": 0
+      },
+      "coverage": {
+        "live_results_min": 64,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "shared-payload-memo-multi-hit",
+      "status": "passed",
+      "module_count": 64,
+      "deterministic_counters": {
+        "package.module_payload_handle_clones": 64,
+        "package.module_payload_unique_bytes": 0,
+        "package.module_payloads_frozen": 0,
+        "package.modules_decoded": 0,
+        "package.process_memo_payload_handle_clones": 64
+      },
+      "coverage": {
+        "live_results_min": 0,
+        "proof_evidence_reduction_allowed": true
+      }
+    },
+    {
+      "id": "shared-payload-session-s1-snapshot-legacy",
+      "status": "passed",
+      "module_count": 0,
+      "deterministic_counters": {
+        "package.module_payloads_frozen": 0,
+        "package.session_index_cow_copies": 0,
+        "package.session_index_cow_entries": 0,
+        "package.session_snapshot_clones": 0
+      },
+      "coverage": {
+        "live_results_min": 0,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "shared-payload-session-s1-snapshot-shared",
+      "status": "passed",
+      "module_count": 0,
+      "deterministic_counters": {
+        "package.module_payloads_frozen": 0,
+        "package.session_index_cow_copies": 0,
+        "package.session_index_cow_entries": 0,
+        "package.session_snapshot_clones": 1
+      },
+      "coverage": {
+        "live_results_min": 0,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "shared-payload-session-s1-first-cow-legacy",
+      "status": "passed",
+      "module_count": 0,
+      "deterministic_counters": {
+        "package.module_payloads_frozen": 0,
+        "package.session_index_cow_copies": 0,
+        "package.session_index_cow_entries": 0,
+        "package.session_snapshot_clones": 0
+      },
+      "coverage": {
+        "live_results_min": 0,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "shared-payload-session-s1-first-cow-shared",
+      "status": "passed",
+      "module_count": 0,
+      "deterministic_counters": {
+        "package.module_payloads_frozen": 0,
+        "package.session_index_cow_copies": 1,
+        "package.session_index_cow_entries": 1,
+        "package.session_snapshot_clones": 0
+      },
+      "coverage": {
+        "live_results_min": 0,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "shared-payload-session-s64-snapshot-legacy",
+      "status": "passed",
+      "module_count": 0,
+      "deterministic_counters": {
+        "package.module_payloads_frozen": 0,
+        "package.session_index_cow_copies": 0,
+        "package.session_index_cow_entries": 0,
+        "package.session_snapshot_clones": 0
+      },
+      "coverage": {
+        "live_results_min": 0,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "shared-payload-session-s64-snapshot-shared",
+      "status": "passed",
+      "module_count": 0,
+      "deterministic_counters": {
+        "package.module_payloads_frozen": 0,
+        "package.session_index_cow_copies": 0,
+        "package.session_index_cow_entries": 0,
+        "package.session_snapshot_clones": 1
+      },
+      "coverage": {
+        "live_results_min": 0,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "shared-payload-session-s64-first-cow-legacy",
+      "status": "passed",
+      "module_count": 0,
+      "deterministic_counters": {
+        "package.module_payloads_frozen": 0,
+        "package.session_index_cow_copies": 0,
+        "package.session_index_cow_entries": 0,
+        "package.session_snapshot_clones": 0
+      },
+      "coverage": {
+        "live_results_min": 0,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "shared-payload-session-s64-first-cow-shared",
+      "status": "passed",
+      "module_count": 0,
+      "deterministic_counters": {
+        "package.module_payloads_frozen": 0,
+        "package.session_index_cow_copies": 1,
+        "package.session_index_cow_entries": 64,
+        "package.session_snapshot_clones": 0
+      },
+      "coverage": {
+        "live_results_min": 0,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "shared-payload-session-s1024-snapshot-legacy",
+      "status": "passed",
+      "module_count": 0,
+      "deterministic_counters": {
+        "package.module_payloads_frozen": 0,
+        "package.session_index_cow_copies": 0,
+        "package.session_index_cow_entries": 0,
+        "package.session_snapshot_clones": 0
+      },
+      "coverage": {
+        "live_results_min": 0,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "shared-payload-session-s1024-snapshot-shared",
+      "status": "passed",
+      "module_count": 0,
+      "deterministic_counters": {
+        "package.module_payloads_frozen": 0,
+        "package.session_index_cow_copies": 0,
+        "package.session_index_cow_entries": 0,
+        "package.session_snapshot_clones": 1
+      },
+      "coverage": {
+        "live_results_min": 0,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "shared-payload-session-s1024-first-cow-legacy",
+      "status": "passed",
+      "module_count": 0,
+      "deterministic_counters": {
+        "package.module_payloads_frozen": 0,
+        "package.session_index_cow_copies": 0,
+        "package.session_index_cow_entries": 0,
+        "package.session_snapshot_clones": 0
+      },
+      "coverage": {
+        "live_results_min": 0,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "shared-payload-session-s1024-first-cow-shared",
+      "status": "passed",
+      "module_count": 0,
+      "deterministic_counters": {
+        "package.module_payloads_frozen": 0,
+        "package.session_index_cow_copies": 1,
+        "package.session_index_cow_entries": 1024,
+        "package.session_snapshot_clones": 0
+      },
+      "coverage": {
+        "live_results_min": 0,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "shared-payload-shard-multi-j1",
+      "status": "passed",
+      "module_count": 64,
+      "deterministic_counters": {
+        "package.module_payload_handle_clones": 64,
+        "package.module_payload_unique_bytes": 76522272,
+        "package.module_payloads_frozen": 64,
+        "package.modules_decoded": 64,
+        "package.requested_jobs": 1
+      },
+      "coverage": {
+        "live_results_min": 64,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "shared-payload-shard-multi-j8",
+      "status": "passed",
+      "module_count": 64,
+      "deterministic_counters": {
+        "package.module_payload_handle_clones": 64,
+        "package.module_payload_unique_bytes": 76522272,
+        "package.module_payloads_frozen": 64,
+        "package.modules_decoded": 64,
+        "package.requested_jobs": 8
+      },
+      "coverage": {
+        "live_results_min": 64,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "shared-payload-small-1k-c256-legacy",
+      "status": "passed",
+      "module_count": 0,
+      "deterministic_counters": {
+        "package.avoided_module_payload_clone_bytes": 0,
+        "package.module_payload_handle_clones": 0,
+        "package.module_payload_unique_bytes": 0,
+        "package.module_payloads_frozen": 0
+      },
+      "coverage": {
+        "live_results_min": 0,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "shared-payload-small-1k-c256-shared",
+      "status": "passed",
+      "module_count": 0,
+      "deterministic_counters": {
+        "package.avoided_module_payload_clone_bytes": 1229056,
+        "package.module_payload_handle_clones": 256,
+        "package.module_payload_unique_bytes": 0,
+        "package.module_payloads_frozen": 0
+      },
+      "coverage": {
+        "live_results_min": 0,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "package-artifact-snapshot-rep-api-pm0-dc0-fast-raw-j1",
+      "status": "passed",
+      "module_count": 1000,
+      "deterministic_counters": {
+        "package.artifact_file_hashes": 1000,
+        "package.artifact_files_read": 0,
+        "package.artifact_full_decodes": 2000,
+        "package.artifact_prepared_reuses": 0,
+        "package.prepared_artifact_admissions": 0,
+        "package.prepared_artifact_admitted_bytes": 0,
+        "package.prepared_artifact_byte_limit_fallbacks": 0,
+        "package.prepared_artifact_current_bytes": 0,
+        "package.prepared_artifact_current_entries": 0,
+        "package.prepared_artifact_derivation_current_bytes": 0,
+        "package.prepared_artifact_derivation_peak_bytes": 0,
+        "package.prepared_artifact_entry_limit_fallbacks": 0,
+        "package.prepared_artifact_key_current_bytes": 0,
+        "package.prepared_artifact_key_peak_bytes": 0,
+        "package.prepared_artifact_peak_bytes": 0,
+        "package.prepared_artifact_peak_entries": 0,
+        "package.prepared_artifact_released_bytes": 0,
+        "package.prepared_artifact_releases": 0,
+        "package.prepared_artifact_saturated_charge_fallbacks": 0
+      },
+      "coverage": {
+        "live_results_min": 0,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "package-artifact-snapshot-rep-api-pm0-dc0-fast-snapshot-j1",
+      "status": "passed",
+      "module_count": 1000,
+      "deterministic_counters": {
+        "package.artifact_file_hashes": 1000,
+        "package.artifact_files_read": 0,
+        "package.artifact_full_decodes": 1000,
+        "package.artifact_prepared_reuses": 1000,
+        "package.prepared_artifact_admissions": 1000,
+        "package.prepared_artifact_admitted_bytes": 60012497,
+        "package.prepared_artifact_byte_limit_fallbacks": 0,
+        "package.prepared_artifact_current_bytes": 0,
+        "package.prepared_artifact_current_entries": 0,
+        "package.prepared_artifact_derivation_current_bytes": 0,
+        "package.prepared_artifact_derivation_peak_bytes": 60111,
+        "package.prepared_artifact_entry_limit_fallbacks": 0,
+        "package.prepared_artifact_key_current_bytes": 0,
+        "package.prepared_artifact_key_peak_bytes": 0,
+        "package.prepared_artifact_peak_bytes": 60012497,
+        "package.prepared_artifact_peak_entries": 1000,
+        "package.prepared_artifact_released_bytes": 60012497,
+        "package.prepared_artifact_releases": 1000,
+        "package.prepared_artifact_saturated_charge_fallbacks": 0
+      },
+      "coverage": {
+        "live_results_min": 0,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "package-artifact-snapshot-1k-api-pm0-dc0-fast-raw-j1",
+      "status": "passed",
+      "module_count": 1,
+      "deterministic_counters": {
+        "package.artifact_file_hashes": 1,
+        "package.artifact_files_read": 0,
+        "package.artifact_full_decodes": 2,
+        "package.artifact_prepared_reuses": 0,
+        "package.prepared_artifact_admissions": 0,
+        "package.prepared_artifact_admitted_bytes": 0,
+        "package.prepared_artifact_byte_limit_fallbacks": 0,
+        "package.prepared_artifact_current_bytes": 0,
+        "package.prepared_artifact_current_entries": 0,
+        "package.prepared_artifact_derivation_current_bytes": 0,
+        "package.prepared_artifact_derivation_peak_bytes": 0,
+        "package.prepared_artifact_entry_limit_fallbacks": 0,
+        "package.prepared_artifact_key_current_bytes": 0,
+        "package.prepared_artifact_key_peak_bytes": 0,
+        "package.prepared_artifact_peak_bytes": 0,
+        "package.prepared_artifact_peak_entries": 0,
+        "package.prepared_artifact_released_bytes": 0,
+        "package.prepared_artifact_releases": 0,
+        "package.prepared_artifact_saturated_charge_fallbacks": 0
+      },
+      "coverage": {
+        "live_results_min": 0,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "package-artifact-snapshot-1k-api-pm0-dc0-fast-snapshot-j1",
+      "status": "passed",
+      "module_count": 1,
+      "deterministic_counters": {
+        "package.artifact_file_hashes": 1,
+        "package.artifact_files_read": 0,
+        "package.artifact_full_decodes": 1,
+        "package.artifact_prepared_reuses": 1,
+        "package.prepared_artifact_admissions": 1,
+        "package.prepared_artifact_admitted_bytes": 4057,
+        "package.prepared_artifact_byte_limit_fallbacks": 0,
+        "package.prepared_artifact_current_bytes": 0,
+        "package.prepared_artifact_current_entries": 0,
+        "package.prepared_artifact_derivation_current_bytes": 0,
+        "package.prepared_artifact_derivation_peak_bytes": 4057,
+        "package.prepared_artifact_entry_limit_fallbacks": 0,
+        "package.prepared_artifact_key_current_bytes": 0,
+        "package.prepared_artifact_key_peak_bytes": 0,
+        "package.prepared_artifact_peak_bytes": 4057,
+        "package.prepared_artifact_peak_entries": 1,
+        "package.prepared_artifact_released_bytes": 4057,
+        "package.prepared_artifact_releases": 1,
+        "package.prepared_artifact_saturated_charge_fallbacks": 0
+      },
+      "coverage": {
+        "live_results_min": 0,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "package-artifact-snapshot-1m-api-pm0-dc0-fast-raw-j1",
+      "status": "passed",
+      "module_count": 1,
+      "deterministic_counters": {
+        "package.artifact_file_hashes": 1,
+        "package.artifact_files_read": 0,
+        "package.artifact_full_decodes": 2,
+        "package.artifact_prepared_reuses": 0,
+        "package.prepared_artifact_admissions": 0,
+        "package.prepared_artifact_admitted_bytes": 0,
+        "package.prepared_artifact_byte_limit_fallbacks": 0,
+        "package.prepared_artifact_current_bytes": 0,
+        "package.prepared_artifact_current_entries": 0,
+        "package.prepared_artifact_derivation_current_bytes": 0,
+        "package.prepared_artifact_derivation_peak_bytes": 0,
+        "package.prepared_artifact_entry_limit_fallbacks": 0,
+        "package.prepared_artifact_key_current_bytes": 0,
+        "package.prepared_artifact_key_peak_bytes": 0,
+        "package.prepared_artifact_peak_bytes": 0,
+        "package.prepared_artifact_peak_entries": 0,
+        "package.prepared_artifact_released_bytes": 0,
+        "package.prepared_artifact_releases": 0,
+        "package.prepared_artifact_saturated_charge_fallbacks": 0
+      },
+      "coverage": {
+        "live_results_min": 0,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "package-artifact-snapshot-1m-api-pm0-dc0-fast-snapshot-j1",
+      "status": "passed",
+      "module_count": 1,
+      "deterministic_counters": {
+        "package.artifact_file_hashes": 1,
+        "package.artifact_files_read": 0,
+        "package.artifact_full_decodes": 1,
+        "package.artifact_prepared_reuses": 1,
+        "package.prepared_artifact_admissions": 1,
+        "package.prepared_artifact_admitted_bytes": 1193678,
+        "package.prepared_artifact_byte_limit_fallbacks": 0,
+        "package.prepared_artifact_current_bytes": 0,
+        "package.prepared_artifact_current_entries": 0,
+        "package.prepared_artifact_derivation_current_bytes": 0,
+        "package.prepared_artifact_derivation_peak_bytes": 1193678,
+        "package.prepared_artifact_entry_limit_fallbacks": 0,
+        "package.prepared_artifact_key_current_bytes": 0,
+        "package.prepared_artifact_key_peak_bytes": 0,
+        "package.prepared_artifact_peak_bytes": 1193678,
+        "package.prepared_artifact_peak_entries": 1,
+        "package.prepared_artifact_released_bytes": 1193678,
+        "package.prepared_artifact_releases": 1,
+        "package.prepared_artifact_saturated_charge_fallbacks": 0
+      },
+      "coverage": {
+        "live_results_min": 0,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "package-artifact-snapshot-near-api-pm0-dc0-fast-raw-j1",
+      "status": "passed",
+      "module_count": 1,
+      "deterministic_counters": {
+        "package.artifact_file_hashes": 1,
+        "package.artifact_files_read": 0,
+        "package.artifact_full_decodes": 2,
+        "package.artifact_prepared_reuses": 0,
+        "package.prepared_artifact_admissions": 0,
+        "package.prepared_artifact_admitted_bytes": 0,
+        "package.prepared_artifact_byte_limit_fallbacks": 0,
+        "package.prepared_artifact_current_bytes": 0,
+        "package.prepared_artifact_current_entries": 0,
+        "package.prepared_artifact_derivation_current_bytes": 0,
+        "package.prepared_artifact_derivation_peak_bytes": 0,
+        "package.prepared_artifact_entry_limit_fallbacks": 0,
+        "package.prepared_artifact_key_current_bytes": 0,
+        "package.prepared_artifact_key_peak_bytes": 0,
+        "package.prepared_artifact_peak_bytes": 0,
+        "package.prepared_artifact_peak_entries": 0,
+        "package.prepared_artifact_released_bytes": 0,
+        "package.prepared_artifact_releases": 0,
+        "package.prepared_artifact_saturated_charge_fallbacks": 0
+      },
+      "coverage": {
+        "live_results_min": 0,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "package-artifact-snapshot-near-api-pm0-dc0-fast-snapshot-j1",
+      "status": "passed",
+      "module_count": 1,
+      "deterministic_counters": {
+        "package.artifact_file_hashes": 1,
+        "package.artifact_files_read": 0,
+        "package.artifact_full_decodes": 1,
+        "package.artifact_prepared_reuses": 1,
+        "package.prepared_artifact_admissions": 1,
+        "package.prepared_artifact_admitted_bytes": 76220102,
+        "package.prepared_artifact_byte_limit_fallbacks": 0,
+        "package.prepared_artifact_current_bytes": 0,
+        "package.prepared_artifact_current_entries": 0,
+        "package.prepared_artifact_derivation_current_bytes": 0,
+        "package.prepared_artifact_derivation_peak_bytes": 76220102,
+        "package.prepared_artifact_entry_limit_fallbacks": 0,
+        "package.prepared_artifact_key_current_bytes": 0,
+        "package.prepared_artifact_key_peak_bytes": 0,
+        "package.prepared_artifact_peak_bytes": 76220102,
+        "package.prepared_artifact_peak_entries": 1,
+        "package.prepared_artifact_released_bytes": 76220102,
+        "package.prepared_artifact_releases": 1,
+        "package.prepared_artifact_saturated_charge_fallbacks": 0
+      },
+      "coverage": {
+        "live_results_min": 0,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "package-artifact-snapshot-rep-api-pm0-dcp-fast-raw-j1",
+      "status": "passed",
+      "module_count": 1000,
+      "deterministic_counters": {
+        "package.artifact_file_hashes": 1000,
+        "package.artifact_files_read": 0,
+        "package.artifact_full_decodes": 1000,
+        "package.artifact_prepared_reuses": 0,
+        "package.prepared_artifact_admissions": 0,
+        "package.prepared_artifact_admitted_bytes": 0,
+        "package.prepared_artifact_byte_limit_fallbacks": 0,
+        "package.prepared_artifact_current_bytes": 0,
+        "package.prepared_artifact_current_entries": 0,
+        "package.prepared_artifact_derivation_current_bytes": 0,
+        "package.prepared_artifact_derivation_peak_bytes": 0,
+        "package.prepared_artifact_entry_limit_fallbacks": 0,
+        "package.prepared_artifact_key_current_bytes": 0,
+        "package.prepared_artifact_key_peak_bytes": 0,
+        "package.prepared_artifact_peak_bytes": 0,
+        "package.prepared_artifact_peak_entries": 0,
+        "package.prepared_artifact_released_bytes": 0,
+        "package.prepared_artifact_releases": 0,
+        "package.prepared_artifact_saturated_charge_fallbacks": 0
+      },
+      "coverage": {
+        "live_results_min": 0,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "package-artifact-snapshot-rep-api-pm0-dcp-fast-snapshot-j1",
+      "status": "passed",
+      "module_count": 1000,
+      "deterministic_counters": {
+        "package.artifact_file_hashes": 1000,
+        "package.artifact_files_read": 0,
+        "package.artifact_full_decodes": 1000,
+        "package.artifact_prepared_reuses": 1000,
+        "package.prepared_artifact_admissions": 1000,
+        "package.prepared_artifact_admitted_bytes": 60012497,
+        "package.prepared_artifact_byte_limit_fallbacks": 0,
+        "package.prepared_artifact_current_bytes": 0,
+        "package.prepared_artifact_current_entries": 0,
+        "package.prepared_artifact_derivation_current_bytes": 0,
+        "package.prepared_artifact_derivation_peak_bytes": 60111,
+        "package.prepared_artifact_entry_limit_fallbacks": 0,
+        "package.prepared_artifact_key_current_bytes": 0,
+        "package.prepared_artifact_key_peak_bytes": 0,
+        "package.prepared_artifact_peak_bytes": 60012497,
+        "package.prepared_artifact_peak_entries": 1000,
+        "package.prepared_artifact_released_bytes": 60012497,
+        "package.prepared_artifact_releases": 1000,
+        "package.prepared_artifact_saturated_charge_fallbacks": 0
+      },
+      "coverage": {
+        "live_results_min": 0,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "package-artifact-snapshot-rep-api-pm0-dcpp-fast-raw-j1",
+      "status": "passed",
+      "module_count": 1000,
+      "deterministic_counters": {
+        "package.artifact_file_hashes": 1000,
+        "package.artifact_files_read": 0,
+        "package.artifact_full_decodes": 1000,
+        "package.artifact_prepared_reuses": 0,
+        "package.prepared_artifact_admissions": 0,
+        "package.prepared_artifact_admitted_bytes": 0,
+        "package.prepared_artifact_byte_limit_fallbacks": 0,
+        "package.prepared_artifact_current_bytes": 0,
+        "package.prepared_artifact_current_entries": 0,
+        "package.prepared_artifact_derivation_current_bytes": 0,
+        "package.prepared_artifact_derivation_peak_bytes": 0,
+        "package.prepared_artifact_entry_limit_fallbacks": 0,
+        "package.prepared_artifact_key_current_bytes": 0,
+        "package.prepared_artifact_key_peak_bytes": 0,
+        "package.prepared_artifact_peak_bytes": 0,
+        "package.prepared_artifact_peak_entries": 0,
+        "package.prepared_artifact_released_bytes": 0,
+        "package.prepared_artifact_releases": 0,
+        "package.prepared_artifact_saturated_charge_fallbacks": 0
+      },
+      "coverage": {
+        "live_results_min": 0,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "package-artifact-snapshot-rep-api-pm0-dcpp-fast-snapshot-j1",
+      "status": "passed",
+      "module_count": 1000,
+      "deterministic_counters": {
+        "package.artifact_file_hashes": 1000,
+        "package.artifact_files_read": 0,
+        "package.artifact_full_decodes": 1000,
+        "package.artifact_prepared_reuses": 1000,
+        "package.prepared_artifact_admissions": 1000,
+        "package.prepared_artifact_admitted_bytes": 60012497,
+        "package.prepared_artifact_byte_limit_fallbacks": 0,
+        "package.prepared_artifact_current_bytes": 0,
+        "package.prepared_artifact_current_entries": 0,
+        "package.prepared_artifact_derivation_current_bytes": 0,
+        "package.prepared_artifact_derivation_peak_bytes": 60111,
+        "package.prepared_artifact_entry_limit_fallbacks": 0,
+        "package.prepared_artifact_key_current_bytes": 0,
+        "package.prepared_artifact_key_peak_bytes": 0,
+        "package.prepared_artifact_peak_bytes": 60012497,
+        "package.prepared_artifact_peak_entries": 1000,
+        "package.prepared_artifact_released_bytes": 60012497,
+        "package.prepared_artifact_releases": 1000,
+        "package.prepared_artifact_saturated_charge_fallbacks": 0
+      },
+      "coverage": {
+        "live_results_min": 0,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "package-artifact-snapshot-rep-api-pmp-dc0-fast-raw-j1",
+      "status": "passed",
+      "module_count": 1000,
+      "deterministic_counters": {
+        "package.artifact_file_hashes": 1000,
+        "package.artifact_files_read": 0,
+        "package.artifact_full_decodes": 1000,
+        "package.artifact_prepared_reuses": 0,
+        "package.prepared_artifact_admissions": 0,
+        "package.prepared_artifact_admitted_bytes": 0,
+        "package.prepared_artifact_byte_limit_fallbacks": 0,
+        "package.prepared_artifact_current_bytes": 0,
+        "package.prepared_artifact_current_entries": 0,
+        "package.prepared_artifact_derivation_current_bytes": 0,
+        "package.prepared_artifact_derivation_peak_bytes": 0,
+        "package.prepared_artifact_entry_limit_fallbacks": 0,
+        "package.prepared_artifact_key_current_bytes": 0,
+        "package.prepared_artifact_key_peak_bytes": 0,
+        "package.prepared_artifact_peak_bytes": 0,
+        "package.prepared_artifact_peak_entries": 0,
+        "package.prepared_artifact_released_bytes": 0,
+        "package.prepared_artifact_releases": 0,
+        "package.prepared_artifact_saturated_charge_fallbacks": 0
+      },
+      "coverage": {
+        "live_results_min": 0,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "package-artifact-snapshot-rep-api-pmp-dc0-fast-snapshot-j1",
+      "status": "passed",
+      "module_count": 1000,
+      "deterministic_counters": {
+        "package.artifact_file_hashes": 1000,
+        "package.artifact_files_read": 0,
+        "package.artifact_full_decodes": 1000,
+        "package.artifact_prepared_reuses": 0,
+        "package.prepared_artifact_admissions": 1000,
+        "package.prepared_artifact_admitted_bytes": 60012497,
+        "package.prepared_artifact_byte_limit_fallbacks": 0,
+        "package.prepared_artifact_current_bytes": 0,
+        "package.prepared_artifact_current_entries": 0,
+        "package.prepared_artifact_derivation_current_bytes": 0,
+        "package.prepared_artifact_derivation_peak_bytes": 60111,
+        "package.prepared_artifact_entry_limit_fallbacks": 0,
+        "package.prepared_artifact_key_current_bytes": 0,
+        "package.prepared_artifact_key_peak_bytes": 0,
+        "package.prepared_artifact_peak_bytes": 60012497,
+        "package.prepared_artifact_peak_entries": 1000,
+        "package.prepared_artifact_released_bytes": 60012497,
+        "package.prepared_artifact_releases": 1000,
+        "package.prepared_artifact_saturated_charge_fallbacks": 0
+      },
+      "coverage": {
+        "live_results_min": 0,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "package-artifact-snapshot-rep-api-pmp-dcp-fast-raw-j1",
+      "status": "passed",
+      "module_count": 1000,
+      "deterministic_counters": {
+        "package.artifact_file_hashes": 1000,
+        "package.artifact_files_read": 0,
+        "package.artifact_full_decodes": 1000,
+        "package.artifact_prepared_reuses": 0,
+        "package.prepared_artifact_admissions": 0,
+        "package.prepared_artifact_admitted_bytes": 0,
+        "package.prepared_artifact_byte_limit_fallbacks": 0,
+        "package.prepared_artifact_current_bytes": 0,
+        "package.prepared_artifact_current_entries": 0,
+        "package.prepared_artifact_derivation_current_bytes": 0,
+        "package.prepared_artifact_derivation_peak_bytes": 0,
+        "package.prepared_artifact_entry_limit_fallbacks": 0,
+        "package.prepared_artifact_key_current_bytes": 0,
+        "package.prepared_artifact_key_peak_bytes": 0,
+        "package.prepared_artifact_peak_bytes": 0,
+        "package.prepared_artifact_peak_entries": 0,
+        "package.prepared_artifact_released_bytes": 0,
+        "package.prepared_artifact_releases": 0,
+        "package.prepared_artifact_saturated_charge_fallbacks": 0
+      },
+      "coverage": {
+        "live_results_min": 0,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "package-artifact-snapshot-rep-api-pmp-dcp-fast-snapshot-j1",
+      "status": "passed",
+      "module_count": 1000,
+      "deterministic_counters": {
+        "package.artifact_file_hashes": 1000,
+        "package.artifact_files_read": 0,
+        "package.artifact_full_decodes": 1000,
+        "package.artifact_prepared_reuses": 0,
+        "package.prepared_artifact_admissions": 1000,
+        "package.prepared_artifact_admitted_bytes": 60012497,
+        "package.prepared_artifact_byte_limit_fallbacks": 0,
+        "package.prepared_artifact_current_bytes": 0,
+        "package.prepared_artifact_current_entries": 0,
+        "package.prepared_artifact_derivation_current_bytes": 0,
+        "package.prepared_artifact_derivation_peak_bytes": 60111,
+        "package.prepared_artifact_entry_limit_fallbacks": 0,
+        "package.prepared_artifact_key_current_bytes": 0,
+        "package.prepared_artifact_key_peak_bytes": 0,
+        "package.prepared_artifact_peak_bytes": 60012497,
+        "package.prepared_artifact_peak_entries": 1000,
+        "package.prepared_artifact_released_bytes": 60012497,
+        "package.prepared_artifact_releases": 1000,
+        "package.prepared_artifact_saturated_charge_fallbacks": 0
+      },
+      "coverage": {
+        "live_results_min": 0,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "package-artifact-snapshot-rep-api-pmp-dcpp-fast-raw-j1",
+      "status": "passed",
+      "module_count": 1000,
+      "deterministic_counters": {
+        "package.artifact_file_hashes": 1000,
+        "package.artifact_files_read": 0,
+        "package.artifact_full_decodes": 1000,
+        "package.artifact_prepared_reuses": 0,
+        "package.prepared_artifact_admissions": 0,
+        "package.prepared_artifact_admitted_bytes": 0,
+        "package.prepared_artifact_byte_limit_fallbacks": 0,
+        "package.prepared_artifact_current_bytes": 0,
+        "package.prepared_artifact_current_entries": 0,
+        "package.prepared_artifact_derivation_current_bytes": 0,
+        "package.prepared_artifact_derivation_peak_bytes": 0,
+        "package.prepared_artifact_entry_limit_fallbacks": 0,
+        "package.prepared_artifact_key_current_bytes": 0,
+        "package.prepared_artifact_key_peak_bytes": 0,
+        "package.prepared_artifact_peak_bytes": 0,
+        "package.prepared_artifact_peak_entries": 0,
+        "package.prepared_artifact_released_bytes": 0,
+        "package.prepared_artifact_releases": 0,
+        "package.prepared_artifact_saturated_charge_fallbacks": 0
+      },
+      "coverage": {
+        "live_results_min": 0,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "package-artifact-snapshot-rep-api-pmp-dcpp-fast-snapshot-j1",
+      "status": "passed",
+      "module_count": 1000,
+      "deterministic_counters": {
+        "package.artifact_file_hashes": 1000,
+        "package.artifact_files_read": 0,
+        "package.artifact_full_decodes": 1000,
+        "package.artifact_prepared_reuses": 0,
+        "package.prepared_artifact_admissions": 1000,
+        "package.prepared_artifact_admitted_bytes": 60012497,
+        "package.prepared_artifact_byte_limit_fallbacks": 0,
+        "package.prepared_artifact_current_bytes": 0,
+        "package.prepared_artifact_current_entries": 0,
+        "package.prepared_artifact_derivation_current_bytes": 0,
+        "package.prepared_artifact_derivation_peak_bytes": 60111,
+        "package.prepared_artifact_entry_limit_fallbacks": 0,
+        "package.prepared_artifact_key_current_bytes": 0,
+        "package.prepared_artifact_key_peak_bytes": 0,
+        "package.prepared_artifact_peak_bytes": 60012497,
+        "package.prepared_artifact_peak_entries": 1000,
+        "package.prepared_artifact_released_bytes": 60012497,
+        "package.prepared_artifact_releases": 1000,
+        "package.prepared_artifact_saturated_charge_fallbacks": 0
+      },
+      "coverage": {
+        "live_results_min": 0,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "package-artifact-snapshot-rep-cli-off-fast-raw-j1",
+      "status": "passed",
+      "module_count": 1000,
+      "deterministic_counters": {
+        "package.artifact_file_hashes": 1000,
+        "package.artifact_files_read": 1000,
+        "package.artifact_full_decodes": 2000,
+        "package.artifact_prepared_reuses": 0,
+        "package.prepared_artifact_admissions": 0,
+        "package.prepared_artifact_admitted_bytes": 0,
+        "package.prepared_artifact_byte_limit_fallbacks": 0,
+        "package.prepared_artifact_current_bytes": 0,
+        "package.prepared_artifact_current_entries": 0,
+        "package.prepared_artifact_derivation_current_bytes": 0,
+        "package.prepared_artifact_derivation_peak_bytes": 0,
+        "package.prepared_artifact_entry_limit_fallbacks": 0,
+        "package.prepared_artifact_key_current_bytes": 0,
+        "package.prepared_artifact_key_peak_bytes": 0,
+        "package.prepared_artifact_peak_bytes": 0,
+        "package.prepared_artifact_peak_entries": 0,
+        "package.prepared_artifact_released_bytes": 0,
+        "package.prepared_artifact_releases": 0,
+        "package.prepared_artifact_saturated_charge_fallbacks": 0
+      },
+      "coverage": {
+        "live_results_min": 0,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "package-artifact-snapshot-rep-cli-off-fast-snapshot-j1",
+      "status": "passed",
+      "module_count": 1000,
+      "deterministic_counters": {
+        "package.artifact_file_hashes": 1000,
+        "package.artifact_files_read": 1000,
+        "package.artifact_full_decodes": 1000,
+        "package.artifact_prepared_reuses": 1000,
+        "package.prepared_artifact_admissions": 1000,
+        "package.prepared_artifact_admitted_bytes": 60012497,
+        "package.prepared_artifact_byte_limit_fallbacks": 0,
+        "package.prepared_artifact_current_bytes": 0,
+        "package.prepared_artifact_current_entries": 0,
+        "package.prepared_artifact_derivation_current_bytes": 0,
+        "package.prepared_artifact_derivation_peak_bytes": 60111,
+        "package.prepared_artifact_entry_limit_fallbacks": 0,
+        "package.prepared_artifact_key_current_bytes": 0,
+        "package.prepared_artifact_key_peak_bytes": 0,
+        "package.prepared_artifact_peak_bytes": 60012497,
+        "package.prepared_artifact_peak_entries": 1000,
+        "package.prepared_artifact_released_bytes": 60012497,
+        "package.prepared_artifact_releases": 1000,
+        "package.prepared_artifact_saturated_charge_fallbacks": 0
+      },
+      "coverage": {
+        "live_results_min": 0,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "package-artifact-snapshot-rep-cli-audit-read-fast-raw-j1",
+      "status": "passed",
+      "module_count": 1000,
+      "deterministic_counters": {
+        "package.artifact_file_hashes": 1000,
+        "package.artifact_files_read": 1000,
+        "package.artifact_full_decodes": 3000,
+        "package.artifact_prepared_reuses": 0,
+        "package.prepared_artifact_admissions": 0,
+        "package.prepared_artifact_admitted_bytes": 0,
+        "package.prepared_artifact_byte_limit_fallbacks": 0,
+        "package.prepared_artifact_current_bytes": 0,
+        "package.prepared_artifact_current_entries": 0,
+        "package.prepared_artifact_derivation_current_bytes": 0,
+        "package.prepared_artifact_derivation_peak_bytes": 0,
+        "package.prepared_artifact_entry_limit_fallbacks": 0,
+        "package.prepared_artifact_key_current_bytes": 0,
+        "package.prepared_artifact_key_peak_bytes": 49355,
+        "package.prepared_artifact_peak_bytes": 0,
+        "package.prepared_artifact_peak_entries": 0,
+        "package.prepared_artifact_released_bytes": 0,
+        "package.prepared_artifact_releases": 0,
+        "package.prepared_artifact_saturated_charge_fallbacks": 0
+      },
+      "coverage": {
+        "live_results_min": 0,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "package-artifact-snapshot-rep-cli-audit-read-fast-snapshot-j1",
+      "status": "passed",
+      "module_count": 1000,
+      "deterministic_counters": {
+        "package.artifact_file_hashes": 1000,
+        "package.artifact_files_read": 1000,
+        "package.artifact_full_decodes": 1000,
+        "package.artifact_prepared_reuses": 1000,
+        "package.prepared_artifact_admissions": 1000,
+        "package.prepared_artifact_admitted_bytes": 60012497,
+        "package.prepared_artifact_byte_limit_fallbacks": 0,
+        "package.prepared_artifact_current_bytes": 0,
+        "package.prepared_artifact_current_entries": 0,
+        "package.prepared_artifact_derivation_current_bytes": 0,
+        "package.prepared_artifact_derivation_peak_bytes": 60111,
+        "package.prepared_artifact_entry_limit_fallbacks": 0,
+        "package.prepared_artifact_key_current_bytes": 0,
+        "package.prepared_artifact_key_peak_bytes": 0,
+        "package.prepared_artifact_peak_bytes": 60012497,
+        "package.prepared_artifact_peak_entries": 1000,
+        "package.prepared_artifact_released_bytes": 60012497,
+        "package.prepared_artifact_releases": 1000,
+        "package.prepared_artifact_saturated_charge_fallbacks": 0
+      },
+      "coverage": {
+        "live_results_min": 0,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "package-artifact-snapshot-rep-cli-audit-hit-fast-raw-j1",
+      "status": "passed",
+      "module_count": 1000,
+      "deterministic_counters": {
+        "package.artifact_file_hashes": 1000,
+        "package.artifact_files_read": 1000,
+        "package.artifact_full_decodes": 2000,
+        "package.artifact_prepared_reuses": 0,
+        "package.prepared_artifact_admissions": 0,
+        "package.prepared_artifact_admitted_bytes": 0,
+        "package.prepared_artifact_byte_limit_fallbacks": 0,
+        "package.prepared_artifact_current_bytes": 0,
+        "package.prepared_artifact_current_entries": 0,
+        "package.prepared_artifact_derivation_current_bytes": 0,
+        "package.prepared_artifact_derivation_peak_bytes": 0,
+        "package.prepared_artifact_entry_limit_fallbacks": 0,
+        "package.prepared_artifact_key_current_bytes": 0,
+        "package.prepared_artifact_key_peak_bytes": 49355,
+        "package.prepared_artifact_peak_bytes": 0,
+        "package.prepared_artifact_peak_entries": 0,
+        "package.prepared_artifact_released_bytes": 0,
+        "package.prepared_artifact_releases": 0,
+        "package.prepared_artifact_saturated_charge_fallbacks": 0
+      },
+      "coverage": {
+        "live_results_min": 0,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "package-artifact-snapshot-rep-cli-audit-hit-fast-snapshot-j1",
+      "status": "passed",
+      "module_count": 1000,
+      "deterministic_counters": {
+        "package.artifact_file_hashes": 1000,
+        "package.artifact_files_read": 1000,
+        "package.artifact_full_decodes": 1000,
+        "package.artifact_prepared_reuses": 0,
+        "package.prepared_artifact_admissions": 1000,
+        "package.prepared_artifact_admitted_bytes": 60012497,
+        "package.prepared_artifact_byte_limit_fallbacks": 0,
+        "package.prepared_artifact_current_bytes": 0,
+        "package.prepared_artifact_current_entries": 0,
+        "package.prepared_artifact_derivation_current_bytes": 0,
+        "package.prepared_artifact_derivation_peak_bytes": 60111,
+        "package.prepared_artifact_entry_limit_fallbacks": 0,
+        "package.prepared_artifact_key_current_bytes": 0,
+        "package.prepared_artifact_key_peak_bytes": 0,
+        "package.prepared_artifact_peak_bytes": 60012497,
+        "package.prepared_artifact_peak_entries": 1000,
+        "package.prepared_artifact_released_bytes": 60012497,
+        "package.prepared_artifact_releases": 1000,
+        "package.prepared_artifact_saturated_charge_fallbacks": 0
+      },
+      "coverage": {
+        "live_results_min": 0,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "package-artifact-snapshot-rep-cli-disk-read-fast-raw-j1",
+      "status": "passed",
+      "module_count": 1000,
+      "deterministic_counters": {
+        "package.artifact_file_hashes": 1000,
+        "package.artifact_files_read": 1000,
+        "package.artifact_full_decodes": 2000,
+        "package.artifact_prepared_reuses": 0,
+        "package.prepared_artifact_admissions": 0,
+        "package.prepared_artifact_admitted_bytes": 0,
+        "package.prepared_artifact_byte_limit_fallbacks": 0,
+        "package.prepared_artifact_current_bytes": 0,
+        "package.prepared_artifact_current_entries": 0,
+        "package.prepared_artifact_derivation_current_bytes": 0,
+        "package.prepared_artifact_derivation_peak_bytes": 0,
+        "package.prepared_artifact_entry_limit_fallbacks": 0,
+        "package.prepared_artifact_key_current_bytes": 0,
+        "package.prepared_artifact_key_peak_bytes": 0,
+        "package.prepared_artifact_peak_bytes": 0,
+        "package.prepared_artifact_peak_entries": 0,
+        "package.prepared_artifact_released_bytes": 0,
+        "package.prepared_artifact_releases": 0,
+        "package.prepared_artifact_saturated_charge_fallbacks": 0
+      },
+      "coverage": {
+        "live_results_min": 0,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "package-artifact-snapshot-rep-cli-disk-read-fast-snapshot-j1",
+      "status": "passed",
+      "module_count": 1000,
+      "deterministic_counters": {
+        "package.artifact_file_hashes": 1000,
+        "package.artifact_files_read": 1000,
+        "package.artifact_full_decodes": 1000,
+        "package.artifact_prepared_reuses": 1000,
+        "package.prepared_artifact_admissions": 1000,
+        "package.prepared_artifact_admitted_bytes": 60012497,
+        "package.prepared_artifact_byte_limit_fallbacks": 0,
+        "package.prepared_artifact_current_bytes": 0,
+        "package.prepared_artifact_current_entries": 0,
+        "package.prepared_artifact_derivation_current_bytes": 0,
+        "package.prepared_artifact_derivation_peak_bytes": 60111,
+        "package.prepared_artifact_entry_limit_fallbacks": 0,
+        "package.prepared_artifact_key_current_bytes": 0,
+        "package.prepared_artifact_key_peak_bytes": 0,
+        "package.prepared_artifact_peak_bytes": 60012497,
+        "package.prepared_artifact_peak_entries": 1000,
+        "package.prepared_artifact_released_bytes": 60012497,
+        "package.prepared_artifact_releases": 1000,
+        "package.prepared_artifact_saturated_charge_fallbacks": 0
+      },
+      "coverage": {
+        "live_results_min": 0,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "package-artifact-snapshot-rep-cli-disk-hit-fast-raw-j1",
+      "status": "passed",
+      "module_count": 1000,
+      "deterministic_counters": {
+        "package.artifact_file_hashes": 1000,
+        "package.artifact_files_read": 1000,
+        "package.artifact_full_decodes": 1000,
+        "package.artifact_prepared_reuses": 0,
+        "package.prepared_artifact_admissions": 0,
+        "package.prepared_artifact_admitted_bytes": 0,
+        "package.prepared_artifact_byte_limit_fallbacks": 0,
+        "package.prepared_artifact_current_bytes": 0,
+        "package.prepared_artifact_current_entries": 0,
+        "package.prepared_artifact_derivation_current_bytes": 0,
+        "package.prepared_artifact_derivation_peak_bytes": 0,
+        "package.prepared_artifact_entry_limit_fallbacks": 0,
+        "package.prepared_artifact_key_current_bytes": 0,
+        "package.prepared_artifact_key_peak_bytes": 0,
+        "package.prepared_artifact_peak_bytes": 0,
+        "package.prepared_artifact_peak_entries": 0,
+        "package.prepared_artifact_released_bytes": 0,
+        "package.prepared_artifact_releases": 0,
+        "package.prepared_artifact_saturated_charge_fallbacks": 0
+      },
+      "coverage": {
+        "live_results_min": 0,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "package-artifact-snapshot-rep-cli-disk-hit-fast-snapshot-j1",
+      "status": "passed",
+      "module_count": 1000,
+      "deterministic_counters": {
+        "package.artifact_file_hashes": 1000,
+        "package.artifact_files_read": 1000,
+        "package.artifact_full_decodes": 1000,
+        "package.artifact_prepared_reuses": 0,
+        "package.prepared_artifact_admissions": 1000,
+        "package.prepared_artifact_admitted_bytes": 60012497,
+        "package.prepared_artifact_byte_limit_fallbacks": 0,
+        "package.prepared_artifact_current_bytes": 0,
+        "package.prepared_artifact_current_entries": 0,
+        "package.prepared_artifact_derivation_current_bytes": 0,
+        "package.prepared_artifact_derivation_peak_bytes": 60111,
+        "package.prepared_artifact_entry_limit_fallbacks": 0,
+        "package.prepared_artifact_key_current_bytes": 0,
+        "package.prepared_artifact_key_peak_bytes": 0,
+        "package.prepared_artifact_peak_bytes": 60012497,
+        "package.prepared_artifact_peak_entries": 1000,
+        "package.prepared_artifact_released_bytes": 60012497,
+        "package.prepared_artifact_releases": 1000,
+        "package.prepared_artifact_saturated_charge_fallbacks": 0
+      },
+      "coverage": {
+        "live_results_min": 0,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "package-artifact-snapshot-rep-cli-off-reference-raw-j1",
+      "status": "passed",
+      "module_count": 1000,
+      "deterministic_counters": {
+        "package.artifact_file_hashes": 1000,
+        "package.artifact_files_read": 1000,
+        "package.artifact_full_decodes": 1000,
+        "package.artifact_prepared_reuses": 0,
+        "package.prepared_artifact_admissions": 0,
+        "package.prepared_artifact_admitted_bytes": 0,
+        "package.prepared_artifact_byte_limit_fallbacks": 0,
+        "package.prepared_artifact_current_bytes": 0,
+        "package.prepared_artifact_current_entries": 0,
+        "package.prepared_artifact_derivation_current_bytes": 0,
+        "package.prepared_artifact_derivation_peak_bytes": 0,
+        "package.prepared_artifact_entry_limit_fallbacks": 0,
+        "package.prepared_artifact_key_current_bytes": 0,
+        "package.prepared_artifact_key_peak_bytes": 0,
+        "package.prepared_artifact_peak_bytes": 0,
+        "package.prepared_artifact_peak_entries": 0,
+        "package.prepared_artifact_released_bytes": 0,
+        "package.prepared_artifact_releases": 0,
+        "package.prepared_artifact_saturated_charge_fallbacks": 0
+      },
+      "coverage": {
+        "live_results_min": 0,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "package-artifact-snapshot-rep-cli-off-reference-snapshot-j1",
+      "status": "passed",
+      "module_count": 1000,
+      "deterministic_counters": {
+        "package.artifact_file_hashes": 1000,
+        "package.artifact_files_read": 1000,
+        "package.artifact_full_decodes": 1000,
+        "package.artifact_prepared_reuses": 0,
+        "package.prepared_artifact_admissions": 0,
+        "package.prepared_artifact_admitted_bytes": 0,
+        "package.prepared_artifact_byte_limit_fallbacks": 0,
+        "package.prepared_artifact_current_bytes": 0,
+        "package.prepared_artifact_current_entries": 0,
+        "package.prepared_artifact_derivation_current_bytes": 0,
+        "package.prepared_artifact_derivation_peak_bytes": 0,
+        "package.prepared_artifact_entry_limit_fallbacks": 0,
+        "package.prepared_artifact_key_current_bytes": 0,
+        "package.prepared_artifact_key_peak_bytes": 0,
+        "package.prepared_artifact_peak_bytes": 0,
+        "package.prepared_artifact_peak_entries": 0,
+        "package.prepared_artifact_released_bytes": 0,
+        "package.prepared_artifact_releases": 0,
+        "package.prepared_artifact_saturated_charge_fallbacks": 0
+      },
+      "coverage": {
+        "live_results_min": 0,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "package-artifact-snapshot-rep-cli-audit-read-reference-raw-j1",
+      "status": "passed",
+      "module_count": 1000,
+      "deterministic_counters": {
+        "package.artifact_file_hashes": 1000,
+        "package.artifact_files_read": 1000,
+        "package.artifact_full_decodes": 2000,
+        "package.artifact_prepared_reuses": 0,
+        "package.prepared_artifact_admissions": 0,
+        "package.prepared_artifact_admitted_bytes": 0,
+        "package.prepared_artifact_byte_limit_fallbacks": 0,
+        "package.prepared_artifact_current_bytes": 0,
+        "package.prepared_artifact_current_entries": 0,
+        "package.prepared_artifact_derivation_current_bytes": 0,
+        "package.prepared_artifact_derivation_peak_bytes": 0,
+        "package.prepared_artifact_entry_limit_fallbacks": 0,
+        "package.prepared_artifact_key_current_bytes": 0,
+        "package.prepared_artifact_key_peak_bytes": 49355,
+        "package.prepared_artifact_peak_bytes": 0,
+        "package.prepared_artifact_peak_entries": 0,
+        "package.prepared_artifact_released_bytes": 0,
+        "package.prepared_artifact_releases": 0,
+        "package.prepared_artifact_saturated_charge_fallbacks": 0
+      },
+      "coverage": {
+        "live_results_min": 0,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "package-artifact-snapshot-rep-cli-audit-read-reference-snapshot-j1",
+      "status": "passed",
+      "module_count": 1000,
+      "deterministic_counters": {
+        "package.artifact_file_hashes": 1000,
+        "package.artifact_files_read": 1000,
+        "package.artifact_full_decodes": 2000,
+        "package.artifact_prepared_reuses": 0,
+        "package.prepared_artifact_admissions": 0,
+        "package.prepared_artifact_admitted_bytes": 0,
+        "package.prepared_artifact_byte_limit_fallbacks": 0,
+        "package.prepared_artifact_current_bytes": 0,
+        "package.prepared_artifact_current_entries": 0,
+        "package.prepared_artifact_derivation_current_bytes": 0,
+        "package.prepared_artifact_derivation_peak_bytes": 0,
+        "package.prepared_artifact_entry_limit_fallbacks": 0,
+        "package.prepared_artifact_key_current_bytes": 0,
+        "package.prepared_artifact_key_peak_bytes": 49355,
+        "package.prepared_artifact_peak_bytes": 0,
+        "package.prepared_artifact_peak_entries": 0,
+        "package.prepared_artifact_released_bytes": 0,
+        "package.prepared_artifact_releases": 0,
+        "package.prepared_artifact_saturated_charge_fallbacks": 0
+      },
+      "coverage": {
+        "live_results_min": 0,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "package-artifact-snapshot-rep-cli-audit-hit-reference-raw-j1",
+      "status": "passed",
+      "module_count": 1000,
+      "deterministic_counters": {
+        "package.artifact_file_hashes": 1000,
+        "package.artifact_files_read": 1000,
+        "package.artifact_full_decodes": 2000,
+        "package.artifact_prepared_reuses": 0,
+        "package.prepared_artifact_admissions": 0,
+        "package.prepared_artifact_admitted_bytes": 0,
+        "package.prepared_artifact_byte_limit_fallbacks": 0,
+        "package.prepared_artifact_current_bytes": 0,
+        "package.prepared_artifact_current_entries": 0,
+        "package.prepared_artifact_derivation_current_bytes": 0,
+        "package.prepared_artifact_derivation_peak_bytes": 0,
+        "package.prepared_artifact_entry_limit_fallbacks": 0,
+        "package.prepared_artifact_key_current_bytes": 0,
+        "package.prepared_artifact_key_peak_bytes": 49355,
+        "package.prepared_artifact_peak_bytes": 0,
+        "package.prepared_artifact_peak_entries": 0,
+        "package.prepared_artifact_released_bytes": 0,
+        "package.prepared_artifact_releases": 0,
+        "package.prepared_artifact_saturated_charge_fallbacks": 0
+      },
+      "coverage": {
+        "live_results_min": 0,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "package-artifact-snapshot-rep-cli-audit-hit-reference-snapshot-j1",
+      "status": "passed",
+      "module_count": 1000,
+      "deterministic_counters": {
+        "package.artifact_file_hashes": 1000,
+        "package.artifact_files_read": 1000,
+        "package.artifact_full_decodes": 2000,
+        "package.artifact_prepared_reuses": 0,
+        "package.prepared_artifact_admissions": 0,
+        "package.prepared_artifact_admitted_bytes": 0,
+        "package.prepared_artifact_byte_limit_fallbacks": 0,
+        "package.prepared_artifact_current_bytes": 0,
+        "package.prepared_artifact_current_entries": 0,
+        "package.prepared_artifact_derivation_current_bytes": 0,
+        "package.prepared_artifact_derivation_peak_bytes": 0,
+        "package.prepared_artifact_entry_limit_fallbacks": 0,
+        "package.prepared_artifact_key_current_bytes": 0,
+        "package.prepared_artifact_key_peak_bytes": 49355,
+        "package.prepared_artifact_peak_bytes": 0,
+        "package.prepared_artifact_peak_entries": 0,
+        "package.prepared_artifact_released_bytes": 0,
+        "package.prepared_artifact_releases": 0,
+        "package.prepared_artifact_saturated_charge_fallbacks": 0
+      },
+      "coverage": {
+        "live_results_min": 0,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "package-artifact-snapshot-rep-cli-disk-read-reference-raw-j1",
+      "status": "passed",
+      "module_count": 1000,
+      "deterministic_counters": {
+        "package.artifact_file_hashes": 1000,
+        "package.artifact_files_read": 1000,
+        "package.artifact_full_decodes": 1000,
+        "package.artifact_prepared_reuses": 0,
+        "package.prepared_artifact_admissions": 0,
+        "package.prepared_artifact_admitted_bytes": 0,
+        "package.prepared_artifact_byte_limit_fallbacks": 0,
+        "package.prepared_artifact_current_bytes": 0,
+        "package.prepared_artifact_current_entries": 0,
+        "package.prepared_artifact_derivation_current_bytes": 0,
+        "package.prepared_artifact_derivation_peak_bytes": 0,
+        "package.prepared_artifact_entry_limit_fallbacks": 0,
+        "package.prepared_artifact_key_current_bytes": 0,
+        "package.prepared_artifact_key_peak_bytes": 0,
+        "package.prepared_artifact_peak_bytes": 0,
+        "package.prepared_artifact_peak_entries": 0,
+        "package.prepared_artifact_released_bytes": 0,
+        "package.prepared_artifact_releases": 0,
+        "package.prepared_artifact_saturated_charge_fallbacks": 0
+      },
+      "coverage": {
+        "live_results_min": 0,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "package-artifact-snapshot-rep-cli-disk-read-reference-snapshot-j1",
+      "status": "passed",
+      "module_count": 1000,
+      "deterministic_counters": {
+        "package.artifact_file_hashes": 1000,
+        "package.artifact_files_read": 1000,
+        "package.artifact_full_decodes": 1000,
+        "package.artifact_prepared_reuses": 0,
+        "package.prepared_artifact_admissions": 0,
+        "package.prepared_artifact_admitted_bytes": 0,
+        "package.prepared_artifact_byte_limit_fallbacks": 0,
+        "package.prepared_artifact_current_bytes": 0,
+        "package.prepared_artifact_current_entries": 0,
+        "package.prepared_artifact_derivation_current_bytes": 0,
+        "package.prepared_artifact_derivation_peak_bytes": 0,
+        "package.prepared_artifact_entry_limit_fallbacks": 0,
+        "package.prepared_artifact_key_current_bytes": 0,
+        "package.prepared_artifact_key_peak_bytes": 0,
+        "package.prepared_artifact_peak_bytes": 0,
+        "package.prepared_artifact_peak_entries": 0,
+        "package.prepared_artifact_released_bytes": 0,
+        "package.prepared_artifact_releases": 0,
+        "package.prepared_artifact_saturated_charge_fallbacks": 0
+      },
+      "coverage": {
+        "live_results_min": 0,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "package-artifact-snapshot-rep-cli-disk-hit-reference-raw-j1",
+      "status": "passed",
+      "module_count": 1000,
+      "deterministic_counters": {
+        "package.artifact_file_hashes": 1000,
+        "package.artifact_files_read": 1000,
+        "package.artifact_full_decodes": 1000,
+        "package.artifact_prepared_reuses": 0,
+        "package.prepared_artifact_admissions": 0,
+        "package.prepared_artifact_admitted_bytes": 0,
+        "package.prepared_artifact_byte_limit_fallbacks": 0,
+        "package.prepared_artifact_current_bytes": 0,
+        "package.prepared_artifact_current_entries": 0,
+        "package.prepared_artifact_derivation_current_bytes": 0,
+        "package.prepared_artifact_derivation_peak_bytes": 0,
+        "package.prepared_artifact_entry_limit_fallbacks": 0,
+        "package.prepared_artifact_key_current_bytes": 0,
+        "package.prepared_artifact_key_peak_bytes": 0,
+        "package.prepared_artifact_peak_bytes": 0,
+        "package.prepared_artifact_peak_entries": 0,
+        "package.prepared_artifact_released_bytes": 0,
+        "package.prepared_artifact_releases": 0,
+        "package.prepared_artifact_saturated_charge_fallbacks": 0
+      },
+      "coverage": {
+        "live_results_min": 0,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "package-artifact-snapshot-rep-cli-disk-hit-reference-snapshot-j1",
+      "status": "passed",
+      "module_count": 1000,
+      "deterministic_counters": {
+        "package.artifact_file_hashes": 1000,
+        "package.artifact_files_read": 1000,
+        "package.artifact_full_decodes": 1000,
+        "package.artifact_prepared_reuses": 0,
+        "package.prepared_artifact_admissions": 0,
+        "package.prepared_artifact_admitted_bytes": 0,
+        "package.prepared_artifact_byte_limit_fallbacks": 0,
+        "package.prepared_artifact_current_bytes": 0,
+        "package.prepared_artifact_current_entries": 0,
+        "package.prepared_artifact_derivation_current_bytes": 0,
+        "package.prepared_artifact_derivation_peak_bytes": 0,
+        "package.prepared_artifact_entry_limit_fallbacks": 0,
+        "package.prepared_artifact_key_current_bytes": 0,
+        "package.prepared_artifact_key_peak_bytes": 0,
+        "package.prepared_artifact_peak_bytes": 0,
+        "package.prepared_artifact_peak_entries": 0,
+        "package.prepared_artifact_released_bytes": 0,
+        "package.prepared_artifact_releases": 0,
+        "package.prepared_artifact_saturated_charge_fallbacks": 0
+      },
+      "coverage": {
+        "live_results_min": 0,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "package-artifact-snapshot-rep-api-pm0-dc0-fast-raw-j8",
+      "status": "passed",
+      "module_count": 1000,
+      "deterministic_counters": {
+        "package.artifact_file_hashes": 1000,
+        "package.artifact_files_read": 0,
+        "package.artifact_full_decodes": 2000,
+        "package.artifact_prepared_reuses": 0,
+        "package.prepared_artifact_admissions": 0,
+        "package.prepared_artifact_admitted_bytes": 0,
+        "package.prepared_artifact_byte_limit_fallbacks": 0,
+        "package.prepared_artifact_current_bytes": 0,
+        "package.prepared_artifact_current_entries": 0,
+        "package.prepared_artifact_derivation_current_bytes": 0,
+        "package.prepared_artifact_derivation_peak_bytes": 0,
+        "package.prepared_artifact_entry_limit_fallbacks": 0,
+        "package.prepared_artifact_key_current_bytes": 0,
+        "package.prepared_artifact_key_peak_bytes": 0,
+        "package.prepared_artifact_peak_bytes": 0,
+        "package.prepared_artifact_peak_entries": 0,
+        "package.prepared_artifact_released_bytes": 0,
+        "package.prepared_artifact_releases": 0,
+        "package.prepared_artifact_saturated_charge_fallbacks": 0
+      },
+      "coverage": {
+        "live_results_min": 0,
+        "proof_evidence_reduction_allowed": false
+      }
+    },
+    {
+      "id": "package-artifact-snapshot-rep-api-pm0-dc0-fast-snapshot-j8",
+      "status": "passed",
+      "module_count": 1000,
+      "deterministic_counters": {
+        "package.artifact_file_hashes": 1000,
+        "package.artifact_files_read": 0,
+        "package.artifact_full_decodes": 2000,
+        "package.artifact_prepared_reuses": 0,
+        "package.prepared_artifact_admissions": 0,
+        "package.prepared_artifact_admitted_bytes": 0,
+        "package.prepared_artifact_byte_limit_fallbacks": 0,
+        "package.prepared_artifact_current_bytes": 0,
+        "package.prepared_artifact_current_entries": 0,
+        "package.prepared_artifact_derivation_current_bytes": 0,
+        "package.prepared_artifact_derivation_peak_bytes": 0,
+        "package.prepared_artifact_entry_limit_fallbacks": 0,
+        "package.prepared_artifact_key_current_bytes": 0,
+        "package.prepared_artifact_key_peak_bytes": 0,
+        "package.prepared_artifact_peak_bytes": 0,
+        "package.prepared_artifact_peak_entries": 0,
+        "package.prepared_artifact_released_bytes": 0,
+        "package.prepared_artifact_releases": 0,
+        "package.prepared_artifact_saturated_charge_fallbacks": 0
+      },
+      "coverage": {
+        "live_results_min": 0,
+        "proof_evidence_reduction_allowed": false
+      }
+    }
+  ],
+  "targeted_build_certs": [
+    {
+      "id": "targeted-build-certs-small-off",
+      "status": "passed",
+      "support_module_count": 2,
+      "target_module_count": 1,
+      "deterministic_counters": {"avoided_source_interface_resolutions": 0, "cache_summary_emitted": 0, "support_checks_avoided": 0, "support_context_cache_hits": 0, "support_context_entries_written": 0, "support_live_checked": 2, "target_result_cache_hits": 0, "target_result_cache_misses": 0, "target_result_cache_schema_misses": 0, "target_result_cache_stale": 0, "target_result_entries_written": 0, "targets_live_built": 1}
+    },
+    {
+      "id": "targeted-build-certs-small-read-through-cold",
+      "status": "passed",
+      "support_module_count": 2,
+      "target_module_count": 1,
+      "deterministic_counters": {"avoided_source_interface_resolutions": 0, "cache_summary_emitted": 1, "support_checks_avoided": 0, "support_context_cache_hits": 0, "support_context_entries_written": 0, "support_live_checked": 2, "target_result_cache_hits": 0, "target_result_cache_misses": 1, "target_result_cache_schema_misses": 0, "target_result_cache_stale": 0, "target_result_entries_written": 1, "targets_live_built": 1}
+    },
+    {
+      "id": "targeted-build-certs-small-read-through-warm",
+      "status": "passed",
+      "support_module_count": 2,
+      "target_module_count": 1,
+      "deterministic_counters": {"avoided_source_interface_resolutions": 0, "cache_summary_emitted": 1, "support_checks_avoided": 0, "support_context_cache_hits": 0, "support_context_entries_written": 0, "support_live_checked": 2, "target_result_cache_hits": 1, "target_result_cache_misses": 0, "target_result_cache_schema_misses": 0, "target_result_cache_stale": 0, "target_result_entries_written": 0, "targets_live_built": 1}
+    },
+    {
+      "id": "targeted-build-certs-large-off",
+      "status": "passed",
+      "support_module_count": 24,
+      "target_module_count": 1,
+      "deterministic_counters": {"avoided_source_interface_resolutions": 0, "cache_summary_emitted": 0, "support_checks_avoided": 0, "support_context_cache_hits": 0, "support_context_entries_written": 0, "support_live_checked": 24, "target_result_cache_hits": 0, "target_result_cache_misses": 0, "target_result_cache_schema_misses": 0, "target_result_cache_stale": 0, "target_result_entries_written": 0, "targets_live_built": 1}
+    },
+    {
+      "id": "targeted-build-certs-large-read-through-cold",
+      "status": "passed",
+      "support_module_count": 24,
+      "target_module_count": 1,
+      "deterministic_counters": {"avoided_source_interface_resolutions": 0, "cache_summary_emitted": 1, "support_checks_avoided": 0, "support_context_cache_hits": 0, "support_context_entries_written": 0, "support_live_checked": 24, "target_result_cache_hits": 0, "target_result_cache_misses": 1, "target_result_cache_schema_misses": 0, "target_result_cache_stale": 0, "target_result_entries_written": 1, "targets_live_built": 1}
+    },
+    {
+      "id": "targeted-build-certs-large-read-through-warm",
+      "status": "passed",
+      "support_module_count": 24,
+      "target_module_count": 1,
+      "deterministic_counters": {"avoided_source_interface_resolutions": 0, "cache_summary_emitted": 1, "support_checks_avoided": 0, "support_context_cache_hits": 0, "support_context_entries_written": 0, "support_live_checked": 24, "target_result_cache_hits": 1, "target_result_cache_misses": 0, "target_result_cache_schema_misses": 0, "target_result_cache_stale": 0, "target_result_entries_written": 0, "targets_live_built": 1}
+    }
+  ],
+  "targeted_build_certs_rollout": [
+    {
+      "id": "targeted-build-certs-small-local-hit-cold",
+      "status": "passed",
+      "support_module_count": 2,
+      "target_module_count": 1,
+      "deterministic_counters": {"support_selected": 2, "targets_selected": 1, "external_selected": 0, "forced_live_support": 0, "targets_forced_live": 0, "visited_support": 2, "visited_targets": 1, "visited_external": 0, "context_hits": 0, "context_bypassed_hits": 0, "context_misses": 2, "context_stale": 0, "context_schema_misses": 0, "context_invalid": 0, "context_ineligible": 0, "live_prerequisite_checks": 2, "avoided_kernel_checks": 0, "avoided_source_interface_resolutions": 0, "target_attempts": 1, "target_fresh_builds": 1, "entries_written": 2}
+    },
+    {
+      "id": "targeted-build-certs-small-local-hit-warm",
+      "status": "passed",
+      "support_module_count": 2,
+      "target_module_count": 1,
+      "deterministic_counters": {"support_selected": 2, "targets_selected": 1, "external_selected": 0, "forced_live_support": 0, "targets_forced_live": 0, "visited_support": 2, "visited_targets": 1, "visited_external": 0, "context_hits": 2, "context_bypassed_hits": 0, "context_misses": 0, "context_stale": 0, "context_schema_misses": 0, "context_invalid": 0, "context_ineligible": 0, "live_prerequisite_checks": 0, "avoided_kernel_checks": 2, "avoided_source_interface_resolutions": 2, "target_attempts": 1, "target_fresh_builds": 1, "entries_written": 0}
+    },
+    {
+      "id": "targeted-build-certs-large-local-hit-cold",
+      "status": "passed",
+      "support_module_count": 24,
+      "target_module_count": 1,
+      "deterministic_counters": {"support_selected": 24, "targets_selected": 1, "external_selected": 0, "forced_live_support": 0, "targets_forced_live": 0, "visited_support": 24, "visited_targets": 1, "visited_external": 0, "context_hits": 0, "context_bypassed_hits": 0, "context_misses": 24, "context_stale": 0, "context_schema_misses": 0, "context_invalid": 0, "context_ineligible": 0, "live_prerequisite_checks": 24, "avoided_kernel_checks": 0, "avoided_source_interface_resolutions": 0, "target_attempts": 1, "target_fresh_builds": 1, "entries_written": 24}
+    },
+    {
+      "id": "targeted-build-certs-large-local-hit-partially-warm",
+      "status": "passed",
+      "support_module_count": 24,
+      "target_module_count": 1,
+      "deterministic_counters": {"support_selected": 24, "targets_selected": 1, "external_selected": 0, "forced_live_support": 0, "targets_forced_live": 0, "visited_support": 24, "visited_targets": 1, "visited_external": 0, "context_hits": 11, "context_bypassed_hits": 12, "context_misses": 1, "context_stale": 0, "context_schema_misses": 0, "context_invalid": 0, "context_ineligible": 0, "live_prerequisite_checks": 13, "avoided_kernel_checks": 11, "avoided_source_interface_resolutions": 11, "target_attempts": 1, "target_fresh_builds": 1, "entries_written": 1}
+    },
+    {
+      "id": "targeted-build-certs-large-local-hit-fully-warm",
+      "status": "passed",
+      "support_module_count": 24,
+      "target_module_count": 1,
+      "deterministic_counters": {"support_selected": 24, "targets_selected": 1, "external_selected": 0, "forced_live_support": 0, "targets_forced_live": 0, "visited_support": 24, "visited_targets": 1, "visited_external": 0, "context_hits": 24, "context_bypassed_hits": 0, "context_misses": 0, "context_stale": 0, "context_schema_misses": 0, "context_invalid": 0, "context_ineligible": 0, "live_prerequisite_checks": 0, "avoided_kernel_checks": 24, "avoided_source_interface_resolutions": 24, "target_attempts": 1, "target_fresh_builds": 1, "entries_written": 0}
+    }
+  ],
+  "update_policy": "Manual review only. Record the reason for every deterministic baseline change in the reviewing commit or pull request. Raw elapsed time and peak RSS are advisory evidence and must never be copied into this generic deterministic baseline."
+}

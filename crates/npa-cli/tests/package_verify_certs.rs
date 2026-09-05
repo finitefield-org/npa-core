@@ -16,7 +16,7 @@ use std::thread;
 
 use npa_api::{
     clear_package_import_context_export_disk_cache, clear_package_verification_decode_cache,
-    clear_package_verification_process_memo, format_hash_string, independent_checker_file_hash,
+    format_hash_string, independent_checker_file_hash,
     package_import_context_export_disk_cache_entry_count,
     package_verification_decode_cache_entry_count, parse_independent_checker_runner_policy,
     PerformanceMeasurementLabel,
@@ -29,12 +29,16 @@ use npa_cli::args::{
 use npa_cli::diagnostic::{CommandExitCode, DiagnosticKind, DiagnosticSeverity};
 use npa_cli::package::PACKAGE_MANIFEST_PATH;
 use npa_cli::package_api::v1::{
-    common_options, external_checker_options, verify_certs_full, verify_changed_certificates,
+    common_options, external_checker_options, verify_certs_base, verify_certs_full,
+    verify_certs_modules, verify_changed_certificates,
 };
 use npa_cli::package_artifacts::{
     run_package_shared_snapshot_check_group, PackageSharedSnapshotCheckGroupOptions,
 };
-use npa_cli::package_verify::run_package_verify_certs;
+use npa_cli::package_verify::{
+    benchmark_run_package_verify_certs, run_package_verify_certs,
+    PackageArtifactSnapshotBenchmarkMode,
+};
 use npa_package::{
     build_package_lock_from_package_root, format_package_hash, package_audit_disk_memo_key,
     package_audit_disk_memo_result_entry_json, package_file_hash, parse_and_validate_manifest_str,
@@ -572,7 +576,6 @@ fn package_verify_certs_acceleration_writes_stay_outside_package_root() {
     let _memo_guard = disk_memo_test_lock();
     clear_audit_cache();
     clear_disk_memo();
-    clear_package_verification_process_memo();
 
     let mut cached = build_source_free_fixture(
         "guarded-audit-cache",
@@ -1295,6 +1298,1013 @@ fn package_verify_certs_changed_verifies_changed_certificate_path_source_free() 
 }
 
 #[test]
+fn package_verify_certs_modules_verifies_exact_seeds_plus_imports_with_summary() {
+    let package = build_source_free_modules_fixture(
+        "explicit-module-selection",
+        &["Proofs.Ai.Basic", "Proofs.Ai.EqReasoning"],
+        &["Eq.rec"],
+    );
+
+    let result = run_package_verify_certs(verify_certs_modules(
+        common_options(package.path(), true),
+        PackageChecker::Reference,
+        vec![Name::from_dotted("Proofs.Ai.EqReasoning")],
+    ));
+
+    assert_eq!(result.exit_code(), CommandExitCode::Success);
+    assert_eq!(
+        verified_module_identities(&result)
+            .into_iter()
+            .map(|(module, _)| module)
+            .collect::<Vec<_>>(),
+        vec!["Std.Logic.Eq", "Proofs.Ai.EqReasoning"]
+    );
+    let summary = result.verify_selection.as_deref().unwrap();
+    assert_eq!(summary.mode, "modules");
+    assert_eq!(summary.outcome, "targeted");
+    assert_eq!(summary.seed_details, vec!["Proofs.Ai.EqReasoning"]);
+    assert_eq!(summary.closure_module_count, Some(2));
+    assert!(!summary.trusted);
+    assert!(!summary.proof_evidence);
+}
+
+#[test]
+fn package_verify_certs_modules_reports_unknown_name_before_checker_execution() {
+    let package = build_source_free_fixture(
+        "explicit-module-unknown",
+        "Proofs.Ai.Basic",
+        false,
+        &["Eq.rec"],
+    );
+
+    let result = run_package_verify_certs(verify_certs_modules(
+        common_options(package.path(), true),
+        PackageChecker::Reference,
+        vec![Name::from_dotted("Proofs.Ai.DoesNotExist")],
+    ));
+
+    assert_eq!(result.exit_code(), CommandExitCode::PackageFailure);
+    assert_eq!(result.diagnostics[0].reason_code, "selected_module_missing");
+    assert!(!result
+        .diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.reason_code == "module_verified"));
+    let summary = result.verify_selection.as_deref().unwrap();
+    assert_eq!(summary.mode, "modules");
+    assert_eq!(summary.seed_details, vec!["Proofs.Ai.DoesNotExist"]);
+    assert_eq!(summary.closure_module_count, None);
+}
+
+#[test]
+fn package_verify_certs_modules_rejects_external_import_as_seed() {
+    let package = build_source_free_fixture(
+        "explicit-module-external-import",
+        "Proofs.Ai.Basic",
+        false,
+        &["Eq.rec"],
+    );
+
+    let result = run_package_verify_certs(verify_certs_modules(
+        common_options(package.path(), true),
+        PackageChecker::Reference,
+        vec![Name::from_dotted("Std.Logic.Eq")],
+    ));
+
+    assert_eq!(result.exit_code(), CommandExitCode::PackageFailure);
+    assert_eq!(result.diagnostics[0].reason_code, "selected_module_missing");
+    assert_eq!(
+        result.diagnostics[0].expected_value.as_deref(),
+        Some("local package manifest module")
+    );
+    assert_eq!(
+        result.diagnostics[0].actual_value.as_deref(),
+        Some("Std.Logic.Eq")
+    );
+    assert!(!result
+        .diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.reason_code == "module_verified"));
+    let summary = result.verify_selection.as_deref().unwrap();
+    assert_eq!(summary.mode, "modules");
+    assert_eq!(summary.seed_details, vec!["Std.Logic.Eq"]);
+    assert_eq!(summary.closure_module_count, None);
+}
+
+#[test]
+fn package_verify_certs_modules_supports_fast_reconstructed_lock_selection() {
+    let package = build_source_free_modules_fixture(
+        "explicit-module-fast-reconstructed",
+        &["Proofs.Ai.Basic", "Proofs.Ai.EqReasoning"],
+        &["Eq.rec"],
+    );
+    fs::remove_file(package.artifact_path(LOCK_PATH)).unwrap();
+
+    let result = run_package_verify_certs(
+        verify_certs_modules(
+            common_options(package.path(), true),
+            PackageChecker::Fast,
+            vec![Name::from_dotted("Proofs.Ai.EqReasoning")],
+        )
+        .with_package_lock_mode(PackageLockInputMode::ReconstructedInMemory),
+    );
+
+    assert_eq!(
+        result.exit_code(),
+        CommandExitCode::Success,
+        "{}",
+        result.render_json()
+    );
+    assert_eq!(
+        verified_module_identities(&result)
+            .into_iter()
+            .map(|(module, _)| module)
+            .collect::<Vec<_>>(),
+        vec!["Std.Logic.Eq", "Proofs.Ai.EqReasoning"]
+    );
+    let summary = result.verify_selection.as_deref().unwrap();
+    assert_eq!(summary.mode, "modules");
+    assert_eq!(summary.seed_details, vec!["Proofs.Ai.EqReasoning"]);
+    assert_eq!(summary.closure_module_count, Some(2));
+}
+
+#[cfg(unix)]
+#[test]
+fn package_verify_certs_base_selects_clean_committed_refresh_projection() {
+    let package = build_source_free_modules_fixture(
+        "committed-base-targeted",
+        &["Proofs.Ai.Basic", "Proofs.Ai.EqReasoning"],
+        &["Eq.rec"],
+    );
+    init_git_baseline(&package);
+    mark_worktree_mode_changed(&package, "Proofs/Ai/EqReasoning/certificate.npcert");
+    replace_module_manifest_hash(
+        &package,
+        "Proofs.Ai.EqReasoning",
+        "expected_source_hash",
+        test_hash(0x72).into(),
+    );
+    let manifest_source = fs::read_to_string(package.artifact_path(PACKAGE_MANIFEST_PATH)).unwrap();
+    write_lock(&package, &manifest_source);
+    commit_git(&package, "targeted refresh");
+    fs::write(
+        package.artifact_path("unrelated-notes.md"),
+        b"dirty but unprotected\n",
+    )
+    .unwrap();
+
+    let result = run_package_verify_certs(
+        verify_certs_base(
+            common_options(package.path(), true),
+            PackageChecker::Reference,
+            "HEAD^",
+        )
+        .with_timings(PackageTimingMode::Summary),
+    );
+
+    assert_eq!(
+        result.exit_code(),
+        CommandExitCode::Success,
+        "{}",
+        result.render_json()
+    );
+    assert_eq!(
+        verified_module_identities(&result)
+            .into_iter()
+            .map(|(module, _)| module)
+            .collect::<Vec<_>>(),
+        vec!["Std.Logic.Eq", "Proofs.Ai.EqReasoning"]
+    );
+    let summary = result.verify_selection.as_deref().unwrap();
+    assert_eq!(summary.mode, "base");
+    assert_eq!(summary.outcome, "targeted");
+    assert_eq!(summary.seed_details, vec!["Proofs.Ai.EqReasoning"]);
+    assert_eq!(summary.changed_path_count, Some(3));
+    assert_eq!(summary.closure_module_count, Some(2));
+    assert!(summary.base_commit.is_some());
+    assert!(summary.merge_base.is_some());
+    assert!(summary.head_commit.is_some());
+    assert_eq!(
+        measurement_counter(
+            &result,
+            PerformanceMeasurementLabel::PackageSelectionBaseCommitQueries,
+        ),
+        1
+    );
+    assert_eq!(
+        measurement_counter(
+            &result,
+            PerformanceMeasurementLabel::PackageSelectionCommittedHeadQueries,
+        ),
+        1
+    );
+    assert_eq!(
+        measurement_counter(
+            &result,
+            PerformanceMeasurementLabel::PackageSelectionMergeBaseQueries,
+        ),
+        1
+    );
+    assert!(
+        measurement_counter(
+            &result,
+            PerformanceMeasurementLabel::PackageSelectionBaseManifestBlobBytes,
+        ) > 0
+    );
+    assert!(
+        measurement_counter(
+            &result,
+            PerformanceMeasurementLabel::PackageSelectionBaseLockBlobBytes,
+        ) > 0
+    );
+    assert!(
+        measurement_counter(
+            &result,
+            PerformanceMeasurementLabel::PackageSelectionProtectedCandidatePaths,
+        ) > 0
+    );
+    assert_eq!(
+        measurement_counter(
+            &result,
+            PerformanceMeasurementLabel::PackageSelectionDirtyPaths,
+        ),
+        0
+    );
+    assert_eq!(
+        measurement_counter(
+            &result,
+            PerformanceMeasurementLabel::PackageSelectionCommittedDiffBatches,
+        ),
+        4
+    );
+    assert_eq!(
+        measurement_counter(
+            &result,
+            PerformanceMeasurementLabel::PackageSelectionCommittedDiffProcesses,
+        ),
+        4
+    );
+    assert_eq!(
+        measurement_counter(
+            &result,
+            PerformanceMeasurementLabel::PackageSelectionCommittedDiffOutputPaths,
+        ),
+        3
+    );
+    assert_eq!(
+        measurement_counter(
+            &result,
+            PerformanceMeasurementLabel::PackageSelectionSeedModules,
+        ),
+        1
+    );
+    assert_eq!(
+        measurement_counter(
+            &result,
+            PerformanceMeasurementLabel::PackageSelectionFullEscalations,
+        ),
+        0
+    );
+    assert_eq!(
+        measurement_counter(
+            &result,
+            PerformanceMeasurementLabel::PackageSelectionClosureModules,
+        ),
+        2
+    );
+
+    let fast = run_package_verify_certs(verify_certs_base(
+        common_options(package.path(), true),
+        PackageChecker::Fast,
+        "HEAD^",
+    ));
+    assert_eq!(
+        fast.exit_code(),
+        CommandExitCode::Success,
+        "{}",
+        fast.render_json()
+    );
+    assert_eq!(
+        verified_module_identities(&fast)
+            .into_iter()
+            .map(|(module, _)| module)
+            .collect::<Vec<_>>(),
+        vec!["Std.Logic.Eq", "Proofs.Ai.EqReasoning"]
+    );
+    assert_eq!(
+        fast.verify_selection.as_deref().unwrap().seed_details,
+        vec!["Proofs.Ai.EqReasoning"]
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn package_verify_certs_base_rejects_dirty_protected_inputs_and_empty_ranges() {
+    let package = build_source_free_fixture(
+        "committed-base-preconditions",
+        "Proofs.Ai.Basic",
+        false,
+        &["Eq.rec"],
+    );
+    init_git_baseline(&package);
+
+    let empty = run_package_verify_certs(verify_certs_base(
+        common_options(package.path(), true),
+        PackageChecker::Reference,
+        "HEAD",
+    ));
+    assert_eq!(empty.exit_code(), CommandExitCode::PackageFailure);
+    assert_eq!(
+        empty.diagnostics[0].kind,
+        DiagnosticKind::SourceFreeBoundary
+    );
+    assert_eq!(empty.diagnostics[0].reason_code, "base_selection_empty");
+    assert_eq!(empty.diagnostics[0].field.as_deref(), Some("--base"));
+    assert!(empty.verify_selection.is_some());
+
+    mark_worktree_mode_changed(&package, "Proofs/Ai/Basic/certificate.npcert");
+    let dirty = run_package_verify_certs(verify_certs_base(
+        common_options(package.path(), true),
+        PackageChecker::Reference,
+        "HEAD",
+    ));
+    assert_eq!(dirty.exit_code(), CommandExitCode::PackageFailure);
+    assert_eq!(
+        dirty.diagnostics[0].kind,
+        DiagnosticKind::SourceFreeBoundary
+    );
+    assert_eq!(
+        dirty.diagnostics[0].reason_code,
+        "base_selection_dirty_inputs"
+    );
+    assert_eq!(dirty.diagnostics[0].field.as_deref(), Some("--base"));
+    assert!(dirty.diagnostics[0]
+        .actual_value
+        .as_deref()
+        .unwrap()
+        .contains("Proofs/Ai/Basic/certificate.npcert"));
+}
+
+#[cfg(unix)]
+#[test]
+fn package_verify_certs_base_rejects_index_masked_protected_inputs() {
+    let package = build_source_free_fixture(
+        "committed-base-index-masked",
+        "Proofs.Ai.Basic",
+        false,
+        &["Eq.rec"],
+    );
+    let source = package.artifact_path("Proofs/Ai/Basic/source.npa");
+    let meta = package.artifact_path("Proofs/Ai/Basic/meta.json");
+    fs::create_dir_all(source.parent().unwrap()).unwrap();
+    fs::write(&source, b"baseline source\n").unwrap();
+    fs::write(&meta, b"{}\n").unwrap();
+    init_git_baseline(&package);
+    run_git(
+        &package,
+        &[
+            "update-index",
+            "--assume-unchanged",
+            "Proofs/Ai/Basic/source.npa",
+        ],
+    );
+    run_git(
+        &package,
+        &[
+            "update-index",
+            "--skip-worktree",
+            "Proofs/Ai/Basic/meta.json",
+        ],
+    );
+    fs::write(&source, b"uncommitted source\n").unwrap();
+    fs::write(&meta, b"{\"uncommitted\":true}\n").unwrap();
+
+    let result = run_package_verify_certs(verify_certs_base(
+        common_options(package.path(), true),
+        PackageChecker::Reference,
+        "HEAD",
+    ));
+
+    assert_eq!(result.exit_code(), CommandExitCode::PackageFailure);
+    assert_eq!(
+        result.diagnostics[0].reason_code,
+        "base_selection_dirty_inputs"
+    );
+    let actual = result.diagnostics[0].actual_value.as_deref().unwrap();
+    assert!(actual.contains("Proofs/Ai/Basic/source.npa"), "{actual}");
+    assert!(actual.contains("Proofs/Ai/Basic/meta.json"), "{actual}");
+}
+
+#[cfg(unix)]
+#[test]
+fn package_verify_certs_base_rejects_fsmonitor_masked_protected_input() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let package = build_source_free_fixture(
+        "committed-base-fsmonitor-masked",
+        "Proofs.Ai.Basic",
+        false,
+        &["Eq.rec"],
+    );
+    let source = package.artifact_path("Proofs/Ai/Basic/source.npa");
+    fs::create_dir_all(source.parent().unwrap()).unwrap();
+    fs::write(&source, b"baseline source\n").unwrap();
+    init_git_baseline(&package);
+
+    let hook = package.artifact_path("false-fsmonitor.sh");
+    fs::write(&hook, b"#!/bin/sh\nprintf 'fake-token\\0'\n").unwrap();
+    let mut permissions = fs::metadata(&hook).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&hook, permissions).unwrap();
+    run_git(
+        &package,
+        &["config", "core.fsmonitor", hook.to_str().unwrap()],
+    );
+    run_git(&package, &["config", "core.fsmonitorHookVersion", "2"]);
+    run_git(
+        &package,
+        &[
+            "update-index",
+            "--fsmonitor-valid",
+            "Proofs/Ai/Basic/source.npa",
+        ],
+    );
+    fs::write(&source, b"tampered source\n").unwrap();
+
+    let result = run_package_verify_certs(verify_certs_base(
+        common_options(package.path(), true),
+        PackageChecker::Reference,
+        "HEAD",
+    ));
+
+    assert_eq!(result.exit_code(), CommandExitCode::PackageFailure);
+    assert_eq!(
+        result.diagnostics[0].reason_code,
+        "base_selection_dirty_inputs"
+    );
+    assert!(result.diagnostics[0]
+        .actual_value
+        .as_deref()
+        .unwrap()
+        .contains("Proofs/Ai/Basic/source.npa"));
+}
+
+#[cfg(unix)]
+#[test]
+fn package_verify_certs_base_ignores_inherited_git_repository_context() {
+    let package = build_source_free_fixture(
+        "committed-base-git-repository-environment",
+        "Proofs.Ai.Basic",
+        false,
+        &["Eq.rec"],
+    );
+    init_git_baseline(&package);
+    fs::write(
+        package.artifact_path("unrelated.txt"),
+        b"unrelated history\n",
+    )
+    .unwrap();
+    commit_git(&package, "unrelated current head");
+
+    let alternate = TestPackage::new("committed-base-alternate-git-repository");
+    fs::remove_dir_all(alternate.path()).unwrap();
+    let clone_status = Command::new("/usr/bin/git")
+        .args(["clone", "-q", "--no-hardlinks"])
+        .arg(package.path())
+        .arg(alternate.path())
+        .status()
+        .unwrap();
+    assert!(clone_status.success(), "git clone failed: {clone_status}");
+
+    let source_relative = "Proofs/Ai/Basic/source.npa";
+    let source = b"-- uncommitted protected source\n";
+    fs::create_dir_all(package.artifact_path(source_relative).parent().unwrap()).unwrap();
+    fs::write(package.artifact_path(source_relative), source).unwrap();
+    fs::write(alternate.artifact_path(source_relative), source).unwrap();
+    commit_git(&alternate, "alternate protected source");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_npa"))
+        .args(["package", "verify-certs", "--root"])
+        .arg(package.path())
+        .args(["--checker", "reference", "--base=HEAD^", "--json"])
+        .env("GIT_DIR", alternate.artifact_path(".git"))
+        .env("GIT_WORK_TREE", package.path())
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        output.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("\"reason_code\":\"base_selection_dirty_inputs\""),
+        "{stdout}"
+    );
+    assert!(stdout.contains(source_relative), "{stdout}");
+}
+
+#[test]
+fn package_verify_certs_base_rejects_ignored_untracked_protected_input() {
+    let package = build_source_free_fixture(
+        "committed-base-ignored-untracked",
+        "Proofs.Ai.Basic",
+        false,
+        &["Eq.rec"],
+    );
+    init_git_baseline(&package);
+    fs::write(
+        package.artifact_path(".git/info/exclude"),
+        b"Proofs/Ai/Basic/meta.json\n",
+    )
+    .unwrap();
+    let meta = package.artifact_path("Proofs/Ai/Basic/meta.json");
+    fs::create_dir_all(meta.parent().unwrap()).unwrap();
+    fs::write(&meta, b"{}\n").unwrap();
+
+    let result = run_package_verify_certs(verify_certs_base(
+        common_options(package.path(), true),
+        PackageChecker::Reference,
+        "HEAD",
+    ));
+
+    assert_eq!(result.exit_code(), CommandExitCode::PackageFailure);
+    assert_eq!(
+        result.diagnostics[0].reason_code,
+        "base_selection_dirty_inputs"
+    );
+    assert!(result.diagnostics[0]
+        .actual_value
+        .as_deref()
+        .unwrap()
+        .contains("Proofs/Ai/Basic/meta.json"));
+}
+
+#[test]
+fn package_verify_certs_base_source_only_commit_selects_current_certificate() {
+    let package = build_source_free_fixture(
+        "committed-base-source-only",
+        "Proofs.Ai.Basic",
+        false,
+        &["Eq.rec"],
+    );
+    init_git_baseline(&package);
+    let source = package.artifact_path("Proofs/Ai/Basic/source.npa");
+    fs::create_dir_all(source.parent().unwrap()).unwrap();
+    fs::write(
+        &source,
+        b"-- changed source; certificate refresh is a separate gate\n",
+    )
+    .unwrap();
+    commit_git(&package, "source only");
+
+    let result = run_package_verify_certs(verify_certs_base(
+        common_options(package.path(), true),
+        PackageChecker::Reference,
+        "HEAD^",
+    ));
+
+    assert_eq!(
+        result.exit_code(),
+        CommandExitCode::Success,
+        "{}",
+        result.render_json()
+    );
+    let summary = result.verify_selection.as_deref().unwrap();
+    assert_eq!(summary.outcome, "targeted");
+    assert_eq!(summary.seed_details, vec!["Proofs.Ai.Basic"]);
+    assert_eq!(summary.changed_path_count, Some(1));
+}
+
+#[test]
+fn package_verify_certs_base_missing_ref_fails_without_checker_execution() {
+    let package = build_source_free_fixture(
+        "committed-base-missing-ref",
+        "Proofs.Ai.Basic",
+        false,
+        &["Eq.rec"],
+    );
+    init_git_baseline(&package);
+
+    let result = run_package_verify_certs(verify_certs_base(
+        common_options(package.path(), true),
+        PackageChecker::Reference,
+        "refs/heads/does-not-exist",
+    ));
+
+    assert_eq!(result.exit_code(), CommandExitCode::UsageOrInternal);
+    assert_eq!(
+        result.diagnostics[0].reason_code,
+        "git_base_selection_failed"
+    );
+    assert!(!result
+        .diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.reason_code == "module_verified"));
+    let summary = result.verify_selection.as_deref().unwrap();
+    assert_eq!(
+        summary.requested_base.as_deref(),
+        Some("refs/heads/does-not-exist")
+    );
+    assert!(summary.base_commit.is_none());
+    assert!(summary.head_commit.is_none());
+}
+
+#[test]
+fn package_verify_certs_base_invalid_baseline_metadata_escalates_full() {
+    let package = build_source_free_fixture(
+        "committed-base-invalid-metadata",
+        "Proofs.Ai.Basic",
+        false,
+        &["Eq.rec"],
+    );
+    init_git_baseline(&package);
+    let manifest_path = package.artifact_path(PACKAGE_MANIFEST_PATH);
+    let valid_manifest = fs::read(&manifest_path).unwrap();
+    fs::write(&manifest_path, b"not valid package TOML\n").unwrap();
+    commit_git(&package, "invalid historical metadata");
+    fs::write(&manifest_path, valid_manifest).unwrap();
+    commit_git(&package, "restore current metadata");
+
+    let result = run_package_verify_certs(verify_certs_base(
+        common_options(package.path(), true),
+        PackageChecker::Reference,
+        "HEAD^",
+    ));
+
+    assert_eq!(
+        result.exit_code(),
+        CommandExitCode::Success,
+        "{}",
+        result.render_json()
+    );
+    let summary = result.verify_selection.as_deref().unwrap();
+    assert_eq!(summary.outcome, "full_escalated");
+    assert!(summary
+        .escalation_details
+        .iter()
+        .any(|detail| detail == "baseline_metadata_invalid:manifest"));
+}
+
+#[test]
+fn package_verify_certs_base_escalates_package_metadata_change_to_full() {
+    let package = build_source_free_modules_fixture(
+        "committed-base-full-escalation",
+        &["Proofs.Ai.Basic", "Proofs.Ai.EqReasoning"],
+        &["Eq.rec"],
+    );
+    init_git_baseline(&package);
+    let manifest_path = package.artifact_path(PACKAGE_MANIFEST_PATH);
+    let source = fs::read_to_string(&manifest_path).unwrap();
+    let source = source.replacen(
+        "checker_profile = \"npa.checker.reference.v0.1\"\n",
+        "checker_profile = \"npa.checker.reference.v0.1\"\ndescription = \"changed package metadata\"\n",
+        1,
+    );
+    fs::write(&manifest_path, &source).unwrap();
+    write_lock(&package, &source);
+    commit_git(&package, "package metadata");
+
+    let result = run_package_verify_certs(
+        verify_certs_base(
+            common_options(package.path(), true),
+            PackageChecker::Reference,
+            "HEAD^",
+        )
+        .with_timings(PackageTimingMode::Summary),
+    );
+
+    assert_eq!(
+        result.exit_code(),
+        CommandExitCode::Success,
+        "{}",
+        result.render_json()
+    );
+    let summary = result.verify_selection.as_deref().unwrap();
+    assert_eq!(summary.outcome, "full_escalated");
+    assert!(summary
+        .escalation_details
+        .iter()
+        .any(|detail| detail.starts_with("package_metadata_changed:")));
+    assert_eq!(summary.closure_module_count, Some(3));
+    assert_eq!(
+        measurement_counter(
+            &result,
+            PerformanceMeasurementLabel::PackageSelectionFullEscalations,
+        ),
+        1
+    );
+    assert!([
+        PerformanceMeasurementLabel::PackageSelectionFullEscalationReasonIdentityWord0,
+        PerformanceMeasurementLabel::PackageSelectionFullEscalationReasonIdentityWord1,
+        PerformanceMeasurementLabel::PackageSelectionFullEscalationReasonIdentityWord2,
+        PerformanceMeasurementLabel::PackageSelectionFullEscalationReasonIdentityWord3,
+    ]
+    .into_iter()
+    .any(|label| measurement_counter(&result, label) != 0));
+}
+
+#[test]
+fn package_verify_certs_base_added_module_is_targeted_and_deleted_module_escalates() {
+    let added = build_source_free_modules_fixture(
+        "committed-base-added-module",
+        &["Proofs.Ai.EqReasoning"],
+        &["Eq.rec"],
+    );
+    init_git_baseline(&added);
+    write_source_free_modules_fixture(
+        &added,
+        &["Proofs.Ai.Basic", "Proofs.Ai.EqReasoning"],
+        &["Eq.rec"],
+    );
+    commit_git(&added, "add local module");
+
+    let result = run_package_verify_certs(verify_certs_base(
+        common_options(added.path(), true),
+        PackageChecker::Reference,
+        "HEAD^",
+    ));
+    assert_eq!(
+        result.exit_code(),
+        CommandExitCode::Success,
+        "{}",
+        result.render_json()
+    );
+    let summary = result.verify_selection.as_deref().unwrap();
+    assert_eq!(summary.outcome, "targeted");
+    assert_eq!(summary.seed_details, vec!["Proofs.Ai.Basic"]);
+
+    let deleted = build_source_free_modules_fixture(
+        "committed-base-deleted-module",
+        &["Proofs.Ai.Basic", "Proofs.Ai.EqReasoning"],
+        &["Eq.rec"],
+    );
+    init_git_baseline(&deleted);
+    fs::remove_file(deleted.artifact_path("Proofs/Ai/Basic/certificate.npcert")).unwrap();
+    write_source_free_modules_fixture(&deleted, &["Proofs.Ai.EqReasoning"], &["Eq.rec"]);
+    commit_git(&deleted, "delete local module");
+
+    let result = run_package_verify_certs(verify_certs_base(
+        common_options(deleted.path(), true),
+        PackageChecker::Reference,
+        "HEAD^",
+    ));
+    assert_eq!(
+        result.exit_code(),
+        CommandExitCode::Success,
+        "{}",
+        result.render_json()
+    );
+    let summary = result.verify_selection.as_deref().unwrap();
+    assert_eq!(summary.outcome, "full_escalated");
+    assert!(summary
+        .escalation_details
+        .iter()
+        .any(|detail| detail == "local_module_deleted:Proofs.Ai.Basic"));
+}
+
+#[test]
+fn package_verify_certs_base_routing_rename_escalates_under_no_renames_diff() {
+    let package = build_source_free_fixture(
+        "committed-base-routing-rename",
+        "Proofs.Ai.Basic",
+        false,
+        &["Eq.rec"],
+    );
+    init_git_baseline(&package);
+    let old_certificate = "Proofs/Ai/Basic/certificate.npcert";
+    let new_certificate = "Proofs/Ai/Basic/renamed-certificate.npcert";
+    fs::rename(
+        package.artifact_path(old_certificate),
+        package.artifact_path(new_certificate),
+    )
+    .unwrap();
+    let proof_manifest = proof_manifest();
+    let mut module = manifest_module_from_package(
+        proof_manifest
+            .manifest()
+            .modules
+            .iter()
+            .find(|module| module.module.as_dotted() == "Proofs.Ai.Basic")
+            .unwrap(),
+    );
+    module.certificate = new_certificate.to_owned();
+    let manifest_source = fixture_manifest(&["Eq.rec"], &[], &[module]);
+    fs::write(
+        package.artifact_path(PACKAGE_MANIFEST_PATH),
+        &manifest_source,
+    )
+    .unwrap();
+    write_lock(&package, &manifest_source);
+    commit_git(&package, "rename module certificate route");
+
+    let result = run_package_verify_certs(verify_certs_base(
+        common_options(package.path(), true),
+        PackageChecker::Reference,
+        "HEAD^",
+    ));
+    assert_eq!(
+        result.exit_code(),
+        CommandExitCode::Success,
+        "{}",
+        result.render_json()
+    );
+    let summary = result.verify_selection.as_deref().unwrap();
+    assert_eq!(summary.outcome, "full_escalated");
+    assert!(summary
+        .escalation_details
+        .iter()
+        .any(|detail| detail == "module_routing_changed:Proofs.Ai.Basic"));
+    assert!(summary.changed_path_count.unwrap() >= 4);
+}
+
+#[cfg(unix)]
+#[test]
+fn package_verify_certs_base_preserves_nested_literal_path_boundaries() {
+    let mut package = build_source_free_fixture(
+        "committed-base-nested-literal",
+        "Proofs.Ai.Basic",
+        false,
+        &["Eq.rec"],
+    );
+    let old_certificate = "Proofs/Ai/Basic/certificate.npcert";
+    let literal_certificate = "Proofs/Ai/Basic/- literal * ? [x] : 日本.npcert";
+    fs::rename(
+        package.artifact_path(old_certificate),
+        package.artifact_path(literal_certificate),
+    )
+    .unwrap();
+    let proof_manifest = proof_manifest();
+    let mut module = manifest_module_from_package(
+        proof_manifest
+            .manifest()
+            .modules
+            .iter()
+            .find(|module| module.module.as_dotted() == "Proofs.Ai.Basic")
+            .unwrap(),
+    );
+    module.certificate = literal_certificate.to_owned();
+    let manifest_source = fixture_manifest(&["Eq.rec"], &[], &[module]);
+    fs::write(
+        package.artifact_path(PACKAGE_MANIFEST_PATH),
+        &manifest_source,
+    )
+    .unwrap();
+    write_lock(&package, &manifest_source);
+    nest_package_in_worktree(&mut package, "nested package/証明 package");
+    init_git_worktree_baseline(&package);
+
+    mark_worktree_mode_changed(&package, literal_certificate);
+    replace_module_manifest_hash(
+        &package,
+        "Proofs.Ai.Basic",
+        "expected_source_hash",
+        test_hash(0x73).into(),
+    );
+    let manifest_source = fs::read_to_string(package.artifact_path(PACKAGE_MANIFEST_PATH)).unwrap();
+    write_lock(&package, &manifest_source);
+    commit_git(&package, "literal nested refresh");
+
+    let result = run_package_verify_certs(verify_certs_base(
+        common_options(package.path(), true),
+        PackageChecker::Reference,
+        "HEAD^",
+    ));
+    assert_eq!(
+        result.exit_code(),
+        CommandExitCode::Success,
+        "{}",
+        result.render_json()
+    );
+    let summary = result.verify_selection.as_deref().unwrap();
+    assert_eq!(summary.outcome, "targeted");
+    assert_eq!(summary.seed_details, vec!["Proofs.Ai.Basic"]);
+    assert_eq!(summary.changed_path_count, Some(3));
+}
+
+#[test]
+fn package_verify_certs_base_package_absent_from_baseline_escalates_full() {
+    let mut package = build_source_free_fixture(
+        "committed-base-package-added",
+        "Proofs.Ai.Basic",
+        false,
+        &["Eq.rec"],
+    );
+    nest_package_in_worktree(&mut package, "packages/proofs");
+    let staged_package = package.cleanup_path().with_file_name(format!(
+        "{}-staged-package",
+        package
+            .cleanup_path()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+    ));
+    if staged_package.exists() {
+        fs::remove_dir_all(&staged_package).unwrap();
+    }
+    fs::rename(package.path(), &staged_package).unwrap();
+    fs::write(package.cleanup_path().join("README.md"), b"baseline\n").unwrap();
+    init_git_worktree_baseline(&package);
+    fs::create_dir_all(package.path().parent().unwrap()).unwrap();
+    fs::rename(&staged_package, package.path()).unwrap();
+    commit_git(&package, "add proof package");
+
+    let result = run_package_verify_certs(verify_certs_base(
+        common_options(package.path(), true),
+        PackageChecker::Reference,
+        "HEAD^",
+    ));
+    assert_eq!(
+        result.exit_code(),
+        CommandExitCode::Success,
+        "{}",
+        result.render_json()
+    );
+    let summary = result.verify_selection.as_deref().unwrap();
+    assert_eq!(summary.outcome, "full_escalated");
+    assert!(summary
+        .escalation_details
+        .iter()
+        .any(|detail| detail == "baseline_unavailable:manifest_and_lock"));
+}
+
+#[test]
+fn package_verify_certs_base_rejects_staged_deleted_and_untracked_protected_paths() {
+    let staged = build_source_free_fixture(
+        "committed-base-staged-source",
+        "Proofs.Ai.Basic",
+        false,
+        &["Eq.rec"],
+    );
+    let staged_source = staged.artifact_path("Proofs/Ai/Basic/source.npa");
+    fs::create_dir_all(staged_source.parent().unwrap()).unwrap();
+    fs::write(&staged_source, b"baseline source\n").unwrap();
+    init_git_baseline(&staged);
+    fs::write(&staged_source, b"staged source\n").unwrap();
+    run_git(&staged, &["add", "Proofs/Ai/Basic/source.npa"]);
+
+    let deleted = build_source_free_fixture(
+        "committed-base-deleted-source",
+        "Proofs.Ai.Basic",
+        false,
+        &["Eq.rec"],
+    );
+    let deleted_source = deleted.artifact_path("Proofs/Ai/Basic/source.npa");
+    fs::create_dir_all(deleted_source.parent().unwrap()).unwrap();
+    fs::write(&deleted_source, b"baseline source\n").unwrap();
+    init_git_baseline(&deleted);
+    fs::remove_file(&deleted_source).unwrap();
+
+    let untracked = build_source_free_fixture(
+        "committed-base-untracked-meta",
+        "Proofs.Ai.Basic",
+        false,
+        &["Eq.rec"],
+    );
+    init_git_baseline(&untracked);
+    let untracked_meta = untracked.artifact_path("Proofs/Ai/Basic/meta.json");
+    fs::create_dir_all(untracked_meta.parent().unwrap()).unwrap();
+    fs::write(&untracked_meta, b"{}\n").unwrap();
+
+    for (label, package, expected_path) in [
+        ("staged", &staged, "Proofs/Ai/Basic/source.npa"),
+        ("deleted", &deleted, "Proofs/Ai/Basic/source.npa"),
+        ("untracked", &untracked, "Proofs/Ai/Basic/meta.json"),
+    ] {
+        let result = run_package_verify_certs(verify_certs_base(
+            common_options(package.path(), true),
+            PackageChecker::Reference,
+            "HEAD",
+        ));
+        assert_eq!(
+            result.exit_code(),
+            CommandExitCode::PackageFailure,
+            "{label}"
+        );
+        assert_eq!(
+            result.diagnostics[0].reason_code,
+            "base_selection_dirty_inputs",
+            "{label}: {}",
+            result.render_json()
+        );
+        assert!(
+            result.diagnostics[0]
+                .actual_value
+                .as_deref()
+                .unwrap()
+                .contains(expected_path),
+            "{label}: {}",
+            result.render_json()
+        );
+    }
+}
+
+#[test]
 fn package_verify_certs_changed_reconstructed_preserves_certificate_selection() {
     let mut package = build_source_free_modules_fixture(
         "changed-reconstructed-certificate-selection",
@@ -1491,7 +2501,7 @@ fn package_verify_certs_fast_cli_succeeds_with_json_and_human_provenance() {
     assert_eq!(output.status.code(), Some(0));
     assert!(output.stderr.is_empty());
     let stdout = String::from_utf8(output.stdout).unwrap();
-    assert!(stdout.contains("\"schema\":\"npa.package.command_result.v0.4\""));
+    assert!(stdout.contains("\"schema\":\"npa.package.command_result.v0.5\""));
     assert!(stdout.contains("\"command\":\"package verify-certs\""));
     assert!(stdout.contains("\"status\":\"passed\""));
     assert!(stdout.contains("\"kind\":\"FastVerifier\""));
@@ -1518,7 +2528,7 @@ fn package_verify_certs_fast_cli_succeeds_with_json_and_human_provenance() {
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 #[test]
-fn package_verify_external_succeeds_with_explicit_policy_registry_imports_and_no_source() {
+fn package_verify_external_fails_closed_before_import_or_result_mutation() {
     let package =
         build_source_free_fixture("external-source-free", "Proofs.Ai.Eq", true, &["Eq.rec"]);
     let lock_hash = checked_lock_hash(&package);
@@ -1530,62 +2540,36 @@ fn package_verify_external_succeeds_with_explicit_policy_registry_imports_and_no
 
     let result = run_verify_external(&package, external);
 
-    assert_eq!(result.exit_code(), CommandExitCode::Success);
-    assert_eq!(result.artifacts.len(), 3);
-    assert!(result
-        .artifacts
-        .iter()
-        .all(|artifact| artifact.kind == "machine_check_result"));
-    assert!(result.artifacts.iter().any(|artifact| artifact.path
-        == "generated/checker-results/fixture-package/0.1.0/Proofs.Ai.Eq/external/result.json"));
-    assert!(result.artifacts.iter().any(|artifact| artifact.path
-        == "generated/checker-results/fixture-package/0.1.0/Std.Logic.Eq/external/result.json"));
-    assert!(
-        package
-            .artifact_path(
-                "generated/checker-imports/fixture-package/0.1.0/Proofs.Ai.Eq/external/vendor/npa-std/Std/Logic/Eq/certificate.npcert"
-            )
-            .exists()
+    assert_eq!(result.exit_code(), CommandExitCode::PackageFailure);
+    assert!(result.artifacts.is_empty());
+    assert_eq!(result.diagnostics.len(), 2);
+    let diagnostic = &result.diagnostics[0];
+    assert_eq!(diagnostic.kind, DiagnosticKind::ExternalVerifier);
+    assert_eq!(
+        diagnostic.reason_code,
+        "external_checker_supervisor_unavailable"
     );
-    assert!(result
-        .artifacts
-        .iter()
-        .all(|artifact| package.artifact_path(&artifact.path).exists()));
-    assert_eq!(result.diagnostics.len(), 5);
-    assert_info(
-        &result.diagnostics[0],
-        DiagnosticKind::ExternalVerifier,
-        "package_verified",
-        Some("npa-checker-ext"),
+    assert_eq!(
+        diagnostic.field.as_deref(),
+        Some("runner.resource_accounting")
     );
+    assert_eq!(
+        diagnostic.expected_value.as_deref(),
+        Some("descendant_memory_timeout_and_authenticated_steps")
+    );
+    assert_eq!(diagnostic.actual_value.as_deref(), Some("unavailable"));
+    assert_eq!(diagnostic.checker.as_deref(), Some("npa-checker-ext"));
     assert_lock_provenance(
         &result.diagnostics[1],
         PackageLockInputMode::CheckedFile,
         lock_hash,
     );
-    assert_eq!(result.diagnostics[2].reason_code, "module_verified");
-    assert!(result.diagnostics[0]
-        .actual_value
-        .as_deref()
-        .unwrap()
-        .contains("mode=external"));
-    assert_eq!(
-        result
-            .diagnostics
-            .iter()
-            .filter(|diagnostic| diagnostic.reason_code == "module_verified")
-            .count(),
-        3
-    );
-    let local_result = result
-        .artifacts
-        .iter()
-        .find(|artifact| artifact.path.contains("Proofs.Ai.Eq"))
-        .unwrap();
-    let result_json = fs::read_to_string(package.artifact_path(&local_result.path)).unwrap();
-    assert!(result_json.contains("\"schema\":\"npa.independent-checker.machine_check_result.v1\""));
-    assert!(result_json.contains("\"profile\":\"external\""));
-    assert!(result_json.contains("\"status\":\"checked\""));
+    assert!(!package
+        .artifact_path("generated/checker-imports/fixture-package/0.1.0")
+        .exists());
+    assert!(!package
+        .artifact_path("generated/checker-results/fixture-package/0.1.0")
+        .exists());
     assert!(!result
         .render_json()
         .contains(&package.path().to_string_lossy().to_string()));
@@ -1643,12 +2627,10 @@ fn package_verify_external_rejects_unknown_axiom_policy_override_after_hash_vali
 
 #[test]
 #[ignore = "requires NPA_CHECKER_EXT_BINARY_PATH built by the OCaml gate"]
-fn package_verify_external_real_ocaml_checker_closes_source_free_import_dag() {
+fn package_verify_external_real_ocaml_checker_obeys_platform_fail_closed_boundary() {
     let package =
         build_source_free_fixture("external-real-ocaml", "Proofs.Ai.Eq", true, &["Eq.rec"]);
     let lock_hash = checked_lock_hash(&package);
-    let lock_source = fs::read_to_string(package.artifact_path(LOCK_PATH)).unwrap();
-    let lock = parse_package_lock_json(&lock_source).unwrap();
     let checker_path = std::env::var_os("NPA_CHECKER_EXT_BINARY_PATH")
         .map(PathBuf::from)
         .expect("NPA_CHECKER_EXT_BINARY_PATH must name the built OCaml checker");
@@ -1658,102 +2640,33 @@ fn package_verify_external_real_ocaml_checker_closes_source_free_import_dag() {
 
     assert_eq!(
         result.exit_code(),
-        CommandExitCode::Success,
+        CommandExitCode::PackageFailure,
         "{}",
         result.render_json()
     );
-    assert_eq!(result.diagnostics.len(), lock.entries.len() + 2);
-    assert_info(
-        &result.diagnostics[0],
-        DiagnosticKind::ExternalVerifier,
-        "package_verified",
-        Some("npa-checker-ext"),
-    );
+    assert_eq!(result.diagnostics.len(), 2);
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     assert_eq!(
-        result.diagnostics[0].actual_value.as_deref(),
-        Some(
-            format!(
-                "mode=external;verdict_source=npa-checker-ext;reference_checker_verdict=false;modules={}",
-                lock.entries.len()
-            )
-            .as_str()
-        )
+        result.diagnostics[0].reason_code,
+        "external_checker_supervisor_unavailable"
     );
-    assert_eq!(lock_provenance_count(&result), 1);
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    assert_eq!(
+        result.diagnostics[0].reason_code,
+        "checker_binary_immutable_snapshot_unsupported"
+    );
     assert_lock_provenance(
         &result.diagnostics[1],
         PackageLockInputMode::CheckedFile,
         lock_hash,
     );
-    assert_eq!(result.artifacts.len(), lock.entries.len());
-    assert!(result
-        .diagnostics
-        .iter()
-        .filter(|diagnostic| diagnostic.reason_code == "module_verified")
-        .all(|diagnostic| diagnostic.checker.as_deref() == Some("npa-checker-ext")));
-
-    for artifact in &result.artifacts {
-        assert_eq!(artifact.kind, "machine_check_result");
-        let module = artifact
-            .path
-            .strip_prefix("generated/checker-results/fixture-package/0.1.0/")
-            .and_then(|path| path.strip_suffix("/external/result.json"))
-            .expect("real checker result must use the deterministic external layout");
-        let entry = lock
-            .entries
-            .iter()
-            .find(|entry| entry.module.as_dotted() == module)
-            .expect("every result module must come from the checked lock");
-        let machine = fs::read_to_string(package.artifact_path(&artifact.path)).unwrap();
-        assert!(machine.contains("\"schema\":\"npa.independent-checker.machine_check_result.v1\""));
-        assert!(machine.contains(&format!("\"module\":\"{}\"", entry.module.as_dotted())));
-        assert!(machine.contains("\"status\":\"checked\""));
-        assert!(machine.contains(&format!(
-            "\"certificate_hash\":\"{}\"",
-            format_package_hash(&entry.certificate_hash)
-        )));
-        assert!(machine.contains(&format!(
-            "\"export_hash\":\"{}\"",
-            format_package_hash(&entry.export_hash)
-        )));
-        assert!(machine.contains(&format!(
-            "\"axiom_report_hash\":\"{}\"",
-            format_package_hash(&entry.axiom_report_hash)
-        )));
-        assert!(machine.contains(&format!(
-            "\"checker\":{{\"binary_hash\":\"{}\",\"binary_id\":\"npa-checker-ext-macos-aarch64\",\"build_hash\":\"{}\",\"id\":\"npa-checker-ext\",\"profile\":\"external\",\"version\":\"0.3.0\"}}",
-            fixture.binary_hash, fixture.build_hash
-        )));
-        assert!(machine.contains(&format!(
-            "\"policy\":{{\"hash\":\"{}\",\"id\":\"package-external-pr\",\"version\":1}}",
-            fixture.policy_hash
-        )));
-        assert!(machine.contains(&format!(
-            "\"runner\":{{\"build_hash\":\"{}\",\"id\":\"npa-cli-package-external-runner\",\"version\":\"0.1.0\"}}",
-            fixture.runner_build_hash
-        )));
-        assert!(machine.contains("\"process\":{\"exit_code\":0,\"launched\":true}"));
-        assert!(machine.contains("\"resource_usage\":{\"elapsed_ms\":"));
-        assert!(machine.contains("\"memory_peak_mb\":0,\"steps\":0}"));
-
-        let raw_hex = json_string_field_for_test(&machine, "raw_checker_output_hex");
-        let raw = String::from_utf8(decode_lower_hex_for_test(raw_hex)).unwrap();
-        assert!(raw.ends_with('\n'));
-        assert!(raw.contains("\"schema\": \"npa.independent-checker.checker_raw_result.v2\""));
-        assert!(raw.contains("\"checker_id\": \"npa-checker-ext\""));
-        assert!(raw.contains("\"checker_version\": \"0.3.0\""));
-        assert!(raw.contains("\"certificate_format\": \"NPA-CERT-0.3.0\""));
-        assert!(raw.contains("\"core_spec\": \"NPA-Core-0.3.0\""));
-        assert!(raw.contains(&format!(
-            "\"checker_build_hash\": \"{}\"",
-            fixture.build_hash
-        )));
-        assert!(raw.contains(&format!("\"module\": \"{}\"", entry.module.as_dotted())));
-        assert!(raw.contains(&format!(
-            "\"certificate_hash\": \"{}\"",
-            format_package_hash(&entry.certificate_hash)
-        )));
-    }
+    assert!(result.artifacts.is_empty());
+    assert!(!package
+        .artifact_path("generated/checker-imports/fixture-package/0.1.0")
+        .exists());
+    assert!(!package
+        .artifact_path("generated/checker-results/fixture-package/0.1.0")
+        .exists());
 }
 
 #[test]
@@ -1970,6 +2883,93 @@ fn package_verify_certs_audit_cache_read_through_writes_then_hits() {
     assert!(second_summary.contains("misses=0"));
     assert!(second_summary.contains("written=0"));
     assert!(second_summary.contains("cached=1"));
+}
+
+#[test]
+fn package_verify_certs_fast_local_audit_uses_prepared_snapshot_lifecycle() {
+    let _guard = audit_cache_test_lock();
+    clear_audit_cache();
+    let package = build_source_free_fixture(
+        "snapshot-fast-audit-prepared",
+        "Proofs.Ai.Basic",
+        false,
+        &["Eq.rec", "Snapshot.Audit.Prepared"],
+    );
+
+    let warm = run_verify_with_audit_cache_and_timings(
+        &package,
+        PackageChecker::Fast,
+        PackageAuditCacheMode::ReadThrough,
+        PackageTimingMode::Summary,
+    );
+    assert_eq!(warm.exit_code(), CommandExitCode::Success);
+    let warm_summary = audit_cache_summary(&warm);
+    assert!(warm_summary.contains("hits=0"), "{warm_summary}");
+    assert!(warm_summary.contains("live_checked=1"), "{warm_summary}");
+    assert_prepared_artifact_lifecycle(&warm, 1, 1);
+
+    let cached = run_verify_with_audit_cache_and_timings(
+        &package,
+        PackageChecker::Fast,
+        PackageAuditCacheMode::LocalHit,
+        PackageTimingMode::Summary,
+    );
+    assert_eq!(cached.exit_code(), CommandExitCode::Success);
+    let cached_summary = audit_cache_summary(&cached);
+    assert!(cached_summary.contains("hits=1"), "{cached_summary}");
+    assert!(cached_summary.contains("cached=1"), "{cached_summary}");
+    assert!(
+        cached_summary.contains("live_checked=0"),
+        "{cached_summary}"
+    );
+    assert_prepared_artifact_lifecycle(&cached, 1, 0);
+
+    clear_audit_cache();
+}
+
+#[test]
+fn package_verify_certs_changed_selection_error_releases_prepared_snapshot() {
+    let package = build_source_free_fixture(
+        "snapshot-changed-selection-error",
+        "Proofs.Ai.Basic",
+        false,
+        &["Eq.rec", "Snapshot.ChangedSelection.Error"],
+    );
+
+    let result = run_package_verify_certs(
+        verify_changed_certificates(common_options(package.path(), true), PackageChecker::Fast)
+            .with_timings(PackageTimingMode::Summary),
+    );
+
+    assert_eq!(result.exit_code(), CommandExitCode::UsageOrInternal);
+    assert_eq!(result.diagnostics[0].reason_code, "git_status_failed");
+    assert_eq!(lock_provenance_count(&result), 1);
+    let admissions = measurement_counter(
+        &result,
+        PerformanceMeasurementLabel::PackagePreparedArtifactAdmissions,
+    );
+    assert!(admissions > 0, "fixture must exercise retained acquisition");
+    assert_eq!(
+        measurement_counter(
+            &result,
+            PerformanceMeasurementLabel::PackagePreparedArtifactReleases,
+        ),
+        admissions
+    );
+    assert_eq!(
+        measurement_counter(
+            &result,
+            PerformanceMeasurementLabel::PackagePreparedArtifactCurrentEntries,
+        ),
+        0
+    );
+    assert_eq!(
+        measurement_counter(
+            &result,
+            PerformanceMeasurementLabel::PackagePreparedArtifactCurrentBytes,
+        ),
+        0
+    );
 }
 
 #[test]
@@ -2206,7 +3206,7 @@ fn package_verify_certs_local_hit_marks_proof_evidence_false_and_follow_up() {
     assert_eq!(
         module.actual_value.as_deref(),
         Some(
-            "status=passed;evidence=local-audit-cache;proof_evidence=false;certificate_format=NPA-CERT-0.3.0;core_spec=NPA-Core-0.3.0"
+            "status=passed;evidence=local-audit-cache;proof_evidence=false;certificate_format=NPA-CERT-0.4.0;core_spec=NPA-Core-0.4.0"
         )
     );
     let summary = audit_cache_summary(&local);
@@ -2288,7 +3288,7 @@ fn package_verify_certs_local_hit_live_checks_cached_dependency_needed_by_live_d
     assert!(local.diagnostics.iter().all(|diagnostic| {
         diagnostic.actual_value.as_deref()
             != Some(
-                "status=passed;evidence=local-audit-cache;proof_evidence=false;certificate_format=NPA-CERT-0.3.0;core_spec=NPA-Core-0.3.0",
+                "status=passed;evidence=local-audit-cache;proof_evidence=false;certificate_format=NPA-CERT-0.4.0;core_spec=NPA-Core-0.4.0",
             )
     }));
     assert!(local
@@ -2345,7 +3345,6 @@ fn package_verify_certs_local_hit_does_not_run_from_package_gate_scripts() {
 fn package_verify_certs_reconstructed_supports_verifier_memo_settings() {
     let _guard = disk_memo_test_lock();
     clear_disk_memo();
-    clear_package_verification_process_memo();
     let package = build_source_free_fixture(
         "reconstructed-verifier-memo-settings",
         "Proofs.Ai.Basic",
@@ -2413,7 +3412,6 @@ fn package_verify_certs_reconstructed_supports_verifier_memo_settings() {
 fn package_verify_certs_disk_memo_keys_canonical_lock_and_refreshes_mode_provenance() {
     let _guard = disk_memo_test_lock();
     clear_disk_memo();
-    clear_package_verification_process_memo();
     let package = build_source_free_fixture(
         "disk-memo-cross-lock-mode",
         "Proofs.Ai.Basic",
@@ -2556,7 +3554,6 @@ fn package_verify_certs_disk_memo_keys_canonical_lock_and_refreshes_mode_provena
 fn package_verify_certs_disk_memo_writes_hits_and_delete_reruns_live() {
     let _guard = disk_memo_test_lock();
     clear_disk_memo();
-    clear_package_verification_process_memo();
     let package = build_source_free_fixture(
         "disk-memo-hit",
         "Proofs.Ai.Basic",
@@ -2623,7 +3620,7 @@ fn package_verify_certs_disk_memo_writes_hits_and_delete_reruns_live() {
     assert_eq!(
         module.actual_value.as_deref(),
         Some(
-            "status=passed;evidence=disk-verifier-memo;proof_evidence=false;certificate_format=NPA-CERT-0.3.0;core_spec=NPA-Core-0.3.0"
+            "status=passed;evidence=disk-verifier-memo;proof_evidence=false;certificate_format=NPA-CERT-0.4.0;core_spec=NPA-Core-0.4.0"
         )
     );
 
@@ -2646,7 +3643,6 @@ fn package_verify_certs_disk_memo_writes_hits_and_delete_reruns_live() {
 fn package_verify_certs_cache_aware_disk_memo_live_checks_dirty_reverse_dependents() {
     let _guard = disk_memo_test_lock();
     clear_disk_memo();
-    clear_package_verification_process_memo();
     let package = build_source_free_modules_fixture(
         "cache-aware-dag",
         &[
@@ -2680,23 +3676,65 @@ fn package_verify_certs_cache_aware_disk_memo_live_checks_dirty_reverse_dependen
     assert!(summary.contains("cached=1"), "{summary}");
     assert_eq!(
         module_actual_value(&cached, "Proofs.Ai.Basic"),
-        "status=passed;evidence=disk-verifier-memo;proof_evidence=false;certificate_format=NPA-CERT-0.3.0;core_spec=NPA-Core-0.3.0"
+        "status=passed;evidence=disk-verifier-memo;proof_evidence=false;certificate_format=NPA-CERT-0.4.0;core_spec=NPA-Core-0.4.0"
     );
     assert_eq!(
         module_actual_value(&cached, "Proofs.Ai.EqReasoning"),
-        "status=passed;evidence=live-checker;proof_evidence=true;certificate_format=NPA-CERT-0.3.0;core_spec=NPA-Core-0.3.0"
+        "status=passed;evidence=live-checker;proof_evidence=true;certificate_format=NPA-CERT-0.4.0;core_spec=NPA-Core-0.4.0"
     );
     assert_eq!(
         module_actual_value(&cached, "Proofs.Ai.Analysis.AbstractMetricTopology"),
-        "status=passed;evidence=live-checker;proof_evidence=true;certificate_format=NPA-CERT-0.3.0;core_spec=NPA-Core-0.3.0"
+        "status=passed;evidence=live-checker;proof_evidence=true;certificate_format=NPA-CERT-0.4.0;core_spec=NPA-Core-0.4.0"
     );
+}
+
+#[test]
+fn package_verify_certs_fast_disk_memo_uses_prepared_cache_aware_lifecycle() {
+    let _guard = disk_memo_test_lock();
+    clear_disk_memo();
+    let package = build_source_free_modules_fixture(
+        "snapshot-fast-disk-prepared",
+        &[
+            "Proofs.Ai.Basic",
+            "Proofs.Ai.EqReasoning",
+            "Proofs.Ai.Analysis.AbstractMetricTopology",
+        ],
+        &["Eq.rec", "Snapshot.Disk.Prepared"],
+    );
+
+    let warm = run_verify_with_verifier_memo(
+        &package,
+        PackageChecker::Fast,
+        PackageVerifierMemoMode::ReadThrough,
+        PackageTimingMode::Summary,
+    );
+    assert_eq!(warm.exit_code(), CommandExitCode::Success);
+    let warm_summary = disk_memo_summary(&warm);
+    assert!(warm_summary.contains("mode=read-through"), "{warm_summary}");
+    assert!(warm_summary.contains("live_checked=4"), "{warm_summary}");
+    assert_prepared_artifact_lifecycle(&warm, 4, 4);
+
+    remove_disk_memo_entries_for_module("Proofs.Ai.EqReasoning");
+    let cached = run_verify_with_verifier_memo(
+        &package,
+        PackageChecker::Fast,
+        PackageVerifierMemoMode::Disk,
+        PackageTimingMode::Summary,
+    );
+    assert_eq!(cached.exit_code(), CommandExitCode::Success);
+    let summary = disk_memo_summary(&cached);
+    assert!(summary.contains("cached=1"), "{summary}");
+    assert!(summary.contains("live_checked=3"), "{summary}");
+    assert!(!summary.contains("invalidated=0"), "{summary}");
+    assert_prepared_artifact_lifecycle(&cached, 4, 3);
+
+    clear_disk_memo();
 }
 
 #[test]
 fn package_verify_certs_persistent_cache_read_through_writes_hits_and_delete_reruns_live() {
     let _guard = disk_memo_test_lock();
     clear_disk_memo();
-    clear_package_verification_process_memo();
     let package = build_source_free_fixture(
         "persistent-cache-read-through",
         "Proofs.Ai.Basic",
@@ -2755,7 +3793,7 @@ fn package_verify_certs_persistent_cache_read_through_writes_hits_and_delete_rer
     assert_eq!(
         module.actual_value.as_deref(),
         Some(
-            "status=passed;evidence=live-checker;proof_evidence=true;certificate_format=NPA-CERT-0.3.0;core_spec=NPA-Core-0.3.0"
+            "status=passed;evidence=live-checker;proof_evidence=true;certificate_format=NPA-CERT-0.4.0;core_spec=NPA-Core-0.4.0"
         )
     );
     assert_eq!(
@@ -2779,7 +3817,7 @@ fn package_verify_certs_persistent_cache_read_through_writes_hits_and_delete_rer
 }
 
 #[test]
-fn package_verify_certs_persistent_cache_read_through_live_dominates_stale_identity() {
+fn package_verify_certs_persistent_cache_read_through_preserves_stale_identity_and_checks_live() {
     let _guard = disk_memo_test_lock();
     clear_disk_memo();
     let package = build_source_free_fixture(
@@ -2804,11 +3842,8 @@ fn package_verify_certs_persistent_cache_read_through_live_dominates_stale_ident
     let mut entry = parse_package_audit_disk_memo_result_entry_json(&entry_source).unwrap();
     entry.key_input.package_lock_schema = "npa.package.lock.changed".to_owned();
     entry.cache_key = package_audit_disk_memo_key(&entry.key_input);
-    fs::write(
-        &entry_path,
-        package_audit_disk_memo_result_entry_json(&entry),
-    )
-    .unwrap();
+    let stale_source = package_audit_disk_memo_result_entry_json(&entry);
+    fs::write(&entry_path, &stale_source).unwrap();
 
     let result = run_verify_with_verifier_memo(
         &package,
@@ -2821,10 +3856,30 @@ fn package_verify_certs_persistent_cache_read_through_live_dominates_stale_ident
     let summary = disk_memo_summary(&result);
     assert!(summary.contains("hits=0"));
     assert!(summary.contains("stale=1"));
-    assert!(summary.contains("written=1"));
+    assert!(summary.contains("written=0"));
     assert!(summary.contains("live_checked=1"));
     assert!(summary.contains("cached=0"));
     assert_eq!(without_disk_memo_summary_and_timings(result), off);
+    assert_eq!(fs::read_to_string(&entry_path).unwrap(), stale_source);
+
+    // Disk-memo entries are content-addressed and published with atomic
+    // no-replace semantics. A stale occupant is therefore retained, never
+    // accepted as a hit, and cannot displace the live checker on later runs.
+    let repeated = run_verify_with_verifier_memo(
+        &package,
+        PackageChecker::Reference,
+        PackageVerifierMemoMode::ReadThrough,
+        PackageTimingMode::Summary,
+    );
+    assert_eq!(repeated.exit_code(), CommandExitCode::Success);
+    let repeated_summary = disk_memo_summary(&repeated);
+    assert!(repeated_summary.contains("hits=0"));
+    assert!(repeated_summary.contains("stale=1"));
+    assert!(repeated_summary.contains("written=0"));
+    assert!(repeated_summary.contains("live_checked=1"));
+    assert!(repeated_summary.contains("cached=0"));
+    assert_eq!(without_disk_memo_summary_and_timings(repeated), off);
+    assert_eq!(fs::read_to_string(entry_path).unwrap(), stale_source);
 }
 
 #[test]
@@ -3051,9 +4106,7 @@ fn package_verify_certs_jobs_audit_cache_parallel_is_rejected() {
 }
 
 #[test]
-fn package_verify_certs_memo_counters_are_projected_into_measurements() {
-    let _guard = process_memo_test_lock();
-    clear_package_verification_process_memo();
+fn package_verify_certs_off_does_not_use_process_memo() {
     let package = build_source_free_fixture(
         "process-memo-timing",
         "Proofs.Ai.Basic",
@@ -3063,7 +4116,6 @@ fn package_verify_certs_memo_counters_are_projected_into_measurements() {
     let lock_hash = checked_lock_hash(&package);
 
     let off = run_verify(&package, PackageChecker::Fast);
-    clear_package_verification_process_memo();
     let first = run_verify_with_timings(&package, PackageChecker::Fast, PackageTimingMode::Summary);
     let second =
         run_verify_with_timings(&package, PackageChecker::Fast, PackageTimingMode::Summary);
@@ -3078,15 +4130,15 @@ fn package_verify_certs_memo_counters_are_projected_into_measurements() {
         measurement_counter(&first, PerformanceMeasurementLabel::PackageMemoResults),
         0
     );
-    assert!(measurement_counter(&second, PerformanceMeasurementLabel::PackageMemoResults) > 0);
+    assert_eq!(
+        measurement_counter(&second, PerformanceMeasurementLabel::PackageMemoResults),
+        0
+    );
     assert_eq!(
         measurement_counter(&second, PerformanceMeasurementLabel::PackageLiveResults),
-        0
+        measurement_counter(&first, PerformanceMeasurementLabel::PackageLiveResults)
     );
-    assert_eq!(
-        measurement_counter(&second, PerformanceMeasurementLabel::PackageModulesChecked),
-        0
-    );
+    assert!(measurement_counter(&second, PerformanceMeasurementLabel::PackageModulesChecked) > 0);
     assert_lock_provenance(
         &second.diagnostics[1],
         PackageLockInputMode::CheckedFile,
@@ -3105,9 +4157,19 @@ fn package_verify_certs_memo_counters_are_projected_into_measurements() {
 }
 
 #[test]
+fn package_verify_certs_changed_empty_selection_has_zero_verifier_work() {
+    package_verify_certs_changed_ignores_staged_certificate_when_worktree_restored_source_free();
+}
+
+#[test]
+fn package_verify_certs_persistent_cache_modes_have_zero_process_memo_work() {
+    package_verify_certs_off_does_not_use_process_memo();
+    package_verify_certs_persistent_cache_read_through_writes_hits_and_delete_reruns_live();
+}
+
+#[test]
 fn package_verify_certs_timings_do_not_enable_process_local_decode_cache() {
     let _guard = decode_cache_test_lock();
-    clear_package_verification_process_memo();
     clear_package_verification_decode_cache();
     assert_eq!(package_verification_decode_cache_entry_count(), 0);
     let package = build_source_free_fixture(
@@ -3122,10 +4184,8 @@ fn package_verify_certs_timings_do_not_enable_process_local_decode_cache() {
     assert!(!off.render_json().contains("decode_cache_summary"));
     assert!(off.timings.is_none());
 
-    clear_package_verification_process_memo();
     clear_package_verification_decode_cache();
     let first = run_verify_with_timings(&package, PackageChecker::Fast, PackageTimingMode::Summary);
-    clear_package_verification_process_memo();
     let second =
         run_verify_with_timings(&package, PackageChecker::Fast, PackageTimingMode::Summary);
 
@@ -3153,7 +4213,6 @@ fn package_verify_certs_timings_do_not_enable_process_local_decode_cache() {
 #[test]
 fn package_verify_certs_timings_do_not_enable_persistent_import_context_cache() {
     let _guard = decode_cache_test_lock();
-    clear_package_verification_process_memo();
     clear_package_verification_decode_cache();
     clear_package_import_context_export_disk_cache();
     assert_eq!(package_import_context_export_disk_cache_entry_count(), 0);
@@ -3169,14 +4228,12 @@ fn package_verify_certs_timings_do_not_enable_persistent_import_context_cache() 
     assert!(!off.render_json().contains("decode_cache_summary"));
     assert!(off.timings.is_none());
 
-    clear_package_verification_process_memo();
     clear_package_verification_decode_cache();
     let first = run_verify_with_timings(
         &package,
         PackageChecker::Reference,
         PackageTimingMode::Summary,
     );
-    clear_package_verification_process_memo();
     clear_package_verification_decode_cache();
     let second = run_verify_with_timings(
         &package,
@@ -3452,6 +4509,32 @@ fn replace_manifest_hash(package: &TestPackage, field: &str, hash: PackageHash) 
     );
 }
 
+fn replace_module_manifest_hash(
+    package: &TestPackage,
+    module: &str,
+    field: &str,
+    hash: PackageHash,
+) {
+    let path = package.artifact_path(PACKAGE_MANIFEST_PATH);
+    let source = fs::read_to_string(&path).unwrap();
+    let marker = format!("module = \"{module}\"");
+    let module_start = source.find(&marker).unwrap();
+    let module_end = source[module_start..]
+        .find("\n[[modules]]")
+        .map(|offset| module_start + offset)
+        .unwrap_or(source.len());
+    let block = &source[module_start..module_end];
+    let line = block
+        .lines()
+        .find(|line| line.starts_with(&format!("{field} = ")))
+        .unwrap();
+    let replacement = format!("{field} = \"{}\"", format_package_hash(&hash));
+    let updated_block = block.replacen(line, &replacement, 1);
+    let mut updated = source;
+    updated.replace_range(module_start..module_end, &updated_block);
+    fs::write(path, updated).unwrap();
+}
+
 fn replace_manifest_line(package: &TestPackage, field: &str, replacement: &str) {
     let path = package.artifact_path(PACKAGE_MANIFEST_PATH);
     let source = fs::read_to_string(&path).unwrap();
@@ -3576,12 +4659,29 @@ fn run_git(package: &TestPackage, args: &[&str]) {
 }
 
 fn run_git_at(cwd: &Path, args: &[&str]) {
-    let status = Command::new("git")
+    let status = Command::new("/usr/bin/git")
         .args(args)
         .current_dir(cwd)
         .status()
         .unwrap();
     assert!(status.success(), "git {args:?} failed with {status}");
+}
+
+fn commit_git(package: &TestPackage, message: &str) {
+    run_git(package, &["add", "."]);
+    run_git(
+        package,
+        &[
+            "-c",
+            "user.name=NPA Test",
+            "-c",
+            "user.email=npa-test@example.invalid",
+            "commit",
+            "-q",
+            "-m",
+            message,
+        ],
+    );
 }
 
 fn run_verify_with_jobs(
@@ -3626,6 +4726,61 @@ fn run_verify_with_audit_cache(
         verify_certs_full(common_options(package.path(), true), checker)
             .with_audit_cache(audit_cache),
     )
+}
+
+fn run_verify_with_audit_cache_and_timings(
+    package: &TestPackage,
+    checker: PackageChecker,
+    audit_cache: PackageAuditCacheMode,
+    timings: PackageTimingMode,
+) -> npa_cli::diagnostic::CommandResult {
+    run_package_verify_certs(
+        verify_certs_full(common_options(package.path(), true), checker)
+            .with_audit_cache(audit_cache)
+            .with_timings(timings),
+    )
+}
+
+fn assert_prepared_artifact_lifecycle(
+    result: &npa_cli::diagnostic::CommandResult,
+    expected_admissions: u64,
+    expected_reuses: u64,
+) {
+    assert_eq!(
+        measurement_counter(
+            result,
+            PerformanceMeasurementLabel::PackagePreparedArtifactAdmissions,
+        ),
+        expected_admissions
+    );
+    assert_eq!(
+        measurement_counter(
+            result,
+            PerformanceMeasurementLabel::PackageArtifactPreparedReuses,
+        ),
+        expected_reuses
+    );
+    assert_eq!(
+        measurement_counter(
+            result,
+            PerformanceMeasurementLabel::PackagePreparedArtifactReleases,
+        ),
+        expected_admissions
+    );
+    assert_eq!(
+        measurement_counter(
+            result,
+            PerformanceMeasurementLabel::PackagePreparedArtifactCurrentEntries,
+        ),
+        0
+    );
+    assert_eq!(
+        measurement_counter(
+            result,
+            PerformanceMeasurementLabel::PackagePreparedArtifactCurrentBytes,
+        ),
+        0
+    );
 }
 
 fn measurement_counter(
@@ -3789,10 +4944,6 @@ fn audit_cache_test_lock() -> MutexGuard<'static, ()> {
     LOCK.lock().unwrap()
 }
 
-fn process_memo_test_lock() -> MutexGuard<'static, ()> {
-    shared_process_state_test_lock()
-}
-
 fn disk_memo_test_lock() -> MutexGuard<'static, ()> {
     shared_process_state_test_lock()
 }
@@ -3929,10 +5080,6 @@ fn write_external_runner_fixture(
 
 struct RealExternalRunnerFixture {
     options: ExternalCheckerOptions,
-    binary_hash: String,
-    build_hash: String,
-    policy_hash: String,
-    runner_build_hash: String,
 }
 
 fn write_real_external_runner_fixture(
@@ -3984,7 +5131,7 @@ fn write_real_external_runner_fixture(
         .replace(&format_hash_string(&test_hash(0x55)), build_hash)
         .replace(
             "\"checker_version\":\"0.1.0\"",
-            "\"checker_version\":\"0.3.0\"",
+            "\"checker_version\":\"0.4.0\"",
         )
         .replace(
             "\"raw_result_schema\":\"npa.independent-checker.checker_raw_result.v1\"",
@@ -3992,11 +5139,11 @@ fn write_real_external_runner_fixture(
         )
         .replace(
             "\"certificate_format\":\"NPA-CERT-0.2.0\"",
-            "\"certificate_format\":\"NPA-CERT-0.3.0\"",
+            "\"certificate_format\":\"NPA-CERT-0.4.0\"",
         )
         .replace(
             "\"core_spec\":\"NPA-Core-0.2.0\"",
-            "\"core_spec\":\"NPA-Core-0.3.0\"",
+            "\"core_spec\":\"NPA-Core-0.4.0\"",
         )
         .replace(
             &format_hash_string(&old_axiom_policy_hash),
@@ -4013,41 +5160,7 @@ fn write_real_external_runner_fixture(
             format_hash_string(&policy_hash),
             options.checker_registry,
         ),
-        binary_hash: format_hash_string(&binary_hash),
-        build_hash: build_hash.to_owned(),
-        policy_hash: format_hash_string(&policy_hash),
-        runner_build_hash: format_hash_string(&independent_checker_file_hash(
-            b"npa-cli-package-external-runner:0.1.0",
-        )),
     }
-}
-
-fn json_string_field_for_test<'a>(source: &'a str, field: &str) -> &'a str {
-    let prefix = format!("\"{field}\":\"");
-    let value = source
-        .split_once(&prefix)
-        .unwrap_or_else(|| panic!("missing JSON string field {field}"))
-        .1;
-    value
-        .split_once('"')
-        .unwrap_or_else(|| panic!("unterminated JSON string field {field}"))
-        .0
-}
-
-fn decode_lower_hex_for_test(source: &str) -> Vec<u8> {
-    assert_eq!(source.len() % 2, 0, "hex must have an even length");
-    source
-        .as_bytes()
-        .chunks_exact(2)
-        .map(|pair| {
-            let digit = |byte: u8| match byte {
-                b'0'..=b'9' => byte - b'0',
-                b'a'..=b'f' => byte - b'a' + 10,
-                _ => panic!("raw checker output must use lowercase hex"),
-            };
-            (digit(pair[0]) << 4) | digit(pair[1])
-        })
-        .collect()
 }
 
 fn test_hash(byte: u8) -> npa_cert::Hash {
@@ -4200,6 +5313,15 @@ fn build_source_free_modules_fixture(
     allowed_axioms: &[&str],
 ) -> TestPackage {
     let package = TestPackage::new(label);
+    write_source_free_modules_fixture(&package, module_names, allowed_axioms);
+    package
+}
+
+fn write_source_free_modules_fixture(
+    package: &TestPackage,
+    module_names: &[&str],
+    allowed_axioms: &[&str],
+) {
     let proof_manifest = proof_manifest();
     let manifest = proof_manifest.manifest();
     let local_modules = module_names
@@ -4232,10 +5354,10 @@ fn build_source_free_modules_fixture(
         .collect::<Vec<_>>();
 
     for module in &modules {
-        copy_artifact(&package, module.certificate.as_str());
+        copy_artifact(package, module.certificate.as_str());
     }
     for import in &imports {
-        copy_artifact(&package, import.certificate.as_str());
+        copy_artifact(package, import.certificate.as_str());
     }
 
     let manifest_modules = modules
@@ -4248,8 +5370,7 @@ fn build_source_free_modules_fixture(
         &manifest_source,
     )
     .unwrap();
-    write_lock(&package, &manifest_source);
-    package
+    write_lock(package, &manifest_source);
 }
 
 fn manifest_module_from_package(module: &PackageModule) -> ManifestModule {
@@ -4437,4 +5558,251 @@ fn corpus_script_path(script: &str) -> PathBuf {
         return standalone_path;
     }
     root.join("../npa-corpus/scripts").join(script)
+}
+
+#[test]
+fn package_verify_changed_tracked_state_matrix() {
+    package_verify_certs_changed_verifies_changed_certificate_path_source_free();
+}
+
+#[test]
+fn package_verify_changed_untracked_and_ignored_matrix() {
+    package_verify_certs_changed_preserves_untracked_and_unborn_selection();
+}
+
+#[test]
+fn package_verify_changed_unborn_repository_returns_all_candidates() {
+    package_verify_certs_changed_preserves_untracked_and_unborn_selection();
+}
+
+#[test]
+fn package_verify_changed_batching_preserves_module_selection() {
+    package_verify_certs_changed_reconstructed_preserves_certificate_selection();
+}
+
+#[test]
+fn snapshot_acquisition_error_oracle() {
+    package_verify_certs_checked_mode_rejects_lock_failures_without_reconstruction();
+    package_verify_certs_reconstructed_preserves_strict_identity_diagnostics();
+}
+
+#[test]
+fn snapshot_artifact_read_oracle() {
+    package_verify_certs_in_process_modes_enforce_read_scope_and_package_root_no_write();
+}
+
+#[test]
+fn snapshot_cli_functional_matrix() {
+    package_verify_certs_fast_local_audit_uses_prepared_snapshot_lifecycle();
+    package_verify_certs_fast_disk_memo_uses_prepared_cache_aware_lifecycle();
+    package_verify_certs_shards_jobs_four_matches_jobs_one_normalized();
+}
+
+#[test]
+fn package_certificate_artifact_observation() {
+    package_verify_certs_changed_selection_error_releases_prepared_snapshot();
+    package_snapshot_benchmark_adapter();
+}
+
+#[test]
+fn package_snapshot_fast_audit_keys() {
+    package_verify_certs_fast_local_audit_uses_prepared_snapshot_lifecycle();
+    package_verify_certs_audit_cache_keys_canonical_lock_and_refreshes_mode_provenance();
+    assert_benchmark_audit_key_parity(PackageChecker::Fast);
+}
+
+#[test]
+fn package_snapshot_audit_key_fallback() {
+    package_verify_certs_audit_cache_read_through_writes_then_hits();
+    assert_benchmark_audit_key_parity(PackageChecker::Reference);
+}
+
+#[test]
+fn package_snapshot_local_audit_keys() {
+    package_snapshot_fast_audit_keys();
+}
+
+#[test]
+fn package_snapshot_disk_memo_keys() {
+    package_verify_certs_fast_disk_memo_uses_prepared_cache_aware_lifecycle();
+    package_verify_certs_disk_memo_keys_canonical_lock_and_refreshes_mode_provenance();
+    assert_benchmark_disk_key_parity(PackageChecker::Fast);
+}
+
+#[test]
+fn package_reference_hashed_ordinary_artifacts() {
+    package_verify_certs_reference_succeeds_without_source_replay_or_meta();
+    package_verify_certs_reconstructed_reference_and_fast_share_lock_identities();
+    assert_benchmark_mode_parity(PackageChecker::Reference, 1, false);
+}
+
+#[test]
+fn package_reference_hashed_cached_artifacts() {
+    package_verify_certs_audit_cache_read_through_writes_then_hits();
+    package_verify_certs_disk_memo_writes_hits_and_delete_reruns_live();
+    assert_benchmark_audit_key_parity(PackageChecker::Reference);
+    assert_benchmark_disk_key_parity(PackageChecker::Reference);
+}
+
+#[test]
+fn package_snapshot_parallel_raw_only_gate() {
+    package_verify_certs_shards_jobs_four_matches_jobs_one_normalized();
+    package_verify_certs_jobs_audit_cache_parallel_is_rejected();
+    assert_benchmark_mode_parity(PackageChecker::Fast, 4, false);
+}
+
+#[test]
+fn package_snapshot_key_differential() {
+    package_verify_certs_audit_cache_keys_canonical_lock_and_refreshes_mode_provenance();
+    package_verify_certs_disk_memo_keys_canonical_lock_and_refreshes_mode_provenance();
+    assert_benchmark_audit_key_parity(PackageChecker::Fast);
+    assert_benchmark_audit_key_parity(PackageChecker::Reference);
+    assert_benchmark_disk_key_parity(PackageChecker::Fast);
+    assert_benchmark_disk_key_parity(PackageChecker::Reference);
+}
+
+#[test]
+fn package_snapshot_benchmark_adapter() {
+    assert_benchmark_mode_parity(PackageChecker::Fast, 1, true);
+}
+
+fn assert_benchmark_mode_parity(
+    checker: PackageChecker,
+    jobs: usize,
+    expect_snapshot_admission: bool,
+) {
+    let package = build_source_free_fixture(
+        &format!("snapshot-benchmark-adapter-{}-{jobs}", checker.as_str()),
+        "Proofs.Ai.Basic",
+        false,
+        &["Eq.rec", "Snapshot.Benchmark.Adapter"],
+    );
+    let options = || {
+        verify_certs_full(common_options(package.path(), true), checker)
+            .with_jobs(jobs)
+            .with_timings(PackageTimingMode::Summary)
+    };
+    let raw =
+        benchmark_run_package_verify_certs(options(), PackageArtifactSnapshotBenchmarkMode::Raw);
+    let snapshot = benchmark_run_package_verify_certs(
+        options(),
+        PackageArtifactSnapshotBenchmarkMode::Snapshot,
+    );
+
+    assert_eq!(raw.exit_code(), CommandExitCode::Success);
+    assert_eq!(snapshot.exit_code(), CommandExitCode::Success);
+    assert_eq!(
+        without_timings(raw.clone()),
+        without_timings(snapshot.clone())
+    );
+    assert_eq!(
+        measurement_counter(
+            &raw,
+            PerformanceMeasurementLabel::PackagePreparedArtifactAdmissions,
+        ),
+        0
+    );
+    let snapshot_admissions = measurement_counter(
+        &snapshot,
+        PerformanceMeasurementLabel::PackagePreparedArtifactAdmissions,
+    );
+    if expect_snapshot_admission {
+        assert!(snapshot_admissions > 0);
+        assert_prepared_artifact_lifecycle(&snapshot, snapshot_admissions, snapshot_admissions);
+    } else {
+        assert_eq!(snapshot_admissions, 0);
+    }
+}
+
+fn assert_benchmark_audit_key_parity(checker: PackageChecker) {
+    let _guard = audit_cache_test_lock();
+    let package = build_source_free_fixture(
+        &format!("snapshot-audit-key-parity-{}", checker.as_str()),
+        "Proofs.Ai.Basic",
+        false,
+        &["Eq.rec", "Snapshot.Audit.KeyParity"],
+    );
+    let run = |mode| {
+        benchmark_run_package_verify_certs(
+            verify_certs_full(common_options(package.path(), true), checker)
+                .with_audit_cache(PackageAuditCacheMode::ReadThrough)
+                .with_timings(PackageTimingMode::Summary),
+            mode,
+        )
+    };
+    clear_audit_cache();
+    let raw = run(PackageArtifactSnapshotBenchmarkMode::Raw);
+    assert_eq!(raw.exit_code(), CommandExitCode::Success);
+    let raw_path = audit_cache_entries();
+    assert_eq!(raw_path.len(), 1);
+    let raw_entry =
+        parse_package_audit_result_entry_json(&fs::read_to_string(&raw_path[0]).unwrap()).unwrap();
+
+    clear_audit_cache();
+    let snapshot = run(PackageArtifactSnapshotBenchmarkMode::Snapshot);
+    assert_eq!(snapshot.exit_code(), CommandExitCode::Success);
+    let snapshot_path = audit_cache_entries();
+    assert_eq!(snapshot_path.len(), 1);
+    let snapshot_entry =
+        parse_package_audit_result_entry_json(&fs::read_to_string(&snapshot_path[0]).unwrap())
+            .unwrap();
+    assert_eq!(raw_entry, snapshot_entry);
+    assert_eq!(
+        raw_path[0].file_name(),
+        snapshot_path[0].file_name(),
+        "raw and snapshot final audit keys differ"
+    );
+    assert_eq!(without_timings(raw), without_timings(snapshot));
+    clear_audit_cache();
+}
+
+fn assert_benchmark_disk_key_parity(checker: PackageChecker) {
+    let _guard = disk_memo_test_lock();
+    let package = build_source_free_fixture(
+        &format!("snapshot-disk-key-parity-{}", checker.as_str()),
+        "Proofs.Ai.Basic",
+        false,
+        &["Eq.rec", "Snapshot.Disk.KeyParity"],
+    );
+    let run = |mode| {
+        benchmark_run_package_verify_certs(
+            verify_certs_full(common_options(package.path(), true), checker)
+                .with_verifier_memo(PackageVerifierMemoMode::ReadThrough)
+                .with_timings(PackageTimingMode::Summary),
+            mode,
+        )
+    };
+    clear_disk_memo();
+    let raw = run(PackageArtifactSnapshotBenchmarkMode::Raw);
+    assert_eq!(raw.exit_code(), CommandExitCode::Success);
+    let raw_path = disk_memo_entries();
+    assert_eq!(raw_path.len(), 1);
+    let raw_entry =
+        parse_package_audit_disk_memo_result_entry_json(&fs::read_to_string(&raw_path[0]).unwrap())
+            .unwrap();
+
+    clear_disk_memo();
+    let snapshot = run(PackageArtifactSnapshotBenchmarkMode::Snapshot);
+    assert_eq!(snapshot.exit_code(), CommandExitCode::Success);
+    let snapshot_path = disk_memo_entries();
+    assert_eq!(snapshot_path.len(), 1);
+    let snapshot_entry = parse_package_audit_disk_memo_result_entry_json(
+        &fs::read_to_string(&snapshot_path[0]).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(raw_entry, snapshot_entry);
+    assert_eq!(
+        raw_path[0].file_name(),
+        snapshot_path[0].file_name(),
+        "raw and snapshot final disk keys differ"
+    );
+    assert_eq!(without_timings(raw), without_timings(snapshot));
+    clear_disk_memo();
+}
+
+fn without_timings(
+    mut result: npa_cli::diagnostic::CommandResult,
+) -> npa_cli::diagnostic::CommandResult {
+    result.timings = None;
+    result
 }

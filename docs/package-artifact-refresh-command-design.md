@@ -5,6 +5,13 @@ retained as the design and implementation record; package authors should use
 the current workflow documented in `npa-toolchain-reference-v0.8.0.md`, which
 retains the v0.6-introduced refresh contract.
 
+The current implementation adds a context-free Human source preflight and
+dependency-first targeted refresh scheduling so selected frontend failures are
+reported before unrelated artifact traversal. See
+[Package Build Selected-Source Fail-Fast Design](package-build-selected-source-fail-fast-design.md).
+That implementation preserves the refresh outputs and completion checks specified
+here.
+
 ## Summary
 
 Add an explicit package refresh mode for local package artifacts:

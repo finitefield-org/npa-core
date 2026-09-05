@@ -199,9 +199,9 @@ fn validate_unique_candidates(candidates: &[Candidate]) -> Result<(), ReferenceC
     let mut seen = BTreeSet::new();
     for candidate in candidates {
         if !seen.insert((
-            candidate.certificate.header.module.clone(),
-            candidate.certificate.hashes.export_hash,
-            candidate.certificate.hashes.certificate_hash,
+            candidate.certificate.header().module.clone(),
+            candidate.certificate.hashes().export_hash,
+            candidate.certificate.hashes().certificate_hash,
         )) {
             return Err(graph_error(ReferenceCheckReason::DuplicateImport, 0));
         }
@@ -217,7 +217,7 @@ fn find_candidate(
     let same_module = candidates
         .iter()
         .enumerate()
-        .filter(|(_, candidate)| candidate.certificate.header.module == import.module)
+        .filter(|(_, candidate)| candidate.certificate.header().module == import.module)
         .map(|(index, _)| index)
         .collect::<Vec<_>>();
     if same_module.is_empty() {
@@ -225,7 +225,7 @@ fn find_candidate(
     }
     let same_export = same_module
         .into_iter()
-        .filter(|index| candidates[*index].certificate.hashes.export_hash == import.export_hash)
+        .filter(|index| candidates[*index].certificate.hashes().export_hash == import.export_hash)
         .collect::<Vec<_>>();
     if same_export.is_empty() {
         return Err(graph_error(
@@ -241,7 +241,9 @@ fn find_candidate(
     };
     let matches = same_export
         .into_iter()
-        .filter(|index| candidates[*index].certificate.hashes.certificate_hash == certificate_hash)
+        .filter(|index| {
+            candidates[*index].certificate.hashes().certificate_hash == certificate_hash
+        })
         .collect::<Vec<_>>();
     match matches.as_slice() {
         [index] => Ok(*index),
@@ -274,7 +276,7 @@ fn check_candidate(
             certificate: Some(Box::new(candidate.certificate.clone())),
         });
     }
-    let identity = candidate.certificate.hashes.certificate_hash;
+    let identity = candidate.certificate.hashes().certificate_hash;
     if checked.contains_key(&identity) {
         return Ok(());
     }
@@ -287,7 +289,7 @@ fn check_candidate(
 
     for (import, offset) in candidate
         .certificate
-        .imports
+        .imports()
         .iter()
         .zip(&candidate.import_offsets)
     {
@@ -360,7 +362,7 @@ fn check_leaf(
     })?;
     let mut visiting = BTreeSet::new();
     let mut checked = BTreeMap::new();
-    for (import, offset) in certificate.imports.iter().zip(import_offsets) {
+    for (import, offset) in certificate.imports().iter().zip(import_offsets) {
         let dependency =
             find_candidate(&candidates, import, offset).map_err(|error| ClosureFailure {
                 error,
@@ -815,8 +817,8 @@ fn failed_json_fields(
         .map(|certificate| {
             format!(
                 ",\"input_certificate_format\":{},\"input_core_spec\":{}",
-                json_string(&certificate.header.format),
-                json_string(&certificate.header.core_spec),
+                json_string(&certificate.header().format),
+                json_string(&certificate.header().core_spec),
             )
         })
         .unwrap_or_default();
@@ -824,8 +826,8 @@ fn failed_json_fields(
         .map(|certificate| {
             format!(
                 ",\"module\":\"{}\",\"certificate_hash\":\"{}\"",
-                certificate.header.module.as_dotted(),
-                hash_wire(&certificate.hashes.certificate_hash),
+                certificate.header().module.as_dotted(),
+                hash_wire(&certificate.hashes().certificate_hash),
             )
         })
         .unwrap_or_default();
@@ -937,10 +939,10 @@ mod tests {
     use super::*;
 
     const INDEXED: &[u8] = include_bytes!(
-        "../../../checkers/npa-checker-ext/test/fixtures/conformance/indexed-v0.2.npcert"
+        "../../../checkers/npa-checker-ext/test/fixtures/conformance/indexed-v0.4.npcert"
     );
     const MUTUAL: &[u8] = include_bytes!(
-        "../../../checkers/npa-checker-ext/test/fixtures/conformance/mutual-v0.2.npcert"
+        "../../../checkers/npa-checker-ext/test/fixtures/conformance/mutual-v0.4.npcert"
     );
 
     fn candidate(bytes: &[u8]) -> Candidate {
@@ -959,8 +961,8 @@ mod tests {
             (&b""[..], None, "unexpected_eof"),
             (
                 &b"\x01X"[..],
-                Some(ReferenceCheckReason::FormatMismatch),
-                "format_mismatch",
+                Some(ReferenceCheckReason::UnexpectedEof),
+                "unexpected_eof",
             ),
         ] {
             let failure = match check_leaf(
@@ -1086,7 +1088,7 @@ mod tests {
     #[test]
     fn candidate_loading_enforces_aggregate_bytes_and_source_exclusion() {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../checkers/npa-checker-ext/test/fixtures/conformance/mutual-v0.2.npcert");
+            .join("../../checkers/npa-checker-ext/test/fixtures/conformance/mutual-v0.4.npcert");
         let aggregate_bytes = MUTUAL.len() * 2;
         assert_eq!(
             load_candidates_from_paths_with_budget(
@@ -1125,9 +1127,9 @@ mod tests {
 
     fn request(certificate: &ModuleCert) -> ImportEntry {
         ImportEntry {
-            module: certificate.header.module.clone(),
-            export_hash: certificate.hashes.export_hash,
-            certificate_hash: Some(certificate.hashes.certificate_hash),
+            module: certificate.header().module.clone(),
+            export_hash: certificate.hashes().export_hash,
+            certificate_hash: Some(certificate.hashes().certificate_hash),
         }
     }
 
@@ -1153,9 +1155,15 @@ mod tests {
 
         let mut indexed_cycle = candidate(INDEXED);
         let mut mutual_cycle = candidate(MUTUAL);
-        indexed_cycle.certificate.imports = vec![request(&mutual_cycle.certificate)];
+        let indexed_import = request(&mutual_cycle.certificate);
+        let mutual_import = request(&indexed_cycle.certificate);
+        let mut indexed_parts = indexed_cycle.certificate.into_parts();
+        indexed_parts.imports = vec![indexed_import];
+        indexed_cycle.certificate = ModuleCert::from_parts(indexed_parts);
         indexed_cycle.import_offsets = vec![14];
-        mutual_cycle.certificate.imports = vec![request(&indexed_cycle.certificate)];
+        let mut mutual_parts = mutual_cycle.certificate.into_parts();
+        mutual_parts.imports = vec![mutual_import];
+        mutual_cycle.certificate = ModuleCert::from_parts(mutual_parts);
         mutual_cycle.import_offsets = vec![13];
         let candidates = [indexed_cycle, mutual_cycle];
         let failure = check_candidate(

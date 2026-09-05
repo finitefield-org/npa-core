@@ -461,22 +461,28 @@ impl FastLoopMeasurementRecorder {
     pub fn observe_authoring_cache_status(&mut self, status: FastLoopAuthoringCacheStatus) {
         if self.is_enabled() {
             self.authoring_cache_status = status;
-            let label = match status {
+            let labels: &[PerformanceMeasurementLabel] = match status {
                 FastLoopAuthoringCacheStatus::Hit => {
-                    Some(PerformanceMeasurementLabel::CacheContextHits)
+                    &[PerformanceMeasurementLabel::CacheContextHits]
                 }
                 FastLoopAuthoringCacheStatus::Disabled => {
-                    Some(PerformanceMeasurementLabel::CacheContextOff)
+                    &[PerformanceMeasurementLabel::CacheContextOff]
                 }
-                FastLoopAuthoringCacheStatus::Miss
-                | FastLoopAuthoringCacheStatus::SchemaMiss
-                | FastLoopAuthoringCacheStatus::Stale => {
-                    Some(PerformanceMeasurementLabel::CacheContextMisses)
+                FastLoopAuthoringCacheStatus::Miss => {
+                    &[PerformanceMeasurementLabel::CacheContextMisses]
                 }
-                FastLoopAuthoringCacheStatus::NotObserved => None,
+                FastLoopAuthoringCacheStatus::SchemaMiss => &[
+                    PerformanceMeasurementLabel::CacheContextMisses,
+                    PerformanceMeasurementLabel::CacheContextSchemaMisses,
+                ],
+                FastLoopAuthoringCacheStatus::Stale => &[
+                    PerformanceMeasurementLabel::CacheContextMisses,
+                    PerformanceMeasurementLabel::CacheContextStale,
+                ],
+                FastLoopAuthoringCacheStatus::NotObserved => &[],
             };
-            if let Some(label) = label {
-                self.measurements.add_counter(label, 1);
+            for label in labels {
+                self.measurements.add_counter(*label, 1);
             }
         }
     }
@@ -845,12 +851,15 @@ mod tests {
         let json = fast_loop_measurement_report_json(&report);
         assert_eq!(
             report.measurements.schema,
-            crate::PERFORMANCE_MEASUREMENTS_SCHEMA_V0_3
+            crate::PERFORMANCE_MEASUREMENTS_SCHEMA
         );
         assert!(json.contains("\"schema\":\"npa.fast-loop-measurement.v2\""));
         assert!(json.contains("\"trusted\":false"));
         assert!(json.contains("\"proof_evidence\":false"));
-        assert!(json.contains("\"schema\":\"npa.performance.measurements.v0.3\""));
+        assert!(json.contains(&format!(
+            "\"schema\":\"{}\"",
+            crate::PERFORMANCE_MEASUREMENTS_SCHEMA
+        )));
         assert!(json.contains("\"label\":\"focused_replay_artifact_bytes\""));
         assert!(json.contains("\"label\":\"prepared_snapshot_elapsed_ns\""));
         assert!(json.contains("\"unit\":\"ns\""));
@@ -889,6 +898,55 @@ mod tests {
 
         assert_eq!(recorder.mode(), FastLoopMeasurementMode::Disabled);
         assert!(recorder.report().is_none());
+    }
+
+    #[test]
+    fn fast_loop_cache_statuses_emit_only_representable_common_counters() {
+        let cases: &[(FastLoopAuthoringCacheStatus, &[PerformanceMeasurementLabel])] = &[
+            (
+                FastLoopAuthoringCacheStatus::Hit,
+                &[PerformanceMeasurementLabel::CacheContextHits],
+            ),
+            (
+                FastLoopAuthoringCacheStatus::Miss,
+                &[PerformanceMeasurementLabel::CacheContextMisses],
+            ),
+            (
+                FastLoopAuthoringCacheStatus::SchemaMiss,
+                &[
+                    PerformanceMeasurementLabel::CacheContextMisses,
+                    PerformanceMeasurementLabel::CacheContextSchemaMisses,
+                ],
+            ),
+            (
+                FastLoopAuthoringCacheStatus::Stale,
+                &[
+                    PerformanceMeasurementLabel::CacheContextMisses,
+                    PerformanceMeasurementLabel::CacheContextStale,
+                ],
+            ),
+            (
+                FastLoopAuthoringCacheStatus::Disabled,
+                &[PerformanceMeasurementLabel::CacheContextOff],
+            ),
+            (FastLoopAuthoringCacheStatus::NotObserved, &[]),
+        ];
+
+        for (status, expected) in cases {
+            let mut recorder = FastLoopMeasurementRecorder::enabled();
+            recorder.observe_authoring_cache_status(*status);
+            let report = recorder.report().unwrap();
+            let actual = report
+                .measurements
+                .counters
+                .iter()
+                .map(|counter| counter.label)
+                .collect::<Vec<_>>();
+            assert_eq!(actual, *expected, "{status:?}");
+            assert!(!actual.contains(&PerformanceMeasurementLabel::CacheContextIneligible));
+            assert!(!actual.contains(&PerformanceMeasurementLabel::CacheTargetsForcedLive));
+            assert!(!actual.contains(&PerformanceMeasurementLabel::CacheContextBypassedHits));
+        }
     }
 
     #[test]
@@ -1050,7 +1108,7 @@ mod tests {
     fn minimal_session_json(theorem_type: &str) -> String {
         format!(
             r#"{{
-              "protocol_version":"npa.machine-api.v1",
+              "protocol_version":"npa.machine-api.v2",
               "root":{{
                 "module":"Scratch",
                 "theorem_name":"Scratch.t",
@@ -1117,7 +1175,7 @@ mod tests {
     ) -> String {
         format!(
             r#"{{
-              "protocol_version":"npa.machine-api.v1",
+              "protocol_version":"npa.machine-api.v2",
               "session_root_hash":"{}",
               "initial_state_fingerprint":"{}",
               "steps":{},

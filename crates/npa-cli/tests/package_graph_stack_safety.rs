@@ -88,7 +88,7 @@ fn deep_manifest_cycle_is_structured_across_package_cli_consumers() {
             .unwrap_or_else(|error| panic!("package {subcommand} JSON should be UTF-8: {error}"));
         assert!(
             stdout.starts_with(&format!(
-                "{{\"schema\":\"npa.package.command_result.v0.4\",\"command\":\"package {subcommand}\","
+                "{{\"schema\":\"npa.package.command_result.v0.5\",\"command\":\"package {subcommand}\","
             )),
             "package {subcommand} should return a command_result envelope: {stdout}"
         );
@@ -171,7 +171,7 @@ fn deep_package_lock_cycle_is_structured_across_source_free_cli_consumers() {
             .unwrap_or_else(|error| panic!("package {subcommand} JSON should be UTF-8: {error}"));
         assert!(
             stdout.starts_with(&format!(
-                "{{\"schema\":\"npa.package.command_result.v0.4\",\"command\":\"package {subcommand}\","
+                "{{\"schema\":\"npa.package.command_result.v0.5\",\"command\":\"package {subcommand}\","
             )),
             "package {subcommand} should return a command_result envelope: {stdout}"
         );

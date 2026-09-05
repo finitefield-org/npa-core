@@ -13,9 +13,11 @@ TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/npa-checker-ext-trace.XXXXXX")
 trap 'rm -rf "$TMP_DIR"' EXIT HUP INT TERM
 
 CHECKER="$EXT_ROOT/_build/npa-checker-ext"
-CERTIFICATE="$ROOT/testdata/package/npa-mathlib-downstream/Downstream/MathlibBasic/certificate.npcert"
-cp -R "$ROOT/testdata/package/npa-mathlib-downstream/vendor" "$TMP_DIR/vendor"
-IMPORT_DIR="$TMP_DIR/vendor"
+CERTIFICATE="$EXT_ROOT/test/fixtures/conformance/imported-mutual-iota-v0.4.npcert"
+IMPORT_DIR="$TMP_DIR/imports"
+mkdir "$IMPORT_DIR"
+cp "$EXT_ROOT/test/fixtures/conformance/mutual-v0.4.npcert" \
+  "$IMPORT_DIR/provider.npcert"
 UNRELATED_FILE="$IMPORT_DIR/unrelated.txt"
 printf 'must not be opened by the checker\n' > "$UNRELATED_FILE"
 POLICY="$EXT_ROOT/test/fixtures/axiom-policy.toml"

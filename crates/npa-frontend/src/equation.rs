@@ -5,7 +5,7 @@ use std::{
 
 use sha2::{Digest, Sha256};
 
-use npa_kernel::{Decl, Expr, Level, Reducibility};
+use npa_kernel::{Ctx, Decl, Env, Expr, Level, Reducibility};
 
 use crate::{
     HumanDiagnostic, HumanDiagnosticKind, HumanDiagnosticPayload, HumanDiagnosticPhase,
@@ -1089,6 +1089,80 @@ pub struct HumanEquationLoweringBinder {
     pub ty: Expr,
 }
 
+pub trait HumanEquationSharingValidator {
+    fn validate_candidate(
+        &self,
+        context: &[HumanEquationLoweringBinder],
+        universe_params: &[String],
+        candidate: &Expr,
+        result_type: &Expr,
+    ) -> bool;
+
+    fn validate_rewritten_body(
+        &self,
+        context: &[HumanEquationLoweringBinder],
+        universe_params: &[String],
+        binder_name: &str,
+        result_type: &Expr,
+        rewritten_body: &Expr,
+    ) -> bool;
+}
+
+pub struct HumanEquationKernelSharingValidator<'a> {
+    env: &'a Env,
+}
+
+impl<'a> HumanEquationKernelSharingValidator<'a> {
+    pub const fn new(env: &'a Env) -> Self {
+        Self { env }
+    }
+
+    fn context(&self, binders: &[HumanEquationLoweringBinder]) -> Ctx {
+        let mut context = Ctx::new();
+        for binder in binders {
+            context.push_assumption(binder.name.clone(), binder.ty.clone());
+        }
+        context
+    }
+}
+
+impl HumanEquationSharingValidator for HumanEquationKernelSharingValidator<'_> {
+    fn validate_candidate(
+        &self,
+        context: &[HumanEquationLoweringBinder],
+        universe_params: &[String],
+        candidate: &Expr,
+        result_type: &Expr,
+    ) -> bool {
+        self.env
+            .check(
+                &self.context(context),
+                universe_params,
+                candidate,
+                result_type,
+            )
+            .is_ok()
+    }
+
+    fn validate_rewritten_body(
+        &self,
+        context: &[HumanEquationLoweringBinder],
+        universe_params: &[String],
+        binder_name: &str,
+        result_type: &Expr,
+        rewritten_body: &Expr,
+    ) -> bool {
+        let Ok(expected_type) = npa_kernel::subst::shift(result_type, 1, 0) else {
+            return false;
+        };
+        let mut context = self.context(context);
+        context.push_assumption(binder_name, result_type.clone());
+        self.env
+            .check(&context, universe_params, rewritten_body, &expected_type)
+            .is_ok()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HumanEquationRecursorLoweringProfile {
     pub recursor_name: String,
@@ -1664,13 +1738,33 @@ pub fn lower_human_equation_decision_tree_to_core(
     profile: HumanEquationLoweringProfile,
     budget: HumanEquationBudget,
 ) -> Result<HumanEquationLoweringResult, HumanEquationLoweringError> {
-    lower_human_equation_decision_tree_to_core_with_theorems(
+    lower_human_equation_decision_tree_to_core_impl(
         equation,
         matrix,
         decision,
         profile,
         budget,
         HumanEquationTheoremRequest::disabled(),
+        None,
+    )
+}
+
+pub fn lower_human_equation_decision_tree_to_core_with_sharing_validator(
+    equation: &HumanResolvedEquationItem,
+    matrix: &HumanEquationPatternMatrix,
+    decision: &HumanEquationDecisionTreeResult,
+    profile: HumanEquationLoweringProfile,
+    budget: HumanEquationBudget,
+    sharing_validator: &dyn HumanEquationSharingValidator,
+) -> Result<HumanEquationLoweringResult, HumanEquationLoweringError> {
+    lower_human_equation_decision_tree_to_core_impl(
+        equation,
+        matrix,
+        decision,
+        profile,
+        budget,
+        HumanEquationTheoremRequest::disabled(),
+        Some(sharing_validator),
     )
 }
 
@@ -1681,6 +1775,46 @@ pub fn lower_human_equation_decision_tree_to_core_with_theorems(
     profile: HumanEquationLoweringProfile,
     budget: HumanEquationBudget,
     theorem_request: HumanEquationTheoremRequest,
+) -> Result<HumanEquationLoweringResult, HumanEquationLoweringError> {
+    lower_human_equation_decision_tree_to_core_impl(
+        equation,
+        matrix,
+        decision,
+        profile,
+        budget,
+        theorem_request,
+        None,
+    )
+}
+
+pub fn lower_human_equation_decision_tree_to_core_with_theorems_and_sharing_validator(
+    equation: &HumanResolvedEquationItem,
+    matrix: &HumanEquationPatternMatrix,
+    decision: &HumanEquationDecisionTreeResult,
+    profile: HumanEquationLoweringProfile,
+    budget: HumanEquationBudget,
+    theorem_request: HumanEquationTheoremRequest,
+    sharing_validator: &dyn HumanEquationSharingValidator,
+) -> Result<HumanEquationLoweringResult, HumanEquationLoweringError> {
+    lower_human_equation_decision_tree_to_core_impl(
+        equation,
+        matrix,
+        decision,
+        profile,
+        budget,
+        theorem_request,
+        Some(sharing_validator),
+    )
+}
+
+fn lower_human_equation_decision_tree_to_core_impl<'a>(
+    equation: &HumanResolvedEquationItem,
+    matrix: &'a HumanEquationPatternMatrix,
+    decision: &'a HumanEquationDecisionTreeResult,
+    profile: HumanEquationLoweringProfile,
+    budget: HumanEquationBudget,
+    theorem_request: HumanEquationTheoremRequest,
+    sharing_validator: Option<&'a dyn HumanEquationSharingValidator>,
 ) -> Result<HumanEquationLoweringResult, HumanEquationLoweringError> {
     let decision_stats = decision_tree_node_stats(&decision.tree.root);
     let mut budget_usage = HumanEquationBudgetUsage {
@@ -1705,7 +1839,7 @@ pub fn lower_human_equation_decision_tree_to_core_with_theorems(
         ));
     }
 
-    let mut lowerer = HumanEquationCoreLowerer::new(matrix, decision, profile);
+    let mut lowerer = HumanEquationCoreLowerer::new(matrix, decision, profile, sharing_validator);
     let mut public_context =
         HumanEquationLoweringContext::new(lowerer.profile.public_binders.clone());
     let public_body = lowerer.lower_node(
@@ -1713,7 +1847,7 @@ pub fn lower_human_equation_decision_tree_to_core_with_theorems(
         &mut public_context,
         HelperReferenceMode::Use,
     )?;
-    let public_body = lowerer.share_repeated_result_terms(public_body)?;
+    let public_body = lowerer.share_repeated_result_terms(public_body, &public_context.binders)?;
     let public_ty = close_pi(
         &lowerer.profile.public_binders,
         lowerer.profile.result_type.clone(),
@@ -2447,17 +2581,6 @@ fn remap_expr_from_source_context_at_depth(
         Expr::Pi { binder, ty, body } => Ok(Expr::pi(
             binder.clone(),
             remap_expr_from_source_context_at_depth(ty, bvar_terms, depth, theorem_name)?,
-            remap_expr_from_source_context_at_depth(body, bvar_terms, depth + 1, theorem_name)?,
-        )),
-        Expr::Let {
-            binder,
-            ty,
-            value,
-            body,
-        } => Ok(Expr::let_in(
-            binder.clone(),
-            remap_expr_from_source_context_at_depth(ty, bvar_terms, depth, theorem_name)?,
-            remap_expr_from_source_context_at_depth(value, bvar_terms, depth, theorem_name)?,
             remap_expr_from_source_context_at_depth(body, bvar_terms, depth + 1, theorem_name)?,
         )),
     }
@@ -4264,6 +4387,7 @@ struct HumanEquationCoreLowerer<'a> {
     profile: HumanEquationLoweringProfile,
     helpers_by_target: BTreeMap<String, HumanEquationHelperCandidate>,
     helper_contexts: BTreeMap<String, Vec<HumanEquationLoweringBinder>>,
+    sharing_validator: Option<&'a dyn HumanEquationSharingValidator>,
     eq_rec_transports: u64,
 }
 
@@ -4272,6 +4396,7 @@ impl<'a> HumanEquationCoreLowerer<'a> {
         matrix: &'a HumanEquationPatternMatrix,
         decision: &'a HumanEquationDecisionTreeResult,
         profile: HumanEquationLoweringProfile,
+        sharing_validator: Option<&'a dyn HumanEquationSharingValidator>,
     ) -> Self {
         let helpers_by_target = decision
             .helper_plan
@@ -4286,6 +4411,7 @@ impl<'a> HumanEquationCoreLowerer<'a> {
             profile,
             helpers_by_target,
             helper_contexts: BTreeMap::new(),
+            sharing_validator,
             eq_rec_transports: 0,
         }
     }
@@ -4596,7 +4722,7 @@ impl<'a> HumanEquationCoreLowerer<'a> {
             })?;
             let mut context = HumanEquationLoweringContext::new(helper_context.clone());
             let body = self.lower_node(node, &mut context, HelperReferenceMode::Inline)?;
-            let body = self.share_repeated_result_terms(body)?;
+            let body = self.share_repeated_result_terms(body, &helper_context)?;
             declarations.push((
                 Decl::Def {
                     name: helper.name.clone(),
@@ -4611,11 +4737,18 @@ impl<'a> HumanEquationCoreLowerer<'a> {
         Ok(declarations)
     }
 
-    fn share_repeated_result_terms(&self, body: Expr) -> Result<Expr, HumanEquationLoweringError> {
+    fn share_repeated_result_terms(
+        &self,
+        body: Expr,
+        context: &[HumanEquationLoweringBinder],
+    ) -> Result<Expr, HumanEquationLoweringError> {
         share_repeated_closed_result_terms(
             body,
             &self.profile.result_type,
             &self.profile.row_values,
+            context,
+            &self.profile.universe_params,
+            self.sharing_validator,
         )
     }
 }
@@ -4782,7 +4915,13 @@ fn share_repeated_closed_result_terms(
     body: Expr,
     result_type: &Expr,
     row_values: &BTreeMap<usize, Expr>,
+    context: &[HumanEquationLoweringBinder],
+    universe_params: &[String],
+    sharing_validator: Option<&dyn HumanEquationSharingValidator>,
 ) -> Result<Expr, HumanEquationLoweringError> {
+    let Some(sharing_validator) = sharing_validator else {
+        return Ok(body);
+    };
     let mut candidates = row_values
         .values()
         .filter(|expr| !expr_contains_bvar(expr))
@@ -4808,7 +4947,7 @@ fn share_repeated_closed_result_terms(
             continue;
         }
         let old_nodes = candidate_nodes.saturating_mul(occurrences);
-        let shared_nodes = 1_u64
+        let shared_nodes = 2_u64
             .saturating_add(result_type_nodes)
             .saturating_add(candidate_nodes)
             .saturating_add(occurrences);
@@ -4830,17 +4969,26 @@ fn share_repeated_closed_result_terms(
     let Some((_, hash, candidate)) = best else {
         return Ok(body);
     };
-    let shifted_body = npa_kernel::subst::shift(&body, 1, 0).map_err(|err| {
-        HumanEquationLoweringError::UnsupportedNestedOrMutualLowering {
-            reason: format!("failed to shift generated body for let sharing: {err:?}"),
-        }
-    })?;
+    if !sharing_validator.validate_candidate(context, universe_params, &candidate, result_type) {
+        return Ok(body);
+    }
+    let Ok(shifted_body) = npa_kernel::subst::shift(&body, 1, 0) else {
+        return Ok(body);
+    };
     let shared_body = replace_closed_subterm_with_bvar(shifted_body, &candidate, 0);
-    Ok(Expr::let_in(
-        format!("__eqc_shared_{}", &hash[..12]),
-        result_type.clone(),
+    let binder_name = format!("__eqc_shared_{}", &hash[..12]);
+    if !sharing_validator.validate_rewritten_body(
+        context,
+        universe_params,
+        &binder_name,
+        result_type,
+        &shared_body,
+    ) {
+        return Ok(body);
+    }
+    Ok(Expr::app(
+        Expr::lam(binder_name, result_type.clone(), shared_body),
         candidate,
-        shared_body,
     ))
 }
 
@@ -4852,9 +5000,6 @@ fn expr_contains_bvar(expr: &Expr) -> bool {
         Expr::Lam { ty, body, .. } | Expr::Pi { ty, body, .. } => {
             expr_contains_bvar(ty) || expr_contains_bvar(body)
         }
-        Expr::Let {
-            ty, value, body, ..
-        } => expr_contains_bvar(ty) || expr_contains_bvar(value) || expr_contains_bvar(body),
     }
 }
 
@@ -4870,11 +5015,6 @@ fn count_nonoverlapping_subterm_occurrences(expr: &Expr, candidate: &Expr) -> u6
             count_nonoverlapping_subterm_occurrences(ty, candidate)
                 .saturating_add(count_nonoverlapping_subterm_occurrences(body, candidate))
         }
-        Expr::Let {
-            ty, value, body, ..
-        } => count_nonoverlapping_subterm_occurrences(ty, candidate)
-            .saturating_add(count_nonoverlapping_subterm_occurrences(value, candidate))
-            .saturating_add(count_nonoverlapping_subterm_occurrences(body, candidate)),
     }
 }
 
@@ -4898,17 +5038,6 @@ fn replace_closed_subterm_with_bvar(expr: Expr, candidate: &Expr, depth: u32) ->
             replace_closed_subterm_with_bvar((*ty).clone(), candidate, depth),
             replace_closed_subterm_with_bvar((*body).clone(), candidate, depth.saturating_add(1)),
         ),
-        Expr::Let {
-            binder,
-            ty,
-            value,
-            body,
-        } => Expr::let_in(
-            binder,
-            replace_closed_subterm_with_bvar((*ty).clone(), candidate, depth),
-            replace_closed_subterm_with_bvar((*value).clone(), candidate, depth),
-            replace_closed_subterm_with_bvar((*body).clone(), candidate, depth.saturating_add(1)),
-        ),
     }
 }
 
@@ -4920,12 +5049,6 @@ fn core_expr_node_count(expr: &Expr) -> u64 {
             .saturating_add(core_expr_node_count(arg)),
         Expr::Lam { ty, body, .. } | Expr::Pi { ty, body, .. } => 1_u64
             .saturating_add(core_expr_node_count(ty))
-            .saturating_add(core_expr_node_count(body)),
-        Expr::Let {
-            ty, value, body, ..
-        } => 1_u64
-            .saturating_add(core_expr_node_count(ty))
-            .saturating_add(core_expr_node_count(value))
             .saturating_add(core_expr_node_count(body)),
     }
 }
@@ -6516,6 +6639,109 @@ def pred (n : Nat) : Nat where
         .expect("lowered equation core module should verify through the checker");
     }
 
+    fn kernel_env_for_human_source(source: &str) -> Env {
+        let module = compile_human_source_to_core(
+            FileId(101),
+            npa_cert::Name::from_dotted("Equation.Sharing.Validator"),
+            source,
+            &[],
+            &HumanCompileOptions::default(),
+        )
+        .expect("validator prelude should elaborate to core");
+        let mut env = Env::new();
+        for declaration in module.declarations {
+            env.add_decl_diagnosed(declaration)
+                .expect("validator prelude declaration should enter the kernel environment");
+        }
+        env
+    }
+
+    struct AcceptSharing;
+
+    impl HumanEquationSharingValidator for AcceptSharing {
+        fn validate_candidate(
+            &self,
+            _context: &[HumanEquationLoweringBinder],
+            _universe_params: &[String],
+            _candidate: &Expr,
+            _result_type: &Expr,
+        ) -> bool {
+            true
+        }
+
+        fn validate_rewritten_body(
+            &self,
+            _context: &[HumanEquationLoweringBinder],
+            _universe_params: &[String],
+            _binder_name: &str,
+            _result_type: &Expr,
+            _rewritten_body: &Expr,
+        ) -> bool {
+            true
+        }
+    }
+
+    struct RejectSharingCandidate;
+
+    impl HumanEquationSharingValidator for RejectSharingCandidate {
+        fn validate_candidate(
+            &self,
+            _context: &[HumanEquationLoweringBinder],
+            _universe_params: &[String],
+            _candidate: &Expr,
+            _result_type: &Expr,
+        ) -> bool {
+            false
+        }
+
+        fn validate_rewritten_body(
+            &self,
+            _context: &[HumanEquationLoweringBinder],
+            _universe_params: &[String],
+            _binder_name: &str,
+            _result_type: &Expr,
+            _rewritten_body: &Expr,
+        ) -> bool {
+            panic!("rewritten body validation must not run after candidate rejection")
+        }
+    }
+
+    struct RejectSharingBody;
+
+    impl HumanEquationSharingValidator for RejectSharingBody {
+        fn validate_candidate(
+            &self,
+            _context: &[HumanEquationLoweringBinder],
+            _universe_params: &[String],
+            _candidate: &Expr,
+            _result_type: &Expr,
+        ) -> bool {
+            true
+        }
+
+        fn validate_rewritten_body(
+            &self,
+            _context: &[HumanEquationLoweringBinder],
+            _universe_params: &[String],
+            _binder_name: &str,
+            _result_type: &Expr,
+            _rewritten_body: &Expr,
+        ) -> bool {
+            false
+        }
+    }
+
+    fn repeated_sharing_test_input(occurrences: usize) -> (Expr, Expr, BTreeMap<usize, Expr>) {
+        let candidate = Expr::app(Expr::konst("candidate", vec![]), Expr::konst("arg", vec![]));
+        let body = Expr::apps(
+            Expr::konst("consumer", vec![]),
+            (0..occurrences).map(|_| candidate.clone()),
+        );
+        let mut row_values = BTreeMap::new();
+        row_values.insert(0, candidate.clone());
+        (body, candidate, row_values)
+    }
+
     fn public_definition_value<'a>(
         bundle: &'a HumanEquationCoreArtifactBundle,
         name: &str,
@@ -6581,24 +6807,6 @@ def pred (n : Nat) : Nat where
                 expression_contains_applied_const(ty, target, min_args)
                     || expression_contains_applied_const(body, target, min_args)
             }
-            Expr::Let {
-                ty, value, body, ..
-            } => {
-                expression_contains_applied_const(ty, target, min_args)
-                    || expression_contains_applied_const(value, target, min_args)
-                    || expression_contains_applied_const(body, target, min_args)
-            }
-        }
-    }
-
-    fn expression_contains_let(expr: &Expr) -> bool {
-        match expr {
-            Expr::Sort(_) | Expr::BVar(_) | Expr::Const { .. } => false,
-            Expr::App(fun, arg) => expression_contains_let(fun) || expression_contains_let(arg),
-            Expr::Lam { ty, body, .. } | Expr::Pi { ty, body, .. } => {
-                expression_contains_let(ty) || expression_contains_let(body)
-            }
-            Expr::Let { .. } => true,
         }
     }
 
@@ -8438,28 +8646,30 @@ inductive Tree : Type where
     }
 
     #[test]
-    fn lowering_shares_repeated_closed_result_terms_with_let() {
-        let source = "\
+    fn lowering_shares_repeated_closed_result_terms_with_checked_lambda_application() {
+        let prelude = "\
 inductive Nat : Type where
 | zero : Nat
 | succ : Nat -> Nat
 inductive Bit : Type where
 | off : Bit
-| on : Bit
-def to_two (b : Bit) : Nat where
-| Bit.off => Nat.succ (Nat.succ Nat.zero)
-| Bit.on => Nat.succ (Nat.succ Nat.zero)";
+| on : Bit";
+        let source = format!(
+            "{prelude}\ndef to_three (b : Bit) : Nat where\n\
+| Bit.off => Nat.succ (Nat.succ (Nat.succ Nat.zero))\n\
+| Bit.on => Nat.succ (Nat.succ (Nat.succ Nat.zero))"
+        );
         let (resolved, matrix, decision) =
-            decision_tree_lowering_inputs(source, HumanEquationBudget::default());
+            decision_tree_lowering_inputs(&source, HumanEquationBudget::default());
         let off_key = constructor_key(&matrix, "Bit.off");
         let on_key = constructor_key(&matrix, "Bit.on");
         let bit_ty = Expr::konst("Bit", vec![]);
-        let shared_value = nat_succ(nat_succ(nat_zero()));
+        let shared_value = nat_succ(nat_succ(nat_succ(nat_zero())));
         let mut row_values = BTreeMap::new();
         row_values.insert(0, shared_value.clone());
         row_values.insert(1, shared_value);
         let profile = HumanEquationLoweringProfile {
-            public_name: "to_two".to_owned(),
+            public_name: "to_three".to_owned(),
             universe_params: Vec::new(),
             public_binders: vec![lowering_binder("b", bit_ty.clone())],
             result_type: nat(),
@@ -8475,20 +8685,28 @@ def to_two (b : Bit) : Nat where
             row_values,
             row_transports: BTreeMap::new(),
         };
+        let env = kernel_env_for_human_source(prelude);
+        let validator = HumanEquationKernelSharingValidator::new(&env);
 
-        let lowered = lower_human_equation_decision_tree_to_core(
+        let lowered = lower_human_equation_decision_tree_to_core_with_sharing_validator(
             &resolved.resolved_equations[0],
             &matrix,
             &decision,
             profile,
             HumanEquationBudget::default(),
+            &validator,
         )
         .expect("repeated closed result terms should lower with sharing");
 
-        assert!(expression_contains_let(public_definition_value(
-            &lowered.bundle,
-            "to_two",
-        )));
+        let public_value = public_definition_value(&lowered.bundle, "to_three");
+        let Expr::Lam { body, .. } = public_value else {
+            panic!("the public definition should close its argument with a lambda")
+        };
+        assert!(matches!(
+            body.as_ref(),
+            Expr::App(fun, _)
+                if matches!(fun.as_ref(), Expr::Lam { binder, .. } if binder.starts_with("__eqc_shared_"))
+        ));
         assert_eq!(
             lowered.sidecar_metrics.pattern_matrix_cells,
             lowered.budget_usage.pattern_matrix_cells
@@ -8497,16 +8715,77 @@ def to_two (b : Bit) : Nat where
             lowered.sidecar_metrics.expanded_branches,
             lowered.budget_usage.expanded_branches
         );
-        verify_lowered_bundle(
-            "\
-inductive Nat : Type where
-| zero : Nat
-| succ : Nat -> Nat
-inductive Bit : Type where
-| off : Bit
-| on : Bit",
-            &lowered.bundle,
+        verify_lowered_bundle(prelude, &lowered.bundle);
+    }
+
+    #[test]
+    fn lowering_sharing_uses_two_wrapper_profitability_boundary() {
+        let (body, candidate, row_values) = repeated_sharing_test_input(3);
+        assert_eq!(core_expr_node_count(&candidate), 3);
+        assert_eq!(
+            count_nonoverlapping_subterm_occurrences(&body, &candidate),
+            3
         );
+
+        let lowered = share_repeated_closed_result_terms(
+            body.clone(),
+            &Expr::sort(Level::zero()),
+            &row_values,
+            &[],
+            &[],
+            Some(&AcceptSharing),
+        )
+        .expect("sharing profitability should be computable");
+
+        assert_eq!(lowered, body);
+    }
+
+    #[test]
+    fn lowering_sharing_without_validator_preserves_original_body() {
+        let (body, _, row_values) = repeated_sharing_test_input(4);
+        let lowered = share_repeated_closed_result_terms(
+            body.clone(),
+            &Expr::sort(Level::zero()),
+            &row_values,
+            &[],
+            &[],
+            None,
+        )
+        .expect("missing validation capability should be a safe fallback");
+
+        assert_eq!(lowered, body);
+    }
+
+    #[test]
+    fn lowering_sharing_candidate_validation_failure_preserves_original_body() {
+        let (body, _, row_values) = repeated_sharing_test_input(4);
+        let lowered = share_repeated_closed_result_terms(
+            body.clone(),
+            &Expr::sort(Level::zero()),
+            &row_values,
+            &[],
+            &[],
+            Some(&RejectSharingCandidate),
+        )
+        .expect("candidate rejection should be a safe fallback");
+
+        assert_eq!(lowered, body);
+    }
+
+    #[test]
+    fn lowering_sharing_body_validation_failure_preserves_original_body() {
+        let (body, _, row_values) = repeated_sharing_test_input(4);
+        let lowered = share_repeated_closed_result_terms(
+            body.clone(),
+            &Expr::sort(Level::zero()),
+            &row_values,
+            &[],
+            &[],
+            Some(&RejectSharingBody),
+        )
+        .expect("rewritten body rejection should be a safe fallback");
+
+        assert_eq!(lowered, body);
     }
 
     #[test]

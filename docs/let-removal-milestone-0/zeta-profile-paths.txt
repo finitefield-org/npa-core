@@ -1,0 +1,16 @@
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/kernel-fuel-hotspot-diagnostics-design.md
+5d22858ffed16d75bcf01a61381abdb4040ae275:docs/core/kernel-whnf-application-spine-machine-design.md
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-api/examples/bench_whnf_application_spine.rs
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-api/examples/check_whnf_application_spine_package.rs
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-api/src/performance_measurement.rs
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-api/src/session.rs
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-api/src/std_library.rs
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-cli/src/diagnostic.rs
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-cli/src/release_manifest.rs
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-frontend/src/human_diagnostic.rs
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-kernel/src/diagnostic.rs
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-kernel/src/env.rs
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-kernel/src/lib.rs
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-kernel/src/work.rs
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/crates/npa-tactic/src/lib.rs
+5d22858ffed16d75bcf01a61381abdb4040ae275:npa-core/testdata/performance/baselines/kernel-whnf-application-spine.measurements.v0.1.json
