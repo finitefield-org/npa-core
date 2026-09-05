@@ -1460,11 +1460,12 @@ guidance, checker/exporter documentation, tracked agent guidance, and current
 design chronology no longer advertise retired v0.7/v0.8 hosts. The old
 toolchain references, scripts, facade examples, compatibility-only code and
 tests, raw M0/M1 inventories, and temporary migration ledgers were removed;
-the retained M0/M1 README files are outcome markers only. The v0.9.0 annotated
-tag and hosted release were independently verified at the exact release
-commit, with no assets. Exact remote-ref and hosted-release queries found no
-v0.7.0 or v0.8.0 targets, so no ambiguous deletion was attempted. The IUT
-ledger remains unchanged by this milestone.
+the retained M0/M1 README files are outcome markers only. The container and
+standalone `npa-core` v0.9.0 tags/releases were independently verified at the
+exact release commits, with no assets. The standalone v0.7.0 tag/release was
+re-resolved against its frozen identity, deleted with its matching cleanup-tag,
+and verified absent; v0.8.0 never resolved. The IUT ledger remains unchanged by
+this milestone.
 
 1. Make `core-spec-v0.4.0.md` the current core reference.
 2. Add a self-contained, current-only exact toolchain 0.9.0 reference. Prepare

@@ -40,10 +40,15 @@ or this non-executable cleanup record.
 
 ## Publication verification
 
-The annotated `v0.9.0` tag object is
+The container's annotated `v0.9.0` tag object is
 `83bd29b0d1786e92f20c9ea62d6cee06b606a69b` and peels to release commit
-`f29b490a1564446871c09bd81bf7dd4940f8d45c`. The hosted release is published
-without binary assets; the asset list is intentionally empty because the
-source tag is the release artifact. Exact remote-ref and hosted-release queries
-found neither `v0.7.0` nor `v0.8.0`, so no deletion was attempted after the
-identity check. The v0.9.0 tag remains unchanged.
+`f29b490a1564446871c09bd81bf7dd4940f8d45c`; its hosted release is
+`RE_kwDOTPY1v84W2Oex`. The standalone `npa-core` v0.9.0 release is
+`RE_kwDOTPfoj84W2OyB` at synchronized commit
+`a47514e176e742b7b623108be2acda4f838449d5`. Both releases intentionally have
+no binary assets because their source tags are the release artifacts. The
+standalone v0.7.0 tag was re-resolved as
+`34b62dc0de4fed4cbf726627775bd62a9c8b0a20` and its hosted release as
+`RE_kwDOTPfoj84VT9eE`; both were then deleted with cleanup-tag. Exact remote
+and hosted-release queries now find neither v0.7.0 nor v0.8.0. The v0.9.0
+tags remain unchanged.
